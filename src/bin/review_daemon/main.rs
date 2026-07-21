@@ -480,6 +480,11 @@ async fn run_provider(
                     // so this doesn't silently stop cleaning up such a file
                     // if a future agy provider variant ever gains one.
                     output_path: built.output_path.clone(),
+                    // TERM #495: an over-large agy prompt is delivered on stdin
+                    // rather than argv. bwrap forwards its own stdin to the
+                    // sandboxed child, so carry the payload through the wrapper
+                    // unchanged (the spawn site pipes it to bwrap's stdin).
+                    stdin_prompt: built.stdin_prompt.clone(),
                 },
             )
         } else {
@@ -645,7 +650,15 @@ async fn run_built_command(
         .args(&built.args)
         .env_clear()
         .envs(env)
-        .stdin(std::process::Stdio::null())
+        // TERM #495: an over-large prompt (a big diff) is delivered on the child's
+        // stdin instead of as an argv element (which would overflow ARG_MAX and
+        // fail spawn()). Pipe stdin only in that case; the normal path keeps the
+        // exact `Stdio::null()` behavior as before.
+        .stdin(if built.stdin_prompt.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // kill_on_drop so an early return / dropped future never leaves an orphan
@@ -659,6 +672,23 @@ async fn run_built_command(
     let mut child = command
         .spawn()
         .map_err(|e| ("other", format!("failed to spawn {}: {e}", built.binary)))?;
+
+    // TERM #495: feed the over-large prompt to the child on stdin, then close it
+    // (EOF) so the CLI stops reading and begins its review. A big-diff payload can
+    // exceed the OS pipe buffer, so write from a SPAWNED task (concurrent with the
+    // stdout/stderr pumps below) -- a blocking write here, before the readers
+    // start, could deadlock if the child writes to stdout while its stdin pipe is
+    // still full. Dropping the handle after the write closes the pipe.
+    if let Some(payload) = built.stdin_prompt.clone() {
+        if let Some(mut child_stdin) = child.stdin.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt as _;
+                let _ = child_stdin.write_all(payload.as_bytes()).await;
+                let _ = child_stdin.shutdown().await;
+                drop(child_stdin);
+            });
+        }
+    }
 
     // Drain both pipes concurrently, stamping last-output time — so a chatty child
     // never deadlocks on a full pipe AND the watchdog can distinguish progress from
@@ -760,6 +790,7 @@ mod tests {
             binary: "sh",
             args: vec!["-c".into(), "sleep 2 && echo READY".into()],
             output_path: None,
+            stdin_prompt: None,
         };
         let stall = StallConfig { timeout_secs: 30, stall_secs: Some(1) };
         let out = run_built_command(
@@ -782,6 +813,7 @@ mod tests {
             binary: "sh",
             args: vec!["-c".into(), "printf READY; sleep 60".into()],
             output_path: None,
+            stdin_prompt: None,
         };
         // stall window 1s, wall-clock backstop 30s: the stall detector (not the
         // backstop) must fire — fast — once output stops after the immediate print.
@@ -806,6 +838,7 @@ mod tests {
             binary: "sh",
             args: vec!["-c".into(), "sleep 30".into()],
             output_path: None,
+            stdin_prompt: None,
         };
         let stall = StallConfig { timeout_secs: 1, stall_secs: Some(10) };
         let out = run_built_command(
