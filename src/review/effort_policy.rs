@@ -868,6 +868,36 @@ pub fn codex_model_for_tier(tier: EffortTier) -> String {
 /// reaches the spawned CLI's argv.
 pub const ALLOWED_CODEX_MODELS: &[&str] = &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
 
+// ── REVX-10: OpenRouter reasoning-object tiers ──────────────────────────────
+
+/// OpenAI-style OpenRouter `reasoning.effort` string for a given
+/// [`EffortTier`] (`none|minimal|low|medium|high|xhigh` per the OpenRouter
+/// reasoning-tokens docs). Used for OpenAI/Kimi/DeepSeek/GLM/Qwen-family
+/// models -- see [`crate::review::dispatch::reasoning_for`].
+pub fn tier_to_openrouter_effort(tier: EffortTier) -> &'static str {
+    match tier {
+        EffortTier::Minimal => "minimal",
+        EffortTier::Low => "low",
+        EffortTier::Medium => "medium",
+        EffortTier::High => "high",
+        EffortTier::Xhigh => "xhigh",
+    }
+}
+
+/// Anthropic/Gemini-style OpenRouter `reasoning.max_tokens` bucket for a
+/// given [`EffortTier`]. Floored at 1024 (Anthropic's documented minimum)
+/// even for [`EffortTier::Minimal`]. Buckets per the S121 research findings:
+/// Low≈2k, Medium≈8k, High≈16k, Xhigh≈24k.
+pub fn tier_to_max_tokens(tier: EffortTier) -> u32 {
+    match tier {
+        EffortTier::Minimal => 1024,
+        EffortTier::Low => 2048,
+        EffortTier::Medium => 8192,
+        EffortTier::High => 16384,
+        EffortTier::Xhigh => 24576,
+    }
+}
+
 // ── REVX-13: review-only provider contract ──────────────────────────────────
 
 /// Providers this codebase asserts are REVIEW/capstone-only and must never be
@@ -1247,6 +1277,26 @@ mod tests {
         let history = load_pass_history(&ctx).await;
         assert_eq!(history.pass_number, 3);
         assert!(history.prior_verdict_contested);
+    }
+
+    // ── tier_to_openrouter_effort / tier_to_max_tokens (REVX-10) ────────
+
+    #[test]
+    fn tier_to_openrouter_effort_covers_all_levels() {
+        assert_eq!(tier_to_openrouter_effort(EffortTier::Minimal), "minimal");
+        assert_eq!(tier_to_openrouter_effort(EffortTier::Low), "low");
+        assert_eq!(tier_to_openrouter_effort(EffortTier::Medium), "medium");
+        assert_eq!(tier_to_openrouter_effort(EffortTier::High), "high");
+        assert_eq!(tier_to_openrouter_effort(EffortTier::Xhigh), "xhigh");
+    }
+
+    #[test]
+    fn tier_to_max_tokens_floors_at_1024_and_scales_up() {
+        assert_eq!(tier_to_max_tokens(EffortTier::Minimal), 1024);
+        assert!(tier_to_max_tokens(EffortTier::Minimal) >= 1024);
+        assert!(tier_to_max_tokens(EffortTier::Low) < tier_to_max_tokens(EffortTier::Medium));
+        assert!(tier_to_max_tokens(EffortTier::Medium) < tier_to_max_tokens(EffortTier::High));
+        assert!(tier_to_max_tokens(EffortTier::High) < tier_to_max_tokens(EffortTier::Xhigh));
     }
 
     #[test]

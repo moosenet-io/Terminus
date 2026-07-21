@@ -703,6 +703,49 @@ mod tests {
         assert!(s.check_recovery(secs_from_now(now, 31)));
     }
 
+    // ── REVX-12: agy weekly-cliff end-to-end (Shelved -> down -> recovery) ──
+
+    #[test]
+    fn agy_weekly_cliff_end_to_end_shelved_down_then_recovers_and_clears() {
+        let now = SystemTime::now();
+        let reg = ReviewerRegistry::new();
+        // Weekly-cliff phrasing, exactly as agy reports it.
+        let msg = "Individual quota reached. Please wait or upgrade. Resets in 76h4m15s.";
+        assert!(is_rate_limit_error(msg));
+        let horizon = parse_horizon_secs(msg).expect("agy weekly-cliff horizon must parse");
+
+        reg.update("agy", |s| s.mark_rate_limited(Some(horizon), now, msg));
+        assert!(reg.is_down("agy", now), "agy must be Shelved (down) immediately after the cliff");
+        assert_eq!(reg.get("agy").last_status, CapStatus::Shelved);
+
+        // Never early-probed: still down well before the horizon elapses.
+        assert!(reg.is_down("agy", secs_from_now(now, 3600)));
+
+        // After the horizon elapses, `check_recovery` allows agy back in --
+        // the panel's next successful dispatch (`mark_success`) is what
+        // actually clears the cap (mirroring `record_dispatch_outcome`'s
+        // real hook in `review::mod`).
+        let after = secs_from_now(now, horizon + 1);
+        assert!(!reg.is_down("agy", after), "agy must no longer read as down once the horizon elapses");
+        reg.update("agy", |s| s.mark_success());
+        let status = reg.get("agy");
+        assert_eq!(status.last_status, CapStatus::Available);
+        assert_eq!(status.consecutive_caps, 0, "a real dispatch success must reset the backoff counter");
+    }
+
+    #[test]
+    fn agy_transient_oauth_blip_is_never_mistaken_for_a_weekly_cliff() {
+        // A genuine auth hiccup must not classify as a rate-limit cap at
+        // all -- distinct from the quota/"resets in" cliff phrasing above.
+        let blip = "Authentication required: please re-authenticate";
+        assert!(!is_rate_limit_error(blip), "an auth blip must not be classified as a rate-limit cap");
+    }
+
+    #[test]
+    fn agy_stays_in_frontier_and_capstone_provider_sets() {
+        assert!(FRONTIER.contains(&"agy"), "agy must remain a first-class FRONTIER panel provider");
+    }
+
     #[test]
     fn mark_recovered_clears_cap_but_keeps_consecutive_count() {
         let now = SystemTime::now();

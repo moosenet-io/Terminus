@@ -262,7 +262,7 @@ impl OpenRouterDocGenerator {
 impl DocGenerator for OpenRouterDocGenerator {
     async fn generate(&self, prompt: &str) -> Result<String, ToolError> {
         self.review_config
-            .dispatch_openrouter(&self.model, prompt)
+            .dispatch_openrouter(&self.model, prompt, None)
             .await
             .map_err(ToolError::Http)
     }

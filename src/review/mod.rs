@@ -49,6 +49,11 @@ pub(crate) mod dispatch;
 // tier/native-mapping tables, not two.
 pub(crate) mod effort_policy;
 pub(crate) mod free_pool;
+// REVX-09/10/11: the paid, pooled OpenRouter provider (curated model set,
+// round-robin + 429 cooldown, and the runtime ON/OFF toggle). `pub(crate)`
+// like `free_pool` -- `dispatch.rs`'s `dispatch_paid_pool` and the
+// `review_paid_pool_toggle` tool (this module, further down) both need it.
+pub(crate) mod paid_pool;
 // `pub(crate)` (was module-private): CXEG-02's `cortex_scope`
 // (`crate::cortex::scope`) reuses `derive_changed_files` directly so it and
 // `review_run`'s KGREV-01 grounding agree on which files a `diff`/
@@ -99,8 +104,14 @@ pub use prompt::{build_docs_prompt, build_prompt, parse_findings, parse_verdict,
 // above.
 pub use consistency::{ConsistencyFinding, ConsistencyRun};
 
-const ALLOWED_PROVIDERS: &[&str] =
-    &["opus", "codex", "agy", "nemotron", "qwen_coder", "free", "claude-fable-5", "gpt56", "diffusion"];
+// REVX-09: `paid` -- the pooled, curated PAID OpenRouter provider (Kimi K2/
+// K2-thinking, DeepSeek V3.2, GLM-5/4.6, Gemini 2.5 Pro) -- added to the
+// allowlist alongside the sub/free lenses; gated behind the REVX-11 runtime
+// toggle (default OFF) and the existing paid-model credit floor, not the
+// routine default gate.
+const ALLOWED_PROVIDERS: &[&str] = &[
+    "opus", "codex", "agy", "nemotron", "qwen_coder", "free", "claude-fable-5", "gpt56", "diffusion", "paid",
+];
 /// Routine review panel cap (per one `review_run` call).
 const MAX_PROVIDERS: usize = 5;
 /// The Epic capstone runs the widest possible panel once per build, so it may
@@ -807,11 +818,20 @@ fn is_intensive_substitute(provider: &str, now: std::time::SystemTime) -> bool {
 /// `consistency::maybe_run` (the Tier-C lens's dedicated pinned-provider
 /// dispatch) both call this rather than each re-deriving which transport a
 /// provider name maps to.
+///
+/// `effort_tier` (REVX-10): the effort-policy tier for the OpenRouter-routed
+/// arms (`paid`, and the existing `gpt56`/`nemotron`/`qwen_coder` fixed-model
+/// arm) -- threaded into [`dispatch::reasoning_for`] so those dispatches
+/// carry a policy-driven `reasoning` object. `None` (every pre-REVX-10 call
+/// site, and the policy-disabled path) omits `reasoning` entirely,
+/// reproducing the prior request body byte-for-byte. Daemon providers ignore
+/// this -- their effort is already carried by `daemon_opts.reasoning_effort`.
 async fn dispatch_provider_raw(
     cfg: &ReviewConfig,
     provider: &str,
     prompt_text: &str,
     daemon_opts: &dispatch::DaemonOpts,
+    effort_tier: Option<effort_policy::EffortTier>,
 ) -> Result<String, String> {
     if dispatch::is_daemon_provider(provider) {
         cfg.dispatch_daemon(provider, prompt_text, daemon_opts).await
@@ -826,12 +846,18 @@ async fn dispatch_provider_raw(
         // ahead of the `openrouter_model_for` check rather than being folded
         // into that table.
         cfg.dispatch_diffusion(prompt_text).await
+    } else if provider == "paid" {
+        // REVX-09/10/11: the pooled, curated PAID OpenRouter provider --
+        // round-robin + 429 failover + the runtime toggle + the credit floor,
+        // all internal to `dispatch_paid_pool`.
+        cfg.dispatch_paid_pool(prompt_text, effort_tier).await
     } else if let Some(model) = dispatch::openrouter_model_for(provider) {
         // Credit guard: refuse a PAID model (e.g. gpt56 = gpt-5.6-luna) when the
         // OpenRouter balance is below the floor, so a paid lens can never bottom
         // out the account. Free models pass through untouched.
         cfg.guard_paid_model(model).await?;
-        cfg.dispatch_openrouter(model, prompt_text).await
+        let reasoning = effort_tier.map(|t| dispatch::reasoning_for(model, t));
+        cfg.dispatch_openrouter(model, prompt_text, reasoning).await
     } else {
         // Unreachable given parse_input's validation for the correctness
         // panel, but fail safe rather than panic if it ever were -- and a
@@ -847,8 +873,9 @@ async fn run_one_provider(
     provider: String,
     prompt_text: String,
     daemon_opts: dispatch::DaemonOpts,
+    effort_tier: Option<effort_policy::EffortTier>,
 ) -> ProviderResult {
-    let raw = dispatch_provider_raw(&cfg, &provider, &prompt_text, &daemon_opts).await;
+    let raw = dispatch_provider_raw(&cfg, &provider, &prompt_text, &daemon_opts, effort_tier).await;
 
     match raw {
         Ok(text) => {
@@ -961,6 +988,26 @@ than failing the whole call."
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let (structure, mut providers, criteria, mut context) = parse_input(&args)?;
+
+        // REVX-11: a disabled `paid` seat is dropped from the EFFECTIVE panel
+        // entirely -- never dispatched (no network call), and never counted
+        // against `panel_unanimous`/`complete` completeness -- unless it was
+        // the ONLY requested provider, in which case that's a clear "no
+        // enabled providers" result rather than a silently empty panel.
+        if providers.iter().any(|p| p == "paid") && !paid_pool::is_enabled() {
+            if providers.iter().all(|p| p == "paid") {
+                return Ok(json!({
+                    "structure": args["structure"],
+                    "providers": [],
+                    "aggregate_verdict": "UNKNOWN",
+                    "complete": false,
+                    "reason": "paid pool is disabled and was the only requested provider -- \
+                               no enabled providers",
+                })
+                .to_string());
+            }
+            providers.retain(|p| p != "paid");
+        }
 
         // KGREV-02: a project with an in-flight incremental KG rebuild (from
         // a just-approved prior review) short-circuits here -- a re-review
@@ -1198,6 +1245,11 @@ than failing the whole call."
             } else {
                 daemon_opts.clone()
             };
+            // REVX-10: the OpenRouter-tier arms (`paid`/`gpt56`/`nemotron`/
+            // `qwen_coder`) get the SAME decision tier threaded through as a
+            // `reasoning` object -- `None` when the policy is disabled, so
+            // those dispatches stay byte-for-byte unchanged in that case.
+            let effort_tier_for_openrouter = if effort_cfg.enabled { Some(decision.tier) } else { None };
             effort_decisions.push((provider.clone(), decision));
 
             let prompt_text = build_prompt(role, &criteria, &context);
@@ -1205,7 +1257,8 @@ than failing the whole call."
             let provider = provider.clone();
             let provider_for_map = provider.clone();
             let handle = set.spawn(async move {
-                let result = run_one_provider(cfg, provider, prompt_text, opts).await;
+                let result =
+                    run_one_provider(cfg, provider, prompt_text, opts, effort_tier_for_openrouter).await;
                 (idx, result)
             });
             id_to_slot.insert(handle.id(), (idx, provider_for_map));
@@ -1456,7 +1509,7 @@ impl ReviewProviderStatus {
     /// `record_dispatch_outcome` hook a real review uses.
     async fn probe_one(cfg: &ReviewConfig, provider: &str) {
         let daemon_opts = dispatch::DaemonOpts::routine();
-        let raw = dispatch_provider_raw(cfg, provider, "ping", &daemon_opts).await;
+        let raw = dispatch_provider_raw(cfg, provider, "ping", &daemon_opts, None).await;
         record_dispatch_outcome(provider, &raw.map(|_| ()));
     }
 }
@@ -1536,6 +1589,66 @@ impl RustTool for ReviewProviderStatus {
     }
 }
 
+/// REVX-11 — `review_paid_pool_toggle`: flip the `paid` provider's runtime
+/// enabled/disabled flag ([`paid_pool::is_enabled`]/[`paid_pool::set_enabled`])
+/// WITHOUT a redeploy. Paid spend is operator-gated (default OFF), so this is
+/// the sanctioned agent-invocable door to turn it on/off on operator
+/// instruction, and to read the current state (omit `enabled` for a
+/// status-only read).
+struct ReviewPaidPoolToggle;
+
+#[async_trait::async_trait]
+impl RustTool for ReviewPaidPoolToggle {
+    fn name(&self) -> &str {
+        "review_paid_pool_toggle"
+    }
+
+    fn description(&self) -> &str {
+        "Enable/disable the `paid` review provider (a pooled, curated set of paid \
+         OpenRouter capstone models -- Kimi K2/K2-thinking, DeepSeek V3.2, GLM-5/4.6, \
+         Gemini 2.5 Pro) at RUNTIME, no redeploy. Defaults OFF (paid spend is \
+         operator-gated). Pass 'enabled: true|false' to flip it, or omit 'enabled' \
+         to just read the current state. The flag survives across review_run calls \
+         for the life of the process; it resets to the REVIEW_PAID_POOL_ENABLED env \
+         default on a process restart."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "description": "If present, sets the paid pool's runtime enabled state. \
+                                     Omit to just read the current state without changing it."
+                }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        if let Some(enabled) = args.get("enabled").and_then(Value::as_bool) {
+            paid_pool::set_enabled(enabled);
+        }
+        let enabled = paid_pool::is_enabled();
+        let structured = json!({
+            "enabled": enabled,
+            "models": paid_pool::configured_models(),
+        });
+        let text = format!(
+            "paid review pool is now {} ({} configured model(s))",
+            if enabled { "ENABLED" } else { "DISABLED" },
+            paid_pool::configured_models().len(),
+        );
+        Ok(ToolOutput::with_structured(text, structured))
+    }
+}
+
 pub fn register(registry: &mut ToolRegistry) {
     registry
         .register(Box::new(ReviewRun::new()))
@@ -1546,6 +1659,9 @@ pub fn register(registry: &mut ToolRegistry) {
     registry
         .register(Box::new(ReviewProviderStatus))
         .expect("review_provider_status must register cleanly");
+    registry
+        .register(Box::new(ReviewPaidPoolToggle))
+        .expect("review_paid_pool_toggle must register cleanly");
 }
 
 #[cfg(test)]
@@ -1806,6 +1922,71 @@ mod tests {
         for p in parsed["providers"].as_array().unwrap() {
             assert!(p["error"].is_string(), "expected a degrade reason, got {p}");
         }
+    }
+
+    // ── REVX-09/11: `paid` provider allowlist + runtime-toggle wiring ──────
+
+    #[test]
+    fn paid_is_in_the_allowed_providers_list() {
+        assert!(ALLOWED_PROVIDERS.contains(&"paid"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn disabled_paid_seat_is_dropped_from_the_panel_not_dispatched() {
+        paid_pool::set_enabled(false);
+        std::env::remove_var("REVIEW_DAEMON_TOKEN");
+        let args = json!({
+            "structure": "panel_majority",
+            "providers": ["opus", "paid"],
+            "criteria": "must compile",
+            "context": {"diff": "+ fn x() {}"}
+        });
+        let out = tool().execute(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let providers = parsed["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 1, "disabled paid seat must be dropped, not dispatched: {parsed}");
+        assert_eq!(providers[0]["provider"], "opus");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn disabled_paid_as_the_only_provider_returns_a_clear_no_enabled_providers_result() {
+        paid_pool::set_enabled(false);
+        let args = json!({
+            "structure": "single",
+            "providers": ["paid"],
+            "criteria": "must compile",
+            "context": {}
+        });
+        let out = tool().execute(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["providers"].as_array().unwrap().len(), 0, "{parsed}");
+        assert_eq!(parsed["complete"], false, "{parsed}");
+        assert!(
+            parsed["reason"].as_str().unwrap_or("").contains("no enabled providers"),
+            "{parsed}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn review_paid_pool_toggle_flips_state_and_reports_it() {
+        let toggle = ReviewPaidPoolToggle;
+        let on = toggle.execute_structured(json!({"enabled": true})).await.unwrap();
+        assert_eq!(on.structured.as_ref().unwrap()["enabled"], true);
+        assert!(paid_pool::is_enabled());
+
+        let off = toggle.execute_structured(json!({"enabled": false})).await.unwrap();
+        assert_eq!(off.structured.as_ref().unwrap()["enabled"], false);
+        assert!(!paid_pool::is_enabled());
+
+        // A status-only read (no `enabled` key) must not change the state.
+        paid_pool::set_enabled(true);
+        let status = toggle.execute_structured(json!({})).await.unwrap();
+        assert_eq!(status.structured.as_ref().unwrap()["enabled"], true);
+        assert!(paid_pool::is_enabled(), "status-only read must not flip the flag");
+        paid_pool::set_enabled(false);
     }
 
     // ── KGREV-02: rebuild-on-pass hook + per-project re-review lock ────────
