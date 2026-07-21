@@ -831,18 +831,19 @@ impl GiteaClient {
 
         let status = resp.status();
         if status.is_success() {
-            // Gitea returns an empty body; a forge that returns the resulting
-            // SHA would carry it as `sha`/`head_sha`/`merge_commit_sha` — parse
-            // defensively and hand it back as authoritative when present.
+            // Gitea returns an empty body. A forge that returns the resulting
+            // BRANCH HEAD would carry it as `head_sha` — the ONLY field that is
+            // unambiguously the updated branch head. We deliberately do NOT read
+            // `sha`/`merge_commit_sha`/`commit_sha` (FIX 4): a merge-commit SHA
+            // is NOT the branch head, and a bare `sha` is ambiguous — using
+            // either for head identity / `head_commit_id` would be wrong. When
+            // no genuine head field is present (the Gitea case) this is `None`
+            // and the caller relies on advanced-AND-mergeable head selection.
             let body_text = resp.text().await.unwrap_or_default();
-            let resulting_sha = serde_json::from_str::<Value>(&body_text)
+            let resulting_head_sha = serde_json::from_str::<Value>(&body_text)
                 .ok()
-                .and_then(|v| {
-                    ["sha", "head_sha", "merge_commit_sha", "commit_sha"]
-                        .iter()
-                        .find_map(|k| v.get(*k).and_then(Value::as_str).map(str::to_string))
-                });
-            return Ok(resulting_sha);
+                .and_then(|v| v.get("head_sha").and_then(Value::as_str).map(str::to_string));
+            return Ok(resulting_head_sha);
         }
         // A `409 Conflict` (or Gitea's `422 Unprocessable Entity` for a branch
         // that cannot be updated cleanly) means the branch genuinely conflicts
@@ -909,15 +910,21 @@ impl GiteaClient {
             let pr_info = self.fetch_pr(owner, repo, pr).await?;
             // The head must be mergeable against the CURRENT base — this is the
             // discriminator that a concurrent un-rebased push cannot satisfy.
+            // FIX 2: `mergeable == Some(true)` REQUIRED — `None` (unknown, still
+            // computing) fails closed (keep waiting), never confirms.
             let mergeable_now = pr_info.mergeable == Some(true);
+            // FIX 3: the confirmed head must ALWAYS be advanced past the
+            // pre-update head — even when a `hint_sha` is present — so a bad or
+            // stale update response can never confirm the OLD un-rebased head.
+            let advanced = pr_info.head.sha != prev_head_sha;
             let confirmed = match hint_sha {
-                // Authoritative SHA from the forge: require the head to be
-                // exactly it (and mergeable). A different head means a push
-                // landed over the rebase — not yet safe.
-                Some(h) => pr_info.head.sha == h && mergeable_now,
+                // Authoritative branch-head SHA from the forge: require the head
+                // to be exactly it AND advanced AND mergeable. A different head
+                // means a push landed over the rebase — not yet safe.
+                Some(h) => pr_info.head.sha == h && advanced && mergeable_now,
                 // No authoritative SHA: require the head to have advanced past
                 // the pre-update head AND be mergeable against current base.
-                None => pr_info.head.sha != prev_head_sha && mergeable_now,
+                None => advanced && mergeable_now,
             };
             if confirmed {
                 return Ok(Some(pr_info));
@@ -2211,6 +2218,16 @@ impl MergePr {
                                         }
                                     };
                                     let gated_sha = rebased.head.sha.clone();
+                                    // (FIX 1) Capture the BASE (target-branch)
+                                    // commit SHA the gated head was rebased onto
+                                    // and gated against. The merge slot does NOT
+                                    // serialize direct pushes to `main`, so `main`
+                                    // can advance CLEANLY (mergeable stays true)
+                                    // between the gate and the merge — landing the
+                                    // gated head atop a newer, un-gated base. We
+                                    // require this exact base SHA to still be
+                                    // current at merge time.
+                                    let gated_base_sha = rebased.base.sha.clone();
 
                                     // (c) Fire a FRESH gate on the confirmed
                                     // rebased head, bounded by the REMAINING op
@@ -2220,21 +2237,26 @@ impl MergePr {
                                         .saturating_duration_since(tokio::time::Instant::now());
                                     match rg.gate(&regate_module, &gated_sha, gate_budget).await {
                                         merge_queue::GateVerdict::Green => {
-                                            // (d) FIX 1 + FIX B: bind the merge to
-                                            // the EXACT gated commit. Re-fetch the
-                                            // head immediately before the POST and
-                                            // require it STILL equals the gated
-                                            // SHA (a push during the gate → land
-                                            // an UNTESTED head → bounce HeadMoved)
-                                            // AND is still mergeable against the
-                                            // current base (the base advanced
-                                            // during the gate → the gated head is
-                                            // no longer tested against the landing
-                                            // state → bounce BaseAdvanced). The
-                                            // merge POST ALSO carries the gated SHA
-                                            // as `head_commit_id`, so Gitea rejects
-                                            // server-side even on a race between
-                                            // this check and the POST.
+                                            // (d) Re-fetch immediately before the
+                                            // POST and require the gated state is
+                                            // STILL current — fail-closed on any
+                                            // drift:
+                                            //  - head moved (a push during the
+                                            //    gate → untested head) → HeadMoved
+                                            //  - base advanced at all, CLEAN or
+                                            //    not (FIX 1: even mergeable-stays-
+                                            //    true, e.g. a direct push to main
+                                            //    outside the queue) → BaseAdvanced
+                                            //  - mergeable != Some(true), incl.
+                                            //    `None`/unknown (FIX 2, fail-safe)
+                                            //    → BaseAdvanced
+                                            // The merge POST ALSO carries the gated
+                                            // SHA as `head_commit_id` (belt to
+                                            // these suspenders — Gitea rejects a
+                                            // head race server-side too). Gitea has
+                                            // no server-side BASE guard, so the
+                                            // client-side capture-then-recheck here
+                                            // is the accepted strongest guarantee.
                                             let confirm =
                                                 client.fetch_pr(owner, repo, pr_num).await?;
                                             if confirm.head.sha != gated_sha {
@@ -2245,12 +2267,25 @@ impl MergePr {
                                                     )),
                                                 ));
                                             }
-                                            if confirm.mergeable == Some(false) {
+                                            if confirm.base.sha != gated_base_sha {
                                                 return Err(ToolError::from(
                                                     merge_queue::RegateBounce::BaseAdvanced(
                                                         format!(
-                                                            "gated {gated_sha} no longer mergeable \
-                                                             against current base"
+                                                            "base moved {gated_base_sha} -> {} \
+                                                             after gating {gated_sha}",
+                                                            confirm.base.sha
+                                                        ),
+                                                    ),
+                                                ));
+                                            }
+                                            if confirm.mergeable != Some(true) {
+                                                return Err(ToolError::from(
+                                                    merge_queue::RegateBounce::BaseAdvanced(
+                                                        format!(
+                                                            "gated {gated_sha} not confirmed \
+                                                             mergeable (mergeable={:?}) against \
+                                                             current base",
+                                                            confirm.mergeable
                                                         ),
                                                     ),
                                                 ));
@@ -6312,6 +6347,23 @@ mod tests {
         b
     }
 
+    /// A PR fixture with EXPLICIT head SHA, base SHA, and mergeability — lets a
+    /// test model a base (target-branch) advance (`base.sha` changes) or an
+    /// unknown mergeability (`mergeable == null`) independently of the head.
+    fn pr_full(
+        pr: u64,
+        head_ref: &str,
+        base_ref: &str,
+        head_sha: &str,
+        base_sha: &str,
+        mergeable: Option<bool>,
+    ) -> Value {
+        let mut b = sample_pr_json_guard(pr, head_ref, base_ref, mergeable, false);
+        b["head"]["sha"] = serde_json::json!(head_sha);
+        b["base"]["sha"] = serde_json::json!(base_sha);
+        b
+    }
+
     /// Simulate the forge's rebase becoming visible: delete the current
     /// GET-pull mock and install one whose head SHA is `new_sha` and which is
     /// `mergeable:true` (the confirmed post-rebase head). Mirrors the mid-flight
@@ -7172,6 +7224,203 @@ mod tests {
             .expect_err("a merge-commit regate_style override must be rejected");
         assert!(matches!(err, ToolError::InvalidArgument(_)), "override → InvalidArgument, got {err:?}");
         assert!(format!("{err}").to_lowercase().contains("must be 'rebase'"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pcon06_clean_base_advance_during_gate_bounces_base_advanced() {
+        // FIX 1 (the important one): `main` advances CLEANLY during the gate (a
+        // direct push to main outside the queue — which the merge slot does NOT
+        // serialize), so the gated head is STILL the branch head and STILL
+        // mergeable (true), but its base commit SHA changed. Merging now would
+        // land the gated head atop a newer, UN-GATED base. The queue captures
+        // the base SHA at gate time and bounces `BaseAdvanced` on any base
+        // drift — clean or not.
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let regate = Arc::new(SyncedReGate {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let regate_task = Arc::clone(&regate) as Arc<dyn merge_queue::ReGate>;
+
+        let server = MockServer::start();
+        let mut get_a = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/89");
+            then.status(200)
+                .json_body(pr_full(89, "feature/t", "main", "deadbeef", "base0000", Some(false)));
+        });
+        let update_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/89/update");
+            then.status(200);
+        });
+        let merge_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/89/merge");
+            then.status(200);
+        });
+
+        let tool = MergePr { client: mock_client(&server) };
+        let handle = tokio::spawn(async move {
+            tool.execute_with_queue_and_regate(
+                serde_json::json!({"repo": "myrepo", "pr": 89}),
+                Some(queue),
+                Some(regate_task),
+            )
+            .await
+        });
+
+        // Confirmed rebased head f00dface on base `base0000` (advanced +
+        // mergeable). resolve confirms it; the gate enters on it.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        get_a.delete();
+        let mut get_b = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/89");
+            then.status(200)
+                .json_body(pr_full(89, "feature/t", "main", "f00dface", "base0000", Some(true)));
+        });
+        entered.notified().await;
+
+        // main advances CLEANLY during the gate: SAME head, STILL mergeable
+        // (true), but the base SHA changed (base0000 -> base9999).
+        get_b.delete();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/89");
+            then.status(200)
+                .json_body(pr_full(89, "feature/t", "main", "f00dface", "base9999", Some(true)));
+        });
+        release.notify_one();
+
+        let result = handle.await.expect("merge task must not panic");
+
+        update_mock.assert();
+        merge_mock.assert_hits(0); // never merge onto an un-gated (advanced) base
+        let err = result.expect_err("a clean base advance during the gate must not merge");
+        assert!(matches!(err, ToolError::Execution(_)), "clean base advance → Execution, got {err:?}");
+        let msg = format!("{err}").to_lowercase();
+        assert!(msg.contains("base advanced"), "distinct base-advanced reason: {err}");
+        assert!(msg.contains("base moved"), "must cite the base SHA drift: {err}");
+        assert!(!store.is_locked("testorg/myrepo/main"), "slot released on the base-advanced bounce");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pcon06_unknown_mergeability_at_confirm_fails_closed() {
+        // FIX 2: at the pre-merge confirmation, `mergeable == None` (unknown /
+        // still computing) must fail CLOSED — never merge on unverified
+        // mergeability. Head and base unchanged, but mergeable flips to null
+        // during the gate → BaseAdvanced (not-confirmed-mergeable), no merge.
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let regate = Arc::new(SyncedReGate {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let regate_task = Arc::clone(&regate) as Arc<dyn merge_queue::ReGate>;
+
+        let server = MockServer::start();
+        let mut get_a = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/90");
+            then.status(200)
+                .json_body(pr_full(90, "feature/u", "main", "deadbeef", "base0000", Some(false)));
+        });
+        let update_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/90/update");
+            then.status(200);
+        });
+        let merge_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/90/merge");
+            then.status(200);
+        });
+
+        let tool = MergePr { client: mock_client(&server) };
+        let handle = tokio::spawn(async move {
+            tool.execute_with_queue_and_regate(
+                serde_json::json!({"repo": "myrepo", "pr": 90}),
+                Some(queue),
+                Some(regate_task),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        get_a.delete();
+        let mut get_b = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/90");
+            then.status(200)
+                .json_body(pr_full(90, "feature/u", "main", "f00dface", "base0000", Some(true)));
+        });
+        entered.notified().await;
+
+        // mergeability becomes UNKNOWN (null) during the gate — same head+base.
+        get_b.delete();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/90");
+            then.status(200)
+                .json_body(pr_full(90, "feature/u", "main", "f00dface", "base0000", None));
+        });
+        release.notify_one();
+
+        let result = handle.await.expect("merge task must not panic");
+
+        update_mock.assert();
+        merge_mock.assert_hits(0); // fail closed on unknown mergeability
+        let err = result.expect_err("unknown mergeability at confirm must not merge");
+        assert!(matches!(err, ToolError::Execution(_)), "unknown mergeable → Execution, got {err:?}");
+        assert!(
+            format!("{err}").to_lowercase().contains("not confirmed mergeable"),
+            "fail-closed-on-unknown reason: {err}"
+        );
+        assert!(!store.is_locked("testorg/myrepo/main"), "slot released on the fail-closed bounce");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pcon06_queue_none_never_enters_regate_even_with_regate_enabled() {
+        // FIX 5: with the queue None (Redis absent) there is NO slot/lease to
+        // bound the rebase→gate→merge op, so the re-gate must NOT activate even
+        // when a backend is supplied and BUILD_MERGE_REGATE_ENABLED is on. A
+        // stale-base PR takes the degrade-open direct-merge path (today's
+        // behavior) — no branch-update, no gate.
+        let regate = FakeReGate::new(merge_queue::GateVerdict::Green);
+
+        let server = MockServer::start();
+        let get_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/91");
+            then.status(200)
+                .json_body(stale_pr_sha(91, "feature/v", "main", "deadbeef"));
+        });
+        let update_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/91/update");
+            then.status(200);
+        });
+        let merge_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/91/merge");
+            then.status(200);
+        });
+
+        let tool = MergePr { client: mock_client(&server) };
+        let result = tool
+            .execute_with_queue_and_regate(
+                serde_json::json!({"repo": "myrepo", "pr": 91}),
+                None, // Redis absent — no slot/lease
+                Some(Arc::clone(&regate) as Arc<dyn merge_queue::ReGate>),
+            )
+            .await;
+
+        get_mock.assert_hits(1); // single fetch on the unqueued direct-merge path
+        update_mock.assert_hits(0); // never rebases
+        assert!(
+            regate.calls.lock().unwrap().is_empty(),
+            "the re-gate must never run without a real queue/slot"
+        );
+        merge_mock.assert(); // degrade-open direct merge (today's behavior)
+        assert!(result.is_ok(), "queue-none stale-base path must be the degrade-open merge: {result:?}");
     }
 
     // ── GMQ-05: gitea_merge_queue_status ────────────────────────────────
