@@ -42,6 +42,12 @@ pub(crate) mod capacity;
 // table a second time -- one source of truth for "which providers go
 // through the daemon vs. OpenRouter", not two.
 pub(crate) mod dispatch;
+// REVX-03..07,14: the dynamic per-provider review effort policy. `pub(crate)`
+// (not private) since `mod.rs::execute()` (this module) computes it once per
+// run and the review_daemon binary's tests reference `ALLOWED_CODEX_MODELS`
+// for its own closed-allowlist invariant -- one source of truth for the
+// tier/native-mapping tables, not two.
+pub(crate) mod effort_policy;
 pub(crate) mod free_pool;
 // `pub(crate)` (was module-private): CXEG-02's `cortex_scope`
 // (`crate::cortex::scope`) reuses `derive_changed_files` directly so it and
@@ -80,6 +86,12 @@ use crate::tool::{RustTool, ToolOutput};
 
 pub use aggregate::{aggregate, Finding, ProviderResult};
 pub use dispatch::ReviewConfig;
+// REVX-13: `claude-fable-5` is a REVIEW/capstone-only provider -- this
+// codebase's review tool never scaffolds, so the enforceable guard here is
+// this documented, greppable assertion helper (any future Terminus surface
+// that DOES dispatch implementer work can assert against it); the
+// authoritative enforcement is the build-pipeline/skill rule (REVX-15).
+pub use effort_policy::is_review_only_provider;
 pub use prompt::{build_docs_prompt, build_prompt, parse_findings, parse_verdict, Role, Structure};
 // CXEG-10: the calibration harness needs to name the CXEG-07 lens's result
 // types to read back what it would have flagged. Re-exported rather than
@@ -1056,6 +1068,43 @@ than failing the whole call."
             })
             .collect();
 
+        // REVX-03..07,14: compute the dynamic effort policy ONCE per run
+        // (base tier from diff signals + the prior-pass adaptive lever), then
+        // derive a PER-PROVIDER decision inside the dispatch loop below.
+        // `REVIEW_EFFORT_POLICY_ENABLED=0` (the master switch, REVX-06)
+        // short-circuits this to a no-op -- `run_tier`/`risk_class` are never
+        // consulted below and every dispatch keeps today's static behavior
+        // (routine/epic presets, REVCAP-01's fixed `"high"` intensive floor)
+        // byte-for-byte.
+        let effort_cfg = effort_policy::EffortPolicyConfig::from_env();
+        let effort_signals = effort_policy::DiffSignals::from_context(&context, &effort_cfg);
+        let (effort_run_tier, effort_hand_off, mut effort_reasons) = if effort_cfg.enabled {
+            let (base, base_reasons) = effort_policy::base_tier(&effort_signals, &effort_cfg);
+            let history = effort_policy::load_pass_history(&context).await;
+            let (tier, hist_reasons, hand_off) =
+                effort_policy::apply_pass_history(base, &history, &effort_cfg);
+            let mut reasons = base_reasons;
+            reasons.extend(hist_reasons);
+            (tier, hand_off, reasons)
+        } else {
+            (effort_policy::EffortTier::Medium, false, Vec::new())
+        };
+        if effort_policy::content_risk_hint(&context) {
+            effort_reasons.push("content: diff text contains secret-shaped literal(s)".to_string());
+        }
+        let token_budget_set =
+            context.get("token_budget").and_then(Value::as_f64).map(|b| b > 0.0).unwrap_or(false);
+        let caller_effort_override =
+            context.get("effort").and_then(Value::as_str).map(|s| s.to_string());
+        // Per-provider decisions, collected for the run output's `effort`
+        // block (REVX-14) regardless of whether the provider is daemon-backed
+        // (only daemon providers actually get `reasoning_effort`/`model`
+        // applied to their dispatch opts below; OpenRouter-routed providers'
+        // decisions are informational here -- REVX-10 wires their native
+        // `reasoning` object, out of this item's scope).
+        let mut effort_decisions: Vec<(String, effort_policy::EffortDecision)> =
+            Vec::with_capacity(providers.len());
+
         let mut set = tokio::task::JoinSet::new();
         // Tracks each spawned task's tokio::task::Id back to its (index,
         // provider name), so a task panic (JoinError) can still be attributed
@@ -1094,12 +1143,63 @@ than failing the whole call."
             // down (the common case, and every pre-PART-B call site) is
             // completely unaffected: `is_intensive_substitute` is `false` for
             // every provider, so this is a no-op there.
-            let opts = if role == Role::Reviewer && is_intensive_substitute(provider, now) {
+            let is_substitute = role == Role::Reviewer && is_intensive_substitute(provider, now);
+            let intensive_floor = if is_substitute { Some(effort_policy::EffortTier::High) } else { None };
+
+            // REVX-14: the per-provider effort decision -- computed for EVERY
+            // provider (so the run's `effort` block always names a reason for
+            // every seat), but only DAEMON providers (opus/codex/agy/fable)
+            // get it actually applied to their dispatch opts below.
+            let decision = if effort_cfg.enabled || is_substitute {
+                effort_policy::decide(
+                    provider,
+                    effort_run_tier,
+                    effort_signals.risk_class,
+                    token_budget_set,
+                    caller_effort_override.as_deref(),
+                    intensive_floor,
+                    &effort_cfg,
+                )
+            } else {
+                // REVIEW_EFFORT_POLICY_ENABLED=0: DYNAMIC tier/model
+                // SELECTION is off (this decision is a fixed, informational
+                // Medium/None placeholder, never applied to dispatch opts
+                // below). This is NOT the same as reverting REVX-08's codex
+                // model bump: `model: None` here means the daemon's own
+                // `build_command_with_model` falls back to its fixed
+                // `review_daemon/provider.rs::CODEX_MODEL` constant, which IS
+                // the REVX-08-upgraded default (`"gpt-5.6-sol"`) at a fixed
+                // default reasoning effort -- disabling the policy disables
+                // DYNAMIC per-provider tier/model selection, it does not roll
+                // codex back to gpt-5.5. (Contrast with the ENABLED path,
+                // where `codex_model_for_tier` selects sol/terra/luna
+                // dynamically and IS overridable per tier via
+                // `REVIEW_CODEX_MODEL_SOL`/`_TERRA`/`_LUNA`.)
+                effort_policy::EffortDecision {
+                    tier: effort_policy::EffortTier::Medium,
+                    reason: "effort policy disabled (REVIEW_EFFORT_POLICY_ENABLED=0): dynamic selection off, \
+                             codex still runs its fixed GPT-5.6 default effort/model (REVX-08)"
+                        .to_string(),
+                    native: None,
+                    model: None,
+                }
+            };
+
+            let opts = if is_substitute {
                 role = Role::IntensiveReviewer;
-                dispatch::DaemonOpts::intensive()
+                // REVCAP-01 PART B preserved exactly: `decision.tier` is
+                // already floored at `max(policy, High)` by `intensive_floor`
+                // above, so `decision.native` is never below the daemon's own
+                // pre-policy `INTENSIVE_REASONING_EFFORT` -- this generalizes
+                // (never regresses) the old fixed-`"high"` intensive() preset.
+                dispatch::DaemonOpts::intensive_with(decision.native.clone(), decision.model.clone())
+            } else if effort_cfg.enabled && dispatch::is_daemon_provider(provider) {
+                daemon_opts.clone().with_effort(decision.native.clone(), decision.model.clone())
             } else {
                 daemon_opts.clone()
             };
+            effort_decisions.push((provider.clone(), decision));
+
             let prompt_text = build_prompt(role, &criteria, &context);
             let cfg = cfg.clone();
             let provider = provider.clone();
@@ -1140,6 +1240,18 @@ than failing the whole call."
         let results: Vec<ProviderResult> = indexed.into_iter().map(|(_, r)| r).collect();
 
         let (aggregate_verdict, complete) = aggregate(structure, &results);
+
+        // REVX-04: record this pass's outcome (material-findings count +
+        // whether the verdict was REQUEST_CHANGES) for the NEXT re-review of
+        // the SAME MR/branch's prior-pass adaptive lever. Best-effort -- a
+        // Redis-absent/unreachable condition is a silent no-op (the lever
+        // just reads as "pass 1" again next time); never affects this call's
+        // own verdict. Skipped entirely when the policy is disabled, so a
+        // disabled policy also writes no state.
+        if effort_cfg.enabled {
+            let material_findings = dedup_across_providers(&results).len();
+            effort_policy::record_pass_outcome(&context, &aggregate_verdict, material_findings).await;
+        }
 
         // CXEG-07: Tier-C consistency/elegance lens. Runs strictly AFTER the
         // line above -- `aggregate_verdict`/`complete` are already fixed and
@@ -1220,6 +1332,30 @@ than failing the whole call."
         // `aggregate_verdict`/`complete` above.
         let escalation = finalize_escalation(escalation_decision, &results);
 
+        // REVX-14: the per-provider effort record -- WHY each pass ran at its
+        // tier, so a human reviewing the run's JSON output can see the
+        // policy's reasoning without cross-referencing logs. `enabled: false`
+        // means every decision below is the disabled-policy placeholder
+        // (static behavior; see the dispatch loop above).
+        let effort_block = json!({
+            "enabled": effort_cfg.enabled,
+            "run_tier": effort_run_tier,
+            "hand_off": effort_hand_off,
+            "reasons": effort_reasons,
+            "providers": effort_decisions
+                .iter()
+                .map(|(provider, d)| {
+                    json!({
+                        "provider": provider,
+                        "tier": d.tier,
+                        "native": d.native,
+                        "model": d.model,
+                        "reason": d.reason,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        });
+
         Ok(json!({
             "structure": args["structure"],
             "providers": results,
@@ -1229,6 +1365,7 @@ than failing the whole call."
             "scribe_docs": scribe_docs,
             "findings_recorded": findings_recorded,
             "escalation": escalation,
+            "effort": effort_block,
             "capacity_substitutions": capacity_substitutions,
             "consistency": {
                 "status": consistency_run.status,
