@@ -631,8 +631,13 @@ pub enum ProviderRole {
     Capstone,
     /// Cheap/free breadth tail: clamp down (breadth not depth).
     BreadthTail,
-    /// Everything else (mid-cost paid lenses, etc): run at the run tier,
-    /// capped at Medium unless the run itself is HIGH risk.
+    /// Everything else -- including any UNKNOWN/unrecognized provider name
+    /// not listed in either `capstone_providers` or `breadth_tail_providers`.
+    /// Safe default: a FIXED `Medium` tier that risk signals do NOT escalate
+    /// above (an unrecognized provider must never be trusted with an
+    /// escalated, more-expensive/more-privileged effort tier just because
+    /// the run happens to be HIGH risk -- see the REVX finding this guards
+    /// against).
     Mid,
 }
 
@@ -668,10 +673,13 @@ pub struct EffortDecision {
 /// - `token_budget_set` + `risk_class != High` biases `Mid`/`BreadthTail`
 ///   seats down one more step; a HIGH-risk run is never biased below its
 ///   policy tier.
-/// - `intensive_floor`, when `Some(EffortTier::High)` (REVCAP-01 PART B),
-///   floors the result at `max(policy, High)` -- preserved verbatim
-///   regardless of role/budget/override math (an override still wins, but
-///   the floor is recorded as an advisory reason either way).
+/// - `intensive_floor`, when `Some(EffortTier::High)` (REVCAP-01 PART B), is
+///   a SAFETY floor that ALWAYS holds: it is applied to the effective effort
+///   AFTER `caller_override` is resolved, i.e. `effective = max(resolved,
+///   floor)`. An override may still RAISE the effort above the floor, but it
+///   can never LOWER an intensive substitute below it -- the floor wins over
+///   a too-low override (this is what makes it a floor and not just a
+///   default).
 #[allow(clippy::too_many_arguments)]
 pub fn decide(
     provider: &str,
@@ -686,12 +694,23 @@ pub fn decide(
         match EffortTier::parse(raw) {
             Some(tier) => {
                 let mut reason = "caller override".to_string();
-                if let Some(floor) = intensive_floor {
+                // REVCAP-01 PART B safety floor: applied AFTER the override
+                // is resolved, so it can only ever RAISE the effective tier,
+                // never let a too-low override push an intensive substitute
+                // below the required floor.
+                let effective_tier = if let Some(floor) = intensive_floor {
                     if tier < floor {
-                        reason.push_str(" (intensive-substitute floor advisory: below floor, override still honored)");
+                        reason.push_str(&format!(
+                            " (intensive-substitute floor enforced: raised {tier:?} -> {floor:?})"
+                        ));
+                        tier.floor_at(floor)
+                    } else {
+                        tier
                     }
-                }
-                return finalize_decision(provider, tier, reason, cfg);
+                } else {
+                    tier
+                };
+                return finalize_decision(provider, effective_tier, reason, cfg);
             }
             None => {
                 // Falls through to policy computation with a note.
@@ -714,7 +733,9 @@ pub fn decide(
     let reason = match role {
         ProviderRole::Capstone => "capstone seat: runs at the full policy tier".to_string(),
         ProviderRole::BreadthTail => "breadth-tail seat: clamped down (breadth not depth)".to_string(),
-        ProviderRole::Mid => "mid-tier seat: policy tier, capped at Medium unless run is HIGH risk".to_string(),
+        ProviderRole::Mid => {
+            "unknown/mid-tier seat: safe default, capped at Medium (never escalated by risk)".to_string()
+        }
     };
     finalize_decision(provider, tier, reason, cfg)
 }
@@ -731,13 +752,11 @@ fn policy_tier_for_provider(
     let mut tier = match role {
         ProviderRole::Capstone => run_tier,
         ProviderRole::BreadthTail => run_tier.deescalate().cap_at(EffortTier::Medium),
-        ProviderRole::Mid => {
-            if risk_class == Some(RiskClass::High) {
-                run_tier
-            } else {
-                run_tier.cap_at(EffortTier::Medium)
-            }
-        }
+        // Safe default for an unknown/unrecognized provider (and any other
+        // "Mid" seat): a FIXED Medium tier, never escalated by risk_class.
+        // A HIGH-risk run must not push an unrecognized provider above its
+        // safe default -- only Capstone seats are trusted with that.
+        ProviderRole::Mid => run_tier.cap_at(EffortTier::Medium),
     };
 
     // Token-budget awareness: bias non-capstone seats down one more step on
@@ -1055,6 +1074,30 @@ mod tests {
     }
 
     #[test]
+    fn intensive_floor_wins_over_a_too_low_caller_override() {
+        // REVX finding: an intensive-substitute dispatch is a SAFETY floor
+        // that must always hold, even when the caller explicitly asked for a
+        // lower effort. `Low` here must NOT survive -- the floor overrides it.
+        let cfg = EffortPolicyConfig::default();
+        let d = decide("free", EffortTier::Low, None, false, Some("low"), Some(EffortTier::High), &cfg);
+        assert!(
+            d.tier >= EffortTier::High,
+            "intensive substitute with a Low caller override must still run at >= High: got {:?}",
+            d.tier
+        );
+        assert!(d.reason.contains("floor enforced"), "reason should note the floor was enforced: {}", d.reason);
+    }
+
+    #[test]
+    fn caller_override_can_still_raise_above_the_intensive_floor() {
+        // A caller override may RAISE effort above the floor -- only
+        // LOWERING below it is disallowed.
+        let cfg = EffortPolicyConfig::default();
+        let d = decide("free", EffortTier::Low, None, false, Some("xhigh"), Some(EffortTier::High), &cfg);
+        assert_eq!(d.tier, EffortTier::Xhigh);
+    }
+
+    #[test]
     fn fable_clamped_to_budget_cap_even_on_high_risk_run() {
         let cfg = EffortPolicyConfig::default();
         let d = decide("claude-fable-5", EffortTier::Xhigh, Some(RiskClass::High), false, None, None, &cfg);
@@ -1067,6 +1110,23 @@ mod tests {
         let cfg = EffortPolicyConfig::default();
         let d = decide("claude-fable-5", EffortTier::Low, None, false, Some("high"), None, &cfg);
         assert_eq!(d.tier, EffortTier::High, "explicit override must win over the Fable budget cap");
+    }
+
+    #[test]
+    fn unknown_provider_defaults_to_fixed_medium_not_escalated_by_risk() {
+        // REVX finding: an unrecognized provider must never be pushed above
+        // its safe Medium default by a HIGH-risk run's escalation.
+        let cfg = EffortPolicyConfig::default();
+        let d = decide(
+            "totally-unrecognized-provider",
+            EffortTier::Xhigh,
+            Some(RiskClass::High),
+            false,
+            None,
+            None,
+            &cfg,
+        );
+        assert_eq!(d.tier, EffortTier::Medium, "unknown provider must clamp to a fixed Medium: got {:?}", d.tier);
     }
 
     #[test]

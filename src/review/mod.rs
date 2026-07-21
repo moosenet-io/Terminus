@@ -1161,9 +1161,25 @@ than failing the whole call."
                     &effort_cfg,
                 )
             } else {
+                // REVIEW_EFFORT_POLICY_ENABLED=0: DYNAMIC tier/model
+                // SELECTION is off (this decision is a fixed, informational
+                // Medium/None placeholder, never applied to dispatch opts
+                // below). This is NOT the same as reverting REVX-08's codex
+                // model bump: `model: None` here means the daemon's own
+                // `build_command_with_model` falls back to its fixed
+                // `review_daemon/provider.rs::CODEX_MODEL` constant, which IS
+                // the REVX-08-upgraded default (`"gpt-5.6-sol"`) at a fixed
+                // default reasoning effort -- disabling the policy disables
+                // DYNAMIC per-provider tier/model selection, it does not roll
+                // codex back to gpt-5.5. (Contrast with the ENABLED path,
+                // where `codex_model_for_tier` selects sol/terra/luna
+                // dynamically and IS overridable per tier via
+                // `REVIEW_CODEX_MODEL_SOL`/`_TERRA`/`_LUNA`.)
                 effort_policy::EffortDecision {
                     tier: effort_policy::EffortTier::Medium,
-                    reason: "effort policy disabled (REVIEW_EFFORT_POLICY_ENABLED=0)".to_string(),
+                    reason: "effort policy disabled (REVIEW_EFFORT_POLICY_ENABLED=0): dynamic selection off, \
+                             codex still runs its fixed GPT-5.6 default effort/model (REVX-08)"
+                        .to_string(),
                     native: None,
                     model: None,
                 }
