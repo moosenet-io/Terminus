@@ -203,6 +203,17 @@ pub enum RegateBounce {
     /// commit — the queue bounces "retry" instead (the merge is also bound to
     /// the gated SHA server-side, so this is the belt to that suspenders).
     HeadMoved(String),
+    /// PCON-06 (FIX B): the base advanced between the re-gate and the merge —
+    /// the gated head is no longer mergeable against the CURRENT base, so
+    /// merging it would land a head that was tested against a now-stale base.
+    /// Bounce "retry" rather than merge against an un-gated base.
+    BaseAdvanced(String),
+    /// PCON-06 (FIX B): the merge-queue lease (`GITEA_MERGE_QUEUE_LOCK_TTL_SECS`)
+    /// is too short to cover the whole rebase→visibility→gate→merge span, so the
+    /// slot could expire mid-op and another merge advance `main` between this
+    /// gate and merge. Refused up front (a config guard) rather than risk
+    /// merging a gated head onto an un-gated base — raise the lock TTL.
+    LeaseTooShort(String),
 }
 
 impl std::fmt::Display for RegateBounce {
@@ -224,13 +235,24 @@ impl std::fmt::Display for RegateBounce {
             ),
             RegateBounce::RebaseNotVisible(d) => write!(
                 f,
-                "merge queue: rebased head did not become visible ({d}) — not gated or merged (a \
-                 stale/incoherent forge read); retry"
+                "merge queue: no confirmed rebased head (advanced past the pre-update head AND \
+                 mergeable against current base) became visible ({d}) — not gated or merged; retry"
             ),
             RegateBounce::HeadMoved(d) => write!(
                 f,
                 "merge queue: the PR head moved after the re-gate ({d}) — the gated commit is no \
                  longer the branch head, so nothing was merged; retry"
+            ),
+            RegateBounce::BaseAdvanced(d) => write!(
+                f,
+                "merge queue: the base advanced after the re-gate ({d}) — the gated head is no \
+                 longer mergeable against current base, so nothing was merged; retry"
+            ),
+            RegateBounce::LeaseTooShort(d) => write!(
+                f,
+                "merge queue: lock lease too short to cover an in-slot re-gate ({d}) — refusing to \
+                 rebase+gate without a lease that spans the whole op; raise \
+                 GITEA_MERGE_QUEUE_LOCK_TTL_SECS"
             ),
         }
     }
@@ -250,7 +272,9 @@ impl From<RegateBounce> for crate::error::ToolError {
             RegateBounce::RedGate(_)
             | RegateBounce::GateTimeout(_)
             | RegateBounce::RebaseNotVisible(_)
-            | RegateBounce::HeadMoved(_) => crate::error::ToolError::Execution(b.to_string()),
+            | RegateBounce::HeadMoved(_)
+            | RegateBounce::BaseAdvanced(_)
+            | RegateBounce::LeaseTooShort(_) => crate::error::ToolError::Execution(b.to_string()),
         }
     }
 }

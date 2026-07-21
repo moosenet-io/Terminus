@@ -785,11 +785,17 @@ impl GiteaClient {
     /// door, S9: the queue never shells out to git or hits a raw HTTP endpoint;
     /// it drives THIS client, exactly like the merge POST does).
     ///
-    /// `style` is Gitea's update strategy: `merge` (create a merge commit of
-    /// the base onto the head — the safe default) or `rebase` (replay the
-    /// branch on top of the base). On success the PR head advances to a new
-    /// SHA; the caller re-fetches the PR ([`GiteaClient::fetch_pr`]) to resolve
-    /// that rebased head before re-gating and merging it.
+    /// `style` is Gitea's update strategy; the PCON-06 re-gate path only ever
+    /// passes `rebase` (replay the branch on top of the base — see FIX C).
+    ///
+    /// Returns `Ok(Some(sha))` when the forge's response carries the resulting
+    /// head SHA (which the caller can then treat as AUTHORITATIVE — it is the
+    /// rebase result, not something inferred from a later, race-prone fetch),
+    /// or `Ok(None)` when it does not. **Gitea's update-branch endpoint returns
+    /// an empty `200` with no body**, so in practice this is `None` for Gitea;
+    /// the field exists so a forge that DOES return the SHA (or a future Gitea)
+    /// is used authoritatively, and so the caller's guarantee degrades
+    /// explicitly (mergeable-verified fetch) rather than silently.
     ///
     /// Distinguishes a genuine [`UpdateBranchError::Conflict`] (Gitea rejects
     /// the update because the branch cannot be brought up to date without a
@@ -804,7 +810,7 @@ impl GiteaClient {
         repo: &str,
         pr: u64,
         style: &str,
-    ) -> Result<(), UpdateBranchError> {
+    ) -> Result<Option<String>, UpdateBranchError> {
         // `style` is forwarded as a query param, exactly as Gitea's
         // `Update a pull request's branch` endpoint expects.
         let endpoint = format!("/repos/{owner}/{repo}/pulls/{pr}/update?style={style}");
@@ -825,7 +831,18 @@ impl GiteaClient {
 
         let status = resp.status();
         if status.is_success() {
-            return Ok(());
+            // Gitea returns an empty body; a forge that returns the resulting
+            // SHA would carry it as `sha`/`head_sha`/`merge_commit_sha` — parse
+            // defensively and hand it back as authoritative when present.
+            let body_text = resp.text().await.unwrap_or_default();
+            let resulting_sha = serde_json::from_str::<Value>(&body_text)
+                .ok()
+                .and_then(|v| {
+                    ["sha", "head_sha", "merge_commit_sha", "commit_sha"]
+                        .iter()
+                        .find_map(|k| v.get(*k).and_then(Value::as_str).map(str::to_string))
+                });
+            return Ok(resulting_sha);
         }
         // A `409 Conflict` (or Gitea's `422 Unprocessable Entity` for a branch
         // that cannot be updated cleanly) means the branch genuinely conflicts
@@ -842,37 +859,45 @@ impl GiteaClient {
         ))))
     }
 
-    /// PCON-06 (FIX 2): after a successful [`GiteaClient::update_pull_branch`],
-    /// resolve the CONFIRMED post-rebase PR — the one whose head SHA has
-    /// actually ADVANCED past `prev_head_sha` (the pre-update head). A forge
-    /// branch-update can be async / the read not immediately coherent, so a
-    /// single `fetch_pr` right after the update may still return the OLD,
-    /// un-rebased head; gating THAT would test (and then merge) code that never
-    /// saw its landing state. This read-until-visible poll returns the PR only
-    /// once its head differs from `prev_head_sha`.
+    /// PCON-06 (FIX 2 + FIX A): after a successful
+    /// [`GiteaClient::update_pull_branch`], resolve the CONFIRMED post-rebase
+    /// PR — the one whose head has both (1) ADVANCED past `prev_head_sha` (the
+    /// pre-update head) AND (2) is `mergeable == Some(true)` against the CURRENT
+    /// base. Requiring BOTH is what makes this authoritative rather than
+    /// merely "some head change":
     ///
-    /// - `Ok(Some(pr))` — an advanced head became visible; gate/merge THIS one.
-    /// - `Ok(None)` — the head never advanced within the (capped) budget; the
-    ///   caller bounces [`merge_queue::RegateBounce::RebaseNotVisible`] rather
-    ///   than gating a possibly-stale head (a successful update on a
-    ///   NotMergeable PR must produce a new head — a persistent non-advance
-    ///   means an incoherent/lagging read, so retry is the safe outcome).
+    /// - A forge branch-update can be async / not immediately coherent, so a
+    ///   single fetch may still show the OLD head — the advance check waits for
+    ///   the update to land (FIX 2).
+    /// - A concurrent AUTHOR PUSH during the window ALSO changes the head, but
+    ///   an un-rebased push is NOT mergeable against the current base — the
+    ///   `mergeable == Some(true)` requirement rejects it, so the queue never
+    ///   gates/merges an un-rebased head (FIX A). (A push that IS already on
+    ///   top of current base is, by definition, up-to-date with the landing
+    ///   state; gating+SHA-bound-merging THAT is still landing-state-safe.)
+    ///
+    /// If `hint_sha` is `Some` (the forge returned the resulting SHA
+    /// authoritatively), the head must equal it AND be mergeable; a mismatch
+    /// means a concurrent push landed over the rebase, so keep waiting for the
+    /// authoritative head to be current.
+    ///
+    /// - `Ok(Some(pr))` — a confirmed, mergeable, advanced head — gate/merge it.
+    /// - `Ok(None)` — none became visible within the (capped) budget; the caller
+    ///   bounces [`merge_queue::RegateBounce::RebaseNotVisible`] rather than
+    ///   gating an unverified head.
     /// - `Err(_)` — a real fetch/transport error, propagated.
-    ///
-    /// The visibility wait is capped at `min(budget, VISIBLE_CAP)` so it never
-    /// consumes the whole slot budget just waiting for a read to settle.
-    pub(crate) async fn resolve_advanced_head(
+    pub(crate) async fn resolve_confirmed_rebased_head(
         &self,
         owner: &str,
         repo: &str,
         pr: u64,
         prev_head_sha: &str,
+        hint_sha: Option<&str>,
         budget: std::time::Duration,
     ) -> Result<Option<GiteaPullRequest>, ToolError> {
-        /// Cap on how long to wait for the rebased head to become visible —
-        /// well under a realistic slot budget, since a coherent read returns
-        /// the advanced head on the first poll and only an async lag needs any
-        /// wait at all.
+        /// Cap on how long to wait for the confirmed rebased head to become
+        /// visible — well under a realistic slot budget, since a coherent read
+        /// returns it on the first poll and only an async lag needs any wait.
         const VISIBLE_CAP: std::time::Duration = std::time::Duration::from_secs(15);
         const POLL_MIN_MS: u64 = 25;
         const POLL_MAX_MS: u64 = 250;
@@ -882,7 +907,19 @@ impl GiteaClient {
         let mut backoff_ms = POLL_MIN_MS;
         loop {
             let pr_info = self.fetch_pr(owner, repo, pr).await?;
-            if pr_info.head.sha != prev_head_sha {
+            // The head must be mergeable against the CURRENT base — this is the
+            // discriminator that a concurrent un-rebased push cannot satisfy.
+            let mergeable_now = pr_info.mergeable == Some(true);
+            let confirmed = match hint_sha {
+                // Authoritative SHA from the forge: require the head to be
+                // exactly it (and mergeable). A different head means a push
+                // landed over the rebase — not yet safe.
+                Some(h) => pr_info.head.sha == h && mergeable_now,
+                // No authoritative SHA: require the head to have advanced past
+                // the pre-update head AND be mergeable against current base.
+                None => pr_info.head.sha != prev_head_sha && mergeable_now,
+            };
+            if confirmed {
                 return Ok(Some(pr_info));
             }
             if tokio::time::Instant::now() >= deadline {
@@ -1980,14 +2017,26 @@ impl MergePr {
             .as_str()
             .map(str::to_string)
             .unwrap_or_else(|| repo.to_lowercase());
-        // PCON-06 (FIX 3): the forge branch-update strategy defaults to
-        // `rebase` — PCON-06 specifies REBASE semantics (replay the branch on
-        // top of current base), so the gated/merged commit is the branch's work
-        // atop the exact landing state. A rebase conflict surfaces as the
-        // 409/422 the conflict discriminator already handles. The knob remains
-        // overridable (`merge` for a merge-commit update) but rebase is the
-        // sanctioned default.
-        let regate_style = args["regate_style"].as_str().unwrap_or("rebase").to_string();
+        // PCON-06 (FIX 3 + FIX C): the forge branch-update strategy is
+        // ALWAYS `rebase` on the re-gate path — PCON-06 specifies REBASE
+        // semantics (replay the branch on top of current base), so the
+        // gated/merged commit is the branch's work atop the exact landing
+        // state, and a rebase conflict surfaces as the 409/422 the conflict
+        // discriminator handles. A `merge`-commit update would weaken that
+        // invariant, so it is NOT permitted: a caller passing anything other
+        // than `rebase` is hard-rejected rather than silently downgrading the
+        // guarantee.
+        const REGATE_STYLE: &str = "rebase";
+        if let Some(requested) = args["regate_style"].as_str() {
+            if requested != REGATE_STYLE {
+                return Err(ToolError::InvalidArgument(format!(
+                    "regate_style must be '{REGATE_STYLE}' on the merge-queue re-gate path \
+                     (a merge-commit update would weaken the exact-landing-state invariant); \
+                     got '{requested}'"
+                )));
+            }
+        }
+        let regate_style = REGATE_STYLE.to_string();
 
         let cfg = MergeQueueConfig::from_env();
         // `cfg.enabled` is the operator-controlled kill switch (GMQ-02):
@@ -2062,19 +2111,46 @@ impl MergePr {
                                             MergeQueueError::NotMergeable,
                                         ));
                                     };
+
+                                    // (FIX B) The slot LEASE must cover the whole
+                                    // rebase→visibility→gate→merge span, or the
+                                    // slot could expire mid-op and another merge
+                                    // advance `main` between this gate and merge
+                                    // (merging a gated head onto an un-gated
+                                    // base). Refuse up front unless the lease
+                                    // comfortably exceeds the op budget, and BOUND
+                                    // the op to `lease - margin` so it can never
+                                    // outrun the lease. `LEASE_MARGIN_SECS` covers
+                                    // the visibility poll + merge POST beyond the
+                                    // gate itself.
+                                    const LEASE_MARGIN_SECS: u64 = 30;
+                                    if cfg.lock_ttl_secs <= LEASE_MARGIN_SECS {
+                                        return Err(ToolError::from(
+                                            merge_queue::RegateBounce::LeaseTooShort(format!(
+                                                "lock_ttl={}s <= margin {}s",
+                                                cfg.lock_ttl_secs, LEASE_MARGIN_SECS
+                                            )),
+                                        ));
+                                    }
+                                    let op_secs = (cfg.lock_ttl_secs - LEASE_MARGIN_SECS)
+                                        .min(cfg.max_wait_secs.max(1));
+                                    let op_deadline = tokio::time::Instant::now()
+                                        + std::time::Duration::from_secs(op_secs);
+
                                     // Capture the PRE-update (stale) head so we
                                     // can later confirm the branch actually
                                     // advanced past it (FIX 2).
                                     let pre_update_head = fresh_pr.head.sha.clone();
-                                    let budget =
-                                        std::time::Duration::from_secs(cfg.max_wait_secs);
 
                                     // (a) Rebase: replay the branch on top of
                                     // current base via the sanctioned forge path
                                     // (single door, S9). A clean update means it
                                     // was a stale base; a 409/422 means a genuine
                                     // conflict — the two are bounced DIFFERENTLY.
-                                    match client
+                                    // `hint_sha` is the forge's authoritative
+                                    // resulting SHA when it returns one (Gitea
+                                    // does not — see `update_pull_branch`).
+                                    let hint_sha = match client
                                         .update_pull_branch(
                                             owner,
                                             repo,
@@ -2097,21 +2173,28 @@ impl MergePr {
                                                 MergeQueueError::NotMergeable,
                                             ));
                                         }
-                                        Ok(()) => {}
-                                    }
+                                        Ok(h) => h,
+                                    };
 
-                                    // (b) FIX 2: resolve the CONFIRMED
-                                    // post-rebase head — read-until the head has
-                                    // actually advanced past `pre_update_head`,
-                                    // so we never gate a stale/un-rebased head
-                                    // from an async/incoherent forge read.
+                                    // (b) FIX 2 + FIX A: resolve the CONFIRMED
+                                    // post-rebase head — one that has advanced
+                                    // past `pre_update_head` (or equals the
+                                    // forge's authoritative `hint_sha`) AND is
+                                    // mergeable against the CURRENT base. The
+                                    // mergeable requirement rejects a concurrent
+                                    // un-rebased author push that merely changed
+                                    // the head, so we never gate/merge an
+                                    // unverified head.
+                                    let visibility_budget = op_deadline
+                                        .saturating_duration_since(tokio::time::Instant::now());
                                     let rebased = match client
-                                        .resolve_advanced_head(
+                                        .resolve_confirmed_rebased_head(
                                             owner,
                                             repo,
                                             pr_num,
                                             &pre_update_head,
-                                            budget,
+                                            hint_sha.as_deref(),
+                                            visibility_budget,
                                         )
                                         .await?
                                     {
@@ -2120,8 +2203,8 @@ impl MergePr {
                                             return Err(ToolError::from(
                                                 merge_queue::RegateBounce::RebaseNotVisible(
                                                     format!(
-                                                        "PR #{pr_num} head still {pre_update_head} \
-                                                         after update"
+                                                        "PR #{pr_num}: no advanced+mergeable head \
+                                                         after update (pre {pre_update_head})"
                                                     ),
                                                 ),
                                             ));
@@ -2130,22 +2213,28 @@ impl MergePr {
                                     let gated_sha = rebased.head.sha.clone();
 
                                     // (c) Fire a FRESH gate on the confirmed
-                                    // rebased head, bounded by the slot budget.
-                                    match rg.gate(&regate_module, &gated_sha, budget).await {
+                                    // rebased head, bounded by the REMAINING op
+                                    // budget (so gate+merge stay within the
+                                    // lease — FIX B).
+                                    let gate_budget = op_deadline
+                                        .saturating_duration_since(tokio::time::Instant::now());
+                                    match rg.gate(&regate_module, &gated_sha, gate_budget).await {
                                         merge_queue::GateVerdict::Green => {
-                                            // (d) FIX 1: bind the merge to the
-                                            // EXACT gated commit. Re-fetch the
-                                            // head immediately before the POST
-                                            // and require it still equals the
-                                            // gated SHA — a push during the gate
-                                            // would otherwise land an UNTESTED
-                                            // head. On a mismatch, do NOT merge:
-                                            // bounce `HeadMoved` (retry). The
-                                            // merge POST ALSO carries the gated
-                                            // SHA as `head_commit_id`, so Gitea
-                                            // rejects server-side even if the
-                                            // head moves between this check and
-                                            // the POST — belt and suspenders.
+                                            // (d) FIX 1 + FIX B: bind the merge to
+                                            // the EXACT gated commit. Re-fetch the
+                                            // head immediately before the POST and
+                                            // require it STILL equals the gated
+                                            // SHA (a push during the gate → land
+                                            // an UNTESTED head → bounce HeadMoved)
+                                            // AND is still mergeable against the
+                                            // current base (the base advanced
+                                            // during the gate → the gated head is
+                                            // no longer tested against the landing
+                                            // state → bounce BaseAdvanced). The
+                                            // merge POST ALSO carries the gated SHA
+                                            // as `head_commit_id`, so Gitea rejects
+                                            // server-side even on a race between
+                                            // this check and the POST.
                                             let confirm =
                                                 client.fetch_pr(owner, repo, pr_num).await?;
                                             if confirm.head.sha != gated_sha {
@@ -2154,6 +2243,16 @@ impl MergePr {
                                                         "gated {gated_sha}, now {}",
                                                         confirm.head.sha
                                                     )),
+                                                ));
+                                            }
+                                            if confirm.mergeable == Some(false) {
+                                                return Err(ToolError::from(
+                                                    merge_queue::RegateBounce::BaseAdvanced(
+                                                        format!(
+                                                            "gated {gated_sha} no longer mergeable \
+                                                             against current base"
+                                                        ),
+                                                    ),
                                                 ));
                                             }
                                             let outcome = client
@@ -2181,8 +2280,7 @@ impl MergePr {
                                         merge_queue::GateVerdict::TimedOut => {
                                             Err(ToolError::from(
                                                 merge_queue::RegateBounce::GateTimeout(format!(
-                                                    "rebased head {gated_sha}, budget {}s",
-                                                    cfg.max_wait_secs
+                                                    "rebased head {gated_sha}, op budget {op_secs}s"
                                                 )),
                                             ))
                                         }
@@ -6203,10 +6301,21 @@ mod tests {
         b
     }
 
+    /// The CONFIRMED rebased head fixture: an EXPLICIT head SHA that is
+    /// `mergeable:true` against the current base — what
+    /// `resolve_confirmed_rebased_head` requires before gating (advanced AND
+    /// mergeable). A concurrent un-rebased push, by contrast, uses
+    /// `stale_pr_sha` (mergeable:false) so the resolver rejects it.
+    fn rebased_pr_sha(pr: u64, head_ref: &str, base: &str, head_sha: &str) -> Value {
+        let mut b = sample_pr_json_guard(pr, head_ref, base, Some(true), false);
+        b["head"]["sha"] = serde_json::json!(head_sha);
+        b
+    }
+
     /// Simulate the forge's rebase becoming visible: delete the current
-    /// GET-pull mock and install one whose head SHA is `new_sha` (the confirmed
-    /// post-rebase head). Mirrors the mid-flight mock swap the GMQ-04
-    /// guard-reflects test uses.
+    /// GET-pull mock and install one whose head SHA is `new_sha` and which is
+    /// `mergeable:true` (the confirmed post-rebase head). Mirrors the mid-flight
+    /// mock swap the GMQ-04 guard-reflects test uses.
     fn advance_head<'a>(
         server: &'a MockServer,
         mut old: httpmock::Mock<'a>,
@@ -6218,7 +6327,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(GET)
                 .path(format!("/api/v1/repos/testorg/myrepo/pulls/{pr}"));
-            then.status(200).json_body(stale_pr_sha(pr, head_ref, "main", new_sha));
+            then.status(200).json_body(rebased_pr_sha(pr, head_ref, "main", new_sha));
         });
     }
 
@@ -6757,7 +6866,7 @@ mod tests {
         let err = result.expect_err("a never-visible rebased head must not merge");
         assert!(matches!(err, ToolError::Execution(_)), "not-visible → Execution, got {err:?}");
         assert!(
-            format!("{err}").to_lowercase().contains("did not become visible"),
+            format!("{err}").to_lowercase().contains("no confirmed rebased head"),
             "distinct not-visible reason: {err}"
         );
         assert!(!store.is_locked("testorg/myrepo/main"), "slot released on the not-visible bounce");
@@ -6814,7 +6923,7 @@ mod tests {
         get_a.delete();
         let mut get_b = server.mock(|when, then| {
             when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/84");
-            then.status(200).json_body(stale_pr_sha(84, "feature/q", "main", "f00dface"));
+            then.status(200).json_body(rebased_pr_sha(84, "feature/q", "main", "f00dface"));
         });
         entered.notified().await; // the gate is now running on f00dface
 
@@ -6838,6 +6947,231 @@ mod tests {
             "distinct head-moved reason: {err}"
         );
         assert!(!store.is_locked("testorg/myrepo/main"), "slot released on the head-moved bounce");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pcon06_concurrent_author_push_is_not_gated_only_the_mergeable_rebase_head_is() {
+        // FIX A (the central one): during the update/visibility window a
+        // concurrent AUTHOR PUSH also changes the head, but an un-rebased push
+        // is NOT mergeable against current base. The queue must reject it and
+        // gate ONLY the confirmed advanced-AND-mergeable rebase result — never
+        // the push. Window sequence: stale `deadbeef` → author push `pushpush`
+        // (advanced but mergeable:false) → rebase result `f00dface`
+        // (advanced + mergeable:true).
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+        let regate = FakeReGate::new(merge_queue::GateVerdict::Green);
+        let regate_task = Arc::clone(&regate) as Arc<dyn merge_queue::ReGate>;
+
+        let server = MockServer::start();
+        let mut get_stale = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/85");
+            then.status(200).json_body(stale_pr_sha(85, "feature/push", "main", "deadbeef"));
+        });
+        let update_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/85/update");
+            then.status(200);
+        });
+        let merge_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/repos/testorg/myrepo/pulls/85/merge")
+                .body_contains("f00dface");
+            then.status(200);
+        });
+
+        let tool = MergePr { client: mock_client(&server) };
+        let handle = tokio::spawn(async move {
+            tool.execute_with_queue_and_regate(
+                serde_json::json!({"repo": "myrepo", "pr": 85}),
+                Some(queue),
+                Some(regate_task),
+            )
+            .await
+        });
+        // A concurrent author push appears first (advanced head, NOT mergeable).
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        get_stale.delete();
+        let mut get_push = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/85");
+            then.status(200).json_body(stale_pr_sha(85, "feature/push", "main", "pushpush"));
+        });
+        // Then the real rebase result becomes visible (advanced + mergeable).
+        tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+        get_push.delete();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/85");
+            then.status(200).json_body(rebased_pr_sha(85, "feature/push", "main", "f00dface"));
+        });
+
+        let result = handle.await.expect("merge task must not panic");
+
+        update_mock.assert();
+        merge_mock.assert();
+        // The gate ran ONLY on the mergeable rebase head, never the push.
+        let calls = regate.calls.lock().unwrap().clone();
+        assert_eq!(calls, vec![("myrepo".to_string(), "f00dface".to_string())]);
+        assert!(
+            !calls.iter().any(|(_, s)| s == "pushpush" || s == "deadbeef"),
+            "an un-rebased push (or the stale head) must never be gated: {calls:?}"
+        );
+        assert_eq!(
+            result.expect("only the confirmed rebase head must merge"),
+            "Pull request #85 merged into main in testorg/myrepo."
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pcon06_lease_too_short_refuses_the_regate_up_front() {
+        // FIX B: if the merge-queue lease cannot cover the whole
+        // rebase→gate→merge span, the queue must refuse the re-gate up front
+        // (rather than risk the slot expiring mid-op and `main` advancing
+        // between gate and merge). No branch-update, no gate, no merge.
+        let ttl_backup = std::env::var("GITEA_MERGE_QUEUE_LOCK_TTL_SECS").ok();
+        std::env::set_var("GITEA_MERGE_QUEUE_LOCK_TTL_SECS", "10"); // <= 30s margin
+
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+        let regate = FakeReGate::new(merge_queue::GateVerdict::Green);
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/87");
+            then.status(200).json_body(stale_pr_sha(87, "feature/s", "main", "deadbeef"));
+        });
+        let update_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/87/update");
+            then.status(200);
+        });
+        let merge_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/87/merge");
+            then.status(200);
+        });
+
+        let tool = MergePr { client: mock_client(&server) };
+        let result = tool
+            .execute_with_queue_and_regate(
+                serde_json::json!({"repo": "myrepo", "pr": 87}),
+                Some(queue),
+                Some(Arc::clone(&regate) as Arc<dyn merge_queue::ReGate>),
+            )
+            .await;
+
+        if let Some(v) = ttl_backup {
+            std::env::set_var("GITEA_MERGE_QUEUE_LOCK_TTL_SECS", v);
+        } else {
+            std::env::remove_var("GITEA_MERGE_QUEUE_LOCK_TTL_SECS");
+        }
+
+        update_mock.assert_hits(0);
+        merge_mock.assert_hits(0);
+        assert!(regate.calls.lock().unwrap().is_empty(), "a too-short lease must never rebase/gate");
+        let err = result.expect_err("a too-short lease must not re-gate");
+        assert!(matches!(err, ToolError::Execution(_)), "lease too short → Execution, got {err:?}");
+        assert!(
+            format!("{err}").to_lowercase().contains("lease too short"),
+            "distinct lease-too-short reason: {err}"
+        );
+        assert!(!store.is_locked("testorg/myrepo/main"), "slot released on the lease guard");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pcon06_base_advances_during_gate_bounces_base_advanced() {
+        // FIX B: the base advances WHILE the gate runs — the gated head is still
+        // the branch head (head unchanged) but is no longer mergeable against
+        // the now-advanced base. The queue must NOT merge a gated head onto an
+        // un-gated base: it bounces `BaseAdvanced`. A synchronizing gate lets
+        // the test flip mergeability mid-gate deterministically.
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let regate = Arc::new(SyncedReGate {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let regate_task = Arc::clone(&regate) as Arc<dyn merge_queue::ReGate>;
+
+        let server = MockServer::start();
+        let mut get_a = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/86");
+            then.status(200).json_body(stale_pr_sha(86, "feature/r", "main", "deadbeef"));
+        });
+        let update_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/86/update");
+            then.status(200);
+        });
+        let merge_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/86/merge");
+            then.status(200);
+        });
+
+        let tool = MergePr { client: mock_client(&server) };
+        let handle = tokio::spawn(async move {
+            tool.execute_with_queue_and_regate(
+                serde_json::json!({"repo": "myrepo", "pr": 86}),
+                Some(queue),
+                Some(regate_task),
+            )
+            .await
+        });
+
+        // Confirmed rebased head f00dface (advanced + mergeable) — resolve
+        // confirms it and the gate enters on it.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        get_a.delete();
+        let mut get_b = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/86");
+            then.status(200).json_body(rebased_pr_sha(86, "feature/r", "main", "f00dface"));
+        });
+        entered.notified().await; // gate running on f00dface
+
+        // The base advances during the gate: SAME head, but now mergeable:false.
+        get_b.delete();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/86");
+            then.status(200).json_body(stale_pr_sha(86, "feature/r", "main", "f00dface"));
+        });
+        release.notify_one();
+
+        let result = handle.await.expect("merge task must not panic");
+
+        update_mock.assert();
+        merge_mock.assert_hits(0); // the gated head is not merged onto an un-gated base
+        assert_eq!(regate.calls.lock().unwrap().clone(), vec!["f00dface".to_string()]);
+        let err = result.expect_err("a base that advanced during the gate must not merge");
+        assert!(matches!(err, ToolError::Execution(_)), "base advanced → Execution, got {err:?}");
+        assert!(
+            format!("{err}").to_lowercase().contains("base advanced"),
+            "distinct base-advanced reason: {err}"
+        );
+        assert!(!store.is_locked("testorg/myrepo/main"), "slot released on the base-advanced bounce");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pcon06_regate_style_merge_override_is_rejected() {
+        // FIX C: a caller must not be able to weaken the rebase invariant by
+        // requesting a merge-commit branch-update on the re-gate path.
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+        let regate = FakeReGate::new(merge_queue::GateVerdict::Green);
+
+        let server = MockServer::start();
+        let tool = MergePr { client: mock_client(&server) };
+        let err = tool
+            .execute_with_queue_and_regate(
+                serde_json::json!({"repo": "myrepo", "pr": 88, "regate_style": "merge"}),
+                Some(queue),
+                Some(Arc::clone(&regate) as Arc<dyn merge_queue::ReGate>),
+            )
+            .await
+            .expect_err("a merge-commit regate_style override must be rejected");
+        assert!(matches!(err, ToolError::InvalidArgument(_)), "override → InvalidArgument, got {err:?}");
+        assert!(format!("{err}").to_lowercase().contains("must be 'rebase'"));
     }
 
     // ── GMQ-05: gitea_merge_queue_status ────────────────────────────────
