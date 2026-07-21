@@ -1165,10 +1165,13 @@ fn resolve_scratch_root(scratch: Option<String>, local: Option<String>) -> Resul
 /// FIX (PCON-10): fail CLOSED when a configured scratch root resolves to a small
 /// in-RAM mount — `validate_target_dir` only checks NFS-dataset non-containment,
 /// so a legacy `BUILD_LOCAL_TARGET_DIR=/tmp/...` (tmpfs) would otherwise pass and
-/// re-introduce the tmpfs+disk exhaustion this closes. Two layers: a LEXICAL
-/// guard against the well-known tmpfs mount roots (works even when the dir does
-/// not yet exist, so a test/first-run is deterministic), plus a `statfs` f_type
-/// check that rejects an actual tmpfs/ramfs when the path exists.
+/// re-introduce the tmpfs+disk exhaustion this closes. Two layers:
+///   1. a LEXICAL fast-path against the well-known tmpfs mount roots (works even
+///      when the dir does not yet exist);
+///   2. a `statfs` f_type check on the NEAREST EXISTING ANCESTOR of the root — so
+///      a not-yet-created dir under a CUSTOM tmpfs mount (e.g.
+///      `/mnt/ram/scratch`, which the lexical list can't know about) is still
+///      rejected by the filesystem type of the mount it would be created on.
 fn reject_tmpfs_scratch(root: &std::path::Path) -> Result<(), ToolError> {
     for bad in ["/tmp", "/dev/shm", "/run"] {
         if scope::is_within(root, std::path::Path::new(bad)) {
@@ -1180,14 +1183,38 @@ fn reject_tmpfs_scratch(root: &std::path::Path) -> Result<(), ToolError> {
             )));
         }
     }
-    if root.exists() && crate::compiler::resource::is_tmpfs(root) {
+    if nearest_existing_ancestor_is_tmpfs(
+        root,
+        &|p| p.exists(),
+        &|p| crate::compiler::resource::is_tmpfs(p),
+    ) {
         return Err(ToolError::NotConfigured(format!(
-            "build scratch root {} is a tmpfs/ramfs filesystem — set {BUILD_SCRATCH_ROOT} \
-             to a big (on-disk) path; refusing to build there (tmpfs+disk exhaustion)",
+            "build scratch root {} resolves onto a tmpfs/ramfs filesystem — set \
+             {BUILD_SCRATCH_ROOT} to a big (on-disk) path; refusing to build there \
+             (tmpfs+disk exhaustion)",
             root.display()
         )));
     }
     Ok(())
+}
+
+/// Walk up from `root` to the nearest EXISTING ancestor and report whether that
+/// ancestor is tmpfs/ramfs. `exists`/`is_tmpfs` are injected so the walk is unit-
+/// testable without a real tmpfs mount. Returns `false` if no ancestor exists
+/// (nothing to stat) — the caller's lexical guard is the backstop there.
+fn nearest_existing_ancestor_is_tmpfs(
+    root: &std::path::Path,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+    is_tmpfs: &dyn Fn(&std::path::Path) -> bool,
+) -> bool {
+    let mut cur = Some(root.to_path_buf());
+    while let Some(c) = cur {
+        if exists(&c) {
+            return is_tmpfs(&c);
+        }
+        cur = c.parent().map(|p| p.to_path_buf());
+    }
+    false
 }
 
 /// PCON-10: the resolved big-disk scratch ROOT for a local build (fail-closed).
@@ -5421,6 +5448,35 @@ mod tests {
         assert_eq!(
             resolve_scratch_root(Some("/data/build/scratch".into()), None).unwrap(),
             PathBuf::from("/data/build/scratch"),
+        );
+    }
+
+    #[test]
+    fn nonexistent_scratch_under_custom_tmpfs_mount_is_rejected() {
+        // FIX (PCON-10): a not-yet-created dir under a CUSTOM tmpfs mount (not in
+        // the lexical /tmp,/dev/shm,/run list) is rejected via the nearest
+        // EXISTING ancestor's filesystem type. Injected exists/is_tmpfs make the
+        // walk deterministic without a real mount.
+        let root = std::path::Path::new("/mnt/ram/scratch/target");
+        // Ancestor /mnt/ram exists and is tmpfs; deeper components do not exist.
+        let exists = |p: &std::path::Path| p == std::path::Path::new("/mnt/ram");
+        let is_tmpfs = |p: &std::path::Path| p == std::path::Path::new("/mnt/ram");
+        assert!(
+            nearest_existing_ancestor_is_tmpfs(root, &exists, &is_tmpfs),
+            "a nonexistent path whose existing ancestor is tmpfs must be rejected"
+        );
+    }
+
+    #[test]
+    fn nonexistent_scratch_under_big_disk_mount_is_accepted() {
+        // FIX (PCON-10): the same walk accepts a not-yet-created dir whose
+        // existing ancestor is an on-disk (non-tmpfs) filesystem.
+        let root = std::path::Path::new("/mnt/bulk/scratch/target");
+        let exists = |p: &std::path::Path| p == std::path::Path::new("/mnt/bulk");
+        let is_tmpfs = |_p: &std::path::Path| false;
+        assert!(
+            !nearest_existing_ancestor_is_tmpfs(root, &exists, &is_tmpfs),
+            "a big-disk ancestor must be accepted"
         );
     }
 

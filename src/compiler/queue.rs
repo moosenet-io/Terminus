@@ -752,7 +752,7 @@ return {id, 1}
 /// Returns `{ok(0/1), token_or_reason}`.
 /// KEYS: 1=zset 2=jobhash 3=hostset
 /// ARGV: 1=id 2=cap 3=now 4=host 5=claim_token 6=modulelock_prefix 7=expected_module
-///       8=job_prefix 9=max_ram_mb(0=off) 10=default_peak_mb (PCON-09)
+///       8=job_prefix 9=max_ram_mb(0=off) 10=default_peak_mb 11=max_jobs(0=off) (PCON-09)
 const CLAIM_LUA: &str = r#"
 local st=redis.call('HGET', KEYS[2], 'state')
 if st~='queued' then return {0, 'not_queued'} end
@@ -771,6 +771,11 @@ if resolved_sha ~= '' then identity=resolved_sha end
 local lockkey=ARGV[6]..module..':'..identity
 if redis.call('EXISTS', lockkey)==1 then return {0, 'module_busy'} end
 if redis.call('SCARD', KEYS[3])>=tonumber(ARGV[2]) then return {0, 'host_full'} end
+-- PCON-09: host job-count cap from the resource budget (BUILD_CONCURRENCY_MAX_JOBS).
+-- Enforced HERE (not only via the caller's cap arg) so the documented cap is
+-- authoritative regardless of who calls claim. maxjobs==0 disables it.
+local maxjobs=tonumber(ARGV[11]) or 0
+if maxjobs>0 and redis.call('SCARD', KEYS[3])>=maxjobs then return {0, 'budget_full'} end
 -- PCON-09: RAM-budget admission. The host set (KEYS[3]) IS the live set of
 -- building jobs on this host; summing each member's stored peak_mb (+ this
 -- job's) and comparing to the budget bounds concurrent RAM without any
@@ -1241,10 +1246,11 @@ impl QueueStore for RedisQueue {
         let cap = cap.max(1) as i64;
         // PCON-09: pass the job-hash prefix + the RAM budget so the atomic claim
         // can sum the currently-building jobs' peaks against the cap.
-        let (jp, max_ram, default_peak) = (
+        let (jp, max_ram, default_peak, max_jobs) = (
             job_prefix(),
             self.budget.max_ram_mb as i64,
             self.budget.default_peak_mb as i64,
+            self.budget.max_jobs as i64,
         );
         let script = redis::Script::new(CLAIM_LUA);
         let out: Result<(i64, String), ()> = self
@@ -1264,6 +1270,7 @@ impl QueueStore for RedisQueue {
                     .arg(jp)
                     .arg(max_ram)
                     .arg(default_peak)
+                    .arg(max_jobs)
                     .invoke_async::<_, (i64, String)>(&mut conn)
                     .await
             })
@@ -1972,6 +1979,11 @@ pub(crate) mod fake {
             if live as u32 >= cap.max(1) {
                 return Ok(ClaimOutcome::HostFull);
             }
+            // PCON-09: host job-count cap from the budget (mirrors CLAIM_LUA) —
+            // authoritative regardless of the caller's `cap`. 0 disables it.
+            if s.budget.max_jobs > 0 && live as u32 >= s.budget.max_jobs {
+                return Ok(ClaimOutcome::BudgetFull);
+            }
             // PCON-09: RAM-budget admission (mirrors CLAIM_LUA). Sum the peaks of
             // the jobs currently building on this host + this job's peak; reject
             // if over budget. Inert when max_ram_mb == 0.
@@ -2303,6 +2315,30 @@ mod tests {
         assert_eq!(
             q.claim(&c.job_id, "chord", HostRole::Primary, 4).await.unwrap(),
             ClaimOutcome::BudgetFull,
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_full_when_max_jobs_exceeded_even_with_ram_room() {
+        // PCON-09 FIX: BUILD_CONCURRENCY_MAX_JOBS is enforced in the claim itself.
+        // max_jobs=2, RAM unlimited (max_ram=0), a generous host cap ⇒ the third
+        // concurrent job of the host is BudgetFull purely on the job cap.
+        let q = InMemoryQueue::new();
+        q.set_budget(ResourceBudget {
+            max_ram_mb: 0,
+            max_jobs: 2,
+            min_disk_mb: 0,
+            default_peak_mb: 4096,
+        });
+        let a = q.enqueue(&req_with_sha("chord", "main", "sha-a")).await.unwrap();
+        let b = q.enqueue(&req_with_sha("chord", "main", "sha-b")).await.unwrap();
+        let c = q.enqueue(&req_with_sha("chord", "main", "sha-c")).await.unwrap();
+        let _t1 = claim_ok(&q, &a.job_id, "chord", HostRole::Primary, 16).await;
+        let _t2 = claim_ok(&q, &b.job_id, "chord", HostRole::Primary, 16).await;
+        assert_eq!(
+            q.claim(&c.job_id, "chord", HostRole::Primary, 16).await.unwrap(),
+            ClaimOutcome::BudgetFull,
+            "third concurrent job must be capped by max_jobs even with RAM room"
         );
     }
 
