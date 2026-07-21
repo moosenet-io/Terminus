@@ -168,6 +168,106 @@ impl From<MergeQueueError> for crate::error::ToolError {
     }
 }
 
+/// PCON-06: the author-facing reason an in-slot rebase + re-gate did NOT land a
+/// merge. Each variant is a DISTINCT, clearly-labeled bounce so the PR author
+/// can tell a *rebase conflict* (their branch genuinely conflicts with `main`
+/// and must be resolved by hand) from a *red gate* (the branch rebased cleanly
+/// but the fresh test-gate on the rebased head failed) from a *gate timeout*
+/// (the gate did not finish within the queue's wait budget — a transient
+/// "retry", not a code failure). Distinct from [`MergeQueueError`], which
+/// covers the queue's OWN outcomes (slot contention, the pre-PCON-06 bounce);
+/// this covers the rebase-and-re-gate flow's outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegateBounce {
+    /// `main` could not be merged into the PR branch without a conflict — the
+    /// forge's branch-update reported a conflict. The author must resolve it
+    /// and re-open; the queue cannot land this merge.
+    RebaseConflict(String),
+    /// The branch rebased cleanly, but the FRESH test-gate on the rebased head
+    /// came back RED (a compile error or failing tests introduced by — or
+    /// exposed against — the new landing state). NOT merged; fix and retry.
+    RedGate(String),
+    /// The fresh re-gate did not finish within the queue's `max_wait_secs`
+    /// budget. The slot is released cleanly (never held indefinitely); this is
+    /// a transient "gate timed out, retry", not a code failure.
+    GateTimeout(String),
+}
+
+impl std::fmt::Display for RegateBounce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegateBounce::RebaseConflict(d) => write!(
+                f,
+                "merge queue: rebase conflict — current base could not be merged into the PR \
+                 branch cleanly ({d}); resolve the conflict on the branch and re-open"
+            ),
+            RegateBounce::RedGate(d) => write!(
+                f,
+                "merge queue: re-gate FAILED (red) on the rebased head ({d}) — not merged; fix \
+                 the failure and retry"
+            ),
+            RegateBounce::GateTimeout(d) => write!(
+                f,
+                "merge queue: re-gate timed out ({d}) — the merge slot was released cleanly, retry"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RegateBounce {}
+
+/// PCON-06: each [`RegateBounce`] maps to a DISTINCT [`crate::error::ToolError`]
+/// the author can act on. A rebase conflict is a genuine `Conflict` (resolve
+/// and re-open); a red gate and a gate timeout are both `Execution` ("the merge
+/// didn't complete") but stay distinguishable by their message prefixes — a red
+/// gate is a code failure to fix, a timeout is a transient retry.
+impl From<RegateBounce> for crate::error::ToolError {
+    fn from(b: RegateBounce) -> Self {
+        match &b {
+            RegateBounce::RebaseConflict(_) => crate::error::ToolError::Conflict(b.to_string()),
+            RegateBounce::RedGate(_) | RegateBounce::GateTimeout(_) => {
+                crate::error::ToolError::Execution(b.to_string())
+            }
+        }
+    }
+}
+
+/// PCON-06: the verdict of a fresh test-gate fired on a rebased head SHA inside
+/// the merge queue's critical section — the SAME `compiler_build` (`mode=test`)
+/// gate the pipeline's Stage 4 runs, on the resolved SHA of the rebased result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GateVerdict {
+    /// The gate ran and PASSED — safe to merge the rebased head.
+    Green,
+    /// The gate ran and FAILED (red): a compile error or failing tests. Do NOT
+    /// merge; bounce with this reason (a [`RegateBounce::RedGate`]).
+    Red(String),
+    /// The gate did not finish within the queue's wait budget — release the
+    /// slot cleanly and bounce (`RegateBounce::GateTimeout`), never hold the
+    /// slot indefinitely.
+    TimedOut,
+    /// The compiler door was unreachable or misconfigured at re-gate time (a
+    /// spawn/config failure, NOT a red verdict) — fall back to today's
+    /// `NotMergeable` bounce (fail-safe, clearly labeled). Carries the reason
+    /// for logging.
+    Unreachable(String),
+}
+
+/// PCON-06: fires a fresh test-gate on the resolved SHA of a rebased PR head,
+/// INSIDE the merge queue's critical section. Abstracted as a trait so the
+/// queue orchestration ([`crate::gitea::MergePr`]) is unit-tested with a fake
+/// gate (no cargo spawn, deterministic verdict), while production wires it to
+/// the single-door `compiler_build` (`mode=test`) path — the SAME test-gate
+/// Stage 4 runs, satisfying S9 (no second, hand-rolled build path).
+///
+/// The implementation MUST honor `budget` (the queue's `max_wait_secs`): a gate
+/// that would run past it returns [`GateVerdict::TimedOut`] rather than blocking
+/// the slot forever.
+#[async_trait]
+pub(crate) trait ReGate: Send + Sync {
+    async fn gate(&self, module: &str, sha: &str, budget: Duration) -> GateVerdict;
+}
+
 /// GMQ-03 stale-base guard: the decision [`evaluate_merge_guard`] returns for
 /// an already-fetched [`GiteaPullRequest`] — evaluated INSIDE the merge
 /// queue's critical section, immediately before the merge POST, so a caller
@@ -1918,6 +2018,31 @@ mod tests {
     fn mergeable_true_proceeds() {
         let pr = pr_fixture(false, Some(true));
         assert_eq!(evaluate_merge_guard(&pr), MergeGuardDecision::Proceed);
+    }
+
+    // ── PCON-06: distinct re-gate bounces map to distinct ToolErrors ─────
+
+    #[test]
+    fn regate_bounces_map_to_distinct_author_facing_tool_errors() {
+        use crate::error::ToolError;
+        // A rebase conflict is a genuine Conflict (resolve + re-open).
+        let conflict: ToolError = RegateBounce::RebaseConflict("textual".into()).into();
+        assert!(matches!(conflict, ToolError::Conflict(_)));
+        assert!(format!("{conflict}").to_lowercase().contains("rebase conflict"));
+
+        // A red gate and a timeout are both Execution ("didn't complete") but
+        // stay DISTINGUISHABLE by their message prefixes.
+        let red: ToolError = RegateBounce::RedGate("abc123".into()).into();
+        assert!(matches!(red, ToolError::Execution(_)));
+        let red_msg = format!("{red}").to_lowercase();
+        assert!(red_msg.contains("re-gate failed"));
+        assert!(!red_msg.contains("timed out"), "a red gate must not read as a timeout");
+
+        let timeout: ToolError = RegateBounce::GateTimeout("budget 300s".into()).into();
+        assert!(matches!(timeout, ToolError::Execution(_)));
+        let to_msg = format!("{timeout}").to_lowercase();
+        assert!(to_msg.contains("timed out"));
+        assert!(!to_msg.contains("re-gate failed"), "a timeout must not read as a red gate");
     }
 
     // ── GMQ-05: read-only status ────────────────────────────────────────
