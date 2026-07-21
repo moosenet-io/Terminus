@@ -98,13 +98,34 @@ const CLAUDE_REASONING_EFFORT_FLAG: &str = "--effort";
 /// codex parses the value as TOML (cf. its `-c model="o3"` example).
 const CODEX_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
 
+/// TERM #495: upper bound (in bytes) on how large a prompt may be before it is
+/// routed to the child's STDIN instead of being passed as an argv element. The
+/// kernel caps the whole `argv`+`envp` block at `ARG_MAX` (~128 KiB on the
+/// daemon host); a ~1900-line diff prompt alone can exceed that and make
+/// `spawn()` fail with `Argument list too long (os error 7)`, silently dropping
+/// codex/opus/agy from the panel on exactly the large diffs a capstone review
+/// matters most for. 64 KiB on the prompt alone leaves a safe margin for the
+/// fixed flag argv + the inherited environment. At or below this size the argv
+/// is built byte-for-byte as before (`stdin_prompt = None`); above it, the
+/// prompt is omitted from argv and delivered on stdin (`stdin_prompt = Some`).
+pub const MAX_PROMPT_ARGV_BYTES: usize = 64 * 1024;
+
 /// A fully-built, ready-to-spawn command: binary name + argv array. Never a
 /// shell string. `output_path` is populated only for providers (codex) that
 /// write their clean reply to a file rather than stdout.
+///
+/// `stdin_prompt` is `None` on the normal path (prompt passed as an argv
+/// element, exactly as before). It is `Some(prompt)` ONLY when the prompt
+/// exceeded [`MAX_PROMPT_ARGV_BYTES`] and was therefore omitted from `args` and
+/// must instead be written to the child process's stdin (see the spawn site in
+/// `main.rs`). Each CLI reads its instructions from stdin when no positional
+/// prompt is present: codex `exec` (omit the positional), `claude -p` / `agy
+/// -p` (keep the boolean `-p`, drop the positional).
 pub struct BuiltCommand {
     pub binary: &'static str,
     pub args: Vec<String>,
     pub output_path: Option<String>,
+    pub stdin_prompt: Option<String>,
 }
 
 /// Build the argv array for `provider` given an opaque `prompt` string. This is
@@ -177,28 +198,46 @@ pub fn build_command_with_model(
             }
             args.push("--output-last-message".into());
             args.push(output_path.clone());
-            // "--" is the standard clap argv terminator: without it, a
-            // prompt starting with '-' (e.g. "-not-a-flag ...") is
-            // parsed as another `codex exec` option rather than the
-            // positional prompt -- confirmed live: codex errors with
-            // "unexpected argument '-n' found" on such a prompt
-            // without this separator. This is not shell injection
-            // (argv is still a fixed array, never a shell string),
-            // but caller-controlled prompt text could otherwise
-            // influence codex's own flag parsing.
-            args.push("--".into());
-            args.push(prompt.to_string());
-            BuiltCommand { binary: CODEX_BIN, args, output_path: Some(output_path) }
+            // TERM #495: an over-large prompt (a big diff) would overflow ARG_MAX
+            // and fail spawn(). When it exceeds the threshold, OMIT the positional
+            // prompt entirely (and its "--" terminator) -- codex `exec` reads its
+            // instructions from stdin when no positional PROMPT is given -- and
+            // deliver it on stdin instead. At/below the threshold the argv is
+            // byte-for-byte identical to before.
+            let stdin_prompt = if prompt.len() > MAX_PROMPT_ARGV_BYTES {
+                Some(prompt.to_string())
+            } else {
+                // "--" is the standard clap argv terminator: without it, a
+                // prompt starting with '-' (e.g. "-not-a-flag ...") is
+                // parsed as another `codex exec` option rather than the
+                // positional prompt -- confirmed live: codex errors with
+                // "unexpected argument '-n' found" on such a prompt
+                // without this separator. This is not shell injection
+                // (argv is still a fixed array, never a shell string),
+                // but caller-controlled prompt text could otherwise
+                // influence codex's own flag parsing.
+                args.push("--".into());
+                args.push(prompt.to_string());
+                None
+            };
+            BuiltCommand { binary: CODEX_BIN, args, output_path: Some(output_path), stdin_prompt }
         }
-        Provider::Agy => BuiltCommand {
-            binary: AGY_BIN,
-            args: vec![
-                "--model".into(), AGY_MODEL.into(),
-                "-p".into(), prompt.to_string(),
-                "--dangerously-skip-permissions".into(),
-            ],
-            output_path: None,
-        },
+        Provider::Agy => {
+            // TERM #495: over-large prompt → deliver on stdin. agy is
+            // claude-derived (`-p` is boolean print-mode, the prompt is a
+            // positional), so keep the `-p`/`--model`/skip-permissions flags and
+            // drop only the positional prompt; agy reads it from stdin. At/below
+            // the threshold the argv is byte-for-byte identical to before.
+            let mut args = vec!["--model".into(), AGY_MODEL.into(), "-p".into()];
+            let stdin_prompt = if prompt.len() > MAX_PROMPT_ARGV_BYTES {
+                Some(prompt.to_string())
+            } else {
+                args.push(prompt.to_string());
+                None
+            };
+            args.push("--dangerously-skip-permissions".into());
+            BuiltCommand { binary: AGY_BIN, args, output_path: None, stdin_prompt }
+        }
     }
 }
 
@@ -211,11 +250,18 @@ pub fn build_command_with_model(
 /// Glob LS` pre-approves those tools without a prompt and without the root-blocked
 /// `--dangerously-skip-permissions`.
 fn claude_command(model: &str, prompt: &str, explore: bool, reasoning_effort: Option<&str>) -> BuiltCommand {
-    let mut args = vec![
-        "--model".into(), model.to_string(),
-        "-p".into(), prompt.to_string(),
-        "--output-format".into(), "text".into(),
-    ];
+    // TERM #495: `-p` is the claude CLI's boolean print-mode flag; the prompt is
+    // a positional. For an over-large prompt (a big diff), OMIT the positional
+    // (keep `-p`) -- `claude -p` reads the prompt from stdin when no positional
+    // is given -- and deliver it on stdin. At/below the threshold the argv is
+    // byte-for-byte identical to before (`stdin_prompt = None`).
+    let over_threshold = prompt.len() > MAX_PROMPT_ARGV_BYTES;
+    let mut args = vec!["--model".into(), model.to_string(), "-p".into()];
+    if !over_threshold {
+        args.push(prompt.to_string());
+    }
+    args.push("--output-format".into());
+    args.push("text".into());
     if explore {
         args.push("--allowedTools".into());
         for t in EXPLORE_TOOLS {
@@ -233,7 +279,8 @@ fn claude_command(model: &str, prompt: &str, explore: bool, reasoning_effort: Op
         args.push(CLAUDE_REASONING_EFFORT_FLAG.to_string());
         args.push(effort.to_string());
     }
-    BuiltCommand { binary: CLAUDE_BIN, args, output_path: None }
+    let stdin_prompt = if over_threshold { Some(prompt.to_string()) } else { None };
+    BuiltCommand { binary: CLAUDE_BIN, args, output_path: None, stdin_prompt }
 }
 
 #[cfg(test)]
@@ -461,6 +508,140 @@ mod tests {
         // silent no-op, never an error or an unexpected argv element.
         let cmd = build_command_with_model(Provider::Opus, "x", false, None, Some("gpt-5.6-luna"));
         assert!(!cmd.args.iter().any(|a| a == "gpt-5.6-luna"));
+    }
+
+    // ── TERM #495: over-ARG_MAX prompt → stdin, not argv ────────────────────
+
+    /// A prompt just over [`MAX_PROMPT_ARGV_BYTES`]. Uses a leading '-' so the
+    /// codex-terminator reasoning is exercised too (it must NOT appear on the
+    /// stdin path since there is no positional prompt to protect).
+    fn oversized_prompt() -> String {
+        let mut s = String::from("-review this enormous diff: ");
+        s.push_str(&"A".repeat(MAX_PROMPT_ARGV_BYTES + 1));
+        assert!(s.len() > MAX_PROMPT_ARGV_BYTES);
+        s
+    }
+
+    #[test]
+    fn small_prompt_keeps_argv_and_leaves_stdin_none_for_every_provider() {
+        for prov in [Provider::Opus, Provider::Fable, Provider::Codex, Provider::Agy] {
+            let cmd = build_command(prov, "small prompt", false, None);
+            assert!(
+                cmd.stdin_prompt.is_none(),
+                "small prompt must stay on argv (stdin_prompt None) for {prov:?}"
+            );
+            assert!(
+                cmd.args.iter().any(|a| a == "small prompt"),
+                "small prompt must be present as an argv element for {prov:?}: {:?}",
+                cmd.args
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_claude_prompt_moves_to_stdin_not_argv() {
+        let prompt = oversized_prompt();
+        for prov in [Provider::Opus, Provider::Fable] {
+            let cmd = build_command(prov, &prompt, false, None);
+            // Prompt must NOT appear anywhere in argv...
+            assert!(
+                !cmd.args.iter().any(|a| a == &prompt),
+                "oversized prompt must not be an argv element for {prov:?}"
+            );
+            // ...and must be delivered on stdin verbatim.
+            assert_eq!(cmd.stdin_prompt.as_deref(), Some(prompt.as_str()));
+            // `-p` (boolean print-mode) is retained so claude reads stdin.
+            assert!(cmd.args.iter().any(|a| a == "-p"), "must keep -p: {:?}", cmd.args);
+            // Other flags survive unchanged.
+            assert!(cmd.args.windows(2).any(|w| w[0] == "--output-format" && w[1] == "text"));
+            assert_no_shell_markers(&cmd);
+            assert_eq!(cmd.output_path, None);
+        }
+    }
+
+    #[test]
+    fn oversized_codex_prompt_moves_to_stdin_and_drops_terminator() {
+        let prompt = oversized_prompt();
+        let cmd = build_command(Provider::Codex, &prompt, false, None);
+        assert!(
+            !cmd.args.iter().any(|a| a == &prompt),
+            "oversized prompt must not be an argv element: (len {})",
+            cmd.args.len()
+        );
+        assert_eq!(cmd.stdin_prompt.as_deref(), Some(prompt.as_str()));
+        // No positional prompt on stdin path → the "--" terminator that only
+        // exists to protect that positional must NOT be emitted.
+        assert!(
+            !cmd.args.iter().any(|a| a == "--"),
+            "no argv terminator when there is no positional prompt: {:?}",
+            cmd.args
+        );
+        // The rest of the invocation is intact: exec + the output-file plumbing.
+        assert!(cmd.args.first().map(String::as_str) == Some("exec"));
+        assert!(cmd.args.windows(2).any(|w| w[0] == "--output-last-message"));
+        assert!(cmd.output_path.is_some());
+        assert_no_shell_markers(&cmd);
+    }
+
+    #[test]
+    fn oversized_agy_prompt_moves_to_stdin_keeps_flags() {
+        let prompt = oversized_prompt();
+        let cmd = build_command(Provider::Agy, &prompt, false, None);
+        assert!(!cmd.args.iter().any(|a| a == &prompt));
+        assert_eq!(cmd.stdin_prompt.as_deref(), Some(prompt.as_str()));
+        // The load-bearing agy flags survive: -p, --model <model>, skip-permissions.
+        assert!(cmd.args.iter().any(|a| a == "-p"));
+        assert!(cmd.args.windows(2).any(|w| w[0] == "--model" && w[1] == AGY_MODEL));
+        assert!(cmd.args.iter().any(|a| a == "--dangerously-skip-permissions"));
+        assert_no_shell_markers(&cmd);
+    }
+
+    #[test]
+    fn oversized_codex_prompt_still_carries_effort_override() {
+        // The stdin path must not regress the REVCAP-01 effort wiring.
+        let prompt = oversized_prompt();
+        let cmd = build_command(Provider::Codex, &prompt, false, Some("high"));
+        assert_eq!(cmd.stdin_prompt.as_deref(), Some(prompt.as_str()));
+        assert!(cmd.args.iter().any(|a| a == "--config"));
+        assert!(cmd
+            .args
+            .iter()
+            .any(|a| a == &format!("{CODEX_REASONING_EFFORT_KEY}=\"high\"")));
+        assert!(!cmd.args.iter().any(|a| a == "--"));
+        assert_no_shell_markers(&cmd);
+    }
+
+    #[test]
+    fn oversized_claude_prompt_still_carries_effort_and_explore() {
+        let prompt = oversized_prompt();
+        let cmd = build_command(Provider::Opus, &prompt, true, Some("high"));
+        assert_eq!(cmd.stdin_prompt.as_deref(), Some(prompt.as_str()));
+        assert!(!cmd.args.iter().any(|a| a == &prompt));
+        assert!(cmd.args.iter().any(|a| a == "--allowedTools"));
+        assert!(cmd.args.windows(2).any(|w| w[0] == "--effort" && w[1] == "high"));
+        // Explore read-only tools still pre-approved, still no mutate/exec tool.
+        for t in ["Read", "Grep", "Glob", "LS"] {
+            assert!(cmd.args.iter().any(|a| a == t));
+        }
+        for forbidden in ["Bash", "Write", "Edit"] {
+            assert!(!cmd.args.iter().any(|a| a == forbidden));
+        }
+        assert_no_shell_markers(&cmd);
+    }
+
+    #[test]
+    fn threshold_boundary_exactly_at_limit_stays_on_argv() {
+        // Exactly MAX_PROMPT_ARGV_BYTES is the '<=' case → argv (stdin None);
+        // one byte over flips to stdin. Verifies the boundary is off-by-one safe.
+        let at = "b".repeat(MAX_PROMPT_ARGV_BYTES);
+        let over = "b".repeat(MAX_PROMPT_ARGV_BYTES + 1);
+        for prov in [Provider::Opus, Provider::Codex, Provider::Agy] {
+            let at_cmd = build_command(prov, &at, false, None);
+            assert!(at_cmd.stdin_prompt.is_none(), "== limit stays on argv for {prov:?}");
+            assert!(at_cmd.args.iter().any(|a| a == &at), "{prov:?} argv has the prompt");
+            let over_cmd = build_command(prov, &over, false, None);
+            assert_eq!(over_cmd.stdin_prompt.as_deref(), Some(over.as_str()), "> limit → stdin for {prov:?}");
+        }
     }
 
     #[test]
