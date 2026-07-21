@@ -37,6 +37,35 @@
 //! rule independently of the baseline (they scan synthetic temp trees).
 //!
 //! This whole module is `#[cfg(test)]` — pure test infrastructure, never shipped.
+//!
+//! ## Scope: a TEXTUAL lint, not a syntactic proof (deliberate — do not "fix")
+//!
+//! This guard is intentionally modeled on the crate's sibling **textual**
+//! scanners — `no_pii_in_own_source_tree` (`src/github/pii.rs`) and the
+//! `no_direct_http_client` token scan (`src/bin/cortex_calibrate.rs`): a
+//! best-effort, mostly SINGLE-LINE lint whose job is to PREVENT REGRESSIONS
+//! (via the per-file baseline ratchet) and to force new tests to be hermetic or
+//! carry an explicit `// hermeticity-allow: <reason>` marker. It is **NOT** an
+//! AST/`syn`-level analysis and is not meant to become one.
+//!
+//! It catches the COMMON single-line forms this session's actual flakes took —
+//! `std::env::set_var("SHARED_KEY", …)`, `Command::new("git")`/`.arg("git")`,
+//! `Path::new("/tmp…")`, etc. The following are **accepted, known gaps**, covered
+//! by the `// hermeticity-allow` marker + the baseline (exactly as the sibling
+//! textual guards accept the same class of gap), NOT bugs to chase:
+//!   - env mutations reached through an **aliased/`use`-imported** name (e.g.
+//!     `use std::env::set_var as sv; sv(…)`), or a re-exported wrapper;
+//!   - a call **split across multiple lines** whose trigger token and its key/
+//!     args land on different lines;
+//!   - a `/tmp` path **constructed** at runtime (`format!("/tmp/{x}")`,
+//!     concatenation) rather than written as a literal;
+//!   - **macro-generated** test bodies.
+//!
+//! Making any of these detectable requires real syntactic analysis — a different,
+//! much larger tool than the spec asked for, and one that would diverge from the
+//! textual guards it deliberately mirrors. The escape hatch for a deliberate
+//! exception is the marker; the safety net for an undetected regression is code
+//! review plus the fact that the flakes this encodes were all single-line.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -2069,6 +2069,68 @@ impl Drop for RemoteSecretGuard {
     }
 }
 
+/// Render the argv that removes the remote per-job SCRATCH dir over ssh:
+/// `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> rm -rf <quoted-dir>`. Pure
+/// (testable offline); the dir is shell-quoted and the connect is bounded so a
+/// synchronous Drop cleanup can never hang.
+fn render_remote_scratch_rm_argv(host: &str, remote_dir: &str) -> Vec<String> {
+    vec![
+        "ssh".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=10".to_string(),
+        host.to_string(),
+        format!("rm -rf {}", shell_quote(remote_dir)),
+    ]
+}
+
+/// PCON-10 FIX: RAII guard reclaiming the REMOTE per-job scratch (the per-job
+/// `CARGO_TARGET_DIR` AND its nested `TMPDIR`, both under `<heavy_target>/<module>-<unit>`)
+/// on EVERY exit path of the remote build — SUCCESS, any `?` error, an ssh/build
+/// timeout, or a panic — mirroring the LOCAL [`ScratchReclaim`] drop guard. Armed
+/// right after the remote target dir is created (before staging/build), so a
+/// failure ANYWHERE after that cannot leak it. The built binary is rsync'd to a
+/// LOCAL path BEFORE this guard drops, so reclaiming on success is safe.
+///
+/// The ONE residual is a hard crash of THIS process (which skips Drop entirely) —
+/// that abnormal-exit case is intentionally backstopped by PCON-05's age/count GC
+/// of per-job heavy target dirs, NOT by this inline guard. Every NORMAL exit
+/// (success or failure/timeout) is covered inline here.
+struct RemoteScratchGuard {
+    host: String,
+    remote_dir: String,
+    redact: Vec<String>,
+    /// Test-only sink: when set, `Drop` RECORDS the rendered rm argv here instead
+    /// of spawning a real ssh — so the "reclaim fires on the failure path"
+    /// property is unit-testable offline. `None` in production.
+    recorder: Option<std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>>,
+}
+
+impl RemoteScratchGuard {
+    fn new(host: String, remote_dir: String, redact: Vec<String>) -> Self {
+        Self {
+            host,
+            remote_dir,
+            redact,
+            recorder: None,
+        }
+    }
+}
+
+impl Drop for RemoteScratchGuard {
+    fn drop(&mut self) {
+        let argv = render_remote_scratch_rm_argv(&self.host, &self.remote_dir);
+        if let Some(rec) = &self.recorder {
+            if let Ok(mut g) = rec.lock() {
+                g.push(argv);
+            }
+            return;
+        }
+        blocking_ssh_rm(&argv, &self.redact);
+    }
+}
+
 /// Run a subprocess argv with an optional cwd + extra env, bounded by `timeout`.
 /// Returns `Ok(stdout)` on success (exit 0), else an `Execution` error with a
 /// trimmed stderr tail. The env is applied on top of the inherited environment.
@@ -3310,6 +3372,17 @@ impl CompilerBuild {
                 None,
             )
             .await?;
+
+            // PCON-10 FIX: arm the remote-scratch reclaim NOW — right after the
+            // per-job target/TMPDIR exist and BEFORE staging/build — so the remote
+            // scratch is removed on EVERY exit path (the built binary is copied to
+            // a LOCAL path before this drops; see RemoteScratchGuard). A hard crash
+            // of this process is the only residual, backstopped by PCON-05 GC.
+            let _remote_scratch_guard = RemoteScratchGuard::new(
+                host_addr.clone(),
+                remote_target_str.clone(),
+                redact.clone(),
+            );
 
             if let Some(sha) = &resolved_sha {
                 // PCON-03 (FINDING 3 review fix): with staging content-addressed
@@ -6424,6 +6497,43 @@ mod tests {
         assert!(
             rec.lock().unwrap().is_empty(),
             "a disarmed guard must not issue a remote rm"
+        );
+    }
+
+    #[test]
+    fn remote_scratch_rm_argv_is_bounded_recursive_and_quoted() {
+        let argv = render_remote_scratch_rm_argv("builduser@heavy", "/mnt/bt/chord-deadbeef");
+        assert_eq!(argv[0], "ssh");
+        let j = argv.join(" ");
+        assert!(j.contains("-o BatchMode=yes"), "{j}");
+        assert!(j.contains("-o ConnectTimeout=10"), "{j}");
+        assert_eq!(argv.last().unwrap(), "rm -rf '/mnt/bt/chord-deadbeef'");
+    }
+
+    #[test]
+    fn remote_scratch_guard_reclaims_on_every_exit_path() {
+        use std::sync::{Arc, Mutex};
+        // PCON-10 FIX: the guard is armed after the remote dir is created and is
+        // NEVER disarmed — so ANY exit (a build error, an ssh/build timeout, a
+        // panic, OR normal success) reclaims the remote per-job scratch inline.
+        let rec: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut g = RemoteScratchGuard::new(
+                "builduser@heavy".to_string(),
+                "/mnt/build-target/chord-deadbeef".to_string(),
+                vec![],
+            );
+            g.recorder = Some(rec.clone());
+        } // early-return / failure / scope-exit: Drop fires here
+        let calls = rec.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "remote scratch reclaim must fire on the failure/early-return path"
+        );
+        assert_eq!(
+            calls[0].last().unwrap(),
+            "rm -rf '/mnt/build-target/chord-deadbeef'"
         );
     }
 
