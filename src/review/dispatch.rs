@@ -117,8 +117,13 @@ impl ReviewConfig {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let openrouter_key = std::env::var("OPENROUTER_API_KEY")
+        // Operator directive (S121): the review daemon's OpenRouter spend (paid
+        // pool + gpt56 + any paid model) is isolated on the DEDICATED
+        // OPENROUTER_API_KEY_CHORDHARMONY key so review-provider cost is cleanly
+        // trackable; fall back to the shared OPENROUTER_API_KEY when it's absent.
+        let openrouter_key = std::env::var("OPENROUTER_API_KEY_CHORDHARMONY")
             .ok()
+            .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         Self { daemon_url, daemon_token, openrouter_key }
