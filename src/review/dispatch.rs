@@ -1250,7 +1250,7 @@ mod tests {
         });
         std::env::set_var("OPENROUTER_CREDITS_URL", format!("{}/api/v1/credits", server.base_url()));
         std::env::set_var("OPENROUTER_CHAT_URL", format!("{}/api/v1/chat/completions", server.base_url()));
-        std::env::set_var("REVIEW_PAID_POOL_MODELS", "vendor/model-a,vendor/model-b");
+        std::env::set_var("REVIEW_PAID_POOL_MODELS", "openai/model-a,openai/model-b");
         paid_pool::set_enabled(true);
         {
             let mut p = paid_pool::global_pool().lock().await;
@@ -1273,7 +1273,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn paid_pool_dispatch_all_cooling_returns_distinct_error() {
-        std::env::set_var("REVIEW_PAID_POOL_MODELS", "vendor/model-c");
+        std::env::set_var("REVIEW_PAID_POOL_MODELS", "openai/model-c");
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET).path("/api/v1/credits");
@@ -1284,7 +1284,7 @@ mod tests {
         {
             let mut p = paid_pool::global_pool().lock().await;
             *p = paid_pool::PaidPool::default();
-            p.mark_rate_limited("vendor/model-c", Instant::now());
+            p.mark_rate_limited("openai/model-c", Instant::now());
         }
         let cfg = ReviewConfig {
             daemon_url: DEFAULT_DAEMON_URL.to_string(),

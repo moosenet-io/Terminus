@@ -8,9 +8,9 @@
 //! Gemini 2.5 Pro per the S121 research findings). It runs ALONGSIDE the free
 //! pool and the sub-backed daemon providers (opus/codex/agy) to add diverse
 //! paid insight to a panel, gated behind:
-//!   - a funded `OPENROUTER_API_KEY` (read at the dispatch boundary in
-//!     `dispatch.rs`, same as every other OpenRouter path -- never hardcoded
-//!     here);
+//!   - a funded key read at the dispatch boundary in `dispatch.rs`:
+//!     `OPENROUTER_API_KEY_CHORDHARMONY` preferred (dedicated review-spend key),
+//!     falling back to `OPENROUTER_API_KEY` -- never hardcoded here;
 //!   - the existing `guard_paid_model` credit floor (refuses a paid dispatch
 //!     below `OPENROUTER_MIN_CREDITS`);
 //!   - REVX-11's runtime ON/OFF toggle ([`is_enabled`]/[`set_enabled`]),
@@ -74,9 +74,17 @@ fn env_bool(key: &str, default: bool) -> bool {
 pub fn configured_models() -> Vec<String> {
     match std::env::var("REVIEW_PAID_POOL_MODELS") {
         Ok(v) if !v.trim().is_empty() => {
-            let items: Vec<String> =
-                v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let items: Vec<String> = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| is_valid_paid_model(s)) // reject garbage/injection + `:free`
+                .collect();
             if items.is_empty() {
+                // Override present but nothing valid -> don't run an unvalidated
+                // or empty pool; fall back to the curated defaults (logged).
+                eprintln!(
+                    "review-paid-pool: REVIEW_PAID_POOL_MODELS had no valid entries (bad shape / unknown provider / :free); using defaults"
+                );
                 DEFAULT_PAID_MODELS.iter().map(|s| s.to_string()).collect()
             } else {
                 items
@@ -84,6 +92,32 @@ pub fn configured_models() -> Vec<String> {
         }
         _ => DEFAULT_PAID_MODELS.iter().map(|s| s.to_string()).collect(),
     }
+}
+
+/// Known OpenRouter provider prefixes the paid pool will accept from the
+/// `REVIEW_PAID_POOL_MODELS` override (closed allowlist — an override can pick
+/// AMONG these, never inject an arbitrary/unknown model id or a bare string).
+const ALLOWED_PAID_PROVIDER_PREFIXES: &[&str] = &[
+    "moonshotai/", "deepseek/", "z-ai/", "google/", "openai/", "qwen/", "anthropic/",
+    "x-ai/", "mistralai/", "meta-llama/", "cohere/", "nvidia/", "microsoft/",
+];
+
+/// A `REVIEW_PAID_POOL_MODELS` entry is accepted only if it is a well-formed
+/// `provider/model` id (safe chars), starts with a KNOWN provider prefix, and is
+/// NOT a `:free` model. The last rule keeps the PAID pool paid-only so the
+/// credit-floor guard (which gates on the pool being paid) can never be bypassed
+/// by slipping a free model in as the first entry (codex review, spend-control).
+fn is_valid_paid_model(m: &str) -> bool {
+    if m.is_empty() || m.len() > 128 || m.ends_with(":free") {
+        return false;
+    }
+    // provider/model shape with a safe character set only.
+    let ok_shape = m.split_once('/').is_some_and(|(prov, rest)| {
+        !prov.is_empty()
+            && !rest.is_empty()
+            && m.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | ':'))
+    });
+    ok_shape && ALLOWED_PAID_PROVIDER_PREFIXES.iter().any(|p| m.starts_with(p))
 }
 
 /// Round-robin pool of curated paid-model ids with per-model cooldowns. Unlike
@@ -178,9 +212,33 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn configured_models_override_replaces_wholesale() {
-        std::env::set_var("REVIEW_PAID_POOL_MODELS", "foo/bar, baz/qux");
+        // Override selects AMONG known providers (validated allowlist).
+        std::env::set_var("REVIEW_PAID_POOL_MODELS", "openai/gpt-5.6, qwen/qwen3-max");
         let models = configured_models();
-        assert_eq!(models, vec!["foo/bar".to_string(), "baz/qux".to_string()]);
+        assert_eq!(models, vec!["openai/gpt-5.6".to_string(), "qwen/qwen3-max".to_string()]);
+        std::env::remove_var("REVIEW_PAID_POOL_MODELS");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn configured_models_rejects_garbage_and_free_and_unknown_providers() {
+        // unknown-provider, bare string, and :free entries are dropped; a valid
+        // one survives. (codex review: closed allowlist + paid-only guard.)
+        std::env::set_var(
+            "REVIEW_PAID_POOL_MODELS",
+            "evil/inject, notaprovider/x, deepseek/deepseek-v3.2:free, bareword, deepseek/deepseek-v3.2",
+        );
+        let models = configured_models();
+        assert_eq!(models, vec!["deepseek/deepseek-v3.2".to_string()]);
+        std::env::remove_var("REVIEW_PAID_POOL_MODELS");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn configured_models_all_invalid_falls_back_to_default() {
+        std::env::set_var("REVIEW_PAID_POOL_MODELS", "junk, notaprovider/x, a/b:free");
+        let models = configured_models();
+        assert_eq!(models.len(), 6, "no valid entries must fall back to the built-in 6");
         std::env::remove_var("REVIEW_PAID_POOL_MODELS");
     }
 
