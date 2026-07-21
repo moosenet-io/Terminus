@@ -1211,7 +1211,7 @@ mod tests {
         // Finding 3: an unknown/garbage requested host is NOT echoed verbatim — it is
         // reported only by count (it can carry ssh targets / arbitrary caller input).
         let (chosen, notes) =
-            select_hosts(&hosts(), "host-a, u@host-b ; nope$secret@<internal-ip> ; junk");
+            select_hosts(&hosts(), "host-a, u@host-b ; nope$secret@<internal-ip> ; junk");  // pii-test-fixture: test fixture private-ip-shaped string, redaction-of-unknown-host test
         assert_eq!(
             chosen.iter().map(|h| h.label.as_str()).collect::<Vec<_>>(),
             vec!["host-a", "host-b"]
@@ -1221,7 +1221,7 @@ mod tests {
         assert!(notes[0].contains('2'), "{}", notes[0]);
         assert!(!notes[0].contains("nope"));
         assert!(!notes[0].contains("secret"));
-        assert!(!notes[0].contains("<internal-ip>"));
+        assert!(!notes[0].contains("<internal-ip>"));  // pii-test-fixture: test fixture private-ip-shaped string, redaction-of-unknown-host test
         assert!(!notes[0].contains("junk"));
     }
 
@@ -1481,13 +1481,13 @@ mod tests {
     fn remote_cmd_triggers_start_reads_result_and_always_exits_zero() {
         let cmd = render_remote_trigger_cmd(
             "systemctl",
-            "<email>",
-            "<path>/.deploy_result",
+            "<email>",  // pii-test-fixture: test fixture path
+            "<path>/.deploy_result",  // pii-test-fixture: test fixture path
         );
         // Finding 3: the marker is `rm`'d, and whether it is now provably ABSENT is
         // captured (`__cleared`) — the run-scoped gate. No mtime / run-reference logic.
-        let rm_at = cmd.find("rm -f -- '<path>/.deploy_result'").expect("pre-trigger rm");
-        let cleared_at = cmd.find("if [ -e '<path>/.deploy_result' ]; then __cleared=0")
+        let rm_at = cmd.find("rm -f -- '<path>/.deploy_result'").expect("pre-trigger rm");  // pii-test-fixture: test fixture path
+        let cleared_at = cmd.find("if [ -e '<path>/.deploy_result' ]; then __cleared=0")  // pii-test-fixture: test fixture path
             .expect("clear-succeeded captured");
         let start_at = cmd.find("systemctl start").unwrap();
         assert!(rm_at < cleared_at && cleared_at < start_at, "rm then clear-check then trigger");
@@ -1495,12 +1495,12 @@ mod tests {
         assert!(cmd.contains("if [ \"$__cleared\" = 1 ]; then __tok="), "cleared gate: {cmd}");
         // Finding 2: the token is sanitized (first line only + safe charset) so a
         // malformed marker can't inject a second sentinel line.
-        assert!(cmd.contains("head -n1 -- '<path>/.deploy_result'"), "first-line only: {cmd}");
+        assert!(cmd.contains("head -n1 -- '<path>/.deploy_result'"), "first-line only: {cmd}");  // pii-test-fixture: test fixture path
         assert!(cmd.contains("tr -cd 'A-Za-z0-9_-'"), "safe-charset strip: {cmd}");
         // No leftover mtime/run-reference machinery.
         assert!(!cmd.contains("__refmt") && !cmd.contains("__floor") && !cmd.contains("stat -c %Y"),
             "no mtime/run-reference logic remains: {cmd}");
-        assert!(cmd.contains("systemctl start '<email>'"));
+        assert!(cmd.contains("systemctl start '<email>'"));  // pii-test-fixture: test fixture
         assert!(cmd.contains("--property=Result --value"));
         assert!(cmd.contains("COMPILER_DEPLOY rc="));
         // Always exit 0 so ssh's exit reflects only connectivity (tri-state trick).
@@ -1511,9 +1511,9 @@ mod tests {
     fn remote_cmd_forces_non_interactive_sudo() {
         // Finding 2: a `sudo` prefix is made non-interactive (`-n`) so a password
         // prompt fails fast instead of hanging for the whole trigger timeout.
-        let cmd = render_remote_trigger_cmd("sudo systemctl", "<email>", "/m");
+        let cmd = render_remote_trigger_cmd("sudo systemctl", "<email>", "/m");  // pii-test-fixture: test fixture email-shaped ssh target string
         assert!(cmd.contains("sudo -n systemctl start "), "{cmd}");
-        assert!(cmd.contains("sudo -n systemctl show '<email>'"), "{cmd}");
+        assert!(cmd.contains("sudo -n systemctl show '<email>'"), "{cmd}");  // pii-test-fixture: test fixture email-shaped ssh target string
         // No bare `sudo systemctl` (would be interactive) survives.
         assert!(!cmd.contains("sudo systemctl"), "{cmd}");
     }
@@ -1661,7 +1661,7 @@ mod tests {
     fn render_template_substitutes_module_and_channel() {
         assert_eq!(
             render_template("constellation-update@{module}.service", "chord", "stable"),
-            "<email>"
+            "<email>"  // pii-test-fixture: test fixture
         );
         assert_eq!(
             render_template("/deploy/{module}/{channel}.tok", "harmony", "experimental"),
@@ -1671,7 +1671,7 @@ mod tests {
 
     #[test]
     fn shell_quote_neutralizes_metacharacters() {
-        assert_eq!(shell_quote("<email>"), "'<email>'");
+        assert_eq!(shell_quote("<email>"), "'<email>'");  // pii-test-fixture: test fixture email-shaped systemd unit string
         assert_eq!(shell_quote("a'b; rm -rf /"), "'a'\\''b; rm -rf /'");
     }
 

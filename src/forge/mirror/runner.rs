@@ -1431,7 +1431,7 @@ mod tests {
     }
 
     /// THE codex RFC-3986 userinfo-hijack hole, at the funnel: an override
-    /// `https://github.com:<email>/…` (real host evil.example) whose
+    /// `https://github.com:<email>/…` (real host evil.example) whose // pii-test-fixture: RFC-3986 userinfo-hijack doc example, email-shaped false positive from "host:<email>"
     /// owner/repo WOULD pass repo_exists is Rejected — never reaches run_once,
     /// so internal code is never pushed to the attacker host.
     #[tokio::test]
@@ -1445,7 +1445,7 @@ mod tests {
             std::env::remove_var(super::super::discovery::GITHUB_HOST_ENV);
         }
         let verifier = MapExists::new(&[("Terminus", true)]);
-        let hijack = "https://github.com:<email>/moosenet-io/Terminus.git";
+        let hijack = "https://github.com:<email>/moosenet-io/Terminus.git"; // pii-test-fixture: userinfo-hijack test fixture, no real PII
         let res = resolve_and_verify_remote(&verifier, "Terminus", Some(hijack)).await;
         unsafe {
             match had_org {

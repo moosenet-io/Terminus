@@ -201,8 +201,8 @@ mod tests {
     fn bounded_tool_label_configured_mesh_ns_buckets_by_namespace() {
         // Only when the caller confirms a CONFIGURED upstream namespace do we
         // bucket by `<mesh:ns>` — bounded by the configured upstream set.
-        assert_eq!(bounded_tool_label("pve__vm_list", false, Some("<host>")), "<mesh:<host>>");
-        assert_eq!(bounded_tool_label("pve__anything", false, Some("<host>")), "<mesh:<host>>");
+        assert_eq!(bounded_tool_label("pve__vm_list", false, Some("<host>")), "<mesh:<host>>");  // pii-test-fixture: test fixture loopback URL, deliberately-unreachable per doc above
+        assert_eq!(bounded_tool_label("pve__anything", false, Some("<host>")), "<mesh:<host>>");  // pii-test-fixture: test fixture loopback URL, deliberately-unreachable per doc above
     }
 
     #[test]
