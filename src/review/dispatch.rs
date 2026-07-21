@@ -129,8 +129,18 @@ impl ReviewConfig {
         Self { daemon_url, daemon_token, openrouter_key }
     }
 
+    /// HTTP client for the direct OpenRouter arms (`free`/`paid`/`gpt56`/
+    /// `nemotron`/`qwen_coder`). REVX-16: a high-reasoning paid model
+    /// (kimi-k2-thinking, deepseek-v3.2 with `reasoning`) can legitimately take
+    /// several minutes; the old fixed 150s ceiling cut it off. Generous 5-min
+    /// default, operator-tunable via `REVIEW_OPENROUTER_TIMEOUT_SECS`.
     fn client() -> Result<reqwest::Client, ToolError> {
-        Self::client_with_timeout(150)
+        let secs = std::env::var("REVIEW_OPENROUTER_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(300);
+        Self::client_with_timeout(secs)
     }
 
     /// A client with a caller-chosen request timeout. The Epic capstone's explore
@@ -646,12 +656,67 @@ pub struct DaemonOpts {
     pub model: Option<String>,
 }
 
+/// REVX-16: the routine-review wall-clock backstop, in seconds.
+///
+/// High-reasoning review agents (codex on GPT-5.6, opus, agy) at a raised
+/// effort tier legitimately *think* for several minutes on a large diff before
+/// they emit a `VERDICT:` line. The old hard-coded 120s backstop killed them
+/// mid-think and surfaced as a spurious `UNKNOWN` ("timed out after 120s
+/// (wall-clock backstop)"), poisoning the panel aggregate to REQUEST_CHANGES
+/// with zero real findings. This raises the routine default to a generous 5
+/// minutes and makes it operator-tunable, capped at the daemon's own
+/// [`crate::bin`]-side `MAX_TIMEOUT_SECS` (1800). The daemon's progress/stall
+/// detector -- not this ceiling -- remains the primary bound for a genuinely
+/// wedged provider.
+const DEFAULT_ROUTINE_TIMEOUT_SECS: u64 = 300;
+/// Mirrors `review_daemon::config::MAX_TIMEOUT_SECS` (the daemon rejects a
+/// larger `timeout_secs`); duplicated as a plain const to avoid a bin-crate dep.
+const DAEMON_MAX_TIMEOUT_SECS: u64 = 1800;
+/// The HTTP client ceiling is always the wall-clock backstop plus this margin
+/// (the socket must outlive the daemon's own kill so we read its error body).
+const CLIENT_TIMEOUT_MARGIN_SECS: u64 = 30;
+
+/// The operator-tunable routine backstop (`REVIEW_ROUTINE_TIMEOUT_SECS`),
+/// defaulting to [`DEFAULT_ROUTINE_TIMEOUT_SECS`] and clamped to the daemon max.
+fn routine_timeout_secs() -> u64 {
+    std::env::var("REVIEW_ROUTINE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_ROUTINE_TIMEOUT_SECS)
+        .min(DAEMON_MAX_TIMEOUT_SECS)
+}
+
+/// REVX-16: the wall-clock backstop for a given effort tier. The routine base
+/// ([`routine_timeout_secs`]) is the *Medium anchor*; every tier scales off it,
+/// so raising the env knob lifts them all proportionally. A deep High/Xhigh pass
+/// gets real minutes to converge (1.6x/2x) while a Minimal/Low breadth pass gets
+/// a tighter budget (0.6x/0.8x, token/time thrift). Floored at 60s (a socket
+/// must have *some* time) and clamped to the daemon max. At the 300s default:
+/// Minimal 180, Low 240, Medium 300, High 480, Xhigh 600.
+fn tier_backstop_secs(tier: EffortTier) -> u64 {
+    let base = routine_timeout_secs();
+    let secs = match tier {
+        EffortTier::Minimal => base * 3 / 5, // 0.6x
+        EffortTier::Low => base * 4 / 5,     // 0.8x
+        EffortTier::Medium => base,
+        EffortTier::High => base * 8 / 5,    // 1.6x
+        EffortTier::Xhigh => base * 2,       // 2.0x
+    };
+    secs.clamp(60, DAEMON_MAX_TIMEOUT_SECS)
+}
+
 impl DaemonOpts {
-    /// Routine per-item/per-sprint review: unchanged pre-capstone behavior.
+    /// Routine per-item/per-sprint review. The wall-clock backstop is now the
+    /// operator-tunable [`routine_timeout_secs`] (generous 5-min default, was a
+    /// hard-coded 120s) so a high-reasoning provider isn't killed mid-think; the
+    /// client ceiling trails it by [`CLIENT_TIMEOUT_MARGIN_SECS`]. Explore/stall/
+    /// effort shape is otherwise unchanged.
     pub fn routine() -> Self {
+        let timeout_secs = routine_timeout_secs();
         Self {
-            timeout_secs: 120,
-            client_timeout_secs: 150,
+            timeout_secs,
+            client_timeout_secs: timeout_secs + CLIENT_TIMEOUT_MARGIN_SECS,
             explore: false,
             stall_secs: None,
             repo_path: None,
@@ -724,6 +789,22 @@ impl DaemonOpts {
     pub fn with_effort(mut self, native_effort: Option<String>, model: Option<String>) -> Self {
         self.reasoning_effort = native_effort;
         self.model = model;
+        self
+    }
+
+    /// REVX-16: widen the wall-clock backstop to match a raised effort `tier`,
+    /// so a deep High/Xhigh routine review gets the minutes it needs instead of
+    /// being killed at the routine baseline. Only ever GROWS the budget
+    /// (`max` with the current value -- never shrinks `epic`/`intensive`'s
+    /// already-long budgets if ever composed onto them) and keeps the client
+    /// ceiling trailing by [`CLIENT_TIMEOUT_MARGIN_SECS`]. A no-op when the
+    /// tier's backstop is not larger than what the preset already carries.
+    pub fn with_backstop_for_tier(mut self, tier: EffortTier) -> Self {
+        let floor = tier_backstop_secs(tier);
+        if floor > self.timeout_secs {
+            self.timeout_secs = floor;
+            self.client_timeout_secs = floor + CLIENT_TIMEOUT_MARGIN_SECS;
+        }
         self
     }
 }
@@ -968,7 +1049,11 @@ mod tests {
     #[test]
     fn epic_daemon_opts_enable_explore_and_stall() {
         let routine = DaemonOpts::routine();
-        assert!(!routine.explore && routine.stall_secs.is_none() && routine.timeout_secs == 120);
+        // REVX-16: the routine backstop is now a generous 5-min default (was a
+        // hard-coded 120s that killed high-reasoning reviewers mid-think).
+        assert!(!routine.explore && routine.stall_secs.is_none());
+        assert_eq!(routine.timeout_secs, DEFAULT_ROUTINE_TIMEOUT_SECS);
+        assert_eq!(routine.client_timeout_secs, DEFAULT_ROUTINE_TIMEOUT_SECS + CLIENT_TIMEOUT_MARGIN_SECS);
         let epic = DaemonOpts::epic(Some("/repo".into()));
         assert!(epic.explore);
         assert!(epic.stall_secs.is_some());
@@ -978,11 +1063,62 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn revx16_tier_backstop_scales_and_respects_env_floor() {
+        std::env::remove_var("REVIEW_ROUTINE_TIMEOUT_SECS");
+        // Higher tiers get strictly more wall-clock; Medium == routine baseline.
+        assert_eq!(tier_backstop_secs(EffortTier::Medium), DEFAULT_ROUTINE_TIMEOUT_SECS);
+        assert!(tier_backstop_secs(EffortTier::High) > tier_backstop_secs(EffortTier::Medium));
+        assert!(tier_backstop_secs(EffortTier::Xhigh) > tier_backstop_secs(EffortTier::High));
+        // The Minimal/Low breadth tail keeps a tighter budget than Medium.
+        assert!(tier_backstop_secs(EffortTier::Low) < tier_backstop_secs(EffortTier::Medium));
+        // Default-base concrete values.
+        assert_eq!(tier_backstop_secs(EffortTier::Minimal), 180);
+        assert_eq!(tier_backstop_secs(EffortTier::Low), 240);
+        assert_eq!(tier_backstop_secs(EffortTier::High), 480);
+        assert_eq!(tier_backstop_secs(EffortTier::Xhigh), 600);
+        // The env knob is the Medium anchor; all tiers scale off it.
+        std::env::set_var("REVIEW_ROUTINE_TIMEOUT_SECS", "500");
+        assert_eq!(tier_backstop_secs(EffortTier::Medium), 500);
+        assert_eq!(tier_backstop_secs(EffortTier::Xhigh), 1000);
+        assert_eq!(tier_backstop_secs(EffortTier::Minimal), 300);
+        // Clamped to the daemon max.
+        std::env::set_var("REVIEW_ROUTINE_TIMEOUT_SECS", "999999");
+        assert_eq!(tier_backstop_secs(EffortTier::Medium), DAEMON_MAX_TIMEOUT_SECS);
+        assert_eq!(tier_backstop_secs(EffortTier::Xhigh), DAEMON_MAX_TIMEOUT_SECS);
+        std::env::remove_var("REVIEW_ROUTINE_TIMEOUT_SECS");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn revx16_with_backstop_for_tier_only_grows_and_trails_client() {
+        std::env::remove_var("REVIEW_ROUTINE_TIMEOUT_SECS");
+        let base = DaemonOpts::routine();
+        let hi = base.clone().with_backstop_for_tier(EffortTier::High);
+        assert!(hi.timeout_secs > base.timeout_secs);
+        assert_eq!(hi.client_timeout_secs, hi.timeout_secs + CLIENT_TIMEOUT_MARGIN_SECS);
+        // Never SHRINKS an already-longer preset (e.g. intensive's 900s).
+        let intensive = DaemonOpts::intensive();
+        let unchanged = intensive.clone().with_backstop_for_tier(EffortTier::Medium);
+        assert_eq!(unchanged.timeout_secs, intensive.timeout_secs);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn revx16_routine_env_override() {
+        std::env::set_var("REVIEW_ROUTINE_TIMEOUT_SECS", "420");
+        let r = DaemonOpts::routine();
+        assert_eq!(r.timeout_secs, 420);
+        assert_eq!(r.client_timeout_secs, 420 + CLIENT_TIMEOUT_MARGIN_SECS);
+        std::env::remove_var("REVIEW_ROUTINE_TIMEOUT_SECS");
+    }
+
+    #[test]
     fn intensive_daemon_opts_raise_effort_and_timeout_but_stay_out_of_explore_mode() {
         let routine = DaemonOpts::routine();
         let intensive = DaemonOpts::intensive();
-        // The proven failure point: routine's 120s backstop is too short for a
-        // genuinely deep review of a large diff -- intensive must exceed it.
+        // Intensive still exceeds the (now generous) routine backstop for a
+        // genuinely deep review of a large diff.
         assert!(intensive.timeout_secs > routine.timeout_secs);
         assert!(intensive.client_timeout_secs > intensive.timeout_secs);
         assert_eq!(intensive.reasoning_effort.as_deref(), Some(INTENSIVE_REASONING_EFFORT));

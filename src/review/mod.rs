@@ -1241,7 +1241,13 @@ than failing the whole call."
                 // (never regresses) the old fixed-`"high"` intensive() preset.
                 dispatch::DaemonOpts::intensive_with(decision.native.clone(), decision.model.clone())
             } else if effort_cfg.enabled && dispatch::is_daemon_provider(provider) {
-                daemon_opts.clone().with_effort(decision.native.clone(), decision.model.clone())
+                // REVX-16: a daemon provider running at a raised effort tier also
+                // gets a wall-clock backstop scaled to that tier, so a deep
+                // High/Xhigh pass isn't killed at the routine baseline mid-think.
+                daemon_opts
+                    .clone()
+                    .with_effort(decision.native.clone(), decision.model.clone())
+                    .with_backstop_for_tier(decision.tier)
             } else {
                 daemon_opts.clone()
             };
