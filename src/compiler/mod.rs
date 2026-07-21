@@ -382,7 +382,11 @@ const BUILD_STAGE_BY_SHA_ENV: &str = "BUILD_STAGE_BY_SHA";
 fn stage_by_sha_enabled() -> bool {
     match env_nonempty(BUILD_STAGE_BY_SHA_ENV) {
         None => true,
-        Some(v) => !matches!(v.to_lowercase().as_str(), "0" | "false"),
+        // "off" accepted alongside "0"/"false" — every doc comment and
+        // fail-closed error message in this module tells an operator to set
+        // `BUILD_STAGE_BY_SHA=off` as the rollback lever, so that spelling
+        // MUST actually work.
+        Some(v) => !matches!(v.to_lowercase().as_str(), "0" | "false" | "off"),
     }
 }
 
@@ -510,41 +514,141 @@ async fn resolve_ref_to_sha(
     Ok(sha.to_lowercase())
 }
 
-/// PCON-02: the fail-closed built-SHA integrity check, factored out as a pure
-/// (synchronous, filesystem-only) function so it is unit-testable without any
-/// of `build_inner`'s surrounding I/O. Reads the [`BUILT_SHA_SIDECAR`]
-/// `autostage_source` wrote at publish time and asserts it matches
-/// `resolved_sha`; on success returns the confirmed sha (== `resolved_sha`, by
-/// construction — a distinct return value rather than just `Ok(())` mirrors
-/// what the caller stores as `built_sha`). A missing sidecar (an older
-/// ref-keyed stage, or a manually-placed/foreign tree) is a HARD mismatch —
-/// exactly the class of bug (a clobbered or alien-SHA tree) this item exists
-/// to catch, never a silent pass.
+/// PCON-01/04 (S122 root-cause fix): resolve `module@git_ref` to its durable
+/// enqueue-time identity for a QUEUED job — `Some(sha)` when SHA-staging is
+/// enabled and the ref resolves, `None` when `BUILD_STAGE_BY_SHA=off` (the
+/// rollback lever), and a fail-closed `Err` when SHA-staging is enabled but
+/// resolution fails (never silently enqueues a job whose identity is
+/// unresolved). Shared by every enqueue entry point
+/// (`CompilerBuild::enqueue_async_onto`, `CompilerRequest::execute_structured`)
+/// so they can never drift onto different resolve-or-not policies.
+async fn resolve_sha_for_enqueue(module: &str, git_ref: &str) -> Result<Option<String>, ToolError> {
+    if !stage_by_sha_enabled() {
+        return Ok(None);
+    }
+    let mut redact: Vec<String> = Vec::new();
+    resolve_ref_to_sha(module, git_ref, &mut redact)
+        .await
+        .map(Some)
+        .map_err(|e| {
+            ToolError::Execution(format!(
+                "compiler: could not resolve {module}@{git_ref} to a commit sha at enqueue \
+                 time (fail-closed — set {BUILD_STAGE_BY_SHA_ENV}=off to fall back to the \
+                 legacy ref-keyed staging/dedupe path): {e}"
+            ))
+        })
+}
+
+/// PCON-02 (root-caused + FINDING 4, review): the built-identity integrity
+/// check, factored out as a pure (synchronous, filesystem-only) function so
+/// it is unit-testable without any of `build_inner`'s surrounding I/O. Reads
+/// the [`BUILT_SHA_SIDECAR`] `autostage_source` wrote at publish time and
+/// asserts it matches `expected_identity` (the resolved sha in SHA-mode, or
+/// the raw ref in the legacy `BUILD_STAGE_BY_SHA=off` mode — the caller
+/// passes `stage_key`/`job_identity` either way, so this function itself
+/// never needs to know which mode is active).
+///
+/// `strict` is what changed for FINDING 4: previously the off-path skipped
+/// this check ENTIRELY (never called at all), silently reintroducing the
+/// original clobber-reuse gap the moment an operator flipped the rollback
+/// lever — the exact failure mode PCON-02 exists to catch. Now the check
+/// ALWAYS runs on the default-staged path (never for an explicit
+/// `source_dir` override, unaffected either way); `strict` only changes how
+/// a MISSING sidecar is treated:
+///   - `strict=true` (SHA-mode; `autostage_source` has ALWAYS written this
+///     sidecar since PCON-01 shipped): a missing sidecar is a HARD mismatch —
+///     an older/foreign/pre-PCON tree must never be silently trusted at a
+///     specific sha identity.
+///   - `strict=false` (`BUILD_STAGE_BY_SHA=off`): a missing sidecar is
+///     EXPECTED for any directory that predates this whole PCON initiative
+///     (the rollback lever must not itself start hard-failing builds that
+///     worked before the sidecar existed) — logged, not fatal.
+/// A sidecar that IS present but MISMATCHES is ALWAYS a hard failure in
+/// EITHER mode — that is a real "this directory was staged for a different
+/// identity" signal, never something to paper over.
+/// Returns `Ok(Some(identity))` on a verified match, `Ok(None)` ONLY for the
+/// documented `strict=false` + missing-sidecar pass-through (FINDING 4), and
+/// `Err` on any real integrity failure (a present-but-mismatched sidecar in
+/// EITHER mode, or a missing sidecar under `strict=true`).
 fn check_built_sha_sidecar(
     local_source_dir: &std::path::Path,
     module: &str,
-    resolved_sha: &str,
-) -> Result<String, ToolError> {
+    expected_identity: &str,
+    strict: bool,
+) -> Result<Option<String>, ToolError> {
     let sidecar_path = local_source_dir.join(BUILT_SHA_SIDECAR);
     let on_disk = std::fs::read_to_string(&sidecar_path)
         .ok()
         .map(|s| s.trim().to_lowercase());
     match on_disk {
-        Some(got) if got == resolved_sha => Ok(got),
+        Some(got) if got == expected_identity => Ok(Some(got)),
         Some(got) => Err(ToolError::Execution(format!(
-            "compiler: built-SHA integrity check FAILED for {module}: staged tree at {} \
-             carries sidecar sha {got:?} but the requested/resolved sha is {resolved_sha:?} — \
-             refusing to build a possibly-alien commit (fail-closed, PCON-02); remove the \
-             stage dir to force a fresh SHA-keyed re-stage",
+            "compiler: built-identity integrity check FAILED for {module}: staged tree at {} \
+             carries sidecar identity {got:?} but the requested identity is \
+             {expected_identity:?} — refusing to build a possibly-alien commit (fail-closed, \
+             PCON-02/PCON-04); remove the stage dir to force a fresh re-stage",
             local_source_dir.display()
         ))),
-        None => Err(ToolError::Execution(format!(
+        None if strict => Err(ToolError::Execution(format!(
             "compiler: built-SHA integrity check FAILED for {module}: staged tree at {} has \
              no {BUILT_SHA_SIDECAR} sidecar (an older ref-keyed stage or a foreign/manual \
              checkout) — refusing to build without SHA provenance (fail-closed, PCON-02); \
              remove the stage dir to force a fresh SHA-keyed re-stage",
             local_source_dir.display()
         ))),
+        None => {
+            // FINDING 4: BUILD_STAGE_BY_SHA=off — a missing sidecar here is the
+            // EXPECTED state for anything staged before this feature existed;
+            // logged (visible, not silent) but never fails the build. A
+            // sidecar that DOES exist and mismatches is still caught above,
+            // unconditionally — this is the one narrowing, not a blanket skip.
+            tracing::warn!(
+                "compiler: {module} staged tree at {} has no {BUILT_SHA_SIDECAR} sidecar \
+                 (BUILD_STAGE_BY_SHA=off — legacy ref-keyed mode; a pre-PCON or never-verified \
+                 stage) — proceeding without an identity check on this dir (fail-open ONLY in \
+                 this documented rollback mode; a MISMATCHED sidecar would still be rejected)",
+                local_source_dir.display()
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// PCON-03: best-effort read of a REMOTE `.built_sha` sidecar over ssh —
+/// `None` on ANY failure (host unreachable, dir/sidecar missing, empty
+/// output). Used ONLY to decide whether an already-staged remote per-sha tree
+/// can be REUSED (skip the transfer entirely, so nothing ever `rsync
+/// --delete`s into a directory a sibling build might be reading — FINDING 3).
+/// This is deliberately tolerant/non-propagating: the STRICT, error-
+/// propagating check that actually gates the build is the unconditional
+/// post-relay assertion at the heavy-path call site (mirrors
+/// [`check_built_sha_sidecar`]'s local/strict-vs-probe split).
+async fn remote_sidecar_sha_best_effort(
+    host_addr: &str,
+    remote_dir: &str,
+    redact: &[String],
+) -> Option<String> {
+    let path = format!("{remote_dir}/{BUILT_SHA_SIDECAR}");
+    let out = run(
+        &[
+            "ssh".to_string(),
+            host_addr.to_string(),
+            format!("cat {}", shell_quote(&path)),
+        ],
+        None,
+        &BTreeMap::new(),
+        Duration::from_secs(30),
+        redact,
+        None,
+        None,
+    )
+    .await
+    .ok()?;
+    let sha = out.trim().to_lowercase();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
     }
 }
 
@@ -2372,6 +2476,18 @@ impl CompilerBuild {
         let mode = parse_mode_arg(&args)?;
         let heavy = request_is_heavy(host_req, &module, fast);
 
+        // PCON-01/04 (S122 root-cause fix): resolve `ref -> sha` HERE, at
+        // enqueue/request time — BEFORE the job is durably recorded — so the
+        // resolved sha becomes the job's durable identity (queue dedupe, the
+        // module-serialization lock, GC's live-set, and the on-disk per-sha
+        // stage dir name all key off it, via `queue::job_identity`). This is
+        // what closes the "ref moves while queued" race: resolving again at
+        // DISPATCH time (when the scheduler eventually claims the job) would
+        // let two enqueues of the same branch at different SHAs (or two
+        // different branches that later resolve to the same sha) race or
+        // silently diverge.
+        let resolved_sha = resolve_sha_for_enqueue(&module, &git_ref).await?;
+
         let enq = store
             .enqueue(&JobRequest {
                 module: module.clone(),
@@ -2382,6 +2498,7 @@ impl CompilerBuild {
                 bin,
                 force: false,
                 mode: mode.clone(),
+                resolved_sha: resolved_sha.clone(),
             })
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
@@ -2414,6 +2531,9 @@ impl CompilerBuild {
             "mode": mode,
             "heavy": heavy,
             "wait": false,
+            // PCON-01/04: the identity this job is durably keyed by from here on
+            // (null only when BUILD_STAGE_BY_SHA=off).
+            "resolved_sha": resolved_sha,
         });
         Ok(ToolOutput::with_structured(text, structured))
     }
@@ -2600,18 +2720,23 @@ impl CompilerBuild {
             }
         })?;
 
-        // PCON-02: fail-closed built-SHA integrity check — ONLY on the SHA-staged
-        // default path (never for an explicit `source_dir` override, which is
-        // untouched by any of PCON-01..05). Reads the sidecar `autostage_source`
-        // wrote at publish time and asserts it matches the resolved sha; a
-        // missing sidecar (an older ref-keyed stage, or a manually-placed tree)
-        // is treated as a hard mismatch — exactly the class of bug (a clobbered
-        // or alien-SHA tree) this item exists to catch, instead of silently
-        // building whatever happens to be on disk.
-        let mut built_sha: Option<String> = None;
-        if let Some(sha) = &resolved_sha {
-            built_sha = Some(check_built_sha_sidecar(&local_source_dir, &module, sha)?);
-        }
+        // PCON-02/FINDING 4: the built-identity integrity check now runs on
+        // EVERY default-staged build (still NEVER for an explicit
+        // `source_dir` override — untouched by any of PCON-01..05) — in BOTH
+        // SHA-mode and the legacy `BUILD_STAGE_BY_SHA=off` mode. Previously
+        // the off-path skipped this check entirely, silently reintroducing
+        // the clobber-reuse gap the moment an operator flipped the rollback
+        // lever. `strict=resolved_sha.is_some()`: in SHA-mode a missing
+        // sidecar is a hard failure (autostage_source has always written one
+        // since PCON-01); in the off/legacy mode a missing sidecar is
+        // expected for a pre-existing/pre-PCON directory (warned, not
+        // fatal) — but a PRESENT, MISMATCHED sidecar is a hard failure
+        // either way (see `check_built_sha_sidecar`'s doc).
+        let built_sha = if explicit_source_dir {
+            None
+        } else {
+            check_built_sha_sidecar(&local_source_dir, &module, stage_key, resolved_sha.is_some())?
+        };
 
         // Pinned toolchain channel to ensure (idempotent; never `rustup update`).
         // BLD-444: this installs the CHANNEL only — it does not itself add the
@@ -2834,45 +2959,164 @@ impl CompilerBuild {
                 events::Emit::stage(events::Stage::Relaying)
                     .message(resolved.role.as_str().to_string()),
             );
-            // Stage source to the remote + ensure the remote dirs exist. Every
-            // interpolated remote path is shell-quoted (defense-in-depth on top of
-            // the segment validation above), and rsync uses `-s`/--protect-args so
-            // the remote path is never re-split by the remote shell.
+            // Ensure the per-job remote TARGET dir exists either way (source
+            // staging below handles `remote_source`/its parent itself).
             run(
                 &[
                     "ssh".into(),
                     host_addr.clone(),
-                    format!(
-                        "mkdir -p {} {}",
-                        shell_quote(&remote_source),
-                        shell_quote(&remote_target_str)
-                    ),
+                    format!("mkdir -p {}", shell_quote(&remote_target_str)),
                 ],
                 None,
                 &BTreeMap::new(),
-                Duration::from_secs(120),
+                Duration::from_secs(60),
                 &redact,
                 None,
                 None,
             )
             .await?;
-            run(
-                &[
-                    "rsync".into(),
-                    "-a".into(),
-                    "--delete".into(),
-                    "-s".into(),
-                    format!("{}/", local_source_dir.to_string_lossy()),
-                    format!("{host_addr}:{remote_source}/"),
-                ],
-                None,
-                &BTreeMap::new(),
-                Duration::from_secs(1800),
-                &redact,
-                None,
-                None,
-            )
-            .await?;
+
+            if let Some(sha) = &resolved_sha {
+                // PCON-03 (FINDING 3 review fix): with staging content-addressed
+                // by sha (PCON-01), TWO jobs that resolved DIFFERENT original
+                // refs to the SAME sha relay to this SAME `remote_source` — the
+                // whole point (dedup: identical content, no reason to stage it
+                // twice). But `rsync -a --delete` straight into a directory a
+                // SIBLING job's build might already be reading from is exactly
+                // the clobber this item exists to close. So: if the remote
+                // ALREADY carries a verified copy of this sha, REUSE it (no
+                // transfer at all — never touches the live `remote_source`).
+                // Otherwise, stage into an ISOLATED sibling temp dir (where
+                // `--delete` is safe — nothing else can see it yet) and
+                // atomically `mv -T` it into place, mirroring
+                // `autostage_source`'s local atomic-rename publish exactly: the
+                // move either wins outright, or fails because a racer already
+                // published first (`mv -T` refuses to merge into an existing
+                // directory) — a safe no-op either way, verified afterward by
+                // the PCON-02 sidecar assertion below regardless of which
+                // racer's `mv` actually landed.
+                let reused = remote_sidecar_sha_best_effort(&host_addr, &remote_source, &redact)
+                    .await
+                    .as_deref()
+                    == Some(sha.as_str());
+                if reused {
+                    tracing::debug!(
+                        "compiler: heavy relay for {module}@{sha} reuses the already-staged \
+                         remote tree at {remote_source} (PCON-03 same-sha dedup, no transfer)"
+                    );
+                } else {
+                    let remote_source_parent = remote_source
+                        .rsplit_once('/')
+                        .map(|(p, _)| p.to_string())
+                        .unwrap_or_else(|| remote_root.clone());
+                    let staging_remote =
+                        format!("{remote_source}.stage-{}", uuid::Uuid::new_v4().simple());
+                    run(
+                        &[
+                            "ssh".into(),
+                            host_addr.clone(),
+                            format!(
+                                "mkdir -p {} {}",
+                                shell_quote(&remote_source_parent),
+                                shell_quote(&staging_remote)
+                            ),
+                        ],
+                        None,
+                        &BTreeMap::new(),
+                        Duration::from_secs(120),
+                        &redact,
+                        None,
+                        None,
+                    )
+                    .await?;
+                    // Export into the ISOLATED staging dir. `--delete` is safe
+                    // HERE — it is a fresh, not-yet-published dir nothing else
+                    // can be reading.
+                    run(
+                        &[
+                            "rsync".into(),
+                            "-a".into(),
+                            "--delete".into(),
+                            "-s".into(),
+                            format!("{}/", local_source_dir.to_string_lossy()),
+                            format!("{host_addr}:{staging_remote}/"),
+                        ],
+                        None,
+                        &BTreeMap::new(),
+                        Duration::from_secs(1800),
+                        &redact,
+                        None,
+                        None,
+                    )
+                    .await?;
+                    // Atomic publish: `mv -T` (no-target-directory — a plain
+                    // rename, never "move INTO an existing dir") either wins,
+                    // or fails because `remote_source` already exists (a
+                    // concurrent racer published first). The `|| rm -rf`
+                    // fallback always cleans up OUR staging dir either way, so
+                    // this shell step always exits 0 — a lost race or a genuine
+                    // remote failure are BOTH caught by the unconditional
+                    // PCON-02 sidecar assertion right after this block (a
+                    // publish that neither landed nor found a matching racer
+                    // leaves no/an unreadable sidecar, which that check treats
+                    // as a hard failure).
+                    run(
+                        &[
+                            "ssh".into(),
+                            host_addr.clone(),
+                            format!(
+                                "mv -T {} {} 2>/dev/null || rm -rf {}",
+                                shell_quote(&staging_remote),
+                                shell_quote(&remote_source),
+                                shell_quote(&staging_remote)
+                            ),
+                        ],
+                        None,
+                        &BTreeMap::new(),
+                        Duration::from_secs(120),
+                        &redact,
+                        None,
+                        None,
+                    )
+                    .await?;
+                }
+            } else {
+                // Legacy path (BUILD_STAGE_BY_SHA=off): unchanged verbatim
+                // behavior — `remote_source` is ref-keyed (never shared by two
+                // different refs, so the same-sha sharing this fix addresses
+                // does not arise here).
+                run(
+                    &[
+                        "ssh".into(),
+                        host_addr.clone(),
+                        format!("mkdir -p {}", shell_quote(&remote_source)),
+                    ],
+                    None,
+                    &BTreeMap::new(),
+                    Duration::from_secs(120),
+                    &redact,
+                    None,
+                    None,
+                )
+                .await?;
+                run(
+                    &[
+                        "rsync".into(),
+                        "-a".into(),
+                        "--delete".into(),
+                        "-s".into(),
+                        format!("{}/", local_source_dir.to_string_lossy()),
+                        format!("{host_addr}:{remote_source}/"),
+                    ],
+                    None,
+                    &BTreeMap::new(),
+                    Duration::from_secs(1800),
+                    &redact,
+                    None,
+                    None,
+                )
+                .await?;
+            }
 
             // PCON-02 (remote leg): re-assert the built-SHA integrity check
             // against the tree that ACTUALLY landed on the heavy host — a
@@ -2902,7 +3146,10 @@ impl CompilerBuild {
                         "compiler: built-SHA integrity check FAILED for {module} on the heavy \
                          host: could not read the remote {BUILT_SHA_SIDECAR} sidecar at \
                          {remote_source} after relay ({e}) — refusing to build a tree whose \
-                         provenance could not be confirmed (fail-closed, PCON-02)"
+                         provenance could not be confirmed (fail-closed, PCON-02); if this \
+                         persists, a stale/incomplete directory from before PCON-03's atomic \
+                         publish may be wedging {remote_source} on the heavy host — an \
+                         operator should verify and remove it manually"
                     ))
                 })?;
                 let got = remote_sidecar.trim().to_lowercase();
@@ -2911,7 +3158,9 @@ impl CompilerBuild {
                         "compiler: built-SHA integrity check FAILED for {module} on the heavy \
                          host: remote sidecar sha {got:?} at {remote_source} != requested/\
                          resolved sha {sha:?} — refusing to build a possibly-alien commit \
-                         (fail-closed, PCON-02)"
+                         (fail-closed, PCON-02); if this persists across retries, a \
+                         stale/incomplete pre-PCON-03 directory may be wedging {remote_source} \
+                         on the heavy host — an operator should verify and remove it manually"
                     )));
                 }
             }
@@ -3970,10 +4219,20 @@ pub(crate) async fn invoke_build(
     bin: Option<&str>,
     mode: &str,
     request_id: Option<&str>,
+    resolved_sha: Option<&str>,
 ) -> Result<(), ToolError> {
+    // PCON-01/04 (S122 root-cause fix): dispatch against the sha resolved at
+    // ENQUEUE time (`queue::JobRequest::resolved_sha`, carried through
+    // `QueuedJob`), never by re-resolving `git_ref` here. Re-resolving at
+    // dispatch time would reopen exactly the race this fix closes — the ref
+    // could have moved between enqueue and dispatch. Since a full sha is
+    // already `is_full_sha`, `build_inner`'s own resolution step is then a
+    // verbatim no-op (no network call), so this is purely "use the identity
+    // we already committed to", not a second resolution.
+    let effective_ref = resolved_sha.filter(|s| !s.is_empty()).unwrap_or(git_ref);
     let mut args = json!({
         "module": module,
-        "ref": git_ref,
+        "ref": effective_ref,
         "host": if heavy { "heavy" } else { "primary" },
         "mode": if mode == "test" { "test" } else { "build" },
     });
@@ -4108,6 +4367,9 @@ impl RustTool for CompilerRequest {
                     .to_string(),
             )
         })?;
+        // PCON-01/04 (S122 root-cause fix): see `enqueue_async_onto`'s identical
+        // block for the full rationale — resolve ONCE, here, at request time.
+        let resolved_sha = resolve_sha_for_enqueue(&module, &git_ref).await?;
         let enq = store
             .enqueue(&JobRequest {
                 module: module.clone(),
@@ -4118,6 +4380,7 @@ impl RustTool for CompilerRequest {
                 bin,
                 force,
                 mode: mode.clone(),
+                resolved_sha: resolved_sha.clone(),
             })
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
@@ -4142,6 +4405,7 @@ impl RustTool for CompilerRequest {
             "ready": ready,
             "force": force,
             "mode": mode,
+            "resolved_sha": resolved_sha,
         });
         Ok(ToolOutput::with_structured(text, structured))
     }
@@ -4462,6 +4726,13 @@ mod tests {
         // core `enqueue_async` delegates to; exercising it directly here is the
         // deterministic substitute for mocking `RedisQueue::from_env` (which is a
         // process-global singleton and can't be redirected at a fake after boot).
+        //
+        // PCON-01/04: this test's `ref` ("abc123") is not a real, resolvable sha
+        // and no Gitea is reachable in a unit test, so SHA-staging is disabled
+        // here (the documented rollback lever) — this test is about the
+        // ENQUEUE/plumbing contract, not sha resolution (that has its own
+        // dedicated tests: `resolve_ref_to_sha_*`).
+        let _env = ScopedEnv::new().set(BUILD_STAGE_BY_SHA_ENV, "off");
         let q = crate::compiler::queue::fake::InMemoryQueue::new();
         let start = std::time::Instant::now();
         let out = CompilerBuild::enqueue_async_onto(
@@ -6585,7 +6856,7 @@ mod tests {
             let _env = ScopedEnv::new().unset(BUILD_STAGE_BY_SHA_ENV);
             assert!(stage_by_sha_enabled(), "default must be ON (the safe-by-construction path)");
         }
-        for off in ["0", "false", "FALSE", "False"] {
+        for off in ["0", "false", "FALSE", "False", "off", "OFF"] {
             let _env = ScopedEnv::new().set(BUILD_STAGE_BY_SHA_ENV, off);
             assert!(!stage_by_sha_enabled(), "{off:?} must disable SHA-staging (rollback lever)");
         }
@@ -6622,6 +6893,40 @@ mod tests {
         assert!(matches!(err, ToolError::NotConfigured(_)), "{err:?}");
     }
 
+    // ── ROOT-CAUSE FIX: resolve_sha_for_enqueue (the enqueue-time resolution
+    // every enqueue entry point shares) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_sha_for_enqueue_is_none_when_stage_by_sha_is_off() {
+        let _env = ScopedEnv::new().set(BUILD_STAGE_BY_SHA_ENV, "off");
+        let got = resolve_sha_for_enqueue("terminus", "main").await.unwrap();
+        assert_eq!(got, None, "the rollback lever must skip resolution entirely, not just fail-open");
+    }
+
+    #[tokio::test]
+    async fn resolve_sha_for_enqueue_returns_the_sha_verbatim_for_an_already_full_sha() {
+        let _env = ScopedEnv::new().unset(BUILD_STAGE_BY_SHA_ENV);
+        let sha = "1".repeat(40);
+        let got = resolve_sha_for_enqueue("terminus", &sha).await.unwrap();
+        assert_eq!(got, Some(sha));
+    }
+
+    #[tokio::test]
+    async fn resolve_sha_for_enqueue_fails_closed_on_a_branch_ref_when_gitea_unreachable() {
+        // The load-bearing enqueue-time guarantee: SHA-staging ON + a branch
+        // ref that cannot be resolved (no Gitea reachable in a unit test) MUST
+        // fail the enqueue outright — never silently enqueue a job whose
+        // durable identity is unresolved (that would be the exact "ref moves
+        // while queued" race this whole fix closes).
+        let _env = ScopedEnv::new()
+            .unset(BUILD_STAGE_BY_SHA_ENV)
+            .set("GITEA_URL", "http://gitea.example.internal:3000")
+            .unset("GITEA_IDENTITY_NAME")
+            .unset("GITEA_PAT_MOOSE");
+        let err = resolve_sha_for_enqueue("terminus", "main").await.unwrap_err();
+        assert!(err.to_string().contains("enqueue time"), "{err}");
+    }
+
     #[tokio::test]
     async fn resolve_ref_to_sha_pushes_token_to_redact_before_any_network_attempt() {
         // Mirrors the S7 push-before-touch discipline `autostage_source` uses:
@@ -6647,8 +6952,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sha = "a".repeat(40);
         std::fs::write(dir.path().join(BUILT_SHA_SIDECAR), format!("{sha}\n")).unwrap();
-        let got = check_built_sha_sidecar(dir.path(), "terminus", &sha).unwrap();
-        assert_eq!(got, sha);
+        let got = check_built_sha_sidecar(dir.path(), "terminus", &sha, true).unwrap();
+        assert_eq!(got, Some(sha));
     }
 
     #[test]
@@ -6657,12 +6962,12 @@ mod tests {
         let sha = "b".repeat(40);
         std::fs::write(dir.path().join(BUILT_SHA_SIDECAR), format!("  {} \n", sha.to_uppercase()))
             .unwrap();
-        let got = check_built_sha_sidecar(dir.path(), "terminus", &sha).unwrap();
-        assert_eq!(got, sha);
+        let got = check_built_sha_sidecar(dir.path(), "terminus", &sha, true).unwrap();
+        assert_eq!(got, Some(sha));
     }
 
     #[test]
-    fn check_built_sha_sidecar_fails_closed_on_a_mismatch() {
+    fn check_built_sha_sidecar_fails_closed_on_a_mismatch_strict() {
         // This is the exact class of bug PCON-02 exists to catch: a staged tree
         // that carries a DIFFERENT sha than what was requested/resolved (a
         // clobbered or alien-SHA checkout) must be refused, not silently built.
@@ -6670,19 +6975,52 @@ mod tests {
         let staged = "c".repeat(40);
         let requested = "d".repeat(40);
         std::fs::write(dir.path().join(BUILT_SHA_SIDECAR), &staged).unwrap();
-        let err = check_built_sha_sidecar(dir.path(), "terminus", &requested).unwrap_err();
+        let err = check_built_sha_sidecar(dir.path(), "terminus", &requested, true).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains(&staged) && msg.contains(&requested), "{msg}");
     }
 
     #[test]
-    fn check_built_sha_sidecar_fails_closed_when_sidecar_is_missing() {
-        // An older ref-keyed stage (or a foreign/manually-placed tree) has no
-        // sidecar at all — treated as a hard mismatch (fail-closed), not a pass.
+    fn check_built_sha_sidecar_fails_closed_when_sidecar_is_missing_strict() {
+        // SHA-mode (strict=true): an older ref-keyed stage (or a foreign/
+        // manually-placed tree) has no sidecar at all — treated as a hard
+        // mismatch (fail-closed), not a pass.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path()).unwrap();
-        let err = check_built_sha_sidecar(dir.path(), "terminus", &"e".repeat(40)).unwrap_err();
+        let err = check_built_sha_sidecar(dir.path(), "terminus", &"e".repeat(40), true).unwrap_err();
         assert!(err.to_string().contains(BUILT_SHA_SIDECAR));
+    }
+
+    // ── FINDING 4 (review): strict=false (BUILD_STAGE_BY_SHA=off) policy ──────
+
+    #[test]
+    fn check_built_sha_sidecar_non_strict_allows_a_missing_sidecar() {
+        // The legacy/off-mode rollback lever must not itself start hard-failing
+        // builds whose stage dir predates this feature (no sidecar at all).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let got = check_built_sha_sidecar(dir.path(), "terminus", "main", false).unwrap();
+        assert_eq!(got, None, "missing sidecar in non-strict mode is a pass-through, not a sha");
+    }
+
+    #[test]
+    fn check_built_sha_sidecar_non_strict_still_fails_closed_on_a_present_mismatch() {
+        // FINDING 4's actual fix: even in the off/legacy mode, a sidecar that
+        // IS present but names a DIFFERENT identity must still be rejected —
+        // "off" only tolerates a missing sidecar, never a wrong one.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(BUILT_SHA_SIDECAR), "some-other-branch").unwrap();
+        let err = check_built_sha_sidecar(dir.path(), "terminus", "main", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("some-other-branch") && msg.contains("main"), "{msg}");
+    }
+
+    #[test]
+    fn check_built_sha_sidecar_non_strict_passes_on_a_matching_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(BUILT_SHA_SIDECAR), "main").unwrap();
+        let got = check_built_sha_sidecar(dir.path(), "terminus", "main", false).unwrap();
+        assert_eq!(got, Some("main".to_string()));
     }
 
     // ── PCON-03: per-(module, sha) remote source/target disjointness ──────────
