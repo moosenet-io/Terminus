@@ -41,6 +41,8 @@ pub mod gateway;
 pub mod house_style;
 pub mod gateway_framework;
 pub mod github;
+#[cfg(test)]
+mod hermeticity; // PCON-08: test-hermeticity source-scan guard (test-only)
 pub mod <secret-manager>; // pii-test-fixture
 pub mod inference_proxy;
 pub mod intake;
