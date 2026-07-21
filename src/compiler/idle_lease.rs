@@ -2337,6 +2337,7 @@ mod tests {
             bin: None,
             force: false,
             mode: "build".to_string(),
+            resolved_sha: None,
         };
         let key = "BUILD_MODULE_PEAK_MB_BUDGETPROBE_UNIQZZ";
         // No per-module peak ⇒ falls back to the global default (7 GiB).

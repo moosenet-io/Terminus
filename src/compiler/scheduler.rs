@@ -3,9 +3,13 @@
 //! Reads the durable [`queue`](super::queue) and makes runs happen *gracefully*:
 //! small/capped builds go now on the primary; heavy builds (that need the heavy
 //! host's idle-mode) are held for a configured build **window** or a fleet-quiet
-//! signal. Concurrency is bounded per host, and no two conflicting builds of one
-//! module ever run at once (the queue's per-module lock, enforced atomically in
-//! [`QueueStore::claim`]).
+//! signal. Concurrency is bounded per host, and no two builds of the exact same
+//! `(module, ref)` ever run at once (the queue's `(module, ref)` lock, enforced
+//! atomically in [`QueueStore::claim`]) — PCON-04 (S122) re-keyed this lock from
+//! `module` alone: with PCON-01..03's per-SHA stage/target isolation, two
+//! DIFFERENT shas of one module no longer need to be force-serialized. Each tick
+//! also opportunistically GCs stale per-SHA stage dirs (PCON-05, best-effort,
+//! never fails the tick).
 //!
 //! ## Dispatch rule (per tick)
 //! Walk the queue in dispatch order (priority, then FIFO). For each job:
@@ -398,6 +402,7 @@ impl BuildExecutor for CompilerBuildExecutor {
             job.bin.as_deref(),
             &job.mode,
             Some(&job.job_id),
+            job.resolved_sha.as_deref(),
         )
         .await
         .map_err(|e| e.to_string())
@@ -499,6 +504,46 @@ impl Scheduler {
                 return report;
             }
         };
+        // PCON-05: snapshot the currently-live `(module -> {identity})` set
+        // BEFORE the dispatch loop below consumes `jobs`, so the opportunistic
+        // GC sweep at the end of this tick never reclaims a stage dir a job
+        // still references. Two root-cause-fix requirements (review):
+        //
+        // 1. Every entry uses `queue::job_identity` (the resolved sha when
+        //    known, else the raw ref) — NEVER `git_ref` alone. The on-disk
+        //    per-sha stage dir PCON-01 creates is named by the resolved sha;
+        //    a live-set keyed by the mutable ref for a branch-based job would
+        //    never actually match that directory name, silently defeating
+        //    this protection for the common (non-direct-sha) case.
+        // 2. The set MUST include in-flight (building) jobs, not just queued
+        //    ones (FINDING 2) — a claimed job drops out of `peek`'s queued set
+        //    entirely while its build is still actively reading the stage dir
+        //    off disk. `snapshot()`'s `leases` field is the queue's own
+        //    definition of "currently building". A snapshot FAILURE is
+        //    fail-closed: GC is SKIPPED entirely this tick (never runs with a
+        //    partial/stale live-set that could omit a real in-flight build) —
+        //    dispatch itself is unaffected, only the opportunistic GC sweep
+        //    at the very end is gated on it.
+        let mut live_by_module: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for j in &jobs {
+            live_by_module
+                .entry(j.module.clone())
+                .or_default()
+                .insert(crate::compiler::queue::job_identity(&j.git_ref, &j.resolved_sha).to_string());
+        }
+        let snapshot_result = self.queue.snapshot().await;
+        if let Ok(snap) = &snapshot_result {
+            for lease in &snap.leases {
+                live_by_module
+                    .entry(lease.module.clone())
+                    .or_default()
+                    .insert(
+                        crate::compiler::queue::job_identity(&lease.git_ref, &lease.resolved_sha)
+                            .to_string(),
+                    );
+            }
+        }
         for job in jobs {
             let host = if job.heavy {
                 HostRole::Heavy
@@ -542,6 +587,25 @@ impl Scheduler {
                     break;
                 }
             }
+        }
+        // PCON-05: opportunistic GC of stale per-sha stage dirs. Runs on every
+        // tick but is cheap (a `read_dir` + a bounded reclaim) and never
+        // fails/blocks the tick's DISPATCH outcome — see
+        // `gc_stage_dirs_best_effort`'s doc. FAIL-CLOSED (review FINDING 2's
+        // explicit follow-up): if the snapshot() above failed, `live_by_module`
+        // is missing the in-flight/building set entirely — GC MUST NOT run
+        // against that incomplete picture, so it is skipped this tick rather
+        // than risking a reclaim of a dir a build we simply couldn't see is
+        // still reading. Reconcile/peek failing earlier in this tick already
+        // returns before reaching here, so this is the one remaining path
+        // that could otherwise silently proceed on partial data.
+        if snapshot_result.is_ok() {
+            super::gc_stage_dirs_best_effort(&live_by_module);
+        } else {
+            tracing::warn!(
+                "compiler scheduler: queue snapshot unavailable this tick — skipping PCON-05 \
+                 GC (fail-closed: never reclaim stage dirs without the full in-flight live-set)"
+            );
         }
         report
     }
@@ -828,6 +892,7 @@ mod tests {
             bin: None,
             force: false,
             mode: "build".to_string(),
+            resolved_sha: None,
         }
     }
 
@@ -1412,5 +1477,275 @@ mod tests {
             q.claim(&j_next.job_id, "m1", HostRole::Primary, 2).await.unwrap(),
             ClaimOutcome::Claimed { .. }
         ));
+    }
+
+    /// Create `module_root/<name>` and back-date its mtime by `age_secs` (no new
+    /// dependency: `std::fs::File::set_modified`, stable since Rust 1.75).
+    fn touch_dir(module_root: &std::path::Path, name: &str, age_secs: u64) {
+        let dir = module_root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        let f = std::fs::File::open(&dir).unwrap();
+        f.set_modified(mtime).unwrap();
+    }
+
+    /// A deterministic, VALID full-40-hex-sha-shaped name for test dir `i` —
+    /// PCON-05 FIX 1 means GC ignores any dir whose name is NOT this shape
+    /// (mirrors `compiler::tests::fake_sha`), so every GC-relevant test dir
+    /// here (and every `git_ref`/`resolved_sha` a live job references, so the
+    /// live-set entry actually matches a real GC-candidate name) must use one.
+    fn fake_sha(i: usize) -> String {
+        format!("{i:0>40}")
+    }
+
+    #[tokio::test]
+    async fn pcon05_gc_never_reclaims_a_stage_dir_referenced_by_a_building_lease() {
+        // FINDING 2 (review): the opportunistic GC sweep's "live" protection set
+        // MUST include in-flight (building) jobs, not just currently-queued
+        // ones — once a job is claimed it drops out of `peek`'s queued set
+        // entirely while its build is still actively reading the stage dir off
+        // disk, so a live set built from `peek` alone would let GC delete that
+        // dir out from under a running build.
+        //
+        // Env note: like `fleet_quiet_from_chord_falls_back_when_unconfigured`
+        // above, this test touches process env directly (no crate-wide lock
+        // exists for it) — accepted existing practice in this file; the vars
+        // are restored at the end.
+        let dataset_root = tempfile::tempdir().unwrap();
+        let prev_root = std::env::var("BUILD_DATASET_ROOT").ok();
+        let prev_count = std::env::var("BUILD_SHA_STAGE_RETAIN_COUNT").ok();
+        let prev_secs = std::env::var("BUILD_SHA_STAGE_RETAIN_SECS").ok();
+        std::env::set_var("BUILD_DATASET_ROOT", dataset_root.path());
+        // Force the age/count floor down so this test's dirs actually exercise
+        // reclaim decisions instead of all surviving under the (generous)
+        // production defaults.
+        std::env::set_var("BUILD_SHA_STAGE_RETAIN_COUNT", "1");
+        std::env::set_var("BUILD_SHA_STAGE_RETAIN_SECS", "0");
+
+        let live_sha = fake_sha(1);
+        let dead_sha = fake_sha(2);
+        let recent_sha = fake_sha(3);
+        let q = Arc::new(InMemoryQueue::new());
+        q.enqueue(&req("chord", &live_sha, false)).await.unwrap();
+        let ex = RecordingExecutor::new(false);
+        let s = sched(q.clone(), ex.clone(), Arc::new(NoopIdle), cfg(4, 4, vec![]));
+
+        // Tick 1: claims the job (state -> 'building'). Its handle is
+        // deliberately NOT awaited so the fake job stays 'building' for the
+        // rest of this test (mirrors `per_host_cap_holds_second_build` above).
+        let r1 = s.tick_once(12, false).await;
+        assert_eq!(r1.dispatched.len(), 1, "the job must be claimed (building) before tick 2");
+        assert_eq!(q.state_of(&r1.dispatched[0]).as_deref(), Some("building"));
+
+        // Three per-sha stage dirs under the module root (all real sha-shaped
+        // names — PCON-05 FIX 1 ignores anything else), deliberately ordered
+        // so age/count ALONE would reclaim the live one and keep an unrelated
+        // one — proving the survival below comes from the leases fix, not
+        // incidentally from the retain-count floor:
+        //   - `live_sha` (the BUILDING job's own ref): OLDEST — would be
+        //     reclaimed by age/count alone; must survive via the live set.
+        //   - `recent_sha`: NEWEST, unrelated — survives via the
+        //     retain-count=1 floor (positive control: GC still protects
+        //     *something* by count).
+        //   - `dead_sha`: unrelated, neither newest nor live — MUST be
+        //     reclaimed (positive control: GC is not a no-op).
+        let module_root = dataset_root.path().join("src").join("chord");
+        touch_dir(&module_root, &live_sha, 999_999);
+        touch_dir(&module_root, &dead_sha, 500_000);
+        touch_dir(&module_root, &recent_sha, 100);
+
+        // Tick 2: the building job is no longer in `peek`'s queued set at all —
+        // exactly the scenario the fix must cover via `snapshot().leases`.
+        let r2 = s.tick_once(12, false).await;
+        assert!(r2.dispatched.is_empty() && r2.contended.is_empty());
+
+        assert!(
+            module_root.join(&live_sha).exists(),
+            "a stage dir referenced by a BUILDING lease must never be GC'd"
+        );
+        assert!(
+            module_root.join(&recent_sha).exists(),
+            "the newest dir survives via the retain-count floor"
+        );
+        assert!(
+            !module_root.join(&dead_sha).exists(),
+            "an unrelated, old, non-live, over-count dir must still be reclaimed \
+             (proves GC is doing real work, not just protecting everything)"
+        );
+
+        for h in r1.handles.into_iter().chain(r2.handles) {
+            let _ = h.await;
+        }
+        match prev_root {
+            Some(v) => std::env::set_var("BUILD_DATASET_ROOT", v),
+            None => std::env::remove_var("BUILD_DATASET_ROOT"),
+        }
+        match prev_count {
+            Some(v) => std::env::set_var("BUILD_SHA_STAGE_RETAIN_COUNT", v),
+            None => std::env::remove_var("BUILD_SHA_STAGE_RETAIN_COUNT"),
+        }
+        match prev_secs {
+            Some(v) => std::env::set_var("BUILD_SHA_STAGE_RETAIN_SECS", v),
+            None => std::env::remove_var("BUILD_SHA_STAGE_RETAIN_SECS"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pcon05_gc_protects_a_branch_ref_jobs_resolved_sha_stage_root_cause_fix() {
+        // ROOT-CAUSE FIX (review, "the heart of PCON's correctness"): a job
+        // enqueued against a mutable branch ref (`git_ref="feature-branch"`)
+        // whose ref->sha resolution happened at ENQUEUE time carries
+        // `resolved_sha` — and the on-disk per-sha stage dir PCON-01 creates is
+        // named by THAT sha, never by the branch name. Before this fix, the
+        // GC live-set was built from `git_ref` alone, so it could NEVER
+        // actually match the sha-named directory on disk for a branch-based
+        // job — silently defeating the "never reclaim a live dir" protection
+        // for the common (non-direct-sha) case. This proves the live-set now
+        // uses `queue::job_identity` (resolved sha when known) end-to-end
+        // through the real scheduler tick, not just in isolation.
+        let dataset_root = tempfile::tempdir().unwrap();
+        let prev_root = std::env::var("BUILD_DATASET_ROOT").ok();
+        let prev_count = std::env::var("BUILD_SHA_STAGE_RETAIN_COUNT").ok();
+        let prev_secs = std::env::var("BUILD_SHA_STAGE_RETAIN_SECS").ok();
+        std::env::set_var("BUILD_DATASET_ROOT", dataset_root.path());
+        std::env::set_var("BUILD_SHA_STAGE_RETAIN_COUNT", "1");
+        std::env::set_var("BUILD_SHA_STAGE_RETAIN_SECS", "0");
+
+        let resolved_sha = fake_sha(9);
+        let dead_sha = fake_sha(10);
+        let recent_sha = fake_sha(11);
+        let branch_req = JobRequest {
+            resolved_sha: Some(resolved_sha.clone()),
+            ..req("chord", "feature-branch", false)
+        };
+        let q = Arc::new(InMemoryQueue::new());
+        q.enqueue(&branch_req).await.unwrap();
+        let ex = RecordingExecutor::new(false);
+        let s = sched(q.clone(), ex.clone(), Arc::new(NoopIdle), cfg(4, 4, vec![]));
+
+        // Tick 1: claim it (state -> 'building'); handle deliberately unawaited.
+        let r1 = s.tick_once(12, false).await;
+        assert_eq!(r1.dispatched.len(), 1);
+        assert_eq!(q.state_of(&r1.dispatched[0]).as_deref(), Some("building"));
+
+        // The stage dir on disk is named by the RESOLVED SHA (PCON-01), NOT
+        // "feature-branch" — deliberately the OLDEST so age/count alone would
+        // reclaim it. Two unrelated (real sha-shaped — PCON-05 FIX 1 ignores
+        // anything else) dirs: `recent_sha` (newest, survives via the
+        // retain-count=1 floor — proves GC still protects something by count)
+        // and `dead_sha` (neither live nor newest — MUST be reclaimed, proving
+        // GC is doing real work, not just protecting everything).
+        let module_root = dataset_root.path().join("src").join("chord");
+        touch_dir(&module_root, &resolved_sha, 999_999);
+        touch_dir(&module_root, &dead_sha, 500_000);
+        touch_dir(&module_root, &recent_sha, 100);
+
+        let r2 = s.tick_once(12, false).await;
+        assert!(r2.dispatched.is_empty());
+
+        assert!(
+            module_root.join(&resolved_sha).exists(),
+            "the resolved-sha stage dir of a BRANCH-ref job must survive GC — the live-set \
+             must key off resolved_sha (job_identity), not the raw branch ref"
+        );
+        assert!(
+            module_root.join(&recent_sha).exists(),
+            "the newest dir survives via the retain-count floor"
+        );
+        assert!(
+            !module_root.join(&dead_sha).exists(),
+            "an unrelated, old, non-live, over-count dir must still be reclaimed \
+             (proves GC is doing real work, not just protecting everything)"
+        );
+
+        for h in r1.handles.into_iter().chain(r2.handles) {
+            let _ = h.await;
+        }
+        match prev_root {
+            Some(v) => std::env::set_var("BUILD_DATASET_ROOT", v),
+            None => std::env::remove_var("BUILD_DATASET_ROOT"),
+        }
+        match prev_count {
+            Some(v) => std::env::set_var("BUILD_SHA_STAGE_RETAIN_COUNT", v),
+            None => std::env::remove_var("BUILD_SHA_STAGE_RETAIN_COUNT"),
+        }
+        match prev_secs {
+            Some(v) => std::env::set_var("BUILD_SHA_STAGE_RETAIN_SECS", v),
+            None => std::env::remove_var("BUILD_SHA_STAGE_RETAIN_SECS"),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_failure_skips_gc_entirely_fail_closed() {
+        // Review's explicit follow-up: a snapshot() error must NOT let GC
+        // proceed with a partial (queued-only) live-set — it must skip the
+        // sweep entirely that tick. Uses `fail_snapshots` (isolated from
+        // `set_down`) so `reconcile`/`peek`/dispatch stay perfectly healthy —
+        // proving GC specifically, not just "the whole tick degraded",
+        // respects the fail-closed rule.
+        let dataset_root = tempfile::tempdir().unwrap();
+        let prev_root = std::env::var("BUILD_DATASET_ROOT").ok();
+        let prev_count = std::env::var("BUILD_SHA_STAGE_RETAIN_COUNT").ok();
+        let prev_secs = std::env::var("BUILD_SHA_STAGE_RETAIN_SECS").ok();
+        std::env::set_var("BUILD_DATASET_ROOT", dataset_root.path());
+        std::env::set_var("BUILD_SHA_STAGE_RETAIN_COUNT", "1");
+        std::env::set_var("BUILD_SHA_STAGE_RETAIN_SECS", "0");
+
+        // Two unrelated dirs (real sha-shaped — PCON-05 FIX 1 ignores
+        // anything else; retain-count=1 always keeps the single newest
+        // regardless of GC even running, so a single-dir setup couldn't
+        // distinguish "GC skipped" from "GC ran but the count floor
+        // protected it anyway"): `old_target` would normally be reclaimed by
+        // age/count; `recent_protected` is the newest and always survives via
+        // the count floor either way — it isolates that this test is really
+        // about `old_target` specifically.
+        let old_target = fake_sha(20);
+        let recent_protected = fake_sha(21);
+        let module_root = dataset_root.path().join("src").join("chord");
+        touch_dir(&module_root, &old_target, 999_999);
+        touch_dir(&module_root, &recent_protected, 100);
+
+        let q = Arc::new(InMemoryQueue::new());
+        let ex = RecordingExecutor::new(false);
+        let s = sched(q.clone(), ex.clone(), Arc::new(NoopIdle), cfg(4, 4, vec![]));
+        q.fail_snapshots(1);
+        let r = s.tick_once(12, false).await;
+        assert!(
+            !r.unavailable,
+            "dispatch itself is healthy — only snapshot (and therefore GC) failed: {:?}",
+            r.dispatched
+        );
+
+        assert!(
+            module_root.join(&old_target).exists(),
+            "GC must be skipped (fail-closed) when snapshot() fails — an old, otherwise-\
+             reclaimable dir must survive rather than risk GC running without the full \
+             in-flight live-set"
+        );
+        assert!(module_root.join(&recent_protected).exists());
+
+        // A later tick (snapshot healthy again) DOES reclaim it — proving the
+        // skip above was really about THIS tick's snapshot failure, not GC
+        // being permanently disabled.
+        let r2 = s.tick_once(12, false).await;
+        assert!(!r2.unavailable);
+        assert!(
+            !module_root.join(&old_target).exists(),
+            "once snapshot() succeeds again, GC reclaims the dir on the next tick"
+        );
+        assert!(module_root.join(&recent_protected).exists());
+
+        match prev_root {
+            Some(v) => std::env::set_var("BUILD_DATASET_ROOT", v),
+            None => std::env::remove_var("BUILD_DATASET_ROOT"),
+        }
+        match prev_count {
+            Some(v) => std::env::set_var("BUILD_SHA_STAGE_RETAIN_COUNT", v),
+            None => std::env::remove_var("BUILD_SHA_STAGE_RETAIN_COUNT"),
+        }
+        match prev_secs {
+            Some(v) => std::env::set_var("BUILD_SHA_STAGE_RETAIN_SECS", v),
+            None => std::env::remove_var("BUILD_SHA_STAGE_RETAIN_SECS"),
+        }
     }
 }
