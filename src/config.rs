@@ -1487,6 +1487,29 @@ pub fn build_merge_regate_enabled() -> bool {
         .unwrap_or(true)
 }
 
+// ── PCON-07: speculative merge batching (GitHub-merge-queue model) ──────────
+
+/// PCON-07: the maximum number of same-base PRs the merge queue will stack into
+/// ONE speculative rebased batch, gate ONCE, and merge together on green (the
+/// GitHub-merge-queue "speculative batches" throughput optimization layered on
+/// top of PCON-06's serialized rebase-and-re-gate). From `BUILD_MERGE_BATCH_MAX`.
+///
+/// **Defaults to `1`, and `1` is the safe baseline: NO batching at all — every
+/// merge takes exactly the PCON-06 single-PR rebase-and-re-gate path,
+/// byte-for-byte.** Batching only engages at a value `> 1`, and only for a
+/// caller that explicitly supplies a `batch_prs` set (see `gitea_merge_pr`);
+/// with the default `1`, or a single-PR call, the batch layer is never entered.
+///
+/// A value of `0` or an unparyseable value is clamped up to `1` (never zero —
+/// a batch must always contain at least the front PR), so the accessor can
+/// never disable merging entirely or return a degenerate cap.
+pub fn build_merge_batch_max() -> usize {
+    env_nonempty("BUILD_MERGE_BATCH_MAX")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2335,5 +2358,36 @@ mod tests {
         assert_eq!(gitea_merge_queue_wait_ttl_secs(), 500);
         std::env::remove_var("GITEA_MERGE_QUEUE_MAX_WAIT_SECS");
         std::env::remove_var("GITEA_MERGE_QUEUE_WAIT_TTL_SECS");
+    }
+
+    // ── PCON-07: speculative merge batching cap ─────────────────────────────
+
+    #[test]
+    #[serial]
+    fn build_merge_batch_max_defaults_to_one_no_batching() {
+        // The safe baseline: unset ⇒ 1 ⇒ PCON-06 single-PR behavior, never any
+        // batching engaged.
+        std::env::remove_var("BUILD_MERGE_BATCH_MAX");
+        assert_eq!(build_merge_batch_max(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn build_merge_batch_max_honors_a_value_above_one() {
+        std::env::set_var("BUILD_MERGE_BATCH_MAX", "4");
+        assert_eq!(build_merge_batch_max(), 4);
+        std::env::remove_var("BUILD_MERGE_BATCH_MAX");
+    }
+
+    #[test]
+    #[serial]
+    fn build_merge_batch_max_clamps_zero_and_garbage_up_to_one() {
+        // A batch must always contain at least the front PR — 0 (or an
+        // unparseable value) can never disable merging; it clamps to 1.
+        std::env::set_var("BUILD_MERGE_BATCH_MAX", "0");
+        assert_eq!(build_merge_batch_max(), 1);
+        std::env::set_var("BUILD_MERGE_BATCH_MAX", "not-a-number");
+        assert_eq!(build_merge_batch_max(), 1);
+        std::env::remove_var("BUILD_MERGE_BATCH_MAX");
     }
 }

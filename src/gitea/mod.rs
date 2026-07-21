@@ -1923,7 +1923,8 @@ impl RustTool for MergePr {
                 "queue_key": { "type": "string", "description": "Override the default merge-queue key ({owner}/{repo}/{base}) — merges sharing a key are serialized/ordered together (optional)" },
                 "min_delay_secs": { "type": "integer", "description": "Override GITEA_MERGE_QUEUE_MIN_DELAY_SECS for this call: minimum seconds since the last merge to this queue key before this one proceeds (optional)" },
                 "priority": { "type": "integer", "description": "Merge-queue ordering priority; higher runs earlier among concurrent waiters for the same key, FIFO within equal priorities (default 0, optional)" },
-                "no_queue": { "type": "boolean", "description": "Bypass the merge queue entirely for this call (e.g. an emergency merge) — merges immediately, unordered and unspaced (optional)" }
+                "no_queue": { "type": "boolean", "description": "Bypass the merge queue entirely for this call (e.g. an emergency merge) — merges immediately, unordered and unspaced (optional)" },
+                "batch_prs": { "type": "array", "items": { "type": "integer" }, "description": "PCON-07 speculative batching (design/acceptance built + tested; PRODUCTION land gated OFF): additional SAME-BASE PR numbers to speculatively batch with this PR. Today production DEGRADES any N>1 request to the safe PCON-06 single-PR path for this PR only (a real combined-N-PR land needs a combined-state gate primitive the current forge lacks); the other members take their own separate merge calls. This PR (`pr`) is always the front. Omit for the default single-PR merge (optional)" }
             },
             "required": ["repo", "pr"]
         }))
@@ -2066,6 +2067,42 @@ impl MergePr {
         // present, without having to unset `REDIS_URL` for every other
         // Redis-backed feature on the host.
         let active_queue = queue.as_ref().filter(|_| cfg.enabled);
+
+        // PCON-07: speculative merge batching — PRODUCTION IS INTENTIONALLY
+        // DEGRADED TO N=1 (safe). A caller can request a batch
+        // (`BUILD_MERGE_BATCH_MAX > 1` + a `batch_prs` set), but a genuine N>1
+        // land CANNOT be performed safely with today's forge: Gitea has no
+        // combined-branch primitive, so each member can only be rebased onto
+        // `main` INDEPENDENTLY — which does NOT prove the COMBINED N-PR state
+        // that actually lands is green. Landing such a state (or a member atop
+        // an advanced base) would bypass PCON-06's exact-landing-state
+        // guarantee. Until a combined-state gate exists (a forge combined-branch
+        // primitive, or a single-door local-git stack builder producing ONE
+        // combined SHA to gate), we log ONCE and run the exact PCON-06 single-PR
+        // path (N=1) for the front PR — nothing untested can ever land. The full
+        // `merge_queue::run_speculative_batch` algorithm + `SpeculativeBatchOps`
+        // trait are built and fully unit-tested (the design/acceptance
+        // deliverable), ready to light up the day that primitive lands. See
+        // `docs/specs/S122-pcon07-speculative-batching.md`.
+        //
+        // NOTE (same-base): the slot below is keyed off the FRONT PR's base
+        // only, and only the front PR is ever merged here — so a mixed-base
+        // `batch_prs` can never affect per-base serialization (the N=1 degrade
+        // makes that violation impossible in production). Any future combined
+        // land MUST validate all members share the front's base before keying
+        // the slot (documented in the design note and the trait contract).
+        if active_queue.is_some() {
+            let batch_max = crate::config::build_merge_batch_max();
+            let batch_prs = parse_batch_prs(&args, pr_num, batch_max);
+            if batch_max > 1 && batch_prs.len() > 1 {
+                log_batch_degrade_once(batch_max, batch_prs.len());
+                // Fall through to the exact PCON-06 single-PR path below for the
+                // front PR (`pr_num`). The other requested members are left for
+                // their own separate merge calls — each gets its own PCON-06
+                // single-PR gate. Nothing here speculatively rebases any branch,
+                // so there is no half-rebased member to clean up.
+            }
+        }
 
         // GMQ-01: the POST + response handling live in the single shared
         // `GiteaClient::merge_pull` path (next to `create_pull`), which also
@@ -2462,6 +2499,55 @@ impl MergePr {
             base = outcome.base
         ))
     }
+}
+
+/// PCON-07: "log once" guard so the N>1→N=1 production degrade doesn't spam a
+/// warning on every batch-requesting merge while `BUILD_MERGE_BATCH_MAX > 1` is
+/// configured.
+static LOGGED_BATCH_DEGRADE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// PCON-07: log ONCE that a requested speculative batch is being degraded to a
+/// single-PR (N=1) merge in production, because a safe combined-state gate is
+/// not yet available (see the seam in `execute_with_queue_and_regate` and
+/// `docs/specs/S122-pcon07-speculative-batching.md`).
+fn log_batch_degrade_once(batch_max: usize, requested: usize) {
+    if !LOGGED_BATCH_DEGRADE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "PCON-07: speculative batching requested (BUILD_MERGE_BATCH_MAX={batch_max}, \
+             {requested} PRs) but requires a combined-branch/combined-state gate primitive \
+             not yet available in the single-door forge; running N=1 per PCON-06 (single-PR \
+             rebase-and-re-gate) so nothing untested can land. This warning logs once per \
+             process."
+        );
+    }
+}
+
+/// PCON-07: parse the caller-supplied `batch_prs` array into the ordered,
+/// deduped set of same-base PRs to speculatively batch — the FRONT PR
+/// (`front_pr`, the one this call is for) is always first, followed by any
+/// additional `batch_prs` in the order given, capped at `batch_max`. A missing
+/// or non-array `batch_prs` yields just `[front_pr]` (no batching). Duplicate
+/// entries and the front PR itself are de-duplicated so the front never appears
+/// twice.
+///
+/// Used ONLY to DETECT a batch request (so the production N=1 degrade can log
+/// once); it does not itself drive any land. NOTE: a future combined-state land
+/// is the caller's responsibility to supply only PRs sharing the front PR's
+/// base, and MUST validate that before keying the per-base slot.
+fn parse_batch_prs(args: &Value, front_pr: u64, batch_max: usize) -> Vec<u64> {
+    let mut out = vec![front_pr];
+    if let Some(arr) = args["batch_prs"].as_array() {
+        for v in arr {
+            if let Some(pr) = v.as_u64() {
+                if pr != front_pr && !out.contains(&pr) {
+                    out.push(pr);
+                }
+            }
+        }
+    }
+    out.truncate(batch_max.max(1));
+    out
 }
 
 // GMQ-05: gitea_merge_queue_status (read-only)
@@ -7670,5 +7756,137 @@ mod tests {
             .as_i64()
             .expect("next_allowed_merge_ms set");
         assert_eq!(next_allowed, last + 5_000);
+    }
+
+    // ── PCON-07: speculative merge batching wired through gitea_merge_pr ─────
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pcon07_batch_request_degrades_to_single_pr_in_production() {
+        // SAFETY: even with BUILD_MERGE_BATCH_MAX=2 and a caller-supplied
+        // `batch_prs`, PRODUCTION must NOT attempt a real N>1 land — today's
+        // forge cannot gate the COMBINED landing state, so an independent
+        // per-member gate would bypass PCON-06's exact-landing-state guarantee.
+        // The seam therefore DEGRADES to the PCON-06 single-PR path for the
+        // FRONT PR only: #101 merges via the single path; the other requested
+        // member #102 is NEVER touched (it takes its own separate merge call);
+        // and nothing is ever gated on a combined state.
+        let batch_backup = std::env::var("BUILD_MERGE_BATCH_MAX").ok();
+        let regate_backup = std::env::var("BUILD_MERGE_REGATE_ENABLED").ok();
+        std::env::set_var("BUILD_MERGE_BATCH_MAX", "2");
+        std::env::remove_var("BUILD_MERGE_REGATE_ENABLED"); // default ON
+
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+        let regate = FakeReGate::new(merge_queue::GateVerdict::Green);
+        let regate_task = Arc::clone(&regate) as Arc<dyn merge_queue::ReGate>;
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/101");
+            then.status(200).json_body(sample_pr_json(101, "feature/b", "main"));
+        });
+        let merge_101 = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/101/merge");
+            then.status(200);
+        });
+        // The other requested member #102 must NEVER be touched (no combined land).
+        let touch_102_get = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/102");
+            then.status(200).json_body(sample_pr_json(102, "feature/c", "main"));
+        });
+        let touch_102_merge = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/102/merge");
+            then.status(200);
+        });
+
+        let tool = MergePr { client: mock_client(&server) };
+        let result = tool
+            .execute_with_queue_and_regate(
+                serde_json::json!({"repo": "myrepo", "pr": 101, "batch_prs": [102]}),
+                Some(queue),
+                Some(regate_task),
+            )
+            .await;
+
+        if let Some(v) = batch_backup { std::env::set_var("BUILD_MERGE_BATCH_MAX", v); } else { std::env::remove_var("BUILD_MERGE_BATCH_MAX"); }
+        if let Some(v) = regate_backup { std::env::set_var("BUILD_MERGE_REGATE_ENABLED", v); }
+
+        merge_101.assert();
+        // #102 is never fetched or merged — no combined-state land occurs.
+        touch_102_get.assert_hits(0);
+        touch_102_merge.assert_hits(0);
+        let summary = result.expect("the degrade must merge the front PR via the single path");
+        assert_eq!(
+            summary, "Pull request #101 merged into main in testorg/myrepo.",
+            "a degraded batch must produce the exact PCON-06 single-PR success string for the front PR"
+        );
+        // The front PR (#101) is mergeable → the Proceed direct-merge path, no
+        // re-gate — identical to PCON-06 with no batching in play.
+        assert!(
+            regate.calls.lock().unwrap().is_empty(),
+            "the degraded single-PR mergeable path must not re-gate"
+        );
+        assert!(!store.is_locked("testorg/myrepo/main"), "the slot must be released");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pcon07_batch_max_one_ignores_batch_prs_and_takes_the_pcon06_single_path() {
+        // The safe baseline: with BUILD_MERGE_BATCH_MAX unset (=1), a supplied
+        // `batch_prs` is IGNORED — the merge takes the exact PCON-06 single-PR
+        // path for the front PR only. The other batch member is never touched,
+        // and the success string is the single-PR string, byte-for-byte.
+        let batch_backup = std::env::var("BUILD_MERGE_BATCH_MAX").ok();
+        std::env::remove_var("BUILD_MERGE_BATCH_MAX"); // default 1 = no batching
+
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+        let regate = FakeReGate::new(merge_queue::GateVerdict::Green);
+        let regate_task = Arc::clone(&regate) as Arc<dyn merge_queue::ReGate>;
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/201");
+            then.status(200).json_body(sample_pr_json(201, "feature/c", "main"));
+        });
+        let merge_201 = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/201/merge");
+            then.status(200);
+        });
+        // PR 202 must NEVER be touched when batching is off.
+        let touch_202_get = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/202");
+            then.status(200).json_body(sample_pr_json(202, "feature/d", "main"));
+        });
+        let touch_202_merge = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/202/merge");
+            then.status(200);
+        });
+
+        let tool = MergePr { client: mock_client(&server) };
+        let result = tool
+            .execute_with_queue_and_regate(
+                serde_json::json!({"repo": "myrepo", "pr": 201, "batch_prs": [202]}),
+                Some(queue),
+                Some(regate_task),
+            )
+            .await;
+
+        if let Some(v) = batch_backup { std::env::set_var("BUILD_MERGE_BATCH_MAX", v); }
+
+        merge_201.assert();
+        touch_202_get.assert_hits(0);
+        touch_202_merge.assert_hits(0);
+        let summary = result.expect("the single-PR path must merge the front PR");
+        assert_eq!(
+            summary, "Pull request #201 merged into main in testorg/myrepo.",
+            "batch_max=1 must reproduce the exact PCON-06 single-PR success string"
+        );
+        // A mergeable PR takes the direct-merge (Proceed) path — no re-gate.
+        assert!(
+            regate.calls.lock().unwrap().is_empty(),
+            "the single-PR mergeable path must not re-gate"
+        );
     }
 }
