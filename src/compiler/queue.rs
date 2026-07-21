@@ -1634,14 +1634,16 @@ pub(crate) mod fake {
         }
 
         /// PCON-04 fidelity test helper: the job id currently holding the
-        /// `(module, git_ref)` lock, looked up under the EXACT SAME prefixed key
-        /// [`module_lock_key`] constructs — i.e. the same key shape the real
-        /// Lua uses (`lockprefix..module..':'..ref`) — so a test can assert the
+        /// `(module, identity)` lock — `identity` being `job_identity`'s output
+        /// (the resolved sha when known, else the raw ref) — looked up under
+        /// the EXACT SAME prefixed key [`module_lock_key`] constructs, i.e.
+        /// the same key shape the real Lua uses
+        /// (`lockprefix..module..':'..identity`), so a test can assert the
         /// fake's lock storage is keyed identically to production, not just
         /// internally self-consistent.
-        pub(crate) fn module_lock_holder(&self, module: &str, git_ref: &str) -> Option<String> {
+        pub(crate) fn module_lock_holder(&self, module: &str, identity: &str) -> Option<String> {
             let s = self.state.lock().unwrap();
-            s.module_lock.get(&module_lock_key(module, git_ref)).cloned()
+            s.module_lock.get(&module_lock_key(module, identity)).cloned()
         }
     }
 

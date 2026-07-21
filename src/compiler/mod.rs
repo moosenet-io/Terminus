@@ -668,6 +668,73 @@ async fn remote_sidecar_sha_best_effort(
     }
 }
 
+/// FIX 3 (review, HIGH): the unconditional POST-RELAY built-identity
+/// assertion against whatever ACTUALLY landed on the heavy host — run in
+/// BOTH SHA-mode and the legacy `BUILD_STAGE_BY_SHA=off` mode (previously
+/// this was skipped ENTIRELY off-mode, since the whole block was gated on
+/// `resolved_sha.is_some()`). Mirrors [`check_built_sha_sidecar`]'s
+/// strict/non-strict split, but for the REMOTE sidecar specifically:
+///   - A PRESENT remote sidecar that MISMATCHES `expected_identity` is
+///     ALWAYS a hard failure, in either mode — a wrong-tree relay is exactly
+///     what this exists to catch, and off-mode's escape hatch was only ever
+///     meant to tolerate a MISSING sidecar (a pre-PCON/never-verified
+///     directory), never a present-but-wrong one.
+///   - A MISSING/unreadable remote sidecar is a hard failure under
+///     `strict=true` (SHA-mode; the relay must be able to prove what it just
+///     staged) but only a WARNING under `strict=false` (off-mode; matches the
+///     local `check_built_sha_sidecar`'s off-mode policy exactly — the
+///     rollback lever must not itself start hard-failing a pre-existing
+///     ref-keyed remote tree that predates this whole PCON initiative).
+///
+/// PCON follow-up (deferred, not this fix): this only proves the SIDECAR
+/// matches — it does not verify the remote source tree's completeness/
+/// contents beyond that one file (the stale/incomplete `remote_source` edge
+/// case flagged in the FINDING-3 fix's commit). Tracked as a hardening
+/// follow-up, not attempted here.
+async fn assert_remote_sidecar(
+    host_addr: &str,
+    remote_source: &str,
+    module: &str,
+    expected_identity: &str,
+    strict: bool,
+    redact: &[String],
+) -> Result<(), ToolError> {
+    match remote_sidecar_sha_best_effort(host_addr, remote_source, redact).await {
+        Some(got) if got == expected_identity => Ok(()),
+        Some(got) => Err(ToolError::Execution(format!(
+            "compiler: built-identity integrity check FAILED for {module} on the heavy host: \
+             remote sidecar {got:?} at {remote_source} != requested identity \
+             {expected_identity:?} — refusing to build a possibly-alien commit (fail-closed, \
+             PCON-02/PCON-04, both SHA-mode and BUILD_STAGE_BY_SHA=off); if this persists \
+             across retries, a stale/incomplete pre-PCON-03 directory may be wedging \
+             {remote_source} on the heavy host — an operator should verify and remove it \
+             manually"
+        ))),
+        None if strict => Err(ToolError::Execution(format!(
+            "compiler: built-SHA integrity check FAILED for {module} on the heavy host: could \
+             not read a remote {BUILT_SHA_SIDECAR} sidecar at {remote_source} after relay — \
+             refusing to build a tree whose provenance could not be confirmed (fail-closed, \
+             PCON-02); if this persists, a stale/incomplete directory from before PCON-03's \
+             atomic publish may be wedging {remote_source} on the heavy host — an operator \
+             should verify and remove it manually"
+        ))),
+        None => {
+            // BUILD_STAGE_BY_SHA=off: a missing/unreadable remote sidecar is
+            // expected for a pre-existing ref-keyed remote tree (matches the
+            // LOCAL off-mode policy) — warned, not fatal. A PRESENT but
+            // mismatched sidecar is still caught above, unconditionally.
+            tracing::warn!(
+                "compiler: {module} remote tree at {remote_source} on the heavy host has no \
+                 readable {BUILT_SHA_SIDECAR} sidecar (BUILD_STAGE_BY_SHA=off — legacy \
+                 ref-keyed mode) — proceeding without a remote identity check on this dir \
+                 (fail-open ONLY in this documented rollback mode; a MISMATCHED sidecar would \
+                 still be rejected)"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Resolve the git-transport credential (SECRET — a raw Gitea PAT, NOT the
 /// `Bearer <token>`-wrapped form [`inject_gitea_registry_env`] builds for the
 /// Cargo-registry HTTP header) auto-stage hands to git via `GIT_ASKPASS`.
@@ -1176,12 +1243,56 @@ fn sha_stage_retain_secs() -> u64 {
         .unwrap_or(DEFAULT_SHA_STAGE_RETAIN_SECS)
 }
 
+/// FIX 2 (review, HIGH): env var for the HARD, live-set-independent age floor
+/// below which GC NEVER reclaims a dir, full stop — regardless of the
+/// live-set (`peek` + building leases) saying it looks unreferenced. The
+/// live-set has an inherent TOCTOU window (`peek` is bounded by
+/// `peek_limit`; a job claimed moments after the snapshot is briefly
+/// invisible to it) — age is the guard that holds even when the live-set is
+/// simply wrong/stale, not just a secondary nicety. Default well beyond any
+/// real build ([`MAX_BUILD_TIMEOUT_SECS`], the longest a single
+/// `compiler_build` may run) so a fresh OR still-in-flight stage can never be
+/// reclaimed by this alone.
+const BUILD_SHA_STAGE_MIN_AGE_SECS_ENV: &str = "BUILD_SHA_STAGE_MIN_AGE_SECS";
+/// 2x [`MAX_BUILD_TIMEOUT_SECS`] (3600s) — generous headroom over the
+/// longest a single build may legitimately run, so this floor is never
+/// mistaken for a normal build-duration timeout.
+const DEFAULT_SHA_STAGE_MIN_AGE_SECS: u64 = MAX_BUILD_TIMEOUT_SECS * 2;
+
+fn sha_stage_min_age_secs() -> u64 {
+    env_nonempty(BUILD_SHA_STAGE_MIN_AGE_SECS_ENV)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SHA_STAGE_MIN_AGE_SECS)
+}
+
 /// PCON-05: reclaim old per-sha stage dirs directly under `module_root`
 /// (`${BUILD_DATASET_ROOT}/src/<module>`) by age AND count. Keeps the newest
 /// `retain_count` dirs (by mtime) UNCONDITIONALLY, keeps anything younger than
 /// `retain_secs`, and NEVER touches a dir whose name is in `live` (a sha a
 /// queued/building job currently references) — even if it would otherwise be
 /// old/over-count. Returns the names of the dirs actually removed.
+///
+/// Two review fixes narrow what this function is even willing to consider:
+///
+/// FIX 1 (HIGH — GC precision): only a directory whose NAME is the owned
+/// per-sha content-addressed shape — a full 40-hex sha ([`is_full_sha`]),
+/// exactly what PCON-01 stages under — is ever a GC candidate. A legacy
+/// ref-keyed stage (`BUILD_STAGE_BY_SHA=off`, named by a branch/tag) or any
+/// other/foreign directory under the module root is skipped OUTRIGHT, before
+/// any age/count/live-set logic runs — this function has no business judging
+/// a dir it doesn't own the naming scheme for.
+///
+/// FIX 2 (HIGH — GC atomicity/age guard): `min_age_secs` is a HARD floor
+/// independent of the live-set. The live-set (`peek` + building leases,
+/// snapshotted by the caller) has an inherent TOCTOU window — `peek` is
+/// bounded by a limit, and a job claimed moments after the snapshot is
+/// briefly invisible to it — so a dir absent from `live` is NOT proof it's
+/// safe to reclaim. Age is checked FIRST and unconditionally: anything
+/// younger than `min_age_secs` is protected NO MATTER WHAT the live-set says
+/// (including a dir the live-set has never heard of at all). The live-set
+/// remains a SECONDARY protection for genuinely old dirs a build is still
+/// somehow using (e.g. an exceptionally long-running build past
+/// `min_age_secs`).
 ///
 /// Pure w.r.t. the clock (`now` is passed in) and operates on a caller-given
 /// root, so it is fully unit-testable against a `tempdir()` with no live
@@ -1192,6 +1303,7 @@ fn gc_sha_stage_dirs(
     module_root: &std::path::Path,
     retain_count: usize,
     retain_secs: u64,
+    min_age_secs: u64,
     live: &std::collections::HashSet<String>,
     now: std::time::SystemTime,
 ) -> std::io::Result<Vec<String>> {
@@ -1208,11 +1320,13 @@ fn gc_sha_stage_dirs(
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        // Never touch the atomic-publish staging temp dirs autostage_source
-        // creates as SIBLINGS of the module dir (`.bldgap3-stage-*`) — those
-        // live one level up, so this loop (over `module_root`'s own children)
-        // can't see them anyway; defense-in-depth skip if it ever does.
-        if name.starts_with('.') {
+        // FIX 1: only the owned per-sha naming shape is ever a candidate —
+        // never a legacy ref-keyed stage or any other/foreign directory. This
+        // also naturally skips the atomic-publish staging temp dirs
+        // `autostage_source` creates (`.bldgap3-stage-*`, which additionally
+        // live one level up as SIBLINGS of the module dir, so this loop can't
+        // see them anyway — defense-in-depth either way).
+        if !is_full_sha(&name) {
             continue;
         }
         let meta = entry.metadata()?;
@@ -1223,13 +1337,18 @@ fn gc_sha_stage_dirs(
     entries.sort_by(|a, b| b.2.cmp(&a.2));
     let mut removed = Vec::new();
     for (idx, (name, path, mtime)) in entries.into_iter().enumerate() {
+        // FIX 2: the hard, live-set-independent age floor — checked FIRST,
+        // unconditionally, before even consulting `live`.
+        let age = now.duration_since(mtime).unwrap_or_default();
+        if age.as_secs() < min_age_secs {
+            continue;
+        }
         if live.contains(&name) {
             continue;
         }
         if idx < retain_count {
             continue;
         }
-        let age = now.duration_since(mtime).unwrap_or_default();
         if age.as_secs() < retain_secs {
             continue;
         }
@@ -1260,6 +1379,7 @@ pub(crate) fn gc_stage_dirs_best_effort(
     };
     let retain_count = sha_stage_retain_count();
     let retain_secs = sha_stage_retain_secs();
+    let min_age_secs = sha_stage_min_age_secs();
     let now = std::time::SystemTime::now();
     let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in modules.flatten() {
@@ -1268,7 +1388,7 @@ pub(crate) fn gc_stage_dirs_best_effort(
         }
         let module = entry.file_name().to_string_lossy().to_string();
         let live = live_by_module.get(&module).unwrap_or(&empty);
-        match gc_sha_stage_dirs(&entry.path(), retain_count, retain_secs, live, now) {
+        match gc_sha_stage_dirs(&entry.path(), retain_count, retain_secs, min_age_secs, live, now) {
             Ok(removed) if !removed.is_empty() => {
                 tracing::info!(
                     module = %module,
@@ -2753,6 +2873,15 @@ impl CompilerBuild {
         } else {
             check_built_sha_sidecar(&local_source_dir, &module, stage_key, resolved_sha.is_some())?
         };
+        // PCON follow-up (deferred, review — not this fix): this proves the
+        // sidecar matched at THIS instant, not that the tree stays byte-for-
+        // byte unchanged for the rest of the build — nothing today snapshots
+        // or locks `local_source_dir` read-only across the whole
+        // toolchain-ensure + lockgen + cargo invocation below, so a
+        // theoretical concurrent mutation between this check and cargo
+        // actually reading the files is a TOCTOU window. Tracked as a PCON
+        // hardening follow-up (an immutable snapshot/lock spanning the whole
+        // build), not attempted here.
 
         // Pinned toolchain channel to ensure (idempotent; never `rustup update`).
         // BLD-444: this installs the CHANNEL only — it does not itself add the
@@ -3134,59 +3263,25 @@ impl CompilerBuild {
                 .await?;
             }
 
-            // PCON-02 (remote leg): re-assert the built-SHA integrity check
-            // against the tree that ACTUALLY landed on the heavy host — a
-            // relay hiccup (a partial/interrupted rsync, or a rewritten
-            // sidecar) is caught here rather than trusting the local check
-            // transitively. Only when SHA-staging resolved a sha (never for an
-            // explicit `source_dir` override — that path never sets
-            // `resolved_sha`).
-            if let Some(sha) = &resolved_sha {
-                let remote_sidecar_path = format!("{remote_source}/{BUILT_SHA_SIDECAR}");
-                let remote_sidecar = run(
-                    &[
-                        "ssh".into(),
-                        host_addr.clone(),
-                        format!("cat {}", shell_quote(&remote_sidecar_path)),
-                    ],
-                    None,
-                    &BTreeMap::new(),
-                    Duration::from_secs(60),
-                    &redact,
-                    None,
-                    None,
-                )
-                .await
-                .map_err(|e| {
-                    ToolError::Execution(format!(
-                        "compiler: built-SHA integrity check FAILED for {module} on the heavy \
-                         host: could not read the remote {BUILT_SHA_SIDECAR} sidecar at \
-                         {remote_source} after relay ({e}) — refusing to build a tree whose \
-                         provenance could not be confirmed (fail-closed, PCON-02); if this \
-                         persists, a stale/incomplete directory from before PCON-03's atomic \
-                         publish may be wedging {remote_source} on the heavy host — an \
-                         operator should verify and remove it manually"
-                    ))
-                })?;
-                // EXACT (trim only, no case folding) — mirrors the local
-                // `check_built_sha_sidecar` fix: `sha` is already canonically
-                // lowercase (from `resolve_ref_to_sha`), and the remote
-                // sidecar was rsync'd verbatim from the local one written from
-                // that same value, so no normalization should be needed for a
-                // genuine match — folding case here would paper over exactly
-                // the class of mismatch this check exists to catch.
-                let got = remote_sidecar.trim().to_string();
-                if &got != sha {
-                    return Err(ToolError::Execution(format!(
-                        "compiler: built-SHA integrity check FAILED for {module} on the heavy \
-                         host: remote sidecar sha {got:?} at {remote_source} != requested/\
-                         resolved sha {sha:?} — refusing to build a possibly-alien commit \
-                         (fail-closed, PCON-02); if this persists across retries, a \
-                         stale/incomplete pre-PCON-03 directory may be wedging {remote_source} \
-                         on the heavy host — an operator should verify and remove it manually"
-                    )));
-                }
-            }
+            // PCON-02/FIX 3 (remote leg): re-assert the built-identity
+            // integrity check against the tree that ACTUALLY landed on the
+            // heavy host — a relay hiccup (a partial/interrupted rsync, or a
+            // rewritten sidecar) is caught here rather than trusting the
+            // local check transitively. UNCONDITIONAL — runs in BOTH
+            // SHA-mode and legacy `BUILD_STAGE_BY_SHA=off` mode now (never
+            // for an explicit `source_dir` override, which never reaches the
+            // remote relay path with a stage_key-addressed `remote_source`
+            // at all). See `assert_remote_sidecar`'s doc for the exact
+            // strict-vs-non-strict policy.
+            assert_remote_sidecar(
+                &host_addr,
+                &remote_source,
+                &module,
+                stage_key,
+                resolved_sha.is_some(),
+                &redact,
+            )
+            .await?;
 
             let mut build_env = sccache_env.vars.clone();
             build_env.insert("CARGO_TARGET_DIR".to_string(), remote_target_str.clone());
@@ -7119,25 +7214,36 @@ mod tests {
         f.set_modified(mtime).unwrap();
     }
 
+    /// A deterministic, VALID full-40-hex-sha-shaped name for test dir `i` —
+    /// FIX 1 means `gc_sha_stage_dirs` now ignores any dir whose name is NOT
+    /// this shape, so every GC test dir must actually look like one.
+    fn fake_sha(i: usize) -> String {
+        format!("{i:0>40}")
+    }
+
     #[test]
     fn gc_keeps_the_newest_retain_count_regardless_of_age() {
         let dir = tempfile::tempdir().unwrap();
         // 5 dirs, oldest to newest by age.
+        let shas: Vec<String> = (0..5).map(fake_sha).collect();
         for (i, age) in [500, 400, 300, 200, 100].into_iter().enumerate() {
-            touch_sha_dir(dir.path(), &format!("sha{i}"), age);
+            touch_sha_dir(dir.path(), &shas[i], age);
         }
         let live = std::collections::HashSet::new();
-        let removed = gc_sha_stage_dirs(dir.path(), 2, 0, &live, std::time::SystemTime::now()).unwrap();
+        // min_age_secs=0 so the FIX-2 floor doesn't interfere with this
+        // count/age-focused test (it has its own dedicated tests below).
+        let removed =
+            gc_sha_stage_dirs(dir.path(), 2, 0, 0, &live, std::time::SystemTime::now()).unwrap();
         // retain_secs=0 means age never protects anything; only the 2 newest
-        // (sha4 age100, sha3 age200) survive by count.
+        // (shas[4] age100, shas[3] age200) survive by count.
         assert_eq!(removed.len(), 3, "{removed:?}");
-        assert!(!removed.contains(&"sha4".to_string()));
-        assert!(!removed.contains(&"sha3".to_string()));
-        for gone in ["sha0", "sha1", "sha2"] {
-            assert!(removed.contains(&gone.to_string()), "{removed:?}");
+        assert!(!removed.contains(&shas[4]));
+        assert!(!removed.contains(&shas[3]));
+        for gone in &shas[0..3] {
+            assert!(removed.contains(gone), "{removed:?}");
             assert!(!dir.path().join(gone).exists());
         }
-        for kept in ["sha3", "sha4"] {
+        for kept in &shas[3..5] {
             assert!(dir.path().join(kept).exists());
         }
     }
@@ -7146,15 +7252,18 @@ mod tests {
     fn gc_keeps_anything_younger_than_retain_secs_even_beyond_the_count_floor() {
         let dir = tempfile::tempdir().unwrap();
         // 3 dirs, all younger than a generous retain window.
-        touch_sha_dir(dir.path(), "sha-old", 50);
-        touch_sha_dir(dir.path(), "sha-mid", 30);
-        touch_sha_dir(dir.path(), "sha-new", 10);
+        let shas: Vec<String> = (0..3).map(fake_sha).collect();
+        touch_sha_dir(dir.path(), &shas[0], 50);
+        touch_sha_dir(dir.path(), &shas[1], 30);
+        touch_sha_dir(dir.path(), &shas[2], 10);
         let live = std::collections::HashSet::new();
         // retain_count=1 would normally reclaim the other 2 by count, but
         // retain_secs=3600 (1h) protects everything younger than that.
-        let removed = gc_sha_stage_dirs(dir.path(), 1, 3600, &live, std::time::SystemTime::now()).unwrap();
+        // min_age_secs=0 isolates this from the FIX-2 floor.
+        let removed =
+            gc_sha_stage_dirs(dir.path(), 1, 3600, 0, &live, std::time::SystemTime::now()).unwrap();
         assert!(removed.is_empty(), "{removed:?}");
-        for name in ["sha-old", "sha-mid", "sha-new"] {
+        for name in &shas {
             assert!(dir.path().join(name).exists());
         }
     }
@@ -7162,14 +7271,18 @@ mod tests {
     #[test]
     fn gc_never_reclaims_a_live_referenced_dir_even_if_old_and_over_count() {
         let dir = tempfile::tempdir().unwrap();
-        touch_sha_dir(dir.path(), "sha-live", 999_999);
-        touch_sha_dir(dir.path(), "sha-dead", 999_998);
+        let (live_sha, dead_sha) = (fake_sha(1), fake_sha(2));
+        touch_sha_dir(dir.path(), &live_sha, 999_999);
+        touch_sha_dir(dir.path(), &dead_sha, 999_998);
         let mut live = std::collections::HashSet::new();
-        live.insert("sha-live".to_string());
-        let removed = gc_sha_stage_dirs(dir.path(), 0, 0, &live, std::time::SystemTime::now()).unwrap();
-        assert_eq!(removed, vec!["sha-dead".to_string()]);
-        assert!(dir.path().join("sha-live").exists(), "a live-referenced dir must never be reclaimed");
-        assert!(!dir.path().join("sha-dead").exists());
+        live.insert(live_sha.clone());
+        // min_age_secs=0 isolates this from the FIX-2 floor (both dirs are
+        // ancient anyway; this test is specifically about the live-set).
+        let removed =
+            gc_sha_stage_dirs(dir.path(), 0, 0, 0, &live, std::time::SystemTime::now()).unwrap();
+        assert_eq!(removed, vec![dead_sha.clone()]);
+        assert!(dir.path().join(&live_sha).exists(), "a live-referenced dir must never be reclaimed");
+        assert!(!dir.path().join(&dead_sha).exists());
     }
 
     #[test]
@@ -7178,8 +7291,96 @@ mod tests {
         let missing = dir.path().join("never-created");
         let live = std::collections::HashSet::new();
         let removed =
-            gc_sha_stage_dirs(&missing, 5, 0, &live, std::time::SystemTime::now()).unwrap();
+            gc_sha_stage_dirs(&missing, 5, 0, 0, &live, std::time::SystemTime::now()).unwrap();
         assert!(removed.is_empty());
+    }
+
+    // ── FIX 1 (review, HIGH): GC precision — only owned sha-shaped dirs ───────
+
+    #[test]
+    fn gc_never_touches_a_legacy_ref_keyed_or_foreign_directory() {
+        // A legacy ref-keyed stage (BUILD_STAGE_BY_SHA=off, named by a branch)
+        // and an unrelated/foreign directory must NEVER be GC candidates at
+        // all, regardless of age/count/live-set — this function has no
+        // business judging a dir it doesn't own the naming scheme for.
+        let dir = tempfile::tempdir().unwrap();
+        touch_sha_dir(dir.path(), "main", 999_999);
+        touch_sha_dir(dir.path(), "feature-branch", 999_999);
+        touch_sha_dir(dir.path(), "some-foreign-dir", 999_999);
+        // A real owned sha, also very old and over count/age, to prove GC
+        // still does real work on what it DOES own.
+        let sha = fake_sha(9);
+        touch_sha_dir(dir.path(), &sha, 999_999);
+        let live = std::collections::HashSet::new();
+        let removed =
+            gc_sha_stage_dirs(dir.path(), 0, 0, 0, &live, std::time::SystemTime::now()).unwrap();
+        assert_eq!(removed, vec![sha.clone()], "{removed:?}");
+        for untouched in ["main", "feature-branch", "some-foreign-dir"] {
+            assert!(
+                dir.path().join(untouched).exists(),
+                "{untouched} must never be a GC candidate (not sha-shaped)"
+            );
+        }
+        assert!(!dir.path().join(&sha).exists());
+    }
+
+    // ── FIX 2 (review, HIGH): GC atomicity/age guard — a hard, live-set-
+    // independent age floor ────────────────────────────────────────────────
+
+    #[test]
+    fn gc_never_reclaims_a_dir_younger_than_min_age_even_when_absent_from_live_set() {
+        // The load-bearing FIX-2 guarantee: a RECENT dir is protected by age
+        // ALONE — even with an EMPTY live-set (simulating the exact TOCTOU
+        // scenario: `peek`'s bounded limit or a claim landing just after the
+        // snapshot means a genuinely in-flight build's dir can be invisible
+        // to the live-set) and even with retain_count/retain_secs=0 (which
+        // would otherwise reclaim everything).
+        let dir = tempfile::tempdir().unwrap();
+        let recent_sha = fake_sha(1);
+        touch_sha_dir(dir.path(), &recent_sha, 30); // 30s old — very fresh
+        let live = std::collections::HashSet::new(); // deliberately empty
+        let removed = gc_sha_stage_dirs(
+            dir.path(),
+            0,   // retain_count=0
+            0,   // retain_secs=0
+            3600, // min_age_secs=1h — well beyond this dir's 30s age
+            &live,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        assert!(removed.is_empty(), "{removed:?}");
+        assert!(dir.path().join(&recent_sha).exists());
+    }
+
+    #[test]
+    fn gc_reclaims_once_a_dir_clears_the_min_age_floor() {
+        // The complement: once a dir is OLDER than min_age_secs, the floor no
+        // longer protects it (retain_count/retain_secs/live-set decide as
+        // usual) — proving min_age is a floor, not a permanent hold.
+        let dir = tempfile::tempdir().unwrap();
+        let old_sha = fake_sha(1);
+        touch_sha_dir(dir.path(), &old_sha, 7200); // 2h old
+        let live = std::collections::HashSet::new();
+        let removed =
+            gc_sha_stage_dirs(dir.path(), 0, 0, 3600, &live, std::time::SystemTime::now()).unwrap();
+        assert_eq!(removed, vec![old_sha.clone()]);
+        assert!(!dir.path().join(&old_sha).exists());
+    }
+
+    #[test]
+    fn sha_stage_min_age_default_and_env_override() {
+        {
+            let _env = ScopedEnv::new().unset(BUILD_SHA_STAGE_MIN_AGE_SECS_ENV);
+            assert_eq!(sha_stage_min_age_secs(), DEFAULT_SHA_STAGE_MIN_AGE_SECS);
+            assert!(
+                DEFAULT_SHA_STAGE_MIN_AGE_SECS > MAX_BUILD_TIMEOUT_SECS,
+                "the default floor must exceed the longest a real build may run"
+            );
+        }
+        {
+            let _env = ScopedEnv::new().set(BUILD_SHA_STAGE_MIN_AGE_SECS_ENV, "120");
+            assert_eq!(sha_stage_min_age_secs(), 120);
+        }
     }
 
     #[test]

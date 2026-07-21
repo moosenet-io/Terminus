@@ -1489,6 +1489,15 @@ mod tests {
         f.set_modified(mtime).unwrap();
     }
 
+    /// A deterministic, VALID full-40-hex-sha-shaped name for test dir `i` —
+    /// PCON-05 FIX 1 means GC ignores any dir whose name is NOT this shape
+    /// (mirrors `compiler::tests::fake_sha`), so every GC-relevant test dir
+    /// here (and every `git_ref`/`resolved_sha` a live job references, so the
+    /// live-set entry actually matches a real GC-candidate name) must use one.
+    fn fake_sha(i: usize) -> String {
+        format!("{i:0>40}")
+    }
+
     #[tokio::test]
     async fn pcon05_gc_never_reclaims_a_stage_dir_referenced_by_a_building_lease() {
         // FINDING 2 (review): the opportunistic GC sweep's "live" protection set
@@ -1513,8 +1522,11 @@ mod tests {
         std::env::set_var("BUILD_SHA_STAGE_RETAIN_COUNT", "1");
         std::env::set_var("BUILD_SHA_STAGE_RETAIN_SECS", "0");
 
+        let live_sha = fake_sha(1);
+        let dead_sha = fake_sha(2);
+        let recent_sha = fake_sha(3);
         let q = Arc::new(InMemoryQueue::new());
-        q.enqueue(&req("chord", "deadbeef", false)).await.unwrap();
+        q.enqueue(&req("chord", &live_sha, false)).await.unwrap();
         let ex = RecordingExecutor::new(false);
         let s = sched(q.clone(), ex.clone(), Arc::new(NoopIdle), cfg(4, 4, vec![]));
 
@@ -1525,21 +1537,22 @@ mod tests {
         assert_eq!(r1.dispatched.len(), 1, "the job must be claimed (building) before tick 2");
         assert_eq!(q.state_of(&r1.dispatched[0]).as_deref(), Some("building"));
 
-        // Three per-sha stage dirs under the module root, deliberately ordered
+        // Three per-sha stage dirs under the module root (all real sha-shaped
+        // names — PCON-05 FIX 1 ignores anything else), deliberately ordered
         // so age/count ALONE would reclaim the live one and keep an unrelated
         // one — proving the survival below comes from the leases fix, not
         // incidentally from the retain-count floor:
-        //   - "deadbeef" (the BUILDING job's own ref): OLDEST — would be
+        //   - `live_sha` (the BUILDING job's own ref): OLDEST — would be
         //     reclaimed by age/count alone; must survive via the live set.
-        //   - "recent-other": NEWEST, unrelated — survives via the
+        //   - `recent_sha`: NEWEST, unrelated — survives via the
         //     retain-count=1 floor (positive control: GC still protects
         //     *something* by count).
-        //   - "old-dead": unrelated, neither newest nor live — MUST be
+        //   - `dead_sha`: unrelated, neither newest nor live — MUST be
         //     reclaimed (positive control: GC is not a no-op).
         let module_root = dataset_root.path().join("src").join("chord");
-        touch_dir(&module_root, "deadbeef", 999_999);
-        touch_dir(&module_root, "old-dead", 500_000);
-        touch_dir(&module_root, "recent-other", 100);
+        touch_dir(&module_root, &live_sha, 999_999);
+        touch_dir(&module_root, &dead_sha, 500_000);
+        touch_dir(&module_root, &recent_sha, 100);
 
         // Tick 2: the building job is no longer in `peek`'s queued set at all —
         // exactly the scenario the fix must cover via `snapshot().leases`.
@@ -1547,15 +1560,15 @@ mod tests {
         assert!(r2.dispatched.is_empty() && r2.contended.is_empty());
 
         assert!(
-            module_root.join("deadbeef").exists(),
+            module_root.join(&live_sha).exists(),
             "a stage dir referenced by a BUILDING lease must never be GC'd"
         );
         assert!(
-            module_root.join("recent-other").exists(),
+            module_root.join(&recent_sha).exists(),
             "the newest dir survives via the retain-count floor"
         );
         assert!(
-            !module_root.join("old-dead").exists(),
+            !module_root.join(&dead_sha).exists(),
             "an unrelated, old, non-live, over-count dir must still be reclaimed \
              (proves GC is doing real work, not just protecting everything)"
         );
@@ -1598,7 +1611,9 @@ mod tests {
         std::env::set_var("BUILD_SHA_STAGE_RETAIN_COUNT", "1");
         std::env::set_var("BUILD_SHA_STAGE_RETAIN_SECS", "0");
 
-        let resolved_sha = "f".repeat(40);
+        let resolved_sha = fake_sha(9);
+        let dead_sha = fake_sha(10);
+        let recent_sha = fake_sha(11);
         let branch_req = JobRequest {
             resolved_sha: Some(resolved_sha.clone()),
             ..req("chord", "feature-branch", false)
@@ -1615,14 +1630,15 @@ mod tests {
 
         // The stage dir on disk is named by the RESOLVED SHA (PCON-01), NOT
         // "feature-branch" — deliberately the OLDEST so age/count alone would
-        // reclaim it. Two unrelated dirs: "recent-other" (newest, survives via
-        // the retain-count=1 floor — proves GC still protects something by
-        // count) and "old-dead" (neither live nor newest — MUST be reclaimed,
-        // proving GC is doing real work, not just protecting everything).
+        // reclaim it. Two unrelated (real sha-shaped — PCON-05 FIX 1 ignores
+        // anything else) dirs: `recent_sha` (newest, survives via the
+        // retain-count=1 floor — proves GC still protects something by count)
+        // and `dead_sha` (neither live nor newest — MUST be reclaimed, proving
+        // GC is doing real work, not just protecting everything).
         let module_root = dataset_root.path().join("src").join("chord");
         touch_dir(&module_root, &resolved_sha, 999_999);
-        touch_dir(&module_root, "old-dead", 500_000);
-        touch_dir(&module_root, "recent-other", 100);
+        touch_dir(&module_root, &dead_sha, 500_000);
+        touch_dir(&module_root, &recent_sha, 100);
 
         let r2 = s.tick_once(12, false).await;
         assert!(r2.dispatched.is_empty());
@@ -1633,11 +1649,11 @@ mod tests {
              must key off resolved_sha (job_identity), not the raw branch ref"
         );
         assert!(
-            module_root.join("recent-other").exists(),
+            module_root.join(&recent_sha).exists(),
             "the newest dir survives via the retain-count floor"
         );
         assert!(
-            !module_root.join("old-dead").exists(),
+            !module_root.join(&dead_sha).exists(),
             "an unrelated, old, non-live, over-count dir must still be reclaimed \
              (proves GC is doing real work, not just protecting everything)"
         );
@@ -1675,16 +1691,19 @@ mod tests {
         std::env::set_var("BUILD_SHA_STAGE_RETAIN_COUNT", "1");
         std::env::set_var("BUILD_SHA_STAGE_RETAIN_SECS", "0");
 
-        // Two unrelated dirs (retain-count=1 always keeps the single newest
+        // Two unrelated dirs (real sha-shaped — PCON-05 FIX 1 ignores
+        // anything else; retain-count=1 always keeps the single newest
         // regardless of GC even running, so a single-dir setup couldn't
         // distinguish "GC skipped" from "GC ran but the count floor
-        // protected it anyway"): "old-target" would normally be reclaimed by
-        // age/count; "recent-protected" is the newest and always survives via
+        // protected it anyway"): `old_target` would normally be reclaimed by
+        // age/count; `recent_protected` is the newest and always survives via
         // the count floor either way — it isolates that this test is really
-        // about "old-target" specifically.
+        // about `old_target` specifically.
+        let old_target = fake_sha(20);
+        let recent_protected = fake_sha(21);
         let module_root = dataset_root.path().join("src").join("chord");
-        touch_dir(&module_root, "old-target", 999_999);
-        touch_dir(&module_root, "recent-protected", 100);
+        touch_dir(&module_root, &old_target, 999_999);
+        touch_dir(&module_root, &recent_protected, 100);
 
         let q = Arc::new(InMemoryQueue::new());
         let ex = RecordingExecutor::new(false);
@@ -1698,12 +1717,12 @@ mod tests {
         );
 
         assert!(
-            module_root.join("old-target").exists(),
+            module_root.join(&old_target).exists(),
             "GC must be skipped (fail-closed) when snapshot() fails — an old, otherwise-\
              reclaimable dir must survive rather than risk GC running without the full \
              in-flight live-set"
         );
-        assert!(module_root.join("recent-protected").exists());
+        assert!(module_root.join(&recent_protected).exists());
 
         // A later tick (snapshot healthy again) DOES reclaim it — proving the
         // skip above was really about THIS tick's snapshot failure, not GC
@@ -1711,10 +1730,10 @@ mod tests {
         let r2 = s.tick_once(12, false).await;
         assert!(!r2.unavailable);
         assert!(
-            !module_root.join("old-target").exists(),
+            !module_root.join(&old_target).exists(),
             "once snapshot() succeeds again, GC reclaims the dir on the next tick"
         );
-        assert!(module_root.join("recent-protected").exists());
+        assert!(module_root.join(&recent_protected).exists());
 
         match prev_root {
             Some(v) => std::env::set_var("BUILD_DATASET_ROOT", v),
