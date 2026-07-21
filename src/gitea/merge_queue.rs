@@ -191,6 +191,18 @@ pub enum RegateBounce {
     /// budget. The slot is released cleanly (never held indefinitely); this is
     /// a transient "gate timed out, retry", not a code failure.
     GateTimeout(String),
+    /// PCON-06 (FIX 2): after a successful branch-update, the PR head never
+    /// became visibly advanced past its pre-update SHA within the budget — an
+    /// async/incoherent forge read. The queue MUST NOT gate (and merge) a
+    /// possibly-stale, un-rebased head, so it bounces "retry" rather than risk
+    /// merging code that was never tested against its landing state.
+    RebaseNotVisible(String),
+    /// PCON-06 (FIX 1): the PR head changed between the moment the re-gate ran
+    /// and the merge (a push to the branch during/after the gate). The gated
+    /// commit is no longer the branch head, so merging would land an UNTESTED
+    /// commit — the queue bounces "retry" instead (the merge is also bound to
+    /// the gated SHA server-side, so this is the belt to that suspenders).
+    HeadMoved(String),
 }
 
 impl std::fmt::Display for RegateBounce {
@@ -210,6 +222,16 @@ impl std::fmt::Display for RegateBounce {
                 f,
                 "merge queue: re-gate timed out ({d}) — the merge slot was released cleanly, retry"
             ),
+            RegateBounce::RebaseNotVisible(d) => write!(
+                f,
+                "merge queue: rebased head did not become visible ({d}) — not gated or merged (a \
+                 stale/incoherent forge read); retry"
+            ),
+            RegateBounce::HeadMoved(d) => write!(
+                f,
+                "merge queue: the PR head moved after the re-gate ({d}) — the gated commit is no \
+                 longer the branch head, so nothing was merged; retry"
+            ),
         }
     }
 }
@@ -225,9 +247,10 @@ impl From<RegateBounce> for crate::error::ToolError {
     fn from(b: RegateBounce) -> Self {
         match &b {
             RegateBounce::RebaseConflict(_) => crate::error::ToolError::Conflict(b.to_string()),
-            RegateBounce::RedGate(_) | RegateBounce::GateTimeout(_) => {
-                crate::error::ToolError::Execution(b.to_string())
-            }
+            RegateBounce::RedGate(_)
+            | RegateBounce::GateTimeout(_)
+            | RegateBounce::RebaseNotVisible(_)
+            | RegateBounce::HeadMoved(_) => crate::error::ToolError::Execution(b.to_string()),
         }
     }
 }
