@@ -678,22 +678,31 @@ const DAEMON_MAX_TIMEOUT_SECS: u64 = 1800;
 /// two tiers into each other: at base 120 the tiers are 72/96/120/192/240 --
 /// still strictly monotonic. A base under this floor is clamped UP to it.
 const MIN_ROUTINE_TIMEOUT_SECS: u64 = 120;
+/// Upper clamp for the Medium-anchor base: half the daemon max, so the largest
+/// tier multiplier (Xhigh = base * 2) reaches EXACTLY `DAEMON_MAX_TIMEOUT_SECS`
+/// and never has to be clamped down. That is what keeps the tiers STRICTLY
+/// monotonic at the top of the range too (codex review): without this cap, a
+/// large base would push both High (1.6x) and Xhigh (2x) past the daemon max
+/// and collapse them onto it. An operator wanting a longer whole-review budget
+/// than 15 min should use Epic/explore mode, not this routine knob.
+const MAX_ROUTINE_TIMEOUT_SECS: u64 = DAEMON_MAX_TIMEOUT_SECS / 2;
 /// The HTTP client ceiling is always the wall-clock backstop plus this margin
 /// (the socket must outlive the daemon's own kill so we read its error body).
 const CLIENT_TIMEOUT_MARGIN_SECS: u64 = 30;
 
 /// The operator-tunable routine backstop (`REVIEW_ROUTINE_TIMEOUT_SECS`),
 /// defaulting to [`DEFAULT_ROUTINE_TIMEOUT_SECS`] and clamped to
-/// `[MIN_ROUTINE_TIMEOUT_SECS, DAEMON_MAX_TIMEOUT_SECS]`. The lower clamp keeps
-/// the per-tier multipliers strictly monotonic for every valid base (a tiny
-/// value can't collapse Minimal/Low/Medium together).
+/// `[MIN_ROUTINE_TIMEOUT_SECS, MAX_ROUTINE_TIMEOUT_SECS]`. Both clamps keep the
+/// per-tier multipliers STRICTLY monotonic for every valid base: the lower
+/// bound stops a tiny value collapsing Minimal/Low/Medium, the upper bound stops
+/// a huge value collapsing High/Xhigh onto the daemon max.
 fn routine_timeout_secs() -> u64 {
     std::env::var("REVIEW_ROUTINE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_ROUTINE_TIMEOUT_SECS)
-        .clamp(MIN_ROUTINE_TIMEOUT_SECS, DAEMON_MAX_TIMEOUT_SECS)
+        .clamp(MIN_ROUTINE_TIMEOUT_SECS, MAX_ROUTINE_TIMEOUT_SECS)
 }
 
 /// REVX-16: the wall-clock backstop for a given effort tier. The routine base
@@ -1059,7 +1068,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn epic_daemon_opts_enable_explore_and_stall() {
+        std::env::remove_var("REVIEW_ROUTINE_TIMEOUT_SECS");
         let routine = DaemonOpts::routine();
         // REVX-16: the routine backstop is now a generous 5-min default (was a
         // hard-coded 120s that killed high-reasoning reviewers mid-think).
@@ -1094,10 +1105,16 @@ mod tests {
         assert_eq!(tier_backstop_secs(EffortTier::Medium), 500);
         assert_eq!(tier_backstop_secs(EffortTier::Xhigh), 1000);
         assert_eq!(tier_backstop_secs(EffortTier::Minimal), 300);
-        // Clamped to the daemon max (base clamps to 1800, then Xhigh 2x re-clamps).
+        // A huge base clamps to MAX_ROUTINE_TIMEOUT_SECS (900); Xhigh (2x) then
+        // reaches EXACTLY the daemon max without collapsing High onto it (codex
+        // review: strict monotonicity must hold at the top of the range too).
         std::env::set_var("REVIEW_ROUTINE_TIMEOUT_SECS", "999999");
-        assert_eq!(tier_backstop_secs(EffortTier::Medium), DAEMON_MAX_TIMEOUT_SECS);
+        assert_eq!(tier_backstop_secs(EffortTier::Medium), MAX_ROUTINE_TIMEOUT_SECS);
         assert_eq!(tier_backstop_secs(EffortTier::Xhigh), DAEMON_MAX_TIMEOUT_SECS);
+        assert!(
+            tier_backstop_secs(EffortTier::High) < tier_backstop_secs(EffortTier::Xhigh),
+            "High must stay strictly below Xhigh even at the max base"
+        );
         // codex+free review finding: a TINY base must NOT collapse tiers to a
         // floor -- the base is clamped up to MIN_ROUTINE_TIMEOUT_SECS so every
         // tier stays STRICTLY monotonic even at the smallest valid base.
@@ -1139,7 +1156,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn intensive_daemon_opts_raise_effort_and_timeout_but_stay_out_of_explore_mode() {
+        std::env::remove_var("REVIEW_ROUTINE_TIMEOUT_SECS");
         let routine = DaemonOpts::routine();
         let intensive = DaemonOpts::intensive();
         // Intensive still exceeds the (now generous) routine backstop for a
