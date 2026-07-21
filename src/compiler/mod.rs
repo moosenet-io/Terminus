@@ -26,6 +26,7 @@ pub mod host;
 pub mod idle_lease; // BLD-11: compiler↔idle-mode lease (Chord+MINT idle around heavy builds)
 pub mod publish;
 pub mod queue; // BLD-06: the durable compiler job queue (Namespace::Queue)
+pub mod resource; // PCON-09: resource-aware admission budget (RAM/jobs/disk)
 pub mod scheduler; // BLD-06: window/quiet gating + per-host caps + idle seam
 pub mod sccache;
 pub mod scope;
@@ -1139,6 +1140,126 @@ fn local_target_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("terminus-build-target"))
 }
 
+/// PCON-10: the big-disk build-scratch ROOT for a LOCAL build's per-job
+/// `CARGO_TARGET_DIR` + `TMPDIR`. Env var name only (S1).
+const BUILD_SCRATCH_ROOT: &str = "BUILD_SCRATCH_ROOT";
+
+/// PCON-10 pure core: resolve the scratch ROOT from the two candidate config
+/// values. Prefers `BUILD_SCRATCH_ROOT` (a big appdata-backed disk), then the
+/// existing `BUILD_LOCAL_TARGET_DIR` (already sized exec-safe by the operator for
+/// BLD-05), so a host already configured keeps working. FAILS CLOSED when NEITHER
+/// is set — we refuse to silently place a per-job target/TMPDIR on the default
+/// `/tmp` tmpfs, the exact tmpfs+disk exhaustion this closes.
+fn resolve_scratch_root(scratch: Option<String>, local: Option<String>) -> Result<PathBuf, ToolError> {
+    let root = scratch.or(local).map(PathBuf::from).ok_or_else(|| {
+        ToolError::NotConfigured(format!(
+            "build scratch root not configured: set {BUILD_SCRATCH_ROOT} to a big-disk \
+             path (or {BUILD_LOCAL_TARGET_DIR}) — refusing to place a per-job \
+             CARGO_TARGET_DIR/TMPDIR on the default /tmp tmpfs (tmpfs+disk exhaustion)"
+        ))
+    })?;
+    reject_tmpfs_scratch(&root)?;
+    Ok(root)
+}
+
+/// FIX (PCON-10): fail CLOSED when a configured scratch root resolves to a small
+/// in-RAM mount — `validate_target_dir` only checks NFS-dataset non-containment,
+/// so a legacy `BUILD_LOCAL_TARGET_DIR=/tmp/...` (tmpfs) would otherwise pass and
+/// re-introduce the tmpfs+disk exhaustion this closes. Two layers:
+///   1. a LEXICAL fast-path against the well-known tmpfs mount roots (works even
+///      when the dir does not yet exist);
+///   2. a `statfs` f_type check on the NEAREST EXISTING ANCESTOR of the root — so
+///      a not-yet-created dir under a CUSTOM tmpfs mount (e.g.
+///      `/mnt/ram/scratch`, which the lexical list can't know about) is still
+///      rejected by the filesystem type of the mount it would be created on.
+fn reject_tmpfs_scratch(root: &std::path::Path) -> Result<(), ToolError> {
+    for bad in ["/tmp", "/dev/shm", "/run"] {
+        if scope::is_within(root, std::path::Path::new(bad)) {
+            return Err(ToolError::NotConfigured(format!(
+                "build scratch root {} is on the small in-RAM {bad} tmpfs — set \
+                 {BUILD_SCRATCH_ROOT} to a big (on-disk) path; refusing to build there \
+                 (tmpfs+disk exhaustion)",
+                root.display()
+            )));
+        }
+    }
+    if nearest_existing_ancestor_is_tmpfs(
+        root,
+        &|p| p.exists(),
+        &|p| crate::compiler::resource::is_tmpfs(p),
+    ) {
+        return Err(ToolError::NotConfigured(format!(
+            "build scratch root {} resolves onto a tmpfs/ramfs filesystem — set \
+             {BUILD_SCRATCH_ROOT} to a big (on-disk) path; refusing to build there \
+             (tmpfs+disk exhaustion)",
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Walk up from `root` to the nearest EXISTING ancestor and report whether that
+/// ancestor is tmpfs/ramfs. `exists`/`is_tmpfs` are injected so the walk is unit-
+/// testable without a real tmpfs mount. Returns `false` if no ancestor exists
+/// (nothing to stat) — the caller's lexical guard is the backstop there.
+fn nearest_existing_ancestor_is_tmpfs(
+    root: &std::path::Path,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+    is_tmpfs: &dyn Fn(&std::path::Path) -> bool,
+) -> bool {
+    let mut cur = Some(root.to_path_buf());
+    while let Some(c) = cur {
+        if exists(&c) {
+            return is_tmpfs(&c);
+        }
+        cur = c.parent().map(|p| p.to_path_buf());
+    }
+    false
+}
+
+/// PCON-10: the resolved big-disk scratch ROOT for a local build (fail-closed).
+fn job_scratch_root() -> Result<PathBuf, ToolError> {
+    resolve_scratch_root(
+        env_nonempty(BUILD_SCRATCH_ROOT),
+        env_nonempty(BUILD_LOCAL_TARGET_DIR),
+    )
+}
+
+/// PCON-10: the per-job `(target, tmpdir)` under a scratch ROOT, keyed by the
+/// unique per-invocation `unit`. Disjoint across concurrent jobs; both live on
+/// the big disk (never the small `/tmp` tmpfs). The parent `root.join(unit)` is
+/// the single dir reclaimed on finalize.
+fn job_scratch_dirs(root: &std::path::Path, unit: &str) -> (PathBuf, PathBuf) {
+    let base = root.join(unit);
+    (base.join("target"), base.join("tmp"))
+}
+
+/// PCON-10: best-effort reclaim of a per-job build-scratch dir on drop — covers
+/// build success AND every `?` early-return path of `build_inner`. A crash that
+/// skips the drop is covered by PCON-05's age/count GC backstop.
+struct ScratchReclaim(Option<PathBuf>);
+
+impl ScratchReclaim {
+    fn new(dir: PathBuf) -> Self {
+        Self(Some(dir))
+    }
+}
+
+impl Drop for ScratchReclaim {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "PCON-10: failed to reclaim per-job build scratch {}: {e}",
+                        dir.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn target_triple() -> String {
     env_nonempty(BUILD_TARGET_TRIPLE).unwrap_or_else(|| DEFAULT_TARGET_TRIPLE.to_string())
 }
@@ -1948,6 +2069,68 @@ impl Drop for RemoteSecretGuard {
     }
 }
 
+/// Render the argv that removes the remote per-job SCRATCH dir over ssh:
+/// `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> rm -rf <quoted-dir>`. Pure
+/// (testable offline); the dir is shell-quoted and the connect is bounded so a
+/// synchronous Drop cleanup can never hang.
+fn render_remote_scratch_rm_argv(host: &str, remote_dir: &str) -> Vec<String> {
+    vec![
+        "ssh".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=10".to_string(),
+        host.to_string(),
+        format!("rm -rf {}", shell_quote(remote_dir)),
+    ]
+}
+
+/// PCON-10 FIX: RAII guard reclaiming the REMOTE per-job scratch (the per-job
+/// `CARGO_TARGET_DIR` AND its nested `TMPDIR`, both under `<heavy_target>/<module>-<unit>`)
+/// on EVERY exit path of the remote build — SUCCESS, any `?` error, an ssh/build
+/// timeout, or a panic — mirroring the LOCAL [`ScratchReclaim`] drop guard. Armed
+/// right after the remote target dir is created (before staging/build), so a
+/// failure ANYWHERE after that cannot leak it. The built binary is rsync'd to a
+/// LOCAL path BEFORE this guard drops, so reclaiming on success is safe.
+///
+/// The ONE residual is a hard crash of THIS process (which skips Drop entirely) —
+/// that abnormal-exit case is intentionally backstopped by PCON-05's age/count GC
+/// of per-job heavy target dirs, NOT by this inline guard. Every NORMAL exit
+/// (success or failure/timeout) is covered inline here.
+struct RemoteScratchGuard {
+    host: String,
+    remote_dir: String,
+    redact: Vec<String>,
+    /// Test-only sink: when set, `Drop` RECORDS the rendered rm argv here instead
+    /// of spawning a real ssh — so the "reclaim fires on the failure path"
+    /// property is unit-testable offline. `None` in production.
+    recorder: Option<std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>>,
+}
+
+impl RemoteScratchGuard {
+    fn new(host: String, remote_dir: String, redact: Vec<String>) -> Self {
+        Self {
+            host,
+            remote_dir,
+            redact,
+            recorder: None,
+        }
+    }
+}
+
+impl Drop for RemoteScratchGuard {
+    fn drop(&mut self) {
+        let argv = render_remote_scratch_rm_argv(&self.host, &self.remote_dir);
+        if let Some(rec) = &self.recorder {
+            if let Ok(mut g) = rec.lock() {
+                g.push(argv);
+            }
+            return;
+        }
+        blocking_ssh_rm(&argv, &self.redact);
+    }
+}
+
 /// Run a subprocess argv with an optional cwd + extra env, bounded by `timeout`.
 /// Returns `Ok(stdout)` on success (exit 0), else an `Execution` error with a
 /// trimmed stderr tail. The env is applied on top of the inherited environment.
@@ -2554,6 +2737,7 @@ fn scrub_infra_literals(input: &str) -> String {
         BUILD_HEAVY_DATASET_ROOT,
         BUILD_HEAVY_LOCAL_TARGET_DIR,
         BUILD_LOCAL_TARGET_DIR,
+        BUILD_SCRATCH_ROOT,
     ]
     .iter()
     .filter_map(|k| env_nonempty(k))
@@ -2950,15 +3134,35 @@ impl CompilerBuild {
 
         if resolved.is_local() {
             // ── LOCAL build (primary, in place) ──────────────────────────────
-            let target_dir = local_target_dir();
-            // GUARD: exec-safe local/tmpfs target, never the file-level NFS dataset.
+            // PCON-10: a PER-JOB CARGO_TARGET_DIR + TMPDIR on the big-disk scratch
+            // root (fail-closed if unset — never the small /tmp tmpfs), so two
+            // concurrent local builds never share a target/temp dir. Reclaimed on
+            // finalize by the drop guard below (PCON-05 GC is the crash backstop).
+            let scratch_root = job_scratch_root()?;
+            let (target_dir, tmp_dir) = job_scratch_dirs(&scratch_root, &unit);
+            // GUARD: both exec-safe local disk, never the file-level NFS dataset.
             scope::validate_target_dir(&target_dir, &root)?;
+            scope::validate_target_dir(&tmp_dir, &root)?;
+            // FIX (PCON-10): arm the reclaim guard BEFORE creating anything, so a
+            // PARTIAL create that then errors (or any later `?`) still removes
+            // `<root>/<unit>` — the guard must own the dir before it can leak.
+            let _scratch_guard = ScratchReclaim::new(scratch_root.join(&unit));
+            // cargo creates CARGO_TARGET_DIR itself, but TMPDIR must pre-exist.
+            std::fs::create_dir_all(&tmp_dir).map_err(|e| {
+                ToolError::Execution(format!(
+                    "could not create per-job TMPDIR {}: {e}",
+                    tmp_dir.display()
+                ))
+            })?;
 
             let mut build_env = sccache_env.vars.clone();
             build_env.insert(
                 "CARGO_TARGET_DIR".to_string(),
                 target_dir.to_string_lossy().to_string(),
             );
+            // PCON-10: keep temp on the big disk too (rustc/linker/tempfile spill),
+            // never the small /tmp tmpfs.
+            build_env.insert("TMPDIR".to_string(), tmp_dir.to_string_lossy().to_string());
             // Force cargo's N/M progress bar on the piped (non-TTY) stdio so the
             // tap gets live {step,total} updates (BLD-19).
             inject_cargo_progress_env(&mut build_env);
@@ -3125,6 +3329,10 @@ impl CompilerBuild {
             // never under the remote NFS dataset.
             scope::validate_target_dir(&remote_target, std::path::Path::new(&remote_root))?;
             let remote_target_str = remote_target.to_string_lossy().to_string();
+            // PCON-10: a per-job TMPDIR on the heavy BUILD disk (a subdir of the
+            // per-job target, so it is reclaimed with it), never the remote /tmp
+            // tmpfs — rustc/linker/tempfile spill would otherwise exhaust it.
+            let remote_tmp_str = format!("{}/.tmpdir", remote_target_str.trim_end_matches('/'));
             // PCON-03: content-addressed by `stage_key` (the resolved sha when
             // SHA-staging is active, else the legacy ref) — mirrors PCON-01's
             // local stage path. Two DIFFERENT shas of one module now relay to
@@ -3150,7 +3358,11 @@ impl CompilerBuild {
                 &[
                     "ssh".into(),
                     host_addr.clone(),
-                    format!("mkdir -p {}", shell_quote(&remote_target_str)),
+                    format!(
+                        "mkdir -p {} {}",
+                        shell_quote(&remote_target_str),
+                        shell_quote(&remote_tmp_str)
+                    ),
                 ],
                 None,
                 &BTreeMap::new(),
@@ -3160,6 +3372,17 @@ impl CompilerBuild {
                 None,
             )
             .await?;
+
+            // PCON-10 FIX: arm the remote-scratch reclaim NOW — right after the
+            // per-job target/TMPDIR exist and BEFORE staging/build — so the remote
+            // scratch is removed on EVERY exit path (the built binary is copied to
+            // a LOCAL path before this drops; see RemoteScratchGuard). A hard crash
+            // of this process is the only residual, backstopped by PCON-05 GC.
+            let _remote_scratch_guard = RemoteScratchGuard::new(
+                host_addr.clone(),
+                remote_target_str.clone(),
+                redact.clone(),
+            );
 
             if let Some(sha) = &resolved_sha {
                 // PCON-03 (FINDING 3 review fix): with staging content-addressed
@@ -3325,6 +3548,8 @@ impl CompilerBuild {
 
             let mut build_env = sccache_env.vars.clone();
             build_env.insert("CARGO_TARGET_DIR".to_string(), remote_target_str.clone());
+            // PCON-10: per-job TMPDIR on the heavy build disk, never remote /tmp.
+            build_env.insert("TMPDIR".to_string(), remote_tmp_str.clone());
             // Force cargo's N/M progress bar on the piped (non-TTY, over-ssh) stdio
             // so the tap gets live {step,total} updates (BLD-19).
             inject_cargo_progress_env(&mut build_env);
@@ -5224,6 +5449,145 @@ mod tests {
         assert!(scope::validate_target_dir(&target, &root).is_ok());
     }
 
+    // ── PCON-10: per-job CARGO_TARGET_DIR + TMPDIR on the big disk ────────────
+
+    #[test]
+    fn scratch_root_fails_closed_when_neither_var_is_set() {
+        // Unset big-disk root ⇒ hard error, never a silent /tmp tmpfs fallback.
+        let err = resolve_scratch_root(None, None).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("scratch root not configured"), "{msg}");
+        assert!(msg.contains("tmpfs"), "should name the tmpfs hazard: {msg}");
+    }
+
+    #[test]
+    fn scratch_root_prefers_scratch_then_local_target() {
+        assert_eq!(
+            resolve_scratch_root(Some("/big/scratch".into()), Some("/big/local".into())).unwrap(),
+            PathBuf::from("/big/scratch"),
+        );
+        assert_eq!(
+            resolve_scratch_root(None, Some("/big/local".into())).unwrap(),
+            PathBuf::from("/big/local"),
+        );
+    }
+
+    #[test]
+    fn job_scratch_dirs_are_per_job_disjoint_and_on_the_big_disk() {
+        let root = PathBuf::from("/big/scratch");
+        let (t1, tmp1) = job_scratch_dirs(&root, "chord-abc-uuid1");
+        let (t2, tmp2) = job_scratch_dirs(&root, "chord-abc-uuid2");
+        // Two concurrent jobs get disjoint target AND tmp dirs.
+        assert_ne!(t1, t2);
+        assert_ne!(tmp1, tmp2);
+        // Both live under the big-disk root, never /tmp.
+        for p in [&t1, &tmp1, &t2, &tmp2] {
+            assert!(p.starts_with("/big/scratch"), "{p:?}");
+            assert!(!p.starts_with("/tmp"), "{p:?}"); // hermeticity-allow: asserting NOT /tmp
+        }
+        // Distinct roles within one job.
+        assert!(t1.ends_with("target"));
+        assert!(tmp1.ends_with("tmp"));
+    }
+
+    #[test]
+    fn job_scratch_dirs_are_rejected_under_the_nfs_dataset() {
+        // A scratch root that lands under the NFS dataset is refused by the guard
+        // (cargo compiles then EXECUTES build scripts — NFS breaks exec).
+        let dataset = PathBuf::from("/data/build");
+        let (target, tmp) = job_scratch_dirs(&dataset.join("scratch"), "m-uuid");
+        assert!(scope::validate_target_dir(&target, &dataset).is_err());
+        assert!(scope::validate_target_dir(&tmp, &dataset).is_err());
+    }
+
+    #[test]
+    fn job_scratch_dirs_off_the_dataset_pass_the_guard() {
+        let root = PathBuf::from("/big/scratch");
+        let dataset = PathBuf::from("/data/build");
+        let (target, tmp) = job_scratch_dirs(&root, "m-uuid");
+        assert!(scope::validate_target_dir(&target, &dataset).is_ok());
+        assert!(scope::validate_target_dir(&tmp, &dataset).is_ok());
+    }
+
+    #[test]
+    fn scratch_root_rejects_tmpfs_and_accepts_big_disk() {
+        // FIX (PCON-10): a /tmp (tmpfs) local-target fallback is rejected
+        // fail-closed — validate_target_dir alone would have let it through.
+        assert!(resolve_scratch_root(None, Some("/tmp/terminus-build".into())).is_err()); // hermeticity-allow: asserting /tmp is rejected
+        assert!(resolve_scratch_root(Some("/tmp".into()), None).is_err()); // hermeticity-allow: asserting /tmp is rejected
+        assert!(resolve_scratch_root(Some("/dev/shm/x".into()), None).is_err());
+        assert!(resolve_scratch_root(Some("/run/build".into()), None).is_err());
+        // A big-disk (non-tmpfs) root is accepted.
+        assert_eq!(
+            resolve_scratch_root(Some("/data/build/scratch".into()), None).unwrap(),
+            PathBuf::from("/data/build/scratch"),
+        );
+    }
+
+    #[test]
+    fn nonexistent_scratch_under_custom_tmpfs_mount_is_rejected() {
+        // FIX (PCON-10): a not-yet-created dir under a CUSTOM tmpfs mount (not in
+        // the lexical /tmp,/dev/shm,/run list) is rejected via the nearest
+        // EXISTING ancestor's filesystem type. Injected exists/is_tmpfs make the
+        // walk deterministic without a real mount.
+        let root = std::path::Path::new("/mnt/ram/scratch/target");
+        // Ancestor /mnt/ram exists and is tmpfs; deeper components do not exist.
+        let exists = |p: &std::path::Path| p == std::path::Path::new("/mnt/ram");
+        let is_tmpfs = |p: &std::path::Path| p == std::path::Path::new("/mnt/ram");
+        assert!(
+            nearest_existing_ancestor_is_tmpfs(root, &exists, &is_tmpfs),
+            "a nonexistent path whose existing ancestor is tmpfs must be rejected"
+        );
+    }
+
+    #[test]
+    fn nonexistent_scratch_under_big_disk_mount_is_accepted() {
+        // FIX (PCON-10): the same walk accepts a not-yet-created dir whose
+        // existing ancestor is an on-disk (non-tmpfs) filesystem.
+        let root = std::path::Path::new("/mnt/bulk/scratch/target");
+        let exists = |p: &std::path::Path| p == std::path::Path::new("/mnt/bulk");
+        let is_tmpfs = |_p: &std::path::Path| false;
+        assert!(
+            !nearest_existing_ancestor_is_tmpfs(root, &exists, &is_tmpfs),
+            "a big-disk ancestor must be accepted"
+        );
+    }
+
+    fn unique_reclaim_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "pcon10-reclaim-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn scratch_reclaim_removes_dir_even_after_partial_creation() {
+        // FIX (PCON-10): the guard is armed BEFORE dir creation, so a PARTIAL
+        // create followed by an early return still reclaims `<root>/<unit>`.
+        let base = unique_reclaim_dir("partial");
+        std::fs::create_dir_all(base.join("target/partial")).unwrap();
+        assert!(base.exists());
+        {
+            let _g = ScratchReclaim::new(base.clone());
+            // simulate an early `?` return: the guard drops here.
+        }
+        assert!(!base.exists(), "partially-created scratch must be reclaimed");
+    }
+
+    #[test]
+    fn scratch_reclaim_is_noop_when_dir_never_created() {
+        // A guard over a dir that was never created must drop cleanly (no panic).
+        let base = unique_reclaim_dir("absent");
+        {
+            let _g = ScratchReclaim::new(base.clone());
+        }
+        assert!(!base.exists());
+    }
+
     #[test]
     fn str_arg_rejects_missing_and_blank() {
         let v = json!({"module": "  ", "ref": "abc"});
@@ -6133,6 +6497,43 @@ mod tests {
         assert!(
             rec.lock().unwrap().is_empty(),
             "a disarmed guard must not issue a remote rm"
+        );
+    }
+
+    #[test]
+    fn remote_scratch_rm_argv_is_bounded_recursive_and_quoted() {
+        let argv = render_remote_scratch_rm_argv("builduser@heavy", "/mnt/bt/chord-deadbeef");
+        assert_eq!(argv[0], "ssh");
+        let j = argv.join(" ");
+        assert!(j.contains("-o BatchMode=yes"), "{j}");
+        assert!(j.contains("-o ConnectTimeout=10"), "{j}");
+        assert_eq!(argv.last().unwrap(), "rm -rf '/mnt/bt/chord-deadbeef'");
+    }
+
+    #[test]
+    fn remote_scratch_guard_reclaims_on_every_exit_path() {
+        use std::sync::{Arc, Mutex};
+        // PCON-10 FIX: the guard is armed after the remote dir is created and is
+        // NEVER disarmed — so ANY exit (a build error, an ssh/build timeout, a
+        // panic, OR normal success) reclaims the remote per-job scratch inline.
+        let rec: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut g = RemoteScratchGuard::new(
+                "builduser@heavy".to_string(),
+                "/mnt/build-target/chord-deadbeef".to_string(),
+                vec![],
+            );
+            g.recorder = Some(rec.clone());
+        } // early-return / failure / scope-exit: Drop fires here
+        let calls = rec.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "remote scratch reclaim must fire on the failure/early-return path"
+        );
+        assert_eq!(
+            calls[0].last().unwrap(),
+            "rm -rf '/mnt/build-target/chord-deadbeef'"
         );
     }
 
