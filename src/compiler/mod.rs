@@ -1151,16 +1151,43 @@ const BUILD_SCRATCH_ROOT: &str = "BUILD_SCRATCH_ROOT";
 /// is set — we refuse to silently place a per-job target/TMPDIR on the default
 /// `/tmp` tmpfs, the exact tmpfs+disk exhaustion this closes.
 fn resolve_scratch_root(scratch: Option<String>, local: Option<String>) -> Result<PathBuf, ToolError> {
-    scratch
-        .or(local)
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            ToolError::NotConfigured(format!(
-                "build scratch root not configured: set {BUILD_SCRATCH_ROOT} to a big-disk \
-                 path (or {BUILD_LOCAL_TARGET_DIR}) — refusing to place a per-job \
-                 CARGO_TARGET_DIR/TMPDIR on the default /tmp tmpfs (tmpfs+disk exhaustion)"
-            ))
-        })
+    let root = scratch.or(local).map(PathBuf::from).ok_or_else(|| {
+        ToolError::NotConfigured(format!(
+            "build scratch root not configured: set {BUILD_SCRATCH_ROOT} to a big-disk \
+             path (or {BUILD_LOCAL_TARGET_DIR}) — refusing to place a per-job \
+             CARGO_TARGET_DIR/TMPDIR on the default /tmp tmpfs (tmpfs+disk exhaustion)"
+        ))
+    })?;
+    reject_tmpfs_scratch(&root)?;
+    Ok(root)
+}
+
+/// FIX (PCON-10): fail CLOSED when a configured scratch root resolves to a small
+/// in-RAM mount — `validate_target_dir` only checks NFS-dataset non-containment,
+/// so a legacy `BUILD_LOCAL_TARGET_DIR=/tmp/...` (tmpfs) would otherwise pass and
+/// re-introduce the tmpfs+disk exhaustion this closes. Two layers: a LEXICAL
+/// guard against the well-known tmpfs mount roots (works even when the dir does
+/// not yet exist, so a test/first-run is deterministic), plus a `statfs` f_type
+/// check that rejects an actual tmpfs/ramfs when the path exists.
+fn reject_tmpfs_scratch(root: &std::path::Path) -> Result<(), ToolError> {
+    for bad in ["/tmp", "/dev/shm", "/run"] {
+        if scope::is_within(root, std::path::Path::new(bad)) {
+            return Err(ToolError::NotConfigured(format!(
+                "build scratch root {} is on the small in-RAM {bad} tmpfs — set \
+                 {BUILD_SCRATCH_ROOT} to a big (on-disk) path; refusing to build there \
+                 (tmpfs+disk exhaustion)",
+                root.display()
+            )));
+        }
+    }
+    if root.exists() && crate::compiler::resource::is_tmpfs(root) {
+        return Err(ToolError::NotConfigured(format!(
+            "build scratch root {} is a tmpfs/ramfs filesystem — set {BUILD_SCRATCH_ROOT} \
+             to a big (on-disk) path; refusing to build there (tmpfs+disk exhaustion)",
+            root.display()
+        )));
+    }
+    Ok(())
 }
 
 /// PCON-10: the resolved big-disk scratch ROOT for a local build (fail-closed).
@@ -3027,6 +3054,10 @@ impl CompilerBuild {
             // GUARD: both exec-safe local disk, never the file-level NFS dataset.
             scope::validate_target_dir(&target_dir, &root)?;
             scope::validate_target_dir(&tmp_dir, &root)?;
+            // FIX (PCON-10): arm the reclaim guard BEFORE creating anything, so a
+            // PARTIAL create that then errors (or any later `?`) still removes
+            // `<root>/<unit>` — the guard must own the dir before it can leak.
+            let _scratch_guard = ScratchReclaim::new(scratch_root.join(&unit));
             // cargo creates CARGO_TARGET_DIR itself, but TMPDIR must pre-exist.
             std::fs::create_dir_all(&tmp_dir).map_err(|e| {
                 ToolError::Execution(format!(
@@ -3034,7 +3065,6 @@ impl CompilerBuild {
                     tmp_dir.display()
                 ))
             })?;
-            let _scratch_guard = ScratchReclaim::new(scratch_root.join(&unit));
 
             let mut build_env = sccache_env.vars.clone();
             build_env.insert(
@@ -5353,7 +5383,7 @@ mod tests {
         // Both live under the big-disk root, never /tmp.
         for p in [&t1, &tmp1, &t2, &tmp2] {
             assert!(p.starts_with("/big/scratch"), "{p:?}");
-            assert!(!p.starts_with("/tmp"), "{p:?}");
+            assert!(!p.starts_with("/tmp"), "{p:?}"); // hermeticity-allow: asserting NOT /tmp
         }
         // Distinct roles within one job.
         assert!(t1.ends_with("target"));
@@ -5377,6 +5407,56 @@ mod tests {
         let (target, tmp) = job_scratch_dirs(&root, "m-uuid");
         assert!(scope::validate_target_dir(&target, &dataset).is_ok());
         assert!(scope::validate_target_dir(&tmp, &dataset).is_ok());
+    }
+
+    #[test]
+    fn scratch_root_rejects_tmpfs_and_accepts_big_disk() {
+        // FIX (PCON-10): a /tmp (tmpfs) local-target fallback is rejected
+        // fail-closed — validate_target_dir alone would have let it through.
+        assert!(resolve_scratch_root(None, Some("/tmp/terminus-build".into())).is_err()); // hermeticity-allow: asserting /tmp is rejected
+        assert!(resolve_scratch_root(Some("/tmp".into()), None).is_err()); // hermeticity-allow: asserting /tmp is rejected
+        assert!(resolve_scratch_root(Some("/dev/shm/x".into()), None).is_err());
+        assert!(resolve_scratch_root(Some("/run/build".into()), None).is_err());
+        // A big-disk (non-tmpfs) root is accepted.
+        assert_eq!(
+            resolve_scratch_root(Some("/data/build/scratch".into()), None).unwrap(),
+            PathBuf::from("/data/build/scratch"),
+        );
+    }
+
+    fn unique_reclaim_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "pcon10-reclaim-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn scratch_reclaim_removes_dir_even_after_partial_creation() {
+        // FIX (PCON-10): the guard is armed BEFORE dir creation, so a PARTIAL
+        // create followed by an early return still reclaims `<root>/<unit>`.
+        let base = unique_reclaim_dir("partial");
+        std::fs::create_dir_all(base.join("target/partial")).unwrap();
+        assert!(base.exists());
+        {
+            let _g = ScratchReclaim::new(base.clone());
+            // simulate an early `?` return: the guard drops here.
+        }
+        assert!(!base.exists(), "partially-created scratch must be reclaimed");
+    }
+
+    #[test]
+    fn scratch_reclaim_is_noop_when_dir_never_created() {
+        // A guard over a dir that was never created must drop cleanly (no panic).
+        let base = unique_reclaim_dir("absent");
+        {
+            let _g = ScratchReclaim::new(base.clone());
+        }
+        assert!(!base.exists());
     }
 
     #[test]

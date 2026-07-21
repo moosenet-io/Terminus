@@ -146,6 +146,28 @@ pub fn disk_free_mb(path: &Path) -> Option<u64> {
     }
 }
 
+/// Whether `path` resides on a tmpfs/ramfs filesystem (the small in-RAM mounts a
+/// build target/TMPDIR must NEVER land on). Uses `statfs` `f_type` when `path`
+/// exists; a stat failure returns `false` (unknown — the caller applies its own
+/// lexical prefix guard on top). `TMPFS_MAGIC = 0x0102_1994`, `RAMFS_MAGIC =
+/// 0x8584_58f6`.
+pub fn is_tmpfs(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: statfs fills a zeroed struct; we only read the scalar f_type.
+    unsafe {
+        let mut st: libc::statfs = std::mem::zeroed();
+        if libc::statfs(c.as_ptr(), &mut st) != 0 {
+            return false;
+        }
+        let t = st.f_type as i64;
+        t == 0x0102_1994 || t == 0x8584_58f6u32 as i64
+    }
+}
+
 /// Whether `path`'s filesystem has at least `min_mb` free. `min_mb == 0` disables
 /// the gate (always `true`). A failed stat degrades OPEN (`true`) — a build is
 /// never blocked on an unreadable path.

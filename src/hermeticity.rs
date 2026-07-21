@@ -130,6 +130,53 @@ fn call_arg_offset(line: &str, needle: &str) -> Option<usize> {
     line.find(needle).map(|p| p + needle.len())
 }
 
+/// Whether a line spawns `git` in one of the common invocation forms:
+/// `Command::new("git")` (also `StdCommand::new` / `std::process::Command::new`
+/// via the substring), a `.arg("git")` builder call, or an args-list whose FIRST
+/// token is `"git"` (`["git", …]` / `[ "git"`).
+fn line_is_git_invocation(l: &str) -> bool {
+    l.contains("Command::new(\"git\")")
+        || l.contains(".arg(\"git\")")
+        || l.contains("[\"git\"")
+        || l.contains("[ \"git\"")
+}
+
+/// Whether a line carries a token that FORCES a git op to be hermetic — the
+/// sandbox filesystem-transport allowance, a fixed test identity, or gpg-signing
+/// disabled. Checked only within a git invocation's own statement (see rule 3).
+fn line_has_forcing_git_config(l: &str) -> bool {
+    l.contains("protocol.file.allow")
+        || l.contains("commit.gpgsign")
+        || l.contains("GIT_AUTHOR_NAME")
+        || l.contains("GIT_COMMITTER_NAME")
+        || l.contains("user.name")
+        || l.contains("user.email")
+}
+
+/// Whether a line contains a hardcoded `/tmp` ROOT as a string literal, in ANY
+/// construction form. Matches the literal `"/tmp"` (bare) or `"/tmp/…"` (a
+/// subpath) — however it is wrapped (`Path::new(...)`, `PathBuf::from(...)`, a
+/// struct field, a `json!` value, …) — because the token scanned for is the
+/// literal itself. Deliberately does NOT match `"/tmpfoo"` (a different root that
+/// merely shares the `/tmp` prefix): the char after `/tmp` must be the closing
+/// quote or a path separator.
+fn line_has_hardcoded_tmp(l: &str) -> bool {
+    // Find each `"/tmp` occurrence and require the next byte to be `"` or `/`.
+    let bytes = l.as_bytes();
+    let needle = b"\"/tmp";
+    let mut from = 0usize;
+    while let Some(rel_pos) = l[from..].find("\"/tmp") {
+        let start = from + rel_pos;
+        let after = start + needle.len();
+        match bytes.get(after) {
+            Some(b'"') | Some(b'/') => return true,
+            _ => {}
+        }
+        from = start + 1;
+    }
+    false
+}
+
 /// Scan a single already-read file's lines for unforced-ambient-state findings.
 /// `rel` is the path reported in findings.
 fn scan_lines(rel: &str, lines: &[&str]) -> Vec<HermeticityFinding> {
@@ -186,16 +233,6 @@ fn scan_lines(rel: &str, lines: &[&str]) -> Vec<HermeticityFinding> {
                 continue;
             }
 
-            // Body-wide "forced git config" check.
-            let body_forces_git = (fn_line..=end).any(|m| {
-                let l = lines[m];
-                l.contains("protocol.file.allow")
-                    || l.contains("commit.gpgsign")
-                    || l.contains("GIT_AUTHOR_NAME")
-                    || l.contains("GIT_COMMITTER_NAME")
-                    || l.contains("user.name")
-            });
-
             for (off, l) in lines[fn_line..=end].iter().enumerate() {
                 let lineno = fn_line + off + 1;
                 if l.contains("hermeticity-allow") {
@@ -233,13 +270,27 @@ fn scan_lines(rel: &str, lines: &[&str]) -> Vec<HermeticityFinding> {
                     }
                 }
 
-                // Rule 3: git op without forced config anywhere in the body.
-                if l.contains("Command::new(\"git\")") && !body_forces_git {
-                    push("git-unforced-config", &mut findings);
+                // Rule 3: a git invocation whose OWN statement does not force the
+                // config that makes a git op hermetic. The forcing token must
+                // appear on/within the invocation's statement (from this line
+                // through the line that ends it with `;`) — a config token that
+                // belongs to a DIFFERENT op elsewhere in the body does NOT count.
+                if line_is_git_invocation(l) {
+                    let gi = fn_line + off; // absolute line index
+                    let mut se = gi;
+                    while se < end && !lines[se].contains(';') {
+                        se += 1;
+                    }
+                    let forced = (gi..=se).any(|m| line_has_forcing_git_config(lines[m]));
+                    if !forced {
+                        push("git-unforced-config", &mut findings);
+                    }
                 }
 
-                // Rule 4: hardcoded /tmp path.
-                if l.contains("\"/tmp/") {
+                // Rule 4: a hardcoded `/tmp` ROOT in a string literal, in any
+                // construction form (`"/tmp"`, `"/tmp/..."`, `Path::new("/tmp")`,
+                // `PathBuf::from("/tmp")`, …) — but NOT `"/tmpfoo"`.
+                if line_has_hardcoded_tmp(l) {
                     push("hardcoded-tmp", &mut findings);
                 }
             }
@@ -283,7 +334,7 @@ pub fn scan_hermeticity(root: &Path) -> Vec<HermeticityFinding> {
 /// live tree (run the self-check with `HERMETICITY_DUMP=1` to regenerate).
 #[cfg(test)]
 const BASELINE: &[(&str, usize)] = &[
-    // == GENERATED BASELINE (regenerate with HERMETICITY_DUMP=1) — 229 findings ==
+    // == GENERATED BASELINE (regenerate with HERMETICITY_DUMP=1) — 231 findings ==
     ("bin/mint.rs", 18),
     ("broker/control.rs", 3),
     ("compiler/deploy.rs", 4),
@@ -321,12 +372,13 @@ const BASELINE: &[(&str, usize)] = &[
     ("reminder/mod.rs", 3),
     ("scribe/inspect.rs", 6),
     ("scribe/mod.rs", 2),
-    ("scribe/vault.rs", 1),
+    ("scribe/vault.rs", 2),
     ("sentinel/mod.rs", 3),
     ("skills/mod.rs", 1),
     ("sysversion/mod.rs", 16),
     ("tools/docgen/drift.rs", 3),
     ("tools/docgen/generate.rs", 4),
+    ("tools/docgen/mod.rs", 1),
     ("vigil/mod.rs", 2),
 ];
 
@@ -385,14 +437,38 @@ mod tests {
         )
     }
     fn git_call(fname: &str, forced: bool) -> String {
-        let cfg = if forced {
-            "    let _c = format!(\"protocol.file.allow=always\");\n"
+        // When forced, the config is an ARG on the SAME statement as the git
+        // invocation (so it associates under the tightened rule 3). `{:?}` keeps
+        // the literal `Command::new("git")` token out of THIS module's source.
+        let forcing = if forced {
+            format!(".arg(\"-c\").arg({:?})", "protocol.file.allow=always")
         } else {
-            ""
+            String::new()
         };
-        // `Command::new({:?})` in source ≠ `Command::new("git")`.
         format!(
-            "#[test]\nfn {fname}() {{\n{cfg}    let _ = std::process::Command::new({:?});\n}}\n",
+            "#[test]\nfn {fname}() {{\n    let _ = std::process::Command::new({:?}){forcing};\n}}\n",
+            "git"
+        )
+    }
+    /// A git op that is UNFORCED, but whose body carries an UNRELATED
+    /// `protocol.file.allow` token on a DIFFERENT statement (FIX 2 regression).
+    fn git_unforced_with_unrelated_config(fname: &str) -> String {
+        format!(
+            "#[test]\nfn {fname}() {{\n    let _cfg = {:?};\n    let _ = std::process::Command::new({:?});\n}}\n",
+            "protocol.file.allow=always", "git"
+        )
+    }
+    /// A git invocation via the `.arg("git")` builder form.
+    fn git_via_arg(fname: &str) -> String {
+        format!(
+            "#[test]\nfn {fname}() {{\n    let _ = std::process::Command::new(\"env\").arg({:?});\n}}\n",
+            "git"
+        )
+    }
+    /// A git invocation via an args-list whose first token is `"git"`.
+    fn git_via_args_list(fname: &str) -> String {
+        format!(
+            "#[test]\nfn {fname}() {{\n    let _ = std::process::Command::new(\"env\").args([{:?}, \"status\"]);\n}}\n",
             "git"
         )
     }
@@ -400,6 +476,28 @@ mod tests {
         // Build the `/tmp/...` literal so `"/tmp/` is not contiguous in source.
         let path = format!("\"/{}\"", "tmp/pcon08-fixture");
         format!("#[test]\nfn {fname}() {{\n    let _p = {path};\n}}\n")
+    }
+    /// `Path::new("/tmp")` — a bare `/tmp` ROOT (no trailing slash), FIX 1.
+    fn tmp_path_new(fname: &str) -> String {
+        format!(
+            "#[test]\nfn {fname}() {{\n    let _p = std::path::Path::new(\"/{}\");\n}}\n",
+            "tmp"
+        )
+    }
+    /// `PathBuf::from("/tmp")` — a bare `/tmp` ROOT, FIX 1.
+    fn tmp_pathbuf_from(fname: &str) -> String {
+        format!(
+            "#[test]\nfn {fname}() {{\n    let _p = std::path::PathBuf::from(\"/{}\");\n}}\n",
+            "tmp"
+        )
+    }
+    /// `"/tmpfoo"` — a DIFFERENT root that merely shares the `/tmp` prefix; must
+    /// NOT be flagged.
+    fn tmpfoo_write(fname: &str) -> String {
+        format!(
+            "#[test]\nfn {fname}() {{\n    let _p = std::path::Path::new(\"/{}\");\n}}\n",
+            "tmpfoo"
+        )
     }
     fn tempdir_write(fname: &str) -> String {
         format!(
@@ -488,11 +586,74 @@ mod tests {
     }
 
     #[test]
+    fn unforced_git_with_unrelated_config_token_elsewhere_is_still_flagged() {
+        // FIX 2: a `protocol.file.allow` token belonging to a DIFFERENT statement
+        // must NOT excuse an unforced git op.
+        let dir = temp_tree("git-unrelated");
+        write(&dir, "a.rs", &git_unforced_with_unrelated_config("t"));
+        let f = scan_hermeticity(&dir);
+        assert!(
+            f.iter().any(|x| x.rule == "git-unforced-config"),
+            "unrelated forcing token must not excuse the git op: {f:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_via_arg_and_args_list_forms_are_detected() {
+        // FIX 2: recognize the arg-form and args-list git invocation forms.
+        for (tag, body) in [
+            ("git-arg", git_via_arg("t")),
+            ("git-args", git_via_args_list("t")),
+        ] {
+            let dir = temp_tree(tag);
+            write(&dir, "a.rs", &body);
+            let f = scan_hermeticity(&dir);
+            assert!(
+                f.iter().any(|x| x.rule == "git-unforced-config"),
+                "{tag} form must be detected as a git invocation: {f:?}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
     fn flags_hardcoded_tmp() {
         let dir = temp_tree("tmp");
         write(&dir, "a.rs", &tmp_write("t"));
         let f = scan_hermeticity(&dir);
         assert!(f.iter().any(|x| x.rule == "hardcoded-tmp"), "{f:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn flags_hardcoded_tmp_in_path_new_and_pathbuf_from_forms() {
+        // FIX 1: bare `/tmp` roots however constructed.
+        for (tag, body) in [
+            ("tmp-pathnew", tmp_path_new("t")),
+            ("tmp-pathbuf", tmp_pathbuf_from("t")),
+        ] {
+            let dir = temp_tree(tag);
+            write(&dir, "a.rs", &body);
+            let f = scan_hermeticity(&dir);
+            assert!(
+                f.iter().any(|x| x.rule == "hardcoded-tmp"),
+                "{tag} must flag a bare /tmp root: {f:?}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn tmp_prefixed_but_different_root_is_not_flagged() {
+        // FIX 1: `"/tmpfoo"` is a DIFFERENT root, not `/tmp`.
+        let dir = temp_tree("tmpfoo");
+        write(&dir, "a.rs", &tmpfoo_write("t"));
+        let f = scan_hermeticity(&dir);
+        assert!(
+            !f.iter().any(|x| x.rule == "hardcoded-tmp"),
+            "/tmpfoo must not be flagged as a /tmp root: {f:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
