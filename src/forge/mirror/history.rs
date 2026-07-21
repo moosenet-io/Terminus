@@ -33,8 +33,12 @@ use super::workdir::run_git;
 
 /// `core.hooksPath=/dev/null` before every git subcommand — the source repo and the
 /// fresh work-dir must never run a repo hook during replay (same posture as the rest
-/// of the mirror engine).
-const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null"];
+/// of the mirror engine). Also forces `commit.gpgsign=false` (harmless for the
+/// `fast-import`/`merge-base`/etc. plumbing commands this is used with, which never
+/// consult it) so any porcelain `git commit` built on top of this constant — as the
+/// test fixtures below do — never depends on the host's ambient GPG signing config.
+/// See the matching constant in `workdir.rs` for the full rationale.
+const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"];
 
 /// Outcome of a full-history replay (metrics only — no PII, no shas).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

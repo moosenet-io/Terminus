@@ -679,7 +679,18 @@ pub(crate) fn assert_never_force(argv: &[&str]) {
 /// might plant, so no hook under `.git/hooks` (or a redirected path) ever runs.
 /// `/dev/null` is a non-directory, so git finds no hook there and silently skips
 /// them (the dev box — the sole host these git ops run on — is Linux).
-const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null"];
+///
+/// Also forces `commit.gpgsign=false`: every commit this engine makes is
+/// authored as the bot identity (`BOT_NAME`/`BOT_EMAIL`), never the deploying
+/// operator, so it must never silently pick up whatever personal GPG signing
+/// key happens to be configured in the ambient `~/.gitconfig` of the host
+/// running these git ops — that would sign a bot-authored commit with a
+/// mismatched personal identity, and in an environment where that key's
+/// agent/passphrase isn't reachable (e.g. a headless build/test sandbox) a
+/// `git commit` would hang or fail entirely. Overriding it on the command
+/// line (like `core.hooksPath` above) always wins over repo/global/system
+/// config, keeping every commit this engine makes fully self-contained.
+const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"];
 
 /// Run a git command in `cwd`, returning stdout on success or an `Execution`
 /// error carrying stderr on failure. Hooks are disabled (see [`HOOKS_OFF`]).
