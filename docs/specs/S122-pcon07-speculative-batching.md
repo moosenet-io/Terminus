@@ -53,57 +53,69 @@ A batch is designed to run **inside one `MergeQueue::with_merge_slot` acquisitio
 base key — the slot still serializes per base; batching only changes what ONE slot would
 process. The algorithm (`merge_queue::run_speculative_batch`) is a **pure orchestration** over
 an abstract `merge_queue::SpeculativeBatchOps`, exactly mirroring how PCON-06 abstracts
-`ReGate` + `MergeLockStore` so the delicate correctness is unit-tested deterministically with
-fakes (no live Redis / forge). A **future** production `SpeculativeBatchOps` (once a
-combined-state gate primitive exists) will wire to the SAME sanctioned PCON-06 helpers (single
-door, S9 — no raw API calls), and CRITICALLY must gate the ONE combined SHA that lands, not
-each member independently:
+`ReGate` + `MergeLockStore` so the algorithm is unit-tested deterministically with fakes.
 
-| Batch op | PCON-06 helper (future wiring) |
+**What the fake tests prove (and don't):** they exercise the batch-formation / single-gate /
+bisect-on-red **algorithm** against the **trait** with an in-memory fake — NOT the real
+PCON-06 rebase/gate/merge (no forge, no compiler door, no Redis). They prove the algorithm is
+correct **given** a SHA-bound, deadline-bounded, same-base combined-state gate; they do **not**
+prove any production behavior (there is none — production runs N=1, above).
+
+### Safe-by-construction trait (so a future adapter can't be unsafe)
+
+The trait itself forces the exact-landing-state guarantee onto any implementer — a conforming
+adapter is safe by construction:
+
+| Trait method | What the contract forces |
 |---|---|
-| `stack` (build the combined branch) | a combined-branch primitive (not yet available) atop `GiteaClient::update_pull_branch` |
-| `gate` (batch gate) | `merge_queue::ReGate` → `compiler_build` (`mode=test`) on the **combined** SHA |
-| `merge` (land, SHA-bound) | `GiteaClient::merge_pull_with_base` (`head_commit_id` + base/head/mergeable recheck) |
+| `stack(prs, deadline) -> BatchStack` | Produce ONE **combined SHA** (`StackedBatch`) for the whole stack; **eject any member not on the front PR's base** (mixed-base would break per-base serialization); bounded by `deadline`. |
+| `gate(&StackedBatch, deadline) -> BatchGateVerdict` | On green, **RETURN the exact combined SHA it proved** (`Green(sha)`) — cannot claim green without naming what it gated; bounded by `deadline`. |
+| `merge(&StackedBatch, gated_sha, deadline) -> Result` | **Bind the land to `gated_sha`** and verify the stack still resolves to it (fail-closed on drift) before ONE combined fast-forward; bounded by `deadline`. |
+
+A **future** production impl (once a combined-state gate primitive exists) wires these to the
+sanctioned single door (S9): a combined-branch builder for `stack`, `ReGate` → `compiler_build`
+on the **combined** SHA for `gate`, and `merge_pull_with_base` (`head_commit_id` + recheck) for
+the SHA-bound `merge`. It **cannot** gate members independently — the trait shape does not
+permit it (there is one `StackedBatch` with one SHA).
 
 ## Algorithm
 
-`run_speculative_batch(ops, prs, budget)` where `prs` is already capped to
-`BUILD_MERGE_BATCH_MAX` with the front PR first:
+`run_speculative_batch(ops, prs, deadline)` where `prs` is already capped to
+`BUILD_MERGE_BATCH_MAX` with the front PR first, and `deadline` is the slot lease:
 
-1. **Stack** the batch (`ops.stack`). A PR that **conflicts** during the speculative rebase
-   is ejected **before** the gate (`BatchEjectReason::RebaseConflict`) and the batch reforms
-   without it. An already-mergeable PR is captured as-is (no redundant rebase).
-2. If nothing stacked cleanly → done (everything was ejected pre-gate).
-3. **Gate once** on the stacked set:
-   - **Green** → land all in order (SHA-bound). A land that **drifts** (head/base moved
-     between gate and merge) is requeued into `merge_failures`, and — because later members
-     were stacked on it — every survivor after it is requeued too.
+1. **Stack** the batch into ONE combined branch (`ops.stack`). A PR that **conflicts** or is
+   **not on the front's base** is ejected **before** the gate (`BatchEjectReason::RebaseConflict`)
+   and the batch reforms without it.
+2. If nothing combined cleanly → done (everything ejected).
+3. **Gate once** on the combined SHA:
+   - **Green(sha)** → **land once**, bound to `sha` (one combined fast-forward). A combined FF
+     is all-or-nothing: if it drifts/fails, the WHOLE gated set is requeued
+     (`merge_failures`), never a partial untested land. `BatchOutcome.landed_sha` records the
+     exact SHA that landed (== the gated SHA).
    - **TimedOut / Unreachable** → fail-safe: **fall back to N=1 for the front PR**
-     (`fell_back_to_single = Some(front)`). The caller runs the PCON-06 single-PR path for
-     the front PR (which re-gates it fresh); the rest stay queued.
+     (`fell_back_to_single = Some(front)`); the rest stay queued.
    - **Red** → **bisect**.
 
 ### Bisect-on-red
 
-`bisect_red(prefix_confirmed_green, batch)` — gate `prefix + batch` (skipping the gate when
-the verdict for exactly that set is already known — the top-level red is threaded in to
-avoid re-gating it):
+`bisect_red(prefix, prefix_winner, batch, deadline, known)` — re-stack `prefix + batch` into
+ONE combined SHA and gate it (skipping when the verdict for exactly that set is already known —
+the top-level red is threaded in to avoid re-stacking/re-gating it):
 
-- **Green** → the whole `prefix + batch` survives (it was just gated green).
+- **Green(sha)** → the whole `prefix + batch` survives as one combined stack with SHA `sha`
+  (the new winner).
 - **TimedOut / Unreachable** → fail-safe: eject ALL of `batch`
-  (`BatchEjectReason::GateUnavailable`); `prefix` (already green) survives — never merge
-  unproven.
-- **Red**, `batch.len() == 1` → the lone PR IS the offender (it turned the already-green
-  prefix red): eject it (`BatchEjectReason::RedGate`); `prefix` survives.
-- **Red**, `batch.len() > 1` → split in half; recurse **left** (on `prefix`), then **right**
-  (on the left's survivors) so each half is gated stacked on the confirmed prefix.
+  (`BatchEjectReason::GateUnavailable`); the `prefix_winner` survives — never land unproven.
+- **Red**, `batch.len() == 1` → the lone PR IS the offender: eject it
+  (`BatchEjectReason::RedGate`); the `prefix_winner` survives.
+- **Red**, `batch.len() > 1` → split; recurse **left** (on `prefix`), then **right** (on the
+  left's surviving combined stack) so the final winner is ONE combined stack gated green as a
+  unit.
 
-**Correctness invariant (what lands is what was gated):** by construction, the final
-surviving set the bisection returns was gated **GREEN as one unit** at the deepest
-establishing step — never an ad-hoc union of PRs only ever gated apart. Each individual land
-then goes through the PCON-06 SHA-bound merge (`head_commit_id` + base recheck), so a PR that
-drifted between the batch gate and its land is requeued rather than merged untested. `main`
-stays green per landed PR.
+**Correctness invariant (machine-checked in the tests):** the surviving set the bisection
+returns was gated **GREEN as one combined SHA**, and the single land is **bound to that exact
+SHA** — so `BatchOutcome.landed_sha` equals the SHA the gate returned for that same set (the
+tests assert this equality). Never an ad-hoc union of PRs only ever gated apart.
 
 ### Worked example (single offender)
 
@@ -120,11 +132,11 @@ eject `p2`** (requeued with its red reason). `[1,3]` was gated green as a unit.
 | `RedGate` | bisection isolates the PR as the batch-red offender | green remainder merges; offender requeued with the gate reason |
 | `GateUnavailable` | gate timed out / door unreachable for a **sub-batch** during bisection | that sub-batch requeued (never merged unproven); `prefix` survives |
 | `fell_back_to_single` | **top-level** gate timed out / door unreachable | front PR runs the PCON-06 single path (N=1); rest stay queued |
-| `merge_failures` | a green batch member drifted at land time | requeued (bound-merge refused); every later member requeued too |
+| `merge_failures` | the green combined fast-forward land drifted / failed | the WHOLE gated set requeued (a combined FF is all-or-nothing — never a partial untested land) |
 
 Every ejected/failed PR bounces with a clear, distinct reason and is requeued; every merged
-PR was part of the exact set gated green. `BUILD_MERGE_BATCH_MAX=1` (default) never enters
-this layer.
+PR was part of the exact combined SHA gated green (== `landed_sha`).
+`BUILD_MERGE_BATCH_MAX=1` (default) never enters this layer.
 
 ## Known gap vs. the spec (flagged, not worked around)
 
@@ -135,14 +147,16 @@ current code make the *live* "front-N-from-the-queue" discovery unavailable, so 
 1. **The queue stores tickets, not PRs.** `MergeQueue`'s wait ZSET holds opaque FIFO tickets;
    there is no ticket→PR association, so the queue cannot enumerate "the front N PRs" itself.
    A ticket→PR registry would be its own item.
-2. **No combined-branch forge primitive.** Gitea's `update-branch` endpoint only merges a
-   PR's *base* into its head — it cannot stack PR-B onto PR-A onto `main`. So the speculative
-   gate tests each member rebased onto `main` **independently**, not a true combined stack,
-   and a sequential land advances the base so later members' captured base SHA no longer
-   matches at their recheck → they requeue (never merge untested). Each **landed** PR keeps
-   the full PCON-06 per-PR SHA-bound guarantee (`main` stays green), but single-gate
-   combined-stack **throughput** awaits a forge combined-branch primitive (or a local-git
-   stack builder behind the single door).
+2. **No combined-branch / combined-state gate primitive.** Gitea's `update-branch` endpoint
+   only merges a PR's *base* into its head — it cannot stack PR-B onto PR-A onto `main` into
+   ONE combined branch. Gating each member rebased onto `main` **independently** does NOT
+   prove the COMBINED N-PR state that actually lands is green, so it would bypass PCON-06's
+   exact-landing-state guarantee (frontier-gate finding). A safe batch REQUIRES a
+   combined-state gate: gating the ONE combined SHA that lands (a forge combined-branch API,
+   or a single-door local-git stack builder producing one combined SHA). No such primitive
+   exists in the single door yet — so no safe production adapter can exist, and the
+   `SpeculativeBatchOps` trait is deliberately shaped around ONE `StackedBatch`/one combined
+   SHA so a future adapter is forced to gate the combined state, not members apart.
 
 Because of (2), `BUILD_MERGE_BATCH_MAX` **defaults to 1**, and a requested N>1 batch is
 **degraded to N=1 in production** (see "Production status" above): the algorithm, trait, and
@@ -172,11 +186,14 @@ so only the merge queue's identity can push to it.
 
 ## Tests
 
-- Algorithm (`gitea::merge_queue::tests`, fake `SpeculativeBatchOps`): all-green→one gate/N
-  merges; one red→bisect ejects exactly the offender, remainder merges; multiple offenders;
-  rebase-conflict→pre-gate eject + reform; gate-timeout & door-unreachable→fall back to N=1
-  front; batch-of-one; all-conflict; green-but-land-drift requeues the drifter + every later
-  member.
+- Algorithm (`gitea::merge_queue::tests`, fake `SpeculativeBatchOps` — exercises the ALGORITHM
+  against the TRAIT, not real PCON-06): all-green → one gate + one combined land bound to the
+  gated SHA (`landed_sha` == the gate's returned SHA); one red → bisect ejects exactly the
+  offender, the gated remainder lands (SHA-checked); multiple offenders; rebase-conflict →
+  pre-gate eject + reform; **wrong-base member → pre-gate eject (same-base precondition)**;
+  gate-timeout & door-unreachable → fall back to N=1 front; batch-of-one; all-conflict;
+  green-but-combined-land-drift → whole set requeued (all-or-nothing); **deadline threaded to
+  stack + gate + merge** (whole op bounded by the slot lease).
 - Config (`config::tests`): default 1; honors >1; clamps 0/garbage to 1.
 - Wiring / SAFETY (`gitea::tests`): `execute_with_queue_and_regate` —
   `pcon07_batch_request_degrades_to_single_pr_in_production` (BUILD_MERGE_BATCH_MAX=2 +
