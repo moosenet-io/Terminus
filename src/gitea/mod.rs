@@ -1988,6 +1988,21 @@ impl MergePr {
     /// (transport error / door unreachable), it falls back to the pre-PCON-06
     /// `NotMergeable` bounce (fail-safe, never a blind merge, never a
     /// slot held indefinitely).
+    ///
+    /// ## Scope of the guarantee (precise — NOT "always green")
+    /// The exact-landing-state invariant is enforced for every QUEUE-MEDIATED
+    /// change: per-base serialization means no two queued merges race, and each
+    /// merge is gated against — and bound (`head_commit_id`) to — the exact
+    /// head, with the base commit SHA captured at gate time and re-checked
+    /// immediately before the POST, under a hard lease deadline. The ONE
+    /// irreducible residual is a DIRECT, out-of-queue push to `main` in the
+    /// sub-second window between that pre-merge base-recheck and the merge POST:
+    /// Gitea has NO server-side base guard (only `head_commit_id` for the head)
+    /// to close it atomically, so this code narrows and enforces the window but
+    /// cannot claim absolute atomicity against an out-of-queue push. The
+    /// COMPLETE closure is an ops step OUTSIDE this code — configure `main` as a
+    /// PROTECTED branch so only the merge queue can push to it (see
+    /// `.env.example`, `BUILD_MERGE_REGATE_ENABLED`).
     async fn execute_with_queue_and_regate(
         &self,
         args: Value,
@@ -2286,6 +2301,46 @@ impl MergePr {
                                                              mergeable (mergeable={:?}) against \
                                                              current base",
                                                             confirm.mergeable
+                                                        ),
+                                                    ),
+                                                ));
+                                            }
+                                            // HARD lease-deadline check at the
+                                            // boundary (final): if the op ran
+                                            // past `op_deadline` (= lock_ttl -
+                                            // margin) the slot may no longer be
+                                            // held exclusively, so we refuse to
+                                            // POST rather than risk another merge
+                                            // having advanced `main`. The queue
+                                            // exposes no lease-renew, so this hard
+                                            // bound IS the enforcement. This
+                                            // check sits immediately before the
+                                            // POST, right after the base/head/
+                                            // mergeable recheck, to keep the
+                                            // recheck→POST window as small as
+                                            // possible.
+                                            //
+                                            // RESIDUAL (irreducible): a direct,
+                                            // out-of-queue push to `main` in the
+                                            // sub-second gap between this recheck
+                                            // and the POST can still advance the
+                                            // base — Gitea offers NO server-side
+                                            // base guard (only `head_commit_id`
+                                            // for the head) to close it
+                                            // atomically. The COMPLETE closure is
+                                            // an ops step: protect `main` so ONLY
+                                            // the merge queue can push to it (see
+                                            // .env.example / docs). This code
+                                            // guarantees the invariant for all
+                                            // QUEUE-MEDIATED changes; it does not
+                                            // and cannot claim it against a
+                                            // direct push to an unprotected base.
+                                            if tokio::time::Instant::now() >= op_deadline {
+                                                return Err(ToolError::from(
+                                                    merge_queue::RegateBounce::LeaseExpired(
+                                                        format!(
+                                                            "op exceeded the {op_secs}s lease \
+                                                             budget before merging {gated_sha}"
                                                         ),
                                                     ),
                                                 ));
@@ -7421,6 +7476,91 @@ mod tests {
         );
         merge_mock.assert(); // degrade-open direct merge (today's behavior)
         assert!(result.is_ok(), "queue-none stale-base path must be the degrade-open merge: {result:?}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pcon06_op_past_lease_deadline_bounces_before_merging() {
+        // FIX 1 (final): the hard lease-deadline check at the boundary. The op
+        // budget (lock_ttl - 30s margin, bounded by max_wait) elapses WHILE the
+        // gate runs, so by the time the merge would POST the slot's exclusivity
+        // can no longer be guaranteed. The queue must bounce `LeaseExpired`
+        // (retry) rather than POST — even though head/base/mergeable all still
+        // check out. A tiny max_wait makes the deadline arrive fast; a
+        // synchronizing gate holds the op past it deterministically.
+        let backup = std::env::var("GITEA_MERGE_QUEUE_MAX_WAIT_SECS").ok();
+        std::env::set_var("GITEA_MERGE_QUEUE_MAX_WAIT_SECS", "1"); // op budget ~1s
+
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let regate = Arc::new(SyncedReGate {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let regate_task = Arc::clone(&regate) as Arc<dyn merge_queue::ReGate>;
+
+        let server = MockServer::start();
+        let mut get_a = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/93");
+            then.status(200)
+                .json_body(pr_full(93, "feature/w", "main", "deadbeef", "base0000", Some(false)));
+        });
+        let update_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/93/update");
+            then.status(200);
+        });
+        let merge_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/93/merge");
+            then.status(200);
+        });
+
+        let tool = MergePr { client: mock_client(&server) };
+        let handle = tokio::spawn(async move {
+            tool.execute_with_queue_and_regate(
+                serde_json::json!({"repo": "myrepo", "pr": 93}),
+                Some(queue),
+                Some(regate_task),
+            )
+            .await
+        });
+
+        // Confirmed rebased head (advanced + mergeable); the gate enters on it
+        // and stays parked until we release it.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        get_a.delete();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/93");
+            then.status(200)
+                .json_body(pr_full(93, "feature/w", "main", "f00dface", "base0000", Some(true)));
+        });
+        entered.notified().await;
+
+        // Hold the op past its ~1s lease deadline, THEN let the (green) gate
+        // return — head/base/mergeable are all still fine, but the deadline has
+        // passed, so the boundary check must refuse to merge.
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        release.notify_one();
+
+        let result = handle.await.expect("merge task must not panic");
+
+        if let Some(v) = backup {
+            std::env::set_var("GITEA_MERGE_QUEUE_MAX_WAIT_SECS", v);
+        } else {
+            std::env::remove_var("GITEA_MERGE_QUEUE_MAX_WAIT_SECS");
+        }
+
+        update_mock.assert();
+        merge_mock.assert_hits(0); // never POST past the lease deadline
+        let err = result.expect_err("an op past its lease deadline must not merge");
+        assert!(matches!(err, ToolError::Execution(_)), "lease expired → Execution, got {err:?}");
+        assert!(
+            format!("{err}").to_lowercase().contains("lease"),
+            "distinct lease-expired reason: {err}"
+        );
+        assert!(!store.is_locked("testorg/myrepo/main"), "slot released on the lease-deadline bounce");
     }
 
     // ── GMQ-05: gitea_merge_queue_status ────────────────────────────────

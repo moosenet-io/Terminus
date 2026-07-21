@@ -214,6 +214,13 @@ pub enum RegateBounce {
     /// gate and merge. Refused up front (a config guard) rather than risk
     /// merging a gated head onto an un-gated base — raise the lock TTL.
     LeaseTooShort(String),
+    /// PCON-06 (final): the op ran past its lease deadline (`lock_ttl - margin`)
+    /// by the time the merge was about to POST — the slot may no longer be held
+    /// exclusively, so another merge could have advanced `main`. Refused at the
+    /// boundary (a hard pre-merge deadline check) rather than POST a merge whose
+    /// slot exclusivity can no longer be guaranteed; retry re-runs it fresh
+    /// under a new lease.
+    LeaseExpired(String),
 }
 
 impl std::fmt::Display for RegateBounce {
@@ -254,6 +261,11 @@ impl std::fmt::Display for RegateBounce {
                  rebase+gate without a lease that spans the whole op; raise \
                  GITEA_MERGE_QUEUE_LOCK_TTL_SECS"
             ),
+            RegateBounce::LeaseExpired(d) => write!(
+                f,
+                "merge queue: re-gate ran past its lease deadline ({d}) — refusing to merge with a \
+                 lease whose exclusivity can no longer be guaranteed; retry re-runs it fresh"
+            ),
         }
     }
 }
@@ -274,7 +286,8 @@ impl From<RegateBounce> for crate::error::ToolError {
             | RegateBounce::RebaseNotVisible(_)
             | RegateBounce::HeadMoved(_)
             | RegateBounce::BaseAdvanced(_)
-            | RegateBounce::LeaseTooShort(_) => crate::error::ToolError::Execution(b.to_string()),
+            | RegateBounce::LeaseTooShort(_)
+            | RegateBounce::LeaseExpired(_) => crate::error::ToolError::Execution(b.to_string()),
         }
     }
 }
