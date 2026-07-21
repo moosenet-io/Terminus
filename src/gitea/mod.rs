@@ -1894,221 +1894,6 @@ impl merge_queue::ReGate for CompilerReGate {
     }
 }
 
-/// PCON-07: a captured, confirmed speculative-rebase result for one batch
-/// member — the exact SHA/base the PR was rebased onto and gated against, so its
-/// land can be SHA-bound (`head_commit_id`) + base/head/mergeable-rechecked
-/// exactly like the PCON-06 single-PR path.
-struct ConfirmedRebase {
-    gated_sha: String,
-    gated_base_sha: String,
-    base_ref: String,
-    head_ref: String,
-}
-
-/// PCON-07: production [`merge_queue::SpeculativeBatchOps`] over the sanctioned
-/// PCON-06 forge helpers (single door, S9 — NO raw API calls):
-/// - `stack` = per-PR sanctioned rebase via [`GiteaClient::update_pull_branch`]
-///   + [`GiteaClient::resolve_confirmed_rebased_head`] (a PR that conflicts is
-///   ejected pre-gate; an already-current/mergeable PR is captured as-is);
-/// - `gate` = ONE [`merge_queue::ReGate`] on the top-of-(sub)batch confirmed
-///   head (the SAME `compiler_build` test-gate, honoring the op budget);
-/// - `merge` = [`GiteaClient::merge_pull_with_base`] bound to the gated SHA,
-///   after a fresh head/base/mergeable + lease-deadline recheck — so each landed
-///   PR is bound to exactly what was gated; any drift requeues it.
-///
-/// ## Honest scope (flagged): no combined-branch forge primitive
-/// Gitea's `update-branch` endpoint only merges a PR's BASE into its head — it
-/// cannot stack PR-B onto PR-A onto `main`. So the speculative gate tests each
-/// member rebased onto `main` INDEPENDENTLY, not a true combined stack, and a
-/// sequential land advances the base so later members' captured base SHA no
-/// longer matches at their recheck → they requeue (never merge untested). Each
-/// LANDED PR keeps the full PCON-06 per-PR SHA-bound guarantee (`main` stays
-/// green), but full single-gate combined-stack throughput awaits a forge
-/// combined-branch primitive in the single door. This is why `BUILD_MERGE_BATCH_MAX`
-/// defaults to 1 and N>1 is strictly opt-in. See
-/// `docs/specs/S122-pcon07-speculative-batching.md`.
-struct ForgeBatchOps<'a> {
-    client: &'a GiteaClient,
-    regate: &'a dyn merge_queue::ReGate,
-    owner: &'a str,
-    repo: &'a str,
-    regate_module: &'a str,
-    regate_style: &'a str,
-    style: &'a str,
-    message: Option<&'a str>,
-    op_deadline: tokio::time::Instant,
-    confirmed: std::sync::Mutex<std::collections::HashMap<u64, ConfirmedRebase>>,
-}
-
-impl<'a> ForgeBatchOps<'a> {
-    fn remaining_budget(&self) -> std::time::Duration {
-        self.op_deadline.saturating_duration_since(tokio::time::Instant::now())
-    }
-}
-
-#[async_trait]
-impl merge_queue::SpeculativeBatchOps for ForgeBatchOps<'_> {
-    async fn stack(&self, prs: &[u64]) -> merge_queue::BatchStack {
-        let mut stacked = Vec::new();
-        let mut conflicted = Vec::new();
-        for &pr in prs {
-            let fresh = match self.client.fetch_pr(self.owner, self.repo, pr).await {
-                Ok(p) => p,
-                Err(e) => {
-                    conflicted.push((pr, format!("fetch failed: {e}")));
-                    continue;
-                }
-            };
-            if fresh.merged {
-                // Already landed by someone else — nothing to stack; skip it
-                // (not a conflict, not a gate candidate).
-                continue;
-            }
-            // An already-mergeable PR needs no rebase: capture its current head
-            // as the confirmed gated state. Only a stale-base PR is rebased.
-            if fresh.mergeable == Some(true) {
-                self.confirmed.lock().unwrap().insert(
-                    pr,
-                    ConfirmedRebase {
-                        gated_sha: fresh.head.sha.clone(),
-                        gated_base_sha: fresh.base.sha.clone(),
-                        base_ref: fresh.base.ref_name.clone(),
-                        head_ref: fresh.head.ref_name.clone(),
-                    },
-                );
-                stacked.push(pr);
-                continue;
-            }
-            let pre = fresh.head.sha.clone();
-            let hint = match self
-                .client
-                .update_pull_branch(self.owner, self.repo, pr, self.regate_style)
-                .await
-            {
-                Err(UpdateBranchError::Conflict(d)) => {
-                    conflicted.push((pr, d));
-                    continue;
-                }
-                Err(UpdateBranchError::Transport(e)) => {
-                    conflicted.push((pr, format!("transport error during batch rebase: {e}")));
-                    continue;
-                }
-                Ok(h) => h,
-            };
-            match self
-                .client
-                .resolve_confirmed_rebased_head(
-                    self.owner,
-                    self.repo,
-                    pr,
-                    &pre,
-                    hint.as_deref(),
-                    self.remaining_budget(),
-                )
-                .await
-            {
-                Ok(Some(rp)) => {
-                    self.confirmed.lock().unwrap().insert(
-                        pr,
-                        ConfirmedRebase {
-                            gated_sha: rp.head.sha.clone(),
-                            gated_base_sha: rp.base.sha.clone(),
-                            base_ref: rp.base.ref_name.clone(),
-                            head_ref: rp.head.ref_name.clone(),
-                        },
-                    );
-                    stacked.push(pr);
-                }
-                Ok(None) => {
-                    conflicted.push((pr, "no confirmed advanced+mergeable rebased head".to_string()));
-                }
-                Err(e) => {
-                    conflicted.push((pr, format!("error resolving rebased head: {e}")));
-                }
-            }
-        }
-        merge_queue::BatchStack { stacked, conflicted }
-    }
-
-    async fn gate(&self, prs: &[u64], budget: std::time::Duration) -> merge_queue::GateVerdict {
-        // Gate the TOP of the (sub-)batch — the highest-stacked confirmed head
-        // represents the speculative result. An empty set is vacuously green.
-        let Some(&top) = prs.last() else {
-            return merge_queue::GateVerdict::Green;
-        };
-        let sha = {
-            let map = self.confirmed.lock().unwrap();
-            match map.get(&top) {
-                Some(c) => c.gated_sha.clone(),
-                // Not confirmed (shouldn't happen for a stacked PR) — fail-safe.
-                None => {
-                    return merge_queue::GateVerdict::Unreachable(format!(
-                        "no confirmed head for batch top PR #{top}"
-                    ))
-                }
-            }
-        };
-        let budget = budget.min(self.remaining_budget());
-        self.regate.gate(self.regate_module, &sha, budget).await
-    }
-
-    async fn merge(&self, pr: u64) -> Result<(), String> {
-        let confirmed = {
-            let map = self.confirmed.lock().unwrap();
-            match map.get(&pr) {
-                Some(c) => (
-                    c.gated_sha.clone(),
-                    c.gated_base_sha.clone(),
-                    c.base_ref.clone(),
-                    c.head_ref.clone(),
-                ),
-                None => return Err(format!("no confirmed rebase captured for PR #{pr}")),
-            }
-        };
-        let (gated_sha, gated_base_sha, base_ref, head_ref) = confirmed;
-
-        // Fresh recheck immediately before the POST — bind to exactly the gated
-        // head + base, fail-closed on any drift (the PCON-06 per-PR invariant).
-        let confirm = self
-            .client
-            .fetch_pr(self.owner, self.repo, pr)
-            .await
-            .map_err(|e| format!("recheck fetch failed: {e}"))?;
-        if confirm.head.sha != gated_sha {
-            return Err(format!("head moved (gated {gated_sha}, now {})", confirm.head.sha));
-        }
-        if confirm.base.sha != gated_base_sha {
-            return Err(format!(
-                "base advanced ({gated_base_sha} -> {}) after gating {gated_sha}",
-                confirm.base.sha
-            ));
-        }
-        if confirm.mergeable != Some(true) {
-            return Err(format!(
-                "gated {gated_sha} not confirmed mergeable (mergeable={:?})",
-                confirm.mergeable
-            ));
-        }
-        if tokio::time::Instant::now() >= self.op_deadline {
-            return Err(format!("op exceeded the lease budget before merging {gated_sha}"));
-        }
-        self.client
-            .merge_pull_with_base(
-                self.owner,
-                self.repo,
-                pr,
-                self.style,
-                self.message,
-                &base_ref,
-                &head_ref,
-                Some(&gated_sha),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| format!("bound merge failed: {e}"))
-    }
-}
-
 // 9. merge_pr
 pub struct MergePr {
     client: GiteaClient,
@@ -2139,7 +1924,7 @@ impl RustTool for MergePr {
                 "min_delay_secs": { "type": "integer", "description": "Override GITEA_MERGE_QUEUE_MIN_DELAY_SECS for this call: minimum seconds since the last merge to this queue key before this one proceeds (optional)" },
                 "priority": { "type": "integer", "description": "Merge-queue ordering priority; higher runs earlier among concurrent waiters for the same key, FIFO within equal priorities (default 0, optional)" },
                 "no_queue": { "type": "boolean", "description": "Bypass the merge queue entirely for this call (e.g. an emergency merge) — merges immediately, unordered and unspaced (optional)" },
-                "batch_prs": { "type": "array", "items": { "type": "integer" }, "description": "PCON-07 speculative batching (opt-in, requires BUILD_MERGE_BATCH_MAX>1): additional SAME-BASE PR numbers to stack with this PR into one speculative rebased batch, gate once, and merge together on green (bisect + eject the offender on red). This PR (`pr`) is always the front; the set is capped at BUILD_MERGE_BATCH_MAX. Omit for the default single-PR (PCON-06) merge (optional)" }
+                "batch_prs": { "type": "array", "items": { "type": "integer" }, "description": "PCON-07 speculative batching (design/acceptance built + tested; PRODUCTION land gated OFF): additional SAME-BASE PR numbers to speculatively batch with this PR. Today production DEGRADES any N>1 request to the safe PCON-06 single-PR path for this PR only (a real combined-N-PR land needs a combined-state gate primitive the current forge lacks); the other members take their own separate merge calls. This PR (`pr`) is always the front. Omit for the default single-PR merge (optional)" }
             },
             "required": ["repo", "pr"]
         }))
@@ -2283,43 +2068,39 @@ impl MergePr {
         // Redis-backed feature on the host.
         let active_queue = queue.as_ref().filter(|_| cfg.enabled);
 
-        // PCON-07: speculative merge batching (opt-in). Engages ONLY when a
-        // queue AND a re-gate backend are active, `BUILD_MERGE_BATCH_MAX > 1`,
-        // and the caller supplied a `batch_prs` set with more than one entry.
-        // Otherwise this is a no-op and the flow below is the exact PCON-06
-        // path, byte-for-byte (default `BUILD_MERGE_BATCH_MAX=1` never enters
-        // here). The queue tracks opaque tickets, not PR numbers, so it cannot
-        // discover the front-N set itself — the batch is caller-supplied.
-        if let (Some(q), Some(rg)) = (active_queue, active_regate.as_ref()) {
+        // PCON-07: speculative merge batching — PRODUCTION IS INTENTIONALLY
+        // DEGRADED TO N=1 (safe). A caller can request a batch
+        // (`BUILD_MERGE_BATCH_MAX > 1` + a `batch_prs` set), but a genuine N>1
+        // land CANNOT be performed safely with today's forge: Gitea has no
+        // combined-branch primitive, so each member can only be rebased onto
+        // `main` INDEPENDENTLY — which does NOT prove the COMBINED N-PR state
+        // that actually lands is green. Landing such a state (or a member atop
+        // an advanced base) would bypass PCON-06's exact-landing-state
+        // guarantee. Until a combined-state gate exists (a forge combined-branch
+        // primitive, or a single-door local-git stack builder producing ONE
+        // combined SHA to gate), we log ONCE and run the exact PCON-06 single-PR
+        // path (N=1) for the front PR — nothing untested can ever land. The full
+        // `merge_queue::run_speculative_batch` algorithm + `SpeculativeBatchOps`
+        // trait are built and fully unit-tested (the design/acceptance
+        // deliverable), ready to light up the day that primitive lands. See
+        // `docs/specs/S122-pcon07-speculative-batching.md`.
+        //
+        // NOTE (same-base): the slot below is keyed off the FRONT PR's base
+        // only, and only the front PR is ever merged here — so a mixed-base
+        // `batch_prs` can never affect per-base serialization (the N=1 degrade
+        // makes that violation impossible in production). Any future combined
+        // land MUST validate all members share the front's base before keying
+        // the slot (documented in the design note and the trait contract).
+        if active_queue.is_some() {
             let batch_max = crate::config::build_merge_batch_max();
             let batch_prs = parse_batch_prs(&args, pr_num, batch_max);
             if batch_max > 1 && batch_prs.len() > 1 {
-                if let Some(summary) = self
-                    .run_batch_merge(
-                        &client,
-                        owner,
-                        repo,
-                        style,
-                        message,
-                        &regate_module,
-                        &regate_style,
-                        rg.as_ref(),
-                        q,
-                        &cfg,
-                        min_delay_secs,
-                        priority,
-                        &batch_prs,
-                    )
-                    .await?
-                {
-                    // The batch was handled (some merged / some ejected+requeued);
-                    // the post-merge mirror sync already ran inside. Return the
-                    // batch summary directly.
-                    return Ok(summary);
-                }
-                // `None` ⇒ the batch fell back to N=1 for the front PR (gate
-                // timeout / door unreachable). Fall through to the exact PCON-06
-                // single-PR path below, which re-gates the front PR fresh.
+                log_batch_degrade_once(batch_max, batch_prs.len());
+                // Fall through to the exact PCON-06 single-PR path below for the
+                // front PR (`pr_num`). The other requested members are left for
+                // their own separate merge calls — each gets its own PCON-06
+                // single-PR gate. Nothing here speculatively rebases any branch,
+                // so there is no half-rebased member to clean up.
             }
         }
 
@@ -2718,133 +2499,27 @@ impl MergePr {
             base = outcome.base
         ))
     }
+}
 
-    /// PCON-07: run a speculative merge batch inside ONE critical section for
-    /// the base `key`. Returns `Ok(Some(summary))` when the batch was handled
-    /// (some merged / some ejected+requeued — the post-merge mirror sync has
-    /// already run), or `Ok(None)` when it fell back to N=1 for the front PR
-    /// (the caller then runs the exact PCON-06 single-PR path). Every land goes
-    /// through the SHA-bound PCON-06 merge helper via [`ForgeBatchOps`]; the
-    /// bisect/formation logic is the unit-tested [`merge_queue::run_speculative_batch`].
-    #[allow(clippy::too_many_arguments)]
-    async fn run_batch_merge(
-        &self,
-        client: &GiteaClient,
-        owner: &str,
-        repo: &str,
-        style: &str,
-        message: Option<&str>,
-        regate_module: &str,
-        regate_style: &str,
-        regate: &dyn merge_queue::ReGate,
-        queue: &MergeQueue,
-        cfg: &MergeQueueConfig,
-        min_delay_secs: u64,
-        priority: i64,
-        batch_prs: &[u64],
-    ) -> Result<Option<String>, ToolError> {
-        // Same lease guard as PCON-06: the whole rebase→gate→land span must fit
-        // under the lock lease, or fall back to N=1 (never risk a batch whose
-        // slot could expire mid-op).
-        const LEASE_MARGIN_SECS: u64 = 30;
-        if cfg.lock_ttl_secs <= LEASE_MARGIN_SECS {
-            return Ok(None);
-        }
-        let front = batch_prs[0];
-        // Derive the base key from the front PR (all batch members share it —
-        // enforced by `parse_batch_prs`, which only keeps same-base PRs).
-        let front_pr = client.fetch_pr(owner, repo, front).await?;
-        let key = format!("{owner}/{repo}/{}", front_pr.base.ref_name);
+/// PCON-07: "log once" guard so the N>1→N=1 production degrade doesn't spam a
+/// warning on every batch-requesting merge while `BUILD_MERGE_BATCH_MAX > 1` is
+/// configured.
+static LOGGED_BATCH_DEGRADE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-        let batch_owned = batch_prs.to_vec();
-        let slot_result: Result<Result<merge_queue::BatchOutcome, ToolError>, MergeQueueError> =
-            queue
-                .with_merge_slot(&key, priority, cfg, || async {
-                    if let Err(e) =
-                        queue.enforce_spacing(&key, min_delay_secs, cfg.max_wait_secs).await
-                    {
-                        return Err(ToolError::from(e));
-                    }
-                    let op_secs = (cfg.lock_ttl_secs - LEASE_MARGIN_SECS)
-                        .min(cfg.max_wait_secs.max(1));
-                    let op_deadline = tokio::time::Instant::now()
-                        + std::time::Duration::from_secs(op_secs);
-                    let ops = ForgeBatchOps {
-                        client,
-                        regate,
-                        owner,
-                        repo,
-                        regate_module,
-                        regate_style,
-                        style,
-                        message,
-                        op_deadline,
-                        confirmed: std::sync::Mutex::new(std::collections::HashMap::new()),
-                    };
-                    let outcome = merge_queue::run_speculative_batch(
-                        &ops,
-                        &batch_owned,
-                        std::time::Duration::from_secs(op_secs),
-                    )
-                    .await;
-                    // Stamp the spacing marker once if anything actually landed,
-                    // still inside the slot (mirrors PCON-06's `record_merge`).
-                    if !outcome.merged.is_empty() {
-                        queue.record_merge(&key, min_delay_secs).await;
-                    }
-                    Ok(outcome)
-                })
-                .await;
-
-        let outcome = match slot_result {
-            Ok(inner) => inner?,
-            Err(e) => return Err(ToolError::from(e)),
-        };
-
-        // Fell back to N=1 for the front PR — let the caller run the PCON-06
-        // single path (which re-gates the front PR fresh).
-        if outcome.fell_back_to_single.is_some() {
-            return Ok(None);
-        }
-
-        // Best-effort post-merge mirror sync-source, once, if anything landed —
-        // same non-fatal hook as the single-PR path.
-        if !outcome.merged.is_empty() {
-            if let Err(e) = crate::forge::mirror::tools::dispatch_mirror_action(
-                "sync-source",
-                json!({ "repo": repo }),
-            )
-            .await
-            {
-                tracing::warn!(
-                    target: "mirror_audit",
-                    event = "sync_source_after_batch_merge_failed",
-                    repo = %repo,
-                    error = %e,
-                    "post-batch-merge mirror sync-source failed (non-fatal — the batch merged \
-                     successfully; the mirror runner will re-sync '{repo}' on its next tick)"
-                );
-            }
-        }
-
-        // Build a clear summary: what landed, and what was ejected/requeued and
-        // why (distinct reasons per the PCON-07 failure semantics).
-        let mut summary = format!("Batch merge into {} in {owner}/{repo}: ", front_pr.base.ref_name);
-        if outcome.merged.is_empty() {
-            summary.push_str("no PRs merged");
-        } else {
-            let merged: Vec<String> =
-                outcome.merged.iter().map(|p| format!("#{p}")).collect();
-            summary.push_str(&format!("merged {} PR(s) [{}]", outcome.merged.len(), merged.join(", ")));
-        }
-        for (pr, reason) in &outcome.ejected {
-            summary.push_str(&format!("; ejected #{pr} (requeue): {reason}"));
-        }
-        for (pr, reason) in &outcome.merge_failures {
-            summary.push_str(&format!("; #{pr} not landed (requeue): {reason}"));
-        }
-        summary.push('.');
-        Ok(Some(summary))
+/// PCON-07: log ONCE that a requested speculative batch is being degraded to a
+/// single-PR (N=1) merge in production, because a safe combined-state gate is
+/// not yet available (see the seam in `execute_with_queue_and_regate` and
+/// `docs/specs/S122-pcon07-speculative-batching.md`).
+fn log_batch_degrade_once(batch_max: usize, requested: usize) {
+    if !LOGGED_BATCH_DEGRADE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "PCON-07: speculative batching requested (BUILD_MERGE_BATCH_MAX={batch_max}, \
+             {requested} PRs) but requires a combined-branch/combined-state gate primitive \
+             not yet available in the single-door forge; running N=1 per PCON-06 (single-PR \
+             rebase-and-re-gate) so nothing untested can land. This warning logs once per \
+             process."
+        );
     }
 }
 
@@ -2854,8 +2529,12 @@ impl MergePr {
 /// additional `batch_prs` in the order given, capped at `batch_max`. A missing
 /// or non-array `batch_prs` yields just `[front_pr]` (no batching). Duplicate
 /// entries and the front PR itself are de-duplicated so the front never appears
-/// twice. NOTE: the caller is responsible for supplying only PRs that share the
-/// front PR's base — the speculative stack rebases each onto that base.
+/// twice.
+///
+/// Used ONLY to DETECT a batch request (so the production N=1 degrade can log
+/// once); it does not itself drive any land. NOTE: a future combined-state land
+/// is the caller's responsibility to supply only PRs sharing the front PR's
+/// base, and MUST validate that before keying the per-base slot.
 fn parse_batch_prs(args: &Value, front_pr: u64, batch_max: usize) -> Vec<u64> {
     let mut out = vec![front_pr];
     if let Some(arr) = args["batch_prs"].as_array() {
@@ -8083,11 +7762,15 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn pcon07_all_green_batch_gates_once_and_merges_all_members() {
-        // BUILD_MERGE_BATCH_MAX=2 + a caller-supplied `batch_prs` engages the
-        // speculative batch: two already-mergeable same-base PRs are stacked,
-        // gated ONCE, and both merge (each bound to its gated head via
-        // head_commit_id). The gate fires exactly once.
+    async fn pcon07_batch_request_degrades_to_single_pr_in_production() {
+        // SAFETY: even with BUILD_MERGE_BATCH_MAX=2 and a caller-supplied
+        // `batch_prs`, PRODUCTION must NOT attempt a real N>1 land — today's
+        // forge cannot gate the COMBINED landing state, so an independent
+        // per-member gate would bypass PCON-06's exact-landing-state guarantee.
+        // The seam therefore DEGRADES to the PCON-06 single-PR path for the
+        // FRONT PR only: #101 merges via the single path; the other requested
+        // member #102 is NEVER touched (it takes its own separate merge call);
+        // and nothing is ever gated on a combined state.
         let batch_backup = std::env::var("BUILD_MERGE_BATCH_MAX").ok();
         let regate_backup = std::env::var("BUILD_MERGE_REGATE_ENABLED").ok();
         std::env::set_var("BUILD_MERGE_BATCH_MAX", "2");
@@ -8099,22 +7782,21 @@ mod tests {
         let regate_task = Arc::clone(&regate) as Arc<dyn merge_queue::ReGate>;
 
         let server = MockServer::start();
-        for pr in [101_u64, 102] {
-            server.mock(move |when, then| {
-                when.method(GET).path(format!("/api/v1/repos/testorg/myrepo/pulls/{pr}"));
-                then.status(200).json_body(sample_pr_json(pr, "feature/b", "main"));
-            });
-        }
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/101");
+            then.status(200).json_body(sample_pr_json(101, "feature/b", "main"));
+        });
         let merge_101 = server.mock(|when, then| {
-            when.method(POST)
-                .path("/api/v1/repos/testorg/myrepo/pulls/101/merge")
-                .body_contains("deadbeef");
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/101/merge");
             then.status(200);
         });
-        let merge_102 = server.mock(|when, then| {
-            when.method(POST)
-                .path("/api/v1/repos/testorg/myrepo/pulls/102/merge")
-                .body_contains("deadbeef");
+        // The other requested member #102 must NEVER be touched (no combined land).
+        let touch_102_get = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/102");
+            then.status(200).json_body(sample_pr_json(102, "feature/c", "main"));
+        });
+        let touch_102_merge = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/102/merge");
             then.status(200);
         });
 
@@ -8131,15 +7813,19 @@ mod tests {
         if let Some(v) = regate_backup { std::env::set_var("BUILD_MERGE_REGATE_ENABLED", v); }
 
         merge_101.assert();
-        merge_102.assert();
-        let summary = result.expect("an all-green batch must merge all members");
-        assert!(summary.contains("merged 2 PR(s)"), "summary must report 2 merges: {summary}");
-        assert!(summary.contains("#101") && summary.contains("#102"), "both PRs listed: {summary}");
-        // Gated exactly ONCE (the whole point of batching), on the top head.
+        // #102 is never fetched or merged — no combined-state land occurs.
+        touch_102_get.assert_hits(0);
+        touch_102_merge.assert_hits(0);
+        let summary = result.expect("the degrade must merge the front PR via the single path");
         assert_eq!(
-            regate.calls.lock().unwrap().clone(),
-            vec![("myrepo".to_string(), "deadbeef".to_string())],
-            "the batch must be gated exactly once"
+            summary, "Pull request #101 merged into main in testorg/myrepo.",
+            "a degraded batch must produce the exact PCON-06 single-PR success string for the front PR"
+        );
+        // The front PR (#101) is mergeable → the Proceed direct-merge path, no
+        // re-gate — identical to PCON-06 with no batching in play.
+        assert!(
+            regate.calls.lock().unwrap().is_empty(),
+            "the degraded single-PR mergeable path must not re-gate"
         );
         assert!(!store.is_locked("testorg/myrepo/main"), "the slot must be released");
     }

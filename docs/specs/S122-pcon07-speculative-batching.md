@@ -20,27 +20,49 @@ into one batch.
 - **Default (unset) = `1` = NO batching.** Every merge takes the exact PCON-06 single-PR
   rebase-and-re-gate path, **byte-for-byte**. This is the safe baseline; the batch layer is
   never entered.
-- Batching engages only when the value is `> 1` **and** the caller explicitly supplies a
-  `batch_prs` set (to `gitea_merge_pr`) with more than one entry. The merge queue tracks
-  opaque FIFO tickets, **not PR numbers**, so it cannot discover the "front N" set on its
-  own — the batch is caller-supplied (a Harmony conductor / a future queue PR-registry
-  provides it). See "Known gap vs. the spec" below.
+- A caller can *request* a batch (value `> 1` **and** a `batch_prs` set with more than one
+  entry to `gitea_merge_pr`), but **production currently DEGRADES that request to N=1** —
+  see "Production status" below. Nothing untested can land.
 - `0` / garbage clamps up to `1` (a batch always contains at least the front PR).
+
+## Production status — BUILT + TESTED, but the production land is gated OFF
+
+**A real N>1 land is intentionally NOT performed in production today**, because it cannot be
+made safe with the current forge (frontier-gate finding, confirmed). Gating each member
+rebased onto `main` **independently** does NOT prove the **combined** N-PR state that
+actually lands is green — so landing such a state (or a member atop an advanced base) would
+bypass PCON-06's exact-landing-state guarantee. A safe batch needs a **combined-state gate**:
+gating the ONE combined SHA that actually lands (from a forge combined-branch primitive, or a
+single-door local-git stack builder). No such primitive exists in the single-door path yet.
+
+Therefore `MergePr::execute_with_queue_and_regate`, when it sees a batch request with
+`BUILD_MERGE_BATCH_MAX > 1`, **logs once** ("speculative batching requires a
+combined-branch/combined-state gate primitive not yet available; running N=1 per PCON-06")
+and runs the exact PCON-06 single-PR path for the **front PR** — the other requested members
+take their own separate merge calls, each with its own PCON-06 single-PR gate. No branch is
+speculatively rebased, so there is no half-rebased member to clean up on any path.
+
+The `run_speculative_batch` algorithm + `SpeculativeBatchOps` trait + the full fake-based
+test matrix ARE the deliverable (the spec's "design + acceptance" Phase) — complete, proven,
+and referenced only by tests today (`#[allow(dead_code)]`), ready to wire the day a
+combined-state gate primitive lands.
 
 ## Where it composes with PCON-06
 
-The batch runs **inside one `MergeQueue::with_merge_slot` acquisition** for the base key —
-the slot still serializes per base; batching only changes what ONE slot processes. The
-algorithm (`merge_queue::run_speculative_batch`) is a **pure orchestration** over an abstract
-`merge_queue::SpeculativeBatchOps`, exactly mirroring how PCON-06 abstracts `ReGate` +
-`MergeLockStore` so the delicate correctness is unit-tested deterministically with fakes (no
-live Redis / forge). Production wires `SpeculativeBatchOps` to the SAME sanctioned PCON-06
-helpers (single door, S9 — no raw API calls):
+A batch is designed to run **inside one `MergeQueue::with_merge_slot` acquisition** for the
+base key — the slot still serializes per base; batching only changes what ONE slot would
+process. The algorithm (`merge_queue::run_speculative_batch`) is a **pure orchestration** over
+an abstract `merge_queue::SpeculativeBatchOps`, exactly mirroring how PCON-06 abstracts
+`ReGate` + `MergeLockStore` so the delicate correctness is unit-tested deterministically with
+fakes (no live Redis / forge). A **future** production `SpeculativeBatchOps` (once a
+combined-state gate primitive exists) will wire to the SAME sanctioned PCON-06 helpers (single
+door, S9 — no raw API calls), and CRITICALLY must gate the ONE combined SHA that lands, not
+each member independently:
 
-| Batch op | PCON-06 helper reused |
+| Batch op | PCON-06 helper (future wiring) |
 |---|---|
-| `stack` (speculative rebase) | `GiteaClient::update_pull_branch` + `resolve_confirmed_rebased_head` |
-| `gate` (batch gate) | `merge_queue::ReGate` → `compiler_build` (`mode=test`) |
+| `stack` (build the combined branch) | a combined-branch primitive (not yet available) atop `GiteaClient::update_pull_branch` |
+| `gate` (batch gate) | `merge_queue::ReGate` → `compiler_build` (`mode=test`) on the **combined** SHA |
 | `merge` (land, SHA-bound) | `GiteaClient::merge_pull_with_base` (`head_commit_id` + base/head/mergeable recheck) |
 
 ## Algorithm
@@ -122,11 +144,22 @@ current code make the *live* "front-N-from-the-queue" discovery unavailable, so 
    combined-stack **throughput** awaits a forge combined-branch primitive (or a local-git
    stack builder behind the single door).
 
-Because of (2), `BUILD_MERGE_BATCH_MAX` **defaults to 1** and N>1 is strictly opt-in: the
-algorithm, trait, and SHA-bound land are all implemented and tested (this is the spec's
-"documented Phase — design + acceptance"), ready to light up fully the day a combined-branch
-primitive lands. This matches the spec's own framing ("design + optional build … the build is
-optional/follow-on").
+Because of (2), `BUILD_MERGE_BATCH_MAX` **defaults to 1**, and a requested N>1 batch is
+**degraded to N=1 in production** (see "Production status" above): the algorithm, trait, and
+SHA-bound land are all implemented and tested (the spec's "documented Phase — design +
+acceptance"), ready to light up fully the day a combined-state gate primitive lands. This
+matches the spec's own framing ("design + optional build … the build is optional/follow-on").
+
+### Same-base requirement (per-base serialization)
+
+The `with_merge_slot` critical section is keyed off the **front PR's base**
+(`{owner}/{repo}/{base}`). A batch that mixed bases would violate per-base serialization
+(members of a different base would run under the wrong slot). In production this is **moot**:
+the N=1 degrade only ever merges the front PR, under its own base's slot, so a mixed-base
+`batch_prs` cannot affect slot keying. Any **future** combined land MUST validate that every
+member shares the front PR's base **before** keying the slot — this is a documented
+precondition of `SpeculativeBatchOps` (the caller supplies same-base members) and of the
+combined-branch producer.
 
 ## Guarantee scope & the protected-`main` ops step
 
@@ -145,6 +178,9 @@ so only the merge queue's identity can push to it.
   front; batch-of-one; all-conflict; green-but-land-drift requeues the drifter + every later
   member.
 - Config (`config::tests`): default 1; honors >1; clamps 0/garbage to 1.
-- Wiring (`gitea::tests`): `execute_with_queue_and_regate` — all-green 2-PR batch gates once
-  and merges both; `BUILD_MERGE_BATCH_MAX=1` ignores `batch_prs` and reproduces the exact
-  PCON-06 single-PR success string (batching opt-in).
+- Wiring / SAFETY (`gitea::tests`): `execute_with_queue_and_regate` —
+  `pcon07_batch_request_degrades_to_single_pr_in_production` (BUILD_MERGE_BATCH_MAX=2 +
+  `batch_prs` → only the front PR merges via the PCON-06 single path, the other member is
+  NEVER touched, and nothing is gated on a combined state); and
+  `pcon07_batch_max_one_ignores_batch_prs_and_takes_the_pcon06_single_path` (default 1
+  reproduces the exact PCON-06 single-PR success string, byte-for-byte).

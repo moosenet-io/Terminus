@@ -1180,6 +1180,21 @@ impl Drop for ReleaseGuard {
 // untested. Every ejected PR bounces with a clear, distinct reason and is
 // requeued. `BUILD_MERGE_BATCH_MAX=1` (the default) never enters this layer at
 // all — the merge takes the exact PCON-06 single-PR path, byte-for-byte.
+//
+// ## Production status: BUILT + TESTED, but the production LAND is gated OFF
+// This algorithm, the [`SpeculativeBatchOps`] trait, and the full fake-based
+// test matrix are the PCON-07 "documented Phase — design + acceptance"
+// deliverable, and they are complete and proven. But there is NO production
+// caller that performs a real N>1 land, ON PURPOSE: a safe batch requires a
+// COMBINED-STATE gate (gating the ONE combined SHA that actually lands), which
+// today's single-door Gitea forge cannot produce — it can only rebase each
+// member onto `main` INDEPENDENTLY, which does not prove the combined N-PR
+// landing state is green. So `MergePr::execute_with_queue_and_regate` degrades
+// a batch REQUEST to the PCON-06 single-PR path (N=1) and logs once; nothing
+// untested can ever land. These items are therefore `#[allow(dead_code)]`
+// (referenced only by tests today) and ready to wire the day a combined-branch
+// primitive (or a single-door local-git stack builder) exists. See
+// `docs/specs/S122-pcon07-speculative-batching.md` ("Known gap vs. the spec").
 
 /// PCON-07: the reason a PR was EJECTED from a speculative batch (and requeued
 /// so it is retried on its own next round). Each variant is a DISTINCT,
@@ -1188,6 +1203,7 @@ impl Drop for ReleaseGuard {
 /// clearly separable from a *red-gate offender* (bisection isolated this PR as
 /// the one that turned the batch red).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // PCON-07: built + tested; production land gated OFF until a combined-state gate exists (see module doc)
 pub(crate) enum BatchEjectReason {
     /// The PR conflicted while stacking the speculative batch — it could not be
     /// rebased onto the current base cleanly, so it was ejected before any gate
@@ -1233,6 +1249,7 @@ impl std::fmt::Display for BatchEjectReason {
 /// S9): `update_pull_branch` (stack rebase), `ReGate` (gate), and
 /// `merge_pull_with_base` bound to each gated SHA (land).
 #[async_trait]
+#[allow(dead_code)] // PCON-07: built + tested; production land gated OFF until a combined-state gate exists (see module doc)
 pub(crate) trait SpeculativeBatchOps: Send + Sync {
     /// Speculatively rebase/stack `prs` (in queue order) onto the current base.
     /// A PR that CONFLICTS during the rebase is reported in
@@ -1255,6 +1272,7 @@ pub(crate) trait SpeculativeBatchOps: Send + Sync {
 /// PCON-07: the result of [`SpeculativeBatchOps::stack`] — which PRs stacked
 /// cleanly (ready to gate) and which conflicted (ejected before the gate).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(dead_code)] // PCON-07: built + tested; production land gated OFF until a combined-state gate exists (see module doc)
 pub(crate) struct BatchStack {
     /// PRs that rebased cleanly onto the current base, in queue order — the set
     /// the batch gate runs on.
@@ -1266,6 +1284,7 @@ pub(crate) struct BatchStack {
 
 /// PCON-07: the outcome of a speculative batch run.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(dead_code)] // PCON-07: built + tested; production land gated OFF until a combined-state gate exists (see module doc)
 pub(crate) struct BatchOutcome {
     /// PRs that LANDED, in merge order. Every one was part of the exact set that
     /// was gated GREEN as a unit (see the correctness invariant above).
@@ -1305,6 +1324,7 @@ pub(crate) struct BatchOutcome {
 ///    - **Red** → **bisect**: binary-split, re-gate halves, isolate + eject the
 ///      offender(s), and land the green remainder — which was gated green as one
 ///      unit at the isolating step (correctness invariant).
+#[allow(dead_code)] // PCON-07: built + tested; production land gated OFF until a combined-state gate exists (see module doc)
 pub(crate) async fn run_speculative_batch(
     ops: &dyn SpeculativeBatchOps,
     prs: &[u64],
@@ -1365,6 +1385,7 @@ pub(crate) async fn run_speculative_batch(
 /// land that drifts (`Err`) is requeued into `merge_failures` AND every survivor
 /// after it too — each later PR was stacked on the one that failed, so it can no
 /// longer land against the state it was gated in.
+#[allow(dead_code)] // PCON-07: built + tested; production land gated OFF until a combined-state gate exists (see module doc)
 async fn land_in_order(
     ops: &dyn SpeculativeBatchOps,
     survivors: &[u64],
@@ -1406,6 +1427,7 @@ async fn land_in_order(
 ///   deepest establishing step.
 ///
 /// Returns `(survivors = prefix + kept, ejected, gate_calls)`.
+#[allow(dead_code)] // PCON-07: built + tested; production land gated OFF until a combined-state gate exists (see module doc)
 fn bisect_red<'a>(
     ops: &'a dyn SpeculativeBatchOps,
     prefix: Vec<u64>,
