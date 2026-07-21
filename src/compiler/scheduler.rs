@@ -3,9 +3,13 @@
 //! Reads the durable [`queue`](super::queue) and makes runs happen *gracefully*:
 //! small/capped builds go now on the primary; heavy builds (that need the heavy
 //! host's idle-mode) are held for a configured build **window** or a fleet-quiet
-//! signal. Concurrency is bounded per host, and no two conflicting builds of one
-//! module ever run at once (the queue's per-module lock, enforced atomically in
-//! [`QueueStore::claim`]).
+//! signal. Concurrency is bounded per host, and no two builds of the exact same
+//! `(module, ref)` ever run at once (the queue's `(module, ref)` lock, enforced
+//! atomically in [`QueueStore::claim`]) — PCON-04 (S122) re-keyed this lock from
+//! `module` alone: with PCON-01..03's per-SHA stage/target isolation, two
+//! DIFFERENT shas of one module no longer need to be force-serialized. Each tick
+//! also opportunistically GCs stale per-SHA stage dirs (PCON-05, best-effort,
+//! never fails the tick).
 //!
 //! ## Dispatch rule (per tick)
 //! Walk the queue in dispatch order (priority, then FIFO). For each job:
@@ -499,6 +503,21 @@ impl Scheduler {
                 return report;
             }
         };
+        // PCON-05: snapshot the currently-live (queued) `(module -> {ref/sha})`
+        // set BEFORE the dispatch loop below consumes `jobs`, so the opportunistic
+        // GC sweep at the end of this tick never reclaims a stage dir a job in
+        // THIS peek still references. (An in-flight/building job's ref is a
+        // strict subset of what was queued moments ago in practice, and GC's own
+        // age/count floor + best-effort semantics make this a safe approximation,
+        // not a hard correctness requirement — see `gc_sha_stage_dirs`'s doc.)
+        let mut live_by_module: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for j in &jobs {
+            live_by_module
+                .entry(j.module.clone())
+                .or_default()
+                .insert(j.git_ref.clone());
+        }
         for job in jobs {
             let host = if job.heavy {
                 HostRole::Heavy
@@ -543,6 +562,10 @@ impl Scheduler {
                 }
             }
         }
+        // PCON-05: opportunistic, best-effort GC of stale per-sha stage dirs.
+        // Runs on every tick but is cheap (a `read_dir` + a bounded reclaim) and
+        // NEVER fails/blocks the tick — see `gc_stage_dirs_best_effort`'s doc.
+        super::gc_stage_dirs_best_effort(&live_by_module);
         report
     }
 

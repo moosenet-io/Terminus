@@ -550,12 +550,20 @@ fn job_key(job_id: &str) -> String {
 fn module_lock_prefix() -> String {
     Namespace::Queue.key("modulelock:")
 }
-/// Per-module serialization lock (held for the duration of a build). The Lua now
-/// derives this key from the job hash's own module (A1/A2); retained as the
-/// canonical key constructor used by tests + the namespace assertion.
+/// PCON-04: per-`(module, ref)` serialization lock (held for the duration of a
+/// build). Previously keyed by `module` ALONE, which force-serialized every
+/// build of a module regardless of which commit — including two builds of
+/// DIFFERENT, mutually-isolated SHAs (PCON-01..03 already stage/target them
+/// disjointly, so nothing about them actually conflicts). Re-keying to
+/// `(module, ref)` means the lock now only ever contends two requests for the
+/// SAME ref/sha (which the dedupe pointer above already coalesces to one job
+/// in the common case); different-SHA jobs of one module are no longer
+/// mutually excluded by this lock. The Lua derives this key from the job
+/// hash's own module+ref (A1/A2); retained as the canonical key constructor
+/// used by tests + the namespace assertion.
 #[allow(dead_code)]
-fn module_lock_key(module: &str) -> String {
-    format!("{}{module}", module_lock_prefix())
+fn module_lock_key(module: &str, git_ref: &str) -> String {
+    format!("{}{module}:{git_ref}", module_lock_prefix())
 }
 /// The namespaced prefix for per-host in-flight sets. Passed to the Lua so
 /// `release`/`reconcile` can derive the host-slot key from the job hash's OWN
@@ -686,9 +694,11 @@ return {id, 1}
 "#;
 
 /// Claim queued→building under the module lock + host cap. The module-lock key is
-/// DERIVED from the job hash's OWN stored module (A2), and the caller's `module`
-/// arg is VERIFIED against it — a mismatch is refused so a buggy call can never
-/// take a foreign module lock and break per-module serialization. On success
+/// DERIVED from the job hash's OWN stored `(module, ref)` (A2; PCON-04 — ref is the
+/// resolved SHA once PCON-01's staging is active, so the lock only ever contends
+/// same-SHA jobs), and the caller's `module` arg is VERIFIED against it — a
+/// mismatch is refused so a buggy call can never take a foreign module lock and
+/// break per-`(module, ref)` serialization. On success
 /// writes the claim FENCE token + `started_at` (the reconcile lease clock).
 /// Returns `{ok(0/1), token_or_reason}`.
 /// KEYS: 1=zset 2=jobhash 3=hostset
@@ -699,7 +709,10 @@ if st~='queued' then return {0, 'not_queued'} end
 local module=redis.call('HGET', KEYS[2], 'module')
 if not module then return {0, 'rejected'} end
 if ARGV[7] ~= '' and ARGV[7] ~= module then return {0, 'rejected'} end
-local lockkey=ARGV[6]..module
+-- PCON-04: the lock is keyed by (module, ref) — see module_lock_key's doc —
+-- so two DIFFERENT-sha jobs of one module are no longer mutually excluded.
+local ref=redis.call('HGET', KEYS[2], 'ref') or ''
+local lockkey=ARGV[6]..module..':'..ref
 if redis.call('EXISTS', lockkey)==1 then return {0, 'module_busy'} end
 if redis.call('SCARD', KEYS[3])>=tonumber(ARGV[2]) then return {0, 'host_full'} end
 redis.call('ZREM', KEYS[1], ARGV[1])
@@ -743,8 +756,9 @@ local host=redis.call('HGET', jobkey, 'host')
 -- dedupe pointer, so a rerun/clear targets the mode-specific entry.
 local mode=redis.call('HGET', jobkey, 'mode') or 'build'
 if mode~='test' then mode='build' end
+-- PCON-04: lock key is (module, ref) — see module_lock_key's doc.
 if module then
-  local lockkey=lockprefix..module
+  local lockkey=lockprefix..module..':'..(ref or '')
   if redis.call('GET', lockkey)==jobid then redis.call('DEL', lockkey) end
 end
 if host then
@@ -899,10 +913,12 @@ local started=tonumber(redis.call('HGET', jobkey, 'started_at') or '0')
 if (tonumber(nowv) - started) < tonumber(ARGV[3]) then
   return 0
 end
--- Derive the module lock + host slot from the hash's OWN fields.
+-- Derive the module lock + host slot from the hash's OWN fields. PCON-04:
+-- the lock is keyed by (module, ref) — see module_lock_key's doc.
 local module=redis.call('HGET', jobkey, 'module')
+local crashref=redis.call('HGET', jobkey, 'ref') or ''
 if module then
-  local lockkey=lockprefix..module
+  local lockkey=lockprefix..module..':'..crashref
   if redis.call('GET', lockkey)==jobid then redis.call('DEL', lockkey) end
 end
 local host=redis.call('HGET', jobkey, 'host')
@@ -1405,7 +1421,9 @@ pub(crate) mod fake {
     struct State {
         jobs: HashMap<String, Job>,
         dedupe: HashMap<String, String>,       // module@ref -> id
-        module_lock: HashMap<String, String>,  // module -> id
+        // PCON-04: keyed by `lock_ident(module, ref)`, not module alone — see
+        // `lock_ident`'s doc.
+        module_lock: HashMap<String, String>,
         host_inflight: HashMap<&'static str, Vec<String>>,
         seq: i64,
         next_id: u64,
@@ -1531,6 +1549,16 @@ pub(crate) mod fake {
         seq - prank * 1_000_000_000_000
     }
 
+    /// PCON-04: the fake's module-lock identity, mirroring the real Lua's
+    /// `lockprefix..module..':'..ref` (see `module_lock_key`'s doc). Module
+    /// never contains `:` (`validate_segment` restricts it to
+    /// `[A-Za-z0-9._-]`), nor does any `/`-separated ref component
+    /// (`validate_git_ref` uses the same charset per component), so `:` is an
+    /// unambiguous separator here.
+    fn lock_ident(module: &str, git_ref: &str) -> String {
+        format!("{module}:{git_ref}")
+    }
+
     /// The shared release body (mirrors `RELEASE_BODY` Lua): free the module lock
     /// + host slot — both derived from the job's OWN stored module/host (A1, never
     /// a caller arg) — clear the fence token, honor a re-run (else clear dedupe),
@@ -1551,9 +1579,11 @@ pub(crate) mod fake {
             None => return,
         };
         let (dmod, dref, dhost, dprank, dheavy, rerun, dbin, dforce, dmode) = done;
-        // Derive the module lock + host slot from the STORED fields.
-        if s.module_lock.get(&dmod).map(String::as_str) == Some(job_id) {
-            s.module_lock.remove(&dmod);
+        // Derive the module lock + host slot from the STORED fields. PCON-04:
+        // the lock is keyed by (module, ref).
+        let lk = lock_ident(&dmod, &dref);
+        if s.module_lock.get(&lk).map(String::as_str) == Some(job_id) {
+            s.module_lock.remove(&lk);
         }
         if let Some(h) = dhost {
             if let Some(v) = s.host_inflight.get_mut(h.as_str()) {
@@ -1749,15 +1779,17 @@ pub(crate) mod fake {
             if s.down {
                 return Err(QueueError::Unavailable);
             }
-            // Derive the module from the job's OWN stored field; verify the arg.
-            let stored_module = match s.jobs.get(job_id) {
-                Some(j) if j.state == "queued" => j.module.clone(),
+            // Derive the module (+ ref, for the PCON-04 lock key) from the job's
+            // OWN stored fields; verify the caller's `module` arg against it.
+            let (stored_module, stored_ref) = match s.jobs.get(job_id) {
+                Some(j) if j.state == "queued" => (j.module.clone(), j.git_ref.clone()),
                 Some(_) | None => return Ok(ClaimOutcome::NotQueued),
             };
             if !module.is_empty() && module != stored_module {
                 return Ok(ClaimOutcome::Rejected);
             }
-            if s.module_lock.contains_key(&stored_module) {
+            let lock_key = lock_ident(&stored_module, &stored_ref);
+            if s.module_lock.contains_key(&lock_key) {
                 return Ok(ClaimOutcome::ModuleBusy);
             }
             let live = s.host_inflight.get(host.as_str()).map(Vec::len).unwrap_or(0);
@@ -1773,7 +1805,7 @@ pub(crate) mod fake {
                 j.started_at = now_ms();
                 j.claim_token = Some(token.clone());
             }
-            s.module_lock.insert(stored_module, job_id.to_string());
+            s.module_lock.insert(lock_key, job_id.to_string());
             s.host_inflight
                 .entry(host.as_str())
                 .or_default()
@@ -1874,10 +1906,11 @@ pub(crate) mod fake {
             }
             // `module`/`host` args are advisory — derive from the job's OWN fields.
             let _ = (module, host);
-            let stored_module = s.jobs.get(job_id).map(|j| j.module.clone());
-            if let Some(m) = stored_module {
-                if s.module_lock.get(&m).map(String::as_str) == Some(job_id) {
-                    s.module_lock.remove(&m);
+            let stored = s.jobs.get(job_id).map(|j| (j.module.clone(), j.git_ref.clone()));
+            if let Some((m, r)) = stored {
+                let lk = lock_ident(&m, &r);
+                if s.module_lock.get(&lk).map(String::as_str) == Some(job_id) {
+                    s.module_lock.remove(&lk);
                 }
             }
             for v in s.host_inflight.values_mut() {
@@ -1908,7 +1941,7 @@ pub(crate) mod fake {
             let now = now_ms();
             let stale_ms = stale_after.as_millis() as i64;
             // Snapshot the building candidates + whether each finished (marker).
-            let building: Vec<(String, String, Option<HostRole>, Option<String>, i64)> = s
+            let building: Vec<(String, String, String, Option<HostRole>, Option<String>, i64)> = s
                 .jobs
                 .iter()
                 .filter(|(_, j)| j.state == "building")
@@ -1916,6 +1949,7 @@ pub(crate) mod fake {
                     (
                         id.clone(),
                         j.module.clone(),
+                        j.git_ref.clone(),
                         j.host,
                         j.outcome.clone(),
                         j.started_at,
@@ -1923,15 +1957,16 @@ pub(crate) mod fake {
                 })
                 .collect();
             let mut report = ReconcileReport::default();
-            for (id, module, _host, outcome, started) in building {
+            for (id, module, git_ref, _host, outcome, started) in building {
                 if let Some(outcome) = outcome {
                     // FINISHED but not released → release only, NO rebuild.
                     release_locked(&mut s, &id, &outcome);
                     report.released.push(id);
                 } else if (now - started) >= stale_ms {
-                    // Crashed mid-build → requeue.
-                    if s.module_lock.get(&module).map(String::as_str) == Some(id.as_str()) {
-                        s.module_lock.remove(&module);
+                    // Crashed mid-build → requeue. PCON-04: lock keyed by (module, ref).
+                    let lk = lock_ident(&module, &git_ref);
+                    if s.module_lock.get(&lk).map(String::as_str) == Some(id.as_str()) {
+                        s.module_lock.remove(&lk);
                     }
                     for v in s.host_inflight.values_mut() {
                         v.retain(|x| x != &id);
@@ -1982,6 +2017,18 @@ mod tests {
             ready: true,
             force: false,
             mode: "build".to_string(),
+        }
+    }
+
+    /// A `mode="test"` request for the same `(module, ref)` — used to obtain a
+    /// SECOND, distinct job id sharing the exact same PCON-04 `(module, ref)`
+    /// lock identity (the lock key is mode-independent, unlike the dedupe key),
+    /// since a same-`(module, ref, mode)` enqueue always coalesces onto any
+    /// existing active job rather than creating a new one.
+    fn test_req(module: &str, git_ref: &str) -> JobRequest {
+        JobRequest {
+            mode: "test".to_string(),
+            ..req(module, git_ref, Priority::Normal, false)
         }
     }
 
@@ -2114,20 +2161,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_module_serializes_via_module_lock() {
+    async fn same_module_same_ref_serializes_via_module_lock() {
+        // PCON-04: the lock is keyed by (module, ref) now, not module alone — two
+        // REQUESTS for the exact same ref (a real re-request, e.g. the dedupe
+        // pointer already expired/was cleared) still serialize gracefully.
         let q = InMemoryQueue::new();
         let j1 = q.enqueue(&req("chord", "r1", Priority::Normal, false)).await.unwrap();
-        let j2 = q.enqueue(&req("chord", "r2", Priority::Normal, false)).await.unwrap();
-        // First claim of module `chord` succeeds; a second (different ref, same
-        // module) is refused while the first builds — graceful serialization.
+        // A second, distinct job of the SAME (module, ref) — bypass dedupe by
+        // enqueuing under a different mode so it gets its own job id but shares
+        // the (module, ref) lock identity.
+        let j2 = q.enqueue(&test_req("chord", "r1")).await.unwrap();
+        assert_ne!(j1.job_id, j2.job_id, "distinct jobs (different mode) for test setup");
+
         let tok1 = claim_ok(&q, &j1.job_id, "chord", HostRole::Primary, 4).await;
         assert_eq!(
             q.claim(&j2.job_id, "chord", HostRole::Primary, 4).await.unwrap(),
-            ClaimOutcome::ModuleBusy
+            ClaimOutcome::ModuleBusy,
+            "same (module, ref) still serializes"
         );
-        // Once the first finishes, the module lock frees and the second claims.
+        // Once the first finishes, the (module, ref) lock frees and the second claims.
         q.complete(&j1.job_id, "chord", HostRole::Primary, JobState::Done, &tok1).await.unwrap();
         claim_ok(&q, &j2.job_id, "chord", HostRole::Primary, 4).await;
+    }
+
+    #[tokio::test]
+    async fn different_ref_same_module_no_longer_serializes_pcon04() {
+        // PCON-04: with staging/targets isolated per (module, sha) by PCON-01..03,
+        // the module lock is re-keyed to (module, ref) — so two DIFFERENT refs
+        // (in practice, two different resolved SHAs) of the SAME module are no
+        // longer force-serialized by a blanket module-wide lock; both may build
+        // concurrently, bounded only by the host cap.
+        let q = InMemoryQueue::new();
+        let j1 = q.enqueue(&req("chord", "sha-aaaa", Priority::Normal, false)).await.unwrap();
+        let j2 = q.enqueue(&req("chord", "sha-bbbb", Priority::Normal, false)).await.unwrap();
+        claim_ok(&q, &j1.job_id, "chord", HostRole::Primary, 4).await;
+        // The second, DIFFERENT-ref job of the same module claims successfully
+        // too — it is NOT ModuleBusy.
+        let outcome2 = q.claim(&j2.job_id, "chord", HostRole::Primary, 4).await.unwrap();
+        assert!(
+            matches!(outcome2, ClaimOutcome::Claimed { .. }),
+            "different-ref job of the same module must not be ModuleBusy: {outcome2:?}"
+        );
     }
 
     #[tokio::test]
@@ -2307,12 +2381,15 @@ mod tests {
     async fn complete_releases_module_lock_and_host_slot_atomically() {
         let q = InMemoryQueue::new();
         // j1 (module m1) claimed on primary cap=1: holds the module lock AND the
-        // one primary host slot.
+        // one primary host slot. PCON-04: the lock is (module, ref)-keyed, so
+        // j1b must share j1's exact ref to still contend the SAME lock — it uses
+        // mode=test to still land as a distinct job id.
         let j1 = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
         let j2 = q.enqueue(&req("m2", "r2", Priority::Normal, false)).await.unwrap();
-        let j1b = q.enqueue(&req("m1", "rB", Priority::Normal, false)).await.unwrap();
+        let j1b = q.enqueue(&test_req("m1", "r1")).await.unwrap();
         let tok1 = claim_ok(&q, &j1.job_id, "m1", HostRole::Primary, 1).await;
-        // While j1 builds: a different module is host-capped, and same module is locked.
+        // While j1 builds: a different module is host-capped, and same (module,
+        // ref) is locked.
         assert_eq!(
             q.claim(&j2.job_id, "m2", HostRole::Primary, 1).await.unwrap(),
             ClaimOutcome::HostFull
@@ -2333,8 +2410,10 @@ mod tests {
     #[tokio::test]
     async fn complete_on_redis_down_does_not_half_release_the_lock() {
         let q = InMemoryQueue::new();
+        // PCON-04: j1b shares j1's exact ref (same lock identity), distinguished
+        // by mode so it still lands as a separate job id.
         let j1 = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
-        let j1b = q.enqueue(&req("m1", "rB", Priority::Normal, false)).await.unwrap();
+        let j1b = q.enqueue(&test_req("m1", "r1")).await.unwrap();
         let tok1 = claim_ok(&q, &j1.job_id, "m1", HostRole::Primary, 1).await;
         // Redis goes down at release time → the LOW-LEVEL release fails as a whole;
         // NOTHING is partially released (the module lock is still held). (Uses the
@@ -2485,12 +2564,14 @@ mod tests {
         // It took no lock under the wrong name, and the job is still queued: a
         // correct claim still succeeds and same-module serialization holds.
         assert_eq!(q.state_of(&j.job_id).as_deref(), Some("queued"));
-        let j2 = q.enqueue(&req("m1", "r2", Priority::Normal, false)).await.unwrap();
+        // PCON-04: j2 shares j's exact ref (same lock identity), distinguished by
+        // mode so it still lands as a separate job id.
+        let j2 = q.enqueue(&test_req("m1", "r1")).await.unwrap();
         claim_ok(&q, &j.job_id, "m1", HostRole::Primary, 4).await;
         assert_eq!(
             q.claim(&j2.job_id, "m1", HostRole::Primary, 4).await.unwrap(),
             ClaimOutcome::ModuleBusy,
-            "the correct module lock still serializes same-module builds"
+            "the correct (module, ref) lock still serializes same-ref builds"
         );
     }
 
@@ -2814,12 +2895,18 @@ mod tests {
         let _: () = raw(&backend, "CONFIG", &["SET".into(), "maxmemory-policy".into(), "noeviction".into()]).await;
         assert_eq!(q.peek(10).await.unwrap().len(), 1, "queued job persists under noeviction");
 
-        // 3) Claim writes a fence token + module lock; a 2nd claim is ModuleBusy.
+        // 3) Claim writes a fence token + (module, ref) lock (PCON-04); a 2nd
+        // claim of the SAME ref (distinguished by mode, so it's a separate job)
+        // is ModuleBusy against the real CLAIM_LUA.
         let tok = match q.claim(&a.job_id, "chord", HostRole::Primary, 1).await.unwrap() {
             ClaimOutcome::Claimed { token } => token,
             o => panic!("{o:?}"),
         };
-        let j2 = q.enqueue(&mk("chord", "z", Priority::Normal, false, true)).await.unwrap();
+        let j2 = JobRequest {
+            mode: "test".to_string(),
+            ..mk("chord", "abc", Priority::Normal, false, true)
+        };
+        let j2 = q.enqueue(&j2).await.unwrap();
         assert_eq!(
             q.claim(&j2.job_id, "chord", HostRole::Primary, 4).await.unwrap(),
             ClaimOutcome::ModuleBusy
@@ -2830,7 +2917,12 @@ mod tests {
         q.finalize(&a.job_id, JobState::Done, &tok).await.unwrap();
         q.release(&a.job_id, "chord", HostRole::Primary, &tok).await.unwrap();
         let after = q.peek(10).await.unwrap();
-        let rerun = after.iter().find(|j| j.module == "chord" && j.git_ref == "abc").unwrap();
+        // Disambiguate from the still-queued mode=test `j2` (same module/ref,
+        // different mode/lock-sharing but a distinct dedupe entry) via `mode`.
+        let rerun = after
+            .iter()
+            .find(|j| j.module == "chord" && j.git_ref == "abc" && j.mode == "build")
+            .unwrap();
         assert_ne!(rerun.job_id, a.job_id, "re-run is a fresh job");
         // Rust-built and Lua-derived dedupe keys must AGREE on the collision-free
         // encoding: a fresh enqueue of the same pair coalesces onto the Lua-written
@@ -2884,10 +2976,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redis_concurrent_claim_serializes_same_module() {
-        // B4: two schedulers race to claim TWO DIFFERENT refs of the SAME module,
-        // against the real CLAIM_LUA — exactly one wins, the other is ModuleBusy
-        // (per-module serialization holds under real concurrency).
+    async fn redis_concurrent_claim_serializes_same_module_ref() {
+        // B4 / PCON-04: two schedulers race to claim the SAME (module, ref)
+        // (distinguished only by mode, so each gets its own job id), against the
+        // real CLAIM_LUA — exactly one wins, the other is ModuleBusy (the
+        // (module, ref) lock serializes under real concurrency).
         let Some(server) = EphemeralRedis::start() else {
             eprintln!("SKIP redis_concurrent_claim: redis-server not installed");
             return;
@@ -2896,18 +2989,18 @@ mod tests {
             RedisBackend::build(&server.url(), None, 0, 1, Duration::from_millis(500)).unwrap();
         let _: () = raw(&backend, "FLUSHALL", &[]).await;
         let q = Arc::new(RedisQueue::new(backend.clone()));
-        let mk = |r: &str| JobRequest {
+        let mk = |mode: &str| JobRequest {
             module: "chord".into(),
-            git_ref: r.into(),
+            git_ref: "r1".into(),
             priority: Priority::Normal,
             heavy: false,
             ready: true,
             bin: None,
             force: false,
-            mode: "build".to_string(),
+            mode: mode.to_string(),
         };
-        let j1 = q.enqueue(&mk("r1")).await.unwrap();
-        let j2 = q.enqueue(&mk("r2")).await.unwrap();
+        let j1 = q.enqueue(&mk("build")).await.unwrap();
+        let j2 = q.enqueue(&mk("test")).await.unwrap();
         // Race both claims concurrently.
         let (qa, qb) = (q.clone(), q.clone());
         let (ia, ib) = (j1.job_id.clone(), j2.job_id.clone());
@@ -2919,8 +3012,43 @@ mod tests {
             .filter(|o| matches!(o, ClaimOutcome::Claimed { .. }))
             .count();
         let busy = [&ra, &rb].iter().filter(|o| matches!(o, ClaimOutcome::ModuleBusy)).count();
-        assert_eq!(claimed, 1, "exactly one racer claims the module: {ra:?} / {rb:?}");
+        assert_eq!(claimed, 1, "exactly one racer claims the (module, ref) lock: {ra:?} / {rb:?}");
         assert_eq!(busy, 1, "the other is serialized out (ModuleBusy): {ra:?} / {rb:?}");
+    }
+
+    #[tokio::test]
+    async fn redis_different_ref_same_module_claims_concurrently_pcon04() {
+        // PCON-04, against the real CLAIM_LUA: two DIFFERENT refs (in practice,
+        // two different resolved SHAs — PCON-01..03 isolate their stage/target
+        // dirs) of the SAME module both claim successfully — the (module, ref)
+        // lock no longer force-serializes them.
+        let Some(server) = EphemeralRedis::start() else {
+            eprintln!("SKIP redis_different_ref_same_module: redis-server not installed");
+            return;
+        };
+        let backend =
+            RedisBackend::build(&server.url(), None, 0, 1, Duration::from_millis(500)).unwrap();
+        let _: () = raw(&backend, "FLUSHALL", &[]).await;
+        let q = RedisQueue::new(backend.clone());
+        let mk = |r: &str| JobRequest {
+            module: "chord".into(),
+            git_ref: r.into(),
+            priority: Priority::Normal,
+            heavy: false,
+            ready: true,
+            bin: None,
+            force: false,
+            mode: "build".to_string(),
+        };
+        let j1 = q.enqueue(&mk("sha-aaaa")).await.unwrap();
+        let j2 = q.enqueue(&mk("sha-bbbb")).await.unwrap();
+        let r1 = q.claim(&j1.job_id, "chord", HostRole::Primary, 4).await.unwrap();
+        assert!(matches!(r1, ClaimOutcome::Claimed { .. }), "{r1:?}");
+        let r2 = q.claim(&j2.job_id, "chord", HostRole::Primary, 4).await.unwrap();
+        assert!(
+            matches!(r2, ClaimOutcome::Claimed { .. }),
+            "different-ref job of the same module must not be ModuleBusy: {r2:?}"
+        );
     }
 
     #[test]
@@ -2962,7 +3090,7 @@ mod tests {
             seq_key(),
             dedupe_key("chord", "abc", "build"),
             job_key("id"),
-            module_lock_key("chord"),
+            module_lock_key("chord", "abc"),
             host_set_key(HostRole::Heavy),
         ] {
             assert!(k.starts_with("queue:"), "{k} must be under the Queue namespace");
