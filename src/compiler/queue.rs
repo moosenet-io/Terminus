@@ -1421,8 +1421,10 @@ pub(crate) mod fake {
     struct State {
         jobs: HashMap<String, Job>,
         dedupe: HashMap<String, String>,       // module@ref -> id
-        // PCON-04: keyed by `lock_ident(module, ref)`, not module alone — see
-        // `lock_ident`'s doc.
+        // PCON-04: keyed by `module_lock_key(module, ref)` — the SAME
+        // constructor the real Lua's key shape mirrors and tests assert
+        // against (single source of truth for the key format) — not module
+        // alone.
         module_lock: HashMap<String, String>,
         host_inflight: HashMap<&'static str, Vec<String>>,
         seq: i64,
@@ -1543,20 +1545,21 @@ pub(crate) mod fake {
                 .map(|j| j.coalesced)
                 .unwrap_or(0)
         }
+
+        /// PCON-04 fidelity test helper: the job id currently holding the
+        /// `(module, git_ref)` lock, looked up under the EXACT SAME prefixed key
+        /// [`module_lock_key`] constructs — i.e. the same key shape the real
+        /// Lua uses (`lockprefix..module..':'..ref`) — so a test can assert the
+        /// fake's lock storage is keyed identically to production, not just
+        /// internally self-consistent.
+        pub(crate) fn module_lock_holder(&self, module: &str, git_ref: &str) -> Option<String> {
+            let s = self.state.lock().unwrap();
+            s.module_lock.get(&module_lock_key(module, git_ref)).cloned()
+        }
     }
 
     fn score(seq: i64, prank: i64) -> i64 {
         seq - prank * 1_000_000_000_000
-    }
-
-    /// PCON-04: the fake's module-lock identity, mirroring the real Lua's
-    /// `lockprefix..module..':'..ref` (see `module_lock_key`'s doc). Module
-    /// never contains `:` (`validate_segment` restricts it to
-    /// `[A-Za-z0-9._-]`), nor does any `/`-separated ref component
-    /// (`validate_git_ref` uses the same charset per component), so `:` is an
-    /// unambiguous separator here.
-    fn lock_ident(module: &str, git_ref: &str) -> String {
-        format!("{module}:{git_ref}")
     }
 
     /// The shared release body (mirrors `RELEASE_BODY` Lua): free the module lock
@@ -1581,7 +1584,7 @@ pub(crate) mod fake {
         let (dmod, dref, dhost, dprank, dheavy, rerun, dbin, dforce, dmode) = done;
         // Derive the module lock + host slot from the STORED fields. PCON-04:
         // the lock is keyed by (module, ref).
-        let lk = lock_ident(&dmod, &dref);
+        let lk = module_lock_key(&dmod, &dref);
         if s.module_lock.get(&lk).map(String::as_str) == Some(job_id) {
             s.module_lock.remove(&lk);
         }
@@ -1788,7 +1791,7 @@ pub(crate) mod fake {
             if !module.is_empty() && module != stored_module {
                 return Ok(ClaimOutcome::Rejected);
             }
-            let lock_key = lock_ident(&stored_module, &stored_ref);
+            let lock_key = module_lock_key(&stored_module, &stored_ref);
             if s.module_lock.contains_key(&lock_key) {
                 return Ok(ClaimOutcome::ModuleBusy);
             }
@@ -1908,7 +1911,7 @@ pub(crate) mod fake {
             let _ = (module, host);
             let stored = s.jobs.get(job_id).map(|j| (j.module.clone(), j.git_ref.clone()));
             if let Some((m, r)) = stored {
-                let lk = lock_ident(&m, &r);
+                let lk = module_lock_key(&m, &r);
                 if s.module_lock.get(&lk).map(String::as_str) == Some(job_id) {
                     s.module_lock.remove(&lk);
                 }
@@ -1964,7 +1967,7 @@ pub(crate) mod fake {
                     report.released.push(id);
                 } else if (now - started) >= stale_ms {
                     // Crashed mid-build → requeue. PCON-04: lock keyed by (module, ref).
-                    let lk = lock_ident(&module, &git_ref);
+                    let lk = module_lock_key(&module, &git_ref);
                     if s.module_lock.get(&lk).map(String::as_str) == Some(id.as_str()) {
                         s.module_lock.remove(&lk);
                     }
@@ -2158,6 +2161,42 @@ mod tests {
             .collect();
         // High first, then the two normals in FIFO order.
         assert_eq!(order, vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn module_lock_key_has_the_exact_prefixed_shape_the_real_lua_builds() {
+        // FINDING 1 (review): pin the EXACT key string `module_lock_key`
+        // constructs — `"queue:modulelock:chord:abc"` — so a future edit to
+        // either the Rust constructor or the real Lua's
+        // `lockprefix..module..':'..ref` concatenation can't silently drift
+        // apart without a test catching it.
+        assert_eq!(module_lock_key("chord", "abc"), "queue:modulelock:chord:abc");
+        assert_eq!(module_lock_prefix(), "queue:modulelock:");
+    }
+
+    #[tokio::test]
+    async fn fake_module_lock_is_stored_under_the_exact_production_key_shape() {
+        // FINDING 1 (review): the fake previously stored its module lock under
+        // a BARE `"{module}:{ref}"` string — internally consistent, but NOT the
+        // same key shape the real Lua uses (`lockprefix..module..':'..ref`), so
+        // the PCON-04 re-key tests weren't actually validating the production
+        // key format. The fake must now build the SAME prefixed key
+        // (`module_lock_key`, the single source of truth both sides call) —
+        // proven here by looking the held lock up through that exact
+        // constructor via `module_lock_holder`.
+        let q = InMemoryQueue::new();
+        let j1 = q.enqueue(&req("chord", "abc", Priority::Normal, false)).await.unwrap();
+        let tok = claim_ok(&q, &j1.job_id, "chord", HostRole::Primary, 4).await;
+        assert_eq!(
+            q.module_lock_holder("chord", "abc"),
+            Some(j1.job_id.clone()),
+            "the lock must be discoverable under module_lock_key's exact prefixed shape"
+        );
+        // A lookup under the OLD, un-prefixed shape must NOT find it (proves
+        // the fake isn't accidentally ALSO writing the bare form).
+        assert_ne!(module_lock_key("chord", "abc"), "chord:abc");
+        q.complete(&j1.job_id, "chord", HostRole::Primary, JobState::Done, &tok).await.unwrap();
+        assert_eq!(q.module_lock_holder("chord", "abc"), None, "released after complete");
     }
 
     #[tokio::test]

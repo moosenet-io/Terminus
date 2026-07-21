@@ -503,13 +503,19 @@ impl Scheduler {
                 return report;
             }
         };
-        // PCON-05: snapshot the currently-live (queued) `(module -> {ref/sha})`
-        // set BEFORE the dispatch loop below consumes `jobs`, so the opportunistic
-        // GC sweep at the end of this tick never reclaims a stage dir a job in
-        // THIS peek still references. (An in-flight/building job's ref is a
-        // strict subset of what was queued moments ago in practice, and GC's own
-        // age/count floor + best-effort semantics make this a safe approximation,
-        // not a hard correctness requirement — see `gc_sha_stage_dirs`'s doc.)
+        // PCON-05: snapshot the currently-live `(module -> {ref/sha})` set BEFORE
+        // the dispatch loop below consumes `jobs`, so the opportunistic GC sweep
+        // at the end of this tick never reclaims a stage dir a job still
+        // references. FINDING 2 (review): this MUST include in-flight (building)
+        // jobs, not just queued ones — a job that has already been claimed and
+        // is actively reading its stage dir off disk is no longer in the queued
+        // set at all, so omitting leases here let GC delete a stage dir out from
+        // under a build that was still running. `snapshot()`'s `leases` field is
+        // exactly the queue's own definition of "currently building"; a
+        // snapshot failure (Unavailable) is non-fatal to the tick — it just
+        // means this tick's GC conservatively sees fewer live entries (GC's own
+        // best-effort semantics + age/count floor already tolerate that), never
+        // that the tick itself degrades.
         let mut live_by_module: std::collections::HashMap<String, std::collections::HashSet<String>> =
             std::collections::HashMap::new();
         for j in &jobs {
@@ -517,6 +523,14 @@ impl Scheduler {
                 .entry(j.module.clone())
                 .or_default()
                 .insert(j.git_ref.clone());
+        }
+        if let Ok(snap) = self.queue.snapshot().await {
+            for lease in &snap.leases {
+                live_by_module
+                    .entry(lease.module.clone())
+                    .or_default()
+                    .insert(lease.git_ref.clone());
+            }
         }
         for job in jobs {
             let host = if job.heavy {
@@ -1435,5 +1449,103 @@ mod tests {
             q.claim(&j_next.job_id, "m1", HostRole::Primary, 2).await.unwrap(),
             ClaimOutcome::Claimed { .. }
         ));
+    }
+
+    /// Create `module_root/<name>` and back-date its mtime by `age_secs` (no new
+    /// dependency: `std::fs::File::set_modified`, stable since Rust 1.75).
+    fn touch_dir(module_root: &std::path::Path, name: &str, age_secs: u64) {
+        let dir = module_root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        let f = std::fs::File::open(&dir).unwrap();
+        f.set_modified(mtime).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pcon05_gc_never_reclaims_a_stage_dir_referenced_by_a_building_lease() {
+        // FINDING 2 (review): the opportunistic GC sweep's "live" protection set
+        // MUST include in-flight (building) jobs, not just currently-queued
+        // ones — once a job is claimed it drops out of `peek`'s queued set
+        // entirely while its build is still actively reading the stage dir off
+        // disk, so a live set built from `peek` alone would let GC delete that
+        // dir out from under a running build.
+        //
+        // Env note: like `fleet_quiet_from_chord_falls_back_when_unconfigured`
+        // above, this test touches process env directly (no crate-wide lock
+        // exists for it) — accepted existing practice in this file; the vars
+        // are restored at the end.
+        let dataset_root = tempfile::tempdir().unwrap();
+        let prev_root = std::env::var("BUILD_DATASET_ROOT").ok();
+        let prev_count = std::env::var("BUILD_SHA_STAGE_RETAIN_COUNT").ok();
+        let prev_secs = std::env::var("BUILD_SHA_STAGE_RETAIN_SECS").ok();
+        std::env::set_var("BUILD_DATASET_ROOT", dataset_root.path());
+        // Force the age/count floor down so this test's dirs actually exercise
+        // reclaim decisions instead of all surviving under the (generous)
+        // production defaults.
+        std::env::set_var("BUILD_SHA_STAGE_RETAIN_COUNT", "1");
+        std::env::set_var("BUILD_SHA_STAGE_RETAIN_SECS", "0");
+
+        let q = Arc::new(InMemoryQueue::new());
+        q.enqueue(&req("chord", "deadbeef", false)).await.unwrap();
+        let ex = RecordingExecutor::new(false);
+        let s = sched(q.clone(), ex.clone(), Arc::new(NoopIdle), cfg(4, 4, vec![]));
+
+        // Tick 1: claims the job (state -> 'building'). Its handle is
+        // deliberately NOT awaited so the fake job stays 'building' for the
+        // rest of this test (mirrors `per_host_cap_holds_second_build` above).
+        let r1 = s.tick_once(12, false).await;
+        assert_eq!(r1.dispatched.len(), 1, "the job must be claimed (building) before tick 2");
+        assert_eq!(q.state_of(&r1.dispatched[0]).as_deref(), Some("building"));
+
+        // Three per-sha stage dirs under the module root, deliberately ordered
+        // so age/count ALONE would reclaim the live one and keep an unrelated
+        // one — proving the survival below comes from the leases fix, not
+        // incidentally from the retain-count floor:
+        //   - "deadbeef" (the BUILDING job's own ref): OLDEST — would be
+        //     reclaimed by age/count alone; must survive via the live set.
+        //   - "recent-other": NEWEST, unrelated — survives via the
+        //     retain-count=1 floor (positive control: GC still protects
+        //     *something* by count).
+        //   - "old-dead": unrelated, neither newest nor live — MUST be
+        //     reclaimed (positive control: GC is not a no-op).
+        let module_root = dataset_root.path().join("src").join("chord");
+        touch_dir(&module_root, "deadbeef", 999_999);
+        touch_dir(&module_root, "old-dead", 500_000);
+        touch_dir(&module_root, "recent-other", 100);
+
+        // Tick 2: the building job is no longer in `peek`'s queued set at all —
+        // exactly the scenario the fix must cover via `snapshot().leases`.
+        let r2 = s.tick_once(12, false).await;
+        assert!(r2.dispatched.is_empty() && r2.contended.is_empty());
+
+        assert!(
+            module_root.join("deadbeef").exists(),
+            "a stage dir referenced by a BUILDING lease must never be GC'd"
+        );
+        assert!(
+            module_root.join("recent-other").exists(),
+            "the newest dir survives via the retain-count floor"
+        );
+        assert!(
+            !module_root.join("old-dead").exists(),
+            "an unrelated, old, non-live, over-count dir must still be reclaimed \
+             (proves GC is doing real work, not just protecting everything)"
+        );
+
+        for h in r1.handles.into_iter().chain(r2.handles) {
+            let _ = h.await;
+        }
+        match prev_root {
+            Some(v) => std::env::set_var("BUILD_DATASET_ROOT", v),
+            None => std::env::remove_var("BUILD_DATASET_ROOT"),
+        }
+        match prev_count {
+            Some(v) => std::env::set_var("BUILD_SHA_STAGE_RETAIN_COUNT", v),
+            None => std::env::remove_var("BUILD_SHA_STAGE_RETAIN_COUNT"),
+        }
+        match prev_secs {
+            Some(v) => std::env::set_var("BUILD_SHA_STAGE_RETAIN_SECS", v),
+            None => std::env::remove_var("BUILD_SHA_STAGE_RETAIN_SECS"),
+        }
     }
 }
