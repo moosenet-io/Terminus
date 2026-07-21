@@ -280,6 +280,16 @@ pub struct SchedulerConfig {
     pub complete_retry_base: Duration,
     /// Max completion retry attempts (then the reconcile backstop takes over).
     pub complete_retry_max: u32,
+    /// PCON-09: host concurrent-job cap (`BUILD_CONCURRENCY_MAX_JOBS`). `None`
+    /// (unset) ⇒ fall back to the per-role `primary_cap`/`heavy_cap`.
+    pub max_jobs: Option<u32>,
+    /// PCON-09: free-disk floor (MB) on the build-scratch filesystem before a new
+    /// build admits. `0` ⇒ no disk gate.
+    pub min_disk_mb: u64,
+    /// PCON-09: the filesystem to check for the disk floor
+    /// (`BUILD_CONCURRENCY_DISK_PATH`). `None` ⇒ the disk gate is skipped even if
+    /// `min_disk_mb` is set (degrade-open — we can't stat an unknown path).
+    pub disk_path: Option<std::path::PathBuf>,
 }
 
 impl SchedulerConfig {
@@ -331,13 +341,43 @@ impl SchedulerConfig {
                 .filter(|n| *n >= 1)
                 .unwrap_or(DEFAULT_COMPLETE_RETRY_BASE_MS)),
             complete_retry_max: env_u32(COMPLETE_RETRY_MAX_ENV, DEFAULT_COMPLETE_RETRY_MAX),
+            // PCON-09: `0`/unset ⇒ None ⇒ keep the per-role cap.
+            max_jobs: std::env::var("BUILD_CONCURRENCY_MAX_JOBS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|n| *n >= 1),
+            min_disk_mb: std::env::var("BUILD_CONCURRENCY_MIN_DISK_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0),
+            disk_path: std::env::var("BUILD_CONCURRENCY_DISK_PATH")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .filter(|p| !p.as_os_str().is_empty()),
         }
     }
 
+    /// The concurrent-job cap for a host: the PCON-09 host-wide
+    /// `BUILD_CONCURRENCY_MAX_JOBS` when set, else the per-role cap.
     fn cap_for(&self, host: HostRole) -> u32 {
+        if let Some(j) = self.max_jobs {
+            return j;
+        }
         match host {
             HostRole::Primary => self.primary_cap,
             HostRole::Heavy => self.heavy_cap,
+        }
+    }
+
+    /// PCON-09: whether the build-scratch filesystem has enough free space to
+    /// admit a new build. Degrades OPEN when the floor is unset or the path is
+    /// unknown/unreadable (never blocks a build on a stat failure).
+    fn disk_headroom_ok(&self) -> bool {
+        match (&self.disk_path, self.min_disk_mb) {
+            (Some(path), min) if min > 0 => {
+                crate::compiler::resource::disk_headroom_ok(path, min)
+            }
+            _ => true,
         }
     }
 }
@@ -544,12 +584,21 @@ impl Scheduler {
                     );
             }
         }
+        // PCON-09: disk-headroom floor. If the build-scratch filesystem is below
+        // the configured free-space floor, do NOT admit new builds this tick —
+        // they stay queued and retry once space is reclaimed (degrades OPEN when
+        // unset/unreadable). Computed once per tick (cheap statvfs).
+        let disk_ok = self.config.disk_headroom_ok();
         for job in jobs {
             let host = if job.heavy {
                 HostRole::Heavy
             } else {
                 HostRole::Primary
             };
+            if !disk_ok {
+                report.contended.push(job.job_id.clone());
+                continue;
+            }
             // Heavy builds are window/quiet gated; small builds go straight to
             // the claim (which enforces the host cap + module lock). A `force`d
             // heavy job (BLD-DISPATCH-01 disrupt-on-demand) bypasses ONLY this
@@ -569,7 +618,12 @@ impl Scheduler {
                     report.dispatched.push(job.job_id.clone());
                     report.handles.push(self.spawn_build(job, host, token));
                 }
-                Ok(ClaimOutcome::ModuleBusy) | Ok(ClaimOutcome::HostFull) => {
+                Ok(ClaimOutcome::ModuleBusy)
+                | Ok(ClaimOutcome::HostFull)
+                | Ok(ClaimOutcome::BudgetFull) => {
+                    // PCON-09: BudgetFull (RAM budget) is contention like a full
+                    // host — the job stays queued and retries a later tick as
+                    // running builds finish and free RAM (never an OOM).
                     report.contended.push(job.job_id.clone());
                 }
                 Ok(ClaimOutcome::NotQueued) => {}
@@ -917,6 +971,9 @@ mod tests {
             stale_after: Duration::from_secs(3600),
             complete_retry_base: Duration::from_millis(1),
             complete_retry_max: 50,
+            max_jobs: None,
+            min_disk_mb: 0,
+            disk_path: None,
         }
     }
 

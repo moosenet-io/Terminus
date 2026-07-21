@@ -293,6 +293,12 @@ pub enum ClaimOutcome {
     ModuleBusy,
     /// The target host is already at its concurrency cap.
     HostFull,
+    /// PCON-09: admitting this build would exceed the host's RAM budget
+    /// (`BUILD_CONCURRENCY_MAX_RAM_MB`) — the sum of the currently-building
+    /// jobs' peaks plus this job's peak is over budget. Retry a later tick as
+    /// running builds finish and free RAM (never an OOM). Only ever returned
+    /// when the RAM gate is enabled (`max_ram_mb > 0`).
+    BudgetFull,
     /// The call was REFUSED as malformed: the caller's `module` arg does not match
     /// the job's own stored module (a buggy call that must never take a foreign
     /// module lock — A2). The job is left untouched.
@@ -618,6 +624,7 @@ fn host_set_key(host: HostRole) -> String {
 /// ARGV: 1=candidate_id 2=prank 3=now 4=job_prefix 5=module 6=ref 7=prio_label
 ///       8=heavy 9=ready 10=held_ttl 11=bin(''=none) 12=force(0/1)
 ///       8=heavy(0/1) 9=ready(0/1) 10=held_ttl_secs 13=mode 14=resolved_sha(''=none)
+///       15=peak_mb (PCON-09: this module's resolved admission peak, MB)
 ///
 /// PCON-01/04 (S122 root-cause fix): `KEYS[1]` (the dedupe pointer) is ALREADY
 /// computed by the Rust caller from [`job_identity`] — i.e. `resolved_sha` when
@@ -719,7 +726,7 @@ if ready=='1' then state='queued' end
 redis.call('HSET', jk, 'module', ARGV[5], 'ref', ARGV[6], 'prank', prank,
   'priority', ARGV[7], 'heavy', heavy, 'seq', seq, 'requested_at', now,
   'coalesced', 1, 'state', state, 'bin', ARGV[11], 'force', force, 'mode', mode,
-  'resolved_sha', resolved_sha)
+  'resolved_sha', resolved_sha, 'peak_mb', ARGV[15])
 redis.call('SET', dedupe, id)
 if ready=='1' then
   local score=seq-(prank*1000000000000)
@@ -745,6 +752,7 @@ return {id, 1}
 /// Returns `{ok(0/1), token_or_reason}`.
 /// KEYS: 1=zset 2=jobhash 3=hostset
 /// ARGV: 1=id 2=cap 3=now 4=host 5=claim_token 6=modulelock_prefix 7=expected_module
+///       8=job_prefix 9=max_ram_mb(0=off) 10=default_peak_mb (PCON-09)
 const CLAIM_LUA: &str = r#"
 local st=redis.call('HGET', KEYS[2], 'state')
 if st~='queued' then return {0, 'not_queued'} end
@@ -763,6 +771,23 @@ if resolved_sha ~= '' then identity=resolved_sha end
 local lockkey=ARGV[6]..module..':'..identity
 if redis.call('EXISTS', lockkey)==1 then return {0, 'module_busy'} end
 if redis.call('SCARD', KEYS[3])>=tonumber(ARGV[2]) then return {0, 'host_full'} end
+-- PCON-09: RAM-budget admission. The host set (KEYS[3]) IS the live set of
+-- building jobs on this host; summing each member's stored peak_mb (+ this
+-- job's) and comparing to the budget bounds concurrent RAM without any
+-- separate accumulator — a job leaving the set (release/reconcile) frees its
+-- budget automatically. maxram==0 disables the gate (degrade-open / unset).
+local maxram=tonumber(ARGV[9]) or 0
+if maxram>0 then
+  local defpeak=tonumber(ARGV[10]) or 0
+  local jp=ARGV[8]
+  local total=tonumber(redis.call('HGET', KEYS[2], 'peak_mb') or defpeak) or defpeak
+  local members=redis.call('SMEMBERS', KEYS[3])
+  for i=1,#members do
+    local mp=tonumber(redis.call('HGET', jp..members[i], 'peak_mb') or defpeak) or defpeak
+    total=total+mp
+  end
+  if total>maxram then return {0, 'budget_full'} end
+end
 redis.call('ZREM', KEYS[1], ARGV[1])
 redis.call('HSET', KEYS[2], 'state', 'building', 'host', ARGV[4],
   'started_at', ARGV[3], 'claim_token', ARGV[5])
@@ -1068,11 +1093,17 @@ fn priority_from_rank(rank: i64) -> Priority {
 /// The durable Redis-backed queue (production).
 pub struct RedisQueue {
     backend: Arc<RedisBackend>,
+    /// PCON-09: the host RAM-admission budget, read once from env at
+    /// construction. `max_ram_mb == 0` (the default) leaves the RAM gate inert.
+    budget: crate::compiler::resource::ResourceBudget,
 }
 
 impl RedisQueue {
     pub fn new(backend: Arc<RedisBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            budget: crate::compiler::resource::ResourceBudget::from_env(),
+        }
     }
 
     /// Build from the shared process-global backend; `None` when Redis is not
@@ -1118,6 +1149,11 @@ impl QueueStore for RedisQueue {
         // the job hash so RELEASE/RECONCILE/CLAIM can re-derive `job_identity`
         // without a caller arg (A1).
         let resolved_sha = req.resolved_sha.clone().unwrap_or_default();
+        // PCON-09: resolve this module's admission peak (its configured
+        // BUILD_MODULE_PEAK_MB_<MODULE>, else the conservative default) once at
+        // enqueue and store it on the job hash, so `claim` can sum the peaks of
+        // the currently-building jobs to enforce the RAM budget atomically.
+        let peak_mb = self.budget.peak_for(&req.module).to_string();
         let script = redis::Script::new(ENQUEUE_LUA);
         let out: Result<(String, i64), ()> = self
             .backend
@@ -1140,6 +1176,7 @@ impl QueueStore for RedisQueue {
                     .arg(force)
                     .arg(mode)
                     .arg(resolved_sha)
+                    .arg(peak_mb)
                     .invoke_async::<_, (String, i64)>(&mut conn)
                     .await
             })
@@ -1202,6 +1239,13 @@ impl QueueStore for RedisQueue {
         let token = uuid::Uuid::new_v4().simple().to_string();
         let (lock_prefix, expected_module) = (module_lock_prefix(), module.to_string());
         let cap = cap.max(1) as i64;
+        // PCON-09: pass the job-hash prefix + the RAM budget so the atomic claim
+        // can sum the currently-building jobs' peaks against the cap.
+        let (jp, max_ram, default_peak) = (
+            job_prefix(),
+            self.budget.max_ram_mb as i64,
+            self.budget.default_peak_mb as i64,
+        );
         let script = redis::Script::new(CLAIM_LUA);
         let out: Result<(i64, String), ()> = self
             .backend
@@ -1217,6 +1261,9 @@ impl QueueStore for RedisQueue {
                     .arg(token)
                     .arg(lock_prefix)
                     .arg(expected_module)
+                    .arg(jp)
+                    .arg(max_ram)
+                    .arg(default_peak)
                     .invoke_async::<_, (i64, String)>(&mut conn)
                     .await
             })
@@ -1226,6 +1273,7 @@ impl QueueStore for RedisQueue {
             Ok((_, reason)) => Ok(match reason.as_str() {
                 "module_busy" => ClaimOutcome::ModuleBusy,
                 "host_full" => ClaimOutcome::HostFull,
+                "budget_full" => ClaimOutcome::BudgetFull,
                 "rejected" => ClaimOutcome::Rejected,
                 _ => ClaimOutcome::NotQueued,
             }),
@@ -1491,6 +1539,10 @@ pub(crate) mod fake {
         last_error: Option<String>,
         /// See [`JobRequest::resolved_sha`] / [`job_identity`].
         resolved_sha: Option<String>,
+        /// PCON-09: this module's resolved admission peak (MB), stored at enqueue
+        /// (mirrors the real job hash's `peak_mb`), summed by `claim` for the
+        /// RAM budget.
+        peak_mb: u64,
     }
 
     #[derive(Default)]
@@ -1503,6 +1555,9 @@ pub(crate) mod fake {
         // alone.
         module_lock: HashMap<String, String>,
         host_inflight: HashMap<&'static str, Vec<String>>,
+        /// PCON-09: the RAM-admission budget (unbounded by default — the RAM gate
+        /// is inert unless a test/operator sets a non-zero `max_ram_mb`).
+        budget: crate::compiler::resource::ResourceBudget,
         seq: i64,
         next_id: u64,
         next_token: u64,
@@ -1534,6 +1589,12 @@ pub(crate) mod fake {
         /// Simulate Redis going down for the degradation test.
         pub(crate) fn set_down(&self, down: bool) {
             self.state.lock().unwrap().down = down;
+        }
+
+        /// PCON-09: set the RAM-admission budget for a test (default is
+        /// unbounded, so the RAM gate is inert unless a test opts in).
+        pub(crate) fn set_budget(&self, budget: crate::compiler::resource::ResourceBudget) {
+            self.state.lock().unwrap().budget = budget;
         }
 
         /// Make the next `n` `release` calls fail as Unavailable (a completion-
@@ -1668,10 +1729,11 @@ pub(crate) mod fake {
                 j.force,
                 j.mode.clone(),
                 j.resolved_sha.clone(),
+                j.peak_mb,
             ),
             None => return,
         };
-        let (dmod, dref, dhost, dprank, dheavy, rerun, dbin, dforce, dmode, dsha) = done;
+        let (dmod, dref, dhost, dprank, dheavy, rerun, dbin, dforce, dmode, dsha, dpeak) = done;
         // PCON-01/04 (root-cause fix): derive the module lock + dedupe key from
         // `job_identity` (the resolved sha when known, else the raw ref) — the
         // SAME identity `enqueue` used to build the dedupe pointer and `claim`
@@ -1720,6 +1782,7 @@ pub(crate) mod fake {
                     last_requeue_reason: None,
                     last_error: None,
                     resolved_sha: dsha,
+                    peak_mb: dpeak,
                 },
             );
             s.dedupe.insert(dk, nid);
@@ -1815,6 +1878,8 @@ pub(crate) mod fake {
             let seq = s.seq;
             s.next_id += 1;
             let id = format!("job-{}", s.next_id);
+            // PCON-09: resolve + store the module's admission peak at enqueue.
+            let peak_mb = s.budget.peak_for(&req.module);
             s.jobs.insert(
                 id.clone(),
                 Job {
@@ -1836,6 +1901,7 @@ pub(crate) mod fake {
                     last_requeue_reason: None,
                     last_error: None,
                     resolved_sha: req.resolved_sha.clone(),
+                    peak_mb,
                 },
             );
             s.dedupe.insert(dk, id.clone());
@@ -1905,6 +1971,29 @@ pub(crate) mod fake {
             let live = s.host_inflight.get(host.as_str()).map(Vec::len).unwrap_or(0);
             if live as u32 >= cap.max(1) {
                 return Ok(ClaimOutcome::HostFull);
+            }
+            // PCON-09: RAM-budget admission (mirrors CLAIM_LUA). Sum the peaks of
+            // the jobs currently building on this host + this job's peak; reject
+            // if over budget. Inert when max_ram_mb == 0.
+            let budget = s.budget;
+            if budget.max_ram_mb > 0 {
+                let this_peak = s.jobs.get(job_id).map(|j| j.peak_mb).unwrap_or(0);
+                let building_peaks: Vec<u64> = s
+                    .host_inflight
+                    .get(host.as_str())
+                    .map(|ids| {
+                        ids.iter()
+                            .map(|id| s.jobs.get(id).map(|j| j.peak_mb).unwrap_or(budget.default_peak_mb))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !crate::compiler::resource::ram_admits(
+                    this_peak,
+                    building_peaks,
+                    budget.max_ram_mb,
+                ) {
+                    return Ok(ClaimOutcome::BudgetFull);
+                }
             }
             s.next_token += 1;
             let token = format!("tok-{}", s.next_token);
@@ -2179,6 +2268,88 @@ mod tests {
         match q.claim(id, module, host, cap).await.unwrap() {
             ClaimOutcome::Claimed { token } => token,
             other => panic!("expected Claimed, got {other:?}"),
+        }
+    }
+
+    // ── PCON-09: resource-aware admission (RAM budget) ───────────────────────
+
+    use crate::compiler::resource::ResourceBudget;
+
+    /// A budget with the RAM gate ON: `max_ram_mb` total, `default_peak_mb` per
+    /// module (no per-module env peak configured in these tests).
+    fn ram_budget(max_ram_mb: u64, default_peak_mb: u64) -> ResourceBudget {
+        ResourceBudget {
+            max_ram_mb,
+            max_jobs: 0,
+            min_disk_mb: 0,
+            default_peak_mb,
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_admits_two_different_shas_then_bounds_the_third() {
+        // 8192 MB budget, 4096 MB/job ⇒ exactly two concurrent; a third waits.
+        let q = InMemoryQueue::new();
+        q.set_budget(ram_budget(8192, 4096));
+        let a = q.enqueue(&req_with_sha("chord", "main", "sha-aaaaaa")).await.unwrap();
+        let b = q.enqueue(&req_with_sha("chord", "main", "sha-bbbbbb")).await.unwrap();
+        let c = q.enqueue(&req_with_sha("chord", "main", "sha-cccccc")).await.unwrap();
+        // Different SHAs of ONE module are NOT mutually excluded (PCON-04 lock is
+        // per-(module,sha)) — both admit within the RAM budget (host cap 4).
+        let _t1 = claim_ok(&q, &a.job_id, "chord", HostRole::Primary, 4).await;
+        let _t2 = claim_ok(&q, &b.job_id, "chord", HostRole::Primary, 4).await;
+        // The third exceeds the RAM budget (12288 > 8192) → BudgetFull, NOT
+        // ModuleBusy (it is not blocked by a module lock).
+        assert_eq!(
+            q.claim(&c.job_id, "chord", HostRole::Primary, 4).await.unwrap(),
+            ClaimOutcome::BudgetFull,
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_full_when_peak_exceeds_remaining_ram() {
+        // 6000 MB budget, 4096 MB/job ⇒ one fits, the second is over budget.
+        let q = InMemoryQueue::new();
+        q.set_budget(ram_budget(6000, 4096));
+        let a = q.enqueue(&req_with_sha("chord", "main", "sha-a")).await.unwrap();
+        let b = q.enqueue(&req_with_sha("chord", "main", "sha-b")).await.unwrap();
+        let _t = claim_ok(&q, &a.job_id, "chord", HostRole::Primary, 4).await;
+        // 4096 (building) + 4096 (this) = 8192 > 6000 → waits (never OOMs).
+        assert_eq!(
+            q.claim(&b.job_id, "chord", HostRole::Primary, 4).await.unwrap(),
+            ClaimOutcome::BudgetFull,
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_reconcile_frees_ram_budget() {
+        // A crashed build's budget is reclaimed by the reconcile backstop, so the
+        // waiting job can then admit.
+        let q = InMemoryQueue::new();
+        q.set_budget(ram_budget(6000, 4096));
+        let a = q.enqueue(&req_with_sha("chord", "main", "sha-a")).await.unwrap();
+        let b = q.enqueue(&req_with_sha("chord", "main", "sha-b")).await.unwrap();
+        let _t = claim_ok(&q, &a.job_id, "chord", HostRole::Primary, 4).await;
+        assert_eq!(
+            q.claim(&b.job_id, "chord", HostRole::Primary, 4).await.unwrap(),
+            ClaimOutcome::BudgetFull,
+        );
+        // Reconcile with a zero lease treats the in-flight job as crashed and
+        // requeues it, freeing its host slot (and thus its RAM budget).
+        let rep = q.reconcile(std::time::Duration::ZERO).await.unwrap();
+        assert!(rep.requeued.contains(&a.job_id));
+        // Now b admits (only its own 4096 <= 6000).
+        let _t2 = claim_ok(&q, &b.job_id, "chord", HostRole::Primary, 4).await;
+    }
+
+    #[tokio::test]
+    async fn unbounded_budget_admits_many_independent_shas() {
+        // The default (unbounded) budget never blocks on RAM.
+        let q = InMemoryQueue::new(); // default = ResourceBudget::unbounded()
+        for i in 0..5 {
+            let sha = format!("sha-{i}");
+            let e = q.enqueue(&req_with_sha("chord", "main", &sha)).await.unwrap();
+            let _t = claim_ok(&q, &e.job_id, "chord", HostRole::Primary, 16).await;
         }
     }
 
