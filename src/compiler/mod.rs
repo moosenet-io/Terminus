@@ -2257,6 +2257,46 @@ async fn run_test(
     Ok((status.success(), combined))
 }
 
+/// PCON-06: run the SAME `compiler_build` test-gate (`mode=test`) the pipeline's
+/// Stage 4 runs, on `git_ref` (the resolved SHA of a rebased PR head), and
+/// return the structured pass/fail verdict — so the merge queue can re-gate a
+/// rebased branch through the single build door (S9) instead of a second,
+/// hand-rolled build path.
+///
+/// - `Ok(true)`  — the gate PASSED (green): safe to merge the rebased head.
+/// - `Ok(false)` — the gate FAILED (red): a compile error or failing tests (a
+///   real gate verdict — `mode=test` returns a structured `passed:false`, not
+///   an `Err`, for a non-zero cargo exit). Do NOT merge.
+/// - `Err(_)`    — the gate could NOT be run at all (the build door is
+///   unreachable/misconfigured, a spawn failure, or the structured verdict was
+///   missing). The caller treats this as fail-safe: never merge on an `Err`,
+///   but distinguish it from a red verdict (it falls back to the pre-PCON-06
+///   `NotMergeable` bounce rather than reporting a red gate).
+///
+/// The gate never publishes an artifact and never flips a channel pointer
+/// (`mode=test` is a gate, not a release). `wait:true` blocks until the gate
+/// finishes; the CALLER bounds the total wait against the queue's budget (an
+/// outer timeout), so this function itself does not need a separate deadline.
+pub async fn run_merge_regate(module: &str, git_ref: &str) -> Result<bool, ToolError> {
+    let out = CompilerBuild
+        .execute_structured(serde_json::json!({
+            "module": module,
+            "ref": git_ref,
+            "mode": "test",
+            "wait": true,
+        }))
+        .await?;
+    out.structured
+        .as_ref()
+        .and_then(|s| s.get("passed"))
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            ToolError::Execution(
+                "compiler test-gate returned no structured 'passed' verdict".to_string(),
+            )
+        })
+}
+
 /// The `compiler_build` tool.
 struct CompilerBuild;
 

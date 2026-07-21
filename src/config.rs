@@ -1465,6 +1465,28 @@ pub fn gitea_merge_queue_min_delay_secs() -> u64 {
         .unwrap_or(8)
 }
 
+// ── PCON-06: in-slot rebase + re-gate (Bors / GitHub-merge-queue model) ──────
+
+/// PCON-06: whether the merge queue, on a stale-base (`NotMergeable`) condition,
+/// REBASES current `main` into the PR branch and fires a FRESH compiler
+/// test-gate on the rebased head INSIDE the critical section — merging only on
+/// a green re-gate — instead of bouncing "rebase current base and retry" to the
+/// caller (the pre-PCON-06 behavior). From `BUILD_MERGE_REGATE_ENABLED`
+/// (`"true"`/`"1"` ⇒ on, anything else ⇒ off); defaults to **on**, so where the
+/// compiler build door is reachable every merge is tested in its exact landing
+/// state and `main` stays always-green.
+///
+/// Turning it **off** (or the compiler door being unreachable at re-gate time)
+/// falls back to exactly today's `NotMergeable`-bounce — a fail-safe, never a
+/// blind merge and never an indefinitely-held slot. This is the operator kill
+/// switch for the re-gate behavior specifically; the queue's serialization,
+/// spacing, and stale-base guard are unaffected by it.
+pub fn build_merge_regate_enabled() -> bool {
+    env_nonempty("BUILD_MERGE_REGATE_ENABLED")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
