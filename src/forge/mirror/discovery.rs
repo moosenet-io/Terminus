@@ -187,7 +187,7 @@ pub(crate) async fn discover_public_remote(gitea_repo: &str) -> Option<String> {
 /// The HTTPS authority is isolated as the substring between `://` and the
 /// first `/`, `?`, or `#`, and the whole remote is REJECTED if that authority
 /// contains an `@` — i.e. any userinfo. This defeats the
-/// `https://github.com:<email>/<org>/<repo>.git` hijack, where per
+/// `https://github.com:<email>/<org>/<repo>.git` hijack, where per  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
 /// URL semantics the real host is `evil.example` and `github.com:443` is
 /// userinfo (a naive `split(':')` would wrongly read the host as
 /// `github.com`). Userinfo is never legitimate for our mirror remotes anyway —
@@ -196,9 +196,9 @@ pub(crate) async fn discover_public_remote(gitea_repo: &str) -> Option<String> {
 /// isolate-the-authority-before-splitting lesson as the DSN guard.
 ///
 /// For the scp form the host is the token between an optional trailing-most
-/// `user@` and the `:` (scp legitimately has `<email>:` — the `@` is
+/// `user@` and the `:` (scp legitimately has `<email>:` — the `@` is  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
 /// separating userinfo there, so we take the piece after the LAST `@`; a
-/// spoof like `<email>:o/r` correctly yields `evil.example`).
+/// spoof like `<email>:o/r` correctly yields `evil.example`).  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
 ///
 /// Returns `None` when the host or the two path segments can't be found, or
 /// when https userinfo is present — every parse failure is a hard "cannot
@@ -216,7 +216,7 @@ pub(crate) fn parse_github_remote(remote: &str) -> Option<(String, String, Strin
         let path = &rest[authority_end..];
         // FAIL-CLOSED: userinfo (anything before an '@' in the authority) is
         // never legitimate here — reject the whole remote rather than trust a
-        // host parsed around it. This blocks the `host:<email>`
+        // host parsed around it. This blocks the `host:<email>`  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
         // userinfo hijack.
         if authority.contains('@') {
             return None;
@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn parse_remote_scp_like_extracts_host_owner_repo() {
         assert_eq!(
-            parse_github_remote("<email>:moosenet-io/Terminus.git"),
+            parse_github_remote("<email>:moosenet-io/Terminus.git"),  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
             Some(("github.com".to_string(), "moosenet-io".to_string(), "Terminus".to_string()))
         );
     }
@@ -451,7 +451,7 @@ mod tests {
             Some(("evil.example".to_string(), "moosenet-io".to_string(), "Terminus".to_string()))
         );
         assert_eq!(
-            parse_github_remote("<email>:moosenet-io/Terminus.git"),
+            parse_github_remote("<email>:moosenet-io/Terminus.git"),  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
             Some(("evil.example".to_string(), "moosenet-io".to_string(), "Terminus".to_string()))
         );
     }
@@ -462,19 +462,19 @@ mod tests {
         // USERINFO (before the '@'). A naive split(':') would read the host as
         // `github.com`. Userinfo is never legitimate for our mirror remotes →
         // reject the whole remote (fail-closed), so verify can't be fooled.
-        assert_eq!(parse_github_remote("https://github.com:<email>/moosenet-io/Terminus.git"), None);
+        assert_eq!(parse_github_remote("https://github.com:<email>/moosenet-io/Terminus.git"), None);  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
         // …also without a port, and with a plain userinfo token.
-        assert_eq!(parse_github_remote("https://<email>/moosenet-io/Terminus.git"), None);
-        assert_eq!(parse_github_remote("https://user:<email>/moosenet-io/Terminus.git"), None);
+        assert_eq!(parse_github_remote("https://<email>/moosenet-io/Terminus.git"), None);  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
+        assert_eq!(parse_github_remote("https://user:<email>/moosenet-io/Terminus.git"), None);  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
     }
 
     #[test]
     fn parse_remote_scp_spoof_takes_host_after_last_at() {
-        // scp `<email>:o/r` → the true host is `evil.example`
+        // scp `<email>:o/r` → the true host is `evil.example`  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
         // (after the LAST '@'), NOT github.com — captured as such so verify
         // rejects it on the host mismatch.
         assert_eq!(
-            parse_github_remote("<email>:moosenet-io/Terminus.git"),
+            parse_github_remote("<email>:moosenet-io/Terminus.git"),  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
             Some(("evil.example".to_string(), "moosenet-io".to_string(), "Terminus".to_string()))
         );
     }
@@ -563,7 +563,7 @@ mod tests {
         }
         let ops = StubExists::ok(true);
         let https = verify_public_remote(&ops, "https://evil.example/moosenet-io/Terminus.git").await;
-        let scp = verify_public_remote(&ops, "<email>:moosenet-io/Terminus.git").await;
+        let scp = verify_public_remote(&ops, "<email>:moosenet-io/Terminus.git").await;  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
         unsafe {
             match had_org {
                 Some(v) => std::env::set_var(GITHUB_ORG_ENV, v),
@@ -581,7 +581,7 @@ mod tests {
     }
 
     /// THE codex RFC-3986 userinfo-hijack hole:
-    /// `https://github.com:<email>/moosenet-io/Terminus.git` — the
+    /// `https://github.com:<email>/moosenet-io/Terminus.git` — the  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
     /// REAL host is `evil.example` (github.com:443 is userinfo). The stub says
     /// moosenet-io/Terminus exists, so ONLY correct authority parsing (reject
     /// on userinfo) prevents a Verified→push to evil.example. Must be rejected.
@@ -597,9 +597,9 @@ mod tests {
         }
         let ops = StubExists::ok(true);
         let res =
-            verify_public_remote(&ops, "https://github.com:<email>/moosenet-io/Terminus.git").await;
+            verify_public_remote(&ops, "https://github.com:<email>/moosenet-io/Terminus.git").await;  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
         // scp analogue: true host after the last '@' is evil.example.
-        let scp = verify_public_remote(&ops, "<email>:moosenet-io/Terminus.git").await;
+        let scp = verify_public_remote(&ops, "<email>:moosenet-io/Terminus.git").await;  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
         unsafe {
             match had_org {
                 Some(v) => std::env::set_var(GITHUB_ORG_ENV, v),
@@ -631,7 +631,7 @@ mod tests {
         }
         let ops = StubExists::ok(true);
         let https = verify_public_remote(&ops, "https://github.com/moosenet-io/Muse.git").await;
-        let scp = verify_public_remote(&ops, "<email>:moosenet-io/Muse.git").await;
+        let scp = verify_public_remote(&ops, "<email>:moosenet-io/Muse.git").await;  // pii-test-fixture: RFC-3986 userinfo-hijack example/test using reserved evil.example domain, no real PII
         unsafe {
             match had_org {
                 Some(v) => std::env::set_var(GITHUB_ORG_ENV, v),

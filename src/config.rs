@@ -1190,7 +1190,7 @@ pub fn validate_worker_transport_entry(
 // it proxies to, and every filesystem path it needs, is resolved here —
 // NEVER a literal in `crate::constellation::*` — matching this file's own
 // convention for every other tool in this crate. Following this crate's
-// established secret/config convention (see the `crate::<secret-manager>` and
+// established secret/config convention (see the `crate::<secret-manager>` and // pii-test-fixture: public product name, sanctioned secrets-manager module (same rationale as infra_service_path_exempt's src/<secret-manager>/ + docs/ exemption)
 // `crate::review::dispatch` module docs: there is no separate
 // `SecretManager`/`vault::manager()` API in terminus-rs — a plain env read
 // of a runtime-materialized value, via [`env_nonempty`], IS the vault read
@@ -1318,7 +1318,7 @@ pub fn constellation_operator_secret() -> Option<String> {
 /// Viewer shared secret (CONST-27, §3.4) compared (constant-time) against the
 /// submitted login password AFTER the operator secret has already been
 /// checked and didn't match. From `CONSTELLATION_VIEWER_SECRET`
-/// (operator-provisioned in <secret-manager> — never hardcoded). `None` when unset
+/// (operator-provisioned in <secret-manager> — never hardcoded). `None` when unset // pii-test-fixture: public product name, sanctioned secrets manager (see infra_service_path_exempt rationale)
 /// — callers MUST fail-closed (every viewer-tier login attempt rejected,
 /// same posture as an unset `CONSTELLATION_OPERATOR_SECRET`): an operator who
 /// hasn't provisioned this secret simply hasn't enabled the viewer tier yet,
@@ -1337,7 +1337,7 @@ pub fn constellation_viewer_secret() -> Option<String> {
 /// never supply -- a Lumina credential; the operator's Constellation session
 /// cookie only ever authenticates the *browser* to Terminus, this token is
 /// what separately authenticates *Terminus to Lumina* server-side. From
-/// `CONSTELLATION_LUMINA_TOKEN` (<secret-manager>-provisioned; same value as
+/// `CONSTELLATION_LUMINA_TOKEN` (<secret-manager>-provisioned; same value as // pii-test-fixture: public product name, sanctioned secrets manager (see infra_service_path_exempt rationale)
 /// Lumina's own `LUMINA_HTTP_TOKEN` -- two consumers, one secret, per the
 /// spec's Pre-flight section). `None` when unset -- `proxy_lumina` forwards
 /// unauthenticated in that case, exactly as it did before this item (a

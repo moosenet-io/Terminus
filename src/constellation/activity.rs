@@ -369,7 +369,7 @@ mod tests {
         // FIELD NAME "principal" isn't itself secret-shaped.
         write_lines(
             &path,
-            &[r#"{"timestamp":"2026-07-19T00:00:00Z","system":"harmony","method":"POST","path":"/api/harmony/engine/stop","principal":"<REDACTED-SECRET>","body_summary":null}"#],
+            &[r#"{"timestamp":"2026-07-19T00:00:00Z","system":"harmony","method":"POST","path":"/api/harmony/engine/stop","principal":"<REDACTED-SECRET>","body_summary":null}"#],  // pii-test-fixture: synthetic ghp_-shaped token, masking-behavior test fixture
         );
         std::env::set_var("CONSTELLATION_AUDIT_LOG_PATH", &path);
         let router = router_with_signing_key();
@@ -377,8 +377,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let entries = body["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
-        assert_ne!(entries[0]["principal"], "<REDACTED-SECRET>");
-        assert!(!body.to_string().contains("<REDACTED-SECRET>"));
+        assert_ne!(entries[0]["principal"], "<REDACTED-SECRET>");  // pii-test-fixture: synthetic ghp_-shaped token, masking-behavior test fixture
+        assert!(!body.to_string().contains("<REDACTED-SECRET>"));  // pii-test-fixture: synthetic ghp_-shaped token, masking-behavior test fixture
         std::fs::remove_file(&path).ok();
         std::env::remove_var("CONSTELLATION_AUDIT_LOG_PATH");
         std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");

@@ -29,7 +29,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{json, Value};
 
@@ -43,19 +42,14 @@ use super::history::{
     IdentityMap, ReplayOpts,
 };
 use super::native_clean::DeterministicCleaner;
+use super::workdir::mirror_git;
 
-const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null"];
-
-/// Args for TOKENED transport (fetch/push/ls-remote): hooks off AND all ambient
-/// credential helpers disabled, so the token is supplied ONLY via GIT_ASKPASS and a
-/// global/system credential.helper can neither inject nor persist a credential from
-/// disk. (`credential.helper=` with an empty value resets the helper list to empty.)
-const TRANSPORT_ARGS: &[&str] = &[
-    "-c",
-    "core.hooksPath=/dev/null",
-    "-c",
-    "credential.helper=",
-];
+/// Extra `-c` args layered on top of [`GIT_BASE_CFG`] (via [`mirror_git`]) for
+/// TOKENED transport (fetch/push/ls-remote): all ambient credential helpers
+/// disabled, so the token is supplied ONLY via GIT_ASKPASS and a global/system
+/// credential.helper can neither inject nor persist a credential from disk.
+/// (`credential.helper=` with an empty value resets the helper list to empty.)
+const TRANSPORT_EXTRA: &[&str] = &["-c", "credential.helper="];
 
 /// Inputs for one PR replay.
 pub struct PrReplayConfig {
@@ -105,10 +99,7 @@ pub struct PrReplayOutcome {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Result<String, ToolError> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(HOOKS_OFF)
+    let out = mirror_git(cwd)
         .args(args)
         .output()
         .map_err(|e| ToolError::Execution(format!("git {args:?}: {e}")))?;
@@ -132,14 +123,8 @@ fn scrub_text(s: &str) -> String {
 /// Minimal GIT_ASKPASS helper echoing `$GIT_MIRROR_TOKEN` (no secret in the file).
 fn write_askpass() -> Result<(PathBuf, AskpassGuard), ToolError> {
     use std::io::Write;
-    let path = std::env::temp_dir().join(format!(
-        "ghist05-askpass-{}-{}.sh",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let path = std::env::temp_dir()
+        .join(format!("ghist05-askpass-{}.sh", super::unique_temp_suffix()));
     let mut f = std::fs::File::create(&path)
         .map_err(|e| ToolError::Execution(format!("create askpass: {e}")))?;
     f.write_all(b"#!/bin/sh\nprintf '%s\\n' \"$GIT_MIRROR_TOKEN\"\n")
@@ -167,10 +152,8 @@ impl Drop for AskpassGuard {
 /// GIT_ASKPASS only — never in argv, the URL, or on disk.
 fn git_transport(work_dir: &Path, args: &[&str], token: &str) -> Result<(), ToolError> {
     let (askpass, _guard) = write_askpass()?;
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(work_dir)
-        .args(TRANSPORT_ARGS)
+    let out = mirror_git(work_dir)
+        .args(TRANSPORT_EXTRA)
         .args(args)
         .env("GIT_ASKPASS", &askpass)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -203,10 +186,8 @@ fn fetch_public_main(work_dir: &Path, remote: &str, token: &str) -> Result<Strin
 /// than create a duplicate. ls-remote reads the public repo (no write).
 fn remote_branch_exists(work_dir: &Path, remote: &str, branch: &str, token: &str) -> Result<bool, ToolError> {
     let (askpass, _guard) = write_askpass()?;
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(work_dir)
-        .args(TRANSPORT_ARGS)
+    let out = mirror_git(work_dir)
+        .args(TRANSPORT_EXTRA)
         .args(["ls-remote", "--heads", "--", remote, &format!("refs/heads/{branch}")])
         .env("GIT_ASKPASS", &askpass)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -808,14 +789,7 @@ mod tests {
     use super::*;
 
     fn unique(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "ghist05-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+        std::env::temp_dir().join(format!("ghist05-{tag}-{}", super::super::unique_temp_suffix()))
     }
 
     fn bot_map() -> IdentityMap {
@@ -853,10 +827,7 @@ mod tests {
         std::fs::write(wd.join("a.txt"), b"x\n").unwrap();
         git(&wd, &["add", "-A"]).unwrap();
         // A commit (needs an identity) then a mirror-pr tag on it.
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&wd)
-            .args(HOOKS_OFF)
+        let out = mirror_git(&wd)
             .args(["-c", "user.name=T", "-c", "user.email=<email>", // pii-test-fixture
                    "commit", "-q", "-m", "seed"])
             .output()

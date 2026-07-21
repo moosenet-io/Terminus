@@ -2362,6 +2362,35 @@ mod tests {
         // CORTEX_RISK_SCORE_THRESHOLD/CORTEX_RISK_BAND_ELEVATED_CUT env
         // overrides (execute() calls `CortexConfig::from_env()` internally,
         // not the test's own `escalation_cfg`).
+        //
+        // Hermeticity (test-gate flake fix): this test needs BOTH the base
+        // panel provider (`opus`) and the escalated provider (`codex`) to be
+        // dispatchable (not capacity-paused) yet have the `codex` dispatch
+        // itself fail as "unavailable". Two ambient conditions previously
+        // broke that on the gate host and nowhere else:
+        //   1. `capacity::registry()` is a process-global singleton shared
+        //      with every other test in this binary (see the REVCAP-A
+        //      section below, which documents the same hazard). If an
+        //      earlier test left `opus`/`codex`/`agy` marked down/rate
+        //      limited (e.g. it panicked before its own cleanup ran), the
+        //      REVCAP-01 frontier-capacity gate can pause dispatch entirely
+        //      before either provider is even attempted, so `providers` come
+        //      back with fewer than 2 entries -- unrelated to the thing this
+        //      test actually exercises. Force all three FRONTIER providers
+        //      back to a known-good `mark_success` state up front, exactly
+        //      like the REVCAP-A tests do.
+        //   2. `remove_var("REVIEW_DAEMON_TOKEN")` only guarantees "no token"
+        //      if the ambient process env didn't already have a real one --
+        //      on the compiler-gate host, which also runs the review daemon,
+        //      it can. Don't rely on the token being absent: point
+        //      `REVIEW_DAEMON_URL` at a closed local port so the daemon
+        //      dispatch fails at the transport layer regardless of whether a
+        //      token happens to be configured, making "codex unavailable"
+        //      true unconditionally rather than incidentally.
+        capacity::registry().update("opus", |s| s.mark_success());
+        capacity::registry().update("codex", |s| s.mark_success());
+        capacity::registry().update("agy", |s| s.mark_success());
+
         let store_dir = std::env::temp_dir().join(format!("review-cxeg08-degraded-{}", std::process::id()));
         std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
         seed_tiny_graph("TERM", "src/a.rs");
@@ -2370,6 +2399,10 @@ mod tests {
         std::env::set_var("CORTEX_ESCALATION_ADD_PROVIDER", "codex");
         std::env::remove_var("REVIEW_DAEMON_TOKEN");
         std::env::remove_var("OPENROUTER_API_KEY");
+        // Guaranteed-unreachable: nothing listens on loopback port 1, so this
+        // fails fast (connection refused) rather than depending on ambient
+        // token state, and rather than risking a slow real-network timeout.
+        std::env::set_var("REVIEW_DAEMON_URL", "http://127.0.0.1:1");
 
         let args = json!({
             "structure": "panel_majority",
@@ -2384,7 +2417,7 @@ mod tests {
         assert_eq!(parsed["escalation"]["added_provider"], "codex", "{parsed}");
         assert_eq!(
             parsed["escalation"]["escalation_degraded"], true,
-            "codex has no REVIEW_DAEMON_TOKEN configured -- must degrade, not deadlock: {parsed}"
+            "codex must degrade (no token / unreachable daemon), not deadlock: {parsed}"
         );
         // No deadlock: the call still completed and returned both providers.
         assert_eq!(parsed["providers"].as_array().unwrap().len(), 2, "{parsed}");
@@ -2394,6 +2427,12 @@ mod tests {
         std::env::remove_var("CORTEX_RISK_SCORE_THRESHOLD");
         std::env::remove_var("CORTEX_RISK_BAND_ELEVATED_CUT");
         std::env::remove_var("CORTEX_ESCALATION_ADD_PROVIDER");
+        std::env::remove_var("REVIEW_DAEMON_URL");
+        // Leave the frontier providers in a known-good state for whichever
+        // test runs next (same discipline as the REVCAP-A section).
+        capacity::registry().update("opus", |s| s.mark_success());
+        capacity::registry().update("codex", |s| s.mark_success());
+        capacity::registry().update("agy", |s| s.mark_success());
     }
 
     // ── REVCAP-01 PART A: capacity gate + review_provider_status wiring ────

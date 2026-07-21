@@ -683,12 +683,22 @@ mod tests {
         dir
     }
 
+    /// Count this PROCESS's own leaked `ScratchClone` dirs under the shared
+    /// temp dir. Scoped to `std::process::id()` (the `slug` in
+    /// [`ScratchClone::create`] is `"{pid}-{nanos}"`) rather than matching the
+    /// bare `"terminus-cortex-audit-"` prefix — the compiler test-gate can run
+    /// this same crate's tests from multiple concurrent worktrees/builds
+    /// against a SHARED `/tmp`, and an unscoped prefix match would count a
+    /// concurrent, unrelated process's in-flight scratch dirs as if they were
+    /// this test's own leak, making the before/after equality assertion below
+    /// flaky under exactly that (real, observed) shared-build-host condition.
     fn count_scratch_dirs() -> usize {
+        let prefix = format!("terminus-cortex-audit-{}-", std::process::id());
         fs::read_dir(std::env::temp_dir())
             .map(|entries| {
                 entries
                     .flatten()
-                    .filter(|e| e.file_name().to_string_lossy().starts_with("terminus-cortex-audit-"))
+                    .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
                     .count()
             })
             .unwrap_or(0)

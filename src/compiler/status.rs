@@ -903,7 +903,7 @@ mod tests {
     fn marker_path_substitutes_module() {
         assert_eq!(
             marker_path("/opt/{module}/.deployed_sha", "chord"),
-            "<path>/.deployed_sha"
+            "<path>/.deployed_sha"  // pii-test-fixture: test fixture path, not real infra
         );
     }
 
@@ -953,7 +953,7 @@ mod tests {
 
     #[test]
     fn render_marker_read_argv_is_batchmode_nonmutating_and_guarded() {
-        let argv = render_marker_read_argv("deploy@host", "<path>/.deployed_sha", 8);
+        let argv = render_marker_read_argv("deploy@host", "<path>/.deployed_sha", 8);  // pii-test-fixture: test fixture path, not real infra
         assert_eq!(argv[0], "ssh");
         assert!(argv.iter().any(|a| a == "BatchMode=yes"));
         assert!(argv.iter().any(|a| a == "ConnectTimeout=8"));
@@ -970,13 +970,13 @@ mod tests {
         // exit reflects only connectivity; `cat --` guards an option-like path,
         // which is single-quoted.
         let remote = argv.last().unwrap();
-        assert!(remote.contains("cat -- '<path>/.deployed_sha'"), "{remote}");
+        assert!(remote.contains("cat -- '<path>/.deployed_sha'"), "{remote}");  // pii-test-fixture: test fixture path, not real infra
         assert!(remote.contains("|| true"), "{remote}");
     }
 
     #[test]
     fn shell_quote_neutralizes_metacharacters() {
-        assert_eq!(shell_quote("<path>/x"), "'<path>/x'");
+        assert_eq!(shell_quote("<path>/x"), "'<path>/x'");  // pii-test-fixture: test fixture path, not real infra
         // An embedded quote is escaped, so `; rm -rf` can't break out.
         assert_eq!(shell_quote("a'b; rm -rf /"), "'a'\\''b; rm -rf /'");
     }

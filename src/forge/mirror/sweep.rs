@@ -710,14 +710,8 @@ mod tests {
     }
 
     fn temp_tree(tag: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "ghmr02-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let base = std::env::temp_dir()
+            .join(format!("ghmr02-{tag}-{}", super::super::unique_temp_suffix()));
         std::fs::create_dir_all(&base).unwrap();
         base
     }

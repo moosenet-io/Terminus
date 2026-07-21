@@ -29,12 +29,7 @@ use crate::error::ToolError;
 use crate::github::pii::{ruleset_from_config, TreeViolation};
 
 use super::native_clean::DeterministicCleaner;
-use super::workdir::run_git;
-
-/// `core.hooksPath=/dev/null` before every git subcommand — the source repo and the
-/// fresh work-dir must never run a repo hook during replay (same posture as the rest
-/// of the mirror engine).
-const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null"];
+use super::workdir::{mirror_git, run_git};
 
 /// Outcome of a full-history replay (metrics only — no PII, no shas).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -155,10 +150,7 @@ impl IdentityMap {
 /// HEAD (nothing to clobber). Never used for a push and never on the source repo's
 /// work-tree.
 fn git_capture(cwd: &Path, args: &[&str]) -> Result<String, ToolError> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(HOOKS_OFF)
+    let out = mirror_git(cwd)
         .args(args)
         .output()
         .map_err(|e| ToolError::Execution(format!("git {args:?}: {e}")))?;
@@ -358,19 +350,13 @@ fn run_export_import(
         import_args.push(format!("--import-marks={import_marks}"));
     }
 
-    let mut exporter = Command::new("git")
-        .arg("-C")
-        .arg(source)
-        .args(HOOKS_OFF)
+    let mut exporter = mirror_git(source)
         .args(&export_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| ToolError::Execution(format!("spawn git fast-export: {e}")))?;
-    let mut importer = Command::new("git")
-        .arg("-C")
-        .arg(work_dir)
-        .args(HOOKS_OFF)
+    let mut importer = mirror_git(work_dir)
         .args(&import_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -448,10 +434,7 @@ pub fn replay_range(
         ));
     }
     // Ancestry guard: from must be an ancestor of to (fast-forward only).
-    let anc = Command::new("git")
-        .arg("-C")
-        .arg(source)
-        .args(HOOKS_OFF)
+    let anc = mirror_git(source)
         .args(["merge-base", "--is-ancestor", from_sha, to_sha])
         .status()
         .map_err(|e| ToolError::Execution(format!("merge-base: {e}")))?;
@@ -492,10 +475,7 @@ pub fn replay_range_bounded(
             "no backfill marks present — run replay_full_history before a bounded range".into(),
         ));
     }
-    let anc = Command::new("git")
-        .arg("-C")
-        .arg(source)
-        .args(HOOKS_OFF)
+    let anc = mirror_git(source)
         .args(["merge-base", "--is-ancestor", from_sha, to_sha])
         .status()
         .map_err(|e| ToolError::Execution(format!("merge-base: {e}")))?;
@@ -649,10 +629,7 @@ fn rebase_slice_onto(
     committer_name: &str,
     committer_email: &str,
 ) -> Result<(), ToolError> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(work_dir)
-        .args(HOOKS_OFF)
+    let out = mirror_git(work_dir)
         .env("GIT_COMMITTER_NAME", committer_name)
         .env("GIT_COMMITTER_EMAIL", committer_email)
         .args([
@@ -670,10 +647,7 @@ fn rebase_slice_onto(
         .output()
         .map_err(|e| ToolError::Execution(format!("spawn git rebase: {e}")))?;
     if !out.status.success() {
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(work_dir)
-            .args(HOOKS_OFF)
+        let _ = mirror_git(work_dir)
             .args(["rebase", "--abort"])
             .status();
         return Err(ToolError::Execution(format!(
@@ -917,10 +891,7 @@ fn gate_commit_list(work_dir: &Path, commits: &[String]) -> Result<FullHistoryGa
 fn extract_tree(repo: &Path, tree: &str, dest: &Path) -> Result<(), ToolError> {
     std::fs::create_dir_all(dest)
         .map_err(|e| ToolError::Execution(format!("create tree dir {}: {e}", dest.display())))?;
-    let mut archive = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(HOOKS_OFF)
+    let mut archive = mirror_git(repo)
         .args(["archive", "--format=tar", tree])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -953,17 +924,11 @@ fn extract_tree(repo: &Path, tree: &str, dest: &Path) -> Result<(), ToolError> {
     Ok(())
 }
 
-/// A process-unique temp dir path (no `Date`/`rand` — uses pid + monotonic-ish
-/// system time, unique enough for a serialized backfill).
+/// A process- and call-unique temp dir path (pid + nanos + an atomic sequence
+/// number — see [`super::unique_temp_suffix`] — so concurrent gate scans, in the
+/// same process or across processes sharing `/tmp`, never collide).
 fn temp_dir_unique(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ))
+    std::env::temp_dir().join(format!("{tag}-{}", super::unique_temp_suffix()))
 }
 
 /// What the NEXT `data <n>` block belongs to, set by the command line preceding it.
@@ -1084,14 +1049,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn unique(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "ghist01-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+        std::env::temp_dir().join(format!("ghist01-{tag}-{}", super::super::unique_temp_suffix()))
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
@@ -1115,10 +1073,7 @@ mod tests {
         let commit = |dir: &Path, msg: &str, date: &str| {
             git(dir, &["add", "-A"]);
             // Fixed author + date so the replay's date-preservation is checkable.
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(HOOKS_OFF)
+            let out = mirror_git(dir)
                 .args([
                     "-c",
                     "user.name=Src Author",
@@ -1211,10 +1166,7 @@ mod tests {
     /// Commit `dir` with a fixed identity (helper for the gate tests).
     fn commit_all(dir: &Path, msg: &str) {
         git(dir, &["add", "-A"]);
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(HOOKS_OFF)
+        let out = mirror_git(dir)
             .args([
                 "-c",
                 "user.name=Gate Test",
@@ -1266,10 +1218,7 @@ mod tests {
         // Simulate the PUBLIC main tip: a distinct commit with the SAME tree as the
         // canonical base (as a squash/merge of everything up to C1 would be).
         let pub_base = {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(&wd)
-                .args(HOOKS_OFF)
+            let out = mirror_git(&wd)
                 .args(["-c", "user.name=Pub", "-c", "user.email=<email>", // pii-test-fixture
                        "commit-tree", &base_tree, "-m", "public squash of C1"])
                 .env("GIT_COMMITTER_NAME", "Pub")
@@ -1286,8 +1235,7 @@ mod tests {
         assert_eq!(rep.commits, 2, "the slice has both feature commits: {rep:?}");
 
         // The PR branch is based on the public base (not the canonical lineage).
-        let is_anc = Command::new("git")
-            .arg("-C").arg(&wd).args(HOOKS_OFF)
+        let is_anc = mirror_git(&wd)
             .args(["merge-base", "--is-ancestor", &pub_base, "pr-mirror/7"])
             .status().unwrap().success();
         assert!(is_anc, "pr branch must descend from the public base");
@@ -1342,8 +1290,7 @@ mod tests {
         commit_all(&src, "C5 later");
 
         let pub_base = {
-            let out = Command::new("git")
-                .arg("-C").arg(&wd).args(HOOKS_OFF)
+            let out = mirror_git(&wd)
                 .args(["-c", "user.name=P", "-c", "user.email=<email>", // pii-test-fixture
                        "commit-tree", &base_tree, "-m", "public base"])
                 .env("GIT_COMMITTER_NAME", "P").env("GIT_COMMITTER_EMAIL", "<email>") // pii-test-fixture
@@ -1391,8 +1338,7 @@ mod tests {
         git(&src, &["checkout", "-q", "main"]);
         write(&src, "mainline.txt", b"mainline work\n");
         commit_all(&src, "mainline commit");
-        let out = Command::new("git")
-            .arg("-C").arg(&src).args(HOOKS_OFF)
+        let out = mirror_git(&src)
             .args(["-c", "user.name=M", "-c", "user.email=<email>", // pii-test-fixture
                    "merge", "--no-ff", "-m", "Merge pull request feat", "feat"])
             .output().unwrap();
@@ -1403,8 +1349,7 @@ mod tests {
 
         // Public base: distinct commit with the same tree as the canonical base.
         let pub_base = {
-            let out = Command::new("git")
-                .arg("-C").arg(&wd).args(HOOKS_OFF)
+            let out = mirror_git(&wd)
                 .args(["-c", "user.name=P", "-c", "user.email=<email>", // pii-test-fixture
                        "commit-tree", &base_tree, "-m", "public base"])
                 .env("GIT_COMMITTER_NAME", "P").env("GIT_COMMITTER_EMAIL", "<email>") // pii-test-fixture
@@ -1463,14 +1408,12 @@ mod tests {
         git(&src, &["init", "-q", "-b", "main"]);
         write(&src, "f.txt", b"clean content\n");
         // The MESSAGE (not the blob) carries an internal IP.
-        let out = Command::new("git")
-            .arg("-C").arg(&src).args(HOOKS_OFF)
+        let out = mirror_git(&src)
             .args(["-c", "user.name=A", "-c", "user.email=<email>", // pii-test-fixture
                    "add", "-A"])
             .output().unwrap();
         assert!(out.status.success());
-        let out = Command::new("git")
-            .arg("-C").arg(&src).args(HOOKS_OFF)
+        let out = mirror_git(&src)
             .args(["-c", "user.name=A", "-c", "user.email=<email>", // pii-test-fixture
                    "commit", "-q", "-m", "deploy to <internal-ip> tonight"]) // pii-test-fixture
             .output().unwrap();

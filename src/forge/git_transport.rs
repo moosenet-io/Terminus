@@ -532,7 +532,7 @@ mod tests {
                 "-c",
                 "user.name=t",
                 "-c",
-                "user.email=<email>",
+                "user.email=<email>", // pii-test-fixture: reserved .test TLD, synthetic git identity
                 "commit",
                 "-q",
                 "-m",

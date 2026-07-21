@@ -158,8 +158,8 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::nexus::register(registry);
     crate::plane::register(registry);
     // S115/PGT-01: pg_* Postgres tool suite — core registry only (Chord-served,
-    // never terminus_personal/<host>), matching `intake::register` and
-    // `model_fleet_catalog`'s S9 posture.
+    // never the terminus_personal federated/personal registry), matching
+    // `intake::register` and `model_fleet_catalog`'s S9 posture.
     crate::pg::register(registry);
     crate::relay::register(registry);
     crate::scribe::register(registry);

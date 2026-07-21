@@ -1204,11 +1204,8 @@ mod tests {
     /// the duration of `f` and cleaned up afterward. `#[serial]` on every
     /// caller of this helper avoids racing `SOURCE_ROOT_ENV` across tests.
     fn with_source_root<R>(setup: impl FnOnce(&Path), f: impl FnOnce() -> R) -> R {
-        let dir = std::env::temp_dir().join(format!(
-            "mirror-auto-discover-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let dir = std::env::temp_dir()
+            .join(format!("mirror-auto-discover-{}", super::super::unique_temp_suffix()));
         std::fs::create_dir_all(&dir).unwrap();
         setup(&dir);
         // SAFETY (test-only): callers are `#[serial]`.
@@ -1431,7 +1428,7 @@ mod tests {
     }
 
     /// THE codex RFC-3986 userinfo-hijack hole, at the funnel: an override
-    /// `https://github.com:<email>/…` (real host evil.example) whose
+    /// `https://github.com:<email>/…` (real host evil.example) whose // pii-test-fixture: RFC-3986 userinfo-hijack doc example, email-shaped false positive from "host:<email>"
     /// owner/repo WOULD pass repo_exists is Rejected — never reaches run_once,
     /// so internal code is never pushed to the attacker host.
     #[tokio::test]
@@ -1445,7 +1442,7 @@ mod tests {
             std::env::remove_var(super::super::discovery::GITHUB_HOST_ENV);
         }
         let verifier = MapExists::new(&[("Terminus", true)]);
-        let hijack = "https://github.com:<email>/moosenet-io/Terminus.git";
+        let hijack = "https://github.com:<email>/moosenet-io/Terminus.git"; // pii-test-fixture: userinfo-hijack test fixture, no real PII
         let res = resolve_and_verify_remote(&verifier, "Terminus", Some(hijack)).await;
         unsafe {
             match had_org {
