@@ -672,19 +672,28 @@ const DEFAULT_ROUTINE_TIMEOUT_SECS: u64 = 300;
 /// Mirrors `review_daemon::config::MAX_TIMEOUT_SECS` (the daemon rejects a
 /// larger `timeout_secs`); duplicated as a plain const to avoid a bin-crate dep.
 const DAEMON_MAX_TIMEOUT_SECS: u64 = 1800;
+/// Floor for the Medium-anchor base. Set no lower than the OLD hard-coded 120s
+/// (raising the backstop was the whole point of REVX-16, so a *lower* value is
+/// never wanted) AND high enough that the tier multipliers below never collapse
+/// two tiers into each other: at base 120 the tiers are 72/96/120/192/240 --
+/// still strictly monotonic. A base under this floor is clamped UP to it.
+const MIN_ROUTINE_TIMEOUT_SECS: u64 = 120;
 /// The HTTP client ceiling is always the wall-clock backstop plus this margin
 /// (the socket must outlive the daemon's own kill so we read its error body).
 const CLIENT_TIMEOUT_MARGIN_SECS: u64 = 30;
 
 /// The operator-tunable routine backstop (`REVIEW_ROUTINE_TIMEOUT_SECS`),
-/// defaulting to [`DEFAULT_ROUTINE_TIMEOUT_SECS`] and clamped to the daemon max.
+/// defaulting to [`DEFAULT_ROUTINE_TIMEOUT_SECS`] and clamped to
+/// `[MIN_ROUTINE_TIMEOUT_SECS, DAEMON_MAX_TIMEOUT_SECS]`. The lower clamp keeps
+/// the per-tier multipliers strictly monotonic for every valid base (a tiny
+/// value can't collapse Minimal/Low/Medium together).
 fn routine_timeout_secs() -> u64 {
     std::env::var("REVIEW_ROUTINE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_ROUTINE_TIMEOUT_SECS)
-        .min(DAEMON_MAX_TIMEOUT_SECS)
+        .clamp(MIN_ROUTINE_TIMEOUT_SECS, DAEMON_MAX_TIMEOUT_SECS)
 }
 
 /// REVX-16: the wall-clock backstop for a given effort tier. The routine base
@@ -695,6 +704,9 @@ fn routine_timeout_secs() -> u64 {
 /// must have *some* time) and clamped to the daemon max. At the 300s default:
 /// Minimal 180, Low 240, Medium 300, High 480, Xhigh 600.
 fn tier_backstop_secs(tier: EffortTier) -> u64 {
+    // `base` is clamped to >= MIN_ROUTINE_TIMEOUT_SECS (120), so the integer
+    // multipliers below stay strictly monotonic (72 < 96 < 120 < 192 < 240 at
+    // the floor) -- no tier can collapse into another.
     let base = routine_timeout_secs();
     let secs = match tier {
         EffortTier::Minimal => base * 3 / 5, // 0.6x
@@ -703,7 +715,7 @@ fn tier_backstop_secs(tier: EffortTier) -> u64 {
         EffortTier::High => base * 8 / 5,    // 1.6x
         EffortTier::Xhigh => base * 2,       // 2.0x
     };
-    secs.clamp(60, DAEMON_MAX_TIMEOUT_SECS)
+    secs.min(DAEMON_MAX_TIMEOUT_SECS)
 }
 
 impl DaemonOpts {
@@ -1082,10 +1094,23 @@ mod tests {
         assert_eq!(tier_backstop_secs(EffortTier::Medium), 500);
         assert_eq!(tier_backstop_secs(EffortTier::Xhigh), 1000);
         assert_eq!(tier_backstop_secs(EffortTier::Minimal), 300);
-        // Clamped to the daemon max.
+        // Clamped to the daemon max (base clamps to 1800, then Xhigh 2x re-clamps).
         std::env::set_var("REVIEW_ROUTINE_TIMEOUT_SECS", "999999");
         assert_eq!(tier_backstop_secs(EffortTier::Medium), DAEMON_MAX_TIMEOUT_SECS);
         assert_eq!(tier_backstop_secs(EffortTier::Xhigh), DAEMON_MAX_TIMEOUT_SECS);
+        // codex+free review finding: a TINY base must NOT collapse tiers to a
+        // floor -- the base is clamped up to MIN_ROUTINE_TIMEOUT_SECS so every
+        // tier stays STRICTLY monotonic even at the smallest valid base.
+        std::env::set_var("REVIEW_ROUTINE_TIMEOUT_SECS", "1");
+        let (mn, lo, md, hi, xh) = (
+            tier_backstop_secs(EffortTier::Minimal),
+            tier_backstop_secs(EffortTier::Low),
+            tier_backstop_secs(EffortTier::Medium),
+            tier_backstop_secs(EffortTier::High),
+            tier_backstop_secs(EffortTier::Xhigh),
+        );
+        assert!(mn < lo && lo < md && md < hi && hi < xh, "tiers must stay strictly monotonic at the floor: {mn} {lo} {md} {hi} {xh}");
+        assert_eq!(md, MIN_ROUTINE_TIMEOUT_SECS, "base floored to the minimum");
         std::env::remove_var("REVIEW_ROUTINE_TIMEOUT_SECS");
     }
 
