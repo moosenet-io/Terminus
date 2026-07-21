@@ -17,7 +17,9 @@ use std::time::Instant;
 use serde_json::{json, Value};
 
 use crate::error::ToolError;
+use crate::review::effort_policy::EffortTier;
 use crate::review::free_pool;
+use crate::review::paid_pool;
 
 /// nemotron's fixed, verified-live OpenRouter model tag. Upgraded from the
 /// nano-tier `nvidia/nemotron-nano-9b-v2:free` (real but not frontier-class)
@@ -115,8 +117,13 @@ impl ReviewConfig {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let openrouter_key = std::env::var("OPENROUTER_API_KEY")
+        // Operator directive (S121): the review daemon's OpenRouter spend (paid
+        // pool + gpt56 + any paid model) is isolated on the DEDICATED
+        // OPENROUTER_API_KEY_CHORDHARMONY key so review-provider cost is cleanly
+        // trackable; fall back to the shared OPENROUTER_API_KEY when it's absent.
+        let openrouter_key = std::env::var("OPENROUTER_API_KEY_CHORDHARMONY")
             .ok()
+            .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         Self { daemon_url, daemon_token, openrouter_key }
@@ -272,19 +279,34 @@ impl ReviewConfig {
     }
 
     /// Dispatch directly to OpenRouter's chat-completions endpoint.
-    pub async fn dispatch_openrouter(&self, model: &str, prompt: &str) -> Result<String, String> {
+    ///
+    /// REVX-10: `reasoning`, when `Some`, is injected as the top-level
+    /// `reasoning` object (see [`reasoning_for`] for how a caller picks the
+    /// right shape per model family). `None` reproduces the pre-REVX-10
+    /// request body byte-for-byte -- every pre-existing call site
+    /// (`free_pool`) keeps passing `None` and is unaffected.
+    pub async fn dispatch_openrouter(
+        &self,
+        model: &str,
+        prompt: &str,
+        reasoning: Option<Value>,
+    ) -> Result<String, String> {
         let Some(key) = &self.openrouter_key else {
             return Err("unavailable: OPENROUTER_API_KEY not configured".to_string());
         };
         let client = Self::client().map_err(|e| format!("unavailable: {e}"))?;
+        let mut body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": false,
+        });
+        if let Some(r) = reasoning {
+            body["reasoning"] = r;
+        }
         let resp = client
             .post(openrouter_chat_url())
             .bearer_auth(key)
-            .json(&json!({
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": false,
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|e| format!("unavailable: openrouter unreachable: {e}"))?;
@@ -401,11 +423,61 @@ impl ReviewConfig {
                     "unavailable: all free-tier models are rate-limited (cooling down)".to_string(),
                 );
             };
-            match self.dispatch_openrouter(&model, prompt).await {
+            match self.dispatch_openrouter(&model, prompt, None).await {
                 Ok(text) => return Ok(text),
                 Err(e) => {
                     // Only a rate-limit earns a cooldown; other per-model errors
                     // just rotate (the cursor already advanced) without penalty.
+                    if is_openrouter_rate_limited(&e) {
+                        pool.lock().await.mark_rate_limited(&model, Instant::now());
+                    }
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// REVX-09/10/11: dispatch the `paid` provider -- round-robin the
+    /// curated, config-listed PAID OpenRouter model pool ([`paid_pool`]),
+    /// with per-model 429-cooldown failover exactly like [`Self::dispatch_free_pool`].
+    /// Differs from the free pool in three ways: (1) gated behind the REVX-11
+    /// runtime toggle ([`paid_pool::is_enabled`]) -- disabled is checked
+    /// FIRST, before even looking at the key, so a disabled pool never makes
+    /// a network call; (2) every pooled model is PAID, so the existing
+    /// [`Self::guard_paid_model`] credit floor is checked once up front
+    /// (the balance doesn't vary by which pooled model is picked next); (3)
+    /// `tier`, when `Some`, is threaded into [`reasoning_for`] so each
+    /// dispatch carries the REVX-10 `reasoning` object driven by the
+    /// effort-policy tier.
+    pub async fn dispatch_paid_pool(&self, prompt: &str, tier: Option<EffortTier>) -> Result<String, String> {
+        if !paid_pool::is_enabled() {
+            return Err("unavailable: paid pool disabled".to_string());
+        }
+        if self.openrouter_key.is_none() {
+            return Err("unavailable: OPENROUTER_API_KEY not configured".to_string());
+        }
+        let models = paid_pool::configured_models();
+        if models.is_empty() {
+            return Err("unavailable: paid pool has no configured models".to_string());
+        }
+        // Every pooled model is paid (never a `:free` slug) -- the credit
+        // floor doesn't vary by which one gets picked, so check it once
+        // rather than per-attempt.
+        self.guard_paid_model(&models[0]).await?;
+
+        let pool = paid_pool::global_pool();
+        let attempts = models.len();
+        let mut last_err = "unavailable: paid pool produced no usable model".to_string();
+        for _ in 0..attempts {
+            let model = pool.lock().await.next_available(&models, Instant::now());
+            let Some(model) = model else {
+                return Err("unavailable: all paid pool models cooling down".to_string());
+            };
+            let reasoning = tier.map(|t| reasoning_for(&model, t));
+            match self.dispatch_openrouter(&model, prompt, reasoning).await {
+                Ok(text) => return Ok(text),
+                Err(e) => {
                     if is_openrouter_rate_limited(&e) {
                         pool.lock().await.mark_rate_limited(&model, Instant::now());
                     }
@@ -456,6 +528,26 @@ impl ReviewConfig {
             .await
             .map_err(|e| format!("malformed models response: {e}"))?;
         Ok(free_pool::curate(&body))
+    }
+}
+
+/// REVX-10: pick the OpenRouter `reasoning` object shape for `model` at
+/// `tier`. Gemini/Anthropic/Claude-family model ids (identified by a
+/// case-insensitive substring match on the id) take Anthropic/Gemini-style
+/// `{"max_tokens": N}` (>= 1024, per [`crate::review::effort_policy::tier_to_max_tokens`]);
+/// everything else (OpenAI/Kimi/DeepSeek/GLM/Qwen-family) takes OpenAI-style
+/// `{"effort": "<level>"}` (per
+/// [`crate::review::effort_policy::tier_to_openrouter_effort`]). A model that
+/// ignores the `reasoning` field entirely is harmless -- OpenRouter drops
+/// unknown params (per the spec's edge cases).
+pub fn reasoning_for(model: &str, tier: EffortTier) -> Value {
+    let lower = model.to_ascii_lowercase();
+    let is_max_tokens_style =
+        lower.contains("gemini") || lower.contains("anthropic") || lower.contains("claude");
+    if is_max_tokens_style {
+        json!({"max_tokens": crate::review::effort_policy::tier_to_max_tokens(tier)})
+    } else {
+        json!({"effort": crate::review::effort_policy::tier_to_openrouter_effort(tier)})
     }
 }
 
@@ -695,7 +787,7 @@ mod tests {
             daemon_token: None,
             openrouter_key: None,
         };
-        let err = cfg.dispatch_openrouter(NEMOTRON_MODEL, "x").await.unwrap_err();
+        let err = cfg.dispatch_openrouter(NEMOTRON_MODEL, "x", None).await.unwrap_err();
         assert!(err.contains("OPENROUTER_API_KEY"));
     }
 
@@ -972,6 +1064,7 @@ mod tests {
         p.set_models(models, Instant::now());
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     #[serial_test::serial]
     async fn free_pool_dispatch_rotates_past_a_429_to_the_next_model() {
@@ -1022,5 +1115,186 @@ mod tests {
         }
         let err = keyed_cfg().dispatch_free_pool("x").await.unwrap_err();
         assert!(err.contains("rate-limited (cooling down)"), "got: {err}");
+    }
+
+    // ── REVX-10: reasoning_for ────────────────────────────────────────────
+
+    #[test]
+    fn reasoning_for_gemini_and_anthropic_style_uses_max_tokens() {
+        let r = reasoning_for("google/gemini-2.5-pro", EffortTier::High);
+        assert_eq!(r["max_tokens"].as_u64(), Some(16384));
+        assert!(r.get("effort").is_none());
+
+        let r2 = reasoning_for("anthropic/claude-opus-4-8", EffortTier::Minimal);
+        assert!(r2["max_tokens"].as_u64().unwrap() >= 1024);
+    }
+
+    #[test]
+    fn reasoning_for_openai_kimi_deepseek_glm_style_uses_effort() {
+        let r = reasoning_for("moonshotai/kimi-k2-thinking", EffortTier::Medium);
+        assert_eq!(r["effort"].as_str(), Some("medium"));
+        assert!(r.get("max_tokens").is_none());
+
+        assert_eq!(reasoning_for("deepseek/deepseek-v3.2", EffortTier::High)["effort"].as_str(), Some("high"));
+        assert_eq!(reasoning_for("z-ai/glm-5", EffortTier::Low)["effort"].as_str(), Some("low"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn dispatch_openrouter_no_tier_omits_reasoning_field() {
+        let server = MockServer::start();
+        fn body_excludes_reasoning(req: &httpmock::prelude::HttpMockRequest) -> bool {
+            let body = req.body.as_deref().unwrap_or(&[]);
+            let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            v.get("reasoning").is_none()
+        }
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/chat/completions").matches(body_excludes_reasoning);
+            then.status(200)
+                .json_body(json!({"choices": [{"message": {"content": "ok\nVERDICT: APPROVE"}}]}));
+        });
+        std::env::set_var("OPENROUTER_CHAT_URL", format!("{}/api/v1/chat/completions", server.base_url()));
+        let cfg = keyed_cfg();
+        cfg.dispatch_openrouter(NEMOTRON_MODEL, "x", None).await.unwrap();
+        mock.assert();
+        std::env::remove_var("OPENROUTER_CHAT_URL");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn dispatch_openrouter_with_tier_includes_reasoning_object() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/chat/completions")
+                .json_body_partial(r#"{"reasoning": {"effort": "high"}}"#);
+            then.status(200)
+                .json_body(json!({"choices": [{"message": {"content": "ok\nVERDICT: APPROVE"}}]}));
+        });
+        std::env::set_var("OPENROUTER_CHAT_URL", format!("{}/api/v1/chat/completions", server.base_url()));
+        let cfg = keyed_cfg();
+        let reasoning = reasoning_for("moonshotai/kimi-k2-thinking", EffortTier::High);
+        cfg.dispatch_openrouter("moonshotai/kimi-k2-thinking", "x", Some(reasoning)).await.unwrap();
+        mock.assert();
+        std::env::remove_var("OPENROUTER_CHAT_URL");
+    }
+
+    // ── REVX-09/11: paid pool dispatch ──────────────────────────────────
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn paid_pool_dispatch_disabled_by_default_never_calls_network() {
+        paid_pool::set_enabled(false);
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: Some("test-key".to_string()),
+        };
+        let err = cfg.dispatch_paid_pool("x", None).await.unwrap_err();
+        assert!(err.contains("paid pool disabled"), "got: {err}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn paid_pool_dispatch_degrades_when_no_key_even_if_enabled() {
+        paid_pool::set_enabled(true);
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: None,
+        };
+        let err = cfg.dispatch_paid_pool("x", None).await.unwrap_err();
+        assert!(err.contains("OPENROUTER_API_KEY"), "got: {err}");
+        paid_pool::set_enabled(false);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn paid_pool_dispatch_below_credit_floor_refuses_without_dispatch() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/credits");
+            then.status(200).json_body(json!({"data": {"total_credits": 1.0, "total_usage": 0.99}}));
+        });
+        std::env::set_var("OPENROUTER_CREDITS_URL", format!("{}/api/v1/credits", server.base_url()));
+        paid_pool::set_enabled(true);
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: Some("test-key".to_string()),
+        };
+        let err = cfg.dispatch_paid_pool("x", None).await.unwrap_err();
+        assert!(err.contains("credits low"), "got: {err}");
+        paid_pool::set_enabled(false);
+        std::env::remove_var("OPENROUTER_CREDITS_URL");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn paid_pool_dispatch_rotates_past_a_429_to_the_next_model() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/credits");
+            then.status(200).json_body(json!({"data": {"total_credits": 100.0, "total_usage": 0.0}}));
+        });
+        server.mock(|when, then| {
+            when.method(POST).body_contains("model-a");
+            then.status(429).json_body(json!({"error": {"message": "Too Many Requests"}}));
+        });
+        server.mock(|when, then| {
+            when.method(POST).body_contains("model-b");
+            then.status(200)
+                .json_body(json!({"choices": [{"message": {"content": "looks fine\nVERDICT: APPROVE"}}]}));
+        });
+        std::env::set_var("OPENROUTER_CREDITS_URL", format!("{}/api/v1/credits", server.base_url()));
+        std::env::set_var("OPENROUTER_CHAT_URL", format!("{}/api/v1/chat/completions", server.base_url()));
+        std::env::set_var("REVIEW_PAID_POOL_MODELS", "openai/model-a,openai/model-b");
+        paid_pool::set_enabled(true);
+        {
+            let mut p = paid_pool::global_pool().lock().await;
+            *p = paid_pool::PaidPool::default();
+        }
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: Some("test-key".to_string()),
+        };
+        let out = cfg.dispatch_paid_pool("review", None).await.unwrap();
+        assert!(out.contains("VERDICT: APPROVE"), "should have failed over to model-b: {out}");
+        paid_pool::set_enabled(false);
+        std::env::remove_var("OPENROUTER_CREDITS_URL");
+        std::env::remove_var("OPENROUTER_CHAT_URL");
+        std::env::remove_var("REVIEW_PAID_POOL_MODELS");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn paid_pool_dispatch_all_cooling_returns_distinct_error() {
+        std::env::set_var("REVIEW_PAID_POOL_MODELS", "openai/model-c");
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/credits");
+            then.status(200).json_body(json!({"data": {"total_credits": 100.0, "total_usage": 0.0}}));
+        });
+        std::env::set_var("OPENROUTER_CREDITS_URL", format!("{}/api/v1/credits", server.base_url()));
+        paid_pool::set_enabled(true);
+        {
+            let mut p = paid_pool::global_pool().lock().await;
+            *p = paid_pool::PaidPool::default();
+            p.mark_rate_limited("openai/model-c", Instant::now());
+        }
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: Some("test-key".to_string()),
+        };
+        let err = cfg.dispatch_paid_pool("x", None).await.unwrap_err();
+        assert!(err.contains("cooling down"), "got: {err}");
+        paid_pool::set_enabled(false);
+        std::env::remove_var("OPENROUTER_CREDITS_URL");
+        std::env::remove_var("REVIEW_PAID_POOL_MODELS");
     }
 }

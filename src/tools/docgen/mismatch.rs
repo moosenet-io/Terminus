@@ -376,7 +376,7 @@ impl PanelDispatcher for RealPanelDispatcher {
         if is_daemon_provider(provider) {
             self.cfg.dispatch_daemon(provider, prompt, &crate::review::dispatch::DaemonOpts::routine()).await
         } else if let Some(model) = openrouter_model_for(provider) {
-            self.cfg.dispatch_openrouter(model, prompt).await
+            self.cfg.dispatch_openrouter(model, prompt, None).await
         } else {
             Err(format!("unavailable: unknown panel provider '{provider}'"))
         }
