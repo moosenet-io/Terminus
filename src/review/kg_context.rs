@@ -471,6 +471,34 @@ diff --git a/deleted.rs b/deleted.rs\n\
     }
 
     #[test]
+    fn pcon11_three_dot_diff_excludes_main_only_files() {
+        // PCON-11: with `main` advanced past the branch point, a THREE-dot
+        // `merge-base(main,branch)..branch` diff contains ONLY the branch's own
+        // changes, so `derive_changed_files` yields only the branch's files. A
+        // two-dot `main..branch` diff would ALSO carry every file `main` gained
+        // since the branch point — this test pins the correct (three-dot) set and
+        // shows the polluted (two-dot) set would differ.
+        let branch_only = "--- a/src/branch_feature.rs\n\
+                           +++ b/src/branch_feature.rs\n\
+                           @@ -1 +1 @@\n-old\n+new\n";
+        let three_dot = derive_changed_files(&json!({ "diff": branch_only }));
+        assert_eq!(three_dot, vec!["src/branch_feature.rs".to_string()]);
+        assert!(!three_dot.iter().any(|f| f.contains("main_only")));
+
+        // A two-dot diff would additionally include a file main gained since the
+        // branch point — proving the basis matters for the derived set.
+        let polluted = format!(
+            "{branch_only}--- a/src/main_only.rs\n+++ b/src/main_only.rs\n@@ -1 +1 @@\n-x\n+y\n"
+        );
+        let two_dot = derive_changed_files(&json!({ "diff": polluted }));
+        assert!(
+            two_dot.iter().any(|f| f == "src/main_only.rs"),
+            "a two-dot diff pollutes the changed set with main-only files: {two_dot:?}"
+        );
+        assert!(two_dot.len() > three_dot.len());
+    }
+
+    #[test]
     #[serial_test::serial]
     fn build_kg_block_names_touched_symbol_and_neighbor() {
         let store_dir = tmp_store("block");
