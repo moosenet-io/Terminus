@@ -957,17 +957,11 @@ fn extract_tree(repo: &Path, tree: &str, dest: &Path) -> Result<(), ToolError> {
     Ok(())
 }
 
-/// A process-unique temp dir path (no `Date`/`rand` — uses pid + monotonic-ish
-/// system time, unique enough for a serialized backfill).
+/// A process- and call-unique temp dir path (pid + nanos + an atomic sequence
+/// number — see [`super::unique_temp_suffix`] — so concurrent gate scans, in the
+/// same process or across processes sharing `/tmp`, never collide).
 fn temp_dir_unique(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ))
+    std::env::temp_dir().join(format!("{tag}-{}", super::unique_temp_suffix()))
 }
 
 /// What the NEXT `data <n>` block belongs to, set by the command line preceding it.
@@ -1088,14 +1082,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn unique(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "ghist01-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+        std::env::temp_dir().join(format!("ghist01-{tag}-{}", super::super::unique_temp_suffix()))
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {

@@ -132,14 +132,8 @@ fn scrub_text(s: &str) -> String {
 /// Minimal GIT_ASKPASS helper echoing `$GIT_MIRROR_TOKEN` (no secret in the file).
 fn write_askpass() -> Result<(PathBuf, AskpassGuard), ToolError> {
     use std::io::Write;
-    let path = std::env::temp_dir().join(format!(
-        "ghist05-askpass-{}-{}.sh",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let path = std::env::temp_dir()
+        .join(format!("ghist05-askpass-{}.sh", super::unique_temp_suffix()));
     let mut f = std::fs::File::create(&path)
         .map_err(|e| ToolError::Execution(format!("create askpass: {e}")))?;
     f.write_all(b"#!/bin/sh\nprintf '%s\\n' \"$GIT_MIRROR_TOKEN\"\n")
@@ -808,14 +802,7 @@ mod tests {
     use super::*;
 
     fn unique(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "ghist05-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+        std::env::temp_dir().join(format!("ghist05-{tag}-{}", super::super::unique_temp_suffix()))
     }
 
     fn bot_map() -> IdentityMap {

@@ -1013,14 +1013,7 @@ fn perform_ff_push(
 /// / on disk) rather than reinventing it.
 pub(crate) fn write_askpass_script() -> Result<AskpassScript, ToolError> {
     let dir = std::env::temp_dir();
-    let path = dir.join(format!(
-        "ghmr04-askpass-{}-{}.sh",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let path = dir.join(format!("ghmr04-askpass-{}.sh", super::unique_temp_suffix()));
     let mut f = std::fs::File::create(&path)
         .map_err(|e| ToolError::Execution(format!("failed creating askpass script: {e}")))?;
     // Echo the token for whatever git prompts (username or password); GitHub
@@ -2210,14 +2203,7 @@ mod tests {
     // ── local git repo fixtures (mirror the GHMR-03 test helpers) ────────────
 
     fn unique(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "ghmr04-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+        std::env::temp_dir().join(format!("ghmr04-{tag}-{}", super::super::unique_temp_suffix()))
     }
 
     fn write_file(dir: &Path, rel: &str, content: &str) {

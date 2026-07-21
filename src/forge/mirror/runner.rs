@@ -1204,11 +1204,8 @@ mod tests {
     /// the duration of `f` and cleaned up afterward. `#[serial]` on every
     /// caller of this helper avoids racing `SOURCE_ROOT_ENV` across tests.
     fn with_source_root<R>(setup: impl FnOnce(&Path), f: impl FnOnce() -> R) -> R {
-        let dir = std::env::temp_dir().join(format!(
-            "mirror-auto-discover-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let dir = std::env::temp_dir()
+            .join(format!("mirror-auto-discover-{}", super::super::unique_temp_suffix()));
         std::fs::create_dir_all(&dir).unwrap();
         setup(&dir);
         // SAFETY (test-only): callers are `#[serial]`.

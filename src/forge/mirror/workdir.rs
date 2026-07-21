@@ -734,14 +734,7 @@ mod tests {
     use std::io::Write;
 
     fn unique(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "ghmr03-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+        std::env::temp_dir().join(format!("ghmr03-{tag}-{}", super::super::unique_temp_suffix()))
     }
 
     fn write_file(dir: &Path, rel: &str, content: &str) {
