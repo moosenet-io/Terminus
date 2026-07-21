@@ -1064,6 +1064,7 @@ mod tests {
         p.set_models(models, Instant::now());
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     #[serial_test::serial]
     async fn free_pool_dispatch_rotates_past_a_429_to_the_next_model() {
@@ -1138,6 +1139,7 @@ mod tests {
         assert_eq!(reasoning_for("z-ai/glm-5", EffortTier::Low)["effort"].as_str(), Some("low"));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn dispatch_openrouter_no_tier_omits_reasoning_field() {
         let server = MockServer::start();
@@ -1158,6 +1160,7 @@ mod tests {
         std::env::remove_var("OPENROUTER_CHAT_URL");
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn dispatch_openrouter_with_tier_includes_reasoning_object() {
         let server = MockServer::start();
@@ -1205,6 +1208,7 @@ mod tests {
         paid_pool::set_enabled(false);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     #[serial_test::serial]
     async fn paid_pool_dispatch_below_credit_floor_refuses_without_dispatch() {
@@ -1226,6 +1230,7 @@ mod tests {
         std::env::remove_var("OPENROUTER_CREDITS_URL");
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     #[serial_test::serial]
     async fn paid_pool_dispatch_rotates_past_a_429_to_the_next_model() {
@@ -1264,6 +1269,7 @@ mod tests {
         std::env::remove_var("REVIEW_PAID_POOL_MODELS");
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     #[serial_test::serial]
     async fn paid_pool_dispatch_all_cooling_returns_distinct_error() {
