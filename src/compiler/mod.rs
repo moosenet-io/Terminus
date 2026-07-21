@@ -576,10 +576,19 @@ fn check_built_sha_sidecar(
     expected_identity: &str,
     strict: bool,
 ) -> Result<Option<String>, ToolError> {
+    // EXACT comparison (trim only — no case folding): a resolved sha is
+    // ALREADY canonically lowercase by construction (`resolve_ref_to_sha`
+    // lowercases it before it ever becomes `stage_key`/`expected_identity`,
+    // and `autostage_source` writes the sidecar from that same value), but
+    // the RAW-REF fallback identity (`BUILD_STAGE_BY_SHA=off`, or any future
+    // non-strict caller) is a git branch/tag name — those ARE case-sensitive
+    // (`Foo` and `foo` are different refs). Lowercasing here would let a
+    // lowercase `foo` request silently accept an on-disk `Foo` stage — a
+    // wrong-tree acceptance this check exists to prevent.
     let sidecar_path = local_source_dir.join(BUILT_SHA_SIDECAR);
     let on_disk = std::fs::read_to_string(&sidecar_path)
         .ok()
-        .map(|s| s.trim().to_lowercase());
+        .map(|s| s.trim().to_string());
     match on_disk {
         Some(got) if got == expected_identity => Ok(Some(got)),
         Some(got) => Err(ToolError::Execution(format!(
@@ -644,7 +653,14 @@ async fn remote_sidecar_sha_best_effort(
     )
     .await
     .ok()?;
-    let sha = out.trim().to_lowercase();
+    // EXACT (trim only) — a resolved sha is already canonically lowercase by
+    // construction; see `check_built_sha_sidecar`'s doc for why this function
+    // family never case-folds. This is a best-effort REUSE probe only (the
+    // strict, error-propagating comparison happens unconditionally at the
+    // call site regardless of what this returns), so under-matching here is
+    // safe — it just means a legitimate reuse gets re-transferred instead of
+    // skipped, never a wrong-tree acceptance.
+    let sha = out.trim().to_string();
     if sha.is_empty() {
         None
     } else {
@@ -3152,7 +3168,14 @@ impl CompilerBuild {
                          operator should verify and remove it manually"
                     ))
                 })?;
-                let got = remote_sidecar.trim().to_lowercase();
+                // EXACT (trim only, no case folding) — mirrors the local
+                // `check_built_sha_sidecar` fix: `sha` is already canonically
+                // lowercase (from `resolve_ref_to_sha`), and the remote
+                // sidecar was rsync'd verbatim from the local one written from
+                // that same value, so no normalization should be needed for a
+                // genuine match — folding case here would paper over exactly
+                // the class of mismatch this check exists to catch.
+                let got = remote_sidecar.trim().to_string();
                 if &got != sha {
                     return Err(ToolError::Execution(format!(
                         "compiler: built-SHA integrity check FAILED for {module} on the heavy \
@@ -6957,13 +6980,43 @@ mod tests {
     }
 
     #[test]
-    fn check_built_sha_sidecar_is_case_insensitive_and_trims_whitespace() {
+    fn check_built_sha_sidecar_trims_surrounding_whitespace() {
+        // Whitespace-trim behavior is kept — only case-folding was removed.
         let dir = tempfile::tempdir().unwrap();
         let sha = "b".repeat(40);
-        std::fs::write(dir.path().join(BUILT_SHA_SIDECAR), format!("  {} \n", sha.to_uppercase()))
-            .unwrap();
+        std::fs::write(dir.path().join(BUILT_SHA_SIDECAR), format!("  {sha} \n")).unwrap();
         let got = check_built_sha_sidecar(dir.path(), "terminus", &sha, true).unwrap();
         assert_eq!(got, Some(sha));
+    }
+
+    #[test]
+    fn check_built_sha_sidecar_is_case_sensitive_uppercase_sha_is_a_mismatch() {
+        // FINDING (review, HIGH): the on-disk sidecar was previously
+        // lowercased before comparison while `expected_identity` was not
+        // normalized at all — an uppercase-written sidecar would silently
+        // ACCEPT a lowercase request (a wrong-tree acceptance for any caller
+        // whose identity carries mixed case, e.g. the raw-ref fallback path).
+        // Comparison is now EXACT (trim only) — an uppercase sidecar must be
+        // treated as belonging to a DIFFERENT identity than the canonically
+        // lowercase resolved sha it's compared against.
+        let dir = tempfile::tempdir().unwrap();
+        let sha = "b".repeat(40);
+        std::fs::write(dir.path().join(BUILT_SHA_SIDECAR), sha.to_uppercase()).unwrap();
+        let err = check_built_sha_sidecar(dir.path(), "terminus", &sha, true).unwrap_err();
+        assert!(err.to_string().contains(&sha.to_uppercase()));
+    }
+
+    #[test]
+    fn check_built_sha_sidecar_raw_ref_identity_is_case_sensitive() {
+        // The raw-ref fallback identity (BUILD_STAGE_BY_SHA=off, non-strict)
+        // is a git branch/tag name — `Foo` and `foo` are DIFFERENT refs. A
+        // sidecar recording `Foo` must be rejected for a request for `foo`,
+        // never silently accepted as a case-insensitive match.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(BUILT_SHA_SIDECAR), "Foo").unwrap();
+        let err = check_built_sha_sidecar(dir.path(), "terminus", "foo", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("\"Foo\"") && msg.contains("\"foo\""), "{msg}");
     }
 
     #[test]
