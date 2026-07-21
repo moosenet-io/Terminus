@@ -176,6 +176,13 @@ impl ReviewConfig {
         if let Some(effort) = &opts.reasoning_effort {
             req_body["reasoning_effort"] = json!(effort);
         }
+        // REVX-07/08: an explicit provider-native model override (currently
+        // only meaningful for `codex`'s dynamic GPT-5.6 tier selection --
+        // sol/terra/luna). `None` on every pre-REVX-07 call site, so a
+        // dispatch that never sets `model` is byte-for-byte unchanged.
+        if let Some(model) = &opts.model {
+            req_body["model"] = json!(model);
+        }
         let resp = client
             .post(&url)
             .bearer_auth(token)
@@ -536,6 +543,15 @@ pub struct DaemonOpts {
     /// makes opus enter an agentic tool-loop and never emit a `VERDICT:` line
     /// (proven live), so [`Self::intensive`] deliberately keeps `explore: false`.
     pub reasoning_effort: Option<String>,
+    /// REVX-07/08: an explicit provider-native model override -- currently
+    /// only meaningful for `codex` (its dynamic GPT-5.6 sol/terra/luna tier
+    /// selection; see `effort_policy::codex_model_for_tier`). `None` on
+    /// every pre-REVX-07 preset ([`Self::routine`], [`Self::epic`],
+    /// [`Self::intensive`]) -- omitted from the wire body entirely, so those
+    /// dispatches stay byte-for-byte unchanged; the daemon then falls back
+    /// to its own fixed default. Ignored by every provider that has no
+    /// model-override knob (opus/agy/fable).
+    pub model: Option<String>,
 }
 
 impl DaemonOpts {
@@ -548,6 +564,7 @@ impl DaemonOpts {
             stall_secs: None,
             repo_path: None,
             reasoning_effort: None,
+            model: None,
         }
     }
 
@@ -560,6 +577,7 @@ impl DaemonOpts {
             stall_secs: Some(180),
             repo_path,
             reasoning_effort: None,
+            model: None,
         }
     }
 
@@ -582,7 +600,39 @@ impl DaemonOpts {
             stall_secs: Some(240),
             repo_path: None,
             reasoning_effort: Some(INTENSIVE_REASONING_EFFORT.to_string()),
+            model: None,
         }
+    }
+
+    /// REVX-14: generalizes [`Self::intensive`] -- an intensive-substitute
+    /// dispatch whose effort is the EFFORT-POLICY tier (already floored at
+    /// `max(policy, High)` by `effort_policy::decide`'s `intensive_floor`
+    /// argument) rather than the fixed [`INTENSIVE_REASONING_EFFORT`]
+    /// constant, plus an optional provider-native model override (codex's
+    /// dynamic GPT-5.6 tier). Keeps the same timeout/stall shape as
+    /// [`Self::intensive`] -- only the effort/model strings are
+    /// policy-driven now.
+    pub fn intensive_with(native_effort: Option<String>, model: Option<String>) -> Self {
+        Self {
+            timeout_secs: 900,
+            client_timeout_secs: 950,
+            explore: false,
+            stall_secs: Some(240),
+            repo_path: None,
+            reasoning_effort: native_effort,
+            model,
+        }
+    }
+
+    /// REVX-14: apply a policy-computed native effort string + optional
+    /// model override onto an existing preset (`routine()`/`epic()`), without
+    /// otherwise touching its timeout/explore/stall shape. `native_effort:
+    /// None` clears any effort override (policy disabled or the provider has
+    /// no native reasoning control) -- reproduces the preset byte-for-byte.
+    pub fn with_effort(mut self, native_effort: Option<String>, model: Option<String>) -> Self {
+        self.reasoning_effort = native_effort;
+        self.model = model;
+        self
     }
 }
 

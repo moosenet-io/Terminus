@@ -70,8 +70,16 @@ const FABLE_MODEL: &str = "claude-fable-5";
 /// (the daemon has no stdin), WITHOUT `--dangerously-skip-permissions` (which the
 /// claude CLI refuses to run as root anyway).
 const EXPLORE_TOOLS: &[&str] = &["Read", "Grep", "Glob", "LS"];
-/// Codex CLI model for the "codex" provider slot.
-const CODEX_MODEL: &str = "gpt-5.5";
+/// Codex CLI model for the "codex" provider slot. REVX-08: bumped off
+/// `gpt-5.5` onto the GPT-5.6 line's flagship (`sol`), superseding the
+/// retired v3.17 "do NOT bump codex off gpt-5.5" note -- codex CLI 0.144.1
+/// LIVE-VALIDATED (S121) all three GPT-5.6 variants (sol/terra/luna) under
+/// Plus-plan `codex login` auth. This is the FALLBACK default used only when
+/// no per-request model override survives [`config::clamp_codex_model`] (see
+/// [`build_command`]'s `model_override` parameter) -- REVX-07's effort
+/// policy normally supplies sol/terra/luna DYNAMICALLY per tier via
+/// `effort_policy::codex_model_for_tier`.
+const CODEX_MODEL: &str = "gpt-5.6-sol";
 /// agy (Antigravity CLI) model for the "agy" provider slot.
 const AGY_MODEL: &str = "gemini-3.1-pro";
 
@@ -119,10 +127,29 @@ pub fn build_command(
     explore: bool,
     reasoning_effort: Option<&str>,
 ) -> BuiltCommand {
+    build_command_with_model(provider, prompt, explore, reasoning_effort, None)
+}
+
+/// REVX-07/08: like [`build_command`], but additionally accepts a codex
+/// model-id override (currently the only provider with a dynamic model
+/// knob). `model_override` MUST already have passed
+/// [`super::config::clamp_codex_model`]'s closed-allowlist check by the time
+/// it reaches here -- this function does not itself re-validate it, mirroring
+/// how `reasoning_effort` arrives pre-clamped by `config::clamp_reasoning_effort_for`.
+/// `None` (or any provider other than `Codex`) reproduces [`build_command`]'s
+/// existing fixed-`CODEX_MODEL` behavior exactly.
+pub fn build_command_with_model(
+    provider: Provider,
+    prompt: &str,
+    explore: bool,
+    reasoning_effort: Option<&str>,
+    model_override: Option<&str>,
+) -> BuiltCommand {
     match provider {
         Provider::Opus => claude_command(OPUS_MODEL, prompt, explore, reasoning_effort),
         Provider::Fable => claude_command(FABLE_MODEL, prompt, explore, reasoning_effort),
         Provider::Codex => {
+            let model = model_override.unwrap_or(CODEX_MODEL);
             let output_path = std::env::temp_dir()
                 .join(format!("review-daemon-codex-{}.txt", Uuid::new_v4()))
                 .to_string_lossy()
@@ -131,7 +158,7 @@ pub fn build_command(
                 "exec".into(),
                 "--skip-git-repo-check".into(),
                 "--sandbox".into(), "read-only".into(),
-                "-m".into(), CODEX_MODEL.into(),
+                "-m".into(), model.to_string(),
             ];
             // REVCAP-01 PART B: only appended for an intensive-substitute dispatch
             // -- a routine/epic codex call (`reasoning_effort: None`) produces the
@@ -410,6 +437,30 @@ mod tests {
             "agy has no effort knob and must ignore the parameter: {:?}",
             cmd.args
         );
+    }
+
+    // ── REVX-07/08: dynamic codex model override ────────────────────────
+
+    #[test]
+    fn codex_defaults_to_the_sol_tier_when_no_override() {
+        let cmd = build_command(Provider::Codex, "x", false, None);
+        assert!(cmd.args.windows(2).any(|w| w[0] == "-m" && w[1] == "gpt-5.6-sol"));
+        assert_eq!(CODEX_MODEL, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn codex_model_override_replaces_the_default() {
+        let cmd = build_command_with_model(Provider::Codex, "x", false, None, Some("gpt-5.6-luna"));
+        assert!(cmd.args.windows(2).any(|w| w[0] == "-m" && w[1] == "gpt-5.6-luna"));
+        assert!(!cmd.args.windows(2).any(|w| w[0] == "-m" && w[1] == "gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn non_codex_providers_ignore_the_model_override_param() {
+        // Opus/Fable/Agy have no model-override knob; passing one must be a
+        // silent no-op, never an error or an unexpected argv element.
+        let cmd = build_command_with_model(Provider::Opus, "x", false, None, Some("gpt-5.6-luna"));
+        assert!(!cmd.args.iter().any(|a| a == "gpt-5.6-luna"));
     }
 
     #[test]

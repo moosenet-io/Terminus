@@ -77,32 +77,80 @@ pub fn clamp_stall(requested: u64) -> u64 {
     requested.clamp(1, MAX_STALL_SECS)
 }
 
-/// REVCAP-01 PART B: the only reasoning-effort levels this daemon will forward
-/// into a spawned provider's argv. `reasoning_effort` ends up embedded directly
-/// in `codex exec`'s `-c model_reasoning_effort="<value>"` config-override value
-/// and the `claude` CLI's own effort flag value (see `provider::build_command`) --
-/// still a single, non-shell argv element (never shell-interpolated), but a
-/// closed allowlist here means a caller-supplied string can never smuggle an
-/// unexpected quote/value into that provider-specific config syntax, mirroring
-/// this module's existing "closed set, never derived from raw request input"
-/// invariant for provider/binary/model (see `provider.rs`'s module doc).
-pub const ALLOWED_REASONING_EFFORTS: &[&str] = &["low", "medium", "high"];
+/// REVCAP-01 PART B / REVX-07: the reasoning-effort levels `codex` accepts.
+/// LIVE-VALIDATED (S121, codex CLI 0.144.1) against `gpt-5.6-sol`:
+/// `none|low|medium|high|xhigh` -- NOT `minimal` (that value 400-errors on
+/// sol). Distinct from [`ALLOWED_CLAUDE_REASONING_EFFORTS`] because codex and
+/// the Anthropic adaptive-effort CLIs support different native scales (see
+/// `provider::build_command`'s codex/claude arms) -- a single shared
+/// allowlist would either reject codex's `xhigh`/`none` or accept a value
+/// (`xhigh`) that 400-errors on claude.
+pub const ALLOWED_CODEX_REASONING_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
 
-/// Validate a caller-supplied `reasoning_effort` against
-/// [`ALLOWED_REASONING_EFFORTS`]. Anything absent, or not an EXACT
-/// (case-insensitive) match, is dropped to `None` -- fails closed to "no effort
-/// override" (the pre-PART-B argv shape) rather than forwarding an unrecognized
-/// value into the provider's own config-parsing. The match is against the RAW
-/// input with NO trimming: a padded value like `" high "` is deliberately
-/// rejected (returns `None`), satisfying the strict "exact allowlist member,
-/// reject anything else" contract -- only ASCII case differs from a canonical
-/// level (`"HIGH"` -> `"high"`), never surrounding whitespace or other chars.
-pub fn clamp_reasoning_effort(requested: Option<&str>) -> Option<String> {
+/// The Anthropic adaptive `--effort` levels (`opus`/`claude-fable-5`, via the
+/// `claude` CLI): confirmed against the installed CLI's own `--help`.
+pub const ALLOWED_CLAUDE_REASONING_EFFORTS: &[&str] = &["low", "medium", "high"];
+
+/// Back-compat alias: the pre-REVX-07 single shared allowlist. Kept for any
+/// external reference, but no dispatch path in this daemon uses it anymore --
+/// [`clamp_codex_effort`] / [`clamp_claude_effort`] are the per-provider
+/// clamps `main.rs` now calls.
+pub const ALLOWED_REASONING_EFFORTS: &[&str] = ALLOWED_CLAUDE_REASONING_EFFORTS;
+
+/// Validate a caller-supplied `reasoning_effort` against an EXACT
+/// (case-insensitive, no trimming) allowlist member -- fails closed to `None`
+/// (the pre-PART-B argv shape) on anything absent or unrecognized, mirroring
+/// this module's "closed set, never derived from raw request input"
+/// invariant for provider/binary/model (see `provider.rs`'s module doc). A
+/// padded value like `" high "` is deliberately rejected: only ASCII case
+/// may differ from a canonical level, never surrounding whitespace.
+fn clamp_effort_against(allowed: &[&str], requested: Option<&str>) -> Option<String> {
     let level = requested?;
-    ALLOWED_REASONING_EFFORTS
-        .iter()
-        .find(|allowed| allowed.eq_ignore_ascii_case(level))
-        .map(|allowed| allowed.to_string())
+    allowed.iter().find(|a| a.eq_ignore_ascii_case(level)).map(|a| a.to_string())
+}
+
+/// REVX-07: codex's 5-level clamp (`none|low|medium|high|xhigh`).
+pub fn clamp_codex_effort(requested: Option<&str>) -> Option<String> {
+    clamp_effort_against(ALLOWED_CODEX_REASONING_EFFORTS, requested)
+}
+
+/// REVX-07: the Anthropic adaptive-effort clamp (`low|medium|high`) for
+/// `opus`/`claude-fable-5`.
+pub fn clamp_claude_effort(requested: Option<&str>) -> Option<String> {
+    clamp_effort_against(ALLOWED_CLAUDE_REASONING_EFFORTS, requested)
+}
+
+/// Dispatch to the right per-provider clamp by [`super::provider::Provider`].
+/// `agy` has no known effort knob (see `provider::build_command`'s doc), so
+/// it clamps to `None` unconditionally -- a caller-supplied value for `agy`
+/// is simply dropped, never forwarded.
+pub fn clamp_reasoning_effort_for(
+    provider: super::provider::Provider,
+    requested: Option<&str>,
+) -> Option<String> {
+    use super::provider::Provider;
+    match provider {
+        Provider::Codex => clamp_codex_effort(requested),
+        Provider::Opus | Provider::Fable => clamp_claude_effort(requested),
+        Provider::Agy => None,
+    }
+}
+
+/// REVX-08: the closed set of codex model ids this daemon will ever forward
+/// into `build_command`'s `-m`/`--model` argv element. Mirrors
+/// `effort_policy::ALLOWED_CODEX_MODELS` (kept as a separate constant here so
+/// the daemon binary -- built/deployed independently of the library's
+/// `review::effort_policy` module -- has no compile-time dependency on it;
+/// the two lists are asserted equal in this module's tests). An unrecognized
+/// requested model id is dropped to `None`, and `build_command` then falls
+/// back to its own fixed default (`gpt-5.6-sol`) -- never a caller-controlled
+/// string reaching the spawned CLI's argv unchecked.
+pub const ALLOWED_CODEX_MODELS: &[&str] = &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
+
+/// Validate a caller-supplied codex model id against [`ALLOWED_CODEX_MODELS`].
+pub fn clamp_codex_model(requested: Option<&str>) -> Option<String> {
+    let id = requested?;
+    ALLOWED_CODEX_MODELS.iter().find(|a| **a == id).map(|a| a.to_string())
 }
 
 #[cfg(test)]
@@ -175,42 +223,109 @@ mod tests {
     }
 
     #[test]
-    fn clamp_reasoning_effort_passes_through_allowed_levels() {
-        assert_eq!(clamp_reasoning_effort(Some("high")), Some("high".to_string()));
-        assert_eq!(clamp_reasoning_effort(Some("low")), Some("low".to_string()));
-        assert_eq!(clamp_reasoning_effort(Some("medium")), Some("medium".to_string()));
+    fn clamp_claude_effort_passes_through_allowed_levels() {
+        assert_eq!(clamp_claude_effort(Some("high")), Some("high".to_string()));
+        assert_eq!(clamp_claude_effort(Some("low")), Some("low".to_string()));
+        assert_eq!(clamp_claude_effort(Some("medium")), Some("medium".to_string()));
     }
 
     #[test]
-    fn clamp_reasoning_effort_normalizes_case() {
-        assert_eq!(clamp_reasoning_effort(Some("HIGH")), Some("high".to_string()));
+    fn clamp_claude_effort_normalizes_case() {
+        assert_eq!(clamp_claude_effort(Some("HIGH")), Some("high".to_string()));
     }
 
     #[test]
-    fn clamp_reasoning_effort_drops_absent_blank_or_unrecognized_to_none() {
-        assert_eq!(clamp_reasoning_effort(None), None);
-        assert_eq!(clamp_reasoning_effort(Some("")), None);
-        assert_eq!(clamp_reasoning_effort(Some("   ")), None);
+    fn clamp_claude_effort_drops_absent_blank_or_unrecognized_to_none() {
+        assert_eq!(clamp_claude_effort(None), None);
+        assert_eq!(clamp_claude_effort(Some("")), None);
+        assert_eq!(clamp_claude_effort(Some("   ")), None);
         // Not a recognized level -- and, load-bearing: an attempted injection
         // via a quote character must never pass through into the provider's
         // own -c/flag value unrecognized.
-        assert_eq!(clamp_reasoning_effort(Some("high\" extra=\"evil")), None);
-        assert_eq!(clamp_reasoning_effort(Some("ultra")), None);
+        assert_eq!(clamp_claude_effort(Some("high\" extra=\"evil")), None);
+        assert_eq!(clamp_claude_effort(Some("ultra")), None);
+        // claude tops out at "high" -- codex's "xhigh"/"none" are NOT valid here.
+        assert_eq!(clamp_claude_effort(Some("xhigh")), None);
+        assert_eq!(clamp_claude_effort(Some("none")), None);
     }
 
     #[test]
-    fn clamp_reasoning_effort_matches_exactly_no_whitespace_trimming() {
+    fn clamp_claude_effort_matches_exactly_no_whitespace_trimming() {
         // Strict "exact allowlist member, reject anything else" contract: the
         // match is against the RAW input, so a whitespace-padded value is NOT
         // silently accepted-and-normalized -- it is rejected outright.
-        assert_eq!(clamp_reasoning_effort(Some(" high ")), None);
-        assert_eq!(clamp_reasoning_effort(Some("high ")), None);
-        assert_eq!(clamp_reasoning_effort(Some(" high")), None);
-        assert_eq!(clamp_reasoning_effort(Some("\thigh")), None);
+        assert_eq!(clamp_claude_effort(Some(" high ")), None);
+        assert_eq!(clamp_claude_effort(Some("high ")), None);
+        assert_eq!(clamp_claude_effort(Some(" high")), None);
+        assert_eq!(clamp_claude_effort(Some("\thigh")), None);
         // Only ASCII case may differ from a canonical level -- never whitespace.
-        assert_eq!(clamp_reasoning_effort(Some("HIGH")), Some("high".to_string()));
-        assert_eq!(clamp_reasoning_effort(Some("high")), Some("high".to_string()));
-        assert_eq!(clamp_reasoning_effort(Some("ultra")), None);
+        assert_eq!(clamp_claude_effort(Some("HIGH")), Some("high".to_string()));
+        assert_eq!(clamp_claude_effort(Some("high")), Some("high".to_string()));
+        assert_eq!(clamp_claude_effort(Some("ultra")), None);
+    }
+
+    // ── REVX-07: per-provider clamps ─────────────────────────────────────
+
+    #[test]
+    fn clamp_codex_effort_accepts_all_five_levels_including_xhigh_and_none() {
+        assert_eq!(clamp_codex_effort(Some("xhigh")), Some("xhigh".to_string()));
+        assert_eq!(clamp_codex_effort(Some("none")), Some("none".to_string()));
+        assert_eq!(clamp_codex_effort(Some("low")), Some("low".to_string()));
+        assert_eq!(clamp_codex_effort(Some("medium")), Some("medium".to_string()));
+        assert_eq!(clamp_codex_effort(Some("high")), Some("high".to_string()));
+    }
+
+    #[test]
+    fn clamp_codex_effort_rejects_unrecognized_and_minimal() {
+        // LIVE-VALIDATED (S121): "minimal" 400-errors on gpt-5.6-sol -- it is
+        // deliberately NOT in codex's allowlist even though the general codex
+        // config-reference enum lists it.
+        assert_eq!(clamp_codex_effort(Some("minimal")), None);
+        assert_eq!(clamp_codex_effort(Some("ultra")), None);
+    }
+
+    #[test]
+    fn clamp_claude_effort_tops_out_at_high_rejects_xhigh() {
+        assert_eq!(clamp_claude_effort(Some("xhigh")), None);
+        assert_eq!(clamp_claude_effort(Some("high")), Some("high".to_string()));
+    }
+
+    #[test]
+    fn clamp_reasoning_effort_for_dispatches_by_provider() {
+        use super::super::provider::Provider;
+        assert_eq!(
+            clamp_reasoning_effort_for(Provider::Codex, Some("xhigh")),
+            Some("xhigh".to_string())
+        );
+        assert_eq!(clamp_reasoning_effort_for(Provider::Codex, Some("minimal")), None);
+        assert_eq!(
+            clamp_reasoning_effort_for(Provider::Opus, Some("high")),
+            Some("high".to_string())
+        );
+        assert_eq!(clamp_reasoning_effort_for(Provider::Opus, Some("xhigh")), None);
+        assert_eq!(
+            clamp_reasoning_effort_for(Provider::Fable, Some("medium")),
+            Some("medium".to_string())
+        );
+        // agy has no known effort knob -- always None regardless of input.
+        assert_eq!(clamp_reasoning_effort_for(Provider::Agy, Some("high")), None);
+    }
+
+    #[test]
+    fn shell_injection_string_still_rejected_by_both_clamps() {
+        let injected = "high\" extra=\"evil";
+        assert_eq!(clamp_codex_effort(Some(injected)), None);
+        assert_eq!(clamp_claude_effort(Some(injected)), None);
+    }
+
+    #[test]
+    fn clamp_codex_model_accepts_only_the_closed_allowlist() {
+        assert_eq!(clamp_codex_model(Some("gpt-5.6-sol")), Some("gpt-5.6-sol".to_string()));
+        assert_eq!(clamp_codex_model(Some("gpt-5.6-terra")), Some("gpt-5.6-terra".to_string()));
+        assert_eq!(clamp_codex_model(Some("gpt-5.6-luna")), Some("gpt-5.6-luna".to_string()));
+        assert_eq!(clamp_codex_model(Some("gpt-5.5")), Some("gpt-5.5".to_string()));
+        assert_eq!(clamp_codex_model(Some("gpt-9-evil")), None);
+        assert_eq!(clamp_codex_model(None), None);
     }
 
     #[test]
