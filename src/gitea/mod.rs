@@ -3024,6 +3024,8 @@ impl RustTool for EditBranchProtection {
 
 impl EditBranchProtection {
     async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+
         let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
@@ -3033,10 +3035,26 @@ impl EditBranchProtection {
 
         // Whitelist gates direct push: if usernames are supplied, only they may
         // push directly; otherwise ALL direct pushes are blocked (enable_push=false).
-        let whitelist: Vec<String> = args["push_whitelist_usernames"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
+        // Reject non-string entries rather than silently dropping them — a malformed
+        // whitelist must NOT quietly collapse to "block everyone" (accidental lockdown).
+        let whitelist: Vec<String> = match args.get("push_whitelist_usernames") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(a)) => {
+                let mut v = Vec::with_capacity(a.len());
+                for e in a {
+                    match e.as_str() {
+                        Some(s) => v.push(s.to_string()),
+                        None => return Err(ToolError::InvalidArgument(
+                            "'push_whitelist_usernames' entries must all be strings".to_string(),
+                        )),
+                    }
+                }
+                v
+            }
+            Some(_) => return Err(ToolError::InvalidArgument(
+                "'push_whitelist_usernames' must be an array of strings".to_string(),
+            )),
+        };
         let has_whitelist = !whitelist.is_empty();
 
         let require_signed = args["require_signed_commits"].as_bool().unwrap_or(false);
@@ -3044,7 +3062,8 @@ impl EditBranchProtection {
 
         // Shared rule body. `enable_push` true + `enable_push_whitelist` true means
         // "only whitelisted users push directly"; `enable_push` false blocks all.
-        // Force-push is disabled and deletion is inherently blocked once protected.
+        // Force-push is disabled; deletion of a protected branch is blocked by Gitea
+        // inherently while any rule exists (Gitea has no separate deletion toggle).
         let rule_body = json!({
             "enable_push": has_whitelist,
             "enable_push_whitelist": has_whitelist,
@@ -3055,27 +3074,55 @@ impl EditBranchProtection {
             "enable_force_push": false,
         });
 
-        // Try create first (POST). If a rule already exists Gitea rejects it, so
-        // fall back to update (PATCH) for idempotency.
-        let create_endpoint = format!("/repos/{}/{}/branch_protections", owner, repo);
-        let mut create_body = rule_body.clone();
-        create_body["rule_name"] = json!(branch);
-        // `branch_name` is the older field name — send both for compatibility.
-        create_body["branch_name"] = json!(branch);
+        // Rule names can be glob patterns containing '/' (e.g. "release/*"), so the
+        // name MUST be percent-encoded as a single path segment.
+        let enc_branch = utf8_percent_encode(branch, NON_ALPHANUMERIC).to_string();
 
-        let (protection, action): (Value, &str) =
-            match client.post::<Value, Value>(&create_endpoint, &create_body).await {
-                Ok(v) => (v, "created"),
-                Err(_) => {
-                    // Existing rule (or create rejected) — update it in place.
-                    let patch_endpoint = format!(
-                        "/repos/{}/{}/branch_protections/{}",
-                        owner, repo, branch
-                    );
-                    let v = client.patch::<Value, Value>(&patch_endpoint, &rule_body).await?;
-                    (v, "updated")
-                }
-            };
+        // Determine create-vs-update DETERMINISTICALLY by probing the existing rule,
+        // rather than "POST then PATCH on any error" (which would mask auth/validation/
+        // transient POST failures as an update attempt). 404 → create; 200 → update;
+        // any other non-success is a real error and is propagated.
+        let get_endpoint = format!(
+            "/repos/{}/{}/branch_protections/{}",
+            owner, repo, enc_branch
+        );
+        let get_url = client.api(&get_endpoint);
+        debug!("GET {get_url}");
+        let probe = client
+            .http
+            .get(&get_url)
+            .header("Authorization", client.auth_header())
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Request failed: {e}")))?;
+        let probe_status = probe.status();
+        let exists = if probe_status.is_success() {
+            true
+        } else if probe_status == StatusCode::NOT_FOUND {
+            false
+        } else {
+            let body_text = probe.text().await.unwrap_or_default();
+            return Err(ToolError::Http(format!(
+                "Gitea returned {probe_status} probing branch protection: {body_text}"
+            )));
+        };
+
+        let (protection, action): (Value, &str) = if exists {
+            let patch_endpoint = format!(
+                "/repos/{}/{}/branch_protections/{}",
+                owner, repo, enc_branch
+            );
+            let v = client.patch::<Value, Value>(&patch_endpoint, &rule_body).await?;
+            (v, "updated")
+        } else {
+            let create_endpoint = format!("/repos/{}/{}/branch_protections", owner, repo);
+            let mut create_body = rule_body.clone();
+            create_body["rule_name"] = json!(branch);
+            // `branch_name` is the older field name — send both for compatibility.
+            create_body["branch_name"] = json!(branch);
+            let v = client.post::<Value, Value>(&create_endpoint, &create_body).await?;
+            (v, "created")
+        };
 
         let text = format!(
             "Branch protection {action}: {owner}/{repo}@{branch} (direct push {}, force-push blocked, deletion blocked)",
@@ -6089,6 +6136,12 @@ mod tests {
     #[tokio::test]
     async fn test_edit_branch_protection_creates_with_whitelist() {
         let server = MockServer::start();
+        // Probe: no existing rule → create path.
+        let probe = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/myrepo/branch_protections/main");
+            then.status(404).json_body(serde_json::json!({"message": "Not Found"}));
+        });
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/api/v1/repos/testorg/myrepo/branch_protections")
@@ -6107,6 +6160,7 @@ mod tests {
         let output = tool.execute_structured(serde_json::json!({
             "repo": "myrepo", "branch": "main", "push_whitelist_usernames": ["moose"]
         })).await.unwrap();
+        probe.assert();
         mock.assert();
         let structured = output.structured.expect("structuredContent must be present");
         assert_eq!(structured["action"], "created");
@@ -6118,6 +6172,11 @@ mod tests {
     #[tokio::test]
     async fn test_edit_branch_protection_blocks_all_pushes_when_no_whitelist() {
         let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/myrepo/branch_protections/main");
+            then.status(404);
+        });
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/api/v1/repos/testorg/myrepo/branch_protections")
@@ -6133,15 +6192,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_edit_branch_protection_falls_back_to_patch_when_exists() {
+    async fn test_edit_branch_protection_updates_existing_via_patch() {
         let server = MockServer::start();
-        // Create rejected (rule already exists) ...
-        server.mock(|when, then| {
-            when.method(POST)
-                .path("/api/v1/repos/testorg/myrepo/branch_protections");
-            then.status(403).json_body(serde_json::json!({"message": "already exists"}));
+        // Probe: rule exists → update path (PATCH), no POST attempted.
+        let probe = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/myrepo/branch_protections/main");
+            then.status(200).json_body(serde_json::json!({"rule_name": "main"}));
         });
-        // ... so it PATCHes the existing rule.
         let patch = server.mock(|when, then| {
             when.method(httpmock::Method::PATCH)
                 .path("/api/v1/repos/testorg/myrepo/branch_protections/main");
@@ -6151,9 +6209,59 @@ mod tests {
         let output = tool.execute_structured(serde_json::json!({
             "repo": "myrepo", "branch": "main", "push_whitelist_usernames": ["moose"]
         })).await.unwrap();
+        probe.assert();
         patch.assert();
         let structured = output.structured.expect("structuredContent must be present");
         assert_eq!(structured["action"], "updated");
+    }
+
+    #[tokio::test]
+    async fn test_edit_branch_protection_encodes_slashed_rule_name() {
+        let server = MockServer::start();
+        // A glob rule name with '/' must be percent-encoded as one path segment.
+        let probe = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/myrepo/branch_protections/release%2F%2A");
+            then.status(200).json_body(serde_json::json!({"rule_name": "release/*"}));
+        });
+        let patch = server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH)
+                .path("/api/v1/repos/testorg/myrepo/branch_protections/release%2F%2A");
+            then.status(200).json_body(serde_json::json!({"rule_name": "release/*"}));
+        });
+        let tool = EditBranchProtection { client: mock_client(&server) };
+        tool.execute(serde_json::json!({
+            "repo": "myrepo", "branch": "release/*"
+        })).await.unwrap();
+        probe.assert();
+        patch.assert();
+    }
+
+    #[tokio::test]
+    async fn test_edit_branch_protection_probe_error_propagates() {
+        let server = MockServer::start();
+        // A non-404 probe failure (e.g. auth/permission/transient) must NOT be
+        // silently treated as "create" — it propagates as an error.
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/myrepo/branch_protections/main");
+            then.status(403).json_body(serde_json::json!({"message": "Forbidden"}));
+        });
+        let tool = EditBranchProtection { client: mock_client(&server) };
+        let err = tool.execute(serde_json::json!({"repo": "myrepo", "branch": "main"})).await.unwrap_err();
+        assert!(matches!(err, ToolError::Http(_)));
+    }
+
+    #[tokio::test]
+    async fn test_edit_branch_protection_rejects_non_string_whitelist() {
+        let server = MockServer::start();
+        // Malformed whitelist must be rejected, never silently collapsed to
+        // "block everyone" (accidental lockdown). No HTTP call should be made.
+        let tool = EditBranchProtection { client: mock_client(&server) };
+        let err = tool.execute(serde_json::json!({
+            "repo": "myrepo", "branch": "main", "push_whitelist_usernames": [123]
+        })).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
     #[tokio::test]
