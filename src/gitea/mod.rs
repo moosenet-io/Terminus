@@ -2968,6 +2968,133 @@ impl DeleteBranch {
     }
 }
 
+// ─── TERM-497 (S124 G3): gitea_edit_branch_protection ────────────────────────
+//
+// Close the CI/CD gap where `main` isn't push-protected, so the merge-queue
+// "always-green" guarantee has a hole (direct pushes / force-push / deletion).
+// The sanctioned door (S9) previously had NO branch-protection tool — this adds
+// it so protection is applied through Terminus, not a raw Gitea API call.
+//
+// Idempotent: `POST /repos/{owner}/{repo}/branch_protections` creates a rule;
+// if one already exists for the branch, Gitea 4xx's, so we fall back to
+// `PATCH /repos/{owner}/{repo}/branch_protections/{rule}` to update it. Defaults
+// enforce the "queue-only push" posture: block direct pushes except a whitelist,
+// block force-push, block deletion (deletion of a protected branch is inherently
+// blocked by Gitea once a rule exists).
+
+pub struct EditBranchProtection {
+    client: GiteaClient,
+}
+
+#[async_trait]
+impl RustTool for EditBranchProtection {
+    fn name(&self) -> &str { "gitea_edit_branch_protection" }
+
+    fn description(&self) -> &str {
+        "Create or update branch protection on a Gitea repo branch (idempotent). Defaults to a queue-only posture: block direct pushes except a whitelist, block force-push, block deletion. Use to protect `main` so only the merge-queue identity can push."
+    }
+
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "repo":   { "type": "string", "description": "Repository name" },
+                "branch": { "type": "string", "description": "Branch/rule name to protect (e.g. 'main')" },
+                "owner":  { "type": "string", "description": "Owner override (optional)" },
+                "push_whitelist_usernames": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Usernames allowed to push directly (e.g. the merge-queue identity). If set, direct push is whitelist-gated; if empty/omitted, ALL direct pushes are blocked."
+                },
+                "require_signed_commits": { "type": "boolean", "description": "Require signed commits on the branch (optional, default false)" },
+                "block_on_outdated_branch": { "type": "boolean", "description": "Block merge when the branch is behind the base (optional, default false)" }
+            },
+            "required": ["repo", "branch"]
+        }))
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl EditBranchProtection {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let repo = args["repo"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
+        let branch = args["branch"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'branch' is required".to_string()))?;
+        let owner = client.resolve_owner(args["owner"].as_str());
+
+        // Whitelist gates direct push: if usernames are supplied, only they may
+        // push directly; otherwise ALL direct pushes are blocked (enable_push=false).
+        let whitelist: Vec<String> = args["push_whitelist_usernames"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let has_whitelist = !whitelist.is_empty();
+
+        let require_signed = args["require_signed_commits"].as_bool().unwrap_or(false);
+        let block_outdated = args["block_on_outdated_branch"].as_bool().unwrap_or(false);
+
+        // Shared rule body. `enable_push` true + `enable_push_whitelist` true means
+        // "only whitelisted users push directly"; `enable_push` false blocks all.
+        // Force-push is disabled and deletion is inherently blocked once protected.
+        let rule_body = json!({
+            "enable_push": has_whitelist,
+            "enable_push_whitelist": has_whitelist,
+            "push_whitelist_usernames": whitelist,
+            "push_whitelist_deploy_keys": false,
+            "require_signed_commits": require_signed,
+            "block_on_outdated_branch": block_outdated,
+            "enable_force_push": false,
+        });
+
+        // Try create first (POST). If a rule already exists Gitea rejects it, so
+        // fall back to update (PATCH) for idempotency.
+        let create_endpoint = format!("/repos/{}/{}/branch_protections", owner, repo);
+        let mut create_body = rule_body.clone();
+        create_body["rule_name"] = json!(branch);
+        // `branch_name` is the older field name — send both for compatibility.
+        create_body["branch_name"] = json!(branch);
+
+        let (protection, action): (Value, &str) =
+            match client.post::<Value, Value>(&create_endpoint, &create_body).await {
+                Ok(v) => (v, "created"),
+                Err(_) => {
+                    // Existing rule (or create rejected) — update it in place.
+                    let patch_endpoint = format!(
+                        "/repos/{}/{}/branch_protections/{}",
+                        owner, repo, branch
+                    );
+                    let v = client.patch::<Value, Value>(&patch_endpoint, &rule_body).await?;
+                    (v, "updated")
+                }
+            };
+
+        let text = format!(
+            "Branch protection {action}: {owner}/{repo}@{branch} (direct push {}, force-push blocked, deletion blocked)",
+            if has_whitelist { "whitelist-gated" } else { "blocked" },
+        );
+        let structured = json!({
+            "owner": owner,
+            "repo": repo,
+            "branch": branch,
+            "action": action,
+            "enable_push": has_whitelist,
+            "push_whitelist_usernames": whitelist,
+            "enable_force_push": false,
+            "protection": protection,
+        });
+        Ok((text, structured))
+    }
+}
+
 // ─── EGJS-02: gitea_close_pr ──────────────────────────────────────────────────
 //
 // Close a pull request WITHOUT merging it — distinct from `gitea_merge_pr`.
@@ -3834,6 +3961,7 @@ pub fn register(registry: &mut ToolRegistry) {
             // on the terminus primary (LHEG-06 gap notes).
             let _ = registry.register(Box::new(CreateBranch { client: client.clone() }));
             let _ = registry.register(Box::new(DeleteBranch { client: client.clone() }));
+            let _ = registry.register(Box::new(EditBranchProtection { client: client.clone() }));
             let _ = registry.register(Box::new(ClosePr { client: client.clone() }));
             let _ = registry.register(Box::new(GetPrDiff { client }));
         }
@@ -3867,6 +3995,7 @@ pub fn register(registry: &mut ToolRegistry) {
             stub!("gitea_list_directory", "List directory contents in Gitea (not configured)");
             stub!("gitea_create_branch", "Create a branch in a Gitea repository (not configured)");
             stub!("gitea_delete_branch", "Delete a branch from a Gitea repository (not configured)");
+            stub!("gitea_edit_branch_protection", "Create/update Gitea branch protection (not configured)");
             stub!("gitea_close_pr", "Close a Gitea pull request without merging (not configured)");
             stub!("gitea_get_pr_diff", "Get the diff for a Gitea pull request (not configured)");
         }
@@ -5958,6 +6087,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_edit_branch_protection_creates_with_whitelist() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/repos/testorg/myrepo/branch_protections")
+                .json_body_partial(r#"{
+                    "rule_name": "main",
+                    "enable_push": true,
+                    "enable_push_whitelist": true,
+                    "push_whitelist_usernames": ["moose"],
+                    "enable_force_push": false
+                }"#);
+            then.status(201).json_body(serde_json::json!({
+                "rule_name": "main", "enable_push": true
+            }));
+        });
+        let tool = EditBranchProtection { client: mock_client(&server) };
+        let output = tool.execute_structured(serde_json::json!({
+            "repo": "myrepo", "branch": "main", "push_whitelist_usernames": ["moose"]
+        })).await.unwrap();
+        mock.assert();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["action"], "created");
+        assert_eq!(structured["enable_push"], true);
+        assert_eq!(structured["enable_force_push"], false);
+        assert!(output.text.contains("whitelist-gated"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_branch_protection_blocks_all_pushes_when_no_whitelist() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/repos/testorg/myrepo/branch_protections")
+                .json_body_partial(r#"{"enable_push": false, "enable_force_push": false}"#);
+            then.status(201).json_body(serde_json::json!({"rule_name": "main"}));
+        });
+        let tool = EditBranchProtection { client: mock_client(&server) };
+        let output = tool.execute(serde_json::json!({
+            "repo": "myrepo", "branch": "main"
+        })).await.unwrap();
+        mock.assert();
+        assert!(output.contains("blocked"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_branch_protection_falls_back_to_patch_when_exists() {
+        let server = MockServer::start();
+        // Create rejected (rule already exists) ...
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/repos/testorg/myrepo/branch_protections");
+            then.status(403).json_body(serde_json::json!({"message": "already exists"}));
+        });
+        // ... so it PATCHes the existing rule.
+        let patch = server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH)
+                .path("/api/v1/repos/testorg/myrepo/branch_protections/main");
+            then.status(200).json_body(serde_json::json!({"rule_name": "main"}));
+        });
+        let tool = EditBranchProtection { client: mock_client(&server) };
+        let output = tool.execute_structured(serde_json::json!({
+            "repo": "myrepo", "branch": "main", "push_whitelist_usernames": ["moose"]
+        })).await.unwrap();
+        patch.assert();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["action"], "updated");
+    }
+
+    #[tokio::test]
+    async fn test_edit_branch_protection_requires_repo_and_branch() {
+        let server = MockServer::start();
+        let tool = EditBranchProtection { client: mock_client(&server) };
+        let err = tool.execute(serde_json::json!({"repo": "myrepo"})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
     async fn test_close_pr_correct_request() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
@@ -6050,7 +6257,8 @@ mod tests {
         register(&mut registry);
         let names: Vec<String> = registry.list().into_iter().map(|t| t.name).collect();
         for name in [
-            "gitea_create_branch", "gitea_delete_branch", "gitea_close_pr", "gitea_get_pr_diff",
+            "gitea_create_branch", "gitea_delete_branch", "gitea_edit_branch_protection",
+            "gitea_close_pr", "gitea_get_pr_diff",
         ] {
             assert!(names.iter().any(|n| n == name), "{name} must be registered");
         }
