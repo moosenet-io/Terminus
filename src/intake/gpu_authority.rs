@@ -549,15 +549,25 @@ fn chord_call(action: &str, holder: &str) -> ChordCall {
                                 .unwrap_or(false);
                             ChordCall::Acknowledged { new_grant }
                         } else if status.as_u16() == 409 {
-                            // Body carries the current holder; best-effort parse.
-                            let holder = resp
-                                .json::<serde_json::Value>()
-                                .await
-                                .ok()
-                                .and_then(|v| {
-                                    v.get("holder").and_then(|h| h.as_str()).map(String::from)
-                                })
-                                .unwrap_or_else(|| "unknown".to_string());
+                            // Body carries the current holder, OR the S125 client-yield
+                            // guard's `gpu_yield_client_busy` (Chord refused a fresh grab
+                            // because a client is in flight). Both are a "back off" → the
+                            // retryable Held path; label the client case clearly.
+                            let v = resp.json::<serde_json::Value>().await.ok();
+                            let client_busy = v
+                                .as_ref()
+                                .and_then(|v| v.get("error").and_then(|e| e.as_str()))
+                                .map(|e| e == "gpu_yield_client_busy")
+                                .unwrap_or(false);
+                            let holder = if client_busy {
+                                "client (in-flight request — S125 yield)".to_string()
+                            } else {
+                                v.as_ref()
+                                    .and_then(|v| {
+                                        v.get("holder").and_then(|h| h.as_str()).map(String::from)
+                                    })
+                                    .unwrap_or_else(|| "unknown".to_string())
+                            };
                             ChordCall::Held { holder }
                         } else if matches!(status.as_u16(), 401 | 403) {
                             ChordCall::Unauthorized
