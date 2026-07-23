@@ -285,7 +285,7 @@ async fn probe_chord(client: &Client) -> Value {
 /// base — PII remediation (2026-07): the compiled-in local-loopback fallback
 /// was removed; callers now report `not_configured` instead of guessing a
 /// host.
-fn chord_control_base() -> Option<String> {
+pub(crate) fn chord_control_base() -> Option<String> {
     if let Some(url) = env_url("CHORD_CONTROL_URL") {
         return Some(url);
     }
