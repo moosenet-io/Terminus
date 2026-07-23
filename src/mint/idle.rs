@@ -628,10 +628,21 @@ impl IdleController {
     /// from an earlier lease, so a longer build window is honored instead of the first
     /// lease's (possibly shorter) deadline. No-op unless fully `Idle`.
     pub fn bump_watchdog(&self, new_deadline: u64) {
-        if let IdleState::Idle(m) = &mut *self.inner.write().expect("mint idle lock poisoned") {
+        let mut guard = self.inner.write().expect("mint idle lock poisoned");
+        let changed = if let IdleState::Idle(m) = &mut *guard {
             if new_deadline > m.watchdog_deadline {
                 m.watchdog_deadline = new_deadline;
+                true
+            } else {
+                false
             }
+        } else {
+            false
+        };
+        // Persist the extended deadline so a restart mid-build reloads the LONGER window,
+        // not the first lease's stale (shorter) one, and cannot reactivate MINT early.
+        if changed {
+            self.persist_locked(&guard);
         }
     }
 
