@@ -1322,10 +1322,20 @@ impl GpuLock for LiveGpuLock {
         // admissible/ungated, so they incur no gating and no added latency.
         //
         // S125 IDLE-CLIENT: yield to live client traffic BEFORE the backoff/acquire, so
-        // we never preempt (evict) a client's resident model. Checked here (async, once
-        // per unit) rather than in the sync backoff closure. Non-retryable refusal → the
-        // driver records a skip and the sweep resumes when Chord is quiet.
-        if client_yield_enabled() && chord_client_busy().await {
+        // we never preempt (evict) a client's resident model. Gated on a MINT holder to
+        // honor the contract above (non-MINT holders are never MINT-gated). Checked here
+        // (async, once per unit) rather than in the sync backoff closure. This is the
+        // fast-path yield; the AUTHORITATIVE, atomic, all-paths guarantee is Chord-side
+        // (Chord refuses the gpu-exclusive grant while a client is in flight — CHORD-GPUX
+        // client-guard), which also covers the reacquire/heartbeat paths and the
+        // probe→acquire window this fast-path check alone cannot close. Non-retryable
+        // refusal → the driver records a skip and resumes when Chord is quiet.
+        if crate::mint::idle::is_mint_holder(
+            self.holder,
+            &crate::mint::idle::mint_gpu_holders_from_env(),
+        ) && client_yield_enabled()
+            && chord_client_busy().await
+        {
             return Err(MINT_CLIENT_YIELD_REFUSAL.to_string());
         }
         let holder = self.holder;

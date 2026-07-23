@@ -623,6 +623,18 @@ impl IdleController {
         }
     }
 
+    /// S125 IDLE-WATCHDOG: extend the auto-reactivate deadline to at least `new_deadline`
+    /// (never shorten). Used when a fresh compiler lease enters while MINT is ALREADY idle
+    /// from an earlier lease, so a longer build window is honored instead of the first
+    /// lease's (possibly shorter) deadline. No-op unless fully `Idle`.
+    pub fn bump_watchdog(&self, new_deadline: u64) {
+        if let IdleState::Idle(m) = &mut *self.inner.write().expect("mint idle lock poisoned") {
+            if new_deadline > m.watchdog_deadline {
+                m.watchdog_deadline = new_deadline;
+            }
+        }
+    }
+
     /// Try to admit ONE new MINT run. The in-flight increment happens under the SAME
     /// write lock that flips the phase, so once a concurrent
     /// [`begin_enter`](Self::begin_enter) has installed `EnteringIdle`, this can never
@@ -1208,7 +1220,13 @@ where
     // `transition` guard makes the pre-release phase cancellation-safe.
     let transition = match ctl.try_begin_enter() {
         Ok(t) => t,
-        Err(BeginEnter::AlreadyIdle(m)) => return (EnterOutcome::AlreadyIdle(m), None),
+        Err(BeginEnter::AlreadyIdle(m)) => {
+            // Already idle from an earlier lease: honor a longer watchdog window from this
+            // (overlapping) lease so the fail-safe never fires before the longest lease's
+            // cap. Never shortens an existing deadline.
+            ctl.bump_watchdog(now_epoch().saturating_add(watchdog_secs));
+            return (EnterOutcome::AlreadyIdle(m), None);
+        }
         Err(_) => return (EnterOutcome::InTransition, None),
     };
     // Phase is now `EnteringIdle`: `try_admit` rejects all new runs, so the drain below
