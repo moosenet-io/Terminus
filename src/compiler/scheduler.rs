@@ -694,7 +694,12 @@ impl Scheduler {
             // across the whole build; on a normal return we release it explicitly
             // below, and on an early return / PANIC its `Drop` reactivates both
             // services (a crashed build never leaves them stuck idle).
-            let lease = if job.heavy {
+            // S125 IDLE-COMPILER: a HEAVY build always idles Chord+MINT. Additionally, if
+            // a MINT sweep is CURRENTLY running, take the lease even for a non-heavy build
+            // — otherwise `select_role(Auto, fast=false, peak=None) → Primary` takes no
+            // lease and a default build contends with the live sweep on the shared GPU.
+            let take_lease = job.heavy || crate::intake::gpu_authority::mint_sweep_active();
+            let lease = if take_lease {
                 match idle.acquire(&job).await {
                     Ok(guard) => Some(guard),
                     Err(e) => {

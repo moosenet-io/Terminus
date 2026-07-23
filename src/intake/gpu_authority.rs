@@ -355,6 +355,107 @@ fn chord_auth_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+// ── S125 IDLE-CLIENT: MINT yields the GPU to live client traffic ──────────────
+//
+// Before S125, MINT PREEMPTED clients: it POSTed `/v1/gpu-exclusive/acquire`, which
+// made Chord 503 client inference and evict resident models. The operator wants the
+// REVERSE — MINT must PAUSE for a client. We check Chord's control-plane
+// `/admin/activity` (CHORD-ACT-01) at the top of each GPU-unit acquire; if a client
+// request is in flight we refuse the unit BEFORE acquiring (so we never even preempt),
+// non-retryably, and the driver records a skip. A later unit re-checks and the sweep
+// resumes once Chord is quiet. Operator runs no real clients this sprint, so this is a
+// feature-verification path — but it is live and default-on.
+
+/// Refusal returned when MINT yields the GPU to an in-flight client request on Chord.
+/// Non-retryable (does NOT contain "held exclusively by", so [`is_live_holder_refusal`]
+/// classifies it fail-fast) → the caller records a skip and moves on, exactly like the
+/// idle refusal.
+pub const MINT_CLIENT_YIELD_REFUSAL: &str =
+    "MINT is yielding the GPU to an in-flight client request on Chord (retry later)";
+
+/// Whether MINT yields to live client traffic. `MINT_YIELD_TO_CLIENTS` — default ON.
+/// Set 0/false/no/off to restore the pre-S125 preempt-clients behavior.
+fn client_yield_enabled() -> bool {
+    match std::env::var("MINT_YIELD_TO_CLIENTS") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// If Chord's activity endpoint is unreachable, assume a client IS active
+/// (fail-closed, protect clients) or NOT (fail-open, keep profiling)? Default fail-OPEN
+/// so a down endpoint never wedges a sweep. `MINT_YIELD_FAIL_CLOSED=1` flips it.
+fn client_yield_fail_closed() -> bool {
+    matches!(
+        std::env::var("MINT_YIELD_FAIL_CLOSED").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// TTL cache so the per-unit client-busy check never hammers Chord's control plane.
+static CHORD_BUSY_CACHE: std::sync::Mutex<Option<(std::time::Instant, bool)>> =
+    std::sync::Mutex::new(None);
+const CHORD_BUSY_TTL: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// GET Chord control `/admin/activity`, returning the reported in-flight client count.
+/// `None` on any error (unreachable / parse / no control base configured).
+async fn chord_control_activity_inflight() -> Option<u64> {
+    let base = crate::sysversion::chord_control_base()?;
+    let url = format!("{}/admin/activity", base.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build()
+        .ok()?;
+    let mut req = client.get(&url);
+    if let Some(t) = chord_auth_token() {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    // CHORD-ACT-01 shape: { "inflight": N, "idle_secs": M, ... }
+    v.get("inflight").and_then(|x| x.as_u64())
+}
+
+/// Is Chord actively serving a client right now? TTL-cached; short timeout; on any
+/// error falls back to [`client_yield_fail_closed`].
+async fn chord_client_busy() -> bool {
+    if let Ok(g) = CHORD_BUSY_CACHE.lock() {
+        if let Some((t, v)) = *g {
+            if t.elapsed() < CHORD_BUSY_TTL {
+                return v;
+            }
+        }
+    }
+    let busy = match chord_control_activity_inflight().await {
+        Some(n) => n > 0,
+        None => client_yield_fail_closed(),
+    };
+    if let Ok(mut g) = CHORD_BUSY_CACHE.lock() {
+        *g = Some((std::time::Instant::now(), busy));
+    }
+    busy
+}
+
+/// Is a MINT GPU sweep currently the live GPU-authority holder? Used by the compiler
+/// scheduler (S125 IDLE-COMPILER) to idle a RUNNING MINT even for a non-heavy build,
+/// closing the gap where `select_role(Auto, fast=false, peak=None) → Primary` takes no
+/// idle lease and lets a default build contend with a live sweep.
+pub fn mint_sweep_active() -> bool {
+    match status().lock {
+        Some((holder, _mode, _pid, alive)) if alive => crate::mint::idle::is_mint_holder(
+            &holder,
+            &crate::mint::idle::mint_gpu_holders_from_env(),
+        ),
+        _ => false,
+    }
+}
+
 /// Heartbeat interval (seconds) — how often to re-`acquire` (refresh) Chord's
 /// lock while held. From `CHORD_GPU_EXCLUSIVE_HEARTBEAT_SECS`, default 120.
 /// Must be comfortably under Chord's TTL (default 600s) so a brief stall never
@@ -448,15 +549,25 @@ fn chord_call(action: &str, holder: &str) -> ChordCall {
                                 .unwrap_or(false);
                             ChordCall::Acknowledged { new_grant }
                         } else if status.as_u16() == 409 {
-                            // Body carries the current holder; best-effort parse.
-                            let holder = resp
-                                .json::<serde_json::Value>()
-                                .await
-                                .ok()
-                                .and_then(|v| {
-                                    v.get("holder").and_then(|h| h.as_str()).map(String::from)
-                                })
-                                .unwrap_or_else(|| "unknown".to_string());
+                            // Body carries the current holder, OR the S125 client-yield
+                            // guard's `gpu_yield_client_busy` (Chord refused a fresh grab
+                            // because a client is in flight). Both are a "back off" → the
+                            // retryable Held path; label the client case clearly.
+                            let v = resp.json::<serde_json::Value>().await.ok();
+                            let client_busy = v
+                                .as_ref()
+                                .and_then(|v| v.get("error").and_then(|e| e.as_str()))
+                                .map(|e| e == "gpu_yield_client_busy")
+                                .unwrap_or(false);
+                            let holder = if client_busy {
+                                "client (in-flight request — S125 yield)".to_string()
+                            } else {
+                                v.as_ref()
+                                    .and_then(|v| {
+                                        v.get("holder").and_then(|h| h.as_str()).map(String::from)
+                                    })
+                                    .unwrap_or_else(|| "unknown".to_string())
+                            };
                             ChordCall::Held { holder }
                         } else if matches!(status.as_u16(), 401 | 403) {
                             ChordCall::Unauthorized
@@ -1219,6 +1330,24 @@ impl GpuLock for LiveGpuLock {
         //
         // Non-MINT holders (e.g. the compiler lease) short-circuit both steps as
         // admissible/ungated, so they incur no gating and no added latency.
+        //
+        // S125 IDLE-CLIENT: yield to live client traffic BEFORE the backoff/acquire, so
+        // we never preempt (evict) a client's resident model. Gated on a MINT holder to
+        // honor the contract above (non-MINT holders are never MINT-gated). Checked here
+        // (async, once per unit) rather than in the sync backoff closure. This is the
+        // fast-path yield; the AUTHORITATIVE, atomic, all-paths guarantee is Chord-side
+        // (Chord refuses the gpu-exclusive grant while a client is in flight — CHORD-GPUX
+        // client-guard), which also covers the reacquire/heartbeat paths and the
+        // probe→acquire window this fast-path check alone cannot close. Non-retryable
+        // refusal → the driver records a skip and resumes when Chord is quiet.
+        if crate::mint::idle::is_mint_holder(
+            self.holder,
+            &crate::mint::idle::mint_gpu_holders_from_env(),
+        ) && client_yield_enabled()
+            && chord_client_busy().await
+        {
+            return Err(MINT_CLIENT_YIELD_REFUSAL.to_string());
+        }
         let holder = self.holder;
         let acquired = acquire_with_backoff(
             &RealClock,
@@ -1995,6 +2124,18 @@ mod tests {
         assert!(is_live_holder_refusal(
             "chord reports the GPU is already held exclusively by 'intake_coder_sweep' \
              — refusing to start"
+        ));
+    }
+
+    #[test]
+    fn client_yield_refusal_is_non_retryable_like_idle() {
+        // S125 IDLE-CLIENT: the client-yield refusal must fail FAST (non-retryable), so
+        // the driver records a skip and the sweep resumes when Chord is quiet — exactly
+        // like the idle refusal. It must NOT be classified as a live-holder (retryable)
+        // refusal (i.e. must not contain "held exclusively by").
+        assert!(!is_live_holder_refusal(MINT_CLIENT_YIELD_REFUSAL));
+        assert!(!is_live_holder_refusal(
+            crate::mint::idle::MINT_IDLE_GPU_REFUSAL
         ));
     }
 

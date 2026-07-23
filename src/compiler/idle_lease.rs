@@ -391,8 +391,15 @@ impl IdleBackend for ProdIdleBackend {
     }
 
     async fn mint_idle(&self) -> Result<Option<f64>, String> {
-        use crate::mint::idle::{enter_idle, mint_idle as mint_controller};
-        let enter = enter_idle(LEASE_REASON).await;
+        use crate::mint::idle::{
+            enter_idle_with_watchdog, mint_idle as mint_controller, watchdog_secs_from_env,
+        };
+        // S125 IDLE-WATCHDOG: pin MINT's fail-safe watchdog to at least this lease's
+        // max-lease so the 3600s default can't reactivate MINT before a legitimately long
+        // build's lease cap (DEFAULT_MAX_LEASE_SECS = MAX_BUILD_TIMEOUT_SECS + 1800 > 3600).
+        let watchdog_secs =
+            env_u64(MAX_LEASE_ENV, DEFAULT_MAX_LEASE_SECS).max(watchdog_secs_from_env());
+        let enter = enter_idle_with_watchdog(LEASE_REASON, watchdog_secs).await;
         // On `InTransition`, poll the process-global MINT controller's settled state.
         // Bounded by the caller's per-op timeout (which cancels this if it never settles).
         settle_mint_idle(
