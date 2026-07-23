@@ -1152,7 +1152,17 @@ impl Drop for ReleasingLatchGuard {
 /// freed RAM, record the resume manifest. Delegates to [`enter_idle_on`] against the
 /// process-global controller with the real GPU-lock release.
 pub async fn enter_idle(reason: &str) -> (EnterOutcome, Option<IdleReport>) {
-    enter_idle_on(mint_idle(), reason, release_mint_gpu_lock).await
+    enter_idle_on(mint_idle(), reason, release_mint_gpu_lock, None).await
+}
+
+/// Like [`enter_idle`] but pins the auto-reactivate watchdog window (seconds). The
+/// compiler idle lease (S125 IDLE-WATCHDOG) passes its own max-lease so the MINT
+/// fail-safe never reactivates MINT mid-build for a build longer than the 3600s default.
+pub async fn enter_idle_with_watchdog(
+    reason: &str,
+    watchdog_secs: u64,
+) -> (EnterOutcome, Option<IdleReport>) {
+    enter_idle_on(mint_idle(), reason, release_mint_gpu_lock, Some(watchdog_secs)).await
 }
 
 /// The generic enter-idle orchestration, parameterised over the controller and the
@@ -1182,10 +1192,16 @@ pub async fn enter_idle_on<F>(
     ctl: Arc<IdleController>,
     reason: &str,
     release_fn: F,
+    watchdog_secs: Option<u64>,
 ) -> (EnterOutcome, Option<IdleReport>)
 where
     F: FnOnce() -> GpuReleaseResult + Send + 'static,
 {
+    // S125 IDLE-WATCHDOG: the caller may override the auto-reactivate window. The
+    // compiler lease passes its own (longer) max-lease so the fail-safe watchdog never
+    // fires BEFORE the lease's own cap during a legitimately long build; `None` uses the
+    // env default (`MINT_IDLE_WATCHDOG_SECS`, 3600s).
+    let watchdog_secs = watchdog_secs.unwrap_or_else(watchdog_secs_from_env);
     // Atomically CLAIM the transition FIRST (fixes the TOCTOU: two concurrent enters
     // can no longer both observe "active" and both run release). Only the `Begin`
     // winner proceeds; everyone else returns a no-op with no side effects. The RAII
@@ -1302,7 +1318,7 @@ where
     let manifest = ResumeManifest {
         reason: reason.to_string(),
         entered_at: now,
-        watchdog_deadline: now.saturating_add(watchdog_secs_from_env()),
+        watchdog_deadline: now.saturating_add(watchdog_secs),
         released_holders: report.holders_released.clone(),
         mem_available_before_gb: report.mem_available_before_gb.unwrap_or(0.0),
     };
@@ -2112,7 +2128,7 @@ mod tests {
 
         let ctl_task = ctl.clone();
         let enter =
-            tokio::spawn(async move { enter_idle_on(ctl_task, "test", slow_release).await });
+            tokio::spawn(async move { enter_idle_on(ctl_task, "test", slow_release, None).await });
 
         // Wait until the blocking release has actually started.
         while !started.load(Ordering::SeqCst) {
@@ -2178,7 +2194,7 @@ mod tests {
 
         let ctl_task = ctl.clone();
         let enter =
-            tokio::spawn(async move { enter_idle_on(ctl_task, "test", slow_release).await });
+            tokio::spawn(async move { enter_idle_on(ctl_task, "test", slow_release, None).await });
 
         while !started.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -2239,7 +2255,7 @@ mod tests {
 
         let ctl_task = ctl.clone();
         let enter =
-            tokio::spawn(async move { enter_idle_on(ctl_task, "test", panicking_release).await });
+            tokio::spawn(async move { enter_idle_on(ctl_task, "test", panicking_release, None).await });
 
         // Wait until the blocking release has started (latch set, blocked on recv).
         while !started.load(Ordering::SeqCst) {
@@ -2300,7 +2316,7 @@ mod tests {
         };
 
         // Await to completion (NOT cancelled): the JoinError path must decline to commit.
-        let (outcome, report) = enter_idle_on(ctl.clone(), "test", failing_release).await;
+        let (outcome, report) = enter_idle_on(ctl.clone(), "test", failing_release, None).await;
 
         assert!(
             matches!(outcome, EnterOutcome::InTransition),
