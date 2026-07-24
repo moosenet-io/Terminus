@@ -30,6 +30,13 @@
 //!     diffusion generates in fixed canvas blocks, not a token stream). The
 //!     live backend call goes through `intake::infer::infer_with_metrics`'s
 //!     `kind == "daemon"` arm; this module's tests exercise scoring only.
+//!   - [`embedding_retrieval`] — `task_category = "embedding_retrieval"`
+//!     (SUITE-EMB): the IR-quality suite for TEXT-EMBEDDING models. Promotes the
+//!     `assistant::dim6_embeddings` precursor into a fleet-wired suite — reuses
+//!     its precision/recall/MRR/nDCG + public-vs-domain-delta machinery and adds
+//!     the newcats surface (`INTAKE_CORPUS_DIR` loader, throughput metric,
+//!     `score_and_write`). Backend seam = Chord `/v1/embeddings` via
+//!     `infer::embed_with_metrics`'s `openai_embed` arm.
 //!
 //! ## Shared scoring primitives
 //! [`text_similarity`] holds the small, dependency-free string-similarity
@@ -47,6 +54,7 @@
 
 pub mod diffusion;
 pub mod document_parsing;
+pub mod embedding_retrieval;
 pub mod image_generation;
 pub mod image_parsing;
 pub mod text_similarity;

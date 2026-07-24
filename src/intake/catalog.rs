@@ -73,11 +73,20 @@ pub const TEST_TYPE_AGENT: &str = "agent";
 /// MINT-DIFF-01: the diffusion suite's test-family tag (use-case quality +
 /// performance, distinct from `coder`/`assistant`/`serving`/`agent`).
 pub const TEST_TYPE_DIFFUSION: &str = "diffusion";
+/// SUITE-EMB (S125 TERM #508): the embedding-retrieval suite's test-family tag
+/// (IR quality — precision/recall/MRR/nDCG — plus dimensionality, throughput, and
+/// a public-vs-domain delta). Results land in `assistant_dimension_score` under
+/// `task_category = "embedding_retrieval"`; see
+/// [`crate::intake::newcats::embedding_retrieval`].
+pub const TEST_TYPE_EMBEDDING_RETRIEVAL: &str = "embedding_retrieval";
 
 /// The single serving/context-profile leaf category.
 pub const SERVING_CATEGORY: &str = "context_profile";
 /// The single agent tool-use leaf category.
 pub const AGENT_CATEGORY: &str = "tool_use";
+/// The single embedding-retrieval leaf category (matches the `newcats` module's
+/// `TASK_CATEGORY`).
+pub const EMBEDDING_RETRIEVAL_CATEGORY: &str = "embedding_retrieval";
 
 /// A cell's coverage status. `not_run` is FIRST-CLASS — representing gaps is the
 /// catalog's whole job.
@@ -523,6 +532,21 @@ pub fn build_catalog(inputs: &CatalogInputs) -> Vec<ModelCatalog> {
             _ => not_run_cell(&model, TEST_TYPE_AGENT, AGENT_CATEGORY),
         };
         cells.push(agent_cell);
+
+        // ---- embedding_retrieval cell (SUITE-EMB) ----------------------------
+        // The suite writes its results to `assistant_dimension_score` under
+        // `task_category = "embedding_retrieval"`; no dedicated stored-aggregate
+        // reader is threaded into `CatalogInputs` yet, so — like every other
+        // uncovered family — this is emitted as a FIRST-CLASS `not_run` coverage
+        // cell so the embedding-retrieval axis shows up (as an explicit gap) for
+        // every model until a reader promotes it to `Run`. Adding that reader is a
+        // follow-up, mirroring how `diffusion` introduced its `TEST_TYPE_*` before
+        // a catalog reader existed.
+        cells.push(not_run_cell(
+            &model,
+            TEST_TYPE_EMBEDDING_RETRIEVAL,
+            EMBEDDING_RETRIEVAL_CATEGORY,
+        ));
 
         // ---- serving facts (fleet card) --------------------------------------
         let serving = ServingFacts {
@@ -1201,9 +1225,10 @@ mod tests {
             m.cells.iter().all(|c| c.status == CoverageStatus::NotRun),
             "every cell must be not_run"
         );
-        // Coder (3) + assistant (7) + serving (1) + agent (1) = 12 cells.
-        assert_eq!(m.cells.len(), 12);
-        assert_eq!(m.not_run_count, 12);
+        // Coder (3) + assistant (7) + serving (1) + agent (1) +
+        // embedding_retrieval (1, SUITE-EMB) = 13 cells.
+        assert_eq!(m.cells.len(), 13);
+        assert_eq!(m.not_run_count, 13);
         // multi_file gap is explicitly present, not omitted.
         assert_eq!(
             cell(&cat, "ghost", "coder", "multi_file").status,

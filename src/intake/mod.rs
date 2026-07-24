@@ -473,12 +473,19 @@ fn parse_suites(args: &Value, model_name: &str) -> Vec<String> {
 ///                                daemon model — the Ollama-based suites
 ///                                can't load it, so its default is the
 ///                                diffusion suite, not `context`/`code`)
+///   - "nomic-embed"/"bge"/…    → [embedding_retrieval]  (SUITE-EMB: an
+///                                embedding model can't run the chat-shaped
+///                                suites; see [`is_embedding_model`])
 ///   - default                  → [context]
 /// Pure.
 pub fn default_suites_for(model_name: &str) -> Vec<String> {
     let n = model_name.to_lowercase();
     let v = if n.contains("diffusiongemma") || n.contains("dgem") {
         vec!["diffusion"]
+    } else if is_embedding_model(&n) {
+        // SUITE-EMB (TERM #508): an embedding model can't run the chat-shaped
+        // context/code/agent suites — its default is the IR-retrieval suite.
+        vec!["embedding_retrieval"]
     } else if n.contains("coder") {
         vec!["context", "code"]
     } else if n.contains("gpt-oss") {
@@ -496,6 +503,22 @@ pub fn default_suites_for(model_name: &str) -> Vec<String> {
 pub fn is_non_ollama_daemon(model_name: &str) -> bool {
     let n = model_name.to_lowercase();
     n.contains("diffusiongemma") || n.contains("dgem")
+}
+
+/// Whether a model is a text-embedding model (SUITE-EMB): matched by the common
+/// embedding-model name markers in this fleet's registry (nomic-embed, bge,
+/// mxbai-embed, gte, e5, embeddinggemma, or a bare `-embed`/`embedding` tag).
+/// Pure. Deliberately conservative substring matching — a chat model won't carry
+/// these markers, and a false negative just falls back to the `context` default.
+pub fn is_embedding_model(model_name: &str) -> bool {
+    let n = model_name.to_lowercase();
+    n.contains("embed")
+        || n.contains("nomic")
+        || n.contains("bge-")
+        || n.contains("mxbai")
+        || n.contains("gte-")
+        || n.starts_with("gte")
+        || n.contains("e5-")
 }
 
 /// Pick code-suite languages by model purpose: coder models get the full P0/P1
@@ -816,6 +839,19 @@ impl RustTool for ModelIntake {
                 a.personality_quality.map(|v| format!("{v:.1}/5")).unwrap_or_else(|| "n/a".into()),
             ));
             out.push_str(&format!("recommended_role: {}\n\n", a.recommended_role));
+        }
+
+        // SUITE-EMB (TERM #508): IR-retrieval profiling for embedding models.
+        // Self-contained (creates its own profile row, loads its own corpora),
+        // so it runs independently of the context/code/agent profile_id above.
+        if suites.iter().any(|s| s == "embedding_retrieval") {
+            let res = runner::run_embedding_retrieval_suite(model_name).await?;
+            out.push_str("=== Embedding-retrieval suite (SUITE-EMB) ===\n");
+            if res.skipped {
+                out.push_str(&format!("skipped: {}\n\n", res.summary));
+            } else {
+                out.push_str(&format!("{}\n\n", res.summary));
+            }
         }
 
         out.push_str("Note: coherence_score stored as NULL (LLM-judge deferred).\n");
@@ -1356,6 +1392,10 @@ mod tests {
         assert_eq!(default_suites_for("diffusiongemma-26b-a4b"), vec!["diffusion"]);
         assert_eq!(default_suites_for("dgem-secondary"), vec!["diffusion"]);
         assert_eq!(default_suites_for("llama3:8b"), vec!["context"]);
+        // SUITE-EMB: embedding models route to the embedding_retrieval suite.
+        assert_eq!(default_suites_for("nomic-embed-text:latest"), vec!["embedding_retrieval"]);
+        assert_eq!(default_suites_for("bge-large-en"), vec!["embedding_retrieval"]);
+        assert_eq!(default_suites_for("mxbai-embed-large"), vec!["embedding_retrieval"]);
     }
 
     #[test]

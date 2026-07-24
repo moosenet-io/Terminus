@@ -648,6 +648,54 @@ pub async fn run_diffusion_suite(model_name: &str) -> Result<DiffusionSuiteOutco
     })
 }
 
+/// Outcome of the embedding-retrieval suite (SUITE-EMB, TERM #508) for the tool
+/// return summary.
+pub struct EmbeddingRetrievalSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    /// Human one-liner (metrics, or the skip reason for a non-embedding model).
+    pub summary: String,
+    /// True when the candidate is not an embedding model (clean skip, no rows).
+    pub skipped: bool,
+}
+
+/// Run the embedding-retrieval suite (SUITE-EMB) end-to-end against `model_name`:
+/// load the public (+ optional domain) corpus from `INTAKE_CORPUS_DIR`, embed
+/// every doc/query through Chord's `/v1/embeddings` route via the production
+/// [`crate::intake::assistant::dim6_embeddings::ChordEmbedder`] (which calls
+/// [`crate::intake::infer::embed_with_metrics`]'s `openai_embed` arm — bearer from
+/// the backend's `api_key_env`, never logged), score precision/recall/MRR/nDCG +
+/// dimensionality + throughput + the public-vs-domain delta, and write every row
+/// via [`crate::intake::newcats::embedding_retrieval::score_and_write`].
+///
+/// Creates its own `model_profiles` row (provider `"ollama"` — embedding models
+/// resolve through the Ollama/OpenAI-compatible embeddings path, never the dgem
+/// daemon). A candidate that is not an embedding model is a CLEAN SKIP (no rows),
+/// never an error, matching every other suite's "failure is still signal" stance.
+pub async fn run_embedding_retrieval_suite(
+    model_name: &str,
+) -> Result<EmbeddingRetrievalSuiteOutcome, ToolError> {
+    use crate::intake::assistant::dim6_embeddings::ChordEmbedder;
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::newcats::embedding_retrieval as er;
+
+    let profile_id = create_profile_row(model_name).await?;
+    let pool = storage::get_pool().await?;
+    let (public, domain) = er::load_corpora()?;
+
+    // Backend resolution (GPU vs CPU serve) happens inside the unified embed path;
+    // the tag here keys the stored rows. Embedding serves are GPU-first in this
+    // fleet, so GPU is the default attribution (a future refinement can thread the
+    // observed `EmbedMetrics::hardware` through the embedder).
+    let embedder = ChordEmbedder::new(ModelId::from(model_name), BackendTag::Gpu);
+    let summary = er::score_and_write(&pool, profile_id, &embedder, &public, domain.as_ref()).await?;
+
+    Ok(EmbeddingRetrievalSuiteOutcome {
+        profile_id,
+        summary: summary.line(),
+        skipped: summary.skipped.is_some(),
+    })
+}
+
 /// Disk-usage percentage for a mount via `df`, or None if it can't be read.
 fn disk_pct(mount: &str) -> Option<u8> {
     let out = std::process::Command::new("df")
@@ -774,6 +822,15 @@ pub async fn run_fleet_suites(
                     Ok(s) => parts.push(format!("agent: {s}")),
                     Err(e) => parts.push(format!("agent: error {e}")),
                 }
+            }
+        }
+        // SUITE-EMB (TERM #508): embedding models profile IR retrieval quality
+        // instead of context/code/agent. The driver creates its own profile row
+        // (like the diffusion suite) and cleanly skips a non-embedding candidate.
+        if suites.iter().any(|s| s == "embedding_retrieval") {
+            match run_embedding_retrieval_suite(model).await {
+                Ok(o) => parts.push(format!("embedding_retrieval: {}", o.summary)),
+                Err(e) => parts.push(format!("embedding_retrieval: error {e}")),
             }
         }
 
