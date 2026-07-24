@@ -591,8 +591,8 @@ impl RustTool for ModelIntake {
                 "model_name": { "type": "string", "description": "Ollama model name, e.g. 'gpt-oss:20b'" },
                 "suites": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion"] },
-                    "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other three suites don't apply to it."
+                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing"] },
+                    "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other suites don't apply to it. 'tool_routing' profiles function-calling over Chord's OpenAI-compatible /v1/chat/completions (correct-tool@1, parameter validity, decoy rejection, multi-step) — a first-class generalization of the 'agent' suite's tool-selection path."
                 },
                 "tiers": {
                     "type": "array",
@@ -736,8 +736,8 @@ impl RustTool for ModelIntake {
             ));
         }
 
-        // Ensure a parent profile row for code/agent-only runs.
-        let needs_profile = suites.iter().any(|s| s == "code" || s == "agent");
+        // Ensure a parent profile row for code/agent/tool_routing-only runs.
+        let needs_profile = suites.iter().any(|s| s == "code" || s == "agent" || s == "tool_routing");
         if needs_profile && profile_id.is_none() {
             profile_id = Some(runner::create_profile_row(model_name).await?);
         }
@@ -852,6 +852,24 @@ impl RustTool for ModelIntake {
             } else {
                 out.push_str(&format!("{}\n\n", res.summary));
             }
+        }
+        if suites.iter().any(|s| s == "tool_routing") {
+            let pid = profile_id.expect("profile_id set");
+            let limit = args.get("scenario_limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let res = runner::run_tool_routing_suite(model_name, pid, limit).await?;
+            out.push_str("=== Tool-routing suite ===\n");
+            out.push_str(&format!(
+                "scenarios run: {} ({} rows, {} errored/skipped)\n",
+                res.scenarios_run, res.rows_written, res.errored
+            ));
+            let pct = |v: Option<f64>| v.map(|x| format!("{:.0}%", x * 100.0)).unwrap_or_else(|| "n/a".into());
+            out.push_str(&format!(
+                "correct_tool@1: {} | parameter_validity: {} | decoy_rejection: {} | multi_step: {}\n\n",
+                pct(res.correct_tool_at_1),
+                pct(res.parameter_validity),
+                pct(res.decoy_rejection),
+                pct(res.multi_step_success),
+            ));
         }
 
         out.push_str("Note: coherence_score stored as NULL (LLM-judge deferred).\n");

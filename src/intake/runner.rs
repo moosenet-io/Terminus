@@ -696,6 +696,133 @@ pub async fn run_embedding_retrieval_suite(
     })
 }
 
+/// Per-scenario tool-routing inference timeout (shares the agent suite's env var
+/// + 180s default, since it exercises the same corpus / tool-calling shape).
+fn tool_routing_timeout() -> Duration {
+    super::timeouts::env_timeout("INTAKE_AGENT_TIMEOUT_SEC", 180)
+}
+
+/// The advertised tool-catalog size used for the tool-routing suite: large
+/// enough that decoy rejection + correct-tool@1 are a real discrimination (many
+/// plausible wrong tools alongside the right one), but bounded so the suite stays
+/// fast. The `agent` suite sweeps 10/50/100/200 bands to measure DEGRADATION;
+/// the routing suite instead scores a single representative band per scenario.
+const TOOL_ROUTING_BAND: usize = 50;
+
+/// Outcome of the tool-routing suite (S125 SUITE-TOOL) for the tool summary.
+pub struct ToolRoutingSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub scenarios_run: usize,
+    pub rows_written: usize,
+    /// Per-metric mean over the scenarios that scored it (`None` when none did).
+    pub correct_tool_at_1: Option<f64>,
+    pub parameter_validity: Option<f64>,
+    pub decoy_rejection: Option<f64>,
+    pub multi_step_success: Option<f64>,
+    /// Scenarios skipped because inference errored (not scored, not fabricated).
+    pub errored: usize,
+}
+
+/// Run the tool-routing suite (S125 SUITE-TOOL / TERM-511) against `model_name`,
+/// reusing an existing `model_profiles` row (`profile_id`, as the `agent`/`code`
+/// suites do). Generalizes the `agent` suite's tool-selection/multi-step path
+/// into a first-class profiler that routes through Chord's OpenAI-compatible
+/// `/v1/chat/completions` `tools` endpoint
+/// ([`crate::intake::infer::tool_infer_with_metrics`]) and writes discrete
+/// per-scenario `assistant_dimension_score` rows tagged `task_category =
+/// "tool_routing"` via
+/// [`crate::intake::newcats::tool_routing::score_and_write`].
+///
+/// Reuses [`crate::intake::agent`]'s scenario loader + tool-catalog builder +
+/// multi-step scorer verbatim, so the corpus and catalog have one source of
+/// truth and the legacy `agent` suite is untouched. Only the `tool_selection`
+/// and `multi_step` scenario categories are routing-relevant; the rest
+/// (instruction/hallucination/personality) stay with the `agent` suite and are
+/// filtered out here. A per-scenario inference error is recorded and SKIPPED
+/// (not scored `0.0`), matching every other suite's "a failed case is not a
+/// fabricated zero" convention.
+pub async fn run_tool_routing_suite(
+    model_name: &str,
+    profile_id: uuid::Uuid,
+    limit: Option<usize>,
+) -> Result<ToolRoutingSuiteOutcome, ToolError> {
+    use crate::intake::agent;
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::tool_infer_with_metrics;
+    use crate::intake::newcats::tool_routing::{self, RoutingOutcome};
+
+    let dir = crate::intake::code::corpus_dir()?;
+    let mut scenarios = agent::read_scenarios(&dir)?;
+    scenarios.retain(|s| s.category == "tool_selection" || s.category == "multi_step");
+    if let Some(n) = limit {
+        scenarios.truncate(n);
+    }
+    if scenarios.is_empty() {
+        return Err(ToolError::NotConfigured(
+            "no tool_selection/multi_step scenarios found for tool_routing suite".into(),
+        ));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(format!("client build failed: {e}")))?;
+    let pool = storage::get_pool().await?;
+    let model_id = ModelId::from(model_name);
+    let timeout = tool_routing_timeout();
+
+    // Per-metric tallies (sum, count) so the summary reports means without a
+    // re-query. Order: correct_tool@1, param_validity, decoy_reject, multi_step.
+    let mut tally: std::collections::BTreeMap<String, (f64, usize)> = std::collections::BTreeMap::new();
+    let mut rows_written = 0usize;
+    let mut errored = 0usize;
+
+    for sc in &scenarios {
+        let catalog = if sc.category == "multi_step" {
+            agent::build_catalog(TOOL_ROUTING_BAND, &sc.expected_tools)
+        } else {
+            let required: Vec<String> = sc.expected_tool.iter().cloned().collect();
+            agent::build_catalog(TOOL_ROUTING_BAND, &required)
+        };
+
+        let metrics = tool_infer_with_metrics(&client, model_name, &sc.prompt, &catalog, timeout).await;
+        if metrics.error.is_some() {
+            errored += 1;
+            continue;
+        }
+        let backend_tag = metrics
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Gpu);
+        let outcome = RoutingOutcome {
+            tool_calls: metrics.tool_calls.clone(),
+            error: None,
+        };
+
+        // Tally from the same pure rows we persist (one source of truth).
+        for score in tool_routing::build_scores(model_id.clone(), backend_tag, sc, &outcome) {
+            let e = tally.entry(score.metric.clone()).or_insert((0.0, 0));
+            e.0 += score.value;
+            e.1 += 1;
+        }
+        rows_written += tool_routing::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, sc, &outcome).await?;
+    }
+
+    let mean = |m: &str| tally.get(m).and_then(|(s, n)| if *n > 0 { Some(*s / *n as f64) } else { None });
+
+    Ok(ToolRoutingSuiteOutcome {
+        profile_id,
+        scenarios_run: scenarios.len(),
+        rows_written,
+        correct_tool_at_1: mean(tool_routing::METRIC_CORRECT_TOOL),
+        parameter_validity: mean(tool_routing::METRIC_PARAM_VALIDITY),
+        decoy_rejection: mean(tool_routing::METRIC_DECOY_REJECT),
+        multi_step_success: mean(tool_routing::METRIC_MULTI_STEP),
+        errored,
+    })
+}
+
 /// Disk-usage percentage for a mount via `df`, or None if it can't be read.
 fn disk_pct(mount: &str) -> Option<u8> {
     let out = std::process::Command::new("df")
@@ -801,7 +928,7 @@ pub async fn run_fleet_suites(
                 Err(e) => parts.push(format!("context: error {e}")),
             }
         }
-        let needs = suites.iter().any(|s| s == "code" || s == "agent");
+        let needs = suites.iter().any(|s| s == "code" || s == "agent" || s == "tool_routing");
         if needs && profile_id.is_none() {
             match create_profile_row(model).await {
                 Ok(id) => profile_id = Some(id),
@@ -831,6 +958,23 @@ pub async fn run_fleet_suites(
             match run_embedding_retrieval_suite(model).await {
                 Ok(o) => parts.push(format!("embedding_retrieval: {}", o.summary)),
                 Err(e) => parts.push(format!("embedding_retrieval: error {e}")),
+            }
+        }
+        // S125 SUITE-TOOL: the tool-routing suite is self-contained (it resolves
+        // its own backend + corpus and reuses the shared profile row), so it is
+        // dispatched directly here rather than via an injected closure like
+        // code/agent. Requested only when a model's resolved suites include it.
+        if suites.iter().any(|s| s == "tool_routing") {
+            if let Some(id) = profile_id {
+                match run_tool_routing_suite(model, id, None).await {
+                    Ok(o) => parts.push(format!(
+                        "tool_routing: {} scenarios ({} rows), correct@1={}",
+                        o.scenarios_run,
+                        o.rows_written,
+                        o.correct_tool_at_1.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "n/a".into()),
+                    )),
+                    Err(e) => parts.push(format!("tool_routing: error {e}")),
+                }
             }
         }
 

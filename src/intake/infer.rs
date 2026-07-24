@@ -782,6 +782,202 @@ async fn openai_infer(
     }
 }
 
+/// Normalized result of one tool-calling (function-calling) inference turn.
+///
+/// The tool-routing twin of [`InferMetrics`]: instead of a throughput/token
+/// profile it carries the TOOLS the model chose (`tool_calls`), so a suite can
+/// score correct-tool / parameter-validity / decoy-rejection / multi-step. On any
+/// failure `error` is set and `tool_calls` is empty — callers never panic and
+/// never see a fabricated tool call.
+#[derive(Debug, Clone, Default)]
+pub struct ToolInferMetrics {
+    /// `(function_name, parsed_arguments)` for each tool call, in order. For an
+    /// OpenAI-compatible backend the `arguments` string is JSON-parsed to a
+    /// `Value` (see [`parse_tool_arguments`]); for Ollama it is already an object.
+    pub tool_calls: Vec<(String, serde_json::Value)>,
+    /// Assistant text content (may be empty when the model chose a tool).
+    pub content: String,
+    pub total_time_ms: Option<i32>,
+    pub oom: bool,
+    pub error: Option<String>,
+    /// Backend that served the request (for attribution).
+    pub backend: Option<String>,
+    /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
+    pub hardware: Option<String>,
+}
+
+/// Parse an OpenAI-style tool-call `arguments` value into a JSON `Value`.
+///
+/// The OpenAI function-calling schema returns `arguments` as a STRING containing
+/// serialized JSON (e.g. `"{\"query\":\"Tampa\"}"`), whereas Ollama returns an
+/// object directly. This normalizes both: a string is parsed (a parse failure is
+/// preserved as a `Value::String` so parameter-validity scoring can still see it
+/// as non-object); a non-string value passes through unchanged. Pure.
+pub fn parse_tool_arguments(raw: &serde_json::Value) -> serde_json::Value {
+    match raw {
+        serde_json::Value::String(s) => {
+            serde_json::from_str::<serde_json::Value>(s).unwrap_or_else(|_| raw.clone())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Run `model`/`prompt` with a `tools` catalog on its tagged backend and return
+/// the tool calls the model chose. The tool-calling analogue of
+/// [`infer_with_metrics`]: it resolves the model's backend via [`resolve_backend`]
+/// and dispatches to that backend's tool-calling wire path. Never panics —
+/// transport/HTTP/backend errors land in [`ToolInferMetrics::error`].
+///
+/// Backend support: the OpenAI-compatible path (Chord's `/v1/chat/completions`
+/// with a `tools` array, `openai_tool_infer`) is primary; an `ollama`-tagged
+/// model is routed through the existing `/api/chat` tool seam
+/// ([`context::chat_with_tools`]) so it stays profilable. Any other backend kind
+/// returns a clear, non-silent error (the runner turns it into a clean skip).
+pub async fn tool_infer_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    prompt: &str,
+    tools: &serde_json::Value,
+    timeout: Duration,
+) -> ToolInferMetrics {
+    let backend = resolve_backend(model);
+    let mut m = ToolInferMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        // Chord / lemonade / vLLM / OpenRouter — the OpenAI function-calling wire.
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_tool_infer(
+                client,
+                &backend.url,
+                model,
+                prompt,
+                tools,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
+        // Reuse the original agent seam for an ollama-tagged model (base URL from
+        // `context::ollama_base`, not `backend.url` — same as the `agent` suite).
+        "ollama" => {
+            let out = context::chat_with_tools(client, model, prompt, tools, timeout).await;
+            m.tool_calls = out.tool_calls;
+            m.content = out.content;
+            m.total_time_ms = out.total_time_ms;
+            m.oom = out.oom;
+            m.error = out.error;
+        }
+        other => {
+            m.error = Some(format!(
+                "backend '{}' kind '{other}' does not support tool-calling inference",
+                backend.name
+            ));
+        }
+    }
+    m
+}
+
+/// OpenAI-compatible tool-calling (`POST {base}/v1/chat/completions` with a
+/// `tools` array). The tool-calling twin of [`openai_infer`]: it passes the tool
+/// catalog + `tool_choice: "auto"`, then parses `choices[0].message.tool_calls`
+/// (function name + JSON-string arguments, normalized via [`parse_tool_arguments`]).
+/// Timing is measured LOCALLY (wall clock); `auth` is an optional bearer token
+/// resolved from the backend's `api_key_env` — never logged. Never panics — every
+/// failure lands in `m.error`, and a tool call is never fabricated.
+async fn openai_tool_infer(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    prompt: &str,
+    tools: &serde_json::Value,
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut ToolInferMetrics,
+) {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "stream": false,
+    });
+    if tools.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+        body["tools"] = tools.clone();
+        body["tool_choice"] = serde_json::json!("auto");
+    }
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/chat/completions", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = e.to_string();
+            m.oom = msg.to_lowercase().contains("memory") || msg.to_lowercase().contains("oom");
+            m.error = Some(msg);
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let txt = resp.text().await.unwrap_or_default();
+        m.oom = code == 500 && txt.to_lowercase().contains("memory");
+        m.error = Some(format!("openai HTTP {code}: {txt}"));
+        return;
+    }
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("openai response parse error: {e}"));
+            return;
+        }
+    };
+    m.total_time_ms = Some(started.elapsed().as_millis() as i32);
+    m.content = v
+        .pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if let Some(calls) = v
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(|c| c.as_array())
+    {
+        for c in calls {
+            let name = c
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let args = c
+                .pointer("/function/arguments")
+                .map(parse_tool_arguments)
+                .unwrap_or(serde_json::Value::Null);
+            m.tool_calls.push((name, args));
+        }
+    }
+}
+
 async fn llama_server_infer(
     client: &reqwest::Client,
     base: &str,
@@ -1194,6 +1390,123 @@ mod tests {
         .await;
         assert!(m.error.as_deref().unwrap_or("").contains("500"));
         assert!(m.embedding.is_empty());
+    }
+
+    // S125 SUITE-TOOL: `arguments` normalization — OpenAI returns a JSON STRING,
+    // Ollama an object; both must land as a `Value` (object stays an object).
+    #[test]
+    fn parse_tool_arguments_handles_string_and_object() {
+        // OpenAI: arguments is a serialized-JSON string → parsed to an object.
+        let parsed = parse_tool_arguments(&serde_json::json!("{\"query\":\"Tampa\"}"));
+        assert!(parsed.is_object());
+        assert_eq!(parsed["query"], "Tampa");
+        // Ollama: arguments already an object → passes through unchanged.
+        let obj = serde_json::json!({"query": "Tampa"});
+        assert_eq!(parse_tool_arguments(&obj), obj);
+        // An un-parseable string is preserved as a String (so param-validity can
+        // see it is NOT an object) rather than being dropped.
+        let bad = parse_tool_arguments(&serde_json::json!("not json"));
+        assert!(bad.is_string());
+    }
+
+    // S125 SUITE-TOOL: the tool-calling arm passes `tools`, parses `tool_calls`,
+    // and normalizes the OpenAI JSON-string arguments into an object.
+    #[tokio::test]
+    async fn openai_tool_infer_parses_tool_calls() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/chat/completions");
+                then.status(200).json_body(serde_json::json!({
+                    "choices": [{ "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "type": "function",
+                            "function": { "name": "weather", "arguments": "{\"query\":\"Tampa\"}" }
+                        }]
+                    }}]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ToolInferMetrics::default();
+        let tools = serde_json::json!([
+            {"type": "function", "function": {"name": "weather", "description": "d", "parameters": {"type": "object", "properties": {}}}}
+        ]);
+        openai_tool_infer(
+            &client,
+            &server.base_url(),
+            "test-model",
+            "weather in Tampa?",
+            &tools,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert_eq!(m.tool_calls.len(), 1);
+        assert_eq!(m.tool_calls[0].0, "weather");
+        assert!(m.tool_calls[0].1.is_object());
+        assert_eq!(m.tool_calls[0].1["query"], "Tampa");
+        assert!(m.error.is_none());
+    }
+
+    // No tool call (adversarial/decoy prompt) → empty tool_calls, clean success.
+    #[tokio::test]
+    async fn openai_tool_infer_no_tool_call_is_empty_not_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/chat/completions");
+                then.status(200).json_body(serde_json::json!({
+                    "choices": [{ "message": { "role": "assistant", "content": "I can't help with that." } }]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ToolInferMetrics::default();
+        openai_tool_infer(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            &serde_json::json!([]),
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.tool_calls.is_empty());
+        assert!(m.error.is_none());
+        assert_eq!(m.content, "I can't help with that.");
+    }
+
+    #[tokio::test]
+    async fn openai_tool_infer_surfaces_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/chat/completions");
+                then.status(500).body("boom");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ToolInferMetrics::default();
+        openai_tool_infer(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            &serde_json::json!([]),
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.tool_calls.is_empty());
     }
 
     // A non-embedding model often 200s with an empty vector — treat as a clean error.

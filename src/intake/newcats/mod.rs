@@ -37,6 +37,14 @@
 //!     the newcats surface (`INTAKE_CORPUS_DIR` loader, throughput metric,
 //!     `score_and_write`). Backend seam = Chord `/v1/embeddings` via
 //!     `infer::embed_with_metrics`'s `openai_embed` arm.
+//!   - [`tool_routing`]       — `task_category = "tool_routing"` (S125 SUITE-TOOL):
+//!     the first-class tool-routing / function-calling profiler. Unlike the four
+//!     synthetic-corpus siblings it REUSES the `agent` suite's scenario corpus
+//!     (`agent-scenarios.json`) + tool-catalog builder + multi-step scorer, but
+//!     routes through Chord's OpenAI-compatible `/v1/chat/completions` `tools`
+//!     path (`infer::tool_infer_with_metrics`) and scores discrete metrics
+//!     (`correct_tool_at_1`, `parameter_validity`, `decoy_rejection`,
+//!     `multi_step_success`). The legacy `agent` suite is left untouched.
 //!
 //! ## Shared scoring primitives
 //! [`text_similarity`] holds the small, dependency-free string-similarity
@@ -58,4 +66,5 @@ pub mod embedding_retrieval;
 pub mod image_generation;
 pub mod image_parsing;
 pub mod text_similarity;
+pub mod tool_routing;
 pub mod voice_transcription;

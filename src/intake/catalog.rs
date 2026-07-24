@@ -79,6 +79,10 @@ pub const TEST_TYPE_DIFFUSION: &str = "diffusion";
 /// `task_category = "embedding_retrieval"`; see
 /// [`crate::intake::newcats::embedding_retrieval`].
 pub const TEST_TYPE_EMBEDDING_RETRIEVAL: &str = "embedding_retrieval";
+/// S125 SUITE-TOOL: the tool-routing suite's test-family tag (correct-tool@1,
+/// parameter validity, decoy rejection, multi-step — distinct from the legacy
+/// `agent` tool-use family, which stays a scalar accuracy on its own axis).
+pub const TEST_TYPE_TOOL_ROUTING: &str = "tool_routing";
 
 /// The single serving/context-profile leaf category.
 pub const SERVING_CATEGORY: &str = "context_profile";
@@ -87,6 +91,9 @@ pub const AGENT_CATEGORY: &str = "tool_use";
 /// The single embedding-retrieval leaf category (matches the `newcats` module's
 /// `TASK_CATEGORY`).
 pub const EMBEDDING_RETRIEVAL_CATEGORY: &str = "embedding_retrieval";
+/// The single tool-routing leaf category (all four routing metrics roll up under
+/// the one `"tool_routing"` dimension written by the suite).
+pub const TOOL_ROUTING_CATEGORY: &str = "tool_routing";
 
 /// A cell's coverage status. `not_run` is FIRST-CLASS — representing gaps is the
 /// catalog's whole job.
@@ -547,6 +554,32 @@ pub fn build_catalog(inputs: &CatalogInputs) -> Vec<ModelCatalog> {
             TEST_TYPE_EMBEDDING_RETRIEVAL,
             EMBEDDING_RETRIEVAL_CATEGORY,
         ));
+        // ---- tool-routing cell (S125 SUITE-TOOL) -----------------------------
+        // Reads the same assistant-dimension rollups (`read_assistant_cells`
+        // groups by dimension across every task_category), keyed on the suite's
+        // own `"tool_routing"` dimension — so it never collides with the
+        // hardcoded ASSISTANT_DIMENSIONS list above.
+        let tool_routing_row = inputs
+            .assistant
+            .iter()
+            .find(|a| a.model_name == model && a.dimension == TOOL_ROUTING_CATEGORY);
+        let tool_routing_cell = match tool_routing_row {
+            Some(a) if a.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_TOOL_ROUTING.to_string(),
+                task_category: TOOL_ROUTING_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                pass_rate: None,
+                n_samples: Some(a.n_samples),
+                score_stddev: a.score_stddev,
+                low_confidence: Some(a.n_samples <= 1),
+                last_run_at: a.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_TOOL_ROUTING, TOOL_ROUTING_CATEGORY),
+        };
+        cells.push(tool_routing_cell);
 
         // ---- serving facts (fleet card) --------------------------------------
         let serving = ServingFacts {
@@ -1226,9 +1259,9 @@ mod tests {
             "every cell must be not_run"
         );
         // Coder (3) + assistant (7) + serving (1) + agent (1) +
-        // embedding_retrieval (1, SUITE-EMB) = 13 cells.
-        assert_eq!(m.cells.len(), 13);
-        assert_eq!(m.not_run_count, 13);
+        // embedding_retrieval (1, SUITE-EMB) + tool_routing (1, SUITE-TOOL) = 14 cells.
+        assert_eq!(m.cells.len(), 14);
+        assert_eq!(m.not_run_count, 14);
         // multi_file gap is explicitly present, not omitted.
         assert_eq!(
             cell(&cat, "ghost", "coder", "multi_file").status,
