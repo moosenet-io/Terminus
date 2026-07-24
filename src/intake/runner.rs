@@ -934,6 +934,106 @@ pub async fn run_vision_qa_suite(model_name: &str) -> Result<VisionQaSuiteOutcom
     })
 }
 
+/// Outcome of the reranking suite (SUITE-RRK) for the tool return summary.
+pub struct RerankingSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub queries_run: usize,
+    pub avg_ndcg_uplift: f64,
+    pub avg_reranked_ndcg: f64,
+    pub avg_latency_ms: f64,
+    /// One-line-per-query summary, in corpus order.
+    pub per_query: Vec<String>,
+}
+
+/// Run the reranking suite (SUITE-RRK) end-to-end against `model_name`: load the
+/// reranking corpus (`INTAKE_CORPUS_DIR/reranking.json`), and for each query run
+/// one rerank through [`crate::intake::infer::rerank_with_metrics`] (which routes
+/// an `openai`-tagged model onto Chord's `/v1/rerank`, backed by
+/// bge-reranker-v2-m3), derive a
+/// [`crate::intake::newcats::reranking::RerankOutcome`] from the normalized
+/// [`crate::intake::infer::RerankMetrics`], and write the nDCG-uplift / nDCG /
+/// latency rows via [`crate::intake::newcats::reranking::score_and_write`].
+///
+/// Creates its own `model_profiles` row (provider `"openai"`, since a reranker
+/// runs on Chord's OpenAI-compatible route, not Ollama, and never goes through
+/// [`run_context_suite`]). A per-query rerank error is skipped (recorded in the
+/// summary) rather than aborting the whole suite — matching every other
+/// `newcats` category's "failure is still useful signal" convention. A missing
+/// corpus fails the whole suite up front (a `ToolError`), since without it there
+/// is nothing to score.
+pub async fn run_reranking_suite(model_name: &str) -> Result<RerankingSuiteOutcome, ToolError> {
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::rerank_with_metrics;
+    use crate::intake::newcats::reranking::{self, RerankOutcome};
+
+    let corpus = reranking::load_corpus()?;
+    let profile_id = create_profile_row_for_provider(model_name, "openai").await?;
+    let pool = storage::get_pool().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(e.to_string()))?;
+    let model_id = ModelId::from(model_name);
+
+    let mut per_query = Vec::with_capacity(corpus.len());
+    let mut uplift_sum = 0.0;
+    let mut ndcg_sum = 0.0;
+    let mut latency_sum = 0.0;
+    let mut n = 0usize;
+
+    for query in &corpus {
+        let metrics = rerank_with_metrics(
+            &client,
+            model_name,
+            &query.query,
+            &query.passages,
+            Duration::from_secs(120),
+        )
+        .await;
+        let backend_tag = metrics
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Cpu);
+
+        if let Some(err) = &metrics.error {
+            per_query.push(format!("{}: error ({err})", query.query_id));
+            continue;
+        }
+
+        let outcome = RerankOutcome {
+            reranked_order: metrics.ranking.clone(),
+            latency_ms: metrics.latency_ms,
+        };
+        let reranked_ndcg =
+            reranking::ndcg_at_k(&outcome.reranked_order, &query.relevance, reranking::DEFAULT_K);
+        let baseline_ndcg =
+            reranking::ndcg_at_k(&query.baseline_order, &query.relevance, reranking::DEFAULT_K);
+        let uplift = reranked_ndcg - baseline_ndcg;
+        uplift_sum += uplift;
+        ndcg_sum += reranked_ndcg;
+        latency_sum += outcome.latency_ms as f64;
+        n += 1;
+
+        reranking::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, query, &outcome)
+            .await?;
+
+        per_query.push(format!(
+            "{}: uplift={uplift:.3} ndcg={reranked_ndcg:.3} latency_ms={}",
+            query.query_id, outcome.latency_ms,
+        ));
+    }
+
+    Ok(RerankingSuiteOutcome {
+        profile_id,
+        queries_run: n,
+        avg_ndcg_uplift: if n > 0 { uplift_sum / n as f64 } else { 0.0 },
+        avg_reranked_ndcg: if n > 0 { ndcg_sum / n as f64 } else { 0.0 },
+        avg_latency_ms: if n > 0 { latency_sum / n as f64 } else { 0.0 },
+        per_query,
+    })
+}
+
 /// Disk-usage percentage for a mount via `df`, or None if it can't be read.
 fn disk_pct(mount: &str) -> Option<u8> {
     let out = std::process::Command::new("df")
@@ -1101,6 +1201,21 @@ pub async fn run_fleet_suites(
                     v.items_run, v.accuracy, v.hallucination_rate
                 )),
                 Err(e) => parts.push(format!("vision_qa: error {e}")),
+            }
+        }
+
+        // SUITE-RRK: reranking self-manages its own profile row (provider
+        // "openai", Chord's /v1/rerank), independent of the Ollama-shared
+        // profile_id above — a reranker never goes through the context/code/
+        // agent path. A per-query error is folded into the returned summary; an
+        // error here (e.g. missing corpus) degrades this model's line only.
+        if suites.iter().any(|s| s == "reranking") {
+            match run_reranking_suite(model).await {
+                Ok(o) => parts.push(format!(
+                    "reranking: uplift={:.3} ndcg={:.3} queries={}",
+                    o.avg_ndcg_uplift, o.avg_reranked_ndcg, o.queries_run
+                )),
+                Err(e) => parts.push(format!("reranking: error {e}")),
             }
         }
 

@@ -1,0 +1,50 @@
+[
+  {
+    "query_id": "rrk-01",
+    "query": "How do I handle errors in Rust without panicking?",
+    "passages": [
+      "Python uses try/except blocks to catch exceptions at runtime.",
+      "In Rust, recoverable errors are represented with the Result type and propagated with the question-mark operator instead of panicking.",
+      "The panic! macro aborts the current thread and unwinds the stack.",
+      "Rust's Option type encodes the possible absence of a value as Some or None."
+    ],
+    "relevance": [0.0, 3.0, 1.0, 1.0],
+    "baseline_order": [2, 1, 3, 0]
+  },
+  {
+    "query_id": "rrk-02",
+    "query": "What is a cross-encoder reranker used for?",
+    "passages": [
+      "A bi-encoder embeds the query and each document independently for fast approximate retrieval.",
+      "A cross-encoder jointly encodes the query and a candidate passage to produce a precise relevance score, used to rerank a shortlist from a cheaper first stage.",
+      "TF-IDF weights terms by how rare they are across a document collection.",
+      "Vector databases index dense embeddings for approximate nearest-neighbor search."
+    ],
+    "relevance": [1.0, 3.0, 0.0, 1.0],
+    "baseline_order": [0, 3, 1, 2]
+  },
+  {
+    "query_id": "rrk-03",
+    "query": "How does nDCG measure ranking quality?",
+    "passages": [
+      "Precision at k counts how many of the top k results are relevant.",
+      "Normalized Discounted Cumulative Gain discounts each result's graded relevance by its rank position and normalizes against the ideal ordering.",
+      "BM25 is a bag-of-words ranking function based on term frequency and document length.",
+      "Mean reciprocal rank averages the inverse rank of the first relevant result."
+    ],
+    "relevance": [1.0, 3.0, 0.0, 1.0],
+    "baseline_order": [3, 0, 1, 2]
+  },
+  {
+    "query_id": "rrk-04",
+    "query": "What guarantees does TLS provide for network traffic?",
+    "passages": [
+      "TLS provides confidentiality and integrity for data in transit and authenticates the server via certificates.",
+      "A load balancer distributes incoming requests across a pool of backend servers.",
+      "DNS resolves human-readable hostnames to network addresses.",
+      "Gzip compresses HTTP response bodies to reduce transfer size."
+    ],
+    "relevance": [3.0, 0.0, 0.0, 0.0],
+    "baseline_order": [1, 0, 2, 3]
+  }
+]

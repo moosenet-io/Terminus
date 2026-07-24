@@ -703,6 +703,186 @@ async fn openai_embed(
     m.latency_ms = latency_ms;
 }
 
+/// Normalized result of a single rerank request via the unified path (SUITE-RRK).
+///
+/// `ranking` is the list of input-document indices in the backend's returned
+/// order (best-first for an OpenAI/Cohere/TEI-style rerank endpoint); `scores`
+/// is the aligned relevance score per ranked position, when the server returns
+/// one. `latency_ms` is the wall-clock round-trip. On any failure (transport,
+/// HTTP, parse, empty result set, or a backend whose kind does not support
+/// reranking) `error` is set and `ranking`/`scores` stay empty — callers never
+/// panic and never see a fabricated ranking. Deliberately shaped like
+/// [`EmbedMetrics`] (no `oom` field — a rerank call is not a generation).
+#[derive(Debug, Clone, Default)]
+pub struct RerankMetrics {
+    /// Input-document indices in the backend's returned order (best-first).
+    pub ranking: Vec<usize>,
+    /// Relevance score aligned to `ranking`; empty when the server omits scores.
+    pub scores: Vec<f64>,
+    pub latency_ms: i64,
+    pub error: Option<String>,
+    /// Backend that served the request (for attribution).
+    pub backend: Option<String>,
+    /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
+    pub hardware: Option<String>,
+}
+
+/// Rerank `documents` for `query`/`model` through Chord's unified backend-routing
+/// path (SUITE-RRK). The rerank analogue of [`embed_with_metrics`]: it resolves
+/// the model's tagged backend via [`resolve_backend`] (P5 routing) and dispatches
+/// to that backend's rerank endpoint. The reranking sub-harness is a *client* of
+/// this function — it NEVER opens a socket to the reranker (bge-reranker-v2-m3 on
+/// Chord's `/v1/rerank`) directly.
+///
+/// Backend support: the OpenAI-compatible `/v1/rerank` wire path (Chord's proxy,
+/// or any Cohere/Jina/TEI-style rerank server) is implemented. Any other backend
+/// kind returns a clear, non-silent error (so a non-reranking candidate is
+/// skipped cleanly upstream, not crashed). Never panics — every failure lands in
+/// [`RerankMetrics::error`].
+pub async fn rerank_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    query: &str,
+    documents: &[String],
+    timeout: Duration,
+) -> RerankMetrics {
+    let backend = resolve_backend(model);
+    let mut m = RerankMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        // SUITE-RRK: any OpenAI-compatible rerank backend — Chord's `/v1/rerank`
+        // proxy (bge-reranker-v2-m3), or a Cohere/Jina/TEI rerank server. Mirrors
+        // the `embed_with_metrics` "openai" arm exactly: the bearer token is
+        // optional and resolved from the backend's `api_key_env` at call time
+        // (never stored, never logged).
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_rerank(
+                client,
+                &backend.url,
+                model,
+                query,
+                documents,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
+        other => {
+            // No rerank wire path for this backend kind: a clear, non-silent
+            // error that the runner turns into a clean "skip" (not a crash).
+            m.error = Some(format!(
+                "backend '{}' kind '{other}' does not support reranking",
+                backend.name
+            ));
+        }
+    }
+    m
+}
+
+/// SUITE-RRK: OpenAI-compatible reranking (`POST {base}/v1/rerank`). The rerank
+/// twin of [`openai_embed`]: profiles any backend speaking the OpenAI/Cohere/Jina
+/// rerank wire protocol — Chord's proxy in front of bge-reranker-v2-m3, or a TEI
+/// rerank serve. The request body is `{model, query, documents:[...]}`; latency is
+/// measured LOCALLY (wall clock); `auth` is an optional bearer token resolved from
+/// the backend's `api_key_env` — never logged. The ranking is taken from the
+/// `results` array (each entry an `{index, relevance_score}`); a missing/empty
+/// `results` set is a clean, non-silent error so the runner skips it rather than
+/// crashing. Never panics — every failure lands in `m.error`, and the ranking is
+/// never fabricated.
+async fn openai_rerank(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    query: &str,
+    documents: &[String],
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut RerankMetrics,
+) {
+    let body = serde_json::json!({ "model": model, "query": query, "documents": documents });
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/rerank", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            m.error = Some(e.to_string());
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let txt = resp.text().await.unwrap_or_default();
+        m.error = Some(format!("openai rerank HTTP {code}: {txt}"));
+        return;
+    }
+    let latency_ms = started.elapsed().as_millis() as i64;
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("openai rerank response parse error: {e}"));
+            return;
+        }
+    };
+    // Some OpenAI-compatible servers return 200 with an `{"error": {...}}` body; surface
+    // it rather than treating the run as a success with an empty ranking.
+    if let Some(err) = v.pointer("/error/message").and_then(|e| e.as_str()) {
+        m.error = Some(err.to_string());
+        return;
+    }
+    // Rerank schema: { "results": [ { "index": usize, "relevance_score": f64 }, ... ] },
+    // best-first. `relevance_score` is the OpenAI/Jina field; some servers use `score`.
+    let Some(results) = v.get("results").and_then(|r| r.as_array()) else {
+        m.error = Some("openai rerank response missing a 'results' array".to_string());
+        return;
+    };
+    let mut ranking = Vec::with_capacity(results.len());
+    let mut scores = Vec::with_capacity(results.len());
+    for item in results {
+        // An entry without a usable index is unrankable — skip it rather than
+        // fabricate a position, and let the empty-set guard below catch a body
+        // that yielded nothing usable.
+        let Some(idx) = item.get("index").and_then(|i| i.as_u64()) else {
+            continue;
+        };
+        let score = item
+            .get("relevance_score")
+            .or_else(|| item.get("score"))
+            .and_then(|s| s.as_f64())
+            .unwrap_or(0.0);
+        ranking.push(idx as usize);
+        scores.push(score);
+    }
+    if ranking.is_empty() {
+        m.error = Some("openai rerank endpoint returned no usable results".to_string());
+        return;
+    }
+    m.ranking = ranking;
+    m.scores = scores;
+    m.latency_ms = latency_ms;
+}
+
 /// Subset of Ollama `/api/embeddings` response we consume.
 #[derive(Deserialize)]
 struct OllamaEmbedResponse {
@@ -1861,5 +2041,133 @@ mod tests {
         mock.assert_async().await;
         assert_eq!(m.dimensionality, 2);
         assert!(m.error.is_none());
+    }
+
+    // SUITE-RRK: OpenAI-compatible rerank arm parses the `results` array into a
+    // best-first ranking + aligned scores, and leaves `error` unset. Mirrors
+    // `openai_embed_parses_data_embedding`.
+    #[tokio::test]
+    async fn openai_rerank_parses_results() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/rerank");
+                then.status(200).json_body(serde_json::json!({
+                    "results": [
+                        { "index": 2, "relevance_score": 0.91 },
+                        { "index": 0, "relevance_score": 0.42 },
+                        { "index": 1, "relevance_score": 0.05 }
+                    ]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = RerankMetrics::default();
+        let docs = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        openai_rerank(
+            &client,
+            &server.base_url(),
+            "test-reranker",
+            "q",
+            &docs,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        // Best-first ranking preserved from the server's returned order.
+        assert_eq!(m.ranking, vec![2, 0, 1]);
+        assert_eq!(m.scores.len(), 3);
+        assert!((m.scores[0] - 0.91).abs() < 1e-9);
+        assert!(m.error.is_none());
+        assert!(m.latency_ms >= 0);
+    }
+
+    // SUITE-RRK: a `score` field (instead of `relevance_score`) is also accepted.
+    #[tokio::test]
+    async fn openai_rerank_accepts_score_field_alias() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/rerank");
+                then.status(200).json_body(serde_json::json!({
+                    "results": [ { "index": 0, "score": 0.7 } ]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = RerankMetrics::default();
+        let docs = vec!["only".to_string()];
+        openai_rerank(
+            &client,
+            &server.base_url(),
+            "m",
+            "q",
+            &docs,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert_eq!(m.ranking, vec![0]);
+        assert!((m.scores[0] - 0.7).abs() < 1e-9);
+        assert!(m.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_rerank_surfaces_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/rerank");
+                then.status(500).body("boom");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = RerankMetrics::default();
+        let docs = vec!["a".to_string()];
+        openai_rerank(
+            &client,
+            &server.base_url(),
+            "m",
+            "q",
+            &docs,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.ranking.is_empty());
+    }
+
+    // An empty/absent `results` set is a clean, non-silent error — never a
+    // fabricated ranking.
+    #[tokio::test]
+    async fn openai_rerank_empty_results_is_clean_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/rerank");
+                then.status(200).json_body(serde_json::json!({ "results": [] }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = RerankMetrics::default();
+        let docs = vec!["a".to_string()];
+        openai_rerank(
+            &client,
+            &server.base_url(),
+            "m",
+            "q",
+            &docs,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("no usable results"));
+        assert!(m.ranking.is_empty());
     }
 }

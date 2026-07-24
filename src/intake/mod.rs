@@ -476,6 +476,9 @@ fn parse_suites(args: &Value, model_name: &str) -> Vec<String> {
 ///   - "nomic-embed"/"bge"/…    → [embedding_retrieval]  (SUITE-EMB: an
 ///                                embedding model can't run the chat-shaped
 ///                                suites; see [`is_embedding_model`])
+///   - "rerank"                 → [reranking]  (SUITE-RRK: a cross-encoder
+///                                reranker profiled via Chord's /v1/rerank,
+///                                not an Ollama generative suite)
 ///   - default                  → [context]
 /// Pure.
 pub fn default_suites_for(model_name: &str) -> Vec<String> {
@@ -490,6 +493,11 @@ pub fn default_suites_for(model_name: &str) -> Vec<String> {
         // SUITE-VQA: a vision/VLM model's default is the image-QA suite (the
         // Ollama context suite is text-only and doesn't exercise its vision path).
         vec!["vision_qa"]
+    } else if n.contains("rerank") {
+        // SUITE-RRK: a reranker (e.g. bge-reranker-v2-m3) is a cross-encoder, not
+        // a generative model — the Ollama-based suites don't apply; its default
+        // is the reranking suite via Chord's /v1/rerank.
+        vec!["reranking"]
     } else if n.contains("coder") {
         vec!["context", "code"]
     } else if n.contains("gpt-oss") {
@@ -611,7 +619,7 @@ impl RustTool for ModelIntake {
                 "model_name": { "type": "string", "description": "Ollama model name, e.g. 'gpt-oss:20b'" },
                 "suites": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing", "vision_qa"] },
+                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing", "vision_qa", "reranking"] },
                     "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other suites don't apply to it. 'tool_routing' profiles function-calling over Chord's OpenAI-compatible /v1/chat/completions (correct-tool@1, parameter validity, decoy rejection, multi-step) — a first-class generalization of the 'agent' suite's tool-selection path. 'vision_qa' profiles a vision/VLM model on image-QA via Chord's chat/vision route (accuracy, caption similarity, hallucination, latency, VRAM)."
                 },
                 "tiers": {
@@ -903,6 +911,22 @@ impl RustTool for ModelIntake {
                 res.items_run, res.accuracy, res.hallucination_rate, res.avg_latency_ms,
             ));
             for line in &res.per_item {
+                out.push_str(&format!("  {line}\n"));
+            }
+            out.push('\n');
+        }
+
+        // SUITE-RRK: reranking self-manages its profile row (provider "openai",
+        // Chord's /v1/rerank) and needs no shared `profile_id` — a reranker never
+        // runs the Ollama-based context/code/agent suites.
+        if suites.iter().any(|s| s == "reranking") {
+            let res = runner::run_reranking_suite(model_name).await?;
+            out.push_str("=== Reranking suite ===\n");
+            out.push_str(&format!(
+                "queries run: {}\navg nDCG uplift: {:+.3}\navg reranked nDCG: {:.3}\navg latency_ms: {:.0}\n",
+                res.queries_run, res.avg_ndcg_uplift, res.avg_reranked_ndcg, res.avg_latency_ms,
+            ));
+            for line in &res.per_query {
                 out.push_str(&format!("  {line}\n"));
             }
             out.push('\n');

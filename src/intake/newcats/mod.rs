@@ -51,6 +51,13 @@
 //!     path (`infer::tool_infer_with_metrics`) and scores discrete metrics
 //!     (`correct_tool_at_1`, `parameter_validity`, `decoy_rejection`,
 //!     `multi_step_success`). The legacy `agent` suite is left untouched.
+//!   - [`reranking`]            — `task_category = "reranking"` (SUITE-RRK):
+//!     cross-encoder reranking probe. Emits nDCG UPLIFT over a bi-encoder
+//!     baseline (`ndcg_uplift`), the reranked/baseline nDCG, and rerank
+//!     `latency_ms`. The live backend call goes through
+//!     `intake::infer::rerank_with_metrics`'s `kind == "openai"` arm
+//!     (`POST /v1/rerank`, bge-reranker-v2-m3); scoring (pure nDCG) is
+//!     unit-tested against a mock ordering. Corpus via `INTAKE_CORPUS_DIR`.
 //!
 //! ## Shared scoring primitives
 //! [`text_similarity`] holds the small, dependency-free string-similarity
@@ -71,6 +78,7 @@ pub mod document_parsing;
 pub mod embedding_retrieval;
 pub mod image_generation;
 pub mod image_parsing;
+pub mod reranking;
 pub mod text_similarity;
 pub mod tool_routing;
 pub mod voice_transcription;
