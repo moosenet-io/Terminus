@@ -482,6 +482,34 @@ pub async fn run_tier(
     let prompt = plant_facts(&filler);
     let actual_tokens = estimate_tokens(&prompt);
 
+    // BT-02: backend-agnostic context tier. Ollama keeps its native `/api/generate` path
+    // below (rich `prompt_eval_duration`/`eval_*` → TTFT + throughput). ANY other backend
+    // kind (openai/llama-server/daemon) routes through the backend-resolved
+    // `infer_with_metrics` dispatch — otherwise the context suite would POST an ollama
+    // route at a non-ollama URL and fail. This is what makes the context suite profile
+    // lemonade/vLLM/OpenRouter/Chord, not just ollama.
+    let backend = crate::intake::infer::resolve_backend(model_name);
+    if backend.kind != "ollama" {
+        let m = crate::intake::infer::infer_with_metrics(client, model_name, &prompt, timeout).await;
+        let mut result = TierResult {
+            context_tokens: actual_tokens,
+            throughput_tok_per_sec: m.throughput_tok_per_sec,
+            ttft_ms: m.ttft_ms,
+            total_time_ms: m.total_time_ms,
+            recall_score: None,
+            coherence_score: None,
+            memory_usage_mb: None,
+            oom: m.oom,
+            error: m.error.clone(),
+            response: String::new(),
+        };
+        if result.error.is_none() {
+            result.recall_score = Some(score_recall(&m.response));
+            result.response = m.response;
+        }
+        return result;
+    }
+
     let base = ollama_base();
     let body = serde_json::json!({
         "model": model_name,
