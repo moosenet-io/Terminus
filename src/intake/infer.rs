@@ -673,12 +673,18 @@ async fn openai_embed(
     let mut embedding: Vec<f32> = Vec::with_capacity(arr.len());
     for (i, x) in arr.iter().enumerate() {
         match x.as_f64() {
-            Some(f) if f.is_finite() => embedding.push(f as f32),
-            Some(_) => {
-                m.error = Some(format!(
-                    "openai embeddings response has a non-finite element at index {i}"
-                ));
-                return;
+            Some(f) => {
+                // Validate the CONVERTED f32 (the stored type), not just the f64: a finite
+                // f64 like 1e100 casts to +Inf as f32, so an f64-only finite check would let
+                // an Inf component slip through as a "successful" embedding (codex review).
+                let fv = f as f32;
+                if !fv.is_finite() {
+                    m.error = Some(format!(
+                        "openai embeddings response has a non-finite element at index {i}"
+                    ));
+                    return;
+                }
+                embedding.push(fv);
             }
             None => {
                 m.error = Some(format!(
@@ -1274,6 +1280,35 @@ mod tests {
         )
         .await;
         assert!(m.error.is_some());
+        assert!(m.embedding.is_empty());
+        assert_eq!(m.dimensionality, 0);
+    }
+
+    // codex review (S125): an element finite as f64 but +Inf once cast to the stored f32
+    // (e.g. 1e100) must be rejected — checking the f32, not only the f64, is what catches it.
+    #[tokio::test]
+    async fn openai_embed_rejects_f32_overflow_element() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/embeddings");
+                then.status(200)
+                    .json_body(serde_json::json!({ "data": [{ "embedding": [0.1, 1e100] }] }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = EmbedMetrics::default();
+        openai_embed(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("non-finite"));
         assert!(m.embedding.is_empty());
         assert_eq!(m.dimensionality, 0);
     }
