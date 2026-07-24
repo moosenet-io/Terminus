@@ -66,11 +66,15 @@ fn default_model_arg() -> String {
 pub struct ResolvedBackend {
     pub name: String,
     pub url: String,
-    pub kind: String,     // "ollama" | "llama-server" | "daemon"
+    pub kind: String,     // "ollama" | "llama-server" | "daemon" | "openai" (BT-01)
     pub hardware: String, // "gpu" | "cpu"
     pub always_on: bool,
     pub unit: Option<String>,
     pub launch: Option<LaunchSpec>,
+    /// BT-01: env var holding the bearer token for an OpenAI-compatible backend
+    /// (OpenRouter, or Chord's JWT). `None` for unauthenticated local serves
+    /// (lemonade/vLLM). Read at call time, never stored/logged.
+    pub api_key_env: Option<String>,
     /// The requesting model's local Ollama root (for blob resolution), if known.
     pub model_local_path: Option<String>,
     /// Direct GGUF path for a non-Ollama model (first shard if sharded); when set
@@ -111,6 +115,8 @@ struct RegBackend {
     unit: Option<String>,
     #[serde(default)]
     launch: Option<LaunchSpec>,
+    #[serde(default)]
+    api_key_env: Option<String>,
 }
 
 /// Chord model-registry path, from `MODEL_REGISTRY_PATH`. No compiled-in
@@ -218,6 +224,7 @@ pub fn resolve_backend_at(
         always_on: true,
         unit: None,
         launch: None,
+        api_key_env: None,
         model_local_path: None,
         model_gguf_path: None,
     };
@@ -247,6 +254,7 @@ pub fn resolve_backend_at(
             always_on: b.always_on,
             unit: b.unit.clone(),
             launch: b.launch.clone(),
+            api_key_env: b.api_key_env.clone(),
             model_local_path,
             model_gguf_path,
         },
@@ -377,6 +385,27 @@ pub async fn infer_with_metrics(
         }
         "llama-server" => llama_server_infer(client, &backend.url, prompt, timeout, &mut m).await,
         "daemon" => diffusion_infer(prompt, timeout, &mut m).await,
+        // BT-01: any OpenAI-compatible backend — lemonade-coder, vLLM, OpenRouter, or
+        // Chord itself. This is what unblocks profiling the variety of backends Chord
+        // serves (previously MINT could only reach ollama/llama.cpp/dgem).
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_infer(
+                client,
+                &backend.url,
+                model,
+                prompt,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
         other => {
             m.error = Some(format!("backend '{}' has unsupported kind '{other}'", backend.name));
         }
@@ -562,6 +591,74 @@ struct OllamaEmbedResponse {
 
 /// llama.cpp `llama-server` `/completion` (the server is pinned to one model via
 /// `-m`, so no model name is sent). Fills `m` from the `timings` block.
+/// BT-01: OpenAI-compatible inference (`POST {base}/v1/chat/completions`). Profiles any
+/// backend speaking the OpenAI wire protocol — lemonade-coder (:8081), vLLM, OpenRouter,
+/// or Chord's own proxy. Timing is measured LOCALLY (wall clock) because the OpenAI schema
+/// carries no llama.cpp-style server timings; token counts come from `usage.completion_tokens`
+/// when present, else are estimated. `auth` is an optional bearer token (OpenRouter key /
+/// Chord JWT), resolved from the backend's `api_key_env` — never logged.
+async fn openai_infer(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut InferMetrics,
+) {
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "stream": false,
+    });
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/chat/completions", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = e.to_string();
+            m.oom = msg.to_lowercase().contains("memory") || msg.to_lowercase().contains("oom");
+            m.error = Some(msg);
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let txt = resp.text().await.unwrap_or_default();
+        m.oom = code == 500 && txt.to_lowercase().contains("memory");
+        m.error = Some(format!("openai HTTP {code}: {txt}"));
+        return;
+    }
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("openai response parse error: {e}"));
+            return;
+        }
+    };
+    let elapsed_ms = started.elapsed().as_millis() as i32;
+    m.response = v
+        .pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string();
+    m.response_tokens = v
+        .pointer("/usage/completion_tokens")
+        .and_then(|t| t.as_i64())
+        .map(|t| t as i32)
+        .or_else(|| (!m.response.is_empty()).then(|| context::estimate_tokens(&m.response) as i32));
+    m.total_time_ms = Some(elapsed_ms);
+    if let (Some(tok), true) = (m.response_tokens, elapsed_ms > 0) {
+        m.throughput_tok_per_sec = Some(tok as f64 / (elapsed_ms as f64 / 1000.0));
+    }
+}
+
 async fn llama_server_infer(
     client: &reqwest::Client,
     base: &str,
@@ -740,6 +837,7 @@ mod tests {
             always_on: true,
             unit: None,
             launch: None,
+            api_key_env: None,
             model_local_path: None,
             model_gguf_path: None,
         }
