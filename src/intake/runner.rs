@@ -151,7 +151,17 @@ fn is_hot(loaded: &[(String, u64)], target: &str) -> bool {
 /// Ask Ollama to load a model (keep_alive long enough for the run) by issuing a
 /// trivial generate with an empty prompt. Lazy-load brings the model hot.
 async fn load_model(client: &reqwest::Client, model: &str) -> Result<(), ToolError> {
-    let base = context::ollama_base();
+    // BT-03: registry-resolve the backend instead of assuming local ollama. The Ollama
+    // `keep_alive` pre-warm is ollama-specific; for any other backend kind (openai/
+    // llama-server/daemon) the model is loaded on first request and the backend process
+    // is brought up by `lifecycle::ensure_up` in `infer_with_metrics`, so there is no
+    // separate pre-warm to do here — skip it rather than POST an ollama route at a
+    // non-ollama URL. Uses the registry-resolved base, not the hardcoded loopback.
+    let backend = infer::resolve_backend(model);
+    if backend.kind != "ollama" {
+        return Ok(());
+    }
+    let base = backend.url;
     let body = serde_json::json!({ "model": model, "keep_alive": context::OLLAMA_KEEP_ALIVE });
     client
         .post(format!("{base}/api/generate"))
