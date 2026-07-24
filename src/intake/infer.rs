@@ -1018,6 +1018,10 @@ pub async fn imagegen_with_metrics(
     prompt: &str,
     timeout: Duration,
 ) -> ImageGenMetrics {
+    // Time the WHOLE attempt so the pre-arm exits (ensure_up failure, an
+    // unsupported backend kind) still carry a real wall-clock number instead of
+    // the default 0 — a slow/blocked backend probe is itself signal.
+    let started = std::time::Instant::now();
     let backend = resolve_backend(model);
     let mut m = ImageGenMetrics {
         backend: Some(backend.name.clone()),
@@ -1027,6 +1031,7 @@ pub async fn imagegen_with_metrics(
 
     if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
         m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        m.time_to_image_ms = started.elapsed().as_millis() as i64;
         return m;
     }
 
@@ -1061,6 +1066,7 @@ pub async fn imagegen_with_metrics(
                 "backend '{}' kind '{other}' does not support image generation",
                 backend.name
             ));
+            m.time_to_image_ms = started.elapsed().as_millis() as i64;
         }
     }
     // Best-effort peak VRAM (single post-call sysfs read); `None` if unreadable.
@@ -1141,6 +1147,7 @@ async fn openai_imagegen(
     // rather than treating the run as a success with no image.
     if let Some(err) = v.pointer("/error/message").and_then(|e| e.as_str()) {
         m.error = Some(err.to_string());
+        m.time_to_image_ms = started.elapsed().as_millis() as i64;
         return;
     }
     // OpenAI images schema: { "data": [ { "b64_json": "..."} | { "url": "..." } ] }.
@@ -1159,6 +1166,9 @@ async fn openai_imagegen(
             m.error = Some("image generation returned no image (empty data)".to_string());
         }
     }
+    // Recompute AFTER the body read + parse + success check so the recorded time
+    // reflects the full round-trip, not just time-to-headers.
+    m.time_to_image_ms = started.elapsed().as_millis() as i64;
 }
 
 // ── SUITE-DOC (S125): document parsing via Chord `/v1/documents/parse` ──────
@@ -1218,6 +1228,9 @@ pub async fn docparse_with_metrics(
     filename: &str,
     timeout: Duration,
 ) -> DocParseMetrics {
+    // Time the whole attempt so the pre-arm exits (ensure_up failure, an
+    // unsupported backend kind) carry a real wall-clock number, not the default 0.
+    let started = std::time::Instant::now();
     let backend = resolve_backend(model);
     let mut m = DocParseMetrics {
         backend: Some(backend.name.clone()),
@@ -1227,6 +1240,7 @@ pub async fn docparse_with_metrics(
 
     if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
         m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        m.latency_ms = started.elapsed().as_millis() as i64;
         return m;
     }
 
@@ -1261,6 +1275,7 @@ pub async fn docparse_with_metrics(
                 "backend '{}' kind '{other}' does not support document parsing",
                 backend.name
             ));
+            m.latency_ms = started.elapsed().as_millis() as i64;
         }
     }
     m
@@ -1424,6 +1439,77 @@ async fn openai_docparse(
 
 // ── SUITE-STT: OpenAI-compatible audio transcription (speech-to-text) ──
 
+/// True when `needle` occurs as a contiguous byte subslice of `haystack`. Pure.
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// SUITE-STT: assemble the `multipart/form-data` body for an OpenAI-compatible
+/// transcription request BY HAND (reqwest's `multipart` feature is not enabled).
+///
+/// Hardened against two framing hazards a naive hand-rolled multipart has:
+///   1. **Header injection via the filename.** The caller-supplied `filename` is
+///      interpolated into a `Content-Disposition` header; a raw `"`, `\`, CR or
+///      LF could break out of the quoted value or inject a new header. Each such
+///      character is neutralized (replaced with `_`) before use.
+///   2. **Boundary collision in the payload.** A FIXED boundary that happens to
+///      occur inside the binary audio would split the body at the wrong place.
+///      If the boundary token appears anywhere in `audio_bytes`, this returns a
+///      clean `Err` (the caller surfaces it as a request-build error) rather than
+///      silently sending a corrupted request. A long, fixed token makes this
+///      essentially never fire for real PCM/WAV audio.
+///
+/// Pure and unit-testable (no network).
+fn build_transcription_multipart(
+    boundary: &str,
+    model: &str,
+    filename: &str,
+    audio_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    // (2) Boundary-collision guard: refuse to frame a payload that contains the
+    // delimiter token rather than emit a body a server would mis-parse.
+    if contains_subslice(audio_bytes, boundary.as_bytes()) {
+        return Err(format!(
+            "audio payload ({} bytes) contains the multipart boundary token — cannot frame the request safely",
+            audio_bytes.len()
+        ));
+    }
+    // (1) Neutralize CR / LF / double-quote / backslash in the filename so it
+    // cannot break the quoted Content-Disposition value or inject a header.
+    let safe_filename: String = filename
+        .chars()
+        .map(|c| match c {
+            '\r' | '\n' | '"' | '\\' => '_',
+            other => other,
+        })
+        .collect();
+
+    let mut body: Vec<u8> = Vec::with_capacity(audio_bytes.len() + 512);
+    let push = |s: &str, body: &mut Vec<u8>| body.extend_from_slice(s.as_bytes());
+    // model field
+    push(&format!("--{boundary}\r\n"), &mut body);
+    push("Content-Disposition: form-data; name=\"model\"\r\n\r\n", &mut body);
+    push(&format!("{model}\r\n"), &mut body);
+    // response_format field (ask for a plain JSON `{ "text": ... }` envelope)
+    push(&format!("--{boundary}\r\n"), &mut body);
+    push("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n", &mut body);
+    push("json\r\n", &mut body);
+    // file field (raw audio payload)
+    push(&format!("--{boundary}\r\n"), &mut body);
+    push(
+        &format!("Content-Disposition: form-data; name=\"file\"; filename=\"{safe_filename}\"\r\n"),
+        &mut body,
+    );
+    push("Content-Type: audio/wav\r\n\r\n", &mut body);
+    body.extend_from_slice(audio_bytes);
+    push("\r\n", &mut body);
+    push(&format!("--{boundary}--\r\n"), &mut body);
+    Ok(body)
+}
+
 /// Normalized per-transcription metrics. The STT twin of [`EmbedMetrics`]:
 /// carries the produced transcript + local wall-clock latency (there is no
 /// `oom` field — a transcription request is not a token-generation load). Every
@@ -1457,6 +1543,9 @@ pub async fn transcribe_with_metrics(
     filename: &str,
     timeout: Duration,
 ) -> TranscribeMetrics {
+    // Time the whole attempt so the pre-arm exits (ensure_up failure, an
+    // unsupported backend kind) carry a real wall-clock number, not the default 0.
+    let started = std::time::Instant::now();
     let backend = resolve_backend(model);
     let mut m = TranscribeMetrics {
         backend: Some(backend.name.clone()),
@@ -1466,6 +1555,7 @@ pub async fn transcribe_with_metrics(
 
     if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
         m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        m.latency_ms = started.elapsed().as_millis() as i64;
         return m;
     }
 
@@ -1497,6 +1587,7 @@ pub async fn transcribe_with_metrics(
                 "backend '{}' kind '{other}' does not support audio transcription",
                 backend.name
             ));
+            m.latency_ms = started.elapsed().as_millis() as i64;
         }
     }
     m
@@ -1528,31 +1619,20 @@ async fn openai_transcribe(
     auth: Option<&str>,
     m: &mut TranscribeMetrics,
 ) {
-    // A fixed, collision-unlikely multipart boundary — deterministic (keeps the
-    // parse-path test stable) and never appears in PCM/WAV audio in practice.
+    // A fixed, long, collision-unlikely multipart boundary. It is verified NOT to
+    // appear in the audio payload (see `build_transcription_multipart`) so binary
+    // audio can never corrupt the multipart framing.
     const BOUNDARY: &str = "----terminus-mint-stt-boundary-7f3a9c1e5b";
-    let mut body: Vec<u8> = Vec::with_capacity(audio_bytes.len() + 512);
-    let push = |s: &str, body: &mut Vec<u8>| body.extend_from_slice(s.as_bytes());
-    // model field
-    push(&format!("--{BOUNDARY}\r\n"), &mut body);
-    push("Content-Disposition: form-data; name=\"model\"\r\n\r\n", &mut body);
-    push(&format!("{model}\r\n"), &mut body);
-    // response_format field (ask for a plain JSON `{ "text": ... }` envelope)
-    push(&format!("--{BOUNDARY}\r\n"), &mut body);
-    push("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n", &mut body);
-    push("json\r\n", &mut body);
-    // file field (raw audio payload)
-    push(&format!("--{BOUNDARY}\r\n"), &mut body);
-    push(
-        &format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"),
-        &mut body,
-    );
-    push("Content-Type: audio/wav\r\n\r\n", &mut body);
-    body.extend_from_slice(audio_bytes);
-    push("\r\n", &mut body);
-    push(&format!("--{BOUNDARY}--\r\n"), &mut body);
-
     let started = std::time::Instant::now();
+    let body = match build_transcription_multipart(BOUNDARY, model, filename, audio_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            // Pre-flight framing/sanitization failure — no request was sent.
+            m.error = Some(format!("openai transcription request build error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
     let mut req = client
         .post(format!("{}/v1/audio/transcriptions", base.trim_end_matches('/')))
         .header(
@@ -1657,6 +1737,9 @@ pub async fn synthesize_with_metrics(
     voice: &str,
     timeout: Duration,
 ) -> SpeechMetrics {
+    // Time the whole attempt so the pre-arm exits (ensure_up failure, an
+    // unsupported backend kind) carry a real wall-clock number, not the default 0.
+    let started = std::time::Instant::now();
     let backend = resolve_backend(model);
     let mut m = SpeechMetrics {
         backend: Some(backend.name.clone()),
@@ -1666,6 +1749,7 @@ pub async fn synthesize_with_metrics(
 
     if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
         m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        m.latency_ms = started.elapsed().as_millis() as i64;
         return m;
     }
 
@@ -1698,6 +1782,7 @@ pub async fn synthesize_with_metrics(
                 "backend '{}' kind '{other}' does not support speech synthesis",
                 backend.name
             ));
+            m.latency_ms = started.elapsed().as_millis() as i64;
         }
     }
     m
@@ -2330,6 +2415,11 @@ mod tests {
 
     use std::io::Write;
 
+    /// Serializes tests that mutate the process-global `MODEL_REGISTRY_PATH` /
+    /// remote-Ollama globals, so they don't race each other under cargo's
+    /// parallel test runner.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Write `body` to a unique temp file and return its path (avoids env-var
     /// races between parallel tests).
     fn tmp_registry(tag: &str, body: &str) -> std::path::PathBuf {
@@ -2485,6 +2575,7 @@ mod tests {
         // without needing a live remote Ollama.
         // Loopback URL interpolated onto its own taggable line — see comment in
         // `override_forces_backend_regardless_of_tag` above for why.
+        let _env = ENV_LOCK.lock().unwrap();
         let ollama_url = "http://127.0.0.1:11434"; // pii-test-fixture
         let path = tmp_registry(
             "remote-choke",
@@ -3872,5 +3963,167 @@ mod tests {
         .await;
         assert!(m.error.as_deref().unwrap_or("").contains("empty audio"));
         assert!(m.audio.is_empty());
+    }
+
+    // ── Finding 1 (S125 b2fix): latency recorded on the pre-arm exit paths ──
+
+    /// Finding 1: `openai_imagegen` records latency AFTER the body read + parse +
+    /// success check, not merely at header receipt. A delayed 200 with a valid
+    /// image guarantees a strictly-positive measured time on the SUCCESS path.
+    #[tokio::test]
+    async fn openai_imagegen_records_latency_on_success() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/images/generations");
+                then.status(200)
+                    .delay(std::time::Duration::from_millis(30))
+                    .json_body(serde_json::json!({ "data": [{ "b64_json": "QUJD" }] }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ImageGenMetrics::default();
+        openai_imagegen(
+            &client,
+            &server.base_url(),
+            "sd",
+            "a red cube",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.success, "expected success, error={:?}", m.error);
+        assert!(
+            m.time_to_image_ms > 0,
+            "imagegen latency must be recorded (>0) after body+parse+success, got {}",
+            m.time_to_image_ms
+        );
+    }
+
+    /// Finding 1: the UNSUPPORTED-backend exit of a public metric fn records a real
+    /// wall-clock number (not the default 0). A llama-server backend whose `/health`
+    /// answers (after a delay) makes `ensure_up` succeed, then the non-`openai` kind
+    /// lands in the "does not support" arm with a measurable elapsed.
+    #[tokio::test]
+    async fn imagegen_records_latency_on_unsupported_backend() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/health");
+                then.status(200).delay(std::time::Duration::from_millis(30));
+            })
+            .await;
+        let url = server.base_url();
+        let reg = format!(
+            r#"{{ "models": {{ "img-x:1": {{ "backend": "ondemand" }} }},
+                 "backends": {{ "ondemand": {{ "url": "{url}", "kind": "llama-server", "hardware": "cpu", "unit": "chord-fake-imggen" }} }} }}"#
+        );
+        let path = tmp_registry("img-unsupported", &reg);
+        std::env::set_var("MODEL_REGISTRY_PATH", &path);
+        let client = reqwest::Client::new();
+        let m = imagegen_with_metrics(
+            &client,
+            "img-x:1",
+            "a red cube",
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        std::env::remove_var("MODEL_REGISTRY_PATH");
+        assert!(
+            m.error.as_deref().unwrap_or("").contains("does not support image generation"),
+            "expected unsupported-backend error, got {:?}",
+            m.error
+        );
+        assert!(
+            m.time_to_image_ms > 0,
+            "latency must be recorded (>0) on the unsupported-backend exit, got {}",
+            m.time_to_image_ms
+        );
+    }
+
+    /// Finding 1: the ensure_up-FAILURE exit of a public metric fn records a real
+    /// wall-clock number. A llama-server backend with no unit/launch whose `/health`
+    /// is unhealthy (after a delay) makes `ensure_up` return `Err` with measurable
+    /// elapsed — and no systemctl side effects.
+    #[tokio::test]
+    async fn transcribe_records_latency_on_ensure_up_failure() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/health");
+                then.status(503).delay(std::time::Duration::from_millis(30));
+            })
+            .await;
+        let url = server.base_url();
+        let reg = format!(
+            r#"{{ "models": {{ "stt-x:1": {{ "backend": "ondemand" }} }},
+                 "backends": {{ "ondemand": {{ "url": "{url}", "kind": "llama-server", "hardware": "cpu" }} }} }}"#
+        );
+        let path = tmp_registry("stt-ensure-fail", &reg);
+        std::env::set_var("MODEL_REGISTRY_PATH", &path);
+        let client = reqwest::Client::new();
+        let m = transcribe_with_metrics(
+            &client,
+            "stt-x:1",
+            b"audio-bytes",
+            "clip.wav",
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        std::env::remove_var("MODEL_REGISTRY_PATH");
+        assert!(
+            m.error.as_deref().unwrap_or("").contains("unavailable"),
+            "expected ensure_up-failure error, got {:?}",
+            m.error
+        );
+        assert!(
+            m.latency_ms > 0,
+            "latency must be recorded (>0) on the ensure_up-failure exit, got {}",
+            m.latency_ms
+        );
+    }
+
+    // ── Finding 2 (S125 b2fix): transcription multipart injection/framing ──
+
+    /// A caller-supplied filename carrying a `"` / CR / LF is neutralized so it
+    /// cannot break the quoted Content-Disposition value or inject a header.
+    #[test]
+    fn transcription_multipart_neutralizes_filename_injection() {
+        let boundary = "----test-boundary-abc";
+        let evil = "evil\".wav\r\nX-Injected: 1";
+        let body = build_transcription_multipart(boundary, "m", evil, b"AUDIO").expect("builds");
+        let s = String::from_utf8(body).expect("body is valid utf8 here");
+        assert!(!s.contains("evil\".wav"), "the raw quote must be neutralized: {s}");
+        assert!(
+            !s.contains("X-Injected: 1\r\n"),
+            "CRLF header injection must be neutralized: {s}"
+        );
+        assert!(
+            s.contains("filename=\"evil_.wav__X-Injected: 1\""),
+            "sanitized filename must be a single quoted value: {s}"
+        );
+    }
+
+    /// A payload that embeds the boundary token is rejected cleanly (never framed
+    /// into a corruptible body); a clean payload frames fine.
+    #[test]
+    fn transcription_multipart_rejects_boundary_in_payload() {
+        let boundary = "----test-boundary-xyz";
+        let mut payload = b"leading".to_vec();
+        payload.extend_from_slice(boundary.as_bytes());
+        payload.extend_from_slice(b"trailing");
+        let err = build_transcription_multipart(boundary, "m", "clip.wav", &payload).unwrap_err();
+        assert!(err.contains("boundary"), "expected a boundary-collision error, got {err}");
+
+        let ok = build_transcription_multipart(boundary, "m", "clip.wav", b"clean audio bytes");
+        assert!(ok.is_ok(), "a clean payload must frame successfully");
+        let body = ok.unwrap();
+        assert!(
+            body.starts_with(format!("--{boundary}\r\n").as_bytes()),
+            "the body starts with the opening boundary delimiter"
+        );
     }
 }

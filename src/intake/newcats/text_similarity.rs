@@ -124,6 +124,32 @@ enum NumTok {
     Thousand,
 }
 
+/// SUITE-STT: grammar state for the in-progress cardinal run folded by
+/// [`normalize_spoken_numbers`]. Tracks WHAT was last consumed so an illegal
+/// adjacency (e.g. a second bare unit word) breaks the run instead of silently
+/// summing unrelated tokens.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NumState {
+    /// No active run.
+    Idle,
+    /// A bare units/teens word 0-19 (not following a tens word).
+    Unit,
+    /// A tens word (20..90), awaiting an optional trailing unit (1-9).
+    TenWord,
+    /// A unit that legally followed a tens word ("twenty three").
+    TenUnit,
+    /// Just consumed `hundred`.
+    Hundred,
+    /// A unit following `hundred` ("one hundred five").
+    PostHundredUnit,
+    /// A tens word following `hundred` ("one hundred twenty").
+    PostHundredTen,
+    /// A unit following a post-hundred tens word ("one hundred twenty three").
+    PostHundredTenUnit,
+    /// Just consumed `thousand`; a fresh sub-thousand group may begin.
+    Thousand,
+}
+
 /// Classify a single lowercased, punctuation-trimmed token as a cardinal
 /// number-word, or `None` if it isn't one. Cardinals only (ordinals like
 /// `third` are intentionally NOT handled — see [`normalize_spoken_numbers`]).
@@ -172,9 +198,15 @@ fn classify_number_word(w: &str) -> Option<NumTok> {
 /// [`word_error_rate_normalized`]) makes them compare equal.
 ///
 /// Lowercases, splits on whitespace, and trims leading/trailing punctuation
-/// from each token. A maximal run of adjacent cardinal number-words is folded
-/// into a single digit token via the standard units/tens/hundred/thousand
-/// accumulation (`"one hundred twenty three"` → `"123"`); a bare `"and"`
+/// from each token (a hyphenated cardinal compound like `"twenty-three"` is
+/// split on the hyphen and folds like `"twenty three"`). A run of adjacent
+/// cardinal number-words is folded into a single digit token via the standard
+/// units/tens/hundred/thousand accumulation — but ONLY while the words form a
+/// grammatically valid cardinal: a bare sequence of separate unit words
+/// (`"one two three"`) does NOT sum to `"6"`, it stays `"1 2 3"`, so distinct
+/// transcripts never collapse to the same number. All accumulation is
+/// saturating, so even a pathologically long run can never overflow/panic.
+/// (`"one hundred twenty three"` → `"123"`); a bare `"and"`
 /// *inside* such a run is skipped (`"one hundred and five"` → `"105"`). Tokens
 /// that are already digits (`"2024"`, `"3.5"`) pass through unchanged, as do
 /// all non-number words. Cardinals only — ORDINALS (`"third"`, `"twenty
@@ -182,62 +214,178 @@ fn classify_number_word(w: &str) -> Option<NumTok> {
 /// handful of ordinal clips); scope-limiting to cardinals keeps the parser
 /// small and correct rather than half-covering ordinal spelling variants.
 pub fn normalize_spoken_numbers(text: &str) -> String {
+    // Expand whitespace tokens, additionally splitting a HYPHENATED cardinal
+    // compound ("twenty-three") into its parts so it folds like the spaced form.
+    // A hyphenated token is only split when ALL its parts are number words, so
+    // ordinary hyphenated prose ("state-of-the-art") is left untouched.
+    let mut toks: Vec<(String, String)> = Vec::new(); // (normalized, raw-for-passthrough)
+    for raw in text.split_whitespace() {
+        let norm = raw
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
+        if norm.is_empty() {
+            continue;
+        }
+        if norm.contains('-') {
+            let parts: Vec<String> = norm
+                .split('-')
+                .map(|p| p.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+            if parts.len() >= 2 && parts.iter().all(|p| classify_number_word(p).is_some()) {
+                for p in parts {
+                    toks.push((p.clone(), p));
+                }
+                continue;
+            }
+        }
+        toks.push((norm, raw.to_string()));
+    }
+
     let mut out: Vec<String> = Vec::new();
-    // Accumulator state for an in-progress cardinal number run.
-    let mut active = false;
+    let mut state = NumState::Idle;
     let mut result: u64 = 0; // completed thousands portion
     let mut current: u64 = 0; // sub-thousand group being built
 
-    let flush = |out: &mut Vec<String>, active: &mut bool, result: &mut u64, current: &mut u64| {
-        if *active {
-            out.push((*result + *current).to_string());
-            *active = false;
+    let flush = |out: &mut Vec<String>, state: &mut NumState, result: &mut u64, current: &mut u64| {
+        if *state != NumState::Idle {
+            out.push(result.saturating_add(*current).to_string());
+            *state = NumState::Idle;
             *result = 0;
             *current = 0;
         }
     };
-
-    for raw in text.split_whitespace() {
-        let tok = raw
-            .trim_matches(|c: char| !c.is_alphanumeric())
-            .to_lowercase();
-        if tok.is_empty() {
-            continue;
+    // Start a fresh run from a number word (all arithmetic saturating so a huge
+    // run can never overflow/panic).
+    let start = |cls: &NumTok, state: &mut NumState, result: &mut u64, current: &mut u64| match cls {
+        NumTok::Unit(v) => {
+            *current = *v;
+            *state = NumState::Unit;
         }
+        NumTok::Ten(v) => {
+            *current = *v;
+            *state = NumState::TenWord;
+        }
+        NumTok::Hundred => {
+            *current = 100;
+            *state = NumState::Hundred;
+        }
+        NumTok::Thousand => {
+            *result = 1000;
+            *state = NumState::Thousand;
+        }
+    };
+
+    for (norm, raw) in &toks {
         // "and" only has meaning as a connector WITHIN a number run; drop it
         // there, keep it verbatim otherwise.
-        if tok == "and" {
-            if active {
+        if norm == "and" {
+            if state != NumState::Idle {
                 continue;
             }
-            out.push(raw.to_string());
+            out.push(raw.clone());
             continue;
         }
-        match classify_number_word(&tok) {
-            Some(NumTok::Unit(v)) => {
-                active = true;
-                current += v;
+        let Some(cls) = classify_number_word(norm) else {
+            flush(&mut out, &mut state, &mut result, &mut current);
+            out.push(raw.clone());
+            continue;
+        };
+        // Does `cls` legally EXTEND the current partial cardinal per cardinal
+        // grammar? A bare run of separate unit words ("one two three") does NOT
+        // sum — each illegal adjacency flushes the run and restarts a fresh one,
+        // so "one two three" stays "1 2 3", distinct from "six".
+        use NumState::*;
+        let extended = match (state, &cls) {
+            // After a bare unit (0-19): only a magnitude extends it.
+            (Unit, NumTok::Hundred) => {
+                current = current.saturating_mul(100);
+                Some(Hundred)
             }
-            Some(NumTok::Ten(v)) => {
-                active = true;
-                current += v;
-            }
-            Some(NumTok::Hundred) => {
-                active = true;
-                current = if current == 0 { 1 } else { current } * 100;
-            }
-            Some(NumTok::Thousand) => {
-                active = true;
-                result += if current == 0 { 1 } else { current } * 1000;
+            (Unit, NumTok::Thousand) => {
+                result = result.saturating_add(current.saturating_mul(1000));
                 current = 0;
+                Some(Thousand)
             }
+            // After a tens word ("twenty"): an optional trailing unit (1-9), or a
+            // magnitude.
+            (TenWord, NumTok::Unit(v)) if (1..=9).contains(v) => {
+                current = current.saturating_add(*v);
+                Some(TenUnit)
+            }
+            (TenWord, NumTok::Thousand) => {
+                result = result.saturating_add(current.saturating_mul(1000));
+                current = 0;
+                Some(Thousand)
+            }
+            // After "twenty three": a magnitude.
+            (TenUnit, NumTok::Hundred) => {
+                current = current.saturating_mul(100);
+                Some(Hundred)
+            }
+            (TenUnit, NumTok::Thousand) => {
+                result = result.saturating_add(current.saturating_mul(1000));
+                current = 0;
+                Some(Thousand)
+            }
+            // After "hundred": a unit (0-19), a tens word, or thousand.
+            (Hundred, NumTok::Unit(v)) => {
+                current = current.saturating_add(*v);
+                Some(PostHundredUnit)
+            }
+            (Hundred, NumTok::Ten(v)) => {
+                current = current.saturating_add(*v);
+                Some(PostHundredTen)
+            }
+            (Hundred, NumTok::Thousand) => {
+                result = result.saturating_add(current.saturating_mul(1000));
+                current = 0;
+                Some(Thousand)
+            }
+            // After "one hundred five": only thousand.
+            (PostHundredUnit, NumTok::Thousand) => {
+                result = result.saturating_add(current.saturating_mul(1000));
+                current = 0;
+                Some(Thousand)
+            }
+            // After "one hundred twenty": an optional trailing unit, or thousand.
+            (PostHundredTen, NumTok::Unit(v)) if (1..=9).contains(v) => {
+                current = current.saturating_add(*v);
+                Some(PostHundredTenUnit)
+            }
+            (PostHundredTen, NumTok::Thousand) => {
+                result = result.saturating_add(current.saturating_mul(1000));
+                current = 0;
+                Some(Thousand)
+            }
+            // After "one hundred twenty three": only thousand.
+            (PostHundredTenUnit, NumTok::Thousand) => {
+                result = result.saturating_add(current.saturating_mul(1000));
+                current = 0;
+                Some(Thousand)
+            }
+            // After "thousand": a fresh sub-thousand group begins.
+            (Thousand, NumTok::Unit(v)) => {
+                current = current.saturating_add(*v);
+                Some(Unit)
+            }
+            (Thousand, NumTok::Ten(v)) => {
+                current = current.saturating_add(*v);
+                Some(TenWord)
+            }
+            _ => None,
+        };
+        match extended {
+            Some(ns) => state = ns,
             None => {
-                flush(&mut out, &mut active, &mut result, &mut current);
-                out.push(raw.to_string());
+                // Illegal adjacency (or a fresh start from Idle): close the current
+                // run and begin a new one from this number word.
+                flush(&mut out, &mut state, &mut result, &mut current);
+                start(&cls, &mut state, &mut result, &mut current);
             }
         }
     }
-    flush(&mut out, &mut active, &mut result, &mut current);
+    flush(&mut out, &mut state, &mut result, &mut current);
     out.join(" ")
 }
 
@@ -334,6 +482,46 @@ mod tests {
         assert_eq!(normalize_spoken_numbers("in 2024 it grew 3.5 percent"), "in 2024 it grew 3.5 percent");
         // Leading/trailing punctuation on a number word is trimmed before folding.
         assert_eq!(normalize_spoken_numbers("timer: ten."), "timer: 10");
+    }
+
+    /// b2fix finding 8: a bare run of separate unit words must NOT be summed —
+    /// "one two three" stays distinct from "six", so different transcripts don't
+    /// collapse to the same number.
+    #[test]
+    fn normalize_spoken_numbers_does_not_sum_bare_unit_runs() {
+        assert_eq!(normalize_spoken_numbers("one two three"), "1 2 3");
+        assert_ne!(
+            normalize_spoken_numbers("one two three"),
+            normalize_spoken_numbers("six"),
+            "a bare unit run must not equal its sum"
+        );
+        // Real compound cardinals still fold correctly.
+        assert_eq!(normalize_spoken_numbers("twenty three"), "23");
+        assert_eq!(normalize_spoken_numbers("forty two"), "42");
+        // Two tens words in a row do not merge either.
+        assert_eq!(normalize_spoken_numbers("twenty thirty"), "20 30");
+    }
+
+    /// b2fix finding 8: hyphenated cardinals fold like their spaced form.
+    #[test]
+    fn normalize_spoken_numbers_handles_hyphenated_cardinals() {
+        assert_eq!(normalize_spoken_numbers("twenty-three"), "23");
+        assert_eq!(normalize_spoken_numbers("twenty-three"), normalize_spoken_numbers("23"));
+        assert_eq!(normalize_spoken_numbers("one hundred twenty-three"), "123");
+        // Non-number hyphenated prose is left intact.
+        assert_eq!(normalize_spoken_numbers("a state-of-the-art model"), "a state-of-the-art model");
+    }
+
+    /// b2fix finding 8: a pathologically long run uses saturating arithmetic and
+    /// must not overflow/panic.
+    #[test]
+    fn normalize_spoken_numbers_long_run_does_not_panic() {
+        // 50k repetitions of a full "nine hundred ninety nine thousand" group —
+        // exercises repeated saturating_add into `result` without panicking.
+        let big = "nine hundred ninety nine thousand ".repeat(50_000);
+        let out = normalize_spoken_numbers(&big);
+        assert!(!out.is_empty());
+        assert!(out.chars().all(|c| c.is_ascii_digit() || c == ' '));
     }
 
     #[test]

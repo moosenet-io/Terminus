@@ -326,11 +326,19 @@ pub fn build_scores(
     case: &TtsCase,
     outcome: &TtsOutcome,
 ) -> Vec<DimensionScore> {
-    let wer = loopback_wer(&outcome.loopback_transcript, &case.text);
-    let accuracy = wer_to_accuracy(wer);
+    let mut rows: Vec<DimensionScore> = Vec::new();
 
-    let mut rows = vec![
-        DimensionScore {
+    // Intelligibility (WER/accuracy) is only meaningful with BOTH a real reference
+    // text AND a non-empty synthesized-then-transcribed loopback. An empty
+    // reference or an empty transcript would score WER 0 / accuracy 1 (a
+    // false-perfect loopback: "silence round-trips to silence"), so those cases
+    // are skipped rather than recorded as perfect.
+    let has_reference = !case.text.trim().is_empty();
+    let has_transcript = !outcome.loopback_transcript.trim().is_empty();
+    if has_reference && has_transcript {
+        let wer = loopback_wer(&outcome.loopback_transcript, &case.text);
+        let accuracy = wer_to_accuracy(wer);
+        rows.push(DimensionScore {
             model_id: model_id.clone(),
             backend_tag,
             dimension: DIMENSION_QUALITY.to_string(),
@@ -347,8 +355,8 @@ pub fn build_scores(
                 })
                 .to_string(),
             ),
-        },
-        DimensionScore {
+        });
+        rows.push(DimensionScore {
             model_id: model_id.clone(),
             backend_tag,
             dimension: DIMENSION_QUALITY.to_string(),
@@ -358,8 +366,8 @@ pub fn build_scores(
             judge: "derived".to_string(),
             low_confidence: false,
             raw_json: None,
-        },
-    ];
+        });
+    }
 
     if let Some(mos) = outcome.mos_proxy {
         rows.push(DimensionScore {
@@ -496,6 +504,37 @@ mod tests {
         assert!(wer > 0.7, "expected high WER for garbled loopback, got {wer}");
         let acc = rows.iter().find(|r| r.metric == "loopback_accuracy").unwrap().value;
         assert!(acc < 0.3, "expected low accuracy for garbled loopback, got {acc}");
+    }
+
+    /// b2fix finding 7: an empty reference or an empty (silent) loopback transcript
+    /// must NOT score a false-perfect WER 0 / accuracy 1 — the intelligibility rows
+    /// are skipped while the performance rows are still recorded.
+    #[test]
+    fn empty_reference_or_transcript_is_not_a_false_perfect() {
+        // Both empty → the classic false-perfect loopback. Skipped.
+        let both_empty = TtsOutcome {
+            loopback_transcript: "   ".to_string(),
+            synthesis_ms: 300,
+            audio_duration_s: Some(1.0),
+            mos_proxy: Some(1.0),
+        };
+        let rows = build_scores(ModelId::from("m"), BackendTag::Gpu, &case("   "), &both_empty);
+        assert!(rows.iter().all(|r| r.metric != "loopback_wer"), "no WER for empty ref+transcript");
+        assert!(rows.iter().all(|r| r.metric != "loopback_accuracy"));
+        assert!(rows.iter().any(|r| r.metric == "synthesis_ms"), "perf rows still recorded");
+
+        // Real reference, empty (silent) synthesis → still skipped, never accuracy 1.0.
+        let silent = TtsOutcome {
+            loopback_transcript: String::new(),
+            synthesis_ms: 300,
+            audio_duration_s: None,
+            mos_proxy: None,
+        };
+        let rows2 = build_scores(ModelId::from("m"), BackendTag::Gpu, &case(REFERENCE), &silent);
+        assert!(
+            rows2.iter().all(|r| r.metric != "loopback_accuracy"),
+            "a silent synthesis must not score accuracy 1.0"
+        );
     }
 
     /// mos_proxy + rtf rows appear only when their inputs are present; performance

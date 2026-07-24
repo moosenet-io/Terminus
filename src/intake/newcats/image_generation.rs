@@ -184,10 +184,12 @@ pub fn build_scores(model_id: ModelId, backend_tag: BackendTag, outcome: &Genera
     ];
 
     // CLIP prompt-adherence: emitted ONLY when a CLIP score was measured (a CLIP
-    // scorer + reference were available). When `None` — the case on this box today —
-    // the metric is cleanly absent (NOT MEASURED), never a fabricated `0.0`.
+    // scorer + reference were available) AND that score is a valid similarity —
+    // finite and within `[0.0, 1.0]`. A NaN/inf or out-of-range value is dropped
+    // rather than persisted (it would poison aggregates); "not measured" and
+    // "measured but invalid" both cleanly omit the row, never a fabricated `0.0`.
     // `judge = "clip"` distinguishes it from the `"derived"` hardware/success rows.
-    if let Some(clip) = outcome.clip_score {
+    if let Some(clip) = outcome.clip_score.filter(|c| c.is_finite() && (0.0..=1.0).contains(c)) {
         rows.push(DimensionScore {
             model_id,
             backend_tag,
@@ -330,6 +332,41 @@ mod tests {
         assert_eq!(clip.value, 0.78);
         assert_eq!(clip.judge, "clip");
         assert_eq!(clip.dimension, DIMENSION);
+    }
+
+    /// b2fix finding 6: an invalid clip_score (NaN / inf / out of `[0,1]`) is NOT
+    /// persisted — the clip_adherence row is omitted, never a poisoned value.
+    #[test]
+    fn clip_adherence_omitted_when_score_is_invalid() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.5, -0.1] {
+            let outcome = GenerationOutcome {
+                success: true,
+                time_to_image_ms: 100,
+                vram_peak_mb: 1024,
+                failure_reason: None,
+                clip_score: Some(bad),
+            };
+            let rows = build_scores(ModelId::from("m"), BackendTag::Gpu, &outcome);
+            assert_eq!(rows.len(), 3, "no clip row for invalid score {bad}");
+            assert!(
+                rows.iter().all(|r| r.metric != "clip_adherence"),
+                "invalid clip_score {bad} must not be persisted"
+            );
+        }
+        // Boundary-valid scores ARE emitted.
+        for good in [0.0, 1.0, 0.5] {
+            let outcome = GenerationOutcome {
+                success: true,
+                time_to_image_ms: 100,
+                vram_peak_mb: 1024,
+                failure_reason: None,
+                clip_score: Some(good),
+            };
+            let rows = build_scores(ModelId::from("m"), BackendTag::Gpu, &outcome);
+            let clip = rows.iter().find(|r| r.metric == "clip_adherence");
+            assert!(clip.is_some(), "valid clip_score {good} must be emitted");
+            assert_eq!(clip.unwrap().value, good);
+        }
     }
 
     /// Default prompt corpus is non-empty and well-formed (label + prompt set).

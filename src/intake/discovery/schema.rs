@@ -326,8 +326,38 @@ impl Modality {
     pub fn classify(pipeline_tag: Option<&str>, tags: &[String]) -> Option<Modality> {
         let pt = pipeline_tag.map(|s| s.trim().to_lowercase());
         let pt = pt.as_deref();
+        // Tokenize a tag/needle on any non-alphanumeric separator (space, hyphen,
+        // underscore, slash, dot, …) into whole lowercase word tokens.
+        fn tag_tokens(s: &str) -> Vec<String> {
+            s.to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_string())
+                .collect()
+        }
+        // Word-boundary tag match. A coarse `contains(substr)` false-positives on
+        // short signals (e.g. "socratic" contains "ocr", "disaster" contains
+        // "asr"); instead we require the needle's token SEQUENCE to appear as a
+        // contiguous run of WHOLE tokens in some tag. For a single-token needle of
+        // length ≥ 4 we also accept a token that BEGINS with it (so "rerank"
+        // matches "reranker"/"reranking", "agent" matches "agentic") — never a
+        // mid-word substring, and never for the 3-char traps (ocr/asr/tts/vqa),
+        // which must match a whole token exactly.
         let has = |needle: &str| {
-            tags.iter().any(|t| t.to_lowercase().contains(needle))
+            let nt = tag_tokens(needle);
+            if nt.is_empty() {
+                return false;
+            }
+            tags.iter().any(|tag| {
+                let tt = tag_tokens(tag);
+                if nt.len() == 1 {
+                    let n = nt[0].as_str();
+                    tt.iter()
+                        .any(|t| t == n || (n.len() >= 4 && t.starts_with(n)))
+                } else {
+                    tt.windows(nt.len()).any(|w| w == nt.as_slice())
+                }
+            })
         };
 
         // 1. Strong tag overrides — capabilities a coarse category hides.
@@ -655,6 +685,32 @@ mod tests {
     fn classify_unrecognized_listing_is_none_not_a_guess() {
         assert_eq!(Modality::classify(None, &[]), None);
         assert_eq!(Modality::classify(Some("some-future-task"), &[]), None);
+    }
+
+    /// CB-02 b2fix (finding 3): short signals match on WORD boundaries, so a
+    /// substring trap like "socratic" (contains "ocr") or "disaster" (contains
+    /// "asr") does NOT misclassify — while real whole-token tags still do.
+    #[test]
+    fn classify_does_not_substring_false_positive_on_short_signals() {
+        // "socratic" contains "ocr" as a substring but is not an OCR/doc model.
+        assert_eq!(
+            Modality::classify(Some("text-generation"), &t(&["socratic", "chat"])),
+            Some(Modality::TextGeneration),
+            "a substring 'ocr' inside 'socratic' must not route to DocumentParsing"
+        );
+        // No pipeline tag + only substring-trap tags → honest None, not a guess.
+        assert_eq!(Modality::classify(None, &t(&["socratic"])), None);
+        assert_eq!(Modality::classify(None, &t(&["disaster"])), None); // contains "asr"
+        assert_eq!(Modality::classify(None, &t(&["mattstseason"])), None); // contains "tts"
+        // Real whole-token tags still classify correctly.
+        assert_eq!(Modality::classify(None, &t(&["ocr"])), Some(Modality::DocumentParsing));
+        assert_eq!(
+            Modality::classify(None, &t(&["document-question-answering"])),
+            Some(Modality::DocumentParsing)
+        );
+        assert_eq!(Modality::classify(None, &t(&["asr"])), Some(Modality::Stt));
+        // A ≥4-char signal still tolerates a morphological suffix (reranker).
+        assert_eq!(Modality::classify(None, &t(&["reranker"])), Some(Modality::Rerank));
     }
 
     #[test]

@@ -202,7 +202,9 @@ pub fn char_error_rate(hypothesis: &str, reference: &str) -> f64 {
 /// Order- and structure-insensitive on purpose — a parser that recovers the
 /// right cell CONTENT but reshapes the grid still scores well, which is the
 /// signal we want here (did it extract the tabular data), not exact geometry.
-/// Both-empty ⇒ `1.0`; either-side-empty (but not both) ⇒ `0.0`.
+/// NO reference/extracted content on either side (including a both-empty
+/// `tables: [[]]`) ⇒ `0.0`, never a false-perfect `1.0` — there is nothing to
+/// have gotten right.
 pub fn score_table_f1(expected: &[Table], actual: &[Table]) -> f64 {
     fn multiset(tables: &[Table]) -> BTreeMap<String, usize> {
         let mut m = BTreeMap::new();
@@ -221,7 +223,9 @@ pub fn score_table_f1(expected: &[Table], actual: &[Table]) -> f64 {
     let exp = multiset(expected);
     let act = multiset(actual);
     if exp.is_empty() && act.is_empty() {
-        return 1.0;
+        // No cell content on EITHER side — nothing to have extracted correctly.
+        // Returning 1.0 here was a false-perfect (e.g. `tables: [[]]`).
+        return 0.0;
     }
     let exp_total: usize = exp.values().sum();
     let act_total: usize = act.values().sum();
@@ -278,7 +282,11 @@ pub fn build_scores(
         ),
     )];
 
-    if !truth.reference_text.is_empty() {
+    // Only score CER/WER against a reference that has real content. A
+    // whitespace-ONLY reference (e.g. "   ") is not a valid ground truth: CER/WER
+    // trim it to empty and would then emit a false-perfect 0.0 against an empty
+    // parse. Gate on the trimmed reference so that case is skipped, not scored.
+    if !truth.reference_text.trim().is_empty() {
         rows.push(derived("cer", char_error_rate(&outcome.text, &truth.reference_text), None));
         rows.push(derived(
             "wer",
@@ -287,7 +295,11 @@ pub fn build_scores(
         ));
     }
 
-    if !truth.tables.is_empty() {
+    // Only emit table_f1 when the ground truth carries real cell content. A
+    // `tables: [[]]` (or all-empty-cell) truth has no reference content to score
+    // against and would otherwise produce a false-perfect 1.0 via the both-empty
+    // branch of `score_table_f1`.
+    if truth.tables.iter().flatten().flatten().any(|c| !c.trim().is_empty()) {
         rows.push(derived("table_f1", score_table_f1(&truth.tables, &outcome.tables), None));
     }
 
@@ -488,6 +500,52 @@ mod tests {
         assert!(rows.iter().all(|r| r.metric != "table_f1"));
     }
 
+    /// b2fix finding 4: a whitespace-ONLY reference is not a valid ground truth —
+    /// CER/WER must be SKIPPED, never emitted as a false-perfect 0.0 against an
+    /// empty parse.
+    #[test]
+    fn whitespace_only_reference_skips_cer_wer() {
+        let mut fields = BTreeMap::new();
+        fields.insert("invoice_number".to_string(), "INV-4471".to_string());
+        let truth = GroundTruth {
+            fields,
+            reference_text: "   \t\n  ".to_string(), // whitespace only
+            ..Default::default()
+        };
+        let outcome = ExtractionOutcome {
+            raw_output: r#"{"invoice_number": "INV-4471"}"#.to_string(),
+            text: String::new(), // empty parse
+            latency_ms: 100,
+            ..Default::default()
+        };
+        let rows = build_scores(ModelId::from("m"), BackendTag::Gpu, &truth, &outcome);
+        assert!(rows.iter().all(|r| r.metric != "cer"), "no CER against a blank reference");
+        assert!(rows.iter().all(|r| r.metric != "wer"), "no WER against a blank reference");
+    }
+
+    /// b2fix finding 5: a `tables: [[]]` ground truth (no cell content) must NOT
+    /// yield a false-perfect table_f1 = 1.0 — the row is skipped, and the pure
+    /// scorer returns 0.0 for no-content-on-either-side.
+    #[test]
+    fn empty_tables_ground_truth_is_not_a_false_perfect() {
+        let truth = GroundTruth {
+            tables: vec![vec![]], // [[]] — one table, zero rows/cells
+            ..Default::default()
+        };
+        let outcome = ExtractionOutcome {
+            tables: vec![vec![]],
+            latency_ms: 100,
+            ..Default::default()
+        };
+        let rows = build_scores(ModelId::from("m"), BackendTag::Gpu, &truth, &outcome);
+        assert!(
+            rows.iter().all(|r| r.metric != "table_f1"),
+            "no table_f1 row for a contentless [[]] ground truth"
+        );
+        // Pure scorer: no content on either side is 0.0, never 1.0.
+        assert_eq!(score_table_f1(&[vec![]], &[vec![]]), 0.0);
+    }
+
     #[test]
     fn empty_output_scores_zero_not_nan() {
         let truth = expected_answer_key();
@@ -528,8 +586,9 @@ mod tests {
         let actual = vec![vec![vec!["a".to_string(), "b".to_string()]]];
         let f1 = score_table_f1(&expected, &actual);
         assert!(f1 > 0.0 && f1 < 1.0, "expected partial F1, got {f1}");
-        // Both empty ⇒ 1.0; one side empty ⇒ 0.0.
-        assert_eq!(score_table_f1(&[], &[]), 1.0);
+        // No content on either side ⇒ 0.0 (never a false-perfect 1.0); one side
+        // empty ⇒ 0.0.
+        assert_eq!(score_table_f1(&[], &[]), 0.0);
         assert_eq!(score_table_f1(&expected, &[]), 0.0);
     }
 
