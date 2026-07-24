@@ -1450,17 +1450,20 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 /// SUITE-STT: assemble the `multipart/form-data` body for an OpenAI-compatible
 /// transcription request BY HAND (reqwest's `multipart` feature is not enabled).
 ///
-/// Hardened against two framing hazards a naive hand-rolled multipart has:
-///   1. **Header injection via the filename.** The caller-supplied `filename` is
-///      interpolated into a `Content-Disposition` header; a raw `"`, `\`, CR or
-///      LF could break out of the quoted value or inject a new header. Each such
-///      character is neutralized (replaced with `_`) before use.
-///   2. **Boundary collision in the payload.** A FIXED boundary that happens to
-///      occur inside the binary audio would split the body at the wrong place.
-///      If the boundary token appears anywhere in `audio_bytes`, this returns a
-///      clean `Err` (the caller surfaces it as a request-build error) rather than
-///      silently sending a corrupted request. A long, fixed token makes this
-///      essentially never fire for real PCM/WAV audio.
+/// Hardened against the framing hazards a naive hand-rolled multipart has:
+///   1. **Header/delimiter injection via a caller-supplied field.** BOTH the
+///      `filename` (interpolated into a quoted `Content-Disposition` value) AND
+///      the `model` (interpolated as a raw field body) are attacker-influencable.
+///      A raw `"` / `\` could break out of the quoted filename value, and a CR/LF
+///      in EITHER could inject a header or a premature `\r\n--<boundary>` delimiter
+///      and corrupt framing. Every such character is neutralized (replaced with
+///      `_`) in both fields before use.
+///   2. **Boundary collision in the payload/model.** A FIXED boundary that happens
+///      to occur inside the binary audio (or a crafted `model` value) would split
+///      the body at the wrong place. If the boundary token appears in `audio_bytes`
+///      or `model`, this returns a clean `Err` (the caller surfaces it as a
+///      request-build error) rather than silently sending a corrupted request. A
+///      long, fixed token makes this essentially never fire for real audio.
 ///
 /// Pure and unit-testable (no network).
 fn build_transcription_multipart(
@@ -1469,30 +1472,41 @@ fn build_transcription_multipart(
     filename: &str,
     audio_bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
-    // (2) Boundary-collision guard: refuse to frame a payload that contains the
-    // delimiter token rather than emit a body a server would mis-parse.
+    // (2) Boundary-collision guard: refuse to frame a binary payload that contains
+    // the delimiter token rather than emit a body a server would mis-parse.
     if contains_subslice(audio_bytes, boundary.as_bytes()) {
         return Err(format!(
             "audio payload ({} bytes) contains the multipart boundary token — cannot frame the request safely",
             audio_bytes.len()
         ));
     }
-    // (1) Neutralize CR / LF / double-quote / backslash in the filename so it
-    // cannot break the quoted Content-Disposition value or inject a header.
-    let safe_filename: String = filename
-        .chars()
-        .map(|c| match c {
-            '\r' | '\n' | '"' | '\\' => '_',
-            other => other,
-        })
-        .collect();
+    // (1) Neutralize CR / LF / double-quote / backslash in BOTH caller-supplied
+    // fields so neither can break a quoted value or inject a header/delimiter.
+    let neutralize = |s: &str| -> String {
+        s.chars()
+            .map(|c| match c {
+                '\r' | '\n' | '"' | '\\' => '_',
+                other => other,
+            })
+            .collect()
+    };
+    let safe_model = neutralize(model);
+    let safe_filename = neutralize(filename);
+    // (2, model): even neutralized (CR/LF gone, so a delimiter can't form), refuse
+    // a model value that still embeds the raw boundary token as a defense in depth.
+    if safe_model.contains(boundary) {
+        return Err(
+            "model field contains the multipart boundary token — cannot frame the request safely"
+                .to_string(),
+        );
+    }
 
     let mut body: Vec<u8> = Vec::with_capacity(audio_bytes.len() + 512);
     let push = |s: &str, body: &mut Vec<u8>| body.extend_from_slice(s.as_bytes());
     // model field
     push(&format!("--{boundary}\r\n"), &mut body);
     push("Content-Disposition: form-data; name=\"model\"\r\n\r\n", &mut body);
-    push(&format!("{model}\r\n"), &mut body);
+    push(&format!("{safe_model}\r\n"), &mut body);
     // response_format field (ask for a plain JSON `{ "text": ... }` envelope)
     push(&format!("--{boundary}\r\n"), &mut body);
     push("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n", &mut body);
@@ -4105,6 +4119,43 @@ mod tests {
             s.contains("filename=\"evil_.wav__X-Injected: 1\""),
             "sanitized filename must be a single quoted value: {s}"
         );
+    }
+
+    /// b2fix re-review: the caller-supplied `model` field is neutralized the same
+    /// way as the filename, so a `model` carrying CR/LF (a header/part injection
+    /// that does NOT reuse the literal boundary token) cannot inject a fake part or
+    /// corrupt framing.
+    #[test]
+    fn transcription_multipart_neutralizes_model_field_injection() {
+        let boundary = "----test-boundary-model";
+        // CRLF-based injection of a fake part WITHOUT the literal boundary token
+        // (which would instead hit the reject guard — see the next test).
+        let evil_model =
+            "gpt\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\ninjected".to_string();
+        let body = build_transcription_multipart(boundary, &evil_model, "clip.wav", b"AUDIO")
+            .expect("builds");
+        let s = String::from_utf8(body).expect("body is valid utf8 here");
+        // The injected header/part must NOT survive into the body as real framing.
+        assert!(!s.contains("name=\"x\""), "model-field CRLF injection must be neutralized: {s}");
+        assert!(
+            !s.contains("\r\ninjected"),
+            "no CRLF-delimited injected content survives: {s}"
+        );
+        // Exactly the three legitimate opening delimiters (model / response_format /
+        // file) remain — the injection did not add a fourth part.
+        let opens = s.matches(&format!("--{boundary}\r\n")).count();
+        assert_eq!(opens, 3, "exactly three field delimiters, got {opens}: {s}");
+    }
+
+    /// b2fix re-review: a `model` value embedding the raw boundary token is rejected
+    /// cleanly (defense in depth), never framed into a corruptible body.
+    #[test]
+    fn transcription_multipart_rejects_boundary_in_model() {
+        let boundary = "----test-boundary-modelrej";
+        let evil_model = format!("gpt{boundary}suffix");
+        let err = build_transcription_multipart(boundary, &evil_model, "clip.wav", b"AUDIO")
+            .unwrap_err();
+        assert!(err.contains("model"), "expected a model boundary-collision error, got {err}");
     }
 
     /// A payload that embeds the boundary token is rejected cleanly (never framed

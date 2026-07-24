@@ -546,6 +546,23 @@ mod tests {
         assert_eq!(score_table_f1(&[vec![]], &[vec![]]), 0.0);
     }
 
+    /// b2fix re-review: the PURE `score_table_f1` treats cells that are
+    /// empty-after-trim as NO content, so two tables whose only cells are blank
+    /// (matching whitespace) score 0.0 — never a false-perfect 1.0.
+    #[test]
+    fn table_f1_whitespace_only_cells_are_no_content() {
+        let exp = vec![vec![vec!["  ".to_string(), "\t".to_string()], vec!["\n".to_string()]]];
+        let act = vec![vec![vec!["   ".to_string()], vec![" ".to_string(), "".to_string()]]];
+        assert_eq!(
+            score_table_f1(&exp, &act),
+            0.0,
+            "whitespace-only cells on both sides must not score a false-perfect 1.0"
+        );
+        // A single blank cell vs a real cell is also not a match.
+        let real = vec![vec![vec!["Item".to_string()]]];
+        assert_eq!(score_table_f1(&exp, &real), 0.0, "blank vs real content is 0.0");
+    }
+
     #[test]
     fn empty_output_scores_zero_not_nan() {
         let truth = expected_answer_key();
