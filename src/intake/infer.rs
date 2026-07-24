@@ -950,4 +950,64 @@ mod tests {
         let body = serde_json::json!({"models": []});
         assert!(!tags_contains_model(&body, "qwen3:32b"));
     }
+
+    // BT-01: OpenAI-compatible arm parses an OpenAI chat-completion, records the response,
+    // takes token count from `usage`, and derives a local throughput.
+    #[tokio::test]
+    async fn openai_infer_parses_chat_completion_and_usage() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/chat/completions");
+                then.status(200).json_body(serde_json::json!({
+                    "choices": [{ "message": { "role": "assistant", "content": "hello world" } }],
+                    "usage": { "completion_tokens": 5 }
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = InferMetrics::default();
+        openai_infer(
+            &client,
+            &server.base_url(),
+            "test-model",
+            "hi",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert_eq!(m.response, "hello world");
+        assert_eq!(m.response_tokens, Some(5));
+        assert!(m.error.is_none());
+        assert!(m.total_time_ms.is_some());
+        assert!(m.throughput_tok_per_sec.unwrap_or(0.0) > 0.0);
+    }
+
+    #[tokio::test]
+    async fn openai_infer_surfaces_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/chat/completions");
+                then.status(500).body("out of memory");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = InferMetrics::default();
+        openai_infer(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.oom); // 500 + "memory" → oom flag
+    }
 }
