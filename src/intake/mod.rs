@@ -503,6 +503,11 @@ pub fn default_suites_for(model_name: &str) -> Vec<String> {
         // `/v1/audio/transcriptions` route — the Ollama-based suites can't load
         // it, so its default is the `stt` suite (mirrors the diffusion default).
         vec!["stt"]
+    } else if is_tts_model(&n) {
+        // S125 SUITE-TTS: a piper/TTS model is served behind Chord's synthesis
+        // route (intelligibility scored via an STT loopback) — the Ollama-based
+        // suites can't load it, so its default is the `tts` suite (mirrors stt).
+        vec!["tts"]
     } else if is_embedding_model(&n) {
         // SUITE-EMB (TERM #508): an embedding model can't run the chat-shaped
         // context/code/agent suites — its default is the IR-retrieval suite.
@@ -537,10 +542,35 @@ pub fn is_non_ollama_daemon(model_name: &str) -> bool {
 
 /// SUITE-STT: whether a model is a speech-to-text (ASR) model reached through
 /// Chord's OpenAI-compatible `/v1/audio/transcriptions` route rather than the
-/// Ollama load path. Name-heuristic (whisper family), same style as
-/// [`is_non_ollama_daemon`]. Pure. Expects an already-lowercased name.
+/// Ollama load path. Name-heuristic (whisper / `stt` / asr / transcrib), same
+/// style as [`is_non_ollama_daemon`]. STT always wins over TTS: any name
+/// carrying one of these signals is classified stt, and [`is_tts_model`] is
+/// guarded to return false for it, so the two predicates are provably disjoint.
+/// Pure. Expects an already-lowercased name.
 pub fn is_stt_model(model_name_lower: &str) -> bool {
-    model_name_lower.contains("whisper") || model_name_lower.contains("stt")
+    model_name_lower.contains("whisper")
+        || model_name_lower.contains("stt")
+        || model_name_lower.contains("asr")
+        || model_name_lower.contains("transcrib")
+}
+
+/// S125 SUITE-TTS: whether a model is a text-to-speech (TTS) model reached through
+/// Chord's OpenAI-compatible synthesis route rather than the Ollama load path.
+/// Name-heuristic (piper / vits / a `tts` tag), same style as [`is_stt_model`].
+/// Provably disjoint from [`is_stt_model`]: STT wins, so this returns false for
+/// any name carrying a speech-to-text signal even when it also carries a TTS
+/// marker (e.g. `coqui-stt`, `my-stt-tts`). A bare `coqui` is deliberately NOT a
+/// TTS signal — coqui ships both STT and TTS models, so only a `tts`-bearing
+/// coqui name (`coqui-tts`) routes here. Pure. Expects an already-lowercased name.
+pub fn is_tts_model(model_name_lower: &str) -> bool {
+    // STT always wins -> the predicates are disjoint by construction.
+    if is_stt_model(model_name_lower) {
+        return false;
+    }
+    // Require a TTS-specific signal (bare `coqui` is ambiguous, so excluded).
+    model_name_lower.contains("piper")
+        || model_name_lower.contains("vits")
+        || model_name_lower.contains("tts")
 }
 
 /// Whether a model is a text-embedding model (SUITE-EMB): matched by the common
@@ -645,7 +675,7 @@ impl RustTool for ModelIntake {
                 "model_name": { "type": "string", "description": "Ollama model name, e.g. 'gpt-oss:20b'" },
                 "suites": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing", "vision_qa", "reranking", "image_generation", "document_parsing", "stt"] },
+                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing", "vision_qa", "reranking", "image_generation", "document_parsing", "stt", "tts"] },
                     "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other suites don't apply to it. 'tool_routing' profiles function-calling over Chord's OpenAI-compatible /v1/chat/completions (correct-tool@1, parameter validity, decoy rejection, multi-step) — a first-class generalization of the 'agent' suite's tool-selection path. 'vision_qa' profiles a vision/VLM model on image-QA via Chord's chat/vision route (accuracy, caption similarity, hallucination, latency, VRAM)."
                 },
                 "tiers": {
@@ -1021,6 +1051,31 @@ impl RustTool for ModelIntake {
             }
         }
 
+        // S125 SUITE-TTS: text-to-speech runs through Chord's synthesis route with
+        // an STT loopback for intelligibility, owns its own `openai`-provider
+        // profile row, and is independent of the Ollama-based suites above — so it
+        // dispatches directly here (like document_parsing). This wires the tts
+        // suite into the single-model `model_intake` tool consistently with the
+        // fleet path's `tts` branch (previously it was fleet-only).
+        if suites.iter().any(|s| s == "tts") {
+            out.push_str("=== Text-to-speech suite ===\n");
+            match runner::run_tts_suite(model_name).await {
+                Ok(res) => {
+                    out.push_str(&format!(
+                        "cases run: {}\navg loopback WER: {:.2}\navg real-time factor: {}\n",
+                        res.cases_run,
+                        res.avg_loopback_wer,
+                        res.avg_rtf.map(|r| format!("{r:.2}")).unwrap_or_else(|| "n/a".into()),
+                    ));
+                    for line in &res.per_case {
+                        out.push_str(&format!("  {line}\n"));
+                    }
+                    out.push('\n');
+                }
+                Err(e) => out.push_str(&format!("skipped: {e}\n\n")),
+            }
+        }
+
         out.push_str("Note: coherence_score stored as NULL (LLM-judge deferred).\n");
 
         Ok(out)
@@ -1255,7 +1310,27 @@ async fn run_fleet_sweep(args: &Value, job_id: Option<&str>) -> Result<String, T
     // Per-model suite override map.
     let overrides = args.get("model_suites").cloned().unwrap_or(Value::Null);
 
-    let resolve_suites = move |m: &str| -> Vec<String> {
+    // DR-01: CONVERGENT sweep. When `only_pending` is set, read the persisted
+    // fleet catalog ONCE and, per model, keep only the suites whose coverage cell
+    // is still `not_run`/`stale` (via `catalog::pending_suites`) — settled cells
+    // are skipped so a resumed/partial sweep converges instead of re-profiling
+    // everything. Best-effort: an un-migrated host / DB hiccup falls back to
+    // running all resolved suites (map is `None`), never failing the sweep.
+    let only_pending = args.get("only_pending").and_then(|v| v.as_bool()).unwrap_or(false);
+    let pending_cells: Option<std::collections::HashMap<String, Vec<catalog::StoredCatalogCell>>> =
+        if only_pending {
+            match storage::get_pool().await {
+                Ok(pool) => storage::read_fleet_catalog(&pool)
+                    .await
+                    .ok()
+                    .map(|cards| cards.into_iter().map(|c| (c.model_name.clone(), c.cells)).collect()),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+    let base_resolve = move |m: &str| -> Vec<String> {
         if let Some(arr) = overrides.get(m).and_then(|v| v.as_array()) {
             let v: Vec<String> = arr
                 .iter()
@@ -1267,6 +1342,21 @@ async fn run_fleet_sweep(args: &Value, job_id: Option<&str>) -> Result<String, T
             }
         }
         default_suites_for(m)
+    };
+
+    let resolve_suites = move |m: &str| -> Vec<String> {
+        let suites = base_resolve(m);
+        match &pending_cells {
+            // Targeted (convergent) sweep: prune settled cells. A model absent from
+            // the catalog has no settled cells, so all its suites stay pending.
+            Some(map) => {
+                let empty: Vec<catalog::StoredCatalogCell> = Vec::new();
+                let cells = map.get(m).unwrap_or(&empty);
+                catalog::pending_suites(&suites, cells)
+            }
+            // Full sweep (default): run every resolved suite, unchanged behavior.
+            None => suites,
+        }
     };
 
     let results = runner::run_fleet_suites(
@@ -1368,7 +1458,9 @@ impl RustTool for ModelIntakeFleet {
                 "model_suites": { "type": "object",
                     "description": "Explicit per-model suite override: {model: [suites]}. Overrides purpose inference for that model." },
                 "async": { "type": "boolean",
-                    "description": "Run the sweep as a non-blocking background job (default false = blocking, current behavior). When true, returns a job_id immediately — poll with model_intake_job_status." }
+                    "description": "Run the sweep as a non-blocking background job (default false = blocking, current behavior). When true, returns a job_id immediately — poll with model_intake_job_status." },
+                "only_pending": { "type": "boolean",
+                    "description": "DR-01 convergent sweep: run only the models×suites whose fleet-catalog cell is still not_run/stale (skip settled run/non_viable cells) so a resumed/partial sweep converges. Default false = profile every resolved suite." }
             }
         })
     }
@@ -1572,6 +1664,10 @@ mod tests {
         // SUITE-STT: whisper / ASR models route to the stt suite.
         assert_eq!(default_suites_for("faster-whisper:small"), vec!["stt"]);
         assert_eq!(default_suites_for("whisper-large-v3"), vec!["stt"]);
+        // S125 SUITE-TTS: piper / TTS models route to the tts suite.
+        assert_eq!(default_suites_for("piper-en_US-lessac-medium"), vec!["tts"]);
+        assert_eq!(default_suites_for("coqui-xtts-v2"), vec!["tts"]);
+        assert_eq!(default_suites_for("my-tts-voice"), vec!["tts"]);
     }
 
     #[test]
@@ -1581,6 +1677,62 @@ mod tests {
         assert!(is_stt_model("my-stt-model"));
         assert!(!is_stt_model("qwen3:8b"));
         assert!(!is_stt_model("diffusiongemma-26b-a4b"));
+    }
+
+    #[test]
+    fn is_tts_model_matches_tts_family_and_is_disjoint_from_stt() {
+        // Genuine TTS names (piper / vits / a `tts` tag) route tts-only.
+        assert!(is_tts_model("piper-en_US-lessac-medium"));
+        assert!(is_tts_model("coqui-xtts-v2")); // `xtts` carries the `tts` tag
+        assert!(is_tts_model("coqui-tts"));
+        assert!(is_tts_model("some-vits-model"));
+        assert!(is_tts_model("my-tts-voice"));
+        assert!(!is_stt_model("piper-en_US-lessac-medium"));
+        assert!(!is_stt_model("coqui-tts"));
+
+        // STT wins on any speech-to-text signal, even alongside a tts marker.
+        // `coqui-stt` and `my-stt-tts` satisfy the raw tts substrings but must
+        // classify stt-only.
+        assert!(is_stt_model("coqui-stt"));
+        assert!(!is_tts_model("coqui-stt"));
+        assert!(is_stt_model("my-stt-tts"));
+        assert!(!is_tts_model("my-stt-tts"));
+        assert!(is_stt_model("whisper"));
+        assert!(!is_tts_model("whisper"));
+        assert!(!is_tts_model("faster-whisper:small"));
+        assert!(!is_tts_model("my-stt-model"));
+
+        // A bare `coqui` (no tts/stt marker) is ambiguous and routes to NEITHER
+        // predicate — coqui ships both families, so a bare tag is not a signal.
+        assert!(!is_tts_model("coqui"));
+        assert!(!is_stt_model("coqui"));
+
+        // Non-audio models trip neither predicate.
+        assert!(!is_tts_model("qwen3:8b"));
+        assert!(!is_stt_model("qwen3:8b"));
+
+        // Exhaustive disjointness: NO name may satisfy both predicates at once.
+        for name in [
+            "piper-en_US-lessac-medium",
+            "coqui-xtts-v2",
+            "coqui-tts",
+            "coqui-stt",
+            "my-stt-tts",
+            "some-vits-model",
+            "my-tts-voice",
+            "whisper",
+            "faster-whisper:small",
+            "my-stt-model",
+            "coqui",
+            "qwen3:8b",
+            "asr-conformer",
+            "transcribe-net",
+        ] {
+            assert!(
+                !(is_stt_model(name) && is_tts_model(name)),
+                "name {name:?} satisfied BOTH is_stt_model and is_tts_model"
+            );
+        }
     }
 
     #[test]

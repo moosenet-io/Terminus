@@ -1103,6 +1103,49 @@ pub fn filter_cards(
     (out, note)
 }
 
+/// Map an intake SUITE name (the fleet driver's vocabulary — `context`, `code`,
+/// `agent`, `stt`, `tts`, …) to the catalog `test_type` its results land under,
+/// or `None` for an unknown suite. PURE — the single source of truth the sweep
+/// uses to check whether a suite's coverage cell is already settled.
+pub fn suite_test_type(suite: &str) -> Option<&'static str> {
+    Some(match suite {
+        "context" => TEST_TYPE_SERVING,
+        "code" => TEST_TYPE_CODER,
+        "agent" => TEST_TYPE_AGENT,
+        "diffusion" => TEST_TYPE_DIFFUSION,
+        "embedding_retrieval" => TEST_TYPE_EMBEDDING_RETRIEVAL,
+        "tool_routing" => TEST_TYPE_TOOL_ROUTING,
+        "vision_qa" => TEST_TYPE_VISION_QA,
+        "reranking" => TEST_TYPE_RERANKING,
+        "image_generation" => TEST_TYPE_IMAGE_GENERATION,
+        "document_parsing" => TEST_TYPE_DOCUMENT_PARSING,
+        "stt" => TEST_TYPE_VOICE_TRANSCRIPTION,
+        "tts" => TEST_TYPE_TTS,
+        _ => return None,
+    })
+}
+
+/// DR-01 (S125): of a model's `candidate_suites`, which still need running in a
+/// CONVERGENT sweep — given the model's persisted coverage `cells`. A suite is
+/// PENDING when the model has NO settled (`run`/`non_viable`) cell for that
+/// suite's `test_type` yet: every matching cell is `not_run`/`stale`, or no cell
+/// exists at all. Settled suites are dropped so a resumed/partial sweep targets
+/// the gaps instead of re-profiling everything. An UNKNOWN suite (no `test_type`
+/// mapping) is kept — fail-open, never silently drop coverage. PURE (no DB, no
+/// clock, no env), so the convergence logic is fully unit-testable.
+pub fn pending_suites(candidate_suites: &[String], cells: &[StoredCatalogCell]) -> Vec<String> {
+    candidate_suites
+        .iter()
+        .filter(|suite| match suite_test_type(suite) {
+            Some(tt) => !cells
+                .iter()
+                .any(|c| c.test_type == tt && (c.status == "run" || c.status == "non_viable")),
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
 /// One cell as an output JSON object.
 fn cell_json(c: &StoredCatalogCell) -> Value {
     json!({
@@ -1527,6 +1570,69 @@ mod tests {
         );
     }
 
+    /// CB-01: the coverage matrix must carry a cell for EVERY one of the 8 new
+    /// S125 modalities (regardless of whether the suite is a batch-1 assistant
+    /// reader or a batch-2 `read_task_category_cells` reader), so a model with no
+    /// rows shows an explicit `not_run` gap per modality — never a silently
+    /// omitted row. Note the `stt` modality's emitted `test_type` is
+    /// `voice_transcription` (there is no separate `TEST_TYPE_STT`).
+    #[test]
+    fn catalog_covers_all_s125_modalities() {
+        let mut inp = base_inputs();
+        inp.fleet = vec![FleetModel {
+            model_name: "blank".into(),
+            in_current_fleet: true,
+            vram_footprint_gb: None,
+        }];
+        let cat = build_catalog(&inp);
+        let m = cat.iter().find(|m| m.model_name == "blank").unwrap();
+
+        // (test_type, task_category) for each of the 8 S125 modalities.
+        let s125: [(&str, &str); 8] = [
+            (TEST_TYPE_EMBEDDING_RETRIEVAL, EMBEDDING_RETRIEVAL_CATEGORY),
+            (TEST_TYPE_RERANKING, RERANKING_CATEGORY),
+            (TEST_TYPE_VISION_QA, VISION_QA_CATEGORY),
+            (TEST_TYPE_TOOL_ROUTING, TOOL_ROUTING_CATEGORY),
+            (TEST_TYPE_DOCUMENT_PARSING, DOCUMENT_PARSING_CATEGORY),
+            (TEST_TYPE_IMAGE_GENERATION, IMAGE_GENERATION_CATEGORY),
+            (TEST_TYPE_VOICE_TRANSCRIPTION, VOICE_TRANSCRIPTION_CATEGORY), // stt
+            (TEST_TYPE_TTS, TTS_CATEGORY),
+        ];
+        for (tt, tc) in s125 {
+            let matches: Vec<&CatalogCell> =
+                m.cells.iter().filter(|c| c.test_type == tt).collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "expected exactly one coverage cell for modality {tt}, found {}",
+                matches.len()
+            );
+            let c = matches[0];
+            assert_eq!(c.task_category, tc, "wrong task_category for {tt}");
+            assert_eq!(
+                c.status,
+                CoverageStatus::NotRun,
+                "modality {tt} must account as not_run for a model with no rows"
+            );
+        }
+
+        // The pre-existing modalities remain present alongside the S125 eight.
+        for tt in [
+            TEST_TYPE_CODER,
+            TEST_TYPE_ASSISTANT,
+            TEST_TYPE_SERVING,
+            TEST_TYPE_AGENT,
+        ] {
+            assert!(
+                m.cells.iter().any(|c| c.test_type == tt),
+                "pre-existing modality {tt} missing from coverage matrix"
+            );
+        }
+
+        // Every cell is a not_run gap, and not_run_count agrees with the total.
+        assert_eq!(m.not_run_count, m.cells.len());
+    }
+
     /// A `non_viable_vram` model → `non_viable` coder cells (read off the failure
     /// axis, NOT inferred from aggregates — there are none for a skip).
     #[test]
@@ -1705,6 +1811,50 @@ mod tests {
             refreshed_at: chrono::Utc::now(),
             cells,
         }
+    }
+
+    // DR-01: suite → test_type mapping covers every fleet suite; unknown → None.
+    #[test]
+    fn suite_test_type_mapping() {
+        assert_eq!(suite_test_type("context"), Some(TEST_TYPE_SERVING));
+        assert_eq!(suite_test_type("code"), Some(TEST_TYPE_CODER));
+        assert_eq!(suite_test_type("agent"), Some(TEST_TYPE_AGENT));
+        assert_eq!(suite_test_type("stt"), Some(TEST_TYPE_VOICE_TRANSCRIPTION));
+        assert_eq!(suite_test_type("tts"), Some(TEST_TYPE_TTS));
+        assert_eq!(suite_test_type("vision_qa"), Some(TEST_TYPE_VISION_QA));
+        assert_eq!(suite_test_type("image_generation"), Some(TEST_TYPE_IMAGE_GENERATION));
+        assert_eq!(suite_test_type("nonsense"), None);
+    }
+
+    // DR-01: a CONVERGENT sweep keeps only suites whose cell is not_run/stale (or
+    // absent); a settled (`run`/`non_viable`) cell drops its suite; an unknown
+    // suite is kept (fail-open).
+    #[test]
+    fn pending_suites_targets_gaps_only() {
+        let cells = vec![
+            scell("m", TEST_TYPE_SERVING, "context_profile", "run"), // context settled
+            scell("m", TEST_TYPE_TTS, "tts", "not_run"),             // tts pending
+            scell("m", TEST_TYPE_VISION_QA, "image_parsing", "stale"), // vqa pending (stale)
+            scell("m", TEST_TYPE_RERANKING, "rerank_relevance", "non_viable"), // settled
+        ];
+        let candidates: Vec<String> = ["context", "tts", "vision_qa", "reranking", "stt", "mystery"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let pending = pending_suites(&candidates, &cells);
+        // context (run) + reranking (non_viable) dropped; tts+vqa (gaps), stt (no
+        // cell at all) and mystery (unknown → fail-open) kept.
+        assert_eq!(pending, vec!["tts", "vision_qa", "stt", "mystery"]);
+    }
+
+    #[test]
+    fn pending_suites_empty_when_all_settled() {
+        let cells = vec![
+            scell("m", TEST_TYPE_SERVING, "context_profile", "run"),
+            scell("m", TEST_TYPE_CODER, "blitz", "run"),
+        ];
+        let candidates: Vec<String> = ["context", "code"].iter().map(|s| s.to_string()).collect();
+        assert!(pending_suites(&candidates, &cells).is_empty());
     }
 
     /// A two-model fixture: `alpha` has a run + a not_run coder cell; `beta` has
