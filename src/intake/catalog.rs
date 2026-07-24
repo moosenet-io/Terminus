@@ -73,11 +73,46 @@ pub const TEST_TYPE_AGENT: &str = "agent";
 /// MINT-DIFF-01: the diffusion suite's test-family tag (use-case quality +
 /// performance, distinct from `coder`/`assistant`/`serving`/`agent`).
 pub const TEST_TYPE_DIFFUSION: &str = "diffusion";
+/// SUITE-EMB (S125 TERM #508): the embedding-retrieval suite's test-family tag
+/// (IR quality — precision/recall/MRR/nDCG — plus dimensionality, throughput, and
+/// a public-vs-domain delta). Results land in `assistant_dimension_score` under
+/// `task_category = "embedding_retrieval"`; see
+/// [`crate::intake::newcats::embedding_retrieval`].
+pub const TEST_TYPE_EMBEDDING_RETRIEVAL: &str = "embedding_retrieval";
+/// S125 SUITE-TOOL: the tool-routing suite's test-family tag (correct-tool@1,
+/// parameter validity, decoy rejection, multi-step — distinct from the legacy
+/// `agent` tool-use family, which stays a scalar accuracy on its own axis).
+pub const TEST_TYPE_TOOL_ROUTING: &str = "tool_routing";
+/// SUITE-VQA: the vision-QA suite's test-family tag (image → short answer;
+/// accuracy / caption similarity / hallucination / latency / VRAM).
+pub const TEST_TYPE_VISION_QA: &str = "vision_qa";
+/// The vision-QA leaf `task_category` — the `image_parsing` module's own tag,
+/// which the suite writes its `assistant_dimension_score` rows under.
+pub const VISION_QA_CATEGORY: &str = "image_parsing";
+/// The `dimension` the vision-QA suite writes (image_parsing::DIMENSION). A
+/// vision_qa cell is `run` when a row for this dimension exists for the model
+/// (read via `read_assistant_cells`, which does not filter `task_category`).
+const VISION_QA_DIMENSION: &str = "vision_description";
+/// SUITE-RRK: the reranking suite's test-family tag (nDCG uplift + latency,
+/// distinct from the other families).
+pub const TEST_TYPE_RERANKING: &str = "reranking";
 
 /// The single serving/context-profile leaf category.
 pub const SERVING_CATEGORY: &str = "context_profile";
 /// The single agent tool-use leaf category.
 pub const AGENT_CATEGORY: &str = "tool_use";
+/// The single embedding-retrieval leaf category (matches the `newcats` module's
+/// `TASK_CATEGORY`).
+pub const EMBEDDING_RETRIEVAL_CATEGORY: &str = "embedding_retrieval";
+/// The single tool-routing leaf category (all four routing metrics roll up under
+/// the one `"tool_routing"` dimension written by the suite).
+pub const TOOL_ROUTING_CATEGORY: &str = "tool_routing";
+/// SUITE-RRK: the single reranking leaf category. MUST equal
+/// `newcats::reranking::DIMENSION` — the reranking suite writes its
+/// `assistant_dimension_score` rows under that dimension, and the catalog cell
+/// is derived by matching it (duplicated as a string here, matching how
+/// `ASSISTANT_DIMENSIONS` duplicates the `assistant/dim*.rs` `DIMENSION` consts).
+pub const RERANKING_CATEGORY: &str = "rerank_relevance";
 
 /// A cell's coverage status. `not_run` is FIRST-CLASS — representing gaps is the
 /// catalog's whole job.
@@ -523,6 +558,106 @@ pub fn build_catalog(inputs: &CatalogInputs) -> Vec<ModelCatalog> {
             _ => not_run_cell(&model, TEST_TYPE_AGENT, AGENT_CATEGORY),
         };
         cells.push(agent_cell);
+
+        // ---- embedding_retrieval cell (SUITE-EMB) ----------------------------
+        // The suite writes its results to `assistant_dimension_score` under
+        // `task_category = "embedding_retrieval"`; no dedicated stored-aggregate
+        // reader is threaded into `CatalogInputs` yet, so — like every other
+        // uncovered family — this is emitted as a FIRST-CLASS `not_run` coverage
+        // cell so the embedding-retrieval axis shows up (as an explicit gap) for
+        // every model until a reader promotes it to `Run`. Adding that reader is a
+        // follow-up, mirroring how `diffusion` introduced its `TEST_TYPE_*` before
+        // a catalog reader existed.
+        cells.push(not_run_cell(
+            &model,
+            TEST_TYPE_EMBEDDING_RETRIEVAL,
+            EMBEDDING_RETRIEVAL_CATEGORY,
+        ));
+        // ---- tool-routing cell (S125 SUITE-TOOL) -----------------------------
+        // Reads the same assistant-dimension rollups (`read_assistant_cells`
+        // groups by dimension across every task_category), keyed on the suite's
+        // own `"tool_routing"` dimension — so it never collides with the
+        // hardcoded ASSISTANT_DIMENSIONS list above.
+        let tool_routing_row = inputs
+            .assistant
+            .iter()
+            .find(|a| a.model_name == model && a.dimension == TOOL_ROUTING_CATEGORY);
+        let tool_routing_cell = match tool_routing_row {
+            Some(a) if a.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_TOOL_ROUTING.to_string(),
+                task_category: TOOL_ROUTING_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                pass_rate: None,
+                n_samples: Some(a.n_samples),
+                score_stddev: a.score_stddev,
+                low_confidence: Some(a.n_samples <= 1),
+                last_run_at: a.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_TOOL_ROUTING, TOOL_ROUTING_CATEGORY),
+        };
+        cells.push(tool_routing_cell);
+
+        // ---- vision_qa cell (SUITE-VQA image-QA suite) -----------------------
+        // The vision_qa suite writes `assistant_dimension_score` rows under the
+        // `vision_description` dimension (task_category "image_parsing"), read
+        // into `inputs.assistant` — which does not filter task_category. A
+        // vision_qa cell is `run` when such a row exists for this model, else
+        // not_run (the explicit coverage gap, same as agent/serving).
+        let vision_row = inputs
+            .assistant
+            .iter()
+            .find(|a| a.model_name == model && a.dimension == VISION_QA_DIMENSION);
+        let vision_cell = match vision_row {
+            Some(a) if a.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_VISION_QA.to_string(),
+                task_category: VISION_QA_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                pass_rate: None,
+                n_samples: Some(a.n_samples),
+                score_stddev: a.score_stddev,
+                low_confidence: Some(a.n_samples <= 1),
+                last_run_at: a.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_VISION_QA, VISION_QA_CATEGORY),
+        };
+        cells.push(vision_cell);
+
+        // ---- reranking cell (SUITE-RRK) --------------------------------------
+        // The reranking suite writes its rows into `assistant_dimension_score`
+        // under `dimension = RERANKING_CATEGORY` (see `newcats::reranking`), and
+        // `read_assistant_cells` groups EVERY dimension (no task_category filter),
+        // so a reranking rollup arrives in `inputs.assistant` keyed by that
+        // dimension — no separate input source is needed. `Run` when rows exist,
+        // `not_run` otherwise. The fixed assistant loop above never emits this
+        // cell because RERANKING_CATEGORY is not in `ASSISTANT_DIMENSIONS`, so
+        // there is no double-count.
+        let rerank_row = inputs
+            .assistant
+            .iter()
+            .find(|a| a.model_name == model && a.dimension == RERANKING_CATEGORY);
+        let rerank_cell = match rerank_row {
+            Some(a) if a.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_RERANKING.to_string(),
+                task_category: RERANKING_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                pass_rate: None,
+                n_samples: Some(a.n_samples),
+                score_stddev: a.score_stddev,
+                low_confidence: Some(a.n_samples <= 1),
+                last_run_at: a.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_RERANKING, RERANKING_CATEGORY),
+        };
+        cells.push(rerank_cell);
 
         // ---- serving facts (fleet card) --------------------------------------
         let serving = ServingFacts {
@@ -1201,9 +1336,10 @@ mod tests {
             m.cells.iter().all(|c| c.status == CoverageStatus::NotRun),
             "every cell must be not_run"
         );
-        // Coder (3) + assistant (7) + serving (1) + agent (1) = 12 cells.
-        assert_eq!(m.cells.len(), 12);
-        assert_eq!(m.not_run_count, 12);
+        // Coder (3) + assistant (7) + serving (1) + agent (1) +
+        // embedding_retrieval (1, SUITE-EMB) + tool_routing (1, SUITE-TOOL) + vision_qa (1, SUITE-VQA) + reranking (1, SUITE-RRK) = 16 cells.
+        assert_eq!(m.cells.len(), 16);
+        assert_eq!(m.not_run_count, 16);
         // multi_file gap is explicitly present, not omitted.
         assert_eq!(
             cell(&cat, "ghost", "coder", "multi_file").status,

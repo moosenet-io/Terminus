@@ -116,8 +116,20 @@ pub(crate) type MatrixMap = HashMap<String, MatrixEntry>;
 /// Load presets: from `MODEL_PRESETS_PATH` if set (empty map on read/parse
 /// failure), otherwise the bundled default.
 fn load_presets() -> PresetMap {
-    match env::var("MODEL_PRESETS_PATH").ok().filter(|s| !s.is_empty()) {
-        Some(path) => std::fs::read_to_string(&path)
+    load_presets_from(
+        env::var("MODEL_PRESETS_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .as_deref(),
+    )
+}
+
+/// Core of [`load_presets`] with the override path passed explicitly, so tests
+/// can exercise the read/parse-failure fallback without mutating the
+/// process-global `MODEL_PRESETS_PATH` env var (which races parallel tests).
+fn load_presets_from(path: Option<&str>) -> PresetMap {
+    match path {
+        Some(path) => std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_yaml::from_str(&s).ok())
             .unwrap_or_default(),
@@ -180,13 +192,31 @@ fn pick_preset_for_vram(presets: &PresetMap, vram_gb: f64, platform: &str) -> St
 }
 
 /// The role preference order for a use case. Mirrors Python's `use_case_roles`.
+///
+/// CB-03 (S125): extended to advise per-task **and per-modality** — the offline
+/// twin of the Chord runtime selector. The modality use-cases below map onto the
+/// shared Chord capability taxonomy (chat/reasoning/code/embed/rerank/vlm/ocr/
+/// doc/image_gen/tts/stt/tool_router/diffusion) so the offline advisor and the
+/// online selector agree on role names. Every arm falls back to `primary`/`fast`
+/// so a recommendation is always produced even on a preset that carries no
+/// dedicated model for that modality (the caller then reuses the chat model).
 fn preferred_roles(use_case: &str) -> Vec<&'static str> {
     match use_case {
+        // ── text / chat use-cases (original) ──────────────────────────────
         "coding" => vec!["code", "primary"],
         "reasoning" => vec!["reasoning", "primary"],
         "fast" => vec!["fast", "primary"],
         "research" => vec!["reasoning", "primary", "fast"],
         "general" => vec!["primary", "fast", "code"],
+        // ── modality use-cases (CB-03) ────────────────────────────────────
+        "vision" | "vlm" => vec!["vlm", "primary"],
+        "ocr" | "doc" | "document_parsing" => vec!["doc", "ocr", "vlm", "primary"],
+        "asr" | "stt" | "transcription" => vec!["stt", "primary"],
+        "tts" | "speech" => vec!["tts", "primary"],
+        "rerank" => vec!["rerank", "embed", "primary"],
+        "embed" | "embeddings" => vec!["embed", "embeddings", "fast"],
+        "image_gen" | "image" | "diffusion" => vec!["image_gen", "primary"],
+        "tool_routing" | "tool_router" | "routing" => vec!["tool_router", "fast", "primary"],
         _ => vec!["primary", "fast"],
     }
 }
@@ -219,7 +249,11 @@ impl RustTool for ModelAdvisorRecommend {
                 },
                 "use_case": {
                     "type": "string",
-                    "description": "'general', 'coding', 'reasoning', 'fast', or 'research'",
+                    "description": "Text: 'general', 'coding', 'reasoning', 'fast', 'research'. \
+                                    Modality (CB-03): 'vision', 'ocr'/'doc', 'asr'/'stt', 'tts', \
+                                    'rerank', 'embed', 'image_gen', 'tool_routing' — resolves to the \
+                                    matching Chord-taxonomy role (vlm/doc/stt/tts/rerank/embed/\
+                                    image_gen/tool_router), falling back to the chat model.",
                     "default": "general"
                 },
                 "platform": {
@@ -568,7 +602,6 @@ pub fn register(registry: &mut ToolRegistry) {
 mod tests {
     use super::*;
     use httpmock::prelude::*;
-    use serial_test::serial;
 
     // --- bundled data loads -----------------------------------------------
 
@@ -588,12 +621,36 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    fn test_default_matrix_has_modality_backends() {
+        // CB-03: every non-chat modality backend is a first-class matrix row so
+        // model_advisor_check_fit / query_ollama know their VRAM cost.
+        let matrix = load_matrix();
+        for (model, cap) in [
+            ("llava:7b", "vlm"),
+            ("bge-reranker-v2-m3", "rerank"),
+            ("faster-whisper-small", "stt"),
+            ("piper-lessac-medium", "tts"),
+            ("docling", "doc"),
+            ("sd-turbo", "image_gen"),
+            ("qwen3-embedding:0.6b", "embed"),
+        ] {
+            let entry = matrix
+                .get(model)
+                .unwrap_or_else(|| panic!("matrix missing modality backend '{model}'"));
+            assert!(!entry.quants.is_empty(), "'{model}' must have a quant/VRAM entry");
+            assert!(
+                entry.best_for.iter().any(|b| b == cap),
+                "'{model}' best_for must include Chord capability '{cap}'"
+            );
+        }
+    }
+
+    #[test]
     fn test_missing_override_path_yields_empty_map() {
-        std::env::set_var("MODEL_PRESETS_PATH", "/nonexistent/does-not-exist.yaml");
-        let presets = load_presets();
+        // Exercised via the explicit-path core so no process-global env var is
+        // mutated (that raced parallel tests calling `load_presets`).
+        let presets = load_presets_from(Some("/nonexistent/does-not-exist.yaml"));
         assert!(presets.is_empty());
-        std::env::remove_var("MODEL_PRESETS_PATH");
     }
 
     // --- pick_preset_for_vram ------------------------------------------
@@ -659,6 +716,34 @@ mod tests {
         assert_eq!(preferred_roles("not-a-real-use-case"), vec!["primary", "fast"]);
     }
 
+    // --- preferred_roles: modality use-cases (CB-03) ----------------------
+
+    #[test]
+    fn test_preferred_roles_modalities_map_to_taxonomy() {
+        // Each modality use-case resolves to its Chord-taxonomy role first, and
+        // always falls back to the chat model so a recommendation is guaranteed.
+        assert_eq!(preferred_roles("vision")[0], "vlm");
+        assert_eq!(preferred_roles("vlm")[0], "vlm");
+        assert_eq!(preferred_roles("ocr")[0], "doc");
+        assert_eq!(preferred_roles("doc")[0], "doc");
+        assert_eq!(preferred_roles("asr")[0], "stt");
+        assert_eq!(preferred_roles("stt")[0], "stt");
+        assert_eq!(preferred_roles("tts")[0], "tts");
+        assert_eq!(preferred_roles("rerank")[0], "rerank");
+        assert_eq!(preferred_roles("embed")[0], "embed");
+        assert_eq!(preferred_roles("image_gen")[0], "image_gen");
+        assert_eq!(preferred_roles("diffusion")[0], "image_gen");
+        assert_eq!(preferred_roles("tool_routing")[0], "tool_router");
+        assert_eq!(preferred_roles("routing")[0], "tool_router");
+        // Fallback to chat model is present for every modality.
+        for uc in ["vision", "ocr", "asr", "tts", "rerank", "image_gen", "tool_routing"] {
+            assert!(
+                preferred_roles(uc).contains(&"primary"),
+                "modality '{uc}' must fall back to a chat model"
+            );
+        }
+    }
+
     // --- tool metadata ------------------------------------------------
 
     #[test]
@@ -701,6 +786,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_recommend_selects_multimodal_preset_at_21gb() {
+        // The multimodal_pvf1 preset (alloc 21) is the highest-fitting preset at
+        // 21GB generic — deterministic, and does not disturb the 24GB tier
+        // (still discrete_24gb).
+        let tool = ModelAdvisorRecommend;
+        let result = tool
+            .execute(json!({"vram_gb": 21.0, "use_case": "general", "platform": "generic"}))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["preset_name"], "multimodal_pvf1");
+    }
+
+    #[tokio::test]
+    async fn test_recommend_resolves_each_modality_to_a_model() {
+        // CB-03 core assertion: at a multimodal budget, each modality use-case
+        // surfaces its concrete backend as the top-ranked model.
+        let tool = ModelAdvisorRecommend;
+        let cases = [
+            ("vision", "vlm", "llava:7b"),
+            ("ocr", "doc", "docling"),
+            ("asr", "stt", "faster-whisper-small"),
+            ("tts", "tts", "piper-lessac-medium"),
+            ("rerank", "rerank", "bge-reranker-v2-m3"),
+            ("embed", "embed", "qwen3-embedding:0.6b"),
+            ("image_gen", "image_gen", "sd-turbo"),
+            ("tool_routing", "tool_router", "qwen3.5:4b"),
+        ];
+        for (use_case, role, model) in cases {
+            let result = tool
+                .execute(json!({"vram_gb": 21.0, "use_case": use_case, "platform": "generic"}))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(v["preset_name"], "multimodal_pvf1", "use_case={use_case}");
+            let top = &v["models"].as_array().unwrap()[0];
+            assert_eq!(top["role"], role, "use_case '{use_case}' top role");
+            assert_eq!(top["name"], model, "use_case '{use_case}' top model");
+        }
+    }
+
+    #[tokio::test]
     async fn test_recommend_missing_vram_gb_rejected() {
         let tool = ModelAdvisorRecommend;
         let err = tool.execute(json!({})).await.unwrap_err();
@@ -728,6 +855,20 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["fits"], true);
         assert_eq!(v["model_vram_gb"], 6.0);
+    }
+
+    #[tokio::test]
+    async fn test_check_fit_modality_model_llava() {
+        // CB-03: a modality backend is checkable for fit like any chat model.
+        let tool = ModelAdvisorCheckFit;
+        let result = tool
+            .execute(json!({"model_name": "llava:7b", "quant": "Q4_K_M", "vram_gb": 24.0}))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["fits"], true);
+        assert_eq!(v["model_vram_gb"], 5.0);
     }
 
     #[tokio::test]

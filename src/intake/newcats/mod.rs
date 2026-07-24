@@ -14,7 +14,13 @@
 //!     text → structured output, scored by field-level accuracy.
 //!   - [`image_parsing`]       — `task_category = "image_parsing"`: image →
 //!     description, scored by caption similarity. Ships a dependency-free
-//!     synthetic BMP generator for the sanity test.
+//!     synthetic BMP generator for the sanity test. SUITE-VQA (S125) wires this
+//!     module into the fleet as the `vision_qa` suite: on top of the caption
+//!     path it adds a vision-QA path (image + question → short answer) scored by
+//!     lenient accuracy / caption similarity / hallucination / latency / VRAM,
+//!     driven by `runner::run_vision_qa_suite` over an `INTAKE_CORPUS_DIR`
+//!     manifest, calling Chord's `/v1/chat/completions` image content part via
+//!     `infer::vision_infer_with_metrics`. Catalog family `TEST_TYPE_VISION_QA`.
 //!   - [`image_generation`]    — `task_category = "image_generation"`: DIFFERENT
 //!     metric shape (no tokens/accuracy) — success bool, time-to-image ms,
 //!     VRAM peak MB. No generation backend exists on this box yet; only the
@@ -30,6 +36,28 @@
 //!     diffusion generates in fixed canvas blocks, not a token stream). The
 //!     live backend call goes through `intake::infer::infer_with_metrics`'s
 //!     `kind == "daemon"` arm; this module's tests exercise scoring only.
+//!   - [`embedding_retrieval`] — `task_category = "embedding_retrieval"`
+//!     (SUITE-EMB): the IR-quality suite for TEXT-EMBEDDING models. Promotes the
+//!     `assistant::dim6_embeddings` precursor into a fleet-wired suite — reuses
+//!     its precision/recall/MRR/nDCG + public-vs-domain-delta machinery and adds
+//!     the newcats surface (`INTAKE_CORPUS_DIR` loader, throughput metric,
+//!     `score_and_write`). Backend seam = Chord `/v1/embeddings` via
+//!     `infer::embed_with_metrics`'s `openai_embed` arm.
+//!   - [`tool_routing`]       — `task_category = "tool_routing"` (S125 SUITE-TOOL):
+//!     the first-class tool-routing / function-calling profiler. Unlike the four
+//!     synthetic-corpus siblings it REUSES the `agent` suite's scenario corpus
+//!     (`agent-scenarios.json`) + tool-catalog builder + multi-step scorer, but
+//!     routes through Chord's OpenAI-compatible `/v1/chat/completions` `tools`
+//!     path (`infer::tool_infer_with_metrics`) and scores discrete metrics
+//!     (`correct_tool_at_1`, `parameter_validity`, `decoy_rejection`,
+//!     `multi_step_success`). The legacy `agent` suite is left untouched.
+//!   - [`reranking`]            — `task_category = "reranking"` (SUITE-RRK):
+//!     cross-encoder reranking probe. Emits nDCG UPLIFT over a bi-encoder
+//!     baseline (`ndcg_uplift`), the reranked/baseline nDCG, and rerank
+//!     `latency_ms`. The live backend call goes through
+//!     `intake::infer::rerank_with_metrics`'s `kind == "openai"` arm
+//!     (`POST /v1/rerank`, bge-reranker-v2-m3); scoring (pure nDCG) is
+//!     unit-tested against a mock ordering. Corpus via `INTAKE_CORPUS_DIR`.
 //!
 //! ## Shared scoring primitives
 //! [`text_similarity`] holds the small, dependency-free string-similarity
@@ -47,7 +75,10 @@
 
 pub mod diffusion;
 pub mod document_parsing;
+pub mod embedding_retrieval;
 pub mod image_generation;
 pub mod image_parsing;
+pub mod reranking;
 pub mod text_similarity;
+pub mod tool_routing;
 pub mod voice_transcription;

@@ -473,12 +473,31 @@ fn parse_suites(args: &Value, model_name: &str) -> Vec<String> {
 ///                                daemon model — the Ollama-based suites
 ///                                can't load it, so its default is the
 ///                                diffusion suite, not `context`/`code`)
+///   - "nomic-embed"/"bge"/…    → [embedding_retrieval]  (SUITE-EMB: an
+///                                embedding model can't run the chat-shaped
+///                                suites; see [`is_embedding_model`])
+///   - "rerank"                 → [reranking]  (SUITE-RRK: a cross-encoder
+///                                reranker profiled via Chord's /v1/rerank,
+///                                not an Ollama generative suite)
 ///   - default                  → [context]
 /// Pure.
 pub fn default_suites_for(model_name: &str) -> Vec<String> {
     let n = model_name.to_lowercase();
     let v = if n.contains("diffusiongemma") || n.contains("dgem") {
         vec!["diffusion"]
+    } else if is_embedding_model(&n) {
+        // SUITE-EMB (TERM #508): an embedding model can't run the chat-shaped
+        // context/code/agent suites — its default is the IR-retrieval suite.
+        vec!["embedding_retrieval"]
+    } else if is_vision_model(&n) {
+        // SUITE-VQA: a vision/VLM model's default is the image-QA suite (the
+        // Ollama context suite is text-only and doesn't exercise its vision path).
+        vec!["vision_qa"]
+    } else if n.contains("rerank") {
+        // SUITE-RRK: a reranker (e.g. bge-reranker-v2-m3) is a cross-encoder, not
+        // a generative model — the Ollama-based suites don't apply; its default
+        // is the reranking suite via Chord's /v1/rerank.
+        vec!["reranking"]
     } else if n.contains("coder") {
         vec!["context", "code"]
     } else if n.contains("gpt-oss") {
@@ -497,6 +516,38 @@ pub fn is_non_ollama_daemon(model_name: &str) -> bool {
     let n = model_name.to_lowercase();
     n.contains("diffusiongemma") || n.contains("dgem")
 }
+
+/// Whether a model is a text-embedding model (SUITE-EMB): matched by the common
+/// embedding-model name markers in this fleet's registry (nomic-embed, bge,
+/// mxbai-embed, gte, e5, embeddinggemma, or a bare `-embed`/`embedding` tag).
+/// Pure. Deliberately conservative substring matching — a chat model won't carry
+/// these markers, and a false negative just falls back to the `context` default.
+pub fn is_embedding_model(model_name: &str) -> bool {
+    let n = model_name.to_lowercase();
+    n.contains("embed")
+        || n.contains("nomic")
+        || n.contains("bge-")
+        || n.contains("mxbai")
+        || n.contains("gte-")
+        || n.starts_with("gte")
+        || n.contains("e5-")
+}
+
+/// SUITE-VQA: whether a model name looks like a vision-capable (VLM) model that
+/// the image-QA suite should profile. Matches the common local VLM families.
+/// Pure. `model_name` is expected already-lowercased by the caller path, but is
+/// lowercased again defensively.
+pub fn is_vision_model(model_name: &str) -> bool {
+    let n = model_name.to_lowercase();
+    n.contains("llava")
+        || n.contains("bakllava")
+        || n.contains("minicpm-v")
+        || n.contains("vision")
+        || n.contains("-vl")
+        || n.contains(":vl")
+        || n.contains("moondream")
+}
+
 
 /// Pick code-suite languages by model purpose: coder models get the full P0/P1
 /// set; everyone else gets a lighter, fast set. Empty vec = "all languages in
@@ -568,8 +619,8 @@ impl RustTool for ModelIntake {
                 "model_name": { "type": "string", "description": "Ollama model name, e.g. 'gpt-oss:20b'" },
                 "suites": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion"] },
-                    "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other three suites don't apply to it."
+                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing", "vision_qa", "reranking"] },
+                    "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other suites don't apply to it. 'tool_routing' profiles function-calling over Chord's OpenAI-compatible /v1/chat/completions (correct-tool@1, parameter validity, decoy rejection, multi-step) — a first-class generalization of the 'agent' suite's tool-selection path. 'vision_qa' profiles a vision/VLM model on image-QA via Chord's chat/vision route (accuracy, caption similarity, hallucination, latency, VRAM)."
                 },
                 "tiers": {
                     "type": "array",
@@ -713,8 +764,8 @@ impl RustTool for ModelIntake {
             ));
         }
 
-        // Ensure a parent profile row for code/agent-only runs.
-        let needs_profile = suites.iter().any(|s| s == "code" || s == "agent");
+        // Ensure a parent profile row for code/agent/tool_routing-only runs.
+        let needs_profile = suites.iter().any(|s| s == "code" || s == "agent" || s == "tool_routing");
         if needs_profile && profile_id.is_none() {
             profile_id = Some(runner::create_profile_row(model_name).await?);
         }
@@ -816,6 +867,69 @@ impl RustTool for ModelIntake {
                 a.personality_quality.map(|v| format!("{v:.1}/5")).unwrap_or_else(|| "n/a".into()),
             ));
             out.push_str(&format!("recommended_role: {}\n\n", a.recommended_role));
+        }
+
+        // SUITE-EMB (TERM #508): IR-retrieval profiling for embedding models.
+        // Self-contained (creates its own profile row, loads its own corpora),
+        // so it runs independently of the context/code/agent profile_id above.
+        if suites.iter().any(|s| s == "embedding_retrieval") {
+            let res = runner::run_embedding_retrieval_suite(model_name).await?;
+            out.push_str("=== Embedding-retrieval suite (SUITE-EMB) ===\n");
+            if res.skipped {
+                out.push_str(&format!("skipped: {}\n\n", res.summary));
+            } else {
+                out.push_str(&format!("{}\n\n", res.summary));
+            }
+        }
+        if suites.iter().any(|s| s == "tool_routing") {
+            let pid = profile_id.expect("profile_id set");
+            let limit = args.get("scenario_limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let res = runner::run_tool_routing_suite(model_name, pid, limit).await?;
+            out.push_str("=== Tool-routing suite ===\n");
+            out.push_str(&format!(
+                "scenarios run: {} ({} rows, {} errored/skipped)\n",
+                res.scenarios_run, res.rows_written, res.errored
+            ));
+            let pct = |v: Option<f64>| v.map(|x| format!("{:.0}%", x * 100.0)).unwrap_or_else(|| "n/a".into());
+            out.push_str(&format!(
+                "correct_tool@1: {} | parameter_validity: {} | decoy_rejection: {} | multi_step: {}\n\n",
+                pct(res.correct_tool_at_1),
+                pct(res.parameter_validity),
+                pct(res.decoy_rejection),
+                pct(res.multi_step_success),
+            ));
+        }
+
+        // SUITE-VQA: the vision-QA suite loads its own image corpus and profiles
+        // via Chord's chat/vision route, creating its own profile row (like the
+        // diffusion suite) — it does not share the context/code/agent profile_id.
+        if suites.iter().any(|s| s == "vision_qa") {
+            let res = runner::run_vision_qa_suite(model_name).await?;
+            out.push_str("=== Vision-QA suite ===\n");
+            out.push_str(&format!(
+                "items run: {}\naccuracy: {:.2}\nhallucination_rate: {:.2}\navg_latency_ms: {:.0}\n",
+                res.items_run, res.accuracy, res.hallucination_rate, res.avg_latency_ms,
+            ));
+            for line in &res.per_item {
+                out.push_str(&format!("  {line}\n"));
+            }
+            out.push('\n');
+        }
+
+        // SUITE-RRK: reranking self-manages its profile row (provider "openai",
+        // Chord's /v1/rerank) and needs no shared `profile_id` — a reranker never
+        // runs the Ollama-based context/code/agent suites.
+        if suites.iter().any(|s| s == "reranking") {
+            let res = runner::run_reranking_suite(model_name).await?;
+            out.push_str("=== Reranking suite ===\n");
+            out.push_str(&format!(
+                "queries run: {}\navg nDCG uplift: {:+.3}\navg reranked nDCG: {:.3}\navg latency_ms: {:.0}\n",
+                res.queries_run, res.avg_ndcg_uplift, res.avg_reranked_ndcg, res.avg_latency_ms,
+            ));
+            for line in &res.per_query {
+                out.push_str(&format!("  {line}\n"));
+            }
+            out.push('\n');
         }
 
         out.push_str("Note: coherence_score stored as NULL (LLM-judge deferred).\n");
@@ -1356,6 +1470,10 @@ mod tests {
         assert_eq!(default_suites_for("diffusiongemma-26b-a4b"), vec!["diffusion"]);
         assert_eq!(default_suites_for("dgem-secondary"), vec!["diffusion"]);
         assert_eq!(default_suites_for("llama3:8b"), vec!["context"]);
+        // SUITE-EMB: embedding models route to the embedding_retrieval suite.
+        assert_eq!(default_suites_for("nomic-embed-text:latest"), vec!["embedding_retrieval"]);
+        assert_eq!(default_suites_for("bge-large-en"), vec!["embedding_retrieval"]);
+        assert_eq!(default_suites_for("mxbai-embed-large"), vec!["embedding_retrieval"]);
     }
 
     #[test]

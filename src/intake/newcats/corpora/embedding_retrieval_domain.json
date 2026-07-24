@@ -1,0 +1,22 @@
+{
+  "name": "embedding_retrieval_domain",
+  "description": "A compact DOMAIN corpus for the embedding_retrieval suite (SUITE-EMB): abstracted, PII-free knowledge about the fleet's own domain (self-hosted model serving, retrieval, and the code knowledge graph), the kind of content a domain corpus such as an Engram/KG-derived labeled set would hold. Measures a candidate embedding model's DOMAIN FIT; a large negative delta versus the public baseline is a domain-mismatch flag, not a bad model. All text is abstracted prose with no private data.",
+  "k": 3,
+  "docs": [
+    {"id": "g1", "text": "A model-profiling suite measures a candidate along one capability axis and writes each derived metric as a dimension score row keyed by model and backend."},
+    {"id": "g2", "text": "An embedding model maps text to a dense vector so that semantically similar passages land close together under cosine similarity."},
+    {"id": "g3", "text": "Retrieval quality is scored with precision at k, recall at k, mean reciprocal rank, and rank-discounted gain normalized by the ideal ordering."},
+    {"id": "g4", "text": "A code knowledge graph indexes symbols, files, and references across a repository so an agent can ground an answer in the actual source."},
+    {"id": "g5", "text": "An inference proxy routes each request to a backend by model tag, lazily starting a serve on demand and stopping it when idle to free accelerator memory."},
+    {"id": "g6", "text": "A profiling sweep loads one model at a time, runs its assigned suites, records the results, and evicts the model before loading the next candidate."},
+    {"id": "g7", "text": "The catalog tracks coverage as a matrix of model by test type by task category, where an untested cell is a first-class not-run entry rather than a blank."},
+    {"id": "g8", "text": "A corpus loader reads its query and document set from a configured directory and rejects any file whose text trips the private-data gate."}
+  ],
+  "queries": [
+    {"id": "gq1", "text": "How is retrieval quality measured for an embedding model?", "relevant": ["g3", "g2"]},
+    {"id": "gq2", "text": "What does the code knowledge graph index?", "relevant": ["g4"]},
+    {"id": "gq3", "text": "How does the proxy decide where to run a model and free memory?", "relevant": ["g5"]},
+    {"id": "gq4", "text": "How does a profiling sweep handle one model at a time?", "relevant": ["g6", "g1"]},
+    {"id": "gq5", "text": "How does the catalog represent an untested capability?", "relevant": ["g7"]}
+  ]
+}

@@ -604,6 +604,46 @@ async fn ollama_embed(
     m.latency_ms = latency_ms;
 }
 
+/// Hard cap on a single HTTP response body read for the S125 suite arms
+/// (vision / tool / rerank). Without it an upstream backend can stream an
+/// unbounded body and exhaust memory (DoS). 32 MiB comfortably exceeds any
+/// legitimate chat/rerank JSON while bounding the worst case.
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Read a response body into memory with a hard `cap` (DoS guard). Rejects up
+/// front when the server declares an oversized `Content-Length`, and otherwise
+/// streams chunk-by-chunk, aborting the moment the accumulated size would exceed
+/// `cap`. Returns a clean error string (never panics) on transport error or cap
+/// overflow. Uses `Response::chunk` (no extra crate dependency).
+async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
+    if let Some(len) = resp.content_length() {
+        if len > cap as u64 {
+            return Err(format!(
+                "response Content-Length {len} exceeds {cap}-byte cap"
+            ));
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        if buf.len() + chunk.len() > cap {
+            return Err(format!("response body exceeded {cap}-byte cap"));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Read an ERROR-status body as text with the same hard `cap` as
+/// [`read_body_capped`] — a non-2xx backend can return an unbounded body too, so
+/// the diagnostic text read must also be bounded. On a cap-overflow / transport
+/// error the cap error string itself is surfaced as the body text (diagnostic).
+async fn read_text_capped(resp: reqwest::Response, cap: usize) -> String {
+    match read_body_capped(resp, cap).await {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(e) => e,
+    }
+}
+
 /// BT (S125): OpenAI-compatible embeddings (`POST {base}/v1/embeddings`). The embeddings
 /// twin of [`openai_infer`]: profiles any backend speaking the OpenAI embeddings wire
 /// protocol — Chord's proxy, a vLLM / llama-server embeddings serve, or OpenRouter.
@@ -703,6 +743,233 @@ async fn openai_embed(
     m.latency_ms = latency_ms;
 }
 
+/// Normalized result of a single rerank request via the unified path (SUITE-RRK).
+///
+/// `ranking` is the list of input-document indices in the backend's returned
+/// order (best-first for an OpenAI/Cohere/TEI-style rerank endpoint); `scores`
+/// is the aligned relevance score per ranked position, when the server returns
+/// one. `latency_ms` is the wall-clock round-trip. On any failure (transport,
+/// HTTP, parse, empty result set, or a backend whose kind does not support
+/// reranking) `error` is set and `ranking`/`scores` stay empty — callers never
+/// panic and never see a fabricated ranking. Deliberately shaped like
+/// [`EmbedMetrics`] (no `oom` field — a rerank call is not a generation).
+#[derive(Debug, Clone, Default)]
+pub struct RerankMetrics {
+    /// Input-document indices in the backend's returned order (best-first).
+    pub ranking: Vec<usize>,
+    /// Relevance score aligned to `ranking`; empty when the server omits scores.
+    pub scores: Vec<f64>,
+    pub latency_ms: i64,
+    pub error: Option<String>,
+    /// Backend that served the request (for attribution).
+    pub backend: Option<String>,
+    /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
+    pub hardware: Option<String>,
+}
+
+/// Rerank `documents` for `query`/`model` through Chord's unified backend-routing
+/// path (SUITE-RRK). The rerank analogue of [`embed_with_metrics`]: it resolves
+/// the model's tagged backend via [`resolve_backend`] (P5 routing) and dispatches
+/// to that backend's rerank endpoint. The reranking sub-harness is a *client* of
+/// this function — it NEVER opens a socket to the reranker (bge-reranker-v2-m3 on
+/// Chord's `/v1/rerank`) directly.
+///
+/// Backend support: the OpenAI-compatible `/v1/rerank` wire path (Chord's proxy,
+/// or any Cohere/Jina/TEI-style rerank server) is implemented. Any other backend
+/// kind returns a clear, non-silent error (so a non-reranking candidate is
+/// skipped cleanly upstream, not crashed). Never panics — every failure lands in
+/// [`RerankMetrics::error`].
+pub async fn rerank_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    query: &str,
+    documents: &[String],
+    timeout: Duration,
+) -> RerankMetrics {
+    let backend = resolve_backend(model);
+    let mut m = RerankMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        // SUITE-RRK: any OpenAI-compatible rerank backend — Chord's `/v1/rerank`
+        // proxy (bge-reranker-v2-m3), or a Cohere/Jina/TEI rerank server. Mirrors
+        // the `embed_with_metrics` "openai" arm exactly: the bearer token is
+        // optional and resolved from the backend's `api_key_env` at call time
+        // (never stored, never logged).
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_rerank(
+                client,
+                &backend.url,
+                model,
+                query,
+                documents,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
+        other => {
+            // No rerank wire path for this backend kind: a clear, non-silent
+            // error that the runner turns into a clean "skip" (not a crash).
+            m.error = Some(format!(
+                "backend '{}' kind '{other}' does not support reranking",
+                backend.name
+            ));
+        }
+    }
+    m
+}
+
+/// SUITE-RRK: OpenAI-compatible reranking (`POST {base}/v1/rerank`). The rerank
+/// twin of [`openai_embed`]: profiles any backend speaking the OpenAI/Cohere/Jina
+/// rerank wire protocol — Chord's proxy in front of bge-reranker-v2-m3, or a TEI
+/// rerank serve. The request body is `{model, query, documents:[...]}`; latency is
+/// measured LOCALLY (wall clock); `auth` is an optional bearer token resolved from
+/// the backend's `api_key_env` — never logged. The ranking is taken from the
+/// `results` array (each entry an `{index, relevance_score}`); a missing/empty
+/// `results` set is a clean, non-silent error so the runner skips it rather than
+/// crashing. Never panics — every failure lands in `m.error`, and the ranking is
+/// never fabricated.
+async fn openai_rerank(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    query: &str,
+    documents: &[String],
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut RerankMetrics,
+) {
+    let body = serde_json::json!({ "model": model, "query": query, "documents": documents });
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/rerank", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            m.error = Some(e.to_string());
+            // Finding 4: record wall-clock latency on EVERY exit path, transport
+            // error included, per the metric contract.
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        // Finding 1: cap the error-body read too — a non-2xx backend can stream an
+        // unbounded body just as a 200 can.
+        let txt = read_text_capped(resp, MAX_RESPONSE_BYTES).await;
+        m.error = Some(format!("openai rerank HTTP {code}: {txt}"));
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    // Finding 4 (re-review): record wall-clock latency computed AT each exit point,
+    // not snapshotted once right after headers — the body-read + parse time is real
+    // round-trip latency and must be included on the read/parse/success exits too.
+    // Finding 1: bounded body read (DoS) — never `resp.json()` an uncapped body.
+    let bytes = match read_body_capped(resp, MAX_RESPONSE_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            m.error = Some(format!("openai rerank response read error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("openai rerank response parse error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    // Some OpenAI-compatible servers return 200 with an `{"error": {...}}` body; surface
+    // it rather than treating the run as a success with an empty ranking.
+    if let Some(err) = v.pointer("/error/message").and_then(|e| e.as_str()) {
+        m.error = Some(err.to_string());
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    // Rerank schema: { "results": [ { "index": usize, "relevance_score": f64 }, ... ] },
+    // best-first. `relevance_score` is the OpenAI/Jina field; some servers use `score`.
+    let Some(results) = v.get("results").and_then(|r| r.as_array()) else {
+        m.error = Some("openai rerank response missing a 'results' array".to_string());
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    };
+    let mut ranking = Vec::with_capacity(results.len());
+    let mut scores = Vec::with_capacity(results.len());
+    // Finding 3: an out-of-range or duplicated index yields a ranking that can
+    // panic a downstream consumer indexing `documents` — reject the WHOLE
+    // response rather than emit a corrupt order.
+    let mut seen = std::collections::HashSet::new();
+    for item in results {
+        let Some(idx) = item.get("index").and_then(|i| i.as_u64()) else {
+            m.error =
+                Some("openai rerank response has a result with no usable 'index'".to_string());
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        };
+        let idx = idx as usize;
+        if idx >= documents.len() {
+            m.error = Some(format!(
+                "openai rerank returned out-of-range index {idx} (documents.len() = {})",
+                documents.len()
+            ));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+        if !seen.insert(idx) {
+            m.error = Some(format!("openai rerank returned duplicate index {idx}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+        // Finding 3: a missing/malformed score must REJECT the response — never be
+        // fabricated as 0.0, which would be a silent, wrong relevance number.
+        let Some(score) = item
+            .get("relevance_score")
+            .or_else(|| item.get("score"))
+            .and_then(|s| s.as_f64())
+        else {
+            m.error = Some(format!(
+                "openai rerank result for index {idx} has a missing/malformed score"
+            ));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        };
+        ranking.push(idx);
+        scores.push(score);
+    }
+    if ranking.is_empty() {
+        m.error = Some("openai rerank endpoint returned no usable results".to_string());
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    m.ranking = ranking;
+    m.scores = scores;
+    m.latency_ms = started.elapsed().as_millis() as i64;
+}
+
 /// Subset of Ollama `/api/embeddings` response we consume.
 #[derive(Deserialize)]
 struct OllamaEmbedResponse {
@@ -777,6 +1044,394 @@ async fn openai_infer(
         .map(|t| t as i32)
         .or_else(|| (!m.response.is_empty()).then(|| context::estimate_tokens(&m.response) as i32));
     m.total_time_ms = Some(elapsed_ms);
+    if let (Some(tok), true) = (m.response_tokens, elapsed_ms > 0) {
+        m.throughput_tok_per_sec = Some(tok as f64 / (elapsed_ms as f64 / 1000.0));
+    }
+}
+
+/// Normalized result of one tool-calling (function-calling) inference turn.
+///
+/// The tool-routing twin of [`InferMetrics`]: instead of a throughput/token
+/// profile it carries the TOOLS the model chose (`tool_calls`), so a suite can
+/// score correct-tool / parameter-validity / decoy-rejection / multi-step. On any
+/// failure `error` is set and `tool_calls` is empty — callers never panic and
+/// never see a fabricated tool call.
+#[derive(Debug, Clone, Default)]
+pub struct ToolInferMetrics {
+    /// `(function_name, parsed_arguments)` for each tool call, in order. For an
+    /// OpenAI-compatible backend the `arguments` string is JSON-parsed to a
+    /// `Value` (see [`parse_tool_arguments`]); for Ollama it is already an object.
+    pub tool_calls: Vec<(String, serde_json::Value)>,
+    /// Assistant text content (may be empty when the model chose a tool).
+    pub content: String,
+    pub total_time_ms: Option<i32>,
+    pub oom: bool,
+    pub error: Option<String>,
+    /// Backend that served the request (for attribution).
+    pub backend: Option<String>,
+    /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
+    pub hardware: Option<String>,
+}
+
+/// Parse an OpenAI-style tool-call `arguments` value into a JSON `Value`.
+///
+/// The OpenAI function-calling schema returns `arguments` as a STRING containing
+/// serialized JSON (e.g. `"{\"query\":\"Tampa\"}"`), whereas Ollama returns an
+/// object directly. This normalizes both: a string is parsed (a parse failure is
+/// preserved as a `Value::String` so parameter-validity scoring can still see it
+/// as non-object); a non-string value passes through unchanged. Pure.
+pub fn parse_tool_arguments(raw: &serde_json::Value) -> serde_json::Value {
+    match raw {
+        serde_json::Value::String(s) => {
+            serde_json::from_str::<serde_json::Value>(s).unwrap_or_else(|_| raw.clone())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Run `model`/`prompt` with a `tools` catalog on its tagged backend and return
+/// the tool calls the model chose. The tool-calling analogue of
+/// [`infer_with_metrics`]: it resolves the model's backend via [`resolve_backend`]
+/// and dispatches to that backend's tool-calling wire path. Never panics —
+/// transport/HTTP/backend errors land in [`ToolInferMetrics::error`].
+///
+/// Backend support: the OpenAI-compatible path (Chord's `/v1/chat/completions`
+/// with a `tools` array, `openai_tool_infer`) is primary; an `ollama`-tagged
+/// model is routed through the existing `/api/chat` tool seam
+/// ([`context::chat_with_tools`]) so it stays profilable. Any other backend kind
+/// returns a clear, non-silent error (the runner turns it into a clean skip).
+pub async fn tool_infer_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    prompt: &str,
+    tools: &serde_json::Value,
+    timeout: Duration,
+) -> ToolInferMetrics {
+    let backend = resolve_backend(model);
+    let mut m = ToolInferMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        // Chord / lemonade / vLLM / OpenRouter — the OpenAI function-calling wire.
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_tool_infer(
+                client,
+                &backend.url,
+                model,
+                prompt,
+                tools,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
+        // Reuse the original agent seam for an ollama-tagged model (base URL from
+        // `context::ollama_base`, not `backend.url` — same as the `agent` suite).
+        "ollama" => {
+            let out = context::chat_with_tools(client, model, prompt, tools, timeout).await;
+            m.tool_calls = out.tool_calls;
+            m.content = out.content;
+            m.total_time_ms = out.total_time_ms;
+            m.oom = out.oom;
+            m.error = out.error;
+        }
+        other => {
+            m.error = Some(format!(
+                "backend '{}' kind '{other}' does not support tool-calling inference",
+                backend.name
+            ));
+        }
+    }
+    m
+}
+
+/// OpenAI-compatible tool-calling (`POST {base}/v1/chat/completions` with a
+/// `tools` array). The tool-calling twin of [`openai_infer`]: it passes the tool
+/// catalog + `tool_choice: "auto"`, then parses `choices[0].message.tool_calls`
+/// (function name + JSON-string arguments, normalized via [`parse_tool_arguments`]).
+/// Timing is measured LOCALLY (wall clock); `auth` is an optional bearer token
+/// resolved from the backend's `api_key_env` — never logged. Never panics — every
+/// failure lands in `m.error`, and a tool call is never fabricated.
+async fn openai_tool_infer(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    prompt: &str,
+    tools: &serde_json::Value,
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut ToolInferMetrics,
+) {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "stream": false,
+    });
+    if tools.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+        body["tools"] = tools.clone();
+        body["tool_choice"] = serde_json::json!("auto");
+    }
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/chat/completions", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = e.to_string();
+            m.oom = msg.to_lowercase().contains("memory") || msg.to_lowercase().contains("oom");
+            m.error = Some(msg);
+            // Finding 4: record latency on every exit path, transport error included.
+            m.total_time_ms = Some(started.elapsed().as_millis() as i32);
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        // Finding 1: cap the error-body read too.
+        let txt = read_text_capped(resp, MAX_RESPONSE_BYTES).await;
+        m.oom = code == 500 && txt.to_lowercase().contains("memory");
+        m.error = Some(format!("openai HTTP {code}: {txt}"));
+        m.total_time_ms = Some(started.elapsed().as_millis() as i32);
+        return;
+    }
+    // Finding 1: bounded body read (DoS) — never `resp.json()` an uncapped body.
+    let bytes = match read_body_capped(resp, MAX_RESPONSE_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            m.error = Some(format!("openai response read error: {e}"));
+            m.total_time_ms = Some(started.elapsed().as_millis() as i32);
+            return;
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("openai response parse error: {e}"));
+            m.total_time_ms = Some(started.elapsed().as_millis() as i32);
+            return;
+        }
+    };
+    m.total_time_ms = Some(started.elapsed().as_millis() as i32);
+    // Finding 2: reject a malformed success. The assistant message must be present
+    // and object-shaped; a `{}` / `{"choices":[]}` body is malformed, not an empty
+    // result. A message WITH content and NO tool_calls, however, is legitimate — a
+    // model declining to call a tool — and must still succeed.
+    let Some(message) = v
+        .pointer("/choices/0/message")
+        .filter(|msg| msg.is_object())
+    else {
+        m.error = Some("openai tool response missing choices[0].message".to_string());
+        return;
+    };
+    m.content = message
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if let Some(calls) = message.get("tool_calls").and_then(|c| c.as_array()) {
+        for c in calls {
+            let name = c
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let args = c
+                .pointer("/function/arguments")
+                .map(parse_tool_arguments)
+                .unwrap_or(serde_json::Value::Null);
+            m.tool_calls.push((name, args));
+        }
+    }
+}
+
+/// SUITE-VQA (S125): the multimodal twin of [`infer_with_metrics`]. Resolves the
+/// model's backend and — for an OpenAI-compatible chat backend (Chord's
+/// `/v1/chat/completions`) — sends ONE user message whose `content` is an ARRAY
+/// of a text part plus an `image_url` part carrying a base64 `data:` URL.
+///
+/// Vision requires the chat route WITH image parts, so any non-`openai` backend
+/// kind returns a clean, non-silent error (the VQA runner turns it into a skip,
+/// never a crash/panic). `image_data_url` is a `data:<mime>;base64,<...>` string
+/// built by the caller (see `newcats::image_parsing::to_data_url`). VRAM is read
+/// post-call exactly as [`infer_with_metrics`] does. Never opens a raw socket.
+pub async fn vision_infer_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    prompt: &str,
+    image_data_url: &str,
+    timeout: Duration,
+) -> InferMetrics {
+    let backend = resolve_backend(model);
+    let mut m = InferMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        // Chord's `/v1/chat/completions` proxy (or any OpenAI-compatible vision
+        // server). The VLM (e.g. llava:7b on ollama) is reached THROUGH Chord's
+        // chat route, never by opening ollama's own multimodal socket here.
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_vision_infer(
+                client,
+                &backend.url,
+                model,
+                prompt,
+                image_data_url,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
+        other => {
+            m.error = Some(format!(
+                "vision suite requires an OpenAI-compatible chat backend \
+                 (Chord /v1/chat/completions); model '{model}' resolves to backend kind '{other}'"
+            ));
+        }
+    }
+    m.vram_mb = vram_used_mb();
+    m
+}
+
+/// Build the OpenAI chat-completions request body for a vision probe: a single
+/// user message whose `content` is `[text part, image_url part]`. Pure — split
+/// out so the image-part shape is unit-testable without a live call.
+fn build_vision_chat_body(model: &str, prompt: &str, image_data_url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": prompt },
+                { "type": "image_url", "image_url": { "url": image_data_url } }
+            ]
+        }],
+        "stream": false,
+    })
+}
+
+/// SUITE-VQA: OpenAI-compatible vision inference (`POST {base}/v1/chat/completions`
+/// with an image content part). The vision twin of [`openai_infer`]: identical
+/// send/parse/timing/OOM handling, but the message `content` is the multi-part
+/// array from [`build_vision_chat_body`]. `auth` is an optional bearer token
+/// resolved from the backend's `api_key_env` — never logged. Never panics; every
+/// failure lands in `m.error`.
+#[allow(clippy::too_many_arguments)]
+async fn openai_vision_infer(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    prompt: &str,
+    image_data_url: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut InferMetrics,
+) {
+    let body = build_vision_chat_body(model, prompt, image_data_url);
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/chat/completions", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = e.to_string();
+            m.oom = msg.to_lowercase().contains("memory") || msg.to_lowercase().contains("oom");
+            m.error = Some(msg);
+            // Finding 4: record latency on every exit path, transport error included.
+            m.total_time_ms = Some(started.elapsed().as_millis() as i32);
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        // Finding 1: cap the error-body read too.
+        let txt = read_text_capped(resp, MAX_RESPONSE_BYTES).await;
+        m.oom = code == 500 && txt.to_lowercase().contains("memory");
+        m.error = Some(format!("openai vision HTTP {code}: {txt}"));
+        m.total_time_ms = Some(started.elapsed().as_millis() as i32);
+        return;
+    }
+    // Finding 1: bounded body read (DoS) — never `resp.json()` an uncapped body.
+    let bytes = match read_body_capped(resp, MAX_RESPONSE_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            m.error = Some(format!("openai vision response read error: {e}"));
+            m.total_time_ms = Some(started.elapsed().as_millis() as i32);
+            return;
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("openai vision response parse error: {e}"));
+            m.total_time_ms = Some(started.elapsed().as_millis() as i32);
+            return;
+        }
+    };
+    let elapsed_ms = started.elapsed().as_millis() as i32;
+    m.total_time_ms = Some(elapsed_ms);
+    // Finding 2: reject a malformed success — a `{}` / `{"choices":[]}` body is NOT
+    // an empty-but-valid result. The assistant message content must be PRESENT
+    // (an empty string is present and allowed; an absent field is a clean error).
+    let content = match v
+        .pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+    {
+        Some(c) => c,
+        None => {
+            m.error =
+                Some("openai vision response missing choices[0].message.content".to_string());
+            return;
+        }
+    };
+    m.response = content.to_string();
+    m.response_tokens = v
+        .pointer("/usage/completion_tokens")
+        .and_then(|t| t.as_i64())
+        .map(|t| t as i32)
+        .or_else(|| (!m.response.is_empty()).then(|| context::estimate_tokens(&m.response) as i32));
     if let (Some(tok), true) = (m.response_tokens, elapsed_ms > 0) {
         m.throughput_tok_per_sec = Some(tok as f64 / (elapsed_ms as f64 / 1000.0));
     }
@@ -1138,6 +1793,67 @@ mod tests {
         assert!(m.oom); // 500 + "memory" → oom flag
     }
 
+    // SUITE-VQA: the vision arm parses an OpenAI chat-completion (image request)
+    // exactly like the text arm — response text + usage token count.
+    #[tokio::test]
+    async fn openai_vision_infer_parses_chat_completion() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/chat/completions");
+                then.status(200).json_body(serde_json::json!({
+                    "choices": [{ "message": { "role": "assistant", "content": "red" } }],
+                    "usage": { "completion_tokens": 1 }
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = InferMetrics::default();
+        openai_vision_infer(
+            &client,
+            &server.base_url(),
+            "llava:7b",
+            "what color is the circle?",
+            "data:image/png;base64,AAEC",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert_eq!(m.response, "red");
+        assert_eq!(m.response_tokens, Some(1));
+        assert!(m.error.is_none());
+        assert!(m.total_time_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn openai_vision_infer_surfaces_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/chat/completions");
+                then.status(400).body("bad image");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = InferMetrics::default();
+        openai_vision_infer(
+            &client,
+            &server.base_url(),
+            "llava:7b",
+            "hi",
+            "data:image/png;base64,AAEC",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("400"));
+        assert!(m.response.is_empty());
+    }
+
     // BT (S125): OpenAI-compatible embed arm parses `data[0].embedding`, records the
     // dimensionality, and leaves `error` unset. Mirrors `openai_infer_parses_*`.
     #[tokio::test]
@@ -1194,6 +1910,123 @@ mod tests {
         .await;
         assert!(m.error.as_deref().unwrap_or("").contains("500"));
         assert!(m.embedding.is_empty());
+    }
+
+    // S125 SUITE-TOOL: `arguments` normalization — OpenAI returns a JSON STRING,
+    // Ollama an object; both must land as a `Value` (object stays an object).
+    #[test]
+    fn parse_tool_arguments_handles_string_and_object() {
+        // OpenAI: arguments is a serialized-JSON string → parsed to an object.
+        let parsed = parse_tool_arguments(&serde_json::json!("{\"query\":\"Tampa\"}"));
+        assert!(parsed.is_object());
+        assert_eq!(parsed["query"], "Tampa");
+        // Ollama: arguments already an object → passes through unchanged.
+        let obj = serde_json::json!({"query": "Tampa"});
+        assert_eq!(parse_tool_arguments(&obj), obj);
+        // An un-parseable string is preserved as a String (so param-validity can
+        // see it is NOT an object) rather than being dropped.
+        let bad = parse_tool_arguments(&serde_json::json!("not json"));
+        assert!(bad.is_string());
+    }
+
+    // S125 SUITE-TOOL: the tool-calling arm passes `tools`, parses `tool_calls`,
+    // and normalizes the OpenAI JSON-string arguments into an object.
+    #[tokio::test]
+    async fn openai_tool_infer_parses_tool_calls() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/chat/completions");
+                then.status(200).json_body(serde_json::json!({
+                    "choices": [{ "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "type": "function",
+                            "function": { "name": "weather", "arguments": "{\"query\":\"Tampa\"}" }
+                        }]
+                    }}]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ToolInferMetrics::default();
+        let tools = serde_json::json!([
+            {"type": "function", "function": {"name": "weather", "description": "d", "parameters": {"type": "object", "properties": {}}}}
+        ]);
+        openai_tool_infer(
+            &client,
+            &server.base_url(),
+            "test-model",
+            "weather in Tampa?",
+            &tools,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert_eq!(m.tool_calls.len(), 1);
+        assert_eq!(m.tool_calls[0].0, "weather");
+        assert!(m.tool_calls[0].1.is_object());
+        assert_eq!(m.tool_calls[0].1["query"], "Tampa");
+        assert!(m.error.is_none());
+    }
+
+    // No tool call (adversarial/decoy prompt) → empty tool_calls, clean success.
+    #[tokio::test]
+    async fn openai_tool_infer_no_tool_call_is_empty_not_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/chat/completions");
+                then.status(200).json_body(serde_json::json!({
+                    "choices": [{ "message": { "role": "assistant", "content": "I can't help with that." } }]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ToolInferMetrics::default();
+        openai_tool_infer(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            &serde_json::json!([]),
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.tool_calls.is_empty());
+        assert!(m.error.is_none());
+        assert_eq!(m.content, "I can't help with that.");
+    }
+
+    #[tokio::test]
+    async fn openai_tool_infer_surfaces_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/chat/completions");
+                then.status(500).body("boom");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ToolInferMetrics::default();
+        openai_tool_infer(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            &serde_json::json!([]),
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.tool_calls.is_empty());
     }
 
     // A non-embedding model often 200s with an empty vector — treat as a clean error.
@@ -1341,5 +2174,406 @@ mod tests {
         mock.assert_async().await;
         assert_eq!(m.dimensionality, 2);
         assert!(m.error.is_none());
+    }
+
+    // SUITE-RRK: OpenAI-compatible rerank arm parses the `results` array into a
+    // best-first ranking + aligned scores, and leaves `error` unset. Mirrors
+    // `openai_embed_parses_data_embedding`.
+    #[tokio::test]
+    async fn openai_rerank_parses_results() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/rerank");
+                then.status(200).json_body(serde_json::json!({
+                    "results": [
+                        { "index": 2, "relevance_score": 0.91 },
+                        { "index": 0, "relevance_score": 0.42 },
+                        { "index": 1, "relevance_score": 0.05 }
+                    ]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = RerankMetrics::default();
+        let docs = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        openai_rerank(
+            &client,
+            &server.base_url(),
+            "test-reranker",
+            "q",
+            &docs,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        // Best-first ranking preserved from the server's returned order.
+        assert_eq!(m.ranking, vec![2, 0, 1]);
+        assert_eq!(m.scores.len(), 3);
+        assert!((m.scores[0] - 0.91).abs() < 1e-9);
+        assert!(m.error.is_none());
+        assert!(m.latency_ms >= 0);
+    }
+
+    // SUITE-RRK: a `score` field (instead of `relevance_score`) is also accepted.
+    #[tokio::test]
+    async fn openai_rerank_accepts_score_field_alias() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/rerank");
+                then.status(200).json_body(serde_json::json!({
+                    "results": [ { "index": 0, "score": 0.7 } ]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = RerankMetrics::default();
+        let docs = vec!["only".to_string()];
+        openai_rerank(
+            &client,
+            &server.base_url(),
+            "m",
+            "q",
+            &docs,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert_eq!(m.ranking, vec![0]);
+        assert!((m.scores[0] - 0.7).abs() < 1e-9);
+        assert!(m.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_rerank_surfaces_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/rerank");
+                then.status(500).body("boom");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = RerankMetrics::default();
+        let docs = vec!["a".to_string()];
+        openai_rerank(
+            &client,
+            &server.base_url(),
+            "m",
+            "q",
+            &docs,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.ranking.is_empty());
+    }
+
+    // An empty/absent `results` set is a clean, non-silent error — never a
+    // fabricated ranking.
+    #[tokio::test]
+    async fn openai_rerank_empty_results_is_clean_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/rerank");
+                then.status(200).json_body(serde_json::json!({ "results": [] }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = RerankMetrics::default();
+        let docs = vec!["a".to_string()];
+        openai_rerank(
+            &client,
+            &server.base_url(),
+            "m",
+            "q",
+            &docs,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("no usable results"));
+        assert!(m.ranking.is_empty());
+    }
+
+    // ---- S125 review fixes: bounded reads, malformed-success, index validation,
+    // latency-on-every-path ----
+
+    // Finding 2 (vision): a `{}` / `{"choices":[]}` body is a malformed success —
+    // absent message content must be a clean error, never scored as empty-but-ok.
+    #[tokio::test]
+    async fn openai_vision_infer_rejects_missing_content() {
+        for body in [serde_json::json!({}), serde_json::json!({ "choices": [] })] {
+            let server = httpmock::MockServer::start_async().await;
+            server
+                .mock_async(|when, then| {
+                    when.method(httpmock::Method::POST).path("/v1/chat/completions");
+                    then.status(200).json_body(body.clone());
+                })
+                .await;
+            let client = reqwest::Client::new();
+            let mut m = InferMetrics::default();
+            openai_vision_infer(
+                &client,
+                &server.base_url(),
+                "llava:7b",
+                "hi",
+                "data:image/png;base64,AAEC",
+                std::time::Duration::from_secs(10),
+                None,
+                &mut m,
+            )
+            .await;
+            assert!(m.error.as_deref().unwrap_or("").contains("missing choices[0].message.content"));
+            assert!(m.response.is_empty());
+            // Finding 4: latency recorded even on this malformed-success path.
+            assert!(m.total_time_ms.is_some());
+        }
+    }
+
+    // Finding 4 (vision): latency recorded on a non-2xx HTTP exit path.
+    #[tokio::test]
+    async fn openai_vision_infer_records_latency_on_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/chat/completions");
+                then.status(503).body("unavailable");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = InferMetrics::default();
+        openai_vision_infer(
+            &client,
+            &server.base_url(),
+            "llava:7b",
+            "hi",
+            "data:image/png;base64,AAEC",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("503"));
+        assert!(m.total_time_ms.is_some(), "latency must be recorded on the HTTP-error path");
+    }
+
+    // Finding 2 (tool): an absent/malformed `choices[0].message` is a malformed
+    // success and must reject cleanly.
+    #[tokio::test]
+    async fn openai_tool_infer_rejects_missing_message() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/chat/completions");
+                then.status(200).json_body(serde_json::json!({ "choices": [] }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ToolInferMetrics::default();
+        openai_tool_infer(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            &serde_json::json!([]),
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("missing choices[0].message"));
+        assert!(m.tool_calls.is_empty());
+        assert!(m.total_time_ms.is_some());
+    }
+
+    // Finding 3 (rerank): an out-of-range index rejects the WHOLE response.
+    #[tokio::test]
+    async fn openai_rerank_rejects_out_of_range_index() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/rerank");
+                then.status(200).json_body(serde_json::json!({
+                    "results": [ { "index": 5, "relevance_score": 0.9 } ]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = RerankMetrics::default();
+        let docs = vec!["a".to_string(), "b".to_string()];
+        openai_rerank(
+            &client,
+            &server.base_url(),
+            "m",
+            "q",
+            &docs,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("out-of-range index 5"));
+        assert!(m.ranking.is_empty());
+    }
+
+    // Finding 3 (rerank): a duplicated index rejects the response.
+    #[tokio::test]
+    async fn openai_rerank_rejects_duplicate_index() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/rerank");
+                then.status(200).json_body(serde_json::json!({
+                    "results": [
+                        { "index": 0, "relevance_score": 0.9 },
+                        { "index": 0, "relevance_score": 0.1 }
+                    ]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = RerankMetrics::default();
+        let docs = vec!["a".to_string(), "b".to_string()];
+        openai_rerank(
+            &client,
+            &server.base_url(),
+            "m",
+            "q",
+            &docs,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("duplicate index 0"));
+        assert!(m.ranking.is_empty());
+    }
+
+    // Finding 3 (rerank): a missing score rejects the response — never fabricated 0.0.
+    #[tokio::test]
+    async fn openai_rerank_rejects_missing_score() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/rerank");
+                then.status(200).json_body(serde_json::json!({
+                    "results": [ { "index": 0 } ]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = RerankMetrics::default();
+        let docs = vec!["a".to_string()];
+        openai_rerank(
+            &client,
+            &server.base_url(),
+            "m",
+            "q",
+            &docs,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("missing/malformed score"));
+        assert!(m.ranking.is_empty());
+        assert!(m.scores.is_empty());
+    }
+
+    // Finding 4 (rerank): latency recorded on a non-2xx exit path. A server-side
+    // delay guarantees a strictly-positive measured latency, so this proves the
+    // error path records it rather than leaving the default 0.
+    #[tokio::test]
+    async fn openai_rerank_records_latency_on_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/rerank");
+                then.status(500)
+                    .delay(std::time::Duration::from_millis(30))
+                    .body("boom");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = RerankMetrics::default();
+        let docs = vec!["a".to_string()];
+        openai_rerank(
+            &client,
+            &server.base_url(),
+            "m",
+            "q",
+            &docs,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.latency_ms > 0, "latency must be recorded (>0) on the HTTP-error path");
+    }
+
+    // Finding 4 (re-review): latency on the body-read/parse exit must include the
+    // read+parse time, not just the pre-header round-trip. A delayed 200 with an
+    // unparseable body guarantees a strictly-positive measured latency on the
+    // parse-failure exit.
+    #[tokio::test]
+    async fn openai_rerank_records_latency_on_parse_failure() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/rerank");
+                then.status(200)
+                    .delay(std::time::Duration::from_millis(30))
+                    .header("content-type", "application/json")
+                    .body("this is not json");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = RerankMetrics::default();
+        let docs = vec!["a".to_string()];
+        openai_rerank(
+            &client,
+            &server.base_url(),
+            "m",
+            "q",
+            &docs,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("parse error"));
+        assert!(m.latency_ms > 0, "latency must be recorded (>0) on the parse-failure path");
+    }
+
+    // read_body_capped enforces the byte cap even when Content-Length is absent
+    // (chunked): a body larger than the cap aborts mid-stream with a clean error.
+    #[tokio::test]
+    async fn read_body_capped_enforces_streaming_cap() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/big");
+                then.status(200).body(vec![b'x'; 4096]);
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/big", server.base_url()))
+            .send()
+            .await
+            .unwrap();
+        // Cap well below the 4096-byte body → clean cap error, never a 4KiB read.
+        let err = read_body_capped(resp, 512).await.unwrap_err();
+        assert!(err.contains("cap"), "expected a cap error, got: {err}");
     }
 }

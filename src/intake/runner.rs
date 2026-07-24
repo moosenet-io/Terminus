@@ -648,6 +648,392 @@ pub async fn run_diffusion_suite(model_name: &str) -> Result<DiffusionSuiteOutco
     })
 }
 
+/// Outcome of the embedding-retrieval suite (SUITE-EMB, TERM #508) for the tool
+/// return summary.
+pub struct EmbeddingRetrievalSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    /// Human one-liner (metrics, or the skip reason for a non-embedding model).
+    pub summary: String,
+    /// True when the candidate is not an embedding model (clean skip, no rows).
+    pub skipped: bool,
+}
+
+/// Run the embedding-retrieval suite (SUITE-EMB) end-to-end against `model_name`:
+/// load the public (+ optional domain) corpus from `INTAKE_CORPUS_DIR`, embed
+/// every doc/query through Chord's `/v1/embeddings` route via the production
+/// [`crate::intake::assistant::dim6_embeddings::ChordEmbedder`] (which calls
+/// [`crate::intake::infer::embed_with_metrics`]'s `openai_embed` arm — bearer from
+/// the backend's `api_key_env`, never logged), score precision/recall/MRR/nDCG +
+/// dimensionality + throughput + the public-vs-domain delta, and write every row
+/// via [`crate::intake::newcats::embedding_retrieval::score_and_write`].
+///
+/// Creates its own `model_profiles` row (provider `"ollama"` — embedding models
+/// resolve through the Ollama/OpenAI-compatible embeddings path, never the dgem
+/// daemon). A candidate that is not an embedding model is a CLEAN SKIP (no rows),
+/// never an error, matching every other suite's "failure is still signal" stance.
+pub async fn run_embedding_retrieval_suite(
+    model_name: &str,
+) -> Result<EmbeddingRetrievalSuiteOutcome, ToolError> {
+    use crate::intake::assistant::dim6_embeddings::ChordEmbedder;
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::newcats::embedding_retrieval as er;
+
+    let profile_id = create_profile_row(model_name).await?;
+    let pool = storage::get_pool().await?;
+    let (public, domain) = er::load_corpora()?;
+
+    // Backend resolution (GPU vs CPU serve) happens inside the unified embed path;
+    // the tag here keys the stored rows. Embedding serves are GPU-first in this
+    // fleet, so GPU is the default attribution (a future refinement can thread the
+    // observed `EmbedMetrics::hardware` through the embedder).
+    let embedder = ChordEmbedder::new(ModelId::from(model_name), BackendTag::Gpu);
+    let summary = er::score_and_write(&pool, profile_id, &embedder, &public, domain.as_ref()).await?;
+
+    Ok(EmbeddingRetrievalSuiteOutcome {
+        profile_id,
+        summary: summary.line(),
+        skipped: summary.skipped.is_some(),
+    })
+}
+
+/// Per-scenario tool-routing inference timeout (shares the agent suite's env var
+/// + 180s default, since it exercises the same corpus / tool-calling shape).
+fn tool_routing_timeout() -> Duration {
+    super::timeouts::env_timeout("INTAKE_AGENT_TIMEOUT_SEC", 180)
+}
+
+/// The advertised tool-catalog size used for the tool-routing suite: large
+/// enough that decoy rejection + correct-tool@1 are a real discrimination (many
+/// plausible wrong tools alongside the right one), but bounded so the suite stays
+/// fast. The `agent` suite sweeps 10/50/100/200 bands to measure DEGRADATION;
+/// the routing suite instead scores a single representative band per scenario.
+const TOOL_ROUTING_BAND: usize = 50;
+
+/// Outcome of the tool-routing suite (S125 SUITE-TOOL) for the tool summary.
+pub struct ToolRoutingSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub scenarios_run: usize,
+    pub rows_written: usize,
+    /// Per-metric mean over the scenarios that scored it (`None` when none did).
+    pub correct_tool_at_1: Option<f64>,
+    pub parameter_validity: Option<f64>,
+    pub decoy_rejection: Option<f64>,
+    pub multi_step_success: Option<f64>,
+    /// Scenarios skipped because inference errored (not scored, not fabricated).
+    pub errored: usize,
+}
+
+/// Run the tool-routing suite (S125 SUITE-TOOL / TERM-511) against `model_name`,
+/// reusing an existing `model_profiles` row (`profile_id`, as the `agent`/`code`
+/// suites do). Generalizes the `agent` suite's tool-selection/multi-step path
+/// into a first-class profiler that routes through Chord's OpenAI-compatible
+/// `/v1/chat/completions` `tools` endpoint
+/// ([`crate::intake::infer::tool_infer_with_metrics`]) and writes discrete
+/// per-scenario `assistant_dimension_score` rows tagged `task_category =
+/// "tool_routing"` via
+/// [`crate::intake::newcats::tool_routing::score_and_write`].
+///
+/// Reuses [`crate::intake::agent`]'s scenario loader + tool-catalog builder +
+/// multi-step scorer verbatim, so the corpus and catalog have one source of
+/// truth and the legacy `agent` suite is untouched. Only the `tool_selection`
+/// and `multi_step` scenario categories are routing-relevant; the rest
+/// (instruction/hallucination/personality) stay with the `agent` suite and are
+/// filtered out here. A per-scenario inference error is recorded and SKIPPED
+/// (not scored `0.0`), matching every other suite's "a failed case is not a
+/// fabricated zero" convention.
+pub async fn run_tool_routing_suite(
+    model_name: &str,
+    profile_id: uuid::Uuid,
+    limit: Option<usize>,
+) -> Result<ToolRoutingSuiteOutcome, ToolError> {
+    use crate::intake::agent;
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::tool_infer_with_metrics;
+    use crate::intake::newcats::tool_routing::{self, RoutingOutcome};
+
+    let dir = crate::intake::code::corpus_dir()?;
+    let mut scenarios = agent::read_scenarios(&dir)?;
+    scenarios.retain(|s| s.category == "tool_selection" || s.category == "multi_step");
+    if let Some(n) = limit {
+        scenarios.truncate(n);
+    }
+    if scenarios.is_empty() {
+        return Err(ToolError::NotConfigured(
+            "no tool_selection/multi_step scenarios found for tool_routing suite".into(),
+        ));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(format!("client build failed: {e}")))?;
+    let pool = storage::get_pool().await?;
+    let model_id = ModelId::from(model_name);
+    let timeout = tool_routing_timeout();
+
+    // Per-metric tallies (sum, count) so the summary reports means without a
+    // re-query. Order: correct_tool@1, param_validity, decoy_reject, multi_step.
+    let mut tally: std::collections::BTreeMap<String, (f64, usize)> = std::collections::BTreeMap::new();
+    let mut rows_written = 0usize;
+    let mut errored = 0usize;
+
+    for sc in &scenarios {
+        let catalog = if sc.category == "multi_step" {
+            agent::build_catalog(TOOL_ROUTING_BAND, &sc.expected_tools)
+        } else {
+            let required: Vec<String> = sc.expected_tool.iter().cloned().collect();
+            agent::build_catalog(TOOL_ROUTING_BAND, &required)
+        };
+
+        let metrics = tool_infer_with_metrics(&client, model_name, &sc.prompt, &catalog, timeout).await;
+        if metrics.error.is_some() {
+            errored += 1;
+            continue;
+        }
+        let backend_tag = metrics
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Gpu);
+        let outcome = RoutingOutcome {
+            tool_calls: metrics.tool_calls.clone(),
+            error: None,
+        };
+
+        // Tally from the same pure rows we persist (one source of truth).
+        for score in tool_routing::build_scores(model_id.clone(), backend_tag, sc, &outcome) {
+            let e = tally.entry(score.metric.clone()).or_insert((0.0, 0));
+            e.0 += score.value;
+            e.1 += 1;
+        }
+        rows_written += tool_routing::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, sc, &outcome).await?;
+    }
+
+    let mean = |m: &str| tally.get(m).and_then(|(s, n)| if *n > 0 { Some(*s / *n as f64) } else { None });
+
+    Ok(ToolRoutingSuiteOutcome {
+        profile_id,
+        scenarios_run: scenarios.len(),
+        rows_written,
+        correct_tool_at_1: mean(tool_routing::METRIC_CORRECT_TOOL),
+        parameter_validity: mean(tool_routing::METRIC_PARAM_VALIDITY),
+        decoy_rejection: mean(tool_routing::METRIC_DECOY_REJECT),
+        multi_step_success: mean(tool_routing::METRIC_MULTI_STEP),
+        errored,
+    })
+}
+
+/// Outcome of the vision-QA suite (SUITE-VQA) for the tool return summary.
+pub struct VisionQaSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub items_run: usize,
+    /// Mean lenient-match accuracy in `[0.0, 1.0]`.
+    pub accuracy: f64,
+    /// Fraction of confident-but-wrong answers in `[0.0, 1.0]`.
+    pub hallucination_rate: f64,
+    pub avg_latency_ms: f64,
+    /// One-line-per-item summary (manifest order).
+    pub per_item: Vec<String>,
+}
+
+/// Run the vision-QA suite (SUITE-VQA) end-to-end against `model_name`: load the
+/// image+question+reference-answer corpus from `INTAKE_CORPUS_DIR` (via
+/// [`crate::intake::code::corpus_dir`], the unified resolver), and for each item
+/// send the image (as a base64 `data:` URL image content part) + question to
+/// Chord's `/v1/chat/completions` route through
+/// [`crate::intake::infer::vision_infer_with_metrics`], derive a
+/// [`crate::intake::newcats::image_parsing::VisionQaOutcome`] from the normalized
+/// [`crate::intake::infer::InferMetrics`], and write the SUITE-VQA metric rows
+/// (accuracy / caption similarity / hallucination / latency / VRAM) via
+/// [`crate::intake::newcats::image_parsing::score_and_write_vqa`].
+///
+/// The VLM (e.g. `llava:7b`) runs on Ollama under Chord, so the profile row uses
+/// the default `"ollama"` provider (unlike diffusion's `"daemon"`). A per-item
+/// backend/transport error is recorded (empty answer ⇒ scored as a miss, latency
+/// from whatever timing exists) rather than aborting the suite — the same
+/// "failure is still useful signal" convention every other newcats suite uses.
+/// An unreadable image is skipped with a note (no fabricated row).
+pub async fn run_vision_qa_suite(model_name: &str) -> Result<VisionQaSuiteOutcome, ToolError> {
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::vision_infer_with_metrics;
+    use crate::intake::newcats::image_parsing::{self, VisionQaOutcome};
+
+    // Unified corpus resolver (DR-02): INTAKE_CORPUS_DIR points at the vision_qa
+    // corpus dir (manifest.json + images). Missing var ⇒ clean NotConfigured.
+    let corpus_dir = crate::intake::code::corpus_dir()?;
+    let items = image_parsing::load_vision_qa_manifest(&corpus_dir)?;
+    if items.is_empty() {
+        return Err(ToolError::NotConfigured(
+            "vision_qa manifest is empty (no items to profile)".into(),
+        ));
+    }
+
+    let profile_id = create_profile_row(model_name).await?;
+    let pool = storage::get_pool().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(e.to_string()))?;
+    let model_id = ModelId::from(model_name);
+
+    let mut per_item = Vec::with_capacity(items.len());
+    let mut acc_sum = 0.0;
+    let mut hall_sum = 0.0;
+    let mut lat_sum = 0.0;
+    let mut n = 0usize;
+
+    for item in &items {
+        let img_path = corpus_dir.join(&item.image_file);
+        let bytes = match std::fs::read(&img_path) {
+            Ok(b) => b,
+            Err(e) => {
+                per_item.push(format!("{}: image unreadable ({e})", item.image_file));
+                continue;
+            }
+        };
+        let data_url = image_parsing::to_data_url(&item.image_file, &bytes);
+        let metrics =
+            vision_infer_with_metrics(&client, model_name, &item.question, &data_url, Duration::from_secs(600)).await;
+        let backend_tag = metrics
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Gpu);
+        let outcome = VisionQaOutcome {
+            answer: metrics.response.clone(),
+            latency_ms: metrics.total_time_ms.unwrap_or(0) as i64,
+            vram_peak_mb: metrics.vram_mb,
+        };
+
+        let accurate = image_parsing::lenient_match(&outcome.answer, &item.answer);
+        let hallucinated = image_parsing::is_hallucination(&outcome.answer, &item.answer);
+        acc_sum += if accurate { 1.0 } else { 0.0 };
+        hall_sum += if hallucinated { 1.0 } else { 0.0 };
+        lat_sum += outcome.latency_ms as f64;
+        n += 1;
+
+        image_parsing::score_and_write_vqa(&pool, profile_id, model_id.clone(), backend_tag, item, &outcome).await?;
+
+        per_item.push(if let Some(err) = &metrics.error {
+            format!("{}: error ({err})", item.image_file)
+        } else {
+            format!(
+                "{}: acc={accurate} answer={:?} lat_ms={}",
+                item.image_file, outcome.answer, outcome.latency_ms,
+            )
+        });
+    }
+
+    Ok(VisionQaSuiteOutcome {
+        profile_id,
+        items_run: n,
+        accuracy: if n > 0 { acc_sum / n as f64 } else { 0.0 },
+        hallucination_rate: if n > 0 { hall_sum / n as f64 } else { 0.0 },
+        avg_latency_ms: if n > 0 { lat_sum / n as f64 } else { 0.0 },
+        per_item,
+    })
+}
+
+/// Outcome of the reranking suite (SUITE-RRK) for the tool return summary.
+pub struct RerankingSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub queries_run: usize,
+    pub avg_ndcg_uplift: f64,
+    pub avg_reranked_ndcg: f64,
+    pub avg_latency_ms: f64,
+    /// One-line-per-query summary, in corpus order.
+    pub per_query: Vec<String>,
+}
+
+/// Run the reranking suite (SUITE-RRK) end-to-end against `model_name`: load the
+/// reranking corpus (`INTAKE_CORPUS_DIR/reranking.json`), and for each query run
+/// one rerank through [`crate::intake::infer::rerank_with_metrics`] (which routes
+/// an `openai`-tagged model onto Chord's `/v1/rerank`, backed by
+/// bge-reranker-v2-m3), derive a
+/// [`crate::intake::newcats::reranking::RerankOutcome`] from the normalized
+/// [`crate::intake::infer::RerankMetrics`], and write the nDCG-uplift / nDCG /
+/// latency rows via [`crate::intake::newcats::reranking::score_and_write`].
+///
+/// Creates its own `model_profiles` row (provider `"openai"`, since a reranker
+/// runs on Chord's OpenAI-compatible route, not Ollama, and never goes through
+/// [`run_context_suite`]). A per-query rerank error is skipped (recorded in the
+/// summary) rather than aborting the whole suite — matching every other
+/// `newcats` category's "failure is still useful signal" convention. A missing
+/// corpus fails the whole suite up front (a `ToolError`), since without it there
+/// is nothing to score.
+pub async fn run_reranking_suite(model_name: &str) -> Result<RerankingSuiteOutcome, ToolError> {
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::rerank_with_metrics;
+    use crate::intake::newcats::reranking::{self, RerankOutcome};
+
+    let corpus = reranking::load_corpus()?;
+    let profile_id = create_profile_row_for_provider(model_name, "openai").await?;
+    let pool = storage::get_pool().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(e.to_string()))?;
+    let model_id = ModelId::from(model_name);
+
+    let mut per_query = Vec::with_capacity(corpus.len());
+    let mut uplift_sum = 0.0;
+    let mut ndcg_sum = 0.0;
+    let mut latency_sum = 0.0;
+    let mut n = 0usize;
+
+    for query in &corpus {
+        let metrics = rerank_with_metrics(
+            &client,
+            model_name,
+            &query.query,
+            &query.passages,
+            Duration::from_secs(120),
+        )
+        .await;
+        let backend_tag = metrics
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Cpu);
+
+        if let Some(err) = &metrics.error {
+            per_query.push(format!("{}: error ({err})", query.query_id));
+            continue;
+        }
+
+        let outcome = RerankOutcome {
+            reranked_order: metrics.ranking.clone(),
+            latency_ms: metrics.latency_ms,
+        };
+        let reranked_ndcg =
+            reranking::ndcg_at_k(&outcome.reranked_order, &query.relevance, reranking::DEFAULT_K);
+        let baseline_ndcg =
+            reranking::ndcg_at_k(&query.baseline_order, &query.relevance, reranking::DEFAULT_K);
+        let uplift = reranked_ndcg - baseline_ndcg;
+        uplift_sum += uplift;
+        ndcg_sum += reranked_ndcg;
+        latency_sum += outcome.latency_ms as f64;
+        n += 1;
+
+        reranking::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, query, &outcome)
+            .await?;
+
+        per_query.push(format!(
+            "{}: uplift={uplift:.3} ndcg={reranked_ndcg:.3} latency_ms={}",
+            query.query_id, outcome.latency_ms,
+        ));
+    }
+
+    Ok(RerankingSuiteOutcome {
+        profile_id,
+        queries_run: n,
+        avg_ndcg_uplift: if n > 0 { uplift_sum / n as f64 } else { 0.0 },
+        avg_reranked_ndcg: if n > 0 { ndcg_sum / n as f64 } else { 0.0 },
+        avg_latency_ms: if n > 0 { latency_sum / n as f64 } else { 0.0 },
+        per_query,
+    })
+}
+
 /// Disk-usage percentage for a mount via `df`, or None if it can't be read.
 fn disk_pct(mount: &str) -> Option<u8> {
     let out = std::process::Command::new("df")
@@ -753,7 +1139,7 @@ pub async fn run_fleet_suites(
                 Err(e) => parts.push(format!("context: error {e}")),
             }
         }
-        let needs = suites.iter().any(|s| s == "code" || s == "agent");
+        let needs = suites.iter().any(|s| s == "code" || s == "agent" || s == "tool_routing");
         if needs && profile_id.is_none() {
             match create_profile_row(model).await {
                 Ok(id) => profile_id = Some(id),
@@ -774,6 +1160,62 @@ pub async fn run_fleet_suites(
                     Ok(s) => parts.push(format!("agent: {s}")),
                     Err(e) => parts.push(format!("agent: error {e}")),
                 }
+            }
+        }
+        // SUITE-EMB (TERM #508): embedding models profile IR retrieval quality
+        // instead of context/code/agent. The driver creates its own profile row
+        // (like the diffusion suite) and cleanly skips a non-embedding candidate.
+        if suites.iter().any(|s| s == "embedding_retrieval") {
+            match run_embedding_retrieval_suite(model).await {
+                Ok(o) => parts.push(format!("embedding_retrieval: {}", o.summary)),
+                Err(e) => parts.push(format!("embedding_retrieval: error {e}")),
+            }
+        }
+        // S125 SUITE-TOOL: the tool-routing suite is self-contained (it resolves
+        // its own backend + corpus and reuses the shared profile row), so it is
+        // dispatched directly here rather than via an injected closure like
+        // code/agent. Requested only when a model's resolved suites include it.
+        if suites.iter().any(|s| s == "tool_routing") {
+            if let Some(id) = profile_id {
+                match run_tool_routing_suite(model, id, None).await {
+                    Ok(o) => parts.push(format!(
+                        "tool_routing: {} scenarios ({} rows), correct@1={}",
+                        o.scenarios_run,
+                        o.rows_written,
+                        o.correct_tool_at_1.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "n/a".into()),
+                    )),
+                    Err(e) => parts.push(format!("tool_routing: error {e}")),
+                }
+            }
+        }
+
+        // SUITE-VQA: the vision-QA suite runs its own corpus + image chat-route
+        // path and creates its own profile row (like the single-model MCP path),
+        // so it is dispatched by name here and does not share the context/code/
+        // agent profile_id. A missing corpus / backend is a clean per-model note,
+        // never a panic that aborts the fleet sweep.
+        if suites.iter().any(|s| s == "vision_qa") {
+            match run_vision_qa_suite(model).await {
+                Ok(v) => parts.push(format!(
+                    "vision_qa: {} items, acc={:.2}, halluc={:.2}",
+                    v.items_run, v.accuracy, v.hallucination_rate
+                )),
+                Err(e) => parts.push(format!("vision_qa: error {e}")),
+            }
+        }
+
+        // SUITE-RRK: reranking self-manages its own profile row (provider
+        // "openai", Chord's /v1/rerank), independent of the Ollama-shared
+        // profile_id above — a reranker never goes through the context/code/
+        // agent path. A per-query error is folded into the returned summary; an
+        // error here (e.g. missing corpus) degrades this model's line only.
+        if suites.iter().any(|s| s == "reranking") {
+            match run_reranking_suite(model).await {
+                Ok(o) => parts.push(format!(
+                    "reranking: uplift={:.3} ndcg={:.3} queries={}",
+                    o.avg_ndcg_uplift, o.avg_reranked_ndcg, o.queries_run
+                )),
+                Err(e) => parts.push(format!("reranking: error {e}")),
             }
         }
 
