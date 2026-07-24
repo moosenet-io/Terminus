@@ -333,6 +333,21 @@ pub fn is_transport_error(msg: &str) -> bool {
         || l.contains("eof")
 }
 
+/// FIX2 (S125): whether a stored tier error string denotes a genuine TIMEOUT —
+/// the per-tier/request deadline elapsed (`RequestFailureClass::Timeout`). This
+/// is the real "context too big to serve in time" CAPACITY signal, and is
+/// DELIBERATELY narrower than [`is_transport_error`]: a transient connect/body/
+/// parse blip must NOT count, because it does not prove a larger context is
+/// infeasible (halting escalation on it would wrongly cap the model at that
+/// tier). The runner uses this alongside `oom` to decide a tier is the model's
+/// feasible-context ceiling and STOP escalating. Matches the two timeout markers
+/// `describe_request_error` emits: the `Timeout` label ("timed out") and the
+/// `is_timeout=true` predicate dump. Pure.
+pub fn is_timeout_error(msg: &str) -> bool {
+    let l = msg.to_lowercase();
+    l.contains("timed out") || l.contains("is_timeout=true")
+}
+
 /// Coarse classification of an inference error, unifying the two ad hoc
 /// predicates ([`is_oom_like`], [`is_transport_error`]) into one public
 /// vocabulary (Phase 2 item 4). Named `ErrorClass` — not `RetryReason` or
@@ -1073,6 +1088,27 @@ mod tests {
         assert!(!is_transport_error("model 'foo' not found"));
         assert!(!is_transport_error("invalid prompt"));
         assert!(!is_transport_error("out of memory"));
+    }
+
+    /// FIX2 (S125): `is_timeout_error` is NARROWER than `is_transport_error` — it
+    /// matches ONLY a genuine timeout (the two markers `describe_request_error`
+    /// emits), never a transient connect/body/parse error. This is what lets the
+    /// runner treat a timeout (a real capacity ceiling) differently from a
+    /// one-off network blip.
+    #[test]
+    fn is_timeout_error_matches_only_timeouts() {
+        // Genuine timeouts (the two describe_request_error markers).
+        assert!(is_timeout_error(
+            "run_tier: inference request failed (timed out); is_timeout=true is_connect=false"
+        ));
+        assert!(is_timeout_error("operation timed out"));
+        // NOT timeouts — transient connect/body/parse failures.
+        assert!(!is_timeout_error(
+            "run_tier: inference request failed (connection refused); is_timeout=false is_connect=true"
+        ));
+        assert!(!is_timeout_error("response parse error: expected value"));
+        assert!(!is_timeout_error("unexpected EOF"));
+        assert!(!is_timeout_error("out of memory"));
     }
 
     #[test]

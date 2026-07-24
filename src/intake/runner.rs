@@ -189,14 +189,21 @@ pub fn cap_tiers(tiers: &[usize], cap: usize) -> Vec<usize> {
 }
 
 /// FIX2 (S125): whether a tier result is this model's feasible-context CEILING —
-/// an OOM, a timeout, or any hard tier failure — after which the runner records
-/// the ceiling and STOPS escalating to larger tiers. A larger context can only
-/// be heavier, so attempting it would just burn another full per-tier timeout;
-/// stopping here bounds a big model to ~one timeout rather than one per tier.
-/// (A timeout surfaces as `error = Some("... timed out ...")` with `oom = false`,
-/// so this MUST test `error`, not just `oom`.) Pure.
+/// an OOM or a genuine TIMEOUT (the per-tier deadline elapsed) — after which the
+/// runner records the ceiling and STOPS escalating to larger tiers. A larger
+/// context can only be heavier, so a real capacity limit at this tier means the
+/// next tier is hopeless too; stopping bounds a big model to ~one timeout rather
+/// than one per tier.
+///
+/// Deliberately NARROW (codex re-review): a transient connect/body/parse error
+/// is NOT a ceiling — it does not prove a larger context is infeasible, so a
+/// one-off network blip on (say) the 8k tier must not wrongly cap the model at
+/// 8k. Such a tier is still RECORDED as a failure, but escalation CONTINUES to
+/// the next tier. A timeout surfaces as `error = Some("... timed out ...")` with
+/// `oom = false`, matched by [`context::is_timeout_error`]; an OOM/overload (incl.
+/// HTTP 500/503) is already flagged `oom = true` by `run_tier`. Pure.
 fn tier_hit_ceiling(oom: bool, error: Option<&str>) -> bool {
-    oom || error.is_some()
+    oom || error.map(context::is_timeout_error).unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -2144,22 +2151,28 @@ mod tests {
         assert_eq!(tiers, vec![2000]);
     }
 
-    /// The escalation loop's stop predicate fires on OOM, on a TIMEOUT
-    /// (`oom = false` but an error is present), and on any hard failure — but
-    /// NOT on a clean tier (no oom, no error).
+    /// The escalation stop predicate fires ONLY on a genuine capacity limit —
+    /// OOM or a TIMEOUT — never on a clean tier or a transient connect/body/parse
+    /// error (those must not wrongly cap the model at that tier).
     #[test]
-    fn tier_ceiling_stops_on_timeout_oom_and_failure() {
+    fn tier_ceiling_stops_on_oom_and_timeout_only() {
         // Clean tier: keep escalating.
         assert!(!tier_hit_ceiling(false, None));
-        // OOM tier.
+        // OOM tier (a real capacity limit, incl. HTTP 500/503 which run_tier
+        // flags oom=true): stop.
         assert!(tier_hit_ceiling(true, None));
-        // Timeout tier: oom=false, error present (as `run_tier` records it).
+        // Genuine TIMEOUT (oom=false), exactly as run_tier records it: stop.
         assert!(tier_hit_ceiling(
             false,
-            Some("run_tier: inference request failed (timed out); is_timeout=true")
+            Some("run_tier: inference request failed (timed out); is_timeout=true is_connect=false is_body=false")
         ));
-        // Any other hard failure.
-        assert!(tier_hit_ceiling(false, Some("Ollama HTTP 500: boom")));
+        // Transient CONNECT error: NOT a ceiling -> keep escalating.
+        assert!(!tier_hit_ceiling(
+            false,
+            Some("run_tier: inference request failed (connection refused); is_timeout=false is_connect=true is_body=false")
+        ));
+        // Transient BODY/parse error: NOT a ceiling either.
+        assert!(!tier_hit_ceiling(false, Some("response parse error: expected value")));
     }
 
     /// Simulate the escalation loop over a sequence of tier outcomes: it must
@@ -2185,6 +2198,37 @@ mod tests {
             }
         }
         assert_eq!(attempted, vec![2000, 4000, 8000, 16000, 32000]);
+        assert!(!attempted.iter().any(|&t| t >= 48000));
+    }
+
+    /// A TRANSIENT connect error mid-ladder must NOT halt escalation: the loop
+    /// records that tier's failure and keeps going, stopping only at the later
+    /// genuine timeout. (Guards the codex re-review fix — an 8k network blip must
+    /// not cap the model at 8k.)
+    #[test]
+    fn escalation_continues_past_transient_connect_error() {
+        let outcomes: Vec<(usize, bool, Option<&str>)> = vec![
+            (2000, false, None),
+            // Transient connect blip: recorded, but NOT a ceiling.
+            (
+                8000,
+                false,
+                Some("inference request failed (connection refused); is_timeout=false is_connect=true"),
+            ),
+            (16000, false, None),
+            (32000, false, Some("... timed out ...")), // real ceiling
+            (48000, false, None),                       // must NOT be reached
+        ];
+        let mut attempted = Vec::new();
+        for (tier, oom, err) in &outcomes {
+            attempted.push(*tier);
+            if tier_hit_ceiling(*oom, *err) {
+                break;
+            }
+        }
+        // The 8k connect blip did NOT halt; escalation continued and stopped only
+        // at the 32k timeout.
+        assert_eq!(attempted, vec![2000, 8000, 16000, 32000]);
         assert!(!attempted.iter().any(|&t| t >= 48000));
     }
 
