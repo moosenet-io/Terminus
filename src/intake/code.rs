@@ -31,7 +31,11 @@ use crate::error::ToolError;
 use crate::intake::context;
 use crate::intake::storage::{self, CodeRunRow};
 
-/// Resolve the corpus directory from `INTAKE_CORPUS_DIR`. No compiled-in
+/// Resolve the corpus directory from `INTAKE_CORPUS_DIR`. DR-02 (S125): this is the
+/// SINGLE unified corpus-dir variable — both this agent/code path and the v2 code path
+/// ([`crate::intake::code_v2::corpus_v2_dir`]) intentionally share `INTAKE_CORPUS_DIR`
+/// so an operator sets ONE variable for both (the v2 path keeps `INTAKE_CORPUS_V2_DIR`
+/// only as a deprecated fallback alias). No compiled-in
 /// default (PII remediation 2026-07): required at runtime — fails clean
 /// with `NotConfigured` rather than silently pointing at a real
 /// sweep-harness host path.

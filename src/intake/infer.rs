@@ -658,11 +658,36 @@ async fn openai_embed(
         return;
     }
     // OpenAI embeddings schema: { "data": [ { "embedding": [f32, ...] } ], "usage": {..} }.
-    let embedding: Vec<f32> = v
-        .pointer("/data/0/embedding")
-        .and_then(|e| e.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
-        .unwrap_or_default();
+    let arr = match v.pointer("/data/0/embedding").and_then(|e| e.as_array()) {
+        Some(a) => a,
+        None => {
+            m.error =
+                Some("openai embeddings response missing data[0].embedding array".to_string());
+            return;
+        }
+    };
+    // STRICT parse (codex review, S125): reject the WHOLE response with a clean error
+    // if ANY element is non-numeric or non-finite (NaN/±Inf) — never silently drop an
+    // element. A dropped element would record a wrong `dimensionality`, a silent
+    // corruption of a profiling metric; a bad vector must fail cleanly, not lie.
+    let mut embedding: Vec<f32> = Vec::with_capacity(arr.len());
+    for (i, x) in arr.iter().enumerate() {
+        match x.as_f64() {
+            Some(f) if f.is_finite() => embedding.push(f as f32),
+            Some(_) => {
+                m.error = Some(format!(
+                    "openai embeddings response has a non-finite element at index {i}"
+                ));
+                return;
+            }
+            None => {
+                m.error = Some(format!(
+                    "openai embeddings response has a non-numeric element at index {i}"
+                ));
+                return;
+            }
+        }
+    }
     if embedding.is_empty() {
         m.error = Some("openai embeddings endpoint returned an empty vector".to_string());
         return;
@@ -1190,5 +1215,96 @@ mod tests {
         .await;
         assert!(m.error.as_deref().unwrap_or("").contains("empty vector"));
         assert!(m.embedding.is_empty());
+    }
+
+    // codex review (S125): a non-numeric element must reject the WHOLE response with a
+    // clean error — never silently drop it (that would record a wrong dimensionality).
+    #[tokio::test]
+    async fn openai_embed_rejects_non_numeric_element() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/embeddings");
+                then.status(200)
+                    .json_body(serde_json::json!({ "data": [{ "embedding": [0.1, "bad"] }] }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = EmbedMetrics::default();
+        openai_embed(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("non-numeric"));
+        assert!(m.embedding.is_empty());
+        assert_eq!(m.dimensionality, 0);
+    }
+
+    // codex review (S125): a non-finite element must yield a clean error, never a
+    // corrupt vector or a panic. JSON cannot carry a NaN/Inf literal, so an overflowing
+    // magnitude (`1e400` -> f64 +Inf) is used; whichever guard fires (the finite-check
+    // or the upstream JSON parse), the contract is the same: `m.error` set, no vector.
+    #[tokio::test]
+    async fn openai_embed_rejects_non_finite_element() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/embeddings");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"data":[{"embedding":[0.1, 1e400]}]}"#);
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = EmbedMetrics::default();
+        openai_embed(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.is_some());
+        assert!(m.embedding.is_empty());
+        assert_eq!(m.dimensionality, 0);
+    }
+
+    // codex review (S125): the Bearer token resolved from `api_key_env` is actually sent.
+    #[tokio::test]
+    async fn openai_embed_sends_bearer_auth() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/embeddings")
+                    .header("authorization", "Bearer tok123");
+                then.status(200)
+                    .json_body(serde_json::json!({ "data": [{ "embedding": [0.1, 0.2] }] }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = EmbedMetrics::default();
+        openai_embed(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            std::time::Duration::from_secs(10),
+            Some("tok123"),
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert_eq!(m.dimensionality, 2);
+        assert!(m.error.is_none());
     }
 }
