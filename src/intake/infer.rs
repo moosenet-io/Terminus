@@ -513,6 +513,30 @@ pub async fn embed_with_metrics(
 
     match backend.kind.as_str() {
         "ollama" => ollama_embed(client, &backend.url, model, text, timeout, &mut m).await,
+        // BT (S125): any OpenAI-compatible embeddings backend — Chord's `/v1/embeddings`
+        // proxy, a local vLLM / llama-server embeddings serve, or OpenRouter. Mirrors the
+        // `infer_with_metrics` "openai" arm exactly: the bearer token is optional and is
+        // resolved from the backend's `api_key_env` at call time (never stored, never
+        // logged). This is what lets MINT profile the embedding backends Chord serves
+        // instead of only ollama.
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_embed(
+                client,
+                &backend.url,
+                model,
+                text,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
         other => {
             // No embeddings wire path for this backend kind: a clear, non-silent
             // error that the runner turns into a clean "skip" (not a crash).
@@ -577,6 +601,105 @@ async fn ollama_embed(
     }
     m.dimensionality = parsed.embedding.len();
     m.embedding = parsed.embedding;
+    m.latency_ms = latency_ms;
+}
+
+/// BT (S125): OpenAI-compatible embeddings (`POST {base}/v1/embeddings`). The embeddings
+/// twin of [`openai_infer`]: profiles any backend speaking the OpenAI embeddings wire
+/// protocol — Chord's proxy, a vLLM / llama-server embeddings serve, or OpenRouter.
+/// Latency is measured LOCALLY (wall clock); `auth` is an optional bearer token resolved
+/// from the backend's `api_key_env` — never logged. The dense vector is taken from
+/// `data[0].embedding`; a missing/empty vector (a non-embedding model often 200s with an
+/// empty array) is a clean, non-silent error so the runner skips it rather than crashing.
+/// Never panics — every failure lands in `m.error`, and the vector is never fabricated.
+async fn openai_embed(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    text: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut EmbedMetrics,
+) {
+    let body = serde_json::json!({ "model": model, "input": text });
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/embeddings", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            m.error = Some(e.to_string());
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let txt = resp.text().await.unwrap_or_default();
+        m.error = Some(format!("openai embeddings HTTP {code}: {txt}"));
+        return;
+    }
+    let latency_ms = started.elapsed().as_millis() as i64;
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("openai embeddings response parse error: {e}"));
+            return;
+        }
+    };
+    // Some OpenAI-compatible servers return 200 with an `{"error": {...}}` body; surface
+    // it rather than treating the run as a success with an empty vector.
+    if let Some(err) = v.pointer("/error/message").and_then(|e| e.as_str()) {
+        m.error = Some(err.to_string());
+        return;
+    }
+    // OpenAI embeddings schema: { "data": [ { "embedding": [f32, ...] } ], "usage": {..} }.
+    let arr = match v.pointer("/data/0/embedding").and_then(|e| e.as_array()) {
+        Some(a) => a,
+        None => {
+            m.error =
+                Some("openai embeddings response missing data[0].embedding array".to_string());
+            return;
+        }
+    };
+    // STRICT parse (codex review, S125): reject the WHOLE response with a clean error
+    // if ANY element is non-numeric or non-finite (NaN/±Inf) — never silently drop an
+    // element. A dropped element would record a wrong `dimensionality`, a silent
+    // corruption of a profiling metric; a bad vector must fail cleanly, not lie.
+    let mut embedding: Vec<f32> = Vec::with_capacity(arr.len());
+    for (i, x) in arr.iter().enumerate() {
+        match x.as_f64() {
+            Some(f) => {
+                // Validate the CONVERTED f32 (the stored type), not just the f64: a finite
+                // f64 like 1e100 casts to +Inf as f32, so an f64-only finite check would let
+                // an Inf component slip through as a "successful" embedding (codex review).
+                let fv = f as f32;
+                if !fv.is_finite() {
+                    m.error = Some(format!(
+                        "openai embeddings response has a non-finite element at index {i}"
+                    ));
+                    return;
+                }
+                embedding.push(fv);
+            }
+            None => {
+                m.error = Some(format!(
+                    "openai embeddings response has a non-numeric element at index {i}"
+                ));
+                return;
+            }
+        }
+    }
+    if embedding.is_empty() {
+        m.error = Some("openai embeddings endpoint returned an empty vector".to_string());
+        return;
+    }
+    m.dimensionality = embedding.len();
+    m.embedding = embedding;
     m.latency_ms = latency_ms;
 }
 
@@ -983,7 +1106,11 @@ mod tests {
         assert_eq!(m.response_tokens, Some(5));
         assert!(m.error.is_none());
         assert!(m.total_time_ms.is_some());
-        assert!(m.throughput_tok_per_sec.unwrap_or(0.0) > 0.0);
+        // Throughput is only defined when local wall-clock elapsed > 0ms; a sub-
+        // millisecond httpmock round-trip can legitimately measure 0ms and leave
+        // it `None` (openai_infer guards on `elapsed_ms > 0`). Accept a positive
+        // rate OR `None`, so this is deterministic on a fast host.
+        assert!(m.throughput_tok_per_sec.map(|t| t > 0.0).unwrap_or(true));
     }
 
     #[tokio::test]
@@ -1009,5 +1136,210 @@ mod tests {
         .await;
         assert!(m.error.as_deref().unwrap_or("").contains("500"));
         assert!(m.oom); // 500 + "memory" → oom flag
+    }
+
+    // BT (S125): OpenAI-compatible embed arm parses `data[0].embedding`, records the
+    // dimensionality, and leaves `error` unset. Mirrors `openai_infer_parses_*`.
+    #[tokio::test]
+    async fn openai_embed_parses_data_embedding() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/embeddings");
+                then.status(200).json_body(serde_json::json!({
+                    "data": [{ "embedding": [0.1, 0.2, 0.3] }],
+                    "usage": { "prompt_tokens": 3 }
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = EmbedMetrics::default();
+        openai_embed(
+            &client,
+            &server.base_url(),
+            "test-embed",
+            "hi",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert_eq!(m.dimensionality, 3);
+        assert_eq!(m.embedding.len(), 3);
+        assert!(m.error.is_none());
+        assert!(m.latency_ms >= 0);
+    }
+
+    #[tokio::test]
+    async fn openai_embed_surfaces_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/embeddings");
+                then.status(500).body("boom");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = EmbedMetrics::default();
+        openai_embed(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.embedding.is_empty());
+    }
+
+    // A non-embedding model often 200s with an empty vector — treat as a clean error.
+    #[tokio::test]
+    async fn openai_embed_empty_vector_is_clean_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/embeddings");
+                then.status(200)
+                    .json_body(serde_json::json!({ "data": [{ "embedding": [] }] }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = EmbedMetrics::default();
+        openai_embed(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("empty vector"));
+        assert!(m.embedding.is_empty());
+    }
+
+    // codex review (S125): a non-numeric element must reject the WHOLE response with a
+    // clean error — never silently drop it (that would record a wrong dimensionality).
+    #[tokio::test]
+    async fn openai_embed_rejects_non_numeric_element() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/embeddings");
+                then.status(200)
+                    .json_body(serde_json::json!({ "data": [{ "embedding": [0.1, "bad"] }] }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = EmbedMetrics::default();
+        openai_embed(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("non-numeric"));
+        assert!(m.embedding.is_empty());
+        assert_eq!(m.dimensionality, 0);
+    }
+
+    // codex review (S125): a non-finite element must yield a clean error, never a
+    // corrupt vector or a panic. JSON cannot carry a NaN/Inf literal, so an overflowing
+    // magnitude (`1e400` -> f64 +Inf) is used; whichever guard fires (the finite-check
+    // or the upstream JSON parse), the contract is the same: `m.error` set, no vector.
+    #[tokio::test]
+    async fn openai_embed_rejects_non_finite_element() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/embeddings");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"data":[{"embedding":[0.1, 1e400]}]}"#);
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = EmbedMetrics::default();
+        openai_embed(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.is_some());
+        assert!(m.embedding.is_empty());
+        assert_eq!(m.dimensionality, 0);
+    }
+
+    // codex review (S125): an element finite as f64 but +Inf once cast to the stored f32
+    // (e.g. 1e100) must be rejected — checking the f32, not only the f64, is what catches it.
+    #[tokio::test]
+    async fn openai_embed_rejects_f32_overflow_element() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/embeddings");
+                then.status(200)
+                    .json_body(serde_json::json!({ "data": [{ "embedding": [0.1, 1e100] }] }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = EmbedMetrics::default();
+        openai_embed(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("non-finite"));
+        assert!(m.embedding.is_empty());
+        assert_eq!(m.dimensionality, 0);
+    }
+
+    // codex review (S125): the Bearer token resolved from `api_key_env` is actually sent.
+    #[tokio::test]
+    async fn openai_embed_sends_bearer_auth() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/embeddings")
+                    .header("authorization", "Bearer tok123");
+                then.status(200)
+                    .json_body(serde_json::json!({ "data": [{ "embedding": [0.1, 0.2] }] }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = EmbedMetrics::default();
+        openai_embed(
+            &client,
+            &server.base_url(),
+            "m",
+            "hi",
+            std::time::Duration::from_secs(10),
+            Some("tok123"),
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert_eq!(m.dimensionality, 2);
+        assert!(m.error.is_none());
     }
 }
