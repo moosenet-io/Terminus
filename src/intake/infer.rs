@@ -883,13 +883,15 @@ async fn openai_rerank(
         m.latency_ms = started.elapsed().as_millis() as i64;
         return;
     }
-    let latency_ms = started.elapsed().as_millis() as i64;
+    // Finding 4 (re-review): record wall-clock latency computed AT each exit point,
+    // not snapshotted once right after headers — the body-read + parse time is real
+    // round-trip latency and must be included on the read/parse/success exits too.
     // Finding 1: bounded body read (DoS) — never `resp.json()` an uncapped body.
     let bytes = match read_body_capped(resp, MAX_RESPONSE_BYTES).await {
         Ok(b) => b,
         Err(e) => {
             m.error = Some(format!("openai rerank response read error: {e}"));
-            m.latency_ms = latency_ms;
+            m.latency_ms = started.elapsed().as_millis() as i64;
             return;
         }
     };
@@ -897,7 +899,7 @@ async fn openai_rerank(
         Ok(v) => v,
         Err(e) => {
             m.error = Some(format!("openai rerank response parse error: {e}"));
-            m.latency_ms = latency_ms;
+            m.latency_ms = started.elapsed().as_millis() as i64;
             return;
         }
     };
@@ -905,14 +907,14 @@ async fn openai_rerank(
     // it rather than treating the run as a success with an empty ranking.
     if let Some(err) = v.pointer("/error/message").and_then(|e| e.as_str()) {
         m.error = Some(err.to_string());
-        m.latency_ms = latency_ms;
+        m.latency_ms = started.elapsed().as_millis() as i64;
         return;
     }
     // Rerank schema: { "results": [ { "index": usize, "relevance_score": f64 }, ... ] },
     // best-first. `relevance_score` is the OpenAI/Jina field; some servers use `score`.
     let Some(results) = v.get("results").and_then(|r| r.as_array()) else {
         m.error = Some("openai rerank response missing a 'results' array".to_string());
-        m.latency_ms = latency_ms;
+        m.latency_ms = started.elapsed().as_millis() as i64;
         return;
     };
     let mut ranking = Vec::with_capacity(results.len());
@@ -925,7 +927,7 @@ async fn openai_rerank(
         let Some(idx) = item.get("index").and_then(|i| i.as_u64()) else {
             m.error =
                 Some("openai rerank response has a result with no usable 'index'".to_string());
-            m.latency_ms = latency_ms;
+            m.latency_ms = started.elapsed().as_millis() as i64;
             return;
         };
         let idx = idx as usize;
@@ -934,12 +936,12 @@ async fn openai_rerank(
                 "openai rerank returned out-of-range index {idx} (documents.len() = {})",
                 documents.len()
             ));
-            m.latency_ms = latency_ms;
+            m.latency_ms = started.elapsed().as_millis() as i64;
             return;
         }
         if !seen.insert(idx) {
             m.error = Some(format!("openai rerank returned duplicate index {idx}"));
-            m.latency_ms = latency_ms;
+            m.latency_ms = started.elapsed().as_millis() as i64;
             return;
         }
         // Finding 3: a missing/malformed score must REJECT the response — never be
@@ -952,7 +954,7 @@ async fn openai_rerank(
             m.error = Some(format!(
                 "openai rerank result for index {idx} has a missing/malformed score"
             ));
-            m.latency_ms = latency_ms;
+            m.latency_ms = started.elapsed().as_millis() as i64;
             return;
         };
         ranking.push(idx);
@@ -960,12 +962,12 @@ async fn openai_rerank(
     }
     if ranking.is_empty() {
         m.error = Some("openai rerank endpoint returned no usable results".to_string());
-        m.latency_ms = latency_ms;
+        m.latency_ms = started.elapsed().as_millis() as i64;
         return;
     }
     m.ranking = ranking;
     m.scores = scores;
-    m.latency_ms = latency_ms;
+    m.latency_ms = started.elapsed().as_millis() as i64;
 }
 
 /// Subset of Ollama `/api/embeddings` response we consume.
@@ -2517,6 +2519,40 @@ mod tests {
         .await;
         assert!(m.error.as_deref().unwrap_or("").contains("500"));
         assert!(m.latency_ms > 0, "latency must be recorded (>0) on the HTTP-error path");
+    }
+
+    // Finding 4 (re-review): latency on the body-read/parse exit must include the
+    // read+parse time, not just the pre-header round-trip. A delayed 200 with an
+    // unparseable body guarantees a strictly-positive measured latency on the
+    // parse-failure exit.
+    #[tokio::test]
+    async fn openai_rerank_records_latency_on_parse_failure() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/rerank");
+                then.status(200)
+                    .delay(std::time::Duration::from_millis(30))
+                    .header("content-type", "application/json")
+                    .body("this is not json");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = RerankMetrics::default();
+        let docs = vec!["a".to_string()];
+        openai_rerank(
+            &client,
+            &server.base_url(),
+            "m",
+            "q",
+            &docs,
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("parse error"));
+        assert!(m.latency_ms > 0, "latency must be recorded (>0) on the parse-failure path");
     }
 
     // read_body_capped enforces the byte cap even when Content-Length is absent
