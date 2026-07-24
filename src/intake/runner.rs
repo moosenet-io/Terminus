@@ -1125,6 +1125,109 @@ pub async fn run_image_generation_suite(model_name: &str) -> Result<ImageGenSuit
     })
 }
 
+/// Outcome of the document_parsing suite (SUITE-DOC) for the tool summary.
+pub struct DocParseSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub cases_run: usize,
+    pub avg_field_accuracy: f64,
+    pub avg_latency_ms: f64,
+    /// One line per corpus case, in manifest order.
+    pub per_case: Vec<String>,
+}
+
+/// Run the document_parsing suite (SUITE-DOC) end-to-end against `model_name`:
+/// load the corpus from `INTAKE_CORPUS_DIR/document_parsing/` (see
+/// [`crate::intake::newcats::document_parsing::load_corpus`]), and for each case
+/// POST its document bytes to Chord's `/v1/documents/parse` via
+/// [`crate::intake::infer::docparse_with_metrics`] (the `openai` arm), derive an
+/// [`crate::intake::newcats::document_parsing::ExtractionOutcome`] from the
+/// normalized [`crate::intake::infer::DocParseMetrics`], and write the
+/// field-accuracy / CER / WER / table-F1 rows via that module's `score_and_write`.
+///
+/// Creates its own `model_profiles` row (provider `"chord"`, since a doc-parse
+/// model is served through Chord, not Ollama). A per-case parse error is
+/// recorded (a zero-score row from whatever timing is available) rather than
+/// aborting the whole suite — the same "failure is still useful signal"
+/// convention every other `newcats` category uses. An unset `INTAKE_CORPUS_DIR`
+/// (or missing manifest) returns `ToolError::NotConfigured` — the caller decides
+/// whether that is a hard error or a clean skip.
+pub async fn run_document_parsing_suite(model_name: &str) -> Result<DocParseSuiteOutcome, ToolError> {
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::docparse_with_metrics;
+    use crate::intake::newcats::document_parsing::{self, ExtractionOutcome};
+
+    let (corpus_dir, cases) = document_parsing::load_corpus()?;
+    let profile_id = create_profile_row_for_provider(model_name, "chord").await?;
+    let pool = storage::get_pool().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(e.to_string()))?;
+    let model_id = ModelId::from(model_name);
+
+    let mut per_case = Vec::with_capacity(cases.len());
+    let mut accuracy_sum = 0.0;
+    let mut latency_sum = 0.0;
+    let mut n = 0usize;
+
+    for case in &cases {
+        let path = corpus_dir.join(&case.file);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                per_case.push(format!("{}: error reading {} ({e})", case.id, path.display()));
+                continue;
+            }
+        };
+        let metrics =
+            docparse_with_metrics(&client, model_name, &bytes, &case.file, Duration::from_secs(600))
+                .await;
+        let backend_tag = metrics
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Gpu);
+        let truth = case.ground_truth();
+        let outcome = ExtractionOutcome {
+            raw_output: String::new(),
+            text: metrics.text.clone(),
+            fields: metrics.fields.clone(),
+            tables: metrics.tables.clone(),
+            latency_ms: metrics.latency_ms,
+            response_tokens: metrics.response_tokens,
+        };
+        let accuracy = document_parsing::score_field_accuracy(
+            &truth.fields,
+            &document_parsing::extracted_fields(&outcome),
+        );
+        accuracy_sum += accuracy;
+        latency_sum += outcome.latency_ms as f64;
+        n += 1;
+
+        document_parsing::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, &truth, &outcome)
+            .await?;
+
+        per_case.push(if let Some(err) = &metrics.error {
+            format!("{}: error ({err})", case.id)
+        } else {
+            format!(
+                "{}: field_acc={accuracy:.2} latency_ms={} tables={}",
+                case.id,
+                outcome.latency_ms,
+                outcome.tables.len(),
+            )
+        });
+    }
+
+    Ok(DocParseSuiteOutcome {
+        profile_id,
+        cases_run: n,
+        avg_field_accuracy: if n > 0 { accuracy_sum / n as f64 } else { 0.0 },
+        avg_latency_ms: if n > 0 { latency_sum / n as f64 } else { 0.0 },
+        per_case,
+    })
+}
+
 /// Disk-usage percentage for a mount via `df`, or None if it can't be read.
 fn disk_pct(mount: &str) -> Option<u8> {
     let out = std::process::Command::new("df")
@@ -1324,6 +1427,19 @@ pub async fn run_fleet_suites(
                     o.success_count, o.prompts_run, o.avg_time_to_image_ms
                 )),
                 Err(e) => parts.push(format!("image_generation: error {e}")),
+            }
+        }
+        // SUITE-DOC: document_parsing goes through Chord's `/v1/documents/parse`
+        // (not the Ollama serve loaded above), and owns its own profile row, so
+        // it dispatches directly here (like the diffusion suite) rather than via
+        // an injected closure. A NotConfigured corpus is recorded, not fatal.
+        if suites.iter().any(|s| s == "document_parsing") {
+            match run_document_parsing_suite(model).await {
+                Ok(o) => parts.push(format!(
+                    "document_parsing: cases={} avg_field_acc={:.2}",
+                    o.cases_run, o.avg_field_accuracy
+                )),
+                Err(e) => parts.push(format!("document_parsing: error {e}")),
             }
         }
 

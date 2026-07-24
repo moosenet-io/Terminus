@@ -1,0 +1,35 @@
+{
+  "_comment": "SUITE-DOC (S125) reference corpus for the document_parsing MINT suite. Point INTAKE_CORPUS_DIR at a directory containing this 'document_parsing/' subdir (INTAKE_CORPUS_DIR/document_parsing/manifest.json). Each document is scored on three axes: named business fields (field_accuracy), full-text (CER/WER via reference_text), and tables (cell-set table_f1). All values here are synthetic, no real PII. The .pdf files are minimal one-page synthetic PDFs whose extracted text matches reference_text.",
+  "documents": [
+    {
+      "id": "invoice-001",
+      "file": "invoice-001.pdf",
+      "fields": {
+        "vendor_name": "Acme Supply Co",
+        "invoice_number": "INV-4471",
+        "invoice_date": "2026-07-01",
+        "total_due": "512.00"
+      },
+      "reference_text": "Acme Supply Co Invoice INV-4471 Date: 2026-07-01 Item Qty Price Widget 2 256.00 Total Due: 512.00",
+      "tables": [
+        [
+          ["Item", "Qty", "Price"],
+          ["Widget", "2", "256.00"]
+        ]
+      ]
+    },
+    {
+      "id": "form-002",
+      "file": "form-002.pdf",
+      "fields": {
+        "form_title": "Patient Intake Form",
+        "name": "Jordan Lee",
+        "dob": "1990-04-12",
+        "member_id": "MBR-88213",
+        "plan": "Silver PPO"
+      },
+      "reference_text": "Patient Intake Form Name: Jordan Lee DOB: 1990-04-12 Member ID: MBR-88213 Plan: Silver PPO",
+      "tables": []
+    }
+  ]
+}

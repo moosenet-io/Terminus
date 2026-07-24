@@ -1161,6 +1161,267 @@ async fn openai_imagegen(
     }
 }
 
+// ── SUITE-DOC (S125): document parsing via Chord `/v1/documents/parse` ──────
+
+/// A single parsed table: row-major grid of cell strings.
+pub type DocTable = Vec<Vec<String>>;
+
+/// Normalized result of one document-parse request via the unified path.
+///
+/// Analogue of [`EmbedMetrics`]/[`InferMetrics`] for the `document_parsing`
+/// suite. `text` is the parser's full text/markdown rendering (the CER/WER
+/// source); `fields` is any `field -> value` key/value map the parser returned
+/// (the field-accuracy source; empty when the parser returns only prose);
+/// `tables` are the extracted tables (the table-F1 source). On ANY failure
+/// (transport, HTTP, parse, or a backend whose kind does not parse documents)
+/// `error` is set and the payload fields stay empty — callers never panic and
+/// never see a fabricated document. Like [`EmbedMetrics`], there is no `oom`
+/// field.
+#[derive(Debug, Clone, Default)]
+pub struct DocParseMetrics {
+    /// Full parsed-document text / markdown (CER/WER source).
+    pub text: String,
+    /// Extracted key/value fields, when the parser returns them.
+    pub fields: std::collections::BTreeMap<String, String>,
+    /// Extracted tables, each a row-major grid of cell strings.
+    pub tables: Vec<DocTable>,
+    /// Wall-clock round-trip, ms.
+    pub latency_ms: i64,
+    /// Response token count when the backend reports one (`usage`).
+    pub response_tokens: Option<i64>,
+    pub error: Option<String>,
+    /// Backend that served the request (for attribution).
+    pub backend: Option<String>,
+    /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
+    pub hardware: Option<String>,
+}
+
+/// Parse `document` (raw bytes of a PDF/image/etc., named `filename`) for
+/// `model` through Chord's unified backend-routing path.
+///
+/// The document-parsing analogue of [`embed_with_metrics`]/[`infer_with_metrics`]:
+/// it resolves the model's tagged backend via [`resolve_backend`] and dispatches
+/// to that backend's document-parse endpoint. The `document_parsing` suite is a
+/// *client* of this function — it never opens an HTTP socket directly.
+///
+/// Backend support: any OpenAI-compatible document-parse backend — Chord's
+/// `/v1/documents/parse` proxy (docling behind it) — via the `openai` arm,
+/// mirroring [`embed_with_metrics`]'s `openai` arm exactly (optional bearer
+/// token from the backend's `api_key_env`, resolved at call time, never stored,
+/// never logged). Any other backend kind returns a clear, non-silent error so a
+/// non-parsing candidate is skipped cleanly upstream, not crashed. Never panics
+/// — every failure lands in [`DocParseMetrics::error`].
+pub async fn docparse_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    document: &[u8],
+    filename: &str,
+    timeout: Duration,
+) -> DocParseMetrics {
+    let backend = resolve_backend(model);
+    let mut m = DocParseMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        // SUITE-DOC: any OpenAI-compatible document-parse backend — Chord's
+        // `/v1/documents/parse` proxy (docling). Mirrors the `embed_with_metrics`
+        // "openai" arm: the bearer token is optional and resolved from the
+        // backend's `api_key_env` at call time (never stored, never logged).
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_docparse(
+                client,
+                &backend.url,
+                model,
+                document,
+                filename,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
+        other => {
+            // No document-parse wire path for this backend kind: a clear,
+            // non-silent error the runner turns into a clean "skip".
+            m.error = Some(format!(
+                "backend '{}' kind '{other}' does not support document parsing",
+                backend.name
+            ));
+        }
+    }
+    m
+}
+
+/// Chord `POST {base}/v1/documents/parse`. The document bytes are sent as a
+/// base64 field in a JSON body (reqwest's `multipart` feature is not enabled in
+/// this crate, so a JSON body keeps the wire path dependency-free); the docling
+/// backend behind Chord returns the parsed document. `auth` is an optional
+/// bearer token (Chord JWT), resolved from the backend's `api_key_env` — never
+/// logged. Timing is measured LOCALLY (wall clock) and recorded on EVERY exit
+/// path; body reads are bounded (32 MiB cap, [`read_body_capped`]). Never panics
+/// — every failure lands in `m.error`, and no document is ever fabricated.
+///
+/// Response schema (tolerant): the full text is taken from the first present of
+/// `document.markdown` / `document.text` / `markdown` / `text` / `content`;
+/// fields from `document.fields` / `fields` / `key_value_pairs` (a JSON object,
+/// scalar values coerced to their string form); tables from `document.tables` /
+/// `tables` (each an object carrying `rows` / `cells` / `data`, a 2-D array of
+/// cell strings). A 200 body carrying an `{"error": {...}}` is surfaced as an
+/// error rather than a silent empty parse.
+#[allow(clippy::too_many_arguments)]
+async fn openai_docparse(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    document: &[u8],
+    filename: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut DocParseMetrics,
+) {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let body = serde_json::json!({
+        "model": model,
+        "filename": filename,
+        "document": B64.encode(document),
+    });
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/documents/parse", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            m.error = Some(e.to_string());
+            // Record wall-clock latency on EVERY exit path, transport error included.
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        // Bounded error-body read (DoS) — a non-2xx backend can stream too.
+        let txt = read_text_capped(resp, MAX_RESPONSE_BYTES).await;
+        m.error = Some(format!("documents/parse HTTP {code}: {txt}"));
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    // Bounded body read (DoS) — never `resp.json()` an uncapped body.
+    let bytes = match read_body_capped(resp, MAX_RESPONSE_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            m.error = Some(format!("documents/parse response read error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("documents/parse response parse error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    // Some OpenAI-compatible servers 200 with an `{"error": {...}}` body.
+    if let Some(err) = v.pointer("/error/message").and_then(|e| e.as_str()) {
+        m.error = Some(err.to_string());
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+
+    // Full text: first present of the tolerated pointers.
+    let text = ["/document/markdown", "/document/text", "/markdown", "/text", "/content"]
+        .iter()
+        .find_map(|&p| v.pointer(p).and_then(|x| x.as_str()))
+        .unwrap_or_default()
+        .to_string();
+
+    // Fields: first present object of key/value pointers.
+    let mut fields = std::collections::BTreeMap::new();
+    if let Some(obj) = ["/document/fields", "/fields", "/key_value_pairs"]
+        .iter()
+        .find_map(|&p| v.pointer(p).and_then(|x| x.as_object()))
+    {
+        for (k, val) in obj {
+            let s = match val {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            fields.insert(k.clone(), s);
+        }
+    }
+
+    // Tables: first present array; each table's grid from `rows`/`cells`/`data`.
+    let mut tables: Vec<DocTable> = Vec::new();
+    if let Some(arr) = ["/document/tables", "/tables"]
+        .iter()
+        .find_map(|&p| v.pointer(p).and_then(|x| x.as_array()))
+    {
+        for t in arr {
+            let grid = t
+                .pointer("/rows")
+                .or_else(|| t.pointer("/cells"))
+                .or_else(|| t.pointer("/data"))
+                .or(Some(t)) // a bare 2-D array table entry
+                .and_then(|g| g.as_array());
+            if let Some(rows) = grid {
+                let parsed: DocTable = rows
+                    .iter()
+                    .filter_map(|r| r.as_array())
+                    .map(|cells| {
+                        cells
+                            .iter()
+                            .map(|c| match c {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                            .collect::<Vec<String>>()
+                    })
+                    .collect();
+                if !parsed.is_empty() {
+                    tables.push(parsed);
+                }
+            }
+        }
+    }
+
+    // Both a JSON-object text-less parse and a prose parse are valid; an empty
+    // text AND empty fields AND no tables is a non-silent error (nothing usable).
+    if text.is_empty() && fields.is_empty() && tables.is_empty() {
+        m.error = Some("documents/parse returned no text, fields, or tables".to_string());
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+
+    m.response_tokens = v
+        .pointer("/usage/completion_tokens")
+        .or_else(|| v.pointer("/usage/total_tokens"))
+        .and_then(|t| t.as_i64());
+    m.text = text;
+    m.fields = fields;
+    m.tables = tables;
+    m.latency_ms = started.elapsed().as_millis() as i64;
+}
+
 /// Subset of Ollama `/api/embeddings` response we consume.
 #[derive(Deserialize)]
 struct OllamaEmbedResponse {
@@ -2913,6 +3174,136 @@ mod tests {
         )
         .await;
         assert!(!m.success);
+        assert!(m.error.as_deref().unwrap_or("").contains("parse error"));
+    }
+
+    // SUITE-DOC (S125): the document-parse arm parses the full text, the
+    // key/value fields, and the tables, and leaves `error` unset. Mirrors
+    // `openai_embed_parses_data_embedding`.
+    #[tokio::test]
+    async fn openai_docparse_parses_document_payload() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/documents/parse");
+                then.status(200).json_body(serde_json::json!({
+                    "document": {
+                        "markdown": "Invoice INV-4471\nTotal Due: 512.00",
+                        "fields": { "invoice_number": "INV-4471", "total_due": "512.00" },
+                        "tables": [ { "rows": [["Item", "Qty"], ["Widget", "2"]] } ]
+                    },
+                    "usage": { "completion_tokens": 61 }
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = DocParseMetrics::default();
+        openai_docparse(
+            &client,
+            &server.base_url(),
+            "docling",
+            b"%PDF-1.4 fake bytes",
+            "invoice.pdf",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert!(m.error.is_none());
+        assert!(m.text.contains("INV-4471"));
+        assert_eq!(m.fields.get("invoice_number").map(String::as_str), Some("INV-4471"));
+        assert_eq!(m.fields.get("total_due").map(String::as_str), Some("512.00"));
+        assert_eq!(m.tables.len(), 1);
+        assert_eq!(m.tables[0][1], vec!["Widget".to_string(), "2".to_string()]);
+        assert_eq!(m.response_tokens, Some(61));
+        assert!(m.latency_ms >= 0);
+    }
+
+    // Hardening: an HTTP error surfaces cleanly (bounded error-body read) and
+    // records latency on the error exit path; no document is fabricated.
+    #[tokio::test]
+    async fn openai_docparse_surfaces_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/documents/parse");
+                then.status(500).body("boom");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = DocParseMetrics::default();
+        openai_docparse(
+            &client,
+            &server.base_url(),
+            "docling",
+            b"x",
+            "x.pdf",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.text.is_empty() && m.fields.is_empty() && m.tables.is_empty());
+        assert!(m.latency_ms >= 0);
+    }
+
+    // Hardening: an empty parse (no text, no fields, no tables) is a clean,
+    // non-silent error — never a fabricated empty document.
+    #[tokio::test]
+    async fn openai_docparse_empty_document_is_clean_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/documents/parse");
+                then.status(200).json_body(serde_json::json!({ "document": {} }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = DocParseMetrics::default();
+        openai_docparse(
+            &client,
+            &server.base_url(),
+            "docling",
+            b"x",
+            "x.pdf",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("no text, fields, or tables"));
+    }
+
+    // Hardening: a malformed (non-JSON) 200 body is rejected as a clean parse
+    // error via the bounded-read path — never a fabricated document.
+    #[tokio::test]
+    async fn openai_docparse_rejects_non_json_success() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/documents/parse");
+                then.status(200).body("<<<not json>>>");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = DocParseMetrics::default();
+        openai_docparse(
+            &client,
+            &server.base_url(),
+            "docling",
+            b"x",
+            "x.pdf",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
         assert!(m.error.as_deref().unwrap_or("").contains("parse error"));
     }
 }

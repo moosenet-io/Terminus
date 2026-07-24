@@ -493,6 +493,11 @@ pub fn default_suites_for(model_name: &str) -> Vec<String> {
         // SUITE-IMG: text-to-image models default to the image-generation suite
         // (the Ollama-based context/code/agent suites don't apply to them).
         vec!["image_generation"]
+    } else if n.contains("docling") || n.contains("docparse") || n.contains("ocr") {
+        // SUITE-DOC: a document-parse model (docling/OCR) is served through
+        // Chord's /v1/documents/parse, not an Ollama chat serve — its default
+        // is the document_parsing suite, not context/code.
+        vec!["document_parsing"]
     } else if is_embedding_model(&n) {
         // SUITE-EMB (TERM #508): an embedding model can't run the chat-shaped
         // context/code/agent suites — its default is the IR-retrieval suite.
@@ -627,7 +632,7 @@ impl RustTool for ModelIntake {
                 "model_name": { "type": "string", "description": "Ollama model name, e.g. 'gpt-oss:20b'" },
                 "suites": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing", "vision_qa", "reranking", "image_generation"] },
+                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing", "vision_qa", "reranking", "image_generation", "document_parsing"] },
                     "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other suites don't apply to it. 'tool_routing' profiles function-calling over Chord's OpenAI-compatible /v1/chat/completions (correct-tool@1, parameter validity, decoy rejection, multi-step) — a first-class generalization of the 'agent' suite's tool-selection path. 'vision_qa' profiles a vision/VLM model on image-QA via Chord's chat/vision route (accuracy, caption similarity, hallucination, latency, VRAM)."
                 },
                 "tiers": {
@@ -954,6 +959,28 @@ impl RustTool for ModelIntake {
                 out.push_str(&format!("  {line}\n"));
             }
             out.push('\n');
+        }
+
+        // SUITE-DOC: document_parsing runs through Chord `/v1/documents/parse`
+        // (docling), owns its own profile row, and reads its corpus from
+        // INTAKE_CORPUS_DIR — so it dispatches directly, independent of the
+        // Ollama-based context/code/agent suites above. A NotConfigured corpus
+        // is reported inline, not fatal to the rest of the run.
+        if suites.iter().any(|s| s == "document_parsing") {
+            out.push_str("=== Document-parsing suite ===\n");
+            match runner::run_document_parsing_suite(model_name).await {
+                Ok(res) => {
+                    out.push_str(&format!(
+                        "cases run: {}\navg field_accuracy: {:.2}\navg latency_ms: {:.0}\n",
+                        res.cases_run, res.avg_field_accuracy, res.avg_latency_ms,
+                    ));
+                    for line in &res.per_case {
+                        out.push_str(&format!("  {line}\n"));
+                    }
+                    out.push('\n');
+                }
+                Err(e) => out.push_str(&format!("skipped: {e}\n\n")),
+            }
         }
 
         out.push_str("Note: coherence_score stored as NULL (LLM-judge deferred).\n");
@@ -1501,6 +1528,9 @@ mod tests {
         // SUITE-IMG: text-to-image models route to the image-generation suite.
         assert_eq!(default_suites_for("sd-turbo"), vec!["image_generation"]);
         assert_eq!(default_suites_for("stable-diffusion-3.5"), vec!["image_generation"]);
+        // SUITE-DOC: document-parse models route to the document_parsing suite.
+        assert_eq!(default_suites_for("docling-v2"), vec!["document_parsing"]);
+        assert_eq!(default_suites_for("granite-docling-258m"), vec!["document_parsing"]);
     }
 
     #[test]
