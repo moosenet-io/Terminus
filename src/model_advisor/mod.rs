@@ -116,8 +116,20 @@ pub(crate) type MatrixMap = HashMap<String, MatrixEntry>;
 /// Load presets: from `MODEL_PRESETS_PATH` if set (empty map on read/parse
 /// failure), otherwise the bundled default.
 fn load_presets() -> PresetMap {
-    match env::var("MODEL_PRESETS_PATH").ok().filter(|s| !s.is_empty()) {
-        Some(path) => std::fs::read_to_string(&path)
+    load_presets_from(
+        env::var("MODEL_PRESETS_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .as_deref(),
+    )
+}
+
+/// Core of [`load_presets`] with the override path passed explicitly, so tests
+/// can exercise the read/parse-failure fallback without mutating the
+/// process-global `MODEL_PRESETS_PATH` env var (which races parallel tests).
+fn load_presets_from(path: Option<&str>) -> PresetMap {
+    match path {
+        Some(path) => std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_yaml::from_str(&s).ok())
             .unwrap_or_default(),
@@ -590,7 +602,6 @@ pub fn register(registry: &mut ToolRegistry) {
 mod tests {
     use super::*;
     use httpmock::prelude::*;
-    use serial_test::serial;
 
     // --- bundled data loads -----------------------------------------------
 
@@ -635,12 +646,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_missing_override_path_yields_empty_map() {
-        std::env::set_var("MODEL_PRESETS_PATH", "/nonexistent/does-not-exist.yaml");
-        let presets = load_presets();
+        // Exercised via the explicit-path core so no process-global env var is
+        // mutated (that raced parallel tests calling `load_presets`).
+        let presets = load_presets_from(Some("/nonexistent/does-not-exist.yaml"));
         assert!(presets.is_empty());
-        std::env::remove_var("MODEL_PRESETS_PATH");
     }
 
     // --- pick_preset_for_vram ------------------------------------------
