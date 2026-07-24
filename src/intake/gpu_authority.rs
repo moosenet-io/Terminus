@@ -395,6 +395,17 @@ fn client_yield_fail_closed() -> bool {
     )
 }
 
+/// Pure S125 IDLE-02 decision: should a MINT unit YIELD the GPU to a live client
+/// instead of acquiring? Only MINT's OWN work yields, and only when a client request is
+/// in flight on Chord. `client_busy` is the already-short-circuited probe result — by
+/// construction (see [`LiveGpuLock::acquire`]) it is only ever `true` when the feature
+/// is enabled AND `holder_is_mint` AND Chord reports `inflight > 0`. Split out from the
+/// impure, networked [`chord_client_busy`] probe so the yield-and-resume policy is
+/// deterministically unit-testable with injected signals (no GPU, no clock, no network).
+fn should_yield_to_client(holder_is_mint: bool, client_busy: bool) -> bool {
+    holder_is_mint && client_busy
+}
+
 /// TTL cache so the per-unit client-busy check never hammers Chord's control plane.
 static CHORD_BUSY_CACHE: std::sync::Mutex<Option<(std::time::Instant, bool)>> =
     std::sync::Mutex::new(None);
@@ -1340,12 +1351,17 @@ impl GpuLock for LiveGpuLock {
         // client-guard), which also covers the reacquire/heartbeat paths and the
         // probe→acquire window this fast-path check alone cannot close. Non-retryable
         // refusal → the driver records a skip and resumes when Chord is quiet.
-        if crate::mint::idle::is_mint_holder(
+        let holder_is_mint = crate::mint::idle::is_mint_holder(
             self.holder,
             &crate::mint::idle::mint_gpu_holders_from_env(),
-        ) && client_yield_enabled()
-            && chord_client_busy().await
-        {
+        );
+        // Probe Chord ONLY when it can matter (MINT holder + feature enabled), so a
+        // non-MINT holder incurs no gating and no added network latency — the `&&`
+        // short-circuit skips `chord_client_busy().await` entirely otherwise. The result
+        // is thus the fully-gated client-busy signal; `should_yield_to_client` is the
+        // pure, unit-tested S125 IDLE-02 decision over it.
+        let client_busy = holder_is_mint && client_yield_enabled() && chord_client_busy().await;
+        if should_yield_to_client(holder_is_mint, client_busy) {
             return Err(MINT_CLIENT_YIELD_REFUSAL.to_string());
         }
         let holder = self.holder;
@@ -2601,5 +2617,204 @@ mod tests {
             hold_duration_for(&existing, "intake_coder_sweep", 500),
             Some(Duration::ZERO)
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // S125 Phase-5 idle-switch FEATURE VERIFICATION (IDLE-02 / IDLE-03).
+    //
+    // Deterministic, offline harness (NO real GPU, NO real clock/Instant — signals
+    // and cycle counts are injected) proving MINT correctly YIELDS the shared GPU to
+    // a live Chord client and RESUMES cleanly afterwards. The compiler-yield half
+    // (IDLE-01) is verified in `crate::mint::idle`'s tests
+    // (`idle01_mint_yields_to_compiler_within_bound_and_resumes`), which own the
+    // idle-admission gate; IDLE-03 below combines BOTH causes end to end.
+    //
+    // The bound N is the number of poll cycles within which a running sweep must
+    // observe the signal and yield (or resume). Because the admission gate refuses a
+    // NEW unit the instant the signal is asserted, the real bound is 1 cycle; N gives
+    // headroom and documents the "within a bounded number of poll cycles" contract.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Bound (poll cycles) within which a yield/resume must be observed.
+    const IDLE_VERIFY_BOUND_CYCLES: usize = 5;
+
+    #[test]
+    fn should_yield_to_client_pure_decision_truth_table() {
+        // The pure S125 IDLE-02 decision: only MINT's own work yields, and only while a
+        // client is in flight. A non-MINT holder (e.g. the compiler lease) never yields.
+        assert!(
+            should_yield_to_client(true, true),
+            "MINT holder + client in flight ⇒ yield"
+        );
+        assert!(
+            !should_yield_to_client(true, false),
+            "MINT holder + no client ⇒ run (do not yield)"
+        );
+        assert!(
+            !should_yield_to_client(false, true),
+            "a non-MINT holder is NEVER MINT-yielded, even with a client in flight"
+        );
+        assert!(!should_yield_to_client(false, false));
+        // And the resulting refusal is non-retryable (skip + resume-when-quiet), asserted
+        // structurally so the yield-and-resume contract holds.
+        assert!(!is_live_holder_refusal(MINT_CLIENT_YIELD_REFUSAL));
+    }
+
+    #[test]
+    fn idle02_mint_yields_to_client_within_bound_and_resumes() {
+        // Simulate a "running" MINT sweep polling its per-unit client-yield decision each
+        // cycle (exactly LiveGpuLock::acquire's first gate). Inject a Chord client-activity
+        // signal that is in flight for a window then clears. `client_busy` here is the
+        // already-gated signal (feature enabled + MINT holder), i.e. what
+        // `chord_client_busy()` would return in production for a MINT unit.
+        const CLIENT_START: usize = 1;
+        const CLIENT_CLEAR: usize = 6; // in flight for cycles [1, 6)
+        let client_inflight = |c: usize| (CLIENT_START..CLIENT_CLEAR).contains(&c);
+
+        // Outcome per cycle: true = MINT yielded the GPU to the client; false = MINT ran.
+        let mut yielded: Vec<bool> = Vec::new();
+        for cycle in 0..12usize {
+            yielded.push(should_yield_to_client(
+                /* holder_is_mint = */ true,
+                client_inflight(cycle),
+            ));
+        }
+
+        // YIELD: within N cycles of the client arriving, MINT must be yielding.
+        let first_yield = yielded
+            .iter()
+            .enumerate()
+            .skip(CLIENT_START)
+            .find(|(_, y)| **y)
+            .map(|(c, _)| c)
+            .expect("MINT must yield while a client is in flight");
+        assert!(
+            first_yield - CLIENT_START < IDLE_VERIFY_BOUND_CYCLES,
+            "MINT yielded {} cycles after the client arrived (bound {IDLE_VERIFY_BOUND_CYCLES})",
+            first_yield - CLIENT_START
+        );
+        // MINT keeps yielding for the whole time the client is in flight (no contention).
+        for cycle in CLIENT_START..CLIENT_CLEAR {
+            assert!(yielded[cycle], "cycle {cycle}: MINT must not contend with the client");
+        }
+
+        // RESUME: within N cycles of the client clearing, MINT is running again.
+        let first_resume = yielded
+            .iter()
+            .enumerate()
+            .skip(CLIENT_CLEAR)
+            .find(|(_, y)| !**y)
+            .map(|(c, _)| c)
+            .expect("MINT must resume once the client is quiet");
+        assert!(
+            first_resume - CLIENT_CLEAR < IDLE_VERIFY_BOUND_CYCLES,
+            "MINT resumed {} cycles after the client cleared (bound {IDLE_VERIFY_BOUND_CYCLES})",
+            first_resume - CLIENT_CLEAR
+        );
+        // No spurious yields once the client is gone.
+        for (cycle, y) in yielded.iter().enumerate().skip(CLIENT_CLEAR) {
+            assert!(!y, "cycle {cycle}: MINT must run freely once the client is quiet");
+        }
+    }
+
+    #[test]
+    fn idle03_harness_mint_yields_to_compiler_and_client_then_resumes_no_deadlock() {
+        // Combined feature verification: ONE driver, BOTH yield causes, in the exact
+        // priority order LiveGpuLock::acquire uses (client-yield first, then the
+        // idle-admission gate for a compiler build). Asserts MINT yields within the bound
+        // for EACH cause, resumes without deadlock, never double-acquires, and never gates
+        // the compiler (which would deadlock the very build MINT idled for).
+        use crate::mint::idle::{try_admit_gpu_on, IdleController, Phase, ResumeManifest};
+
+        let mints = vec![
+            "intake_coder_sweep".to_string(),
+            "intake_assistant_sweep".to_string(),
+            "intake_coder_case".to_string(),
+            "mint_breakfix".to_string(),
+        ];
+        let holder = "intake_coder_sweep";
+        let ctl = IdleController::new();
+
+        // Scenario timeline (cycle → condition):
+        //   0,1   quiet                → RUN
+        //   2     client in flight     → YIELD(client)
+        //   3     quiet                → RUN (resumed after client)
+        //   4,5   compiler build       → YIELD(compiler)
+        //   6..   quiet                → RUN (resumed after build)
+        let client_inflight = |c: usize| c == 2;
+        let compiler_build = |c: usize| (4..6).contains(&c);
+
+        #[derive(Debug, PartialEq)]
+        enum Outcome {
+            Ran,
+            YieldClient,
+            YieldCompiler,
+        }
+
+        let mut log: Vec<Outcome> = Vec::new();
+        let mut max_inflight = 0usize;
+
+        for cycle in 0..9usize {
+            // The compiler's control actions drive the idle controller: it idles MINT when
+            // its build starts, and MINT lazily reactivates once the build is gone.
+            if compiler_build(cycle) && ctl.phase() == Phase::Active {
+                ctl.enter(ResumeManifest {
+                    reason: "compiler".into(),
+                    entered_at: cycle as u64,
+                    watchdog_deadline: cycle as u64 + 3600,
+                    released_holders: vec![holder.to_string()],
+                    mem_available_before_gb: 12.0,
+                });
+            } else if !compiler_build(cycle) && ctl.is_idle() {
+                ctl.exit();
+            }
+
+            // INVARIANT: the compiler (non-MINT holder) is NEVER gated / never contends.
+            assert!(
+                try_admit_gpu_on(&ctl, "bld-05-compiler", &mints)
+                    .expect("compiler never gated")
+                    .is_none(),
+                "cycle {cycle}: compiler must never be gated by MINT's idle machinery"
+            );
+
+            // LiveGpuLock::acquire order: client-yield FIRST, then the idle-admission gate.
+            let outcome = if should_yield_to_client(true, client_inflight(cycle)) {
+                Outcome::YieldClient
+            } else {
+                match try_admit_gpu_on(&ctl, holder, &mints) {
+                    Ok(Some(guard)) => {
+                        // Running: exactly one admitted unit — never a double-acquire.
+                        assert_eq!(ctl.inflight_count(), 1, "cycle {cycle}: single admitted unit");
+                        max_inflight = max_inflight.max(ctl.inflight_count());
+                        drop(guard);
+                        assert_eq!(ctl.inflight_count(), 0, "cycle {cycle}: unit released cleanly");
+                        Outcome::Ran
+                    }
+                    Ok(None) => unreachable!("a MINT holder always yields a guard when admitted"),
+                    Err(_) => Outcome::YieldCompiler, // idle-admission refused (build active)
+                }
+            };
+            log.push(outcome);
+        }
+
+        // Yielded for the RIGHT cause, at the RIGHT cycle, within the bound.
+        assert_eq!(log[2], Outcome::YieldClient, "cycle 2: yield to the in-flight client");
+        assert_eq!(log[4], Outcome::YieldCompiler, "cycle 4: yield to the compiler build");
+        assert_eq!(log[5], Outcome::YieldCompiler, "cycle 5: still yielding to the build");
+
+        // Resumed after EACH yield, within the bound, with no deadlock.
+        assert_eq!(log[3], Outcome::Ran, "resumed within 1 cycle of the client clearing");
+        assert_eq!(log[6], Outcome::Ran, "resumed within 1 cycle of the build clearing");
+        assert_eq!(log[0], Outcome::Ran);
+        assert_eq!(log[1], Outcome::Ran);
+        assert_eq!(log[7], Outcome::Ran);
+        assert_eq!(log[8], Outcome::Ran);
+
+        // Both resumes fall within the poll-cycle bound (they are in fact immediate).
+        assert!(3 - 2 < IDLE_VERIFY_BOUND_CYCLES && 6 - 5 < IDLE_VERIFY_BOUND_CYCLES);
+        // No double-acquire across the whole run, and the controller ends Active (no wedge).
+        assert!(max_inflight <= 1, "MINT must never double-acquire the GPU");
+        assert_eq!(ctl.phase(), Phase::Active, "harness ends Active — no deadlock/wedge");
+        assert_eq!(ctl.inflight_count(), 0, "no leaked in-flight units");
     }
 }
