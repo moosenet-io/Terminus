@@ -87,6 +87,126 @@ fn tier_timeout() -> Duration {
 }
 
 // ---------------------------------------------------------------------------
+// FIX2 (S125): bound the context sweep for large models
+// ---------------------------------------------------------------------------
+//
+// A very large model (e.g. 120b) cannot serve the huge context tiers (32k+) on
+// this fleet's VRAM, so before these two changes the sweep would attempt every
+// tier up to 128k and burn a FULL `INTAKE_TIER_TIMEOUT_SEC` (~10 min) timing out
+// on each — ~80 min/model of pure waste. Two pure, testable levers bound it:
+//   1. `max_ctx_tier_for` caps the ladder by parameter scale (parsed from the
+//      model name's trailing `<N>b`) so guaranteed-infeasible tiers are never
+//      even attempted.
+//   2. `tier_hit_ceiling` stops escalation the moment a tier OOMs, times out, or
+//      otherwise fails — a larger tier can only be heavier, so there is no point
+//      attempting it (this bounds a big model to ~one timeout, not one per tier).
+
+/// FIX2 (S125): parse a model's parameter scale in BILLIONS from a trailing
+/// `<N>b` token in its name (`gpt-oss:120b` → 120, `qwen3-coder:30b` → 30,
+/// `llama3:8b` → 8, `gemma2:2.6b` → 2 (fractional rounds down)). Takes the LAST
+/// `<number>b` token at a name boundary (the `b` not followed by another
+/// alphanumeric), so `qwen2.5-coder:32b` → 32 (not 2), and a `2.5` version tag
+/// not followed by `b` is ignored. Returns `None` when no `<N>b` token exists.
+/// Pure.
+pub fn parse_param_scale_b(model_name: &str) -> Option<u32> {
+    let n = model_name.to_ascii_lowercase();
+    let bytes = n.as_bytes();
+    let mut best: Option<u32> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            let mut seen_dot = false;
+            let mut j = i;
+            while j < bytes.len()
+                && (bytes[j].is_ascii_digit() || (bytes[j] == b'.' && !seen_dot))
+            {
+                if bytes[j] == b'.' {
+                    seen_dot = true;
+                }
+                j += 1;
+            }
+            // Require a trailing 'b' immediately after the number, at a name
+            // boundary (end, or a non-alphanumeric like '-', ':', '_').
+            if j < bytes.len() && bytes[j] == b'b' {
+                let after = j + 1;
+                let boundary = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+                if boundary {
+                    if let Ok(v) = n[start..j].parse::<f64>() {
+                        best = Some(v as u32); // trailing token wins (overwrite)
+                    }
+                }
+            }
+            i = j.max(start + 1);
+        } else {
+            i += 1;
+        }
+    }
+    best
+}
+
+/// FIX2 (S125): the max context tier for a given parameter scale (billions).
+/// Pure — the env override is applied separately in [`max_ctx_tier_for`] so this
+/// mapping stays deterministically testable:
+///   >=100b → 16000, >=30b → 32000, >=13b → 64000, else FULL (128000).
+/// `None` (no parseable size) is assumed small → FULL ladder.
+pub fn cap_from_scale(scale_b: Option<u32>) -> usize {
+    let full = *FULL_TIERS.last().expect("FULL_TIERS is non-empty");
+    match scale_b {
+        Some(b) if b >= 100 => 16000,
+        Some(b) if b >= 30 => 32000,
+        Some(b) if b >= 13 => 64000,
+        _ => full,
+    }
+}
+
+/// FIX2 (S125): the largest context tier worth attempting for `model_name`. A
+/// global override (`INTAKE_MAX_CTX_TIER`) forces a ceiling for every model;
+/// otherwise the cap is derived from the model's parsed parameter scale via
+/// [`cap_from_scale`].
+pub fn max_ctx_tier_for(model_name: &str) -> usize {
+    if let Some(cap) = std::env::var("INTAKE_MAX_CTX_TIER")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        return cap;
+    }
+    cap_from_scale(parse_param_scale_b(model_name))
+}
+
+/// FIX2 (S125): apply a max-tier `cap` to a tier ladder, keeping only tiers
+/// `<= cap`. If the cap would exclude EVERY tier, the single smallest tier is
+/// retained so a model always gets at least one measurement. Pure.
+pub fn cap_tiers(tiers: &[usize], cap: usize) -> Vec<usize> {
+    let mut kept: Vec<usize> = tiers.iter().copied().filter(|t| *t <= cap).collect();
+    if kept.is_empty() {
+        if let Some(min) = tiers.iter().copied().min() {
+            kept.push(min);
+        }
+    }
+    kept
+}
+
+/// FIX2 (S125): whether a tier result is this model's feasible-context CEILING —
+/// an OOM or a genuine TIMEOUT (the per-tier deadline elapsed) — after which the
+/// runner records the ceiling and STOPS escalating to larger tiers. A larger
+/// context can only be heavier, so a real capacity limit at this tier means the
+/// next tier is hopeless too; stopping bounds a big model to ~one timeout rather
+/// than one per tier.
+///
+/// Deliberately NARROW (codex re-review): a transient connect/body/parse error
+/// is NOT a ceiling — it does not prove a larger context is infeasible, so a
+/// one-off network blip on (say) the 8k tier must not wrongly cap the model at
+/// 8k. Such a tier is still RECORDED as a failure, but escalation CONTINUES to
+/// the next tier. A timeout surfaces as `error = Some("... timed out ...")` with
+/// `oom = false`, matched by [`context::is_timeout_error`]; an OOM/overload (incl.
+/// HTTP 500/503) is already flagged `oom = true` by `run_tier`. Pure.
+fn tier_hit_ceiling(oom: bool, error: Option<&str>) -> bool {
+    oom || error.map(context::is_timeout_error).unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
 // Ollama /api/ps — currently-hot model + VRAM
 // ---------------------------------------------------------------------------
 
@@ -375,6 +495,15 @@ pub async fn run_context_suite(
         storage::insert_model_profile(&pool, model_name, "ollama", None, vram_gb).await?;
 
     let timeout = tier_timeout();
+
+    // FIX2 (S125): cap the tier ladder by model size so guaranteed-infeasible
+    // huge tiers on a big model aren't even attempted (a 120b model otherwise
+    // burns a full ~10-min timeout on each of 32k..128k). A global override
+    // (`INTAKE_MAX_CTX_TIER`) can force a ceiling for any model.
+    let tier_cap = max_ctx_tier_for(model_name);
+    let capped_tiers = cap_tiers(tiers, tier_cap);
+    let tiers: &[usize] = &capped_tiers;
+
     let mut summaries: Vec<TierSummary> = Vec::new();
     let mut stopped_on_oom = false;
     let mut tiers_run = 0usize;
@@ -443,7 +572,13 @@ pub async fn run_context_suite(
             oom: tr.oom,
         });
 
-        if tr.oom {
+        // FIX2 (S125): stop escalating once this tier is the feasible ceiling —
+        // an OOM, a TIMEOUT, or any hard failure. Previously only `oom` stopped
+        // the loop, so a large model would time out on EVERY larger tier; a
+        // timeout has `oom = false` but `error = Some(...)`, so we now key off
+        // the broader ceiling predicate. (`stopped_on_oom` doubles as the
+        // "stopped early" flag for the report.)
+        if tier_hit_ceiling(tr.oom, tr.error.as_deref()) {
             stopped_on_oom = true;
             break;
         }
@@ -1954,6 +2089,147 @@ mod tests {
         assert_eq!(FULL_TIERS.len(), 9);
         assert_eq!(FULL_TIERS[0], 2000);
         assert_eq!(FULL_TIERS[8], 128000);
+    }
+
+    // ---- FIX2 (S125): size-based tier cap + stop-on-timeout ------------
+
+    /// Parameter-scale parsing pulls the trailing `<N>b` token (fractional
+    /// rounds down), ignores a version tag not followed by `b`, and returns
+    /// None when there is no `<N>b` token.
+    #[test]
+    fn parse_param_scale_from_name() {
+        assert_eq!(parse_param_scale_b("gpt-oss:120b"), Some(120));
+        assert_eq!(parse_param_scale_b("qwen3-coder:30b"), Some(30));
+        assert_eq!(parse_param_scale_b("deepseek-r1:14b"), Some(14));
+        assert_eq!(parse_param_scale_b("llama3:8b"), Some(8));
+        assert_eq!(parse_param_scale_b("gemma2:2.6b"), Some(2)); // rounds down
+        // A `2.5` version tag NOT followed by `b` must be ignored; the real
+        // `32b` size wins.
+        assert_eq!(parse_param_scale_b("qwen2.5-coder:32b"), Some(32));
+        // No `<N>b` token at all.
+        assert_eq!(parse_param_scale_b("nomic-embed-text:latest"), None);
+        assert_eq!(parse_param_scale_b("sd-turbo"), None);
+    }
+
+    /// The size→cap mapping: a 120b model is capped at 16k (32k+ excluded);
+    /// a mid model at 32k/64k; a small/unknown model keeps the FULL ladder.
+    #[test]
+    fn cap_from_scale_mapping() {
+        assert_eq!(cap_from_scale(Some(120)), 16000);
+        assert_eq!(cap_from_scale(Some(100)), 16000);
+        assert_eq!(cap_from_scale(Some(70)), 32000);
+        assert_eq!(cap_from_scale(Some(30)), 32000);
+        assert_eq!(cap_from_scale(Some(14)), 64000);
+        assert_eq!(cap_from_scale(Some(13)), 64000);
+        assert_eq!(cap_from_scale(Some(8)), 128000);
+        assert_eq!(cap_from_scale(Some(7)), 128000);
+        assert_eq!(cap_from_scale(None), 128000);
+    }
+
+    /// A "120b"-named model's capped tier ladder excludes 32k and above.
+    #[test]
+    fn tier_cap_for_120b_excludes_32k_plus() {
+        let cap = cap_from_scale(parse_param_scale_b("gpt-oss:120b"));
+        let tiers = cap_tiers(&FULL_TIERS, cap);
+        assert_eq!(tiers, vec![2000, 4000, 8000, 16000]);
+        assert!(!tiers.iter().any(|&t| t >= 32000));
+    }
+
+    /// A small model keeps the FULL ladder unchanged.
+    #[test]
+    fn tier_cap_for_small_model_keeps_full() {
+        let cap = cap_from_scale(parse_param_scale_b("llama3:8b"));
+        let tiers = cap_tiers(&FULL_TIERS, cap);
+        assert_eq!(tiers, FULL_TIERS.to_vec());
+    }
+
+    /// The cap always leaves at least one (the smallest) tier, even when the
+    /// cap is below every tier.
+    #[test]
+    fn tier_cap_never_empties() {
+        let tiers = cap_tiers(&FULL_TIERS, 1);
+        assert_eq!(tiers, vec![2000]);
+    }
+
+    /// The escalation stop predicate fires ONLY on a genuine capacity limit —
+    /// OOM or a TIMEOUT — never on a clean tier or a transient connect/body/parse
+    /// error (those must not wrongly cap the model at that tier).
+    #[test]
+    fn tier_ceiling_stops_on_oom_and_timeout_only() {
+        // Clean tier: keep escalating.
+        assert!(!tier_hit_ceiling(false, None));
+        // OOM tier (a real capacity limit, incl. HTTP 500/503 which run_tier
+        // flags oom=true): stop.
+        assert!(tier_hit_ceiling(true, None));
+        // Genuine TIMEOUT (oom=false), exactly as run_tier records it: stop.
+        assert!(tier_hit_ceiling(
+            false,
+            Some("run_tier: inference request failed (timed out); is_timeout=true is_connect=false is_body=false")
+        ));
+        // Transient CONNECT error: NOT a ceiling -> keep escalating.
+        assert!(!tier_hit_ceiling(
+            false,
+            Some("run_tier: inference request failed (connection refused); is_timeout=false is_connect=true is_body=false")
+        ));
+        // Transient BODY/parse error: NOT a ceiling either.
+        assert!(!tier_hit_ceiling(false, Some("response parse error: expected value")));
+    }
+
+    /// Simulate the escalation loop over a sequence of tier outcomes: it must
+    /// STOP at the first ceiling tier (here a timeout at 32k) and never attempt
+    /// 48k/64k/... — bounding a big model to ~one timeout.
+    #[test]
+    fn escalation_stops_after_timeout_tier() {
+        // (oom, error) per tier, mirroring TierResult's fields.
+        let outcomes: Vec<(usize, bool, Option<&str>)> = vec![
+            (2000, false, None),
+            (4000, false, None),
+            (8000, false, None),
+            (16000, false, None),
+            (32000, false, Some("... timed out ...")), // ceiling
+            (48000, false, None),                       // must NOT be reached
+            (64000, false, None),                       // must NOT be reached
+        ];
+        let mut attempted = Vec::new();
+        for (tier, oom, err) in &outcomes {
+            attempted.push(*tier);
+            if tier_hit_ceiling(*oom, *err) {
+                break;
+            }
+        }
+        assert_eq!(attempted, vec![2000, 4000, 8000, 16000, 32000]);
+        assert!(!attempted.iter().any(|&t| t >= 48000));
+    }
+
+    /// A TRANSIENT connect error mid-ladder must NOT halt escalation: the loop
+    /// records that tier's failure and keeps going, stopping only at the later
+    /// genuine timeout. (Guards the codex re-review fix — an 8k network blip must
+    /// not cap the model at 8k.)
+    #[test]
+    fn escalation_continues_past_transient_connect_error() {
+        let outcomes: Vec<(usize, bool, Option<&str>)> = vec![
+            (2000, false, None),
+            // Transient connect blip: recorded, but NOT a ceiling.
+            (
+                8000,
+                false,
+                Some("inference request failed (connection refused); is_timeout=false is_connect=true"),
+            ),
+            (16000, false, None),
+            (32000, false, Some("... timed out ...")), // real ceiling
+            (48000, false, None),                       // must NOT be reached
+        ];
+        let mut attempted = Vec::new();
+        for (tier, oom, err) in &outcomes {
+            attempted.push(*tier);
+            if tier_hit_ceiling(*oom, *err) {
+                break;
+            }
+        }
+        // The 8k connect blip did NOT halt; escalation continued and stopped only
+        // at the 32k timeout.
+        assert_eq!(attempted, vec![2000, 8000, 16000, 32000]);
+        assert!(!attempted.iter().any(|&t| t >= 48000));
     }
 
     // BT-03 (TASK #15): the fleet warm gate is backend-aware — only ollama-kind
