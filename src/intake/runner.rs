@@ -157,7 +157,7 @@ async fn load_model(client: &reqwest::Client, model: &str) -> Result<(), ToolErr
     // is brought up by `lifecycle::ensure_up` in `infer_with_metrics`, so there is no
     // separate pre-warm to do here — skip it rather than POST an ollama route at a
     // non-ollama URL. Uses the registry-resolved base, not the hardcoded loopback.
-    let backend = infer::resolve_backend(model);
+    let backend = crate::intake::infer::resolve_backend(model);
     if backend.kind != "ollama" {
         return Ok(());
     }
