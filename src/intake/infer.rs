@@ -984,7 +984,7 @@ async fn openai_rerank(
 /// `error` is set and `success` is false — callers never panic.
 #[derive(Debug, Clone, Default)]
 pub struct ImageGenMetrics {
-    /// Whether a non-empty image was returned (`data[0].b64_json`/`url`).
+    /// Whether a non-empty image was returned (Chord's `image_base64`).
     pub success: bool,
     /// Wall-clock synthesis time, ms. Recorded on EVERY exit once the round-trip
     /// starts (transport error included — a timeout is real elapsed time).
@@ -1080,22 +1080,25 @@ pub async fn imagegen_with_metrics(
 /// diffusers serve, or any compatible server. `time_to_image_ms` is measured LOCALLY
 /// (wall clock) and is recorded on EVERY exit path (transport error included);
 /// `auth` is an optional bearer token resolved from the backend's `api_key_env` —
-/// never logged. Success is decided by a non-empty `data[0].b64_json` OR `data[0].url`;
-/// the image bytes themselves are NOT retained. Body reads are bounded (32 MiB cap,
-/// [`read_body_capped`]) — a server can stream an unbounded body. A missing/empty image
-/// (some servers 200 with an empty `data` array) is a clean, non-silent error so the
+/// never logged. Success is decided by a non-empty `image_base64` (Chord's response
+/// field); the image bytes themselves are NOT retained. Body reads are bounded (32 MiB
+/// cap, [`read_body_capped`]) — a server can stream an unbounded body. A missing/empty
+/// image (some servers 200 with an empty `image_base64`) is a clean, non-silent error so the
 /// runner records a failed generation rather than crashing. Never panics — every failure
 /// lands in `m.error`, and `success` is never fabricated true.
 async fn openai_imagegen(
     client: &reqwest::Client,
     base: &str,
-    model: &str,
+    _model: &str,
     prompt: &str,
     timeout: Duration,
     auth: Option<&str>,
     m: &mut ImageGenMetrics,
 ) {
-    let body = serde_json::json!({ "model": model, "prompt": prompt, "n": 1 });
+    // Chord `/v1/images/generations` contract: `{prompt, steps?, width?, height?}`
+    // (NO `model`/`n` — those 400 the proxy validator). The optional steps/width/
+    // height are left to the serve's defaults here (the probe doesn't tune them).
+    let body = serde_json::json!({ "prompt": prompt });
     let started = std::time::Instant::now();
     let mut req = client
         .post(format!("{}/v1/images/generations", base.trim_end_matches('/')))
@@ -1150,20 +1153,18 @@ async fn openai_imagegen(
         m.time_to_image_ms = started.elapsed().as_millis() as i64;
         return;
     }
-    // OpenAI images schema: { "data": [ { "b64_json": "..."} | { "url": "..." } ] }.
+    // Chord `/v1/images/generations` response schema (sd-turbo diffusers serve,
+    // verified live): `{ "image_base64": "<b64 png>", "model": ..., "time_ms": ... }`.
+    // Success = a non-empty `image_base64` (the OpenAI `data[0].b64_json`/`url`
+    // envelope is NOT what Chord returns). The image bytes are not retained.
     let image = v
-        .pointer("/data/0/b64_json")
+        .pointer("/image_base64")
         .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            v.pointer("/data/0/url")
-                .and_then(|x| x.as_str())
-                .filter(|s| !s.is_empty())
-        });
+        .filter(|s| !s.is_empty());
     match image {
         Some(_) => m.success = true,
         None => {
-            m.error = Some("image generation returned no image (empty data)".to_string());
+            m.error = Some("image generation returned no image (empty image_base64)".to_string());
         }
     }
     // Recompute AFTER the body read + parse + success check so the recorded time
@@ -1301,18 +1302,19 @@ pub async fn docparse_with_metrics(
 async fn openai_docparse(
     client: &reqwest::Client,
     base: &str,
-    model: &str,
+    _model: &str,
     document: &[u8],
-    filename: &str,
+    _filename: &str,
     timeout: Duration,
     auth: Option<&str>,
     m: &mut DocParseMetrics,
 ) {
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    // Chord `/v1/documents/parse` contract: `{document_base64, mode?}` (the field
+    // is `document_base64`, NOT `document` — the old key 400'd "missing field
+    // document_base64"). `mode` is left to the serve default (docling).
     let body = serde_json::json!({
-        "model": model,
-        "filename": filename,
-        "document": B64.encode(document),
+        "document_base64": B64.encode(document),
     });
     let started = std::time::Instant::now();
     let mut req = client
@@ -1440,6 +1442,9 @@ async fn openai_docparse(
 // ── SUITE-STT: OpenAI-compatible audio transcription (speech-to-text) ──
 
 /// True when `needle` occurs as a contiguous byte subslice of `haystack`. Pure.
+/// Retained for [`build_transcription_multipart`]'s security hardening (now
+/// exercised only by its unit tests — the live wire path is JSON, not multipart).
+#[allow(dead_code)]
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || needle.len() > haystack.len() {
         return false;
@@ -1465,7 +1470,10 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 ///      request-build error) rather than silently sending a corrupted request. A
 ///      long, fixed token makes this essentially never fire for real audio.
 ///
-/// Pure and unit-testable (no network).
+/// Pure and unit-testable (no network). Retained for its security-hardening unit
+/// tests only — the live transcription wire path is JSON (`audio_base64`), so this
+/// hand-rolled multipart builder is no longer on the request path.
+#[allow(dead_code)]
 fn build_transcription_multipart(
     boundary: &str,
     model: &str,
@@ -1612,11 +1620,10 @@ pub async fn transcribe_with_metrics(
 /// profiles any backend speaking the OpenAI transcription wire protocol — Chord's
 /// proxy in front of faster-whisper, or any OpenAI-compatible ASR serve.
 ///
-/// The request is `multipart/form-data` (the OpenAI audio API's required shape:
-/// a `file` part plus a `model` field). The multipart body is assembled BY HAND
-/// so no extra reqwest feature is pulled in — the `file` payload is the raw
-/// audio bytes with a `filename` and an `audio/wav` content-type. Latency is
-/// measured LOCALLY (wall clock) and recorded on EVERY exit path; body reads are
+/// The request is a JSON body `{audio_base64, language?}` (Chord's contract — the
+/// OpenAI multipart shape 400'd the proxy validator). The audio bytes are
+/// base64-encoded; `language` is omitted so the whisper serve auto-detects. Latency
+/// is measured LOCALLY (wall clock) and recorded on EVERY exit path; body reads are
 /// bounded (32 MiB cap, [`read_body_capped`]); `auth` is an optional bearer token
 /// resolved from the backend's `api_key_env` — never logged. The transcript is
 /// taken from the response `text` field; a missing/empty transcript is a clean,
@@ -1626,34 +1633,25 @@ pub async fn transcribe_with_metrics(
 async fn openai_transcribe(
     client: &reqwest::Client,
     base: &str,
-    model: &str,
+    _model: &str,
     audio_bytes: &[u8],
-    filename: &str,
+    _filename: &str,
     timeout: Duration,
     auth: Option<&str>,
     m: &mut TranscribeMetrics,
 ) {
-    // A fixed, long, collision-unlikely multipart boundary. It is verified NOT to
-    // appear in the audio payload (see `build_transcription_multipart`) so binary
-    // audio can never corrupt the multipart framing.
-    const BOUNDARY: &str = "----terminus-mint-stt-boundary-7f3a9c1e5b";
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    // Chord `/v1/audio/transcriptions` contract: a JSON body `{audio_base64,
+    // language?}` (NOT OpenAI multipart — that 400'd "invalid transcription
+    // request body"). The audio bytes are base64-encoded; `language` is left to
+    // the whisper serve's auto-detect (omitted). Multipart framing is dropped
+    // from the wire path entirely (`build_transcription_multipart` is retained
+    // only for its unit-tested security hardening).
     let started = std::time::Instant::now();
-    let body = match build_transcription_multipart(BOUNDARY, model, filename, audio_bytes) {
-        Ok(b) => b,
-        Err(e) => {
-            // Pre-flight framing/sanitization failure — no request was sent.
-            m.error = Some(format!("openai transcription request build error: {e}"));
-            m.latency_ms = started.elapsed().as_millis() as i64;
-            return;
-        }
-    };
+    let body = serde_json::json!({ "audio_base64": B64.encode(audio_bytes) });
     let mut req = client
         .post(format!("{}/v1/audio/transcriptions", base.trim_end_matches('/')))
-        .header(
-            "content-type",
-            format!("multipart/form-data; boundary={BOUNDARY}"),
-        )
-        .body(body)
+        .json(&body)
         .timeout(timeout);
     if let Some(t) = auth {
         req = req.header("authorization", format!("Bearer {t}"));
@@ -1710,7 +1708,7 @@ async fn openai_transcribe(
 
 // ── S125 SUITE-TTS: text-to-speech (`/v1/audio/speech`) + STT-loopback ────────
 // The STT-loopback reuses the SHARED `transcribe_with_metrics` / `openai_transcribe`
-// (proper hand-rolled multipart) defined above for SUITE-STT — SUITE-TTS does NOT
+// (JSON `audio_base64` wire path) defined above for SUITE-STT — SUITE-TTS does NOT
 // carry its own duplicate transcription arm (deduped at integration, S125 batch-2).
 
 /// Normalized result of one text-to-speech synthesis request (S125 SUITE-TTS).
@@ -1803,30 +1801,32 @@ pub async fn synthesize_with_metrics(
 }
 
 /// OpenAI-compatible text-to-speech (`POST {base}/v1/audio/speech`). The speech
-/// twin of [`openai_embed`]/[`openai_infer`]: builds a `{model, input, voice,
-/// response_format}` body, POSTs it, measures LOCAL wall-clock latency (recorded
-/// on EVERY exit path), and RECEIVES AUDIO BYTES (not JSON) on success.
-/// `response_format` is requested as `wav` so the SUITE-TTS scorer can derive
-/// duration/RMS from a PCM header; the body read is bounded (32 MiB cap,
-/// [`read_body_capped`]); `auth` is an optional bearer token resolved from the
-/// backend's `api_key_env` — never logged. An empty body is a clean, non-silent
-/// error (skip, not crash). Never panics — every failure lands in `m.error`,
-/// audio is never fabricated.
+/// twin of [`openai_embed`]/[`openai_infer`]: builds a `{text, voice}` body (Chord's
+/// contract — the field is `text`, not the OpenAI `input`), POSTs it, measures LOCAL
+/// wall-clock latency (recorded on EVERY exit path), and parses a JSON envelope
+/// `{audio_base64, sample_rate, model}` on success, base64-decoding `audio_base64`
+/// into the WAV bytes the SUITE-TTS scorer / STT loopback consume. The body read is
+/// bounded (32 MiB cap, [`read_body_capped`]); `auth` is an optional bearer token
+/// resolved from the backend's `api_key_env` — never logged. A missing/empty
+/// `audio_base64` (or a decode failure) is a clean, non-silent error (skip, not
+/// crash). Never panics — every failure lands in `m.error`, audio is never fabricated.
 async fn openai_speech(
     client: &reqwest::Client,
     base: &str,
-    model: &str,
+    _model: &str,
     input: &str,
     voice: &str,
     timeout: Duration,
     auth: Option<&str>,
     m: &mut SpeechMetrics,
 ) {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    // Chord `/v1/audio/speech` contract: `{text, voice?}` (the field is `text`,
+    // NOT the OpenAI `input` — that 400'd "missing field text"). `model`/
+    // `response_format` are dropped (not part of the contract).
     let body = serde_json::json!({
-        "model": model,
-        "input": input,
+        "text": input,
         "voice": voice,
-        "response_format": "wav",
     });
     let started = std::time::Instant::now();
     let mut req = client
@@ -1853,13 +1853,11 @@ async fn openai_speech(
         m.latency_ms = started.elapsed().as_millis() as i64;
         return;
     }
-    // Capture the MIME before consuming the body.
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    // Bounded body read (DoS) — never read an uncapped audio body into memory.
+    // Bounded body read (DoS) — never read an uncapped body into memory. Chord's
+    // `/v1/audio/speech` (piper serve, verified live) returns a JSON envelope
+    // `{ "audio_base64": "<b64 wav>", "sample_rate": ..., "model": ... }`, NOT raw
+    // audio bytes — so parse the JSON and base64-decode `audio_base64` into the WAV
+    // bytes the STT loopback (speak → transcribe → WER) re-feeds to the ASR path.
     let bytes = match read_body_capped(resp, MAX_RESPONSE_BYTES).await {
         Ok(b) => b,
         Err(e) => {
@@ -1868,13 +1866,46 @@ async fn openai_speech(
             return;
         }
     };
-    if bytes.is_empty() {
-        m.error = Some("openai speech endpoint returned an empty audio body".to_string());
+    let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("openai speech response parse error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    // Some OpenAI-compatible servers 200 with an `{"error": {...}}` body.
+    if let Some(err) = v.pointer("/error/message").and_then(|e| e.as_str()) {
+        m.error = Some(err.to_string());
         m.latency_ms = started.elapsed().as_millis() as i64;
         return;
     }
-    m.audio = bytes;
-    m.content_type = content_type;
+    let Some(b64) = v
+        .pointer("/audio_base64")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        m.error = Some("openai speech endpoint returned no audio_base64".to_string());
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    };
+    let audio = match B64.decode(b64) {
+        Ok(a) if !a.is_empty() => a,
+        Ok(_) => {
+            m.error = Some("openai speech endpoint returned an empty audio body".to_string());
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+        Err(e) => {
+            m.error = Some(format!("openai speech audio_base64 decode error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    m.audio = audio;
+    // The decoded payload is WAV (piper `response_format` is WAV); the JSON
+    // envelope carries no per-part MIME, so record the known audio type.
+    m.content_type = Some("audio/wav".to_string());
     m.latency_ms = started.elapsed().as_millis() as i64;
 }
 
@@ -2426,6 +2457,7 @@ struct LlamaTimings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
     use std::io::Write;
 
@@ -3491,19 +3523,21 @@ mod tests {
         assert!(err.contains("cap"), "expected a cap error, got: {err}");
     }
 
-    // SUITE-IMG (S125): OpenAI-compatible image-generation arm parses
-    // `data[0].b64_json`, marks success, records a wall-clock time, and leaves
-    // `error` unset. Mirrors `openai_embed_parses_data_embedding`.
+    // SUITE-IMG (S125): the image-generation arm parses Chord's `image_base64`
+    // response, marks success, records a wall-clock time, and leaves `error` unset.
+    // Also LOCKS the request contract: body is exactly `{prompt}` (no `model`/`n`).
     #[tokio::test]
     async fn openai_imagegen_parses_b64_image_and_success() {
         let server = httpmock::MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
                 when.method(httpmock::Method::POST)
-                    .path("/v1/images/generations");
+                    .path("/v1/images/generations")
+                    .json_body(serde_json::json!({ "prompt": "a red cube on a white table" }));
                 then.status(200).json_body(serde_json::json!({
-                    "created": 1,
-                    "data": [{ "b64_json": "aGVsbG8=" }]
+                    "image_base64": "aGVsbG8=",
+                    "model": "stabilityai/sd-turbo",
+                    "time_ms": 42
                 }));
             })
             .await;
@@ -3525,9 +3559,11 @@ mod tests {
         assert!(m.time_to_image_ms >= 0);
     }
 
-    // A `url`-form image also counts as success (some servers return a URL).
+    // Contract lock: the OLD OpenAI envelope (`data[0].b64_json`/`url`) is NOT what
+    // Chord returns — a response carrying only that shape yields a clean error, never
+    // a fabricated success, because the arm parses `image_base64` exclusively.
     #[tokio::test]
-    async fn openai_imagegen_parses_url_image_and_success() {
+    async fn openai_imagegen_openai_envelope_is_clean_error() {
         let server = httpmock::MockServer::start_async().await;
         server
             .mock_async(|when, then| {
@@ -3550,8 +3586,8 @@ mod tests {
             &mut m,
         )
         .await;
-        assert!(m.success);
-        assert!(m.error.is_none());
+        assert!(!m.success);
+        assert!(m.error.as_deref().unwrap_or("").contains("no image"));
     }
 
     // Hardening: an HTTP error surfaces cleanly (bounded error-body read) AND
@@ -3583,8 +3619,8 @@ mod tests {
         assert!(m.time_to_image_ms >= 0);
     }
 
-    // Hardening: an empty `data` array (some servers 200 with no image) is a
-    // clean error, never a fabricated success.
+    // Hardening: an empty/absent `image_base64` (some servers 200 with no image) is
+    // a clean error, never a fabricated success.
     #[tokio::test]
     async fn openai_imagegen_empty_data_is_clean_error() {
         let server = httpmock::MockServer::start_async().await;
@@ -3592,7 +3628,8 @@ mod tests {
             .mock_async(|when, then| {
                 when.method(httpmock::Method::POST)
                     .path("/v1/images/generations");
-                then.status(200).json_body(serde_json::json!({ "data": [] }));
+                then.status(200)
+                    .json_body(serde_json::json!({ "image_base64": "", "time_ms": 3 }));
             })
             .await;
         let client = reqwest::Client::new();
@@ -3648,7 +3685,11 @@ mod tests {
         let mock = server
             .mock_async(|when, then| {
                 when.method(httpmock::Method::POST)
-                    .path("/v1/documents/parse");
+                    .path("/v1/documents/parse")
+                    // Lock the request contract: the field is `document_base64`.
+                    .json_body(serde_json::json!({
+                        "document_base64": B64.encode(b"%PDF-1.4 fake bytes"),
+                    }));
                 then.status(200).json_body(serde_json::json!({
                     "document": {
                         "markdown": "Invoice INV-4471\nTotal Due: 512.00",
@@ -3680,6 +3721,43 @@ mod tests {
         assert_eq!(m.tables.len(), 1);
         assert_eq!(m.tables[0][1], vec!["Widget".to_string(), "2".to_string()]);
         assert_eq!(m.response_tokens, Some(61));
+        assert!(m.latency_ms >= 0);
+    }
+
+    // Contract lock: Chord's docling serve returns a TOP-LEVEL `{text, pages, model}`
+    // (verified live) — the tolerant parser reads `/text`, so a plain prose parse
+    // succeeds with the transcript populated and no fabricated fields/tables.
+    #[tokio::test]
+    async fn openai_docparse_parses_top_level_text_shape() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/documents/parse");
+                then.status(200).json_body(serde_json::json!({
+                    "text": "## Hello Invoice 42",
+                    "pages": 1,
+                    "model": "docling-2.115.0"
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = DocParseMetrics::default();
+        openai_docparse(
+            &client,
+            &server.base_url(),
+            "docling",
+            b"%PDF-1.4 tiny",
+            "tiny.pdf",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.is_none());
+        assert!(m.text.contains("Hello Invoice 42"));
+        assert!(m.fields.is_empty());
+        assert!(m.tables.is_empty());
         assert!(m.latency_ms >= 0);
     }
 
@@ -3769,16 +3847,19 @@ mod tests {
         assert!(m.error.as_deref().unwrap_or("").contains("parse error"));
     }
 
-    // SUITE-STT: OpenAI-compatible transcription arm POSTs multipart to
-    // /v1/audio/transcriptions, parses `text`, records latency, no error.
-    // Mirrors `openai_embed_parses_*`.
+    // SUITE-STT: the transcription arm POSTs a JSON `{audio_base64}` body to
+    // /v1/audio/transcriptions (Chord's contract, NOT multipart), parses `text`,
+    // records latency, no error. Locks the request body shape.
     #[tokio::test]
     async fn openai_transcribe_parses_text() {
         let server = httpmock::MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
                 when.method(httpmock::Method::POST)
-                    .path("/v1/audio/transcriptions");
+                    .path("/v1/audio/transcriptions")
+                    .json_body(serde_json::json!({
+                        "audio_base64": B64.encode(b"RIFF....WAVE fake audio bytes"),
+                    }));
                 then.status(200)
                     .json_body(serde_json::json!({ "text": "turn off the lights" }));
             })
@@ -3890,17 +3971,27 @@ mod tests {
         assert!(m.transcript.is_empty());
     }
 
-    // S125 SUITE-TTS: the speech arm POSTs to /v1/audio/speech and receives raw
-    // audio bytes, recording them + the content-type and leaving `error` unset.
+    // S125 SUITE-TTS: the speech arm POSTs a JSON `{text, voice}` body to
+    // /v1/audio/speech (Chord's contract — the field is `text`, not `input`) and
+    // parses a JSON `{audio_base64, sample_rate, model}` envelope, base64-decoding
+    // the WAV bytes. Locks both request and response shapes.
     #[tokio::test]
     async fn openai_speech_parses_audio_body() {
+        let wav = b"RIFF____WAVEfake-pcm-bytes".to_vec();
         let server = httpmock::MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
-                when.method(httpmock::Method::POST).path("/v1/audio/speech");
-                then.status(200)
-                    .header("content-type", "audio/wav")
-                    .body(b"RIFF____WAVEfake-pcm-bytes".to_vec());
+                when.method(httpmock::Method::POST)
+                    .path("/v1/audio/speech")
+                    .json_body(serde_json::json!({
+                        "text": "hello world",
+                        "voice": "en_US-lessac-medium",
+                    }));
+                then.status(200).json_body(serde_json::json!({
+                    "audio_base64": B64.encode(&wav),
+                    "sample_rate": 22050,
+                    "model": "en_US-lessac-medium"
+                }));
             })
             .await;
         let client = reqwest::Client::new();
@@ -3917,7 +4008,7 @@ mod tests {
         )
         .await;
         mock.assert_async().await;
-        assert!(!m.audio.is_empty());
+        assert_eq!(m.audio, b"RIFF____WAVEfake-pcm-bytes".to_vec());
         assert_eq!(m.content_type.as_deref(), Some("audio/wav"));
         assert!(m.error.is_none());
         assert!(m.latency_ms >= 0);
@@ -3952,14 +4043,16 @@ mod tests {
         assert!(m.latency_ms >= 0);
     }
 
-    // Hardening: an empty audio body is a clean, non-silent error (skip, not crash).
+    // Hardening: a 200 envelope with an empty/absent `audio_base64` is a clean,
+    // non-silent error (skip, not crash) — never fabricated audio.
     #[tokio::test]
     async fn openai_speech_empty_body_is_clean_error() {
         let server = httpmock::MockServer::start_async().await;
         server
             .mock_async(|when, then| {
                 when.method(httpmock::Method::POST).path("/v1/audio/speech");
-                then.status(200).body(Vec::<u8>::new());
+                then.status(200)
+                    .json_body(serde_json::json!({ "audio_base64": "", "sample_rate": 22050 }));
             })
             .await;
         let client = reqwest::Client::new();
@@ -3975,7 +4068,7 @@ mod tests {
             &mut m,
         )
         .await;
-        assert!(m.error.as_deref().unwrap_or("").contains("empty audio"));
+        assert!(m.error.as_deref().unwrap_or("").contains("no audio_base64"));
         assert!(m.audio.is_empty());
     }
 
@@ -3992,7 +4085,7 @@ mod tests {
                 when.method(httpmock::Method::POST).path("/v1/images/generations");
                 then.status(200)
                     .delay(std::time::Duration::from_millis(30))
-                    .json_body(serde_json::json!({ "data": [{ "b64_json": "QUJD" }] }));
+                    .json_body(serde_json::json!({ "image_base64": "QUJD", "time_ms": 30 }));
             })
             .await;
         let client = reqwest::Client::new();
