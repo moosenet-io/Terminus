@@ -673,7 +673,9 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial(intake_env)]
     fn corpus_dir_env_override() {
+        std::env::remove_var("INTAKE_CORPUS_V2_DIR");
         std::env::set_var("INTAKE_CORPUS_DIR", "/tmp/corpus-x");
         assert_eq!(corpus_dir().unwrap(), PathBuf::from("/tmp/corpus-x"));
         std::env::remove_var("INTAKE_CORPUS_DIR");

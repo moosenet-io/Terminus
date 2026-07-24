@@ -56,16 +56,37 @@ use crate::intake::context;
 use crate::intake::gpu_authority::GpuLock;
 use crate::intake::storage::{self, CodeRunRowV2};
 
-/// Resolve the v2 corpus directory from `INTAKE_CORPUS_V2_DIR`. No
-/// compiled-in default (PII remediation 2026-07): required at runtime —
-/// fails clean with `NotConfigured` rather than silently pointing at a real
-/// sweep-harness host path.
+/// Resolve the v2 corpus directory. No compiled-in default (PII remediation 2026-07):
+/// required at runtime — fails clean with `NotConfigured` rather than silently pointing
+/// at a real sweep-harness host path.
+///
+/// DR-02 (S125): unify the corpus-dir convention. `INTAKE_CORPUS_DIR` is now the single
+/// documented variable shared with the agent path ([`crate::intake::code::corpus_dir`]),
+/// so an operator sets ONE var for both the agent and code corpora. `INTAKE_CORPUS_V2_DIR`
+/// is kept as a DEPRECATED fallback alias for back-compat with existing sweep-harness
+/// configs; it is only consulted when `INTAKE_CORPUS_DIR` is unset, and emits a one-line
+/// deprecation notice so the drift is visible. Prefer `INTAKE_CORPUS_DIR` in new configs.
 pub fn corpus_v2_dir() -> Result<PathBuf, ToolError> {
-    std::env::var("INTAKE_CORPUS_V2_DIR")
+    if let Some(dir) = std::env::var("INTAKE_CORPUS_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| ToolError::NotConfigured("INTAKE_CORPUS_V2_DIR is not set".into()))
+    {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(dir) = std::env::var("INTAKE_CORPUS_V2_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        eprintln!(
+            "[mint] DR-02: INTAKE_CORPUS_V2_DIR is deprecated; set INTAKE_CORPUS_DIR instead \
+             (the unified corpus-dir variable). Honoring INTAKE_CORPUS_V2_DIR for now."
+        );
+        return Ok(PathBuf::from(dir));
+    }
+    Err(ToolError::NotConfigured(
+        "corpus dir is not set (set INTAKE_CORPUS_DIR; INTAKE_CORPUS_V2_DIR is a deprecated alias)"
+            .into(),
+    ))
 }
 
 /// Persistent build-cache root (pre-warmed deps) passed to validators as
@@ -1677,13 +1698,24 @@ mod tests {
     #[test]
     #[serial_test::serial(intake_env)]
     fn corpus_v2_dir_env_override() {
+        // Clean slate for the two shared corpus-dir vars.
+        std::env::remove_var("INTAKE_CORPUS_DIR");
+        std::env::remove_var("INTAKE_CORPUS_V2_DIR");
+
+        // DR-02: the deprecated alias still resolves when it is the only one set.
         std::env::set_var("INTAKE_CORPUS_V2_DIR", "/tmp/corpus-v2-x");
         assert_eq!(corpus_v2_dir().unwrap(), PathBuf::from("/tmp/corpus-v2-x"));
+
+        // DR-02: the unified INTAKE_CORPUS_DIR takes precedence over the alias.
+        std::env::set_var("INTAKE_CORPUS_DIR", "/tmp/corpus-unified");
+        assert_eq!(corpus_v2_dir().unwrap(), PathBuf::from("/tmp/corpus-unified"));
+        std::env::remove_var("INTAKE_CORPUS_DIR");
+
         std::env::remove_var("INTAKE_CORPUS_V2_DIR");
-        // PII remediation (2026-07): INTAKE_CORPUS_V2_DIR has no compiled-in
-        // default anymore — missing it must fail clean with NotConfigured.
+        // No compiled-in default: with neither var set it fails clean, and the
+        // message names the unified var so operators know what to set.
         match corpus_v2_dir() {
-            Err(ToolError::NotConfigured(msg)) => assert!(msg.contains("INTAKE_CORPUS_V2_DIR")),
+            Err(ToolError::NotConfigured(msg)) => assert!(msg.contains("INTAKE_CORPUS_DIR")),
             other => panic!("expected NotConfigured, got {other:?}"),
         }
     }
