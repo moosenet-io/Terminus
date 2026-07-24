@@ -1422,6 +1422,198 @@ async fn openai_docparse(
     m.latency_ms = started.elapsed().as_millis() as i64;
 }
 
+// ── SUITE-STT: OpenAI-compatible audio transcription (speech-to-text) ──
+
+/// Normalized per-transcription metrics. The STT twin of [`EmbedMetrics`]:
+/// carries the produced transcript + local wall-clock latency (there is no
+/// `oom` field — a transcription request is not a token-generation load). Every
+/// failure lands in `error`; the transcript is never fabricated.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TranscribeMetrics {
+    pub transcript: String,
+    /// Local wall-clock processing time for the call, ms.
+    pub latency_ms: i64,
+    pub error: Option<String>,
+    /// Backend that served the request (for attribution).
+    pub backend: Option<String>,
+    /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
+    pub hardware: Option<String>,
+}
+
+/// Transcribe `audio_bytes` for `model` through Chord's unified backend-routing
+/// path (SUITE-STT). The audio analogue of [`embed_with_metrics`]: it resolves
+/// the model's tagged backend via [`resolve_backend`] and dispatches to that
+/// backend's transcription endpoint.
+///
+/// Backend support: any `openai`-kind backend (Chord's `/v1/audio/transcriptions`
+/// proxy in front of faster-whisper, or any OpenAI-compatible ASR serve) via
+/// [`openai_transcribe`]. Any other backend kind returns a clear, non-silent
+/// error so a non-ASR candidate is skipped cleanly upstream, not crashed. Never
+/// panics — every failure lands in [`TranscribeMetrics::error`].
+pub async fn transcribe_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    audio_bytes: &[u8],
+    filename: &str,
+    timeout: Duration,
+) -> TranscribeMetrics {
+    let backend = resolve_backend(model);
+    let mut m = TranscribeMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        // Mirrors the `embed_with_metrics` "openai" arm exactly: the bearer token
+        // is optional and resolved from the backend's `api_key_env` at call time
+        // (never stored, never logged).
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_transcribe(
+                client,
+                &backend.url,
+                model,
+                audio_bytes,
+                filename,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
+        other => {
+            m.error = Some(format!(
+                "backend '{}' kind '{other}' does not support audio transcription",
+                backend.name
+            ));
+        }
+    }
+    m
+}
+
+/// SUITE-STT: OpenAI-compatible audio transcription (`POST
+/// {base}/v1/audio/transcriptions`). The audio twin of [`openai_embed`]:
+/// profiles any backend speaking the OpenAI transcription wire protocol — Chord's
+/// proxy in front of faster-whisper, or any OpenAI-compatible ASR serve.
+///
+/// The request is `multipart/form-data` (the OpenAI audio API's required shape:
+/// a `file` part plus a `model` field). The multipart body is assembled BY HAND
+/// so no extra reqwest feature is pulled in — the `file` payload is the raw
+/// audio bytes with a `filename` and an `audio/wav` content-type. Latency is
+/// measured LOCALLY (wall clock) and recorded on EVERY exit path; body reads are
+/// bounded (32 MiB cap, [`read_body_capped`]); `auth` is an optional bearer token
+/// resolved from the backend's `api_key_env` — never logged. The transcript is
+/// taken from the response `text` field; a missing/empty transcript is a clean,
+/// non-silent error so the runner skips it rather than crashing. Never panics —
+/// every failure lands in `m.error`, and the transcript is never fabricated.
+#[allow(clippy::too_many_arguments)]
+async fn openai_transcribe(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    audio_bytes: &[u8],
+    filename: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut TranscribeMetrics,
+) {
+    // A fixed, collision-unlikely multipart boundary — deterministic (keeps the
+    // parse-path test stable) and never appears in PCM/WAV audio in practice.
+    const BOUNDARY: &str = "----terminus-mint-stt-boundary-7f3a9c1e5b";
+    let mut body: Vec<u8> = Vec::with_capacity(audio_bytes.len() + 512);
+    let push = |s: &str, body: &mut Vec<u8>| body.extend_from_slice(s.as_bytes());
+    // model field
+    push(&format!("--{BOUNDARY}\r\n"), &mut body);
+    push("Content-Disposition: form-data; name=\"model\"\r\n\r\n", &mut body);
+    push(&format!("{model}\r\n"), &mut body);
+    // response_format field (ask for a plain JSON `{ "text": ... }` envelope)
+    push(&format!("--{BOUNDARY}\r\n"), &mut body);
+    push("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n", &mut body);
+    push("json\r\n", &mut body);
+    // file field (raw audio payload)
+    push(&format!("--{BOUNDARY}\r\n"), &mut body);
+    push(
+        &format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"),
+        &mut body,
+    );
+    push("Content-Type: audio/wav\r\n\r\n", &mut body);
+    body.extend_from_slice(audio_bytes);
+    push("\r\n", &mut body);
+    push(&format!("--{BOUNDARY}--\r\n"), &mut body);
+
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/audio/transcriptions", base.trim_end_matches('/')))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .body(body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            m.error = Some(e.to_string());
+            // Record wall-clock latency on EVERY exit path, transport error included.
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        // Bounded error-body read (DoS) — a non-2xx backend can stream too.
+        let txt = read_text_capped(resp, MAX_RESPONSE_BYTES).await;
+        m.error = Some(format!("openai transcription HTTP {code}: {txt}"));
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    // Bounded body read (DoS) — never `resp.json()` an uncapped body.
+    let bytes = match read_body_capped(resp, MAX_RESPONSE_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            m.error = Some(format!("openai transcription response read error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("openai transcription response parse error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    if let Some(err) = v.pointer("/error/message").and_then(|e| e.as_str()) {
+        m.error = Some(err.to_string());
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    // OpenAI transcription schema: { "text": "..." }.
+    let transcript = v.pointer("/text").and_then(|t| t.as_str()).unwrap_or_default();
+    if transcript.trim().is_empty() {
+        m.error = Some("openai transcription endpoint returned an empty transcript".to_string());
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    m.transcript = transcript.to_string();
+    m.latency_ms = started.elapsed().as_millis() as i64;
+}
+
 /// Subset of Ollama `/api/embeddings` response we consume.
 #[derive(Deserialize)]
 struct OllamaEmbedResponse {
@@ -3305,5 +3497,126 @@ mod tests {
         )
         .await;
         assert!(m.error.as_deref().unwrap_or("").contains("parse error"));
+    }
+
+    // SUITE-STT: OpenAI-compatible transcription arm POSTs multipart to
+    // /v1/audio/transcriptions, parses `text`, records latency, no error.
+    // Mirrors `openai_embed_parses_*`.
+    #[tokio::test]
+    async fn openai_transcribe_parses_text() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/audio/transcriptions");
+                then.status(200)
+                    .json_body(serde_json::json!({ "text": "turn off the lights" }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = TranscribeMetrics::default();
+        openai_transcribe(
+            &client,
+            &server.base_url(),
+            "faster-whisper:small",
+            b"RIFF....WAVE fake audio bytes",
+            "clip_001.wav",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert_eq!(m.transcript, "turn off the lights");
+        assert!(m.error.is_none());
+        assert!(m.latency_ms >= 0);
+    }
+
+    // Hardening: an HTTP error surfaces cleanly (bounded error-body read) and
+    // records latency on the error exit path; the transcript is never fabricated.
+    #[tokio::test]
+    async fn openai_transcribe_surfaces_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/audio/transcriptions");
+                then.status(500).body("boom");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = TranscribeMetrics::default();
+        openai_transcribe(
+            &client,
+            &server.base_url(),
+            "m",
+            b"audio",
+            "clip.wav",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.transcript.is_empty());
+        assert!(m.latency_ms >= 0);
+    }
+
+    // Hardening: an ASR endpoint that 200s with an empty transcript is a clean
+    // error, not a silent success — mirrors the empty-embedding case.
+    #[tokio::test]
+    async fn openai_transcribe_empty_text_is_clean_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/audio/transcriptions");
+                then.status(200).json_body(serde_json::json!({ "text": "" }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = TranscribeMetrics::default();
+        openai_transcribe(
+            &client,
+            &server.base_url(),
+            "m",
+            b"audio",
+            "clip.wav",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("empty transcript"));
+        assert!(m.transcript.is_empty());
+    }
+
+    // Hardening: a malformed (non-JSON) 200 body is rejected as a clean parse
+    // error via the bounded-read path — never a fabricated transcript.
+    #[tokio::test]
+    async fn openai_transcribe_rejects_non_json_success() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/audio/transcriptions");
+                then.status(200).body("definitely not json");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = TranscribeMetrics::default();
+        openai_transcribe(
+            &client,
+            &server.base_url(),
+            "m",
+            b"audio",
+            "clip.wav",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("parse error"));
+        assert!(m.transcript.is_empty());
     }
 }

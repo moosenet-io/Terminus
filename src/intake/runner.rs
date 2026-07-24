@@ -574,6 +574,133 @@ pub struct DiffusionSuiteOutcome {
     pub per_use_case: Vec<String>,
 }
 
+/// SUITE-STT: outcome of the speech-to-text suite for the tool return summary.
+pub struct SttSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub clips_run: usize,
+    /// Mean digit-normalized WER over the clips that transcribed (lower better).
+    pub avg_wer: f64,
+    /// Mean real-time factor over the clips whose audio duration was known.
+    pub avg_rtf: f64,
+    /// One-line-per-clip summary, in manifest order.
+    pub per_clip: Vec<String>,
+}
+
+/// SUITE-STT: run the speech-to-text suite end-to-end against `model_name`.
+///
+/// Loads the STT corpus manifest from `INTAKE_CORPUS_DIR`
+/// (`[{ "audio_file", "reference" }, ...]`, e.g. the bundled <host> corpus at
+/// `/opt/ollama-models/mint-corpora/stt/`), then for each clip: reads the audio
+/// bytes, derives the clip duration from its WAV header
+/// ([`crate::intake::newcats::voice_transcription::wav_duration_ms`]), transcribes
+/// it through [`crate::intake::infer::transcribe_with_metrics`] (the `openai`
+/// backend arm → Chord's `/v1/audio/transcriptions` in front of faster-whisper),
+/// and writes the digit-normalized WER / accuracy / latency / RTF rows via
+/// [`crate::intake::newcats::voice_transcription::score_and_write`].
+///
+/// Creates its own `model_profiles` row (provider `"openai"`, since a whisper
+/// model is served behind Chord's OpenAI-compatible route, not Ollama) — mirrors
+/// [`run_diffusion_suite`]'s own-profile-row pattern. A per-clip read/transcribe
+/// error is recorded and the clip skipped rather than aborting the whole suite —
+/// the same "failure is still useful signal" convention as every other newcats
+/// suite. A missing/unreadable corpus fails clean with the manifest's
+/// `ToolError` before any profile row is created.
+pub async fn run_stt_suite(model_name: &str) -> Result<SttSuiteOutcome, ToolError> {
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::transcribe_with_metrics;
+    use crate::intake::newcats::text_similarity::word_error_rate_normalized;
+    use crate::intake::newcats::voice_transcription::{
+        self, wav_duration_ms, TranscriptionOutcome,
+    };
+
+    // Resolve + parse the corpus up front so a missing/broken corpus fails clean
+    // before we create any DB rows.
+    let dir = crate::intake::code::corpus_dir()?;
+    let manifest = voice_transcription::load_manifest(&dir)?;
+
+    let profile_id = create_profile_row_for_provider(model_name, "openai").await?;
+    let pool = storage::get_pool().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(e.to_string()))?;
+    let model_id = ModelId::from(model_name);
+
+    let mut per_clip = Vec::with_capacity(manifest.len());
+    let mut wer_sum = 0.0;
+    let mut rtf_sum = 0.0;
+    let mut rtf_n = 0usize;
+    let mut n = 0usize;
+
+    for entry in &manifest {
+        let audio_path = dir.join(&entry.audio_file);
+        let audio_bytes = match std::fs::read(&audio_path) {
+            Ok(b) => b,
+            Err(e) => {
+                per_clip.push(format!("{}: read error ({e})", entry.audio_file));
+                continue;
+            }
+        };
+        let audio_duration_ms = wav_duration_ms(&audio_bytes);
+        let metrics = transcribe_with_metrics(
+            &client,
+            model_name,
+            &audio_bytes,
+            &entry.audio_file,
+            Duration::from_secs(300),
+        )
+        .await;
+        if let Some(err) = &metrics.error {
+            per_clip.push(format!("{}: error ({err})", entry.audio_file));
+            continue;
+        }
+        let backend_tag = metrics
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Gpu);
+        let outcome = TranscriptionOutcome {
+            transcript: metrics.transcript.clone(),
+            latency_ms: metrics.latency_ms,
+            audio_duration_ms,
+        };
+
+        let wer = word_error_rate_normalized(&outcome.transcript, &entry.reference);
+        wer_sum += wer;
+        let rtf = voice_transcription::real_time_factor(outcome.latency_ms, audio_duration_ms);
+        if let Some(r) = rtf {
+            rtf_sum += r;
+            rtf_n += 1;
+        }
+        n += 1;
+
+        voice_transcription::score_and_write(
+            &pool,
+            profile_id,
+            model_id.clone(),
+            backend_tag,
+            &entry.reference,
+            &outcome,
+        )
+        .await?;
+
+        per_clip.push(format!(
+            "{}: wer={wer:.3} latency_ms={} rtf={}",
+            entry.audio_file,
+            outcome.latency_ms,
+            rtf.map(|r| format!("{r:.2}")).unwrap_or_else(|| "n/a".into()),
+        ));
+    }
+
+    Ok(SttSuiteOutcome {
+        profile_id,
+        clips_run: n,
+        avg_wer: if n > 0 { wer_sum / n as f64 } else { 0.0 },
+        avg_rtf: if rtf_n > 0 { rtf_sum / rtf_n as f64 } else { 0.0 },
+        per_clip,
+    })
+}
+
 /// Run the diffusion suite (MINT-DIFF-01) end-to-end against `model_name`: for
 /// each entry in [`crate::intake::newcats::diffusion::USE_CASES`], run one
 /// generation through [`crate::intake::infer::infer_with_metrics`] (which
@@ -1304,6 +1431,27 @@ pub async fn run_fleet_suites(
                 suites,
                 summary: "skipped: non-Ollama daemon model (DiffusionGemma/dgem)".into(),
                 skipped: true,
+            });
+            continue;
+        }
+        // SUITE-STT: an STT model is served behind Chord's OpenAI-compatible
+        // `/v1/audio/transcriptions` route, NOT loadable by the Ollama
+        // `load_model` path below — run its standalone suite directly (its own
+        // profile row, mirroring the diffusion daemon handling) and move on,
+        // rather than fall through and fail the Ollama load.
+        if suites.iter().any(|s| s == "stt") {
+            let summary = match run_stt_suite(model).await {
+                Ok(o) => format!(
+                    "stt: clips={} avg_wer={:.3} avg_rtf={:.2}",
+                    o.clips_run, o.avg_wer, o.avg_rtf
+                ),
+                Err(e) => format!("stt: error {e}"),
+            };
+            out.push(FleetSuiteResult {
+                model: model.clone(),
+                suites,
+                summary,
+                skipped: false,
             });
             continue;
         }

@@ -112,6 +112,146 @@ pub fn wer_to_accuracy(wer: f64) -> f64 {
     (1.0 - wer).max(0.0)
 }
 
+/// SUITE-STT: one number-word classification, used by [`normalize_spoken_numbers`].
+enum NumTok {
+    /// A units word (`zero`..`nineteen`) → its literal value.
+    Unit(u64),
+    /// A tens word (`twenty`..`ninety`) → its literal value.
+    Ten(u64),
+    /// The `hundred` magnitude.
+    Hundred,
+    /// The `thousand` magnitude.
+    Thousand,
+}
+
+/// Classify a single lowercased, punctuation-trimmed token as a cardinal
+/// number-word, or `None` if it isn't one. Cardinals only (ordinals like
+/// `third` are intentionally NOT handled — see [`normalize_spoken_numbers`]).
+fn classify_number_word(w: &str) -> Option<NumTok> {
+    let v = match w {
+        "zero" => NumTok::Unit(0),
+        "one" => NumTok::Unit(1),
+        "two" => NumTok::Unit(2),
+        "three" => NumTok::Unit(3),
+        "four" => NumTok::Unit(4),
+        "five" => NumTok::Unit(5),
+        "six" => NumTok::Unit(6),
+        "seven" => NumTok::Unit(7),
+        "eight" => NumTok::Unit(8),
+        "nine" => NumTok::Unit(9),
+        "ten" => NumTok::Unit(10),
+        "eleven" => NumTok::Unit(11),
+        "twelve" => NumTok::Unit(12),
+        "thirteen" => NumTok::Unit(13),
+        "fourteen" => NumTok::Unit(14),
+        "fifteen" => NumTok::Unit(15),
+        "sixteen" => NumTok::Unit(16),
+        "seventeen" => NumTok::Unit(17),
+        "eighteen" => NumTok::Unit(18),
+        "nineteen" => NumTok::Unit(19),
+        "twenty" => NumTok::Ten(20),
+        "thirty" => NumTok::Ten(30),
+        "forty" => NumTok::Ten(40),
+        "fifty" => NumTok::Ten(50),
+        "sixty" => NumTok::Ten(60),
+        "seventy" => NumTok::Ten(70),
+        "eighty" => NumTok::Ten(80),
+        "ninety" => NumTok::Ten(90),
+        "hundred" => NumTok::Hundred,
+        "thousand" => NumTok::Thousand,
+        _ => return None,
+    };
+    Some(v)
+}
+
+/// SUITE-STT: canonicalize spelled-out CARDINAL numbers to their digit form so
+/// Word Error Rate is not inflated by a purely orthographic digit-vs-word
+/// mismatch — an ASR model that emits `"23"` where the reference says
+/// `"twenty three"` (or vice-versa) is transcribing correctly, and this
+/// normalization (applied to BOTH sides before scoring, see
+/// [`word_error_rate_normalized`]) makes them compare equal.
+///
+/// Lowercases, splits on whitespace, and trims leading/trailing punctuation
+/// from each token. A maximal run of adjacent cardinal number-words is folded
+/// into a single digit token via the standard units/tens/hundred/thousand
+/// accumulation (`"one hundred twenty three"` → `"123"`); a bare `"and"`
+/// *inside* such a run is skipped (`"one hundred and five"` → `"105"`). Tokens
+/// that are already digits (`"2024"`, `"3.5"`) pass through unchanged, as do
+/// all non-number words. Cardinals only — ORDINALS (`"third"`, `"twenty
+/// third"`) are left as-is (the corpus baseline WER already accounts for the
+/// handful of ordinal clips); scope-limiting to cardinals keeps the parser
+/// small and correct rather than half-covering ordinal spelling variants.
+pub fn normalize_spoken_numbers(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    // Accumulator state for an in-progress cardinal number run.
+    let mut active = false;
+    let mut result: u64 = 0; // completed thousands portion
+    let mut current: u64 = 0; // sub-thousand group being built
+
+    let flush = |out: &mut Vec<String>, active: &mut bool, result: &mut u64, current: &mut u64| {
+        if *active {
+            out.push((*result + *current).to_string());
+            *active = false;
+            *result = 0;
+            *current = 0;
+        }
+    };
+
+    for raw in text.split_whitespace() {
+        let tok = raw
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
+        if tok.is_empty() {
+            continue;
+        }
+        // "and" only has meaning as a connector WITHIN a number run; drop it
+        // there, keep it verbatim otherwise.
+        if tok == "and" {
+            if active {
+                continue;
+            }
+            out.push(raw.to_string());
+            continue;
+        }
+        match classify_number_word(&tok) {
+            Some(NumTok::Unit(v)) => {
+                active = true;
+                current += v;
+            }
+            Some(NumTok::Ten(v)) => {
+                active = true;
+                current += v;
+            }
+            Some(NumTok::Hundred) => {
+                active = true;
+                current = if current == 0 { 1 } else { current } * 100;
+            }
+            Some(NumTok::Thousand) => {
+                active = true;
+                result += if current == 0 { 1 } else { current } * 1000;
+                current = 0;
+            }
+            None => {
+                flush(&mut out, &mut active, &mut result, &mut current);
+                out.push(raw.to_string());
+            }
+        }
+    }
+    flush(&mut out, &mut active, &mut result, &mut current);
+    out.join(" ")
+}
+
+/// SUITE-STT: Word Error Rate after [`normalize_spoken_numbers`] is applied to
+/// BOTH the hypothesis and the reference — the digit-normalized WER the STT
+/// suite scores on (the corpus baseline of ~0.167 is measured with this
+/// normalization). Otherwise identical to [`word_error_rate`].
+pub fn word_error_rate_normalized(hypothesis: &str, reference: &str) -> f64 {
+    word_error_rate(
+        &normalize_spoken_numbers(hypothesis),
+        &normalize_spoken_numbers(reference),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +312,37 @@ mod tests {
             "expected low accuracy for garbled transcript, got {}",
             wer_to_accuracy(w)
         );
+    }
+
+    // ---- SUITE-STT: spelled-number normalization + normalized WER ----
+
+    #[test]
+    fn normalize_spoken_numbers_basic_cardinals() {
+        assert_eq!(normalize_spoken_numbers("set a timer for ten minutes"), "set a timer for 10 minutes");
+        assert_eq!(normalize_spoken_numbers("nine"), "9");
+        assert_eq!(normalize_spoken_numbers("one hundred"), "100");
+        assert_eq!(normalize_spoken_numbers("one hundred twenty three"), "123");
+        assert_eq!(normalize_spoken_numbers("forty two"), "42");
+        assert_eq!(normalize_spoken_numbers("two thousand twenty four"), "2024");
+        // "and" as an in-number connector is dropped; elsewhere it survives.
+        assert_eq!(normalize_spoken_numbers("one hundred and five apples and oranges"), "105 apples and oranges");
+    }
+
+    #[test]
+    fn normalize_spoken_numbers_passthrough_and_punctuation() {
+        // Already-digit and decimal tokens pass through untouched.
+        assert_eq!(normalize_spoken_numbers("in 2024 it grew 3.5 percent"), "in 2024 it grew 3.5 percent");
+        // Leading/trailing punctuation on a number word is trimmed before folding.
+        assert_eq!(normalize_spoken_numbers("timer: ten."), "timer: 10");
+    }
+
+    #[test]
+    fn word_error_rate_normalized_ignores_digit_word_mismatch() {
+        // Pure orthographic digit-vs-word difference → 0.0 after normalization,
+        // even though the raw WER is non-zero.
+        let raw = word_error_rate("set a timer for 10 minutes", "set a timer for ten minutes");
+        assert!(raw > 0.0, "raw WER should penalize the digit/word mismatch, got {raw}");
+        let norm = word_error_rate_normalized("set a timer for 10 minutes", "set a timer for ten minutes");
+        assert!(norm.abs() < 1e-9, "normalized WER should be 0.0, got {norm}");
     }
 }
