@@ -823,6 +823,117 @@ pub async fn run_tool_routing_suite(
     })
 }
 
+/// Outcome of the vision-QA suite (SUITE-VQA) for the tool return summary.
+pub struct VisionQaSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub items_run: usize,
+    /// Mean lenient-match accuracy in `[0.0, 1.0]`.
+    pub accuracy: f64,
+    /// Fraction of confident-but-wrong answers in `[0.0, 1.0]`.
+    pub hallucination_rate: f64,
+    pub avg_latency_ms: f64,
+    /// One-line-per-item summary (manifest order).
+    pub per_item: Vec<String>,
+}
+
+/// Run the vision-QA suite (SUITE-VQA) end-to-end against `model_name`: load the
+/// image+question+reference-answer corpus from `INTAKE_CORPUS_DIR` (via
+/// [`crate::intake::code::corpus_dir`], the unified resolver), and for each item
+/// send the image (as a base64 `data:` URL image content part) + question to
+/// Chord's `/v1/chat/completions` route through
+/// [`crate::intake::infer::vision_infer_with_metrics`], derive a
+/// [`crate::intake::newcats::image_parsing::VisionQaOutcome`] from the normalized
+/// [`crate::intake::infer::InferMetrics`], and write the SUITE-VQA metric rows
+/// (accuracy / caption similarity / hallucination / latency / VRAM) via
+/// [`crate::intake::newcats::image_parsing::score_and_write_vqa`].
+///
+/// The VLM (e.g. `llava:7b`) runs on Ollama under Chord, so the profile row uses
+/// the default `"ollama"` provider (unlike diffusion's `"daemon"`). A per-item
+/// backend/transport error is recorded (empty answer ⇒ scored as a miss, latency
+/// from whatever timing exists) rather than aborting the suite — the same
+/// "failure is still useful signal" convention every other newcats suite uses.
+/// An unreadable image is skipped with a note (no fabricated row).
+pub async fn run_vision_qa_suite(model_name: &str) -> Result<VisionQaSuiteOutcome, ToolError> {
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::vision_infer_with_metrics;
+    use crate::intake::newcats::image_parsing::{self, VisionQaOutcome};
+
+    // Unified corpus resolver (DR-02): INTAKE_CORPUS_DIR points at the vision_qa
+    // corpus dir (manifest.json + images). Missing var ⇒ clean NotConfigured.
+    let corpus_dir = crate::intake::code::corpus_dir()?;
+    let items = image_parsing::load_vision_qa_manifest(&corpus_dir)?;
+    if items.is_empty() {
+        return Err(ToolError::NotConfigured(
+            "vision_qa manifest is empty (no items to profile)".into(),
+        ));
+    }
+
+    let profile_id = create_profile_row(model_name).await?;
+    let pool = storage::get_pool().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(e.to_string()))?;
+    let model_id = ModelId::from(model_name);
+
+    let mut per_item = Vec::with_capacity(items.len());
+    let mut acc_sum = 0.0;
+    let mut hall_sum = 0.0;
+    let mut lat_sum = 0.0;
+    let mut n = 0usize;
+
+    for item in &items {
+        let img_path = corpus_dir.join(&item.image_file);
+        let bytes = match std::fs::read(&img_path) {
+            Ok(b) => b,
+            Err(e) => {
+                per_item.push(format!("{}: image unreadable ({e})", item.image_file));
+                continue;
+            }
+        };
+        let data_url = image_parsing::to_data_url(&item.image_file, &bytes);
+        let metrics =
+            vision_infer_with_metrics(&client, model_name, &item.question, &data_url, Duration::from_secs(600)).await;
+        let backend_tag = metrics
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Gpu);
+        let outcome = VisionQaOutcome {
+            answer: metrics.response.clone(),
+            latency_ms: metrics.total_time_ms.unwrap_or(0) as i64,
+            vram_peak_mb: metrics.vram_mb,
+        };
+
+        let accurate = image_parsing::lenient_match(&outcome.answer, &item.answer);
+        let hallucinated = image_parsing::is_hallucination(&outcome.answer, &item.answer);
+        acc_sum += if accurate { 1.0 } else { 0.0 };
+        hall_sum += if hallucinated { 1.0 } else { 0.0 };
+        lat_sum += outcome.latency_ms as f64;
+        n += 1;
+
+        image_parsing::score_and_write_vqa(&pool, profile_id, model_id.clone(), backend_tag, item, &outcome).await?;
+
+        per_item.push(if let Some(err) = &metrics.error {
+            format!("{}: error ({err})", item.image_file)
+        } else {
+            format!(
+                "{}: acc={accurate} answer={:?} lat_ms={}",
+                item.image_file, outcome.answer, outcome.latency_ms,
+            )
+        });
+    }
+
+    Ok(VisionQaSuiteOutcome {
+        profile_id,
+        items_run: n,
+        accuracy: if n > 0 { acc_sum / n as f64 } else { 0.0 },
+        hallucination_rate: if n > 0 { hall_sum / n as f64 } else { 0.0 },
+        avg_latency_ms: if n > 0 { lat_sum / n as f64 } else { 0.0 },
+        per_item,
+    })
+}
+
 /// Disk-usage percentage for a mount via `df`, or None if it can't be read.
 fn disk_pct(mount: &str) -> Option<u8> {
     let out = std::process::Command::new("df")
@@ -975,6 +1086,21 @@ pub async fn run_fleet_suites(
                     )),
                     Err(e) => parts.push(format!("tool_routing: error {e}")),
                 }
+            }
+        }
+
+        // SUITE-VQA: the vision-QA suite runs its own corpus + image chat-route
+        // path and creates its own profile row (like the single-model MCP path),
+        // so it is dispatched by name here and does not share the context/code/
+        // agent profile_id. A missing corpus / backend is a clean per-model note,
+        // never a panic that aborts the fleet sweep.
+        if suites.iter().any(|s| s == "vision_qa") {
+            match run_vision_qa_suite(model).await {
+                Ok(v) => parts.push(format!(
+                    "vision_qa: {} items, acc={:.2}, halluc={:.2}",
+                    v.items_run, v.accuracy, v.hallucination_rate
+                )),
+                Err(e) => parts.push(format!("vision_qa: error {e}")),
             }
         }
 

@@ -14,7 +14,13 @@
 //!     text → structured output, scored by field-level accuracy.
 //!   - [`image_parsing`]       — `task_category = "image_parsing"`: image →
 //!     description, scored by caption similarity. Ships a dependency-free
-//!     synthetic BMP generator for the sanity test.
+//!     synthetic BMP generator for the sanity test. SUITE-VQA (S125) wires this
+//!     module into the fleet as the `vision_qa` suite: on top of the caption
+//!     path it adds a vision-QA path (image + question → short answer) scored by
+//!     lenient accuracy / caption similarity / hallucination / latency / VRAM,
+//!     driven by `runner::run_vision_qa_suite` over an `INTAKE_CORPUS_DIR`
+//!     manifest, calling Chord's `/v1/chat/completions` image content part via
+//!     `infer::vision_infer_with_metrics`. Catalog family `TEST_TYPE_VISION_QA`.
 //!   - [`image_generation`]    — `task_category = "image_generation"`: DIFFERENT
 //!     metric shape (no tokens/accuracy) — success bool, time-to-image ms,
 //!     VRAM peak MB. No generation backend exists on this box yet; only the

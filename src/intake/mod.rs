@@ -486,6 +486,10 @@ pub fn default_suites_for(model_name: &str) -> Vec<String> {
         // SUITE-EMB (TERM #508): an embedding model can't run the chat-shaped
         // context/code/agent suites — its default is the IR-retrieval suite.
         vec!["embedding_retrieval"]
+    } else if is_vision_model(&n) {
+        // SUITE-VQA: a vision/VLM model's default is the image-QA suite (the
+        // Ollama context suite is text-only and doesn't exercise its vision path).
+        vec!["vision_qa"]
     } else if n.contains("coder") {
         vec!["context", "code"]
     } else if n.contains("gpt-oss") {
@@ -520,6 +524,22 @@ pub fn is_embedding_model(model_name: &str) -> bool {
         || n.starts_with("gte")
         || n.contains("e5-")
 }
+
+/// SUITE-VQA: whether a model name looks like a vision-capable (VLM) model that
+/// the image-QA suite should profile. Matches the common local VLM families.
+/// Pure. `model_name` is expected already-lowercased by the caller path, but is
+/// lowercased again defensively.
+pub fn is_vision_model(model_name: &str) -> bool {
+    let n = model_name.to_lowercase();
+    n.contains("llava")
+        || n.contains("bakllava")
+        || n.contains("minicpm-v")
+        || n.contains("vision")
+        || n.contains("-vl")
+        || n.contains(":vl")
+        || n.contains("moondream")
+}
+
 
 /// Pick code-suite languages by model purpose: coder models get the full P0/P1
 /// set; everyone else gets a lighter, fast set. Empty vec = "all languages in
@@ -591,8 +611,8 @@ impl RustTool for ModelIntake {
                 "model_name": { "type": "string", "description": "Ollama model name, e.g. 'gpt-oss:20b'" },
                 "suites": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing"] },
-                    "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other suites don't apply to it. 'tool_routing' profiles function-calling over Chord's OpenAI-compatible /v1/chat/completions (correct-tool@1, parameter validity, decoy rejection, multi-step) — a first-class generalization of the 'agent' suite's tool-selection path."
+                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing", "vision_qa"] },
+                    "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other suites don't apply to it. 'tool_routing' profiles function-calling over Chord's OpenAI-compatible /v1/chat/completions (correct-tool@1, parameter validity, decoy rejection, multi-step) — a first-class generalization of the 'agent' suite's tool-selection path. 'vision_qa' profiles a vision/VLM model on image-QA via Chord's chat/vision route (accuracy, caption similarity, hallucination, latency, VRAM)."
                 },
                 "tiers": {
                     "type": "array",
@@ -870,6 +890,22 @@ impl RustTool for ModelIntake {
                 pct(res.decoy_rejection),
                 pct(res.multi_step_success),
             ));
+        }
+
+        // SUITE-VQA: the vision-QA suite loads its own image corpus and profiles
+        // via Chord's chat/vision route, creating its own profile row (like the
+        // diffusion suite) — it does not share the context/code/agent profile_id.
+        if suites.iter().any(|s| s == "vision_qa") {
+            let res = runner::run_vision_qa_suite(model_name).await?;
+            out.push_str("=== Vision-QA suite ===\n");
+            out.push_str(&format!(
+                "items run: {}\naccuracy: {:.2}\nhallucination_rate: {:.2}\navg_latency_ms: {:.0}\n",
+                res.items_run, res.accuracy, res.hallucination_rate, res.avg_latency_ms,
+            ));
+            for line in &res.per_item {
+                out.push_str(&format!("  {line}\n"));
+            }
+            out.push('\n');
         }
 
         out.push_str("Note: coherence_score stored as NULL (LLM-judge deferred).\n");

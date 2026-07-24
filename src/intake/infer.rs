@@ -978,6 +978,152 @@ async fn openai_tool_infer(
     }
 }
 
+/// SUITE-VQA (S125): the multimodal twin of [`infer_with_metrics`]. Resolves the
+/// model's backend and — for an OpenAI-compatible chat backend (Chord's
+/// `/v1/chat/completions`) — sends ONE user message whose `content` is an ARRAY
+/// of a text part plus an `image_url` part carrying a base64 `data:` URL.
+///
+/// Vision requires the chat route WITH image parts, so any non-`openai` backend
+/// kind returns a clean, non-silent error (the VQA runner turns it into a skip,
+/// never a crash/panic). `image_data_url` is a `data:<mime>;base64,<...>` string
+/// built by the caller (see `newcats::image_parsing::to_data_url`). VRAM is read
+/// post-call exactly as [`infer_with_metrics`] does. Never opens a raw socket.
+pub async fn vision_infer_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    prompt: &str,
+    image_data_url: &str,
+    timeout: Duration,
+) -> InferMetrics {
+    let backend = resolve_backend(model);
+    let mut m = InferMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        // Chord's `/v1/chat/completions` proxy (or any OpenAI-compatible vision
+        // server). The VLM (e.g. llava:7b on ollama) is reached THROUGH Chord's
+        // chat route, never by opening ollama's own multimodal socket here.
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_vision_infer(
+                client,
+                &backend.url,
+                model,
+                prompt,
+                image_data_url,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
+        other => {
+            m.error = Some(format!(
+                "vision suite requires an OpenAI-compatible chat backend \
+                 (Chord /v1/chat/completions); model '{model}' resolves to backend kind '{other}'"
+            ));
+        }
+    }
+    m.vram_mb = vram_used_mb();
+    m
+}
+
+/// Build the OpenAI chat-completions request body for a vision probe: a single
+/// user message whose `content` is `[text part, image_url part]`. Pure — split
+/// out so the image-part shape is unit-testable without a live call.
+fn build_vision_chat_body(model: &str, prompt: &str, image_data_url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": prompt },
+                { "type": "image_url", "image_url": { "url": image_data_url } }
+            ]
+        }],
+        "stream": false,
+    })
+}
+
+/// SUITE-VQA: OpenAI-compatible vision inference (`POST {base}/v1/chat/completions`
+/// with an image content part). The vision twin of [`openai_infer`]: identical
+/// send/parse/timing/OOM handling, but the message `content` is the multi-part
+/// array from [`build_vision_chat_body`]. `auth` is an optional bearer token
+/// resolved from the backend's `api_key_env` — never logged. Never panics; every
+/// failure lands in `m.error`.
+#[allow(clippy::too_many_arguments)]
+async fn openai_vision_infer(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    prompt: &str,
+    image_data_url: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut InferMetrics,
+) {
+    let body = build_vision_chat_body(model, prompt, image_data_url);
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/chat/completions", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = e.to_string();
+            m.oom = msg.to_lowercase().contains("memory") || msg.to_lowercase().contains("oom");
+            m.error = Some(msg);
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let txt = resp.text().await.unwrap_or_default();
+        m.oom = code == 500 && txt.to_lowercase().contains("memory");
+        m.error = Some(format!("openai vision HTTP {code}: {txt}"));
+        return;
+    }
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("openai vision response parse error: {e}"));
+            return;
+        }
+    };
+    let elapsed_ms = started.elapsed().as_millis() as i32;
+    m.response = v
+        .pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string();
+    m.response_tokens = v
+        .pointer("/usage/completion_tokens")
+        .and_then(|t| t.as_i64())
+        .map(|t| t as i32)
+        .or_else(|| (!m.response.is_empty()).then(|| context::estimate_tokens(&m.response) as i32));
+    m.total_time_ms = Some(elapsed_ms);
+    if let (Some(tok), true) = (m.response_tokens, elapsed_ms > 0) {
+        m.throughput_tok_per_sec = Some(tok as f64 / (elapsed_ms as f64 / 1000.0));
+    }
+}
+
 async fn llama_server_infer(
     client: &reqwest::Client,
     base: &str,
@@ -1332,6 +1478,67 @@ mod tests {
         .await;
         assert!(m.error.as_deref().unwrap_or("").contains("500"));
         assert!(m.oom); // 500 + "memory" → oom flag
+    }
+
+    // SUITE-VQA: the vision arm parses an OpenAI chat-completion (image request)
+    // exactly like the text arm — response text + usage token count.
+    #[tokio::test]
+    async fn openai_vision_infer_parses_chat_completion() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/chat/completions");
+                then.status(200).json_body(serde_json::json!({
+                    "choices": [{ "message": { "role": "assistant", "content": "red" } }],
+                    "usage": { "completion_tokens": 1 }
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = InferMetrics::default();
+        openai_vision_infer(
+            &client,
+            &server.base_url(),
+            "llava:7b",
+            "what color is the circle?",
+            "data:image/png;base64,AAEC",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert_eq!(m.response, "red");
+        assert_eq!(m.response_tokens, Some(1));
+        assert!(m.error.is_none());
+        assert!(m.total_time_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn openai_vision_infer_surfaces_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/chat/completions");
+                then.status(400).body("bad image");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = InferMetrics::default();
+        openai_vision_infer(
+            &client,
+            &server.base_url(),
+            "llava:7b",
+            "hi",
+            "data:image/png;base64,AAEC",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("400"));
+        assert!(m.response.is_empty());
     }
 
     // BT (S125): OpenAI-compatible embed arm parses `data[0].embedding`, records the
