@@ -970,6 +970,914 @@ async fn openai_rerank(
     m.latency_ms = started.elapsed().as_millis() as i64;
 }
 
+/// Normalized result of a single image-generation request via the unified path.
+///
+/// DIFFERENT metric shape from [`InferMetrics`]/[`EmbedMetrics`] (matches
+/// `newcats::image_generation`'s convention): a generation probe is NOT
+/// token/accuracy-based. `success` is whether the backend returned a non-empty
+/// image; `time_to_image_ms` is the wall-clock round-trip (recorded even on a
+/// failure — a slow OOM is still signal); `vram_peak_mb` is a best-effort
+/// single post-call sysfs read (same sense `InferMetrics::vram_mb` uses).
+/// The raw image bytes are deliberately NOT retained — only whether one was
+/// produced — so a probe never buffers megabytes of PNG. On any failure
+/// (transport, HTTP, parse, or a backend kind that can't generate images)
+/// `error` is set and `success` is false — callers never panic.
+#[derive(Debug, Clone, Default)]
+pub struct ImageGenMetrics {
+    /// Whether a non-empty image was returned (`data[0].b64_json`/`url`).
+    pub success: bool,
+    /// Wall-clock synthesis time, ms. Recorded on EVERY exit once the round-trip
+    /// starts (transport error included — a timeout is real elapsed time).
+    pub time_to_image_ms: i64,
+    /// Peak VRAM observed during the attempt, MB; `None` if unreadable — never
+    /// fabricated as `0` (best-effort post-call sysfs read).
+    pub vram_peak_mb: Option<u64>,
+    pub error: Option<String>,
+    /// Backend that served the request (for attribution).
+    pub backend: Option<String>,
+    /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
+    pub hardware: Option<String>,
+}
+
+/// Generate an image for `prompt` with `model` through Chord's unified
+/// backend-routing path (`POST {base}/v1/images/generations`).
+///
+/// The image-generation analogue of [`infer_with_metrics`]/[`embed_with_metrics`]:
+/// it resolves the model's tagged backend via [`resolve_backend`] and dispatches
+/// to that backend's image-generation endpoint. `newcats::image_generation` is a
+/// *client* of this function — it never opens a raw socket.
+///
+/// Backend support: the OpenAI-compatible image route (`/v1/images/generations`,
+/// served by Chord in front of the sd-turbo diffusers backend) is implemented via
+/// the `openai` arm. Any other backend kind returns a clear, non-silent error so
+/// a non-image model is skipped cleanly upstream, not crashed. Never panics —
+/// every failure lands in `ImageGenMetrics::error`.
+pub async fn imagegen_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+) -> ImageGenMetrics {
+    // Time the WHOLE attempt so the pre-arm exits (ensure_up failure, an
+    // unsupported backend kind) still carry a real wall-clock number instead of
+    // the default 0 — a slow/blocked backend probe is itself signal.
+    let started = std::time::Instant::now();
+    let backend = resolve_backend(model);
+    let mut m = ImageGenMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        m.time_to_image_ms = started.elapsed().as_millis() as i64;
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        // Chord's `/v1/images/generations` proxy (sd-turbo diffusers, :8095) or any
+        // OpenAI-compatible image server. Mirrors the `openai` arm of
+        // `infer_with_metrics`/`embed_with_metrics` exactly: the bearer token is
+        // optional and resolved from the backend's `api_key_env` at call time
+        // (never stored, never logged).
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_imagegen(
+                client,
+                &backend.url,
+                model,
+                prompt,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
+        other => {
+            // No image-generation wire path for this backend kind: a clear,
+            // non-silent error the runner turns into a clean "skip" (not a crash).
+            m.error = Some(format!(
+                "backend '{}' kind '{other}' does not support image generation",
+                backend.name
+            ));
+            m.time_to_image_ms = started.elapsed().as_millis() as i64;
+        }
+    }
+    // Best-effort peak VRAM (single post-call sysfs read); `None` if unreadable.
+    m.vram_peak_mb = vram_used_mb();
+    m
+}
+
+/// OpenAI-compatible image generation (`POST {base}/v1/images/generations`). The
+/// image-generation twin of [`openai_infer`]/[`openai_embed`]: profiles any backend
+/// speaking the OpenAI images wire protocol — Chord's proxy in front of the sd-turbo
+/// diffusers serve, or any compatible server. `time_to_image_ms` is measured LOCALLY
+/// (wall clock) and is recorded on EVERY exit path (transport error included);
+/// `auth` is an optional bearer token resolved from the backend's `api_key_env` —
+/// never logged. Success is decided by a non-empty `data[0].b64_json` OR `data[0].url`;
+/// the image bytes themselves are NOT retained. Body reads are bounded (32 MiB cap,
+/// [`read_body_capped`]) — a server can stream an unbounded body. A missing/empty image
+/// (some servers 200 with an empty `data` array) is a clean, non-silent error so the
+/// runner records a failed generation rather than crashing. Never panics — every failure
+/// lands in `m.error`, and `success` is never fabricated true.
+async fn openai_imagegen(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut ImageGenMetrics,
+) {
+    let body = serde_json::json!({ "model": model, "prompt": prompt, "n": 1 });
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/images/generations", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            m.error = Some(e.to_string());
+            // Record wall-clock latency on EVERY exit path, transport error
+            // included (a timeout is real elapsed time), per the metric contract.
+            m.time_to_image_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    // Record wall-clock time as soon as the round-trip completes, so an HTTP-error
+    // response (e.g. a 500 from a VRAM ceiling) still carries a time_to_image number.
+    m.time_to_image_ms = started.elapsed().as_millis() as i64;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        // Bounded error-body read (DoS) — a non-2xx backend can stream an
+        // unbounded body just as a 200 can.
+        let txt = read_text_capped(resp, MAX_RESPONSE_BYTES).await;
+        m.error = Some(format!("openai imagegen HTTP {code}: {txt}"));
+        m.time_to_image_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    // Bounded body read (DoS) — never `resp.json()` an uncapped body.
+    let bytes = match read_body_capped(resp, MAX_RESPONSE_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            m.error = Some(format!("openai imagegen response read error: {e}"));
+            m.time_to_image_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("openai imagegen response parse error: {e}"));
+            m.time_to_image_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    // Some OpenAI-compatible servers 200 with an `{"error": {...}}` body; surface it
+    // rather than treating the run as a success with no image.
+    if let Some(err) = v.pointer("/error/message").and_then(|e| e.as_str()) {
+        m.error = Some(err.to_string());
+        m.time_to_image_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    // OpenAI images schema: { "data": [ { "b64_json": "..."} | { "url": "..." } ] }.
+    let image = v
+        .pointer("/data/0/b64_json")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            v.pointer("/data/0/url")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+        });
+    match image {
+        Some(_) => m.success = true,
+        None => {
+            m.error = Some("image generation returned no image (empty data)".to_string());
+        }
+    }
+    // Recompute AFTER the body read + parse + success check so the recorded time
+    // reflects the full round-trip, not just time-to-headers.
+    m.time_to_image_ms = started.elapsed().as_millis() as i64;
+}
+
+// ── SUITE-DOC (S125): document parsing via Chord `/v1/documents/parse` ──────
+
+/// A single parsed table: row-major grid of cell strings.
+pub type DocTable = Vec<Vec<String>>;
+
+/// Normalized result of one document-parse request via the unified path.
+///
+/// Analogue of [`EmbedMetrics`]/[`InferMetrics`] for the `document_parsing`
+/// suite. `text` is the parser's full text/markdown rendering (the CER/WER
+/// source); `fields` is any `field -> value` key/value map the parser returned
+/// (the field-accuracy source; empty when the parser returns only prose);
+/// `tables` are the extracted tables (the table-F1 source). On ANY failure
+/// (transport, HTTP, parse, or a backend whose kind does not parse documents)
+/// `error` is set and the payload fields stay empty — callers never panic and
+/// never see a fabricated document. Like [`EmbedMetrics`], there is no `oom`
+/// field.
+#[derive(Debug, Clone, Default)]
+pub struct DocParseMetrics {
+    /// Full parsed-document text / markdown (CER/WER source).
+    pub text: String,
+    /// Extracted key/value fields, when the parser returns them.
+    pub fields: std::collections::BTreeMap<String, String>,
+    /// Extracted tables, each a row-major grid of cell strings.
+    pub tables: Vec<DocTable>,
+    /// Wall-clock round-trip, ms.
+    pub latency_ms: i64,
+    /// Response token count when the backend reports one (`usage`).
+    pub response_tokens: Option<i64>,
+    pub error: Option<String>,
+    /// Backend that served the request (for attribution).
+    pub backend: Option<String>,
+    /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
+    pub hardware: Option<String>,
+}
+
+/// Parse `document` (raw bytes of a PDF/image/etc., named `filename`) for
+/// `model` through Chord's unified backend-routing path.
+///
+/// The document-parsing analogue of [`embed_with_metrics`]/[`infer_with_metrics`]:
+/// it resolves the model's tagged backend via [`resolve_backend`] and dispatches
+/// to that backend's document-parse endpoint. The `document_parsing` suite is a
+/// *client* of this function — it never opens an HTTP socket directly.
+///
+/// Backend support: any OpenAI-compatible document-parse backend — Chord's
+/// `/v1/documents/parse` proxy (docling behind it) — via the `openai` arm,
+/// mirroring [`embed_with_metrics`]'s `openai` arm exactly (optional bearer
+/// token from the backend's `api_key_env`, resolved at call time, never stored,
+/// never logged). Any other backend kind returns a clear, non-silent error so a
+/// non-parsing candidate is skipped cleanly upstream, not crashed. Never panics
+/// — every failure lands in [`DocParseMetrics::error`].
+pub async fn docparse_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    document: &[u8],
+    filename: &str,
+    timeout: Duration,
+) -> DocParseMetrics {
+    // Time the whole attempt so the pre-arm exits (ensure_up failure, an
+    // unsupported backend kind) carry a real wall-clock number, not the default 0.
+    let started = std::time::Instant::now();
+    let backend = resolve_backend(model);
+    let mut m = DocParseMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        // SUITE-DOC: any OpenAI-compatible document-parse backend — Chord's
+        // `/v1/documents/parse` proxy (docling). Mirrors the `embed_with_metrics`
+        // "openai" arm: the bearer token is optional and resolved from the
+        // backend's `api_key_env` at call time (never stored, never logged).
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_docparse(
+                client,
+                &backend.url,
+                model,
+                document,
+                filename,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
+        other => {
+            // No document-parse wire path for this backend kind: a clear,
+            // non-silent error the runner turns into a clean "skip".
+            m.error = Some(format!(
+                "backend '{}' kind '{other}' does not support document parsing",
+                backend.name
+            ));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+        }
+    }
+    m
+}
+
+/// Chord `POST {base}/v1/documents/parse`. The document bytes are sent as a
+/// base64 field in a JSON body (reqwest's `multipart` feature is not enabled in
+/// this crate, so a JSON body keeps the wire path dependency-free); the docling
+/// backend behind Chord returns the parsed document. `auth` is an optional
+/// bearer token (Chord JWT), resolved from the backend's `api_key_env` — never
+/// logged. Timing is measured LOCALLY (wall clock) and recorded on EVERY exit
+/// path; body reads are bounded (32 MiB cap, [`read_body_capped`]). Never panics
+/// — every failure lands in `m.error`, and no document is ever fabricated.
+///
+/// Response schema (tolerant): the full text is taken from the first present of
+/// `document.markdown` / `document.text` / `markdown` / `text` / `content`;
+/// fields from `document.fields` / `fields` / `key_value_pairs` (a JSON object,
+/// scalar values coerced to their string form); tables from `document.tables` /
+/// `tables` (each an object carrying `rows` / `cells` / `data`, a 2-D array of
+/// cell strings). A 200 body carrying an `{"error": {...}}` is surfaced as an
+/// error rather than a silent empty parse.
+#[allow(clippy::too_many_arguments)]
+async fn openai_docparse(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    document: &[u8],
+    filename: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut DocParseMetrics,
+) {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let body = serde_json::json!({
+        "model": model,
+        "filename": filename,
+        "document": B64.encode(document),
+    });
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/documents/parse", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            m.error = Some(e.to_string());
+            // Record wall-clock latency on EVERY exit path, transport error included.
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        // Bounded error-body read (DoS) — a non-2xx backend can stream too.
+        let txt = read_text_capped(resp, MAX_RESPONSE_BYTES).await;
+        m.error = Some(format!("documents/parse HTTP {code}: {txt}"));
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    // Bounded body read (DoS) — never `resp.json()` an uncapped body.
+    let bytes = match read_body_capped(resp, MAX_RESPONSE_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            m.error = Some(format!("documents/parse response read error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("documents/parse response parse error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    // Some OpenAI-compatible servers 200 with an `{"error": {...}}` body.
+    if let Some(err) = v.pointer("/error/message").and_then(|e| e.as_str()) {
+        m.error = Some(err.to_string());
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+
+    // Full text: first present of the tolerated pointers.
+    let text = ["/document/markdown", "/document/text", "/markdown", "/text", "/content"]
+        .iter()
+        .find_map(|&p| v.pointer(p).and_then(|x| x.as_str()))
+        .unwrap_or_default()
+        .to_string();
+
+    // Fields: first present object of key/value pointers.
+    let mut fields = std::collections::BTreeMap::new();
+    if let Some(obj) = ["/document/fields", "/fields", "/key_value_pairs"]
+        .iter()
+        .find_map(|&p| v.pointer(p).and_then(|x| x.as_object()))
+    {
+        for (k, val) in obj {
+            let s = match val {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            fields.insert(k.clone(), s);
+        }
+    }
+
+    // Tables: first present array; each table's grid from `rows`/`cells`/`data`.
+    let mut tables: Vec<DocTable> = Vec::new();
+    if let Some(arr) = ["/document/tables", "/tables"]
+        .iter()
+        .find_map(|&p| v.pointer(p).and_then(|x| x.as_array()))
+    {
+        for t in arr {
+            let grid = t
+                .pointer("/rows")
+                .or_else(|| t.pointer("/cells"))
+                .or_else(|| t.pointer("/data"))
+                .or(Some(t)) // a bare 2-D array table entry
+                .and_then(|g| g.as_array());
+            if let Some(rows) = grid {
+                let parsed: DocTable = rows
+                    .iter()
+                    .filter_map(|r| r.as_array())
+                    .map(|cells| {
+                        cells
+                            .iter()
+                            .map(|c| match c {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                            .collect::<Vec<String>>()
+                    })
+                    .collect();
+                if !parsed.is_empty() {
+                    tables.push(parsed);
+                }
+            }
+        }
+    }
+
+    // Both a JSON-object text-less parse and a prose parse are valid; an empty
+    // text AND empty fields AND no tables is a non-silent error (nothing usable).
+    if text.is_empty() && fields.is_empty() && tables.is_empty() {
+        m.error = Some("documents/parse returned no text, fields, or tables".to_string());
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+
+    m.response_tokens = v
+        .pointer("/usage/completion_tokens")
+        .or_else(|| v.pointer("/usage/total_tokens"))
+        .and_then(|t| t.as_i64());
+    m.text = text;
+    m.fields = fields;
+    m.tables = tables;
+    m.latency_ms = started.elapsed().as_millis() as i64;
+}
+
+// ── SUITE-STT: OpenAI-compatible audio transcription (speech-to-text) ──
+
+/// True when `needle` occurs as a contiguous byte subslice of `haystack`. Pure.
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// SUITE-STT: assemble the `multipart/form-data` body for an OpenAI-compatible
+/// transcription request BY HAND (reqwest's `multipart` feature is not enabled).
+///
+/// Hardened against the framing hazards a naive hand-rolled multipart has:
+///   1. **Header/delimiter injection via a caller-supplied field.** BOTH the
+///      `filename` (interpolated into a quoted `Content-Disposition` value) AND
+///      the `model` (interpolated as a raw field body) are attacker-influencable.
+///      A raw `"` / `\` could break out of the quoted filename value, and a CR/LF
+///      in EITHER could inject a header or a premature `\r\n--<boundary>` delimiter
+///      and corrupt framing. Every such character is neutralized (replaced with
+///      `_`) in both fields before use.
+///   2. **Boundary collision in the payload/model.** A FIXED boundary that happens
+///      to occur inside the binary audio (or a crafted `model` value) would split
+///      the body at the wrong place. If the boundary token appears in `audio_bytes`
+///      or `model`, this returns a clean `Err` (the caller surfaces it as a
+///      request-build error) rather than silently sending a corrupted request. A
+///      long, fixed token makes this essentially never fire for real audio.
+///
+/// Pure and unit-testable (no network).
+fn build_transcription_multipart(
+    boundary: &str,
+    model: &str,
+    filename: &str,
+    audio_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    // (2) Boundary-collision guard: refuse to frame a binary payload that contains
+    // the delimiter token rather than emit a body a server would mis-parse.
+    if contains_subslice(audio_bytes, boundary.as_bytes()) {
+        return Err(format!(
+            "audio payload ({} bytes) contains the multipart boundary token — cannot frame the request safely",
+            audio_bytes.len()
+        ));
+    }
+    // (1) Neutralize CR / LF / double-quote / backslash in BOTH caller-supplied
+    // fields so neither can break a quoted value or inject a header/delimiter.
+    let neutralize = |s: &str| -> String {
+        s.chars()
+            .map(|c| match c {
+                '\r' | '\n' | '"' | '\\' => '_',
+                other => other,
+            })
+            .collect()
+    };
+    let safe_model = neutralize(model);
+    let safe_filename = neutralize(filename);
+    // (2, model): even neutralized (CR/LF gone, so a delimiter can't form), refuse
+    // a model value that still embeds the raw boundary token as a defense in depth.
+    if safe_model.contains(boundary) {
+        return Err(
+            "model field contains the multipart boundary token — cannot frame the request safely"
+                .to_string(),
+        );
+    }
+
+    let mut body: Vec<u8> = Vec::with_capacity(audio_bytes.len() + 512);
+    let push = |s: &str, body: &mut Vec<u8>| body.extend_from_slice(s.as_bytes());
+    // model field
+    push(&format!("--{boundary}\r\n"), &mut body);
+    push("Content-Disposition: form-data; name=\"model\"\r\n\r\n", &mut body);
+    push(&format!("{safe_model}\r\n"), &mut body);
+    // response_format field (ask for a plain JSON `{ "text": ... }` envelope)
+    push(&format!("--{boundary}\r\n"), &mut body);
+    push("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n", &mut body);
+    push("json\r\n", &mut body);
+    // file field (raw audio payload)
+    push(&format!("--{boundary}\r\n"), &mut body);
+    push(
+        &format!("Content-Disposition: form-data; name=\"file\"; filename=\"{safe_filename}\"\r\n"),
+        &mut body,
+    );
+    push("Content-Type: audio/wav\r\n\r\n", &mut body);
+    body.extend_from_slice(audio_bytes);
+    push("\r\n", &mut body);
+    push(&format!("--{boundary}--\r\n"), &mut body);
+    Ok(body)
+}
+
+/// Normalized per-transcription metrics. The STT twin of [`EmbedMetrics`]:
+/// carries the produced transcript + local wall-clock latency (there is no
+/// `oom` field — a transcription request is not a token-generation load). Every
+/// failure lands in `error`; the transcript is never fabricated.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TranscribeMetrics {
+    pub transcript: String,
+    /// Local wall-clock processing time for the call, ms.
+    pub latency_ms: i64,
+    pub error: Option<String>,
+    /// Backend that served the request (for attribution).
+    pub backend: Option<String>,
+    /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
+    pub hardware: Option<String>,
+}
+
+/// Transcribe `audio_bytes` for `model` through Chord's unified backend-routing
+/// path (SUITE-STT). The audio analogue of [`embed_with_metrics`]: it resolves
+/// the model's tagged backend via [`resolve_backend`] and dispatches to that
+/// backend's transcription endpoint.
+///
+/// Backend support: any `openai`-kind backend (Chord's `/v1/audio/transcriptions`
+/// proxy in front of faster-whisper, or any OpenAI-compatible ASR serve) via
+/// [`openai_transcribe`]. Any other backend kind returns a clear, non-silent
+/// error so a non-ASR candidate is skipped cleanly upstream, not crashed. Never
+/// panics — every failure lands in [`TranscribeMetrics::error`].
+pub async fn transcribe_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    audio_bytes: &[u8],
+    filename: &str,
+    timeout: Duration,
+) -> TranscribeMetrics {
+    // Time the whole attempt so the pre-arm exits (ensure_up failure, an
+    // unsupported backend kind) carry a real wall-clock number, not the default 0.
+    let started = std::time::Instant::now();
+    let backend = resolve_backend(model);
+    let mut m = TranscribeMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        // Mirrors the `embed_with_metrics` "openai" arm exactly: the bearer token
+        // is optional and resolved from the backend's `api_key_env` at call time
+        // (never stored, never logged).
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_transcribe(
+                client,
+                &backend.url,
+                model,
+                audio_bytes,
+                filename,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
+        other => {
+            m.error = Some(format!(
+                "backend '{}' kind '{other}' does not support audio transcription",
+                backend.name
+            ));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+        }
+    }
+    m
+}
+
+/// SUITE-STT: OpenAI-compatible audio transcription (`POST
+/// {base}/v1/audio/transcriptions`). The audio twin of [`openai_embed`]:
+/// profiles any backend speaking the OpenAI transcription wire protocol — Chord's
+/// proxy in front of faster-whisper, or any OpenAI-compatible ASR serve.
+///
+/// The request is `multipart/form-data` (the OpenAI audio API's required shape:
+/// a `file` part plus a `model` field). The multipart body is assembled BY HAND
+/// so no extra reqwest feature is pulled in — the `file` payload is the raw
+/// audio bytes with a `filename` and an `audio/wav` content-type. Latency is
+/// measured LOCALLY (wall clock) and recorded on EVERY exit path; body reads are
+/// bounded (32 MiB cap, [`read_body_capped`]); `auth` is an optional bearer token
+/// resolved from the backend's `api_key_env` — never logged. The transcript is
+/// taken from the response `text` field; a missing/empty transcript is a clean,
+/// non-silent error so the runner skips it rather than crashing. Never panics —
+/// every failure lands in `m.error`, and the transcript is never fabricated.
+#[allow(clippy::too_many_arguments)]
+async fn openai_transcribe(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    audio_bytes: &[u8],
+    filename: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut TranscribeMetrics,
+) {
+    // A fixed, long, collision-unlikely multipart boundary. It is verified NOT to
+    // appear in the audio payload (see `build_transcription_multipart`) so binary
+    // audio can never corrupt the multipart framing.
+    const BOUNDARY: &str = "----terminus-mint-stt-boundary-7f3a9c1e5b";
+    let started = std::time::Instant::now();
+    let body = match build_transcription_multipart(BOUNDARY, model, filename, audio_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            // Pre-flight framing/sanitization failure — no request was sent.
+            m.error = Some(format!("openai transcription request build error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    let mut req = client
+        .post(format!("{}/v1/audio/transcriptions", base.trim_end_matches('/')))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .body(body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            m.error = Some(e.to_string());
+            // Record wall-clock latency on EVERY exit path, transport error included.
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        // Bounded error-body read (DoS) — a non-2xx backend can stream too.
+        let txt = read_text_capped(resp, MAX_RESPONSE_BYTES).await;
+        m.error = Some(format!("openai transcription HTTP {code}: {txt}"));
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    // Bounded body read (DoS) — never `resp.json()` an uncapped body.
+    let bytes = match read_body_capped(resp, MAX_RESPONSE_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            m.error = Some(format!("openai transcription response read error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("openai transcription response parse error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    if let Some(err) = v.pointer("/error/message").and_then(|e| e.as_str()) {
+        m.error = Some(err.to_string());
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    // OpenAI transcription schema: { "text": "..." }.
+    let transcript = v.pointer("/text").and_then(|t| t.as_str()).unwrap_or_default();
+    if transcript.trim().is_empty() {
+        m.error = Some("openai transcription endpoint returned an empty transcript".to_string());
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    m.transcript = transcript.to_string();
+    m.latency_ms = started.elapsed().as_millis() as i64;
+}
+
+// ── S125 SUITE-TTS: text-to-speech (`/v1/audio/speech`) + STT-loopback ────────
+// The STT-loopback reuses the SHARED `transcribe_with_metrics` / `openai_transcribe`
+// (proper hand-rolled multipart) defined above for SUITE-STT — SUITE-TTS does NOT
+// carry its own duplicate transcription arm (deduped at integration, S125 batch-2).
+
+/// Normalized result of one text-to-speech synthesis request (S125 SUITE-TTS).
+///
+/// `audio` is the raw synthesized audio (WAV bytes when the backend honors a
+/// `wav` `response_format`); `content_type` is the response MIME (for
+/// attribution / a future decoder); `latency_ms` is the wall-clock round-trip.
+/// On any failure (transport, HTTP, empty body, or a backend kind that can't
+/// synthesize) `error` is set and `audio` is empty — callers never panic and
+/// never see fabricated audio. Mirrors [`EmbedMetrics`] (no `oom` field).
+#[derive(Debug, Clone, Default)]
+pub struct SpeechMetrics {
+    pub audio: Vec<u8>,
+    pub content_type: Option<String>,
+    pub latency_ms: i64,
+    pub error: Option<String>,
+    /// Backend that served the request (for attribution).
+    pub backend: Option<String>,
+    /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
+    pub hardware: Option<String>,
+}
+
+/// Synthesize `input` to speech for `model` through Chord's unified backend
+/// routing (`/v1/audio/speech`). The TTS analogue of [`embed_with_metrics`]:
+/// resolves the model's tagged backend via [`resolve_backend`] and dispatches to
+/// that backend's speech endpoint. The SUITE-TTS harness is a *client* of this —
+/// it never opens an HTTP path to piper directly.
+///
+/// Backend support: the OpenAI-compatible speech path (`/v1/audio/speech`) is
+/// implemented (Chord's proxy in front of piper `en_US-lessac-medium`). Any other
+/// backend kind returns a clear, non-silent error so a non-TTS model is skipped
+/// cleanly upstream, not crashed. Never panics — every failure lands in
+/// `SpeechMetrics::error`.
+pub async fn synthesize_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    input: &str,
+    voice: &str,
+    timeout: Duration,
+) -> SpeechMetrics {
+    // Time the whole attempt so the pre-arm exits (ensure_up failure, an
+    // unsupported backend kind) carry a real wall-clock number, not the default 0.
+    let started = std::time::Instant::now();
+    let backend = resolve_backend(model);
+    let mut m = SpeechMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        // Any OpenAI-compatible speech backend — Chord's `/v1/audio/speech` proxy.
+        // Mirrors the `embed_with_metrics` "openai" arm exactly: the bearer token
+        // is optional and resolved from the backend's `api_key_env` at call time
+        // (never stored, never logged).
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_speech(
+                client,
+                &backend.url,
+                model,
+                input,
+                voice,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
+        other => {
+            m.error = Some(format!(
+                "backend '{}' kind '{other}' does not support speech synthesis",
+                backend.name
+            ));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+        }
+    }
+    m
+}
+
+/// OpenAI-compatible text-to-speech (`POST {base}/v1/audio/speech`). The speech
+/// twin of [`openai_embed`]/[`openai_infer`]: builds a `{model, input, voice,
+/// response_format}` body, POSTs it, measures LOCAL wall-clock latency (recorded
+/// on EVERY exit path), and RECEIVES AUDIO BYTES (not JSON) on success.
+/// `response_format` is requested as `wav` so the SUITE-TTS scorer can derive
+/// duration/RMS from a PCM header; the body read is bounded (32 MiB cap,
+/// [`read_body_capped`]); `auth` is an optional bearer token resolved from the
+/// backend's `api_key_env` — never logged. An empty body is a clean, non-silent
+/// error (skip, not crash). Never panics — every failure lands in `m.error`,
+/// audio is never fabricated.
+async fn openai_speech(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    input: &str,
+    voice: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut SpeechMetrics,
+) {
+    let body = serde_json::json!({
+        "model": model,
+        "input": input,
+        "voice": voice,
+        "response_format": "wav",
+    });
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/audio/speech", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            m.error = Some(e.to_string());
+            // Record wall-clock latency on EVERY exit path, transport error included.
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        // Bounded error-body read (DoS) — a non-2xx backend can stream too.
+        let txt = read_text_capped(resp, MAX_RESPONSE_BYTES).await;
+        m.error = Some(format!("openai speech HTTP {code}: {txt}"));
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    // Capture the MIME before consuming the body.
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    // Bounded body read (DoS) — never read an uncapped audio body into memory.
+    let bytes = match read_body_capped(resp, MAX_RESPONSE_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            m.error = Some(format!("openai speech body read error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    if bytes.is_empty() {
+        m.error = Some("openai speech endpoint returned an empty audio body".to_string());
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    m.audio = bytes;
+    m.content_type = content_type;
+    m.latency_ms = started.elapsed().as_millis() as i64;
+}
+
 /// Subset of Ollama `/api/embeddings` response we consume.
 #[derive(Deserialize)]
 struct OllamaEmbedResponse {
@@ -1521,6 +2429,11 @@ mod tests {
 
     use std::io::Write;
 
+    /// Serializes tests that mutate the process-global `MODEL_REGISTRY_PATH` /
+    /// remote-Ollama globals, so they don't race each other under cargo's
+    /// parallel test runner.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Write `body` to a unique temp file and return its path (avoids env-var
     /// races between parallel tests).
     fn tmp_registry(tag: &str, body: &str) -> std::path::PathBuf {
@@ -1676,6 +2589,7 @@ mod tests {
         // without needing a live remote Ollama.
         // Loopback URL interpolated onto its own taggable line — see comment in
         // `override_forces_backend_regardless_of_tag` above for why.
+        let _env = ENV_LOCK.lock().unwrap();
         let ollama_url = "http://127.0.0.1:11434"; // pii-test-fixture
         let path = tmp_registry(
             "remote-choke",
@@ -2575,5 +3489,692 @@ mod tests {
         // Cap well below the 4096-byte body → clean cap error, never a 4KiB read.
         let err = read_body_capped(resp, 512).await.unwrap_err();
         assert!(err.contains("cap"), "expected a cap error, got: {err}");
+    }
+
+    // SUITE-IMG (S125): OpenAI-compatible image-generation arm parses
+    // `data[0].b64_json`, marks success, records a wall-clock time, and leaves
+    // `error` unset. Mirrors `openai_embed_parses_data_embedding`.
+    #[tokio::test]
+    async fn openai_imagegen_parses_b64_image_and_success() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/images/generations");
+                then.status(200).json_body(serde_json::json!({
+                    "created": 1,
+                    "data": [{ "b64_json": "aGVsbG8=" }]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ImageGenMetrics::default();
+        openai_imagegen(
+            &client,
+            &server.base_url(),
+            "sd-turbo",
+            "a red cube on a white table",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert!(m.success);
+        assert!(m.error.is_none());
+        assert!(m.time_to_image_ms >= 0);
+    }
+
+    // A `url`-form image also counts as success (some servers return a URL).
+    #[tokio::test]
+    async fn openai_imagegen_parses_url_image_and_success() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/images/generations");
+                then.status(200).json_body(serde_json::json!({
+                    "data": [{ "url": "https://example.invalid/img.png" }]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ImageGenMetrics::default();
+        openai_imagegen(
+            &client,
+            &server.base_url(),
+            "sd-turbo",
+            "prompt",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.success);
+        assert!(m.error.is_none());
+    }
+
+    // Hardening: an HTTP error surfaces cleanly (bounded error-body read) AND
+    // records a wall-clock time on the error exit path — a slow OOM is signal.
+    #[tokio::test]
+    async fn openai_imagegen_surfaces_http_error_and_records_time() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/images/generations");
+                then.status(500).body("out of memory");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ImageGenMetrics::default();
+        openai_imagegen(
+            &client,
+            &server.base_url(),
+            "m",
+            "prompt",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(!m.success);
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.time_to_image_ms >= 0);
+    }
+
+    // Hardening: an empty `data` array (some servers 200 with no image) is a
+    // clean error, never a fabricated success.
+    #[tokio::test]
+    async fn openai_imagegen_empty_data_is_clean_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/images/generations");
+                then.status(200).json_body(serde_json::json!({ "data": [] }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ImageGenMetrics::default();
+        openai_imagegen(
+            &client,
+            &server.base_url(),
+            "m",
+            "prompt",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(!m.success);
+        assert!(m.error.as_deref().unwrap_or("").contains("no image"));
+    }
+
+    // Hardening: a malformed (non-JSON) 200 body is rejected as a clean parse
+    // error via the bounded-read path — never a fabricated success.
+    #[tokio::test]
+    async fn openai_imagegen_rejects_non_json_success() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/images/generations");
+                then.status(200).body("not json at all");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ImageGenMetrics::default();
+        openai_imagegen(
+            &client,
+            &server.base_url(),
+            "m",
+            "prompt",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(!m.success);
+        assert!(m.error.as_deref().unwrap_or("").contains("parse error"));
+    }
+
+    // SUITE-DOC (S125): the document-parse arm parses the full text, the
+    // key/value fields, and the tables, and leaves `error` unset. Mirrors
+    // `openai_embed_parses_data_embedding`.
+    #[tokio::test]
+    async fn openai_docparse_parses_document_payload() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/documents/parse");
+                then.status(200).json_body(serde_json::json!({
+                    "document": {
+                        "markdown": "Invoice INV-4471\nTotal Due: 512.00",
+                        "fields": { "invoice_number": "INV-4471", "total_due": "512.00" },
+                        "tables": [ { "rows": [["Item", "Qty"], ["Widget", "2"]] } ]
+                    },
+                    "usage": { "completion_tokens": 61 }
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = DocParseMetrics::default();
+        openai_docparse(
+            &client,
+            &server.base_url(),
+            "docling",
+            b"%PDF-1.4 fake bytes",
+            "invoice.pdf",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert!(m.error.is_none());
+        assert!(m.text.contains("INV-4471"));
+        assert_eq!(m.fields.get("invoice_number").map(String::as_str), Some("INV-4471"));
+        assert_eq!(m.fields.get("total_due").map(String::as_str), Some("512.00"));
+        assert_eq!(m.tables.len(), 1);
+        assert_eq!(m.tables[0][1], vec!["Widget".to_string(), "2".to_string()]);
+        assert_eq!(m.response_tokens, Some(61));
+        assert!(m.latency_ms >= 0);
+    }
+
+    // Hardening: an HTTP error surfaces cleanly (bounded error-body read) and
+    // records latency on the error exit path; no document is fabricated.
+    #[tokio::test]
+    async fn openai_docparse_surfaces_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/documents/parse");
+                then.status(500).body("boom");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = DocParseMetrics::default();
+        openai_docparse(
+            &client,
+            &server.base_url(),
+            "docling",
+            b"x",
+            "x.pdf",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.text.is_empty() && m.fields.is_empty() && m.tables.is_empty());
+        assert!(m.latency_ms >= 0);
+    }
+
+    // Hardening: an empty parse (no text, no fields, no tables) is a clean,
+    // non-silent error — never a fabricated empty document.
+    #[tokio::test]
+    async fn openai_docparse_empty_document_is_clean_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/documents/parse");
+                then.status(200).json_body(serde_json::json!({ "document": {} }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = DocParseMetrics::default();
+        openai_docparse(
+            &client,
+            &server.base_url(),
+            "docling",
+            b"x",
+            "x.pdf",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("no text, fields, or tables"));
+    }
+
+    // Hardening: a malformed (non-JSON) 200 body is rejected as a clean parse
+    // error via the bounded-read path — never a fabricated document.
+    #[tokio::test]
+    async fn openai_docparse_rejects_non_json_success() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/documents/parse");
+                then.status(200).body("<<<not json>>>");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = DocParseMetrics::default();
+        openai_docparse(
+            &client,
+            &server.base_url(),
+            "docling",
+            b"x",
+            "x.pdf",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("parse error"));
+    }
+
+    // SUITE-STT: OpenAI-compatible transcription arm POSTs multipart to
+    // /v1/audio/transcriptions, parses `text`, records latency, no error.
+    // Mirrors `openai_embed_parses_*`.
+    #[tokio::test]
+    async fn openai_transcribe_parses_text() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/audio/transcriptions");
+                then.status(200)
+                    .json_body(serde_json::json!({ "text": "turn off the lights" }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = TranscribeMetrics::default();
+        openai_transcribe(
+            &client,
+            &server.base_url(),
+            "faster-whisper:small",
+            b"RIFF....WAVE fake audio bytes",
+            "clip_001.wav",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert_eq!(m.transcript, "turn off the lights");
+        assert!(m.error.is_none());
+        assert!(m.latency_ms >= 0);
+    }
+
+    // Hardening: an HTTP error surfaces cleanly (bounded error-body read) and
+    // records latency on the error exit path; the transcript is never fabricated.
+    #[tokio::test]
+    async fn openai_transcribe_surfaces_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/audio/transcriptions");
+                then.status(500).body("boom");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = TranscribeMetrics::default();
+        openai_transcribe(
+            &client,
+            &server.base_url(),
+            "m",
+            b"audio",
+            "clip.wav",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.transcript.is_empty());
+        assert!(m.latency_ms >= 0);
+    }
+
+    // Hardening: an ASR endpoint that 200s with an empty transcript is a clean
+    // error, not a silent success — mirrors the empty-embedding case.
+    #[tokio::test]
+    async fn openai_transcribe_empty_text_is_clean_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/audio/transcriptions");
+                then.status(200).json_body(serde_json::json!({ "text": "" }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = TranscribeMetrics::default();
+        openai_transcribe(
+            &client,
+            &server.base_url(),
+            "m",
+            b"audio",
+            "clip.wav",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("empty transcript"));
+        assert!(m.transcript.is_empty());
+    }
+
+    // Hardening: a malformed (non-JSON) 200 body is rejected as a clean parse
+    // error via the bounded-read path — never a fabricated transcript.
+    #[tokio::test]
+    async fn openai_transcribe_rejects_non_json_success() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/audio/transcriptions");
+                then.status(200).body("definitely not json");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = TranscribeMetrics::default();
+        openai_transcribe(
+            &client,
+            &server.base_url(),
+            "m",
+            b"audio",
+            "clip.wav",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("parse error"));
+        assert!(m.transcript.is_empty());
+    }
+
+    // S125 SUITE-TTS: the speech arm POSTs to /v1/audio/speech and receives raw
+    // audio bytes, recording them + the content-type and leaving `error` unset.
+    #[tokio::test]
+    async fn openai_speech_parses_audio_body() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/audio/speech");
+                then.status(200)
+                    .header("content-type", "audio/wav")
+                    .body(b"RIFF____WAVEfake-pcm-bytes".to_vec());
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = SpeechMetrics::default();
+        openai_speech(
+            &client,
+            &server.base_url(),
+            "piper",
+            "hello world",
+            "en_US-lessac-medium",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert!(!m.audio.is_empty());
+        assert_eq!(m.content_type.as_deref(), Some("audio/wav"));
+        assert!(m.error.is_none());
+        assert!(m.latency_ms >= 0);
+    }
+
+    // Hardening: an HTTP error surfaces cleanly (bounded error-body read) and
+    // records latency on the error exit path; audio is never fabricated.
+    #[tokio::test]
+    async fn openai_speech_surfaces_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/audio/speech");
+                then.status(500).body("boom");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = SpeechMetrics::default();
+        openai_speech(
+            &client,
+            &server.base_url(),
+            "piper",
+            "hi",
+            "v",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.audio.is_empty());
+        assert!(m.latency_ms >= 0);
+    }
+
+    // Hardening: an empty audio body is a clean, non-silent error (skip, not crash).
+    #[tokio::test]
+    async fn openai_speech_empty_body_is_clean_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/audio/speech");
+                then.status(200).body(Vec::<u8>::new());
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = SpeechMetrics::default();
+        openai_speech(
+            &client,
+            &server.base_url(),
+            "piper",
+            "hi",
+            "v",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("empty audio"));
+        assert!(m.audio.is_empty());
+    }
+
+    // ── Finding 1 (S125 b2fix): latency recorded on the pre-arm exit paths ──
+
+    /// Finding 1: `openai_imagegen` records latency AFTER the body read + parse +
+    /// success check, not merely at header receipt. A delayed 200 with a valid
+    /// image guarantees a strictly-positive measured time on the SUCCESS path.
+    #[tokio::test]
+    async fn openai_imagegen_records_latency_on_success() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/images/generations");
+                then.status(200)
+                    .delay(std::time::Duration::from_millis(30))
+                    .json_body(serde_json::json!({ "data": [{ "b64_json": "QUJD" }] }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ImageGenMetrics::default();
+        openai_imagegen(
+            &client,
+            &server.base_url(),
+            "sd",
+            "a red cube",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.success, "expected success, error={:?}", m.error);
+        assert!(
+            m.time_to_image_ms > 0,
+            "imagegen latency must be recorded (>0) after body+parse+success, got {}",
+            m.time_to_image_ms
+        );
+    }
+
+    /// Finding 1: the UNSUPPORTED-backend exit of a public metric fn records a real
+    /// wall-clock number (not the default 0). A llama-server backend whose `/health`
+    /// answers (after a delay) makes `ensure_up` succeed, then the non-`openai` kind
+    /// lands in the "does not support" arm with a measurable elapsed.
+    #[tokio::test]
+    async fn imagegen_records_latency_on_unsupported_backend() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/health");
+                then.status(200).delay(std::time::Duration::from_millis(30));
+            })
+            .await;
+        let url = server.base_url();
+        let reg = format!(
+            r#"{{ "models": {{ "img-x:1": {{ "backend": "ondemand" }} }},
+                 "backends": {{ "ondemand": {{ "url": "{url}", "kind": "llama-server", "hardware": "cpu", "unit": "chord-fake-imggen" }} }} }}"#
+        );
+        let path = tmp_registry("img-unsupported", &reg);
+        std::env::set_var("MODEL_REGISTRY_PATH", &path);
+        let client = reqwest::Client::new();
+        let m = imagegen_with_metrics(
+            &client,
+            "img-x:1",
+            "a red cube",
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        std::env::remove_var("MODEL_REGISTRY_PATH");
+        assert!(
+            m.error.as_deref().unwrap_or("").contains("does not support image generation"),
+            "expected unsupported-backend error, got {:?}",
+            m.error
+        );
+        assert!(
+            m.time_to_image_ms > 0,
+            "latency must be recorded (>0) on the unsupported-backend exit, got {}",
+            m.time_to_image_ms
+        );
+    }
+
+    /// Finding 1: the ensure_up-FAILURE exit of a public metric fn records a real
+    /// wall-clock number. A llama-server backend with no unit/launch whose `/health`
+    /// is unhealthy (after a delay) makes `ensure_up` return `Err` with measurable
+    /// elapsed — and no systemctl side effects.
+    #[tokio::test]
+    async fn transcribe_records_latency_on_ensure_up_failure() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/health");
+                then.status(503).delay(std::time::Duration::from_millis(30));
+            })
+            .await;
+        let url = server.base_url();
+        let reg = format!(
+            r#"{{ "models": {{ "stt-x:1": {{ "backend": "ondemand" }} }},
+                 "backends": {{ "ondemand": {{ "url": "{url}", "kind": "llama-server", "hardware": "cpu" }} }} }}"#
+        );
+        let path = tmp_registry("stt-ensure-fail", &reg);
+        std::env::set_var("MODEL_REGISTRY_PATH", &path);
+        let client = reqwest::Client::new();
+        let m = transcribe_with_metrics(
+            &client,
+            "stt-x:1",
+            b"audio-bytes",
+            "clip.wav",
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        std::env::remove_var("MODEL_REGISTRY_PATH");
+        assert!(
+            m.error.as_deref().unwrap_or("").contains("unavailable"),
+            "expected ensure_up-failure error, got {:?}",
+            m.error
+        );
+        assert!(
+            m.latency_ms > 0,
+            "latency must be recorded (>0) on the ensure_up-failure exit, got {}",
+            m.latency_ms
+        );
+    }
+
+    // ── Finding 2 (S125 b2fix): transcription multipart injection/framing ──
+
+    /// A caller-supplied filename carrying a `"` / CR / LF is neutralized so it
+    /// cannot break the quoted Content-Disposition value or inject a header.
+    #[test]
+    fn transcription_multipart_neutralizes_filename_injection() {
+        let boundary = "----test-boundary-abc";
+        let evil = "evil\".wav\r\nX-Injected: 1";
+        let body = build_transcription_multipart(boundary, "m", evil, b"AUDIO").expect("builds");
+        let s = String::from_utf8(body).expect("body is valid utf8 here");
+        assert!(!s.contains("evil\".wav"), "the raw quote must be neutralized: {s}");
+        assert!(
+            !s.contains("X-Injected: 1\r\n"),
+            "CRLF header injection must be neutralized: {s}"
+        );
+        assert!(
+            s.contains("filename=\"evil_.wav__X-Injected: 1\""),
+            "sanitized filename must be a single quoted value: {s}"
+        );
+    }
+
+    /// b2fix re-review: the caller-supplied `model` field is neutralized the same
+    /// way as the filename, so a `model` carrying CR/LF (a header/part injection
+    /// that does NOT reuse the literal boundary token) cannot inject a fake part or
+    /// corrupt framing.
+    #[test]
+    fn transcription_multipart_neutralizes_model_field_injection() {
+        let boundary = "----test-boundary-model";
+        // CRLF-based injection of a fake part WITHOUT the literal boundary token
+        // (which would instead hit the reject guard — see the next test).
+        let evil_model =
+            "gpt\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\ninjected".to_string();
+        let body = build_transcription_multipart(boundary, &evil_model, "clip.wav", b"AUDIO")
+            .expect("builds");
+        let s = String::from_utf8(body).expect("body is valid utf8 here");
+        // The injected header/part must NOT survive into the body as real framing.
+        assert!(!s.contains("name=\"x\""), "model-field CRLF injection must be neutralized: {s}");
+        assert!(
+            !s.contains("\r\ninjected"),
+            "no CRLF-delimited injected content survives: {s}"
+        );
+        // Exactly the three legitimate opening delimiters (model / response_format /
+        // file) remain — the injection did not add a fourth part.
+        let opens = s.matches(&format!("--{boundary}\r\n")).count();
+        assert_eq!(opens, 3, "exactly three field delimiters, got {opens}: {s}");
+    }
+
+    /// b2fix re-review: a `model` value embedding the raw boundary token is rejected
+    /// cleanly (defense in depth), never framed into a corruptible body.
+    #[test]
+    fn transcription_multipart_rejects_boundary_in_model() {
+        let boundary = "----test-boundary-modelrej";
+        let evil_model = format!("gpt{boundary}suffix");
+        let err = build_transcription_multipart(boundary, &evil_model, "clip.wav", b"AUDIO")
+            .unwrap_err();
+        assert!(err.contains("model"), "expected a model boundary-collision error, got {err}");
+    }
+
+    /// A payload that embeds the boundary token is rejected cleanly (never framed
+    /// into a corruptible body); a clean payload frames fine.
+    #[test]
+    fn transcription_multipart_rejects_boundary_in_payload() {
+        let boundary = "----test-boundary-xyz";
+        let mut payload = b"leading".to_vec();
+        payload.extend_from_slice(boundary.as_bytes());
+        payload.extend_from_slice(b"trailing");
+        let err = build_transcription_multipart(boundary, "m", "clip.wav", &payload).unwrap_err();
+        assert!(err.contains("boundary"), "expected a boundary-collision error, got {err}");
+
+        let ok = build_transcription_multipart(boundary, "m", "clip.wav", b"clean audio bytes");
+        assert!(ok.is_ok(), "a clean payload must frame successfully");
+        let body = ok.unwrap();
+        assert!(
+            body.starts_with(format!("--{boundary}\r\n").as_bytes()),
+            "the body starts with the opening boundary delimiter"
+        );
     }
 }

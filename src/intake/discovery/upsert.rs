@@ -79,6 +79,11 @@ use crate::intake::discovery::schema::{CandidateStatus, DiscoveryCandidate};
 /// a daily refresh would erase the `size_b`/`vram_footprint_gb`/`gfx1151_class`
 /// a fetch/measure step had recorded on a `Fetching`/`Swept` model. A real
 /// measurement (non-`NULL`, non-`'unknown'`) still overwrites as before.
+///
+/// `modality` (CB-02) is treated the same way: a re-observation recomputes it
+/// from the listing and overwrites when it has a value, but a `NULL`
+/// (unclassifiable this pass) is `COALESCE`d so it never erases a modality a
+/// richer earlier listing already classified.
 pub async fn upsert_candidate(
     pool: &PgPool,
     candidate: &DiscoveryCandidate,
@@ -87,8 +92,8 @@ pub async fn upsert_candidate(
         "INSERT INTO model_discovery_candidate \
              (model_name, hf_repo, category, status, gfx1151_class, size_b, \
               vram_footprint_gb, discovery_source, discovery_score, \
-              discovered_at, last_seen_at, rationale) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), $10) \
+              discovered_at, last_seen_at, rationale, modality) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), $10, $11) \
          ON CONFLICT (model_name) DO UPDATE SET \
              hf_repo = EXCLUDED.hf_repo, \
              category = EXCLUDED.category, \
@@ -101,7 +106,8 @@ pub async fn upsert_candidate(
                                   ELSE EXCLUDED.gfx1151_class END, \
              size_b = COALESCE(EXCLUDED.size_b, model_discovery_candidate.size_b), \
              vram_footprint_gb = COALESCE(EXCLUDED.vram_footprint_gb, \
-                                          model_discovery_candidate.vram_footprint_gb)",
+                                          model_discovery_candidate.vram_footprint_gb), \
+             modality = COALESCE(EXCLUDED.modality, model_discovery_candidate.modality)",
     )
     .bind(&candidate.model_name)
     .bind(&candidate.hf_repo)
@@ -113,6 +119,7 @@ pub async fn upsert_candidate(
     .bind(&candidate.discovery_source)
     .bind(candidate.discovery_score)
     .bind(candidate.rationale.as_deref())
+    .bind(candidate.modality.map(|m| m.as_str()))
     .execute(pool)
     .await
     .map_err(|e| {

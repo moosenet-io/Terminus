@@ -1597,6 +1597,53 @@ pub async fn read_assistant_cells(pool: &PgPool) -> Result<Vec<AssistantCell>, T
     }
 }
 
+/// SUITE-DOC (S125): per-model rollup of the dimension scores for ONE
+/// `task_category` (e.g. `"document_parsing"`): sample count, mean dispersion,
+/// last-run — the same shape as [`read_assistant_cells`] but scoped to a single
+/// task_category and grouped by model only (a newcats suite has one dimension
+/// but several metrics/cases per model, so the coverage signal is per-model, not
+/// per-dimension). `dimension` carries the task_category label for the caller's
+/// convenience. Tolerates the table being absent → empty vec.
+pub async fn read_task_category_cells(
+    pool: &PgPool,
+    task_category: &str,
+) -> Result<Vec<AssistantCell>, ToolError> {
+    let sql = "SELECT model_id, count(*)::bigint, avg(std_dev), max(created_at) \
+         FROM assistant_dimension_score WHERE task_category = $1 GROUP BY model_id";
+    type Row = (
+        String,
+        i64,
+        Option<f64>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    );
+    match sqlx::query_as::<_, Row>(sql)
+        .bind(task_category)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(|(model_name, n, sd, last)| AssistantCell {
+                model_name,
+                dimension: task_category.to_string(),
+                n_samples: n,
+                score_stddev: sd,
+                last_run_at: last,
+            })
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read {task_category} task-category cells: {msg}"
+                )))
+            }
+        }
+    }
+}
+
 /// Latest serving/operational profile per model (the fleet card's serving
 /// facts). Tolerates the operational-profile table being absent → empty vec.
 pub async fn read_serving_rows(pool: &PgPool) -> Result<Vec<ServingRow>, ToolError> {

@@ -485,6 +485,24 @@ pub fn default_suites_for(model_name: &str) -> Vec<String> {
     let n = model_name.to_lowercase();
     let v = if n.contains("diffusiongemma") || n.contains("dgem") {
         vec!["diffusion"]
+    } else if n.contains("sd-turbo")
+        || n.contains("stable-diffusion")
+        || n.contains("sdxl")
+        || n.contains("flux")
+    {
+        // SUITE-IMG: text-to-image models default to the image-generation suite
+        // (the Ollama-based context/code/agent suites don't apply to them).
+        vec!["image_generation"]
+    } else if n.contains("docling") || n.contains("docparse") || n.contains("ocr") {
+        // SUITE-DOC: a document-parse model (docling/OCR) is served through
+        // Chord's /v1/documents/parse, not an Ollama chat serve — its default
+        // is the document_parsing suite, not context/code.
+        vec!["document_parsing"]
+    } else if is_stt_model(&n) {
+        // SUITE-STT: a whisper/ASR model is served behind Chord's
+        // `/v1/audio/transcriptions` route — the Ollama-based suites can't load
+        // it, so its default is the `stt` suite (mirrors the diffusion default).
+        vec!["stt"]
     } else if is_embedding_model(&n) {
         // SUITE-EMB (TERM #508): an embedding model can't run the chat-shaped
         // context/code/agent suites — its default is the IR-retrieval suite.
@@ -515,6 +533,14 @@ pub fn default_suites_for(model_name: &str) -> Vec<String> {
 pub fn is_non_ollama_daemon(model_name: &str) -> bool {
     let n = model_name.to_lowercase();
     n.contains("diffusiongemma") || n.contains("dgem")
+}
+
+/// SUITE-STT: whether a model is a speech-to-text (ASR) model reached through
+/// Chord's OpenAI-compatible `/v1/audio/transcriptions` route rather than the
+/// Ollama load path. Name-heuristic (whisper family), same style as
+/// [`is_non_ollama_daemon`]. Pure. Expects an already-lowercased name.
+pub fn is_stt_model(model_name_lower: &str) -> bool {
+    model_name_lower.contains("whisper") || model_name_lower.contains("stt")
 }
 
 /// Whether a model is a text-embedding model (SUITE-EMB): matched by the common
@@ -619,7 +645,7 @@ impl RustTool for ModelIntake {
                 "model_name": { "type": "string", "description": "Ollama model name, e.g. 'gpt-oss:20b'" },
                 "suites": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing", "vision_qa", "reranking"] },
+                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing", "vision_qa", "reranking", "image_generation", "document_parsing", "stt"] },
                     "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other suites don't apply to it. 'tool_routing' profiles function-calling over Chord's OpenAI-compatible /v1/chat/completions (correct-tool@1, parameter validity, decoy rejection, multi-step) — a first-class generalization of the 'agent' suite's tool-selection path. 'vision_qa' profiles a vision/VLM model on image-QA via Chord's chat/vision route (accuracy, caption similarity, hallucination, latency, VRAM)."
                 },
                 "tiers": {
@@ -706,6 +732,31 @@ impl RustTool for ModelIntake {
                  The Ollama-based intake suites cannot load it — skipped. Request the \
                  'diffusion' suite to profile it via its own daemon harness.\n",
             );
+            return Ok(out);
+        }
+
+        // SUITE-STT: an STT model is served behind Chord's OpenAI-compatible
+        // `/v1/audio/transcriptions` route — the Ollama-based load path can't
+        // load it. When the 'stt' suite is requested, run it via its own corpus
+        // harness and return before the Ollama-load section below (mirrors the
+        // diffusion daemon guard). Any Ollama-based suites requested alongside it
+        // are not applicable and are noted, never silently dropped.
+        if suites.iter().any(|s| s == "stt") {
+            let res = runner::run_stt_suite(model_name).await?;
+            out.push_str("=== STT suite ===\n");
+            out.push_str(&format!(
+                "clips run: {}\navg WER (digit-normalized): {:.3}\navg real-time factor: {:.2}\n",
+                res.clips_run, res.avg_wer, res.avg_rtf,
+            ));
+            for line in &res.per_clip {
+                out.push_str(&format!("  {line}\n"));
+            }
+            if suites.iter().any(|s| s != "stt") {
+                out.push_str(
+                    "Note: Ollama-based suites (context/code/agent) are not applicable to an \
+                     STT model served behind Chord's transcription route and were skipped.\n",
+                );
+            }
             return Ok(out);
         }
 
@@ -930,6 +981,44 @@ impl RustTool for ModelIntake {
                 out.push_str(&format!("  {line}\n"));
             }
             out.push('\n');
+        }
+
+        // SUITE-IMG: image-generation suite (its own profile row + `openai`
+        // backend via Chord's `/v1/images/generations`, sd-turbo behind it).
+        // Self-contained — does not use the Ollama `profile_id` above.
+        if suites.iter().any(|s| s == "image_generation") {
+            let res = runner::run_image_generation_suite(model_name).await?;
+            out.push_str("=== Image-generation suite ===\n");
+            out.push_str(&format!(
+                "prompts run: {}\nsuccessful: {}/{}\navg time_to_image_ms: {:.0}\n",
+                res.prompts_run, res.success_count, res.prompts_run, res.avg_time_to_image_ms,
+            ));
+            for line in &res.per_prompt {
+                out.push_str(&format!("  {line}\n"));
+            }
+            out.push('\n');
+        }
+
+        // SUITE-DOC: document_parsing runs through Chord `/v1/documents/parse`
+        // (docling), owns its own profile row, and reads its corpus from
+        // INTAKE_CORPUS_DIR — so it dispatches directly, independent of the
+        // Ollama-based context/code/agent suites above. A NotConfigured corpus
+        // is reported inline, not fatal to the rest of the run.
+        if suites.iter().any(|s| s == "document_parsing") {
+            out.push_str("=== Document-parsing suite ===\n");
+            match runner::run_document_parsing_suite(model_name).await {
+                Ok(res) => {
+                    out.push_str(&format!(
+                        "cases run: {}\navg field_accuracy: {:.2}\navg latency_ms: {:.0}\n",
+                        res.cases_run, res.avg_field_accuracy, res.avg_latency_ms,
+                    ));
+                    for line in &res.per_case {
+                        out.push_str(&format!("  {line}\n"));
+                    }
+                    out.push('\n');
+                }
+                Err(e) => out.push_str(&format!("skipped: {e}\n\n")),
+            }
         }
 
         out.push_str("Note: coherence_score stored as NULL (LLM-judge deferred).\n");
@@ -1474,6 +1563,24 @@ mod tests {
         assert_eq!(default_suites_for("nomic-embed-text:latest"), vec!["embedding_retrieval"]);
         assert_eq!(default_suites_for("bge-large-en"), vec!["embedding_retrieval"]);
         assert_eq!(default_suites_for("mxbai-embed-large"), vec!["embedding_retrieval"]);
+        // SUITE-IMG: text-to-image models route to the image-generation suite.
+        assert_eq!(default_suites_for("sd-turbo"), vec!["image_generation"]);
+        assert_eq!(default_suites_for("stable-diffusion-3.5"), vec!["image_generation"]);
+        // SUITE-DOC: document-parse models route to the document_parsing suite.
+        assert_eq!(default_suites_for("docling-v2"), vec!["document_parsing"]);
+        assert_eq!(default_suites_for("granite-docling-258m"), vec!["document_parsing"]);
+        // SUITE-STT: whisper / ASR models route to the stt suite.
+        assert_eq!(default_suites_for("faster-whisper:small"), vec!["stt"]);
+        assert_eq!(default_suites_for("whisper-large-v3"), vec!["stt"]);
+    }
+
+    #[test]
+    fn is_stt_model_matches_whisper_family() {
+        assert!(is_stt_model("faster-whisper:small"));
+        assert!(is_stt_model("whisper-large-v3"));
+        assert!(is_stt_model("my-stt-model"));
+        assert!(!is_stt_model("qwen3:8b"));
+        assert!(!is_stt_model("diffusiongemma-26b-a4b"));
     }
 
     #[test]

@@ -96,6 +96,12 @@ const VISION_QA_DIMENSION: &str = "vision_description";
 /// SUITE-RRK: the reranking suite's test-family tag (nDCG uplift + latency,
 /// distinct from the other families).
 pub const TEST_TYPE_RERANKING: &str = "reranking";
+/// SUITE-IMG (S125): the image-generation suite's test-family tag. Distinct from
+/// `TEST_TYPE_DIFFUSION` — image generation (text→image, sd-turbo behind Chord's
+/// `/v1/images/generations`) and the diffusion-language probe are separate suites
+/// with separate `task_category`s (`newcats::image_generation::TASK_CATEGORY ==
+/// "image_generation"` vs `newcats::diffusion::TASK_CATEGORY == "diffusion"`).
+pub const TEST_TYPE_IMAGE_GENERATION: &str = "image_generation";
 
 /// The single serving/context-profile leaf category.
 pub const SERVING_CATEGORY: &str = "context_profile";
@@ -113,6 +119,37 @@ pub const TOOL_ROUTING_CATEGORY: &str = "tool_routing";
 /// is derived by matching it (duplicated as a string here, matching how
 /// `ASSISTANT_DIMENSIONS` duplicates the `assistant/dim*.rs` `DIMENSION` consts).
 pub const RERANKING_CATEGORY: &str = "rerank_relevance";
+/// SUITE-IMG: the image-generation leaf category — the `dimension` the suite
+/// writes (`newcats::image_generation::DIMENSION == "text_to_image"`).
+pub const IMAGE_GENERATION_CATEGORY: &str = "text_to_image";
+/// SUITE-IMG: the `task_category` the suite writes its rows under
+/// (`newcats::image_generation::TASK_CATEGORY`) — the filter for
+/// [`storage::read_task_category_cells`] (distinct from the leaf dimension above).
+pub const IMAGE_GENERATION_TASK_CATEGORY: &str = "image_generation";
+/// SUITE-DOC (S125): the document_parsing suite's test-family tag (field accuracy
+/// + CER/WER + table F1 via Chord `/v1/documents/parse`).
+pub const TEST_TYPE_DOCUMENT_PARSING: &str = "document_parsing";
+/// SUITE-DOC: the single document_parsing leaf category (matches
+/// [`crate::intake::newcats::document_parsing::TASK_CATEGORY`]); also the
+/// `task_category` filter for [`storage::read_task_category_cells`].
+pub const DOCUMENT_PARSING_CATEGORY: &str = "document_parsing";
+/// SUITE-STT (S125): the voice_transcription suite's test-family tag (WER/CER +
+/// latency + RTF via Chord's `/v1/audio/transcriptions`).
+pub const TEST_TYPE_VOICE_TRANSCRIPTION: &str = "voice_transcription";
+/// SUITE-STT: the voice_transcription leaf category — the `dimension` the suite
+/// writes (`newcats::voice_transcription::DIMENSION == "asr_transcription"`).
+pub const VOICE_TRANSCRIPTION_CATEGORY: &str = "asr_transcription";
+/// SUITE-STT: the `task_category` the suite writes its rows under
+/// (`newcats::voice_transcription::TASK_CATEGORY`) — the `read_task_category_cells`
+/// filter (distinct from the leaf dimension above).
+pub const VOICE_TRANSCRIPTION_TASK_CATEGORY: &str = "voice_transcription";
+/// SUITE-TTS (S125): the text-to-speech suite's test-family tag (intelligibility
+/// via loopback ASR + synthesis performance).
+pub const TEST_TYPE_TTS: &str = "tts";
+/// SUITE-TTS: the text-to-speech leaf category / `task_category`
+/// (`newcats::tts::TASK_CATEGORY`), used both as the display category and the
+/// [`storage::read_task_category_cells`] filter.
+pub const TTS_CATEGORY: &str = "tts";
 
 /// A cell's coverage status. `not_run` is FIRST-CLASS — representing gaps is the
 /// catalog's whole job.
@@ -217,6 +254,17 @@ pub struct CatalogInputs {
     pub serving: Vec<ServingRow>,
     /// Agent tool-use rollups.
     pub agent: Vec<AgentRollup>,
+    /// SUITE-IMG (S125): image_generation rollups — one `AssistantCell` per model
+    /// with a `task_category = "image_generation"` dimension-score row, read via
+    /// [`storage::read_task_category_cells`] (a proper per-task_category filtered
+    /// reader, unlike `read_assistant_cells` which ignores task_category).
+    pub image_generation: Vec<AssistantCell>,
+    /// SUITE-DOC (S125): document_parsing rollups (`task_category = "document_parsing"`).
+    pub document_parsing: Vec<AssistantCell>,
+    /// SUITE-STT (S125): voice_transcription rollups (`task_category = "voice_transcription"`).
+    pub voice_transcription: Vec<AssistantCell>,
+    /// SUITE-TTS (S125): text-to-speech rollups (`task_category = "tts"`).
+    pub tts: Vec<AssistantCell>,
     /// The coder epoch stamped on `run` coder cells (`current_epoch()` live).
     pub coder_epoch: String,
 }
@@ -376,6 +424,18 @@ pub fn build_catalog(inputs: &CatalogInputs) -> Vec<ModelCatalog> {
     }
     for a in &inputs.agent {
         universe.insert(a.model_name.clone());
+    }
+    for d in &inputs.image_generation {
+        universe.insert(d.model_name.clone());
+    }
+    for d in &inputs.document_parsing {
+        universe.insert(d.model_name.clone());
+    }
+    for d in &inputs.voice_transcription {
+        universe.insert(d.model_name.clone());
+    }
+    for d in &inputs.tts {
+        universe.insert(d.model_name.clone());
     }
 
     let mut out = Vec::with_capacity(universe.len());
@@ -659,6 +719,110 @@ pub fn build_catalog(inputs: &CatalogInputs) -> Vec<ModelCatalog> {
         };
         cells.push(rerank_cell);
 
+        // ---- image-generation cell (SUITE-IMG) -------------------------------
+        // The suite writes `assistant_dimension_score` rows under
+        // `task_category = "image_generation"` (dimension `text_to_image`). Read
+        // via the per-task_category filtered reader `read_task_category_cells`
+        // (threaded into `inputs.image_generation`), so the cell flips to `Run`
+        // only for a genuine image_generation row — never a cross-suite dimension
+        // collision. `Run` when measured, else the explicit `not_run` gap.
+        let imagegen_row = inputs
+            .image_generation
+            .iter()
+            .find(|a| a.model_name == model);
+        let imagegen_cell = match imagegen_row {
+            Some(a) if a.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_IMAGE_GENERATION.to_string(),
+                task_category: IMAGE_GENERATION_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                // Image generation is a success/hardware probe, not a pass-rate;
+                // only sample count + recency are meaningful (like the serving cell).
+                pass_rate: None,
+                n_samples: Some(a.n_samples),
+                score_stddev: a.score_stddev,
+                low_confidence: Some(a.n_samples <= 1),
+                last_run_at: a.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_IMAGE_GENERATION, IMAGE_GENERATION_CATEGORY),
+        };
+        cells.push(imagegen_cell);
+
+        // ---- document_parsing cell (SUITE-DOC) -------------------------------
+        // The suite writes rows under `task_category = "document_parsing"` (read
+        // via `read_task_category_cells` into `inputs.document_parsing`). `Run`
+        // when a measured row exists, else the explicit `not_run` gap.
+        let doc_row = inputs
+            .document_parsing
+            .iter()
+            .find(|d| d.model_name == model);
+        let doc_cell = match doc_row {
+            Some(d) if d.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_DOCUMENT_PARSING.to_string(),
+                task_category: DOCUMENT_PARSING_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                pass_rate: None,
+                n_samples: Some(d.n_samples),
+                score_stddev: d.score_stddev,
+                low_confidence: Some(d.n_samples <= 1),
+                last_run_at: d.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_DOCUMENT_PARSING, DOCUMENT_PARSING_CATEGORY),
+        };
+        cells.push(doc_cell);
+
+        // ---- voice_transcription cell (SUITE-STT) ----------------------------
+        // The suite writes rows under `task_category = "voice_transcription"`
+        // (read via `read_task_category_cells` into `inputs.voice_transcription`).
+        let stt_row = inputs
+            .voice_transcription
+            .iter()
+            .find(|d| d.model_name == model);
+        let stt_cell = match stt_row {
+            Some(d) if d.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_VOICE_TRANSCRIPTION.to_string(),
+                task_category: VOICE_TRANSCRIPTION_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                pass_rate: None,
+                n_samples: Some(d.n_samples),
+                score_stddev: d.score_stddev,
+                low_confidence: Some(d.n_samples <= 1),
+                last_run_at: d.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_VOICE_TRANSCRIPTION, VOICE_TRANSCRIPTION_CATEGORY),
+        };
+        cells.push(stt_cell);
+
+        // ---- tts cell (SUITE-TTS) --------------------------------------------
+        // The suite writes rows under `task_category = "tts"` (read via
+        // `read_task_category_cells` into `inputs.tts`).
+        let tts_row = inputs.tts.iter().find(|d| d.model_name == model);
+        let tts_cell = match tts_row {
+            Some(d) if d.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_TTS.to_string(),
+                task_category: TTS_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                pass_rate: None,
+                n_samples: Some(d.n_samples),
+                score_stddev: d.score_stddev,
+                low_confidence: Some(d.n_samples <= 1),
+                last_run_at: d.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_TTS, TTS_CATEGORY),
+        };
+        cells.push(tts_cell);
+
         // ---- serving facts (fleet card) --------------------------------------
         let serving = ServingFacts {
             max_context_safe: serving_row.and_then(|s| s.max_context_safe),
@@ -744,6 +908,17 @@ pub async fn refresh_fleet_catalog(pool: &PgPool) -> Result<usize, ToolError> {
     let assistant = storage::read_assistant_cells(pool).await?;
     let serving = storage::read_serving_rows(pool).await?;
     let agent = storage::read_agent_rollups(pool).await?;
+    // SUITE-IMG/DOC/STT/TTS (S125): per-task_category filtered rollups — each read
+    // via `read_task_category_cells` on the row's own `task_category`, so a cell
+    // flips to `Run` only for a genuine row of that suite (never a cross-suite
+    // dimension-name collision the unfiltered assistant reader could allow).
+    let image_generation =
+        storage::read_task_category_cells(pool, IMAGE_GENERATION_TASK_CATEGORY).await?;
+    let document_parsing =
+        storage::read_task_category_cells(pool, DOCUMENT_PARSING_CATEGORY).await?;
+    let voice_transcription =
+        storage::read_task_category_cells(pool, VOICE_TRANSCRIPTION_TASK_CATEGORY).await?;
+    let tts = storage::read_task_category_cells(pool, TTS_CATEGORY).await?;
 
     // Fleet list: nominations UNION the models that appear in any result table.
     // Best-effort — an unreadable nominations file still yields a catalog built
@@ -759,6 +934,10 @@ pub async fn refresh_fleet_catalog(pool: &PgPool) -> Result<usize, ToolError> {
         assistant,
         serving,
         agent,
+        image_generation,
+        document_parsing,
+        voice_transcription,
+        tts,
         coder_epoch: epoch,
     };
     let catalog = build_catalog(&inputs);
@@ -1337,9 +1516,10 @@ mod tests {
             "every cell must be not_run"
         );
         // Coder (3) + assistant (7) + serving (1) + agent (1) +
-        // embedding_retrieval (1, SUITE-EMB) + tool_routing (1, SUITE-TOOL) + vision_qa (1, SUITE-VQA) + reranking (1, SUITE-RRK) = 16 cells.
-        assert_eq!(m.cells.len(), 16);
-        assert_eq!(m.not_run_count, 16);
+        // embedding_retrieval (1, SUITE-EMB) + tool_routing (1, SUITE-TOOL) + vision_qa (1, SUITE-VQA) + reranking (1, SUITE-RRK)
+        // + image_generation (1, SUITE-IMG) + document_parsing (1, SUITE-DOC) + voice_transcription (1, SUITE-STT) + tts (1, SUITE-TTS) = 20 cells.
+        assert_eq!(m.cells.len(), 20);
+        assert_eq!(m.not_run_count, 20);
         // multi_file gap is explicitly present, not omitted.
         assert_eq!(
             cell(&cat, "ghost", "coder", "multi_file").status,

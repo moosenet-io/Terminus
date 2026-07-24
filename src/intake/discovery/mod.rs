@@ -27,7 +27,7 @@ pub mod storage;
 pub mod tool;
 pub mod upsert;
 
-pub use schema::{CandidateStatus, DiscoveryCandidate, FleetCategory};
+pub use schema::{CandidateStatus, DiscoveryCandidate, FleetCategory, Modality};
 
 /// Register the brochure's MCP tools on the CORE registry. Wired into
 /// `crate::intake::register` (the same Chord-served core surface

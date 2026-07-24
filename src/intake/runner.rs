@@ -574,6 +574,133 @@ pub struct DiffusionSuiteOutcome {
     pub per_use_case: Vec<String>,
 }
 
+/// SUITE-STT: outcome of the speech-to-text suite for the tool return summary.
+pub struct SttSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub clips_run: usize,
+    /// Mean digit-normalized WER over the clips that transcribed (lower better).
+    pub avg_wer: f64,
+    /// Mean real-time factor over the clips whose audio duration was known.
+    pub avg_rtf: f64,
+    /// One-line-per-clip summary, in manifest order.
+    pub per_clip: Vec<String>,
+}
+
+/// SUITE-STT: run the speech-to-text suite end-to-end against `model_name`.
+///
+/// Loads the STT corpus manifest from `INTAKE_CORPUS_DIR`
+/// (`[{ "audio_file", "reference" }, ...]`, e.g. the bundled <host> corpus at
+/// `/opt/ollama-models/mint-corpora/stt/`), then for each clip: reads the audio
+/// bytes, derives the clip duration from its WAV header
+/// ([`crate::intake::newcats::voice_transcription::wav_duration_ms`]), transcribes
+/// it through [`crate::intake::infer::transcribe_with_metrics`] (the `openai`
+/// backend arm → Chord's `/v1/audio/transcriptions` in front of faster-whisper),
+/// and writes the digit-normalized WER / accuracy / latency / RTF rows via
+/// [`crate::intake::newcats::voice_transcription::score_and_write`].
+///
+/// Creates its own `model_profiles` row (provider `"openai"`, since a whisper
+/// model is served behind Chord's OpenAI-compatible route, not Ollama) — mirrors
+/// [`run_diffusion_suite`]'s own-profile-row pattern. A per-clip read/transcribe
+/// error is recorded and the clip skipped rather than aborting the whole suite —
+/// the same "failure is still useful signal" convention as every other newcats
+/// suite. A missing/unreadable corpus fails clean with the manifest's
+/// `ToolError` before any profile row is created.
+pub async fn run_stt_suite(model_name: &str) -> Result<SttSuiteOutcome, ToolError> {
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::transcribe_with_metrics;
+    use crate::intake::newcats::text_similarity::word_error_rate_normalized;
+    use crate::intake::newcats::voice_transcription::{
+        self, wav_duration_ms, TranscriptionOutcome,
+    };
+
+    // Resolve + parse the corpus up front so a missing/broken corpus fails clean
+    // before we create any DB rows.
+    let dir = crate::intake::code::corpus_dir()?;
+    let manifest = voice_transcription::load_manifest(&dir)?;
+
+    let profile_id = create_profile_row_for_provider(model_name, "openai").await?;
+    let pool = storage::get_pool().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(e.to_string()))?;
+    let model_id = ModelId::from(model_name);
+
+    let mut per_clip = Vec::with_capacity(manifest.len());
+    let mut wer_sum = 0.0;
+    let mut rtf_sum = 0.0;
+    let mut rtf_n = 0usize;
+    let mut n = 0usize;
+
+    for entry in &manifest {
+        let audio_path = dir.join(&entry.audio_file);
+        let audio_bytes = match std::fs::read(&audio_path) {
+            Ok(b) => b,
+            Err(e) => {
+                per_clip.push(format!("{}: read error ({e})", entry.audio_file));
+                continue;
+            }
+        };
+        let audio_duration_ms = wav_duration_ms(&audio_bytes);
+        let metrics = transcribe_with_metrics(
+            &client,
+            model_name,
+            &audio_bytes,
+            &entry.audio_file,
+            Duration::from_secs(300),
+        )
+        .await;
+        if let Some(err) = &metrics.error {
+            per_clip.push(format!("{}: error ({err})", entry.audio_file));
+            continue;
+        }
+        let backend_tag = metrics
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Gpu);
+        let outcome = TranscriptionOutcome {
+            transcript: metrics.transcript.clone(),
+            latency_ms: metrics.latency_ms,
+            audio_duration_ms,
+        };
+
+        let wer = word_error_rate_normalized(&outcome.transcript, &entry.reference);
+        wer_sum += wer;
+        let rtf = voice_transcription::real_time_factor(outcome.latency_ms, audio_duration_ms);
+        if let Some(r) = rtf {
+            rtf_sum += r;
+            rtf_n += 1;
+        }
+        n += 1;
+
+        voice_transcription::score_and_write(
+            &pool,
+            profile_id,
+            model_id.clone(),
+            backend_tag,
+            &entry.reference,
+            &outcome,
+        )
+        .await?;
+
+        per_clip.push(format!(
+            "{}: wer={wer:.3} latency_ms={} rtf={}",
+            entry.audio_file,
+            outcome.latency_ms,
+            rtf.map(|r| format!("{r:.2}")).unwrap_or_else(|| "n/a".into()),
+        ));
+    }
+
+    Ok(SttSuiteOutcome {
+        profile_id,
+        clips_run: n,
+        avg_wer: if n > 0 { wer_sum / n as f64 } else { 0.0 },
+        avg_rtf: if rtf_n > 0 { rtf_sum / rtf_n as f64 } else { 0.0 },
+        per_clip,
+    })
+}
+
 /// Run the diffusion suite (MINT-DIFF-01) end-to-end against `model_name`: for
 /// each entry in [`crate::intake::newcats::diffusion::USE_CASES`], run one
 /// generation through [`crate::intake::infer::infer_with_metrics`] (which
@@ -1034,6 +1161,314 @@ pub async fn run_reranking_suite(model_name: &str) -> Result<RerankingSuiteOutco
     })
 }
 
+/// Outcome of the image-generation suite (SUITE-IMG) for the tool return summary.
+pub struct ImageGenSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub prompts_run: usize,
+    pub success_count: usize,
+    pub avg_time_to_image_ms: f64,
+    /// One-line-per-prompt summary, in corpus order.
+    pub per_prompt: Vec<String>,
+}
+
+/// Run the image-generation suite (SUITE-IMG) end-to-end against `model_name`:
+/// for each prompt in the corpus ([`crate::intake::newcats::image_generation::load_prompts`],
+/// `INTAKE_CORPUS_DIR/image_generation.json` with an in-source default set), run
+/// one generation through [`crate::intake::infer::imagegen_with_metrics`] (which
+/// routes an `openai`-kind model onto Chord's `/v1/images/generations` route —
+/// sd-turbo diffusers behind Chord), derive a
+/// [`crate::intake::newcats::image_generation::GenerationOutcome`] from the
+/// normalized [`crate::intake::infer::ImageGenMetrics`], and write its success /
+/// time-to-image / VRAM rows via
+/// [`crate::intake::newcats::image_generation::score_and_write`].
+///
+/// Mirrors [`run_diffusion_suite`]: creates its own `model_profiles` row
+/// (provider `"openai"`, since an image-generation backend never goes through
+/// [`run_context_suite`]), and a per-prompt generation error is recorded
+/// (`success = false`, whatever timing/VRAM is available) rather than aborting
+/// the whole suite — the same "failure is still useful signal" convention every
+/// other `newcats` category follows. CLIP prompt-adherence is left NOT MEASURED
+/// (`clip_score = None`) — no CLIP scorer is wired on this box (scaffolded).
+pub async fn run_image_generation_suite(model_name: &str) -> Result<ImageGenSuiteOutcome, ToolError> {
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::imagegen_with_metrics;
+    use crate::intake::newcats::image_generation::{self, GenerationOutcome};
+
+    let profile_id = create_profile_row_for_provider(model_name, "openai").await?;
+    let pool = storage::get_pool().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(e.to_string()))?;
+    let model_id = ModelId::from(model_name);
+    let prompts = image_generation::load_prompts();
+
+    let mut per_prompt = Vec::with_capacity(prompts.len());
+    let mut time_sum = 0.0;
+    let mut success_count = 0usize;
+    let mut n = 0usize;
+
+    for p in &prompts {
+        let metrics = imagegen_with_metrics(&client, model_name, &p.prompt, Duration::from_secs(600)).await;
+        let backend_tag = metrics
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Gpu);
+        let outcome = GenerationOutcome {
+            success: metrics.success,
+            time_to_image_ms: metrics.time_to_image_ms,
+            // `None` VRAM is recorded as 0 in the row (the field is non-optional);
+            // the metric doc notes a 0 here means "unreadable", not "measured 0".
+            vram_peak_mb: metrics.vram_peak_mb.unwrap_or(0),
+            failure_reason: metrics.error.clone(),
+            // CLIP not measured on this box (no CLIP scorer wired) — scaffolded.
+            clip_score: None,
+        };
+        time_sum += outcome.time_to_image_ms as f64;
+        if outcome.success {
+            success_count += 1;
+        }
+        n += 1;
+
+        image_generation::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, &outcome).await?;
+
+        per_prompt.push(if let Some(err) = &metrics.error {
+            format!("{}: error ({err})", p.label)
+        } else {
+            format!(
+                "{}: success={} time_ms={} vram_mb={}",
+                p.label, outcome.success, outcome.time_to_image_ms, outcome.vram_peak_mb,
+            )
+        });
+    }
+
+    Ok(ImageGenSuiteOutcome {
+        profile_id,
+        prompts_run: n,
+        success_count,
+        avg_time_to_image_ms: if n > 0 { time_sum / n as f64 } else { 0.0 },
+        per_prompt,
+    })
+}
+
+/// Outcome of the document_parsing suite (SUITE-DOC) for the tool summary.
+pub struct DocParseSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub cases_run: usize,
+    pub avg_field_accuracy: f64,
+    pub avg_latency_ms: f64,
+    /// One line per corpus case, in manifest order.
+    pub per_case: Vec<String>,
+}
+
+/// Run the document_parsing suite (SUITE-DOC) end-to-end against `model_name`:
+/// load the corpus from `INTAKE_CORPUS_DIR/document_parsing/` (see
+/// [`crate::intake::newcats::document_parsing::load_corpus`]), and for each case
+/// POST its document bytes to Chord's `/v1/documents/parse` via
+/// [`crate::intake::infer::docparse_with_metrics`] (the `openai` arm), derive an
+/// [`crate::intake::newcats::document_parsing::ExtractionOutcome`] from the
+/// normalized [`crate::intake::infer::DocParseMetrics`], and write the
+/// field-accuracy / CER / WER / table-F1 rows via that module's `score_and_write`.
+///
+/// Creates its own `model_profiles` row (provider `"chord"`, since a doc-parse
+/// model is served through Chord, not Ollama). A per-case parse error is
+/// recorded (a zero-score row from whatever timing is available) rather than
+/// aborting the whole suite — the same "failure is still useful signal"
+/// convention every other `newcats` category uses. An unset `INTAKE_CORPUS_DIR`
+/// (or missing manifest) returns `ToolError::NotConfigured` — the caller decides
+/// whether that is a hard error or a clean skip.
+pub async fn run_document_parsing_suite(model_name: &str) -> Result<DocParseSuiteOutcome, ToolError> {
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::docparse_with_metrics;
+    use crate::intake::newcats::document_parsing::{self, ExtractionOutcome};
+
+    let (corpus_dir, cases) = document_parsing::load_corpus()?;
+    let profile_id = create_profile_row_for_provider(model_name, "chord").await?;
+    let pool = storage::get_pool().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(e.to_string()))?;
+    let model_id = ModelId::from(model_name);
+
+    let mut per_case = Vec::with_capacity(cases.len());
+    let mut accuracy_sum = 0.0;
+    let mut latency_sum = 0.0;
+    let mut n = 0usize;
+
+    for case in &cases {
+        let path = corpus_dir.join(&case.file);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                per_case.push(format!("{}: error reading {} ({e})", case.id, path.display()));
+                continue;
+            }
+        };
+        let metrics =
+            docparse_with_metrics(&client, model_name, &bytes, &case.file, Duration::from_secs(600))
+                .await;
+        let backend_tag = metrics
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Gpu);
+        let truth = case.ground_truth();
+        let outcome = ExtractionOutcome {
+            raw_output: String::new(),
+            text: metrics.text.clone(),
+            fields: metrics.fields.clone(),
+            tables: metrics.tables.clone(),
+            latency_ms: metrics.latency_ms,
+            response_tokens: metrics.response_tokens,
+        };
+        let accuracy = document_parsing::score_field_accuracy(
+            &truth.fields,
+            &document_parsing::extracted_fields(&outcome),
+        );
+        accuracy_sum += accuracy;
+        latency_sum += outcome.latency_ms as f64;
+        n += 1;
+
+        document_parsing::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, &truth, &outcome)
+            .await?;
+
+        per_case.push(if let Some(err) = &metrics.error {
+            format!("{}: error ({err})", case.id)
+        } else {
+            format!(
+                "{}: field_acc={accuracy:.2} latency_ms={} tables={}",
+                case.id,
+                outcome.latency_ms,
+                outcome.tables.len(),
+            )
+        });
+    }
+
+    Ok(DocParseSuiteOutcome {
+        profile_id,
+        cases_run: n,
+        avg_field_accuracy: if n > 0 { accuracy_sum / n as f64 } else { 0.0 },
+        avg_latency_ms: if n > 0 { latency_sum / n as f64 } else { 0.0 },
+        per_case,
+    })
+}
+
+/// Outcome of the TTS suite (S125 SUITE-TTS) for the tool return summary.
+pub struct TtsSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub cases_run: usize,
+    pub avg_loopback_wer: f64,
+    pub avg_rtf: Option<f64>,
+    /// One-line-per-case summary, in [`crate::intake::newcats::tts::load_cases`] order.
+    pub per_case: Vec<String>,
+}
+
+/// Run the TTS suite (S125 SUITE-TTS) end-to-end against `model_name`: for each
+/// case in [`crate::intake::newcats::tts::load_cases`], synthesize speech through
+/// Chord's `/v1/audio/speech` ([`crate::intake::infer::synthesize_with_metrics`]),
+/// transcribe the produced audio back through the SHARED STT arm
+/// ([`crate::intake::infer::transcribe_with_metrics`] — the SUITE-STT hand-rolled
+/// multipart transcribe, deduped at integration), derive a
+/// [`crate::intake::newcats::tts::TtsOutcome`], and write the intelligibility
+/// (STT-loopback WER + MOS-proxy) and performance (synthesis_ms + RTF) rows via
+/// [`crate::intake::newcats::tts::score_and_write`].
+///
+/// The STT loopback model is resolved from `TTS_LOOPBACK_STT_MODEL` (a model
+/// name / registry key only — never a host/IP; defaults to `"faster-whisper"`),
+/// and the synthesis voice from `TTS_VOICE` (default `"en_US-lessac-medium"`).
+///
+/// Creates its own `model_profiles` row (provider `"openai"`, matching the Chord
+/// OpenAI-compatible backend kind these routes speak). A per-case failure is
+/// recorded (skipped from the averages) rather than aborting the whole suite —
+/// matches every other `newcats` category's "failure is still useful signal"
+/// convention.
+pub async fn run_tts_suite(model_name: &str) -> Result<TtsSuiteOutcome, ToolError> {
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::{synthesize_with_metrics, transcribe_with_metrics};
+    use crate::intake::newcats::tts::{self, TtsOutcome};
+
+    let profile_id = create_profile_row_for_provider(model_name, "openai").await?;
+    let pool = storage::get_pool().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(e.to_string()))?;
+    let model_id = ModelId::from(model_name);
+
+    // Loopback STT model + synthesis voice: names only, from env (no host/IP).
+    let stt_model = std::env::var("TTS_LOOPBACK_STT_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "faster-whisper".to_string());
+    let voice = std::env::var("TTS_VOICE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "en_US-lessac-medium".to_string());
+
+    let cases = tts::load_cases();
+    let mut per_case = Vec::with_capacity(cases.len());
+    let mut wer_sum = 0.0;
+    let mut rtf_sum = 0.0;
+    let mut rtf_n = 0usize;
+    let mut n = 0usize;
+
+    for case in &cases {
+        // 1) Synthesize.
+        let speech =
+            synthesize_with_metrics(&client, model_name, &case.text, &voice, Duration::from_secs(120)).await;
+        if let Some(err) = &speech.error {
+            per_case.push(format!("{}: synth error ({err})", case.label));
+            continue;
+        }
+        let backend_tag = speech
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Gpu);
+
+        // 2) Transcribe the produced audio (STT loopback) — via the SHARED
+        // SUITE-STT multipart transcribe (deduped). A `filename` is required by
+        // that arm's multipart shape; the synthesized audio is WAV.
+        let stt =
+            transcribe_with_metrics(&client, &stt_model, &speech.audio, "tts-loopback.wav", Duration::from_secs(120)).await;
+        if let Some(err) = &stt.error {
+            per_case.push(format!("{}: stt-loopback error ({err})", case.label));
+            continue;
+        }
+
+        // 3) Derive outcome (duration/MOS from the WAV) and score.
+        let outcome = TtsOutcome::from_audio(stt.transcript.clone(), speech.latency_ms, &speech.audio);
+        let wer = tts::loopback_wer(&outcome.loopback_transcript, &case.text);
+        let rtf = tts::real_time_factor(outcome.synthesis_ms, outcome.audio_duration_s);
+        wer_sum += wer;
+        if let Some(r) = rtf {
+            rtf_sum += r;
+            rtf_n += 1;
+        }
+        n += 1;
+
+        tts::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, case, &outcome).await?;
+
+        per_case.push(format!(
+            "{}: wer={wer:.2} synth_ms={} rtf={} mos={}",
+            case.label,
+            outcome.synthesis_ms,
+            rtf.map(|r| format!("{r:.2}")).unwrap_or_else(|| "n/a".into()),
+            outcome.mos_proxy.map(|v| format!("{v:.2}")).unwrap_or_else(|| "n/a".into()),
+        ));
+    }
+
+    Ok(TtsSuiteOutcome {
+        profile_id,
+        cases_run: n,
+        avg_loopback_wer: if n > 0 { wer_sum / n as f64 } else { 0.0 },
+        avg_rtf: if rtf_n > 0 { Some(rtf_sum / rtf_n as f64) } else { None },
+        per_case,
+    })
+}
+
 /// Disk-usage percentage for a mount via `df`, or None if it can't be read.
 fn disk_pct(mount: &str) -> Option<u8> {
     let out = std::process::Command::new("df")
@@ -1110,6 +1545,27 @@ pub async fn run_fleet_suites(
                 suites,
                 summary: "skipped: non-Ollama daemon model (DiffusionGemma/dgem)".into(),
                 skipped: true,
+            });
+            continue;
+        }
+        // SUITE-STT: an STT model is served behind Chord's OpenAI-compatible
+        // `/v1/audio/transcriptions` route, NOT loadable by the Ollama
+        // `load_model` path below — run its standalone suite directly (its own
+        // profile row, mirroring the diffusion daemon handling) and move on,
+        // rather than fall through and fail the Ollama load.
+        if suites.iter().any(|s| s == "stt") {
+            let summary = match run_stt_suite(model).await {
+                Ok(o) => format!(
+                    "stt: clips={} avg_wer={:.3} avg_rtf={:.2}",
+                    o.clips_run, o.avg_wer, o.avg_rtf
+                ),
+                Err(e) => format!("stt: error {e}"),
+            };
+            out.push(FleetSuiteResult {
+                model: model.clone(),
+                suites,
+                summary,
+                skipped: false,
             });
             continue;
         }
@@ -1216,6 +1672,50 @@ pub async fn run_fleet_suites(
                     o.avg_ndcg_uplift, o.avg_reranked_ndcg, o.queries_run
                 )),
                 Err(e) => parts.push(format!("reranking: error {e}")),
+            }
+        }
+        // SUITE-IMG: image-generation suite. Self-contained (its own profile row
+        // + `openai` backend via Chord's `/v1/images/generations`), so it does
+        // not share the Ollama `profile_id` above. Note: this fleet path first
+        // `load_model`s each model via the Ollama control API, so an `openai`-kind
+        // image backend (sd-turbo) reached here would typically be skipped at that
+        // gate — the direct single-model tool path is the primary entry point for
+        // now; this branch keeps the suite wired into the fleet driver for when an
+        // image model is Ollama-loadable / the load gate is relaxed.
+        if suites.iter().any(|s| s == "image_generation") {
+            match run_image_generation_suite(model).await {
+                Ok(o) => parts.push(format!(
+                    "image_generation: {}/{} ok, avg_time_ms={:.0}",
+                    o.success_count, o.prompts_run, o.avg_time_to_image_ms
+                )),
+                Err(e) => parts.push(format!("image_generation: error {e}")),
+            }
+        }
+        // SUITE-DOC: document_parsing goes through Chord's `/v1/documents/parse`
+        // (not the Ollama serve loaded above), and owns its own profile row, so
+        // it dispatches directly here (like the diffusion suite) rather than via
+        // an injected closure. A NotConfigured corpus is recorded, not fatal.
+        if suites.iter().any(|s| s == "document_parsing") {
+            match run_document_parsing_suite(model).await {
+                Ok(o) => parts.push(format!(
+                    "document_parsing: cases={} avg_field_acc={:.2}",
+                    o.cases_run, o.avg_field_accuracy
+                )),
+                Err(e) => parts.push(format!("document_parsing: error {e}")),
+            }
+        }
+        // S125 SUITE-TTS: self-contained driver (creates its own `openai`-provider
+        // profile row via `run_tts_suite`, like the diffusion suite), so it does not
+        // share the context/code/agent `profile_id` above.
+        if suites.iter().any(|s| s == "tts") {
+            match run_tts_suite(model).await {
+                Ok(o) => parts.push(format!(
+                    "tts: cases={} avg_wer={:.2} avg_rtf={}",
+                    o.cases_run,
+                    o.avg_loopback_wer,
+                    o.avg_rtf.map(|r| format!("{r:.2}")).unwrap_or_else(|| "n/a".into()),
+                )),
+                Err(e) => parts.push(format!("tts: error {e}")),
             }
         }
 
