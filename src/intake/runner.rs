@@ -151,7 +151,17 @@ fn is_hot(loaded: &[(String, u64)], target: &str) -> bool {
 /// Ask Ollama to load a model (keep_alive long enough for the run) by issuing a
 /// trivial generate with an empty prompt. Lazy-load brings the model hot.
 async fn load_model(client: &reqwest::Client, model: &str) -> Result<(), ToolError> {
-    let base = context::ollama_base();
+    // BT-03: registry-resolve the backend instead of assuming local ollama. The Ollama
+    // `keep_alive` pre-warm is ollama-specific; for any other backend kind (openai/
+    // llama-server/daemon) the model is loaded on first request and the backend process
+    // is brought up by `lifecycle::ensure_up` in `infer_with_metrics`, so there is no
+    // separate pre-warm to do here — skip it rather than POST an ollama route at a
+    // non-ollama URL. Uses the registry-resolved base, not the hardcoded loopback.
+    let backend = crate::intake::infer::resolve_backend(model);
+    if backend.kind != "ollama" {
+        return Ok(());
+    }
+    let base = backend.url;
     let body = serde_json::json!({ "model": model, "keep_alive": context::OLLAMA_KEEP_ALIVE });
     client
         .post(format!("{base}/api/generate"))
@@ -166,14 +176,8 @@ async fn load_model(client: &reqwest::Client, model: &str) -> Result<(), ToolErr
 /// Restore the previously-hot model by lazy-loading it again (and evicting the
 /// intake target via keep_alive:0). Best-effort: logs but never errors.
 async fn restore_model(client: &reqwest::Client, prior: &str, evict: &str) {
-    let base = context::ollama_base();
-    // Evict the model we just profiled.
-    let _ = client
-        .post(format!("{base}/api/generate"))
-        .json(&serde_json::json!({ "model": evict, "keep_alive": 0 }))
-        .timeout(Duration::from_secs(60))
-        .send()
-        .await;
+    // BT-03: evict via the backend-aware helper (no-op for non-ollama kinds).
+    evict_model(client, evict).await;
     // Reload the prior hot model.
     if let Err(e) = load_model(client, prior).await {
         tracing::warn!("intake: failed to restore prior hot model '{prior}': {e}");
@@ -468,7 +472,14 @@ pub async fn run_context_suite(
 
 /// Unload a model from VRAM (Ollama keep_alive:0). Best-effort.
 async fn evict_model(client: &reqwest::Client, model: &str) {
-    let base = context::ollama_base();
+    // BT-03: keep_alive:0 eviction is ollama-specific. Non-ollama backends are unloaded by
+    // their own lifecycle (lemonade/vLLM idle-stop, Chord-managed) — skip rather than POST
+    // an ollama route at a non-ollama URL.
+    let backend = crate::intake::infer::resolve_backend(model);
+    if backend.kind != "ollama" {
+        return;
+    }
+    let base = backend.url;
     let _ = client
         .post(format!("{base}/api/generate"))
         .json(&serde_json::json!({ "model": model, "keep_alive": 0 }))
