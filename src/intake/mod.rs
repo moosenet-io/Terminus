@@ -465,10 +465,11 @@ fn parse_suites(args: &Value, model_name: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// Infer the default suite list for a model from its name (the operator's
-/// "correct tests for intended purposes"):
-///   - "coder"                  → [context, code]
-///   - "gpt-oss"                → [context, agent]
-///   - "qwen3:8b" / "harness"   → [context, code, agent]
+/// "correct tests for intended purposes"). S125 makes this EXHAUSTIVE: a general
+/// text/vision model runs every suite APPLICABLE to it, not just one or two:
+///   - general text LLM         → [context, code, agent, tool_routing]
+///     (coder / gpt-oss / qwen3 / harness / any other chat/code model)
+///   - vision (VLM)             → [vision_qa, context, agent, tool_routing]
 ///   - "diffusiongemma"/"dgem"  → [diffusion]  (MINT-DIFF-01: a non-Ollama
 ///                                daemon model — the Ollama-based suites
 ///                                can't load it, so its default is the
@@ -513,22 +514,25 @@ pub fn default_suites_for(model_name: &str) -> Vec<String> {
         // context/code/agent suites — its default is the IR-retrieval suite.
         vec!["embedding_retrieval"]
     } else if is_vision_model(&n) {
-        // SUITE-VQA: a vision/VLM model's default is the image-QA suite (the
-        // Ollama context suite is text-only and doesn't exercise its vision path).
-        vec!["vision_qa"]
+        // SUITE-VQA (S125 exhaustive): a VLM is ALSO a chat model — profile both
+        // its vision path AND the applicable text-based suites, not just
+        // vision_qa. (No `code`: a VLM is not assumed to be a coder, matching the
+        // operator's exhaustive-but-applicable routing.)
+        vec!["vision_qa", "context", "agent", "tool_routing"]
     } else if n.contains("rerank") {
         // SUITE-RRK: a reranker (e.g. bge-reranker-v2-m3) is a cross-encoder, not
         // a generative model — the Ollama-based suites don't apply; its default
         // is the reranking suite via Chord's /v1/rerank.
         vec!["reranking"]
-    } else if n.contains("coder") {
-        vec!["context", "code"]
-    } else if n.contains("gpt-oss") {
-        vec!["context", "agent"]
-    } else if n.contains("qwen3:8b") || n.contains("harness") {
-        vec!["context", "code", "agent"]
     } else {
-        vec!["context"]
+        // S125 exhaustive routing: every GENERAL text LLM (a coder, gpt-oss, a
+        // qwen3/harness chat model, or any other chat/code model) now runs EVERY
+        // text-based suite that applies to it — context, code, agent, AND
+        // tool_routing — so MINT is exhaustive rather than covering just one or
+        // two buckets per model. The specialized single-purpose backends above
+        // (diffusion/image/doc/stt/tts/embedding/vision/rerank) keep returning
+        // only their own suite.
+        vec!["context", "code", "agent", "tool_routing"]
     };
     v.into_iter().map(String::from).collect()
 }
@@ -1615,11 +1619,13 @@ mod tests {
 
     #[test]
     fn parse_suites_default_inferred_by_purpose() {
-        // No suites → per-model purpose routing.
-        assert_eq!(parse_suites(&json!({}), "qwen3-coder:30b"), vec!["context", "code"]);
-        assert_eq!(parse_suites(&json!({}), "gpt-oss:20b"), vec!["context", "agent"]);
-        assert_eq!(parse_suites(&json!({}), "qwen3:8b"), vec!["context", "code", "agent"]);
-        assert_eq!(parse_suites(&json!({}), "mystery:7b"), vec!["context"]);
+        // No suites → per-model purpose routing. S125 exhaustive: every general
+        // text model runs all four text suites.
+        let all_text = vec!["context", "code", "agent", "tool_routing"];
+        assert_eq!(parse_suites(&json!({}), "qwen3-coder:30b"), all_text);
+        assert_eq!(parse_suites(&json!({}), "gpt-oss:20b"), all_text);
+        assert_eq!(parse_suites(&json!({}), "qwen3:8b"), all_text);
+        assert_eq!(parse_suites(&json!({}), "mystery:7b"), all_text);
     }
 
     #[test]
@@ -1640,17 +1646,30 @@ mod tests {
     #[test]
     fn parse_suites_empty_array_falls_back_to_purpose() {
         let s = parse_suites(&json!({"suites": []}), "gpt-oss:20b");
-        assert_eq!(s, vec!["context", "agent"]);
+        // S125 exhaustive: a general text model falls back to all four text suites.
+        assert_eq!(s, vec!["context", "code", "agent", "tool_routing"]);
     }
 
     #[test]
     fn default_suites_for_routing() {
-        assert_eq!(default_suites_for("qwen3-coder:30b"), vec!["context", "code"]);
-        assert_eq!(default_suites_for("gpt-oss:20b"), vec!["context", "agent"]);
-        assert_eq!(default_suites_for("harness-1"), vec!["context", "code", "agent"]);
+        // S125 exhaustive: every GENERAL text LLM now runs ALL four text suites,
+        // not just one or two — coder / gpt-oss / qwen3 / harness / any chat model.
+        let all_text = vec!["context", "code", "agent", "tool_routing"];
+        assert_eq!(default_suites_for("qwen3-coder:30b"), all_text);
+        assert_eq!(default_suites_for("gpt-oss:20b"), all_text);
+        assert_eq!(default_suites_for("harness-1"), all_text);
+        assert_eq!(default_suites_for("qwen3:8b"), all_text);
+        assert_eq!(default_suites_for("llama3:8b"), all_text);
+        // S125 exhaustive: a VLM profiles its vision path AND the text suites
+        // (context/agent/tool_routing — no `code`, a VLM is not assumed a coder).
+        assert_eq!(
+            default_suites_for("llava:13b"),
+            vec!["vision_qa", "context", "agent", "tool_routing"]
+        );
+        // Specialized single-purpose backends still route to only their suite.
         assert_eq!(default_suites_for("diffusiongemma-26b-a4b"), vec!["diffusion"]);
         assert_eq!(default_suites_for("dgem-secondary"), vec!["diffusion"]);
-        assert_eq!(default_suites_for("llama3:8b"), vec!["context"]);
+        assert_eq!(default_suites_for("jina-reranker-v2-base"), vec!["reranking"]);
         // SUITE-EMB: embedding models route to the embedding_retrieval suite.
         assert_eq!(default_suites_for("nomic-embed-text:latest"), vec!["embedding_retrieval"]);
         assert_eq!(default_suites_for("bge-large-en"), vec!["embedding_retrieval"]);
