@@ -109,8 +109,13 @@ pub fn dcg(gains: &[f64]) -> f64 {
 /// (tolerant of a backend that echoes a stray index) rather than panicking.
 /// Pure.
 pub fn ndcg_at_k(order: &[usize], relevance: &[f64], k: usize) -> f64 {
+    // A duplicated index (e.g. `[0, 0]`) would count the same relevant document
+    // twice and let DCG exceed IDCG → nDCG > 1.0. De-duplicate (keep first
+    // occurrence) BEFORE taking the top-k so the metric stays in `[0, 1]`.
+    let mut seen = std::collections::HashSet::new();
     let gains: Vec<f64> = order
         .iter()
+        .filter(|&&i| seen.insert(i))
         .take(k)
         .map(|&i| relevance.get(i).copied().unwrap_or(0.0))
         .collect();
@@ -219,6 +224,37 @@ pub fn load_corpus_from(dir: &Path) -> Result<Vec<RerankQuery>, ToolError> {
             "reranking corpus at {} is empty",
             path.display()
         )));
+    }
+    // Finding 6: validate each query up front so a malformed corpus fails clean
+    // (ToolError) rather than silently producing a bad nDCG. `relevance` must be
+    // aligned 1:1 with `passages`, and every `baseline_order` index must be
+    // in-range and unique (a duplicate/out-of-range baseline would corrupt the
+    // uplift comparison).
+    for q in &corpus {
+        if q.relevance.len() != q.passages.len() {
+            return Err(ToolError::Execution(format!(
+                "reranking corpus query {} has {} relevance labels for {} passages",
+                q.query_id,
+                q.relevance.len(),
+                q.passages.len()
+            )));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for &idx in &q.baseline_order {
+            if idx >= q.passages.len() {
+                return Err(ToolError::Execution(format!(
+                    "reranking corpus query {} baseline_order index {idx} out of range (passages.len() = {})",
+                    q.query_id,
+                    q.passages.len()
+                )));
+            }
+            if !seen.insert(idx) {
+                return Err(ToolError::Execution(format!(
+                    "reranking corpus query {} baseline_order has duplicate index {idx}",
+                    q.query_id
+                )));
+            }
+        }
     }
     Ok(corpus)
 }
@@ -342,6 +378,71 @@ mod tests {
         assert_eq!(corpus[0].query_id, "t1");
         assert_eq!(corpus[0].passages.len(), 2);
         assert_eq!(corpus[0].baseline_order, vec![1, 0]);
+    }
+
+    // Finding 6: a duplicated index must not push nDCG above 1.0.
+    #[test]
+    fn ndcg_dedupes_duplicate_indices_stays_le_one() {
+        let relevance = vec![3.0, 0.0];
+        // `[0, 0]` would double-count doc 0's gain without de-dup → nDCG > 1.0.
+        let n = ndcg_at_k(&[0, 0], &relevance, DEFAULT_K);
+        assert!(n <= 1.0 + 1e-9, "nDCG must stay <= 1.0, got {n}");
+        // Deduped to just [0], which IS the ideal ordering here → exactly 1.0.
+        assert!((n - 1.0).abs() < 1e-9, "deduped [0,0] scores the ideal 1.0, got {n}");
+    }
+
+    // Finding 6: relevance/passages length mismatch fails clean at load.
+    #[test]
+    fn load_corpus_from_rejects_relevance_length_mismatch() {
+        let dir = std::env::temp_dir().join("reranking-corpus-relmismatch");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("reranking.json"),
+            serde_json::json!([
+                { "query_id": "q", "query": "x", "passages": ["a", "b"], "relevance": [1.0], "baseline_order": [0, 1] }
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let err = load_corpus_from(&dir).unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)));
+        assert!(format!("{err:?}").contains("relevance labels"));
+    }
+
+    // Finding 6: an out-of-range baseline_order index fails clean at load.
+    #[test]
+    fn load_corpus_from_rejects_out_of_range_baseline() {
+        let dir = std::env::temp_dir().join("reranking-corpus-oobbaseline");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("reranking.json"),
+            serde_json::json!([
+                { "query_id": "q", "query": "x", "passages": ["a", "b"], "relevance": [1.0, 0.0], "baseline_order": [0, 9] }
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let err = load_corpus_from(&dir).unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)));
+        assert!(format!("{err:?}").contains("out of range"));
+    }
+
+    // Finding 6: a duplicate baseline_order index fails clean at load.
+    #[test]
+    fn load_corpus_from_rejects_duplicate_baseline() {
+        let dir = std::env::temp_dir().join("reranking-corpus-dupbaseline");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("reranking.json"),
+            serde_json::json!([
+                { "query_id": "q", "query": "x", "passages": ["a", "b"], "relevance": [1.0, 0.0], "baseline_order": [0, 0] }
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let err = load_corpus_from(&dir).unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)));
+        assert!(format!("{err:?}").contains("duplicate index"));
     }
 
     #[test]

@@ -153,6 +153,14 @@ pub fn build_scores(
     scenario: &Scenario,
     outcome: &RoutingOutcome,
 ) -> Vec<DimensionScore> {
+    // Finding 5: an errored inference turn (transport/HTTP/parse) must be SKIPPED,
+    // not scored. Otherwise an adversarial turn that errored with no tool calls
+    // would score decoy_rejection = 1.0 (a false perfect), and a non-adversarial
+    // one correct_tool_at_1 = 0.0 (a false miss) — both fabricated. This matches
+    // the skip-on-error contract the other suites use.
+    if outcome.error.is_some() {
+        return Vec::new();
+    }
     let dispatched: Vec<String> = outcome.tool_calls.iter().map(|(n, _)| n.clone()).collect();
     let mut rows = Vec::new();
     match scenario.category.as_str() {
@@ -343,6 +351,27 @@ mod tests {
         };
         let rows = build_scores(ModelId::from("m"), BackendTag::Gpu, &s, &bad);
         assert_eq!(rows.iter().find(|r| r.metric == METRIC_MULTI_STEP).unwrap().value, 0.0);
+    }
+
+    // Finding 5: an errored adversarial turn (no tool calls) must NOT be scored
+    // decoy_rejection = 1.0 — it must produce NO rows (skip-on-error).
+    #[test]
+    fn build_scores_skips_errored_turn() {
+        let s = sc("ts-adv", "tool_selection", true, None, &[]);
+        let errored = RoutingOutcome {
+            tool_calls: vec![],
+            error: Some("transport error: connection refused".to_string()),
+        };
+        let rows = build_scores(ModelId::from("m"), BackendTag::Gpu, &s, &errored);
+        assert!(rows.is_empty(), "an errored turn must emit no rows, got {}", rows.len());
+
+        // A non-adversarial errored turn is likewise skipped (no false miss).
+        let s2 = sc("ts-1", "tool_selection", false, Some("weather"), &[]);
+        let errored2 = RoutingOutcome {
+            tool_calls: vec![],
+            error: Some("HTTP 500".to_string()),
+        };
+        assert!(build_scores(ModelId::from("m"), BackendTag::Gpu, &s2, &errored2).is_empty());
     }
 
     #[test]

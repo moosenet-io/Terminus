@@ -66,6 +66,13 @@ pub trait ImageParseModel {
 /// deterministic, and good enough to separate "described the right thing" from
 /// "described something else entirely" for a sanity-check probe.
 pub fn score_caption_similarity(actual_description: &str, expected_caption: &str) -> f64 {
+    // Finding 7: an empty reference (or empty input) must score 0.0, not the
+    // Jaccard-of-two-empty-sets 1.0 that `token_jaccard` returns for empty+empty.
+    // An empty expected caption paired with an empty model answer is a non-answer,
+    // not a perfect caption match — scoring it 1.0 would fabricate a top score.
+    if actual_description.trim().is_empty() || expected_caption.trim().is_empty() {
+        return 0.0;
+    }
     super::text_similarity::token_jaccard(actual_description, expected_caption)
 }
 
@@ -445,6 +452,27 @@ mod tests {
             .value;
         assert!((sim - 1.0).abs() < 1e-9, "expected 1.0, got {sim}");
         assert!(rows.iter().all(|r| r.dimension == DIMENSION));
+    }
+
+    /// Finding 7: an empty reference (or empty input) scores 0.0, never the
+    /// empty-vs-empty Jaccard 1.0. `lenient_match`/`is_hallucination` are unchanged.
+    #[test]
+    fn caption_similarity_empty_reference_or_input_is_zero() {
+        assert_eq!(score_caption_similarity("", ""), 0.0);
+        assert_eq!(score_caption_similarity("a red square", ""), 0.0);
+        assert_eq!(score_caption_similarity("", "a red square"), 0.0);
+        assert_eq!(score_caption_similarity("   ", "  "), 0.0);
+        // A build_vqa_scores row with an empty reference answer must not fabricate
+        // a perfect caption_similarity.
+        let outcome = VisionQaOutcome { answer: String::new(), latency_ms: 5, vram_peak_mb: None };
+        let item = VisionQaItem {
+            image_file: "x.png".into(),
+            question: "q".into(),
+            answer: String::new(),
+        };
+        let rows = build_vqa_scores(ModelId::from("m"), BackendTag::Gpu, &item, &outcome);
+        let sim = rows.iter().find(|r| r.metric == "caption_similarity").unwrap().value;
+        assert_eq!(sim, 0.0);
     }
 
     /// KNOWN-BAD: description of something entirely different scores near 0.

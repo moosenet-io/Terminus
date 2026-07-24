@@ -202,7 +202,18 @@ pub fn load_corpora_from(dir: &Path) -> Result<(Corpus, Option<Corpus>), ToolErr
     // PII-tainted still fails loudly (the `?` on `from_json`).
     let domain = match std::fs::read_to_string(&domain_path) {
         Ok(raw) => Some(Corpus::from_json(&raw)?),
-        Err(_) => None,
+        // Finding 8: ONLY a genuine "not found" means the optional domain corpus is
+        // absent (⇒ public-only run). Any OTHER io error (permission denied, I/O
+        // error, "is a directory", …) is a real fault and must propagate cleanly —
+        // swallowing it as "absent" would silently drop a domain corpus that IS
+        // present but unreadable.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(ToolError::Execution(format!(
+                "embedding_retrieval domain corpus at {} is unreadable: {e}",
+                domain_path.display()
+            )));
+        }
     };
     Ok((public, domain))
 }
@@ -359,6 +370,25 @@ mod tests {
         .unwrap();
         let (_p, d) = load_corpora_from(dir.path()).unwrap();
         assert!(d.is_some());
+    }
+
+    // Finding 8: a NON-NotFound io error reading the optional domain corpus must
+    // PROPAGATE, not be swallowed as "absent". A directory where the domain FILE
+    // is expected makes `read_to_string` fail with a non-NotFound error.
+    #[test]
+    fn load_corpora_from_propagates_non_notfound_domain_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(PUBLIC_CORPUS_FILE),
+            include_str!("corpora/embedding_retrieval_public.json"),
+        )
+        .unwrap();
+        // Create a DIRECTORY at the domain file path → read_to_string errors with a
+        // non-NotFound kind, which must surface as a clean ToolError, not None.
+        std::fs::create_dir(dir.path().join(DOMAIN_CORPUS_FILE)).unwrap();
+        let err = load_corpora_from(dir.path()).unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)), "expected Execution, got {err:?}");
+        assert!(format!("{err:?}").contains("unreadable"));
     }
 
     #[test]
