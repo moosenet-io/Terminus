@@ -21,7 +21,9 @@
 use sqlx::PgPool;
 
 use crate::error::ToolError;
-use crate::intake::discovery::schema::{CandidateStatus, DiscoveryCandidate, FleetCategory};
+use crate::intake::discovery::schema::{
+    CandidateStatus, DiscoveryCandidate, FleetCategory, Modality,
+};
 
 /// True when a Postgres error text indicates a MISSING RELATION (the
 /// `model_discovery_candidate` table does not exist — an un-migrated host),
@@ -41,7 +43,7 @@ fn is_missing_relation_error(msg: &str) -> bool {
 /// [`DiscoveryCandidate`] field order.
 const READ_BROCHURE_SQL: &str = "SELECT model_name, hf_repo, category, status, gfx1151_class, \
      size_b, vram_footprint_gb, discovery_source, discovery_score, discovered_at, last_seen_at, \
-     fetched_at, marked_for_fleet_at, evicted_at, retained_profile, rationale \
+     fetched_at, marked_for_fleet_at, evicted_at, retained_profile, rationale, modality \
      FROM model_discovery_candidate ORDER BY model_name";
 
 /// Row shape the brochure SELECT decodes into, before `category`/`status` are
@@ -63,6 +65,7 @@ type BrochureRowTuple = (
     Option<chrono::DateTime<chrono::Utc>>, // evicted_at
     Option<serde_json::Value>,             // retained_profile
     Option<String>,                        // rationale
+    Option<String>,                        // modality (CB-02; NULL = unclassified)
 );
 
 /// Read every persisted brochure row. NEVER recomputes/filters — that's
@@ -115,6 +118,7 @@ pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, Too
         evicted_at,
         retained_profile,
         rationale,
+        modality,
     ) in rows
     {
         let category = FleetCategory::from_str(&category).map_err(|e| {
@@ -129,6 +133,20 @@ pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, Too
                  '{status}': {e}"
             ))
         })?;
+        // `modality` is NULLABLE (CB-02): a NULL column is an unclassified
+        // candidate (`None`), NOT an error. A NON-NULL but unparseable value is
+        // surfaced loudly — same "never silently drop/default a row" contract as
+        // category/status above (DISC-03 only ever writes `Modality::as_str()`
+        // values, so this should be unreachable in practice).
+        let modality = match modality {
+            None => None,
+            Some(s) => Some(Modality::from_str(&s).map_err(|e| {
+                ToolError::Database(format!(
+                    "model_discovery_candidate row '{model_name}' has an unparseable modality \
+                     '{s}': {e}"
+                ))
+            })?),
+        };
         out.push(DiscoveryCandidate {
             model_name,
             hf_repo,
@@ -146,6 +164,7 @@ pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, Too
             evicted_at,
             retained_profile,
             rationale,
+            modality,
         });
     }
     Ok(out)

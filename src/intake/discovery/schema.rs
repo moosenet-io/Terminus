@@ -185,6 +185,213 @@ impl CandidateStatus {
     }
 }
 
+/// The profiling MODALITY of a discovery candidate (CB-02, S125, TERM #519) —
+/// the finer capability axis that says WHICH profiling suite would characterize
+/// this model, so a fleet sweep can auto-route a candidate to the right suite.
+///
+/// Distinct from [`FleetCategory`], the coarse discovery-LISTING role. Where
+/// `FleetCategory` answers "which HF listing bucket did we find this under?"
+/// (`visual`/`voice`/`embedding`/…), `Modality` answers the question the sweep
+/// actually needs: "given its `pipeline_tag`/`tags`, which ONE profiling suite
+/// (`embedding_retrieval` / `reranking` / `vision_qa` / `tool_routing` /
+/// `document_parsing` / `image_generation` / `stt` / `tts`) should measure it?"
+///
+/// It deliberately SPLITS the coarse roles the brochure could not distinguish
+/// before:
+/// - the coarse `visual` role → [`Modality::Vlm`] (image-analysis / vision-QA)
+///   vs [`Modality::ImageGen`] (text-to-image), and
+/// - the coarse `voice` role (which meant ASR/STT only) → [`Modality::Stt`]
+///   (speech-to-text) vs [`Modality::Tts`] (text-to-speech),
+/// and adds [`Modality::Rerank`] + [`Modality::DocumentParsing`], which had no
+/// coarse-category home at all (a reranker or an OCR/doc model is often listed
+/// under `embedding`/`visual` yet needs an entirely different suite).
+///
+/// Populated by [`Modality::classify`] from an HF listing's `pipeline_tag` +
+/// `tags` at discovery time. A plain chat/coder/writer LLM classifies as
+/// [`Modality::TextGeneration`] — profiled by the classic
+/// coder/assistant/agent test_types, NOT a newcats specialized suite, so
+/// [`Modality::suite`] is `None` for it. A genuinely unrecognizable listing
+/// yields `None` (persisted as SQL `NULL`) rather than a silent wrong default —
+/// matching this module's "never silently default an enum" ethos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Modality {
+    /// Text embeddings → `embedding_retrieval` suite.
+    Embedding,
+    /// Cross-encoder / listwise reranking → `reranking` suite.
+    Rerank,
+    /// Vision-language / image-analysis / visual-QA → `vision_qa` suite.
+    Vlm,
+    /// Tool-use / function-calling / router LLM → `tool_routing` suite.
+    ToolRouting,
+    /// OCR / document / DocVQA parsing → `document_parsing` suite.
+    DocumentParsing,
+    /// Text-to-image generation → `image_generation` suite.
+    ImageGen,
+    /// Automatic speech recognition (speech-to-text) → `stt` suite.
+    Stt,
+    /// Text-to-speech synthesis → `tts` suite.
+    Tts,
+    /// A plain generative text LLM (chat/coder/writer/diffusion-LLM) with no
+    /// specialized newcats suite — profiled by the classic
+    /// coder/assistant/agent test_types. [`Modality::suite`] returns `None`.
+    TextGeneration,
+}
+
+impl Modality {
+    /// All variants, in a stable documented order — used by tests and any
+    /// caller that needs to enumerate every modality.
+    pub const ALL: [Modality; 9] = [
+        Modality::Embedding,
+        Modality::Rerank,
+        Modality::Vlm,
+        Modality::ToolRouting,
+        Modality::DocumentParsing,
+        Modality::ImageGen,
+        Modality::Stt,
+        Modality::Tts,
+        Modality::TextGeneration,
+    ];
+
+    /// The stable snake_case key persisted to `model_discovery_candidate.modality`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Modality::Embedding => "embedding",
+            Modality::Rerank => "rerank",
+            Modality::Vlm => "vlm",
+            Modality::ToolRouting => "tool_routing",
+            Modality::DocumentParsing => "document_parsing",
+            Modality::ImageGen => "image_gen",
+            Modality::Stt => "stt",
+            Modality::Tts => "tts",
+            Modality::TextGeneration => "text_generation",
+        }
+    }
+
+    /// The MINT profiling suite (`task_category` / `test_type`) whose harness
+    /// would profile a candidate of this modality — the actual auto-route
+    /// target a fleet sweep uses. `None` for [`Modality::TextGeneration`],
+    /// which has no specialized newcats suite (it is covered by the classic
+    /// coder/assistant/agent test_types instead). Suite names match the MINT
+    /// suite guide (`embedding_retrieval`/`reranking`/`vision_qa`/`tool_routing`/
+    /// `document_parsing`/`image_generation`/`stt`/`tts`).
+    pub fn suite(&self) -> Option<&'static str> {
+        match self {
+            Modality::Embedding => Some("embedding_retrieval"),
+            Modality::Rerank => Some("reranking"),
+            Modality::Vlm => Some("vision_qa"),
+            Modality::ToolRouting => Some("tool_routing"),
+            Modality::DocumentParsing => Some("document_parsing"),
+            Modality::ImageGen => Some("image_generation"),
+            Modality::Stt => Some("stt"),
+            Modality::Tts => Some("tts"),
+            Modality::TextGeneration => None,
+        }
+    }
+
+    /// Parse a persisted/queried modality string. An unrecognized value is a
+    /// clean [`ToolError::InvalidArgument`] naming the bad input — never a
+    /// silent default, matching this module's [`FleetCategory`]/
+    /// [`CandidateStatus`] convention. (SQL `NULL` — an unclassified candidate
+    /// — is represented as `Option::None` by the storage layer and never
+    /// reaches this function.)
+    pub fn from_str(s: &str) -> Result<Self, ToolError> {
+        match s {
+            "embedding" => Ok(Modality::Embedding),
+            "rerank" => Ok(Modality::Rerank),
+            "vlm" => Ok(Modality::Vlm),
+            "tool_routing" => Ok(Modality::ToolRouting),
+            "document_parsing" => Ok(Modality::DocumentParsing),
+            "image_gen" => Ok(Modality::ImageGen),
+            "stt" => Ok(Modality::Stt),
+            "tts" => Ok(Modality::Tts),
+            "text_generation" => Ok(Modality::TextGeneration),
+            other => Err(ToolError::InvalidArgument(format!(
+                "unrecognized modality '{other}' (expected one of: embedding, rerank, vlm, \
+                 tool_routing, document_parsing, image_gen, stt, tts, text_generation)"
+            ))),
+        }
+    }
+
+    /// Classify an HF listing into a profiling [`Modality`] from its
+    /// `pipeline_tag` (HF's canonical task label) plus its free-text `tags`.
+    /// Pure and deterministic — the CB-02 classifier heuristic, unit-tested
+    /// without any network.
+    ///
+    /// Precedence is deliberate: strong TAG signals win first, because a
+    /// reranker or an OCR/doc model is frequently listed under a coarser
+    /// bucket (`embedding`/`visual`) whose `pipeline_tag` would otherwise
+    /// mis-route it. The canonical `pipeline_tag` is consulted next, and a few
+    /// tag-only fallbacks last. An input that matches nothing returns `None`
+    /// (an honest "unclassified", persisted as `NULL`) rather than guessing.
+    pub fn classify(pipeline_tag: Option<&str>, tags: &[String]) -> Option<Modality> {
+        let pt = pipeline_tag.map(|s| s.trim().to_lowercase());
+        let pt = pt.as_deref();
+        let has = |needle: &str| {
+            tags.iter().any(|t| t.to_lowercase().contains(needle))
+        };
+
+        // 1. Strong tag overrides — capabilities a coarse category hides.
+        if has("rerank") || has("cross-encoder") || has("cross_encoder") {
+            return Some(Modality::Rerank);
+        }
+        if has("ocr")
+            || has("docvqa")
+            || has("document-question-answering")
+            || has("document-parsing")
+            || has("document_parsing")
+        {
+            return Some(Modality::DocumentParsing);
+        }
+
+        // 2. HF's canonical pipeline_tag.
+        match pt {
+            Some("feature-extraction") | Some("sentence-similarity") => Some(Modality::Embedding),
+            Some("text-ranking") => Some(Modality::Rerank),
+            Some("automatic-speech-recognition") => Some(Modality::Stt),
+            Some("text-to-speech") | Some("text-to-audio") => Some(Modality::Tts),
+            Some("text-to-image") => Some(Modality::ImageGen),
+            Some("document-question-answering") => Some(Modality::DocumentParsing),
+            Some("image-text-to-text")
+            | Some("visual-question-answering")
+            | Some("image-to-text") => Some(Modality::Vlm),
+            Some("text-generation") | Some("text2text-generation") => {
+                // Refine a plain text LLM: a tool/function-calling/router model
+                // is a tool_routing candidate; everything else is generic
+                // text-generation (no specialized suite).
+                if has("function-calling")
+                    || has("function_call")
+                    || has("tool-use")
+                    || has("tool_use")
+                    || has("tool-calling")
+                    || has("agent")
+                {
+                    Some(Modality::ToolRouting)
+                } else {
+                    Some(Modality::TextGeneration)
+                }
+            }
+            // 3. No / unrecognized pipeline_tag: last-ditch tag fallbacks.
+            _ => {
+                if has("text-to-speech") || has("tts") {
+                    Some(Modality::Tts)
+                } else if has("automatic-speech-recognition")
+                    || has("speech-recognition")
+                    || has("asr")
+                {
+                    Some(Modality::Stt)
+                } else if has("text-to-image")
+                    || has("stable-diffusion")
+                    || has("diffusers")
+                {
+                    Some(Modality::ImageGen)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// One `model_discovery_candidate` row. Mirrors the table's columns 1:1;
 /// timestamps are `None` until the corresponding lifecycle event sets them
 /// (DISC-03 owns every write; this is a plain owned struct with no DB access).
@@ -196,6 +403,14 @@ pub struct DiscoveryCandidate {
     pub hf_repo: String,
     pub category: FleetCategory,
     pub status: CandidateStatus,
+    /// The profiling [`Modality`] this candidate was classified into (CB-02) —
+    /// the finer axis that lets a fleet sweep auto-route it to the right suite
+    /// (see [`Modality::suite`]). `None` when the HF listing carried no signal
+    /// the classifier recognized (persisted as SQL `NULL`); DISC-06's daily
+    /// refresh recomputes it via [`Modality::classify`] and a later
+    /// (non-`NULL`) classification never gets erased by a subsequent `NULL`
+    /// re-observation (see `upsert.rs`).
+    pub modality: Option<Modality>,
     /// `acquire.rs::Gfx1151Class::as_str()` value — kept as a plain string here
     /// (not a second copy of that enum) since this module never branches on it;
     /// DISC-05's classifier owns the enum-to-string conversion.
@@ -237,6 +452,18 @@ pub struct DiscoveryCandidate {
 /// `S114-disc01-brochure.sql`), kept byte-identical to this constant.
 pub const MODEL_DISCOVERY_CANDIDATE_MIGRATION_SQL: &str = include_str!(
     "../../../migrations/S114-disc01-brochure.sql"
+);
+
+/// CB-02 (S125, TERM #519) additive migration: adds the nullable `modality`
+/// column (+ its query index) to `model_discovery_candidate`, so each candidate
+/// carries the profiling modality whose suite would characterize it (see
+/// [`Modality`]). Additive/idempotent (`ADD COLUMN IF NOT EXISTS` +
+/// `CREATE INDEX IF NOT EXISTS`), applied out-of-band by an operator exactly
+/// like the DISC-01 migration above. Kept byte-identical to the canonical copy
+/// in `migrations/`; the const exists so a test can assert its shape without a
+/// live Postgres.
+pub const MODEL_DISCOVERY_MODALITY_MIGRATION_SQL: &str = include_str!(
+    "../../../migrations/S125-cb02-discovery-modality.sql"
 );
 
 #[cfg(test)]
@@ -297,6 +524,145 @@ mod tests {
     #[test]
     fn rejected_is_terminal() {
         assert!(CandidateStatus::Rejected.valid_transitions().is_empty());
+    }
+
+    // ---- Modality (CB-02) ----
+
+    #[test]
+    fn modality_round_trips_every_variant() {
+        for m in Modality::ALL {
+            let s = m.as_str();
+            assert_eq!(Modality::from_str(s).expect("round trip"), m, "round trip for {s}");
+        }
+    }
+
+    #[test]
+    fn modality_rejects_unrecognized_string() {
+        let err = Modality::from_str("not_a_modality").unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn modality_as_str_values_are_stable_snake_case() {
+        // Locks the persisted strings — a rename here is a migration, not a refactor.
+        assert_eq!(Modality::Embedding.as_str(), "embedding");
+        assert_eq!(Modality::Rerank.as_str(), "rerank");
+        assert_eq!(Modality::Vlm.as_str(), "vlm");
+        assert_eq!(Modality::ToolRouting.as_str(), "tool_routing");
+        assert_eq!(Modality::DocumentParsing.as_str(), "document_parsing");
+        assert_eq!(Modality::ImageGen.as_str(), "image_gen");
+        assert_eq!(Modality::Stt.as_str(), "stt");
+        assert_eq!(Modality::Tts.as_str(), "tts");
+        assert_eq!(Modality::TextGeneration.as_str(), "text_generation");
+    }
+
+    #[test]
+    fn modality_suite_maps_specialized_variants_and_none_for_text_generation() {
+        assert_eq!(Modality::Embedding.suite(), Some("embedding_retrieval"));
+        assert_eq!(Modality::Rerank.suite(), Some("reranking"));
+        assert_eq!(Modality::Vlm.suite(), Some("vision_qa"));
+        assert_eq!(Modality::ToolRouting.suite(), Some("tool_routing"));
+        assert_eq!(Modality::DocumentParsing.suite(), Some("document_parsing"));
+        assert_eq!(Modality::ImageGen.suite(), Some("image_generation"));
+        assert_eq!(Modality::Stt.suite(), Some("stt"));
+        assert_eq!(Modality::Tts.suite(), Some("tts"));
+        // The only variant with no specialized newcats suite.
+        assert_eq!(Modality::TextGeneration.suite(), None);
+    }
+
+    #[test]
+    fn every_specialized_modality_has_a_suite() {
+        for m in Modality::ALL {
+            if m == Modality::TextGeneration {
+                continue;
+            }
+            assert!(m.suite().is_some(), "{} must map to a suite", m.as_str());
+        }
+    }
+
+    fn t(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn classify_pipeline_tag_maps_the_canonical_tasks() {
+        assert_eq!(Modality::classify(Some("feature-extraction"), &[]), Some(Modality::Embedding));
+        assert_eq!(Modality::classify(Some("sentence-similarity"), &[]), Some(Modality::Embedding));
+        assert_eq!(Modality::classify(Some("text-ranking"), &[]), Some(Modality::Rerank));
+        assert_eq!(
+            Modality::classify(Some("automatic-speech-recognition"), &[]),
+            Some(Modality::Stt)
+        );
+        assert_eq!(Modality::classify(Some("text-to-speech"), &[]), Some(Modality::Tts));
+        assert_eq!(Modality::classify(Some("text-to-image"), &[]), Some(Modality::ImageGen));
+        assert_eq!(
+            Modality::classify(Some("document-question-answering"), &[]),
+            Some(Modality::DocumentParsing)
+        );
+    }
+
+    #[test]
+    fn classify_splits_the_coarse_visual_role_into_vlm_and_image_gen() {
+        // image-analysis / vision-QA VLM ...
+        assert_eq!(Modality::classify(Some("image-text-to-text"), &[]), Some(Modality::Vlm));
+        assert_eq!(
+            Modality::classify(Some("visual-question-answering"), &[]),
+            Some(Modality::Vlm)
+        );
+        // ... vs a text-to-image generator — the split CB-02 introduces.
+        assert_eq!(Modality::classify(Some("text-to-image"), &[]), Some(Modality::ImageGen));
+    }
+
+    #[test]
+    fn classify_splits_the_coarse_voice_role_into_stt_and_tts() {
+        assert_eq!(
+            Modality::classify(Some("automatic-speech-recognition"), &[]),
+            Some(Modality::Stt)
+        );
+        assert_eq!(Modality::classify(Some("text-to-speech"), &[]), Some(Modality::Tts));
+    }
+
+    #[test]
+    fn classify_tags_override_a_coarser_pipeline_tag() {
+        // A reranker listed under the coarse `embedding` bucket
+        // (pipeline_tag=feature-extraction) is still routed to reranking.
+        assert_eq!(
+            Modality::classify(Some("feature-extraction"), &t(&["cross-encoder", "reranker"])),
+            Some(Modality::Rerank)
+        );
+        // An OCR/doc model listed under the coarse `visual` bucket goes to
+        // document_parsing, not plain vision_qa.
+        assert_eq!(
+            Modality::classify(Some("image-text-to-text"), &t(&["ocr", "document"])),
+            Some(Modality::DocumentParsing)
+        );
+    }
+
+    #[test]
+    fn classify_refines_text_generation_into_tool_routing_by_tags() {
+        assert_eq!(
+            Modality::classify(Some("text-generation"), &t(&["function-calling"])),
+            Some(Modality::ToolRouting)
+        );
+        // A plain chat/coder LLM stays generic text-generation.
+        assert_eq!(
+            Modality::classify(Some("text-generation"), &t(&["chat"])),
+            Some(Modality::TextGeneration)
+        );
+    }
+
+    #[test]
+    fn classify_unrecognized_listing_is_none_not_a_guess() {
+        assert_eq!(Modality::classify(None, &[]), None);
+        assert_eq!(Modality::classify(Some("some-future-task"), &[]), None);
+    }
+
+    #[test]
+    fn modality_migration_sql_adds_the_column_and_index() {
+        let sql = MODEL_DISCOVERY_MODALITY_MIGRATION_SQL;
+        assert!(sql.contains("ALTER TABLE model_discovery_candidate"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS modality"));
+        assert!(sql.contains("idx_discovery_candidate_modality"));
     }
 
     #[test]
