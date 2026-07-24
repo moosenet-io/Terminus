@@ -175,6 +175,64 @@ pub fn max_ctx_tier_for(model_name: &str) -> usize {
     cap_from_scale(parse_param_scale_b(model_name))
 }
 
+/// S125 (SUITE-WALLCLOCK): pure core of [`suite_wallclock_cap_for`]. Given an
+/// optional env override (seconds) and the model's parsed parameter scale
+/// (billions), produce the per-suite wall-clock cap. The env override, when a
+/// POSITIVE integer, WINS over the size mapping (`0`/`None` → fall through to the
+/// size mapping): `>=100b → 20 min`, `>=30b → 40 min`, else `None` (uncapped —
+/// small models comfortably finish any suite well inside a bound). Pure so the
+/// mapping AND the override precedence are deterministically unit-testable
+/// without touching the environment.
+fn suite_wallclock_cap_core(env_override_secs: Option<u64>, scale_b: Option<u32>) -> Option<Duration> {
+    if let Some(secs) = env_override_secs.filter(|n| *n > 0) {
+        return Some(Duration::from_secs(secs));
+    }
+    match scale_b {
+        Some(b) if b >= 100 => Some(Duration::from_secs(20 * 60)),
+        Some(b) if b >= 30 => Some(Duration::from_secs(40 * 60)),
+        _ => None,
+    }
+}
+
+/// S125 (SUITE-WALLCLOCK): a per-suite WALL-CLOCK cap for `model_name`, scaled by
+/// its parameter size, so a huge model (e.g. `gpt-oss:120b`) cannot spend
+/// unbounded time in any single inference-bound suite (code/agent/tool_routing/
+/// …). The context suite already has internal tier bounds; this cap is a hard
+/// ceiling applied ON TOP, for uniformity and as a guard against pathological
+/// cases. Size mapping (via [`parse_param_scale_b`]): `>=100b → 20 min`,
+/// `>=30b → 40 min`, else `None`.
+///
+/// A global env override `INTAKE_SUITE_WALLCLOCK_CAP_SEC`, when set to a POSITIVE
+/// integer, forces that cap (seconds) for EVERY model and WINS over the size
+/// mapping; `0`/unset/unparseable → the size mapping. The pure precedence + size
+/// mapping live in [`suite_wallclock_cap_core`]; this wrapper only reads the env.
+pub fn suite_wallclock_cap_for(model_name: &str) -> Option<Duration> {
+    let env_override = std::env::var("INTAKE_SUITE_WALLCLOCK_CAP_SEC")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    suite_wallclock_cap_core(env_override, parse_param_scale_b(model_name))
+}
+
+/// S125 (SUITE-WALLCLOCK): await `fut`, enforcing `cap` as a hard wall-clock
+/// ceiling via [`tokio::time::timeout`] when it is `Some`. Returns
+/// `Some(output)` when the future completed within the cap (or when `cap` is
+/// `None`, in which case it is awaited normally with no wrapper), and `None`
+/// when the cap elapsed first — in which case the suite future is dropped and
+/// cancelled, abandoning only the un-run remainder; any rows the suite already
+/// wrote incrementally (per case/tier/scenario) persist. Never itself errors,
+/// so a cap NEVER fails the whole model — the caller records a capped/partial
+/// note and moves on to the next suite. Composes cleanly on top of the suites'
+/// existing idle-switch yields (the cap is just a ceiling above them).
+async fn with_suite_cap<F, T>(cap: Option<Duration>, fut: F) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match cap {
+        Some(d) => tokio::time::timeout(d, fut).await.ok(),
+        None => Some(fut.await),
+    }
+}
+
 /// FIX2 (S125): apply a max-tier `cap` to a tier ladder, keeping only tiers
 /// `<= cap`. If the cap would exclude EVERY tier, the single smallest tier is
 /// retained so a model always gets at least one measurement. Pure.
@@ -697,6 +755,12 @@ pub struct FleetSuiteResult {
     pub suites: Vec<String>,
     pub summary: String,
     pub skipped: bool,
+    /// S125 (SUITE-WALLCLOCK): names of the suites (if any) that hit their
+    /// per-suite wall-clock cap for this model and were recorded as capped/
+    /// partial. NON-empty here does NOT mean the model failed — the already-
+    /// written rows persist and the remaining suites still ran; it only lets an
+    /// operator see which suites were bounded. Empty for the common case.
+    pub capped_suites: Vec<String>,
 }
 
 /// Outcome of the diffusion suite (MINT-DIFF-01) for the tool return summary.
@@ -1751,6 +1815,7 @@ pub async fn run_fleet_suites(
                 suites,
                 summary: "skipped: no pending suites (coverage already settled)".into(),
                 skipped: true,
+                capped_suites: Vec::new(),
             });
             continue;
         }
@@ -1762,6 +1827,7 @@ pub async fn run_fleet_suites(
                 suites: suites.clone(),
                 summary: format!("skipped: disk pressure — {reason} (left not_run, resumable)"),
                 skipped: true,
+                capped_suites: Vec::new(),
             });
             continue;
         }
@@ -1771,6 +1837,7 @@ pub async fn run_fleet_suites(
                 suites,
                 summary: "skipped: non-Ollama daemon model (DiffusionGemma/dgem)".into(),
                 skipped: true,
+                capped_suites: Vec::new(),
             });
             continue;
         }
@@ -1802,6 +1869,7 @@ pub async fn run_fleet_suites(
                     suites,
                     summary,
                     skipped: true,
+                    capped_suites: Vec::new(),
                 });
                 continue;
             }
@@ -1810,9 +1878,25 @@ pub async fn run_fleet_suites(
         let mut profile_id: Option<uuid::Uuid> = None;
         let mut parts: Vec<String> = Vec::new();
 
+        // S125 (SUITE-WALLCLOCK): a per-model, per-suite hard wall-clock ceiling,
+        // scaled by model size (huge models get 20/40 min; small models are
+        // uncapped → `None`). Computed ONCE here and applied to EACH suite
+        // dispatch below via `with_suite_cap`. On a cap the suite future is
+        // dropped (its incremental rows persist), a warning is logged, a
+        // "…-capped…" note is recorded, and the suite name is collected in
+        // `capped_suites` — the model is NEVER marked failed, and the loop
+        // continues to the next suite. `cap == None` awaits normally (no wrapper).
+        let cap = suite_wallclock_cap_for(model);
+        let cap_secs = cap.map(|c| c.as_secs()).unwrap_or(0);
+        let mut capped_suites: Vec<String> = Vec::new();
+
+        // The context suite already has internal tier bounds; it is wrapped in the
+        // SAME cap for uniformity (belt-and-suspenders) — a 20 min cap will not
+        // trigger for a properly tier-capped context suite, but it guards a
+        // pathological case.
         if suites.iter().any(|s| s == "context") {
-            match run_context_suite(model, tiers, false).await {
-                Ok(o) => {
+            match with_suite_cap(cap, run_context_suite(model, tiers, false)).await {
+                Some(Ok(o)) => {
                     profile_id = Some(o.profile_id);
                     parts.push(format!(
                         "context: safe_ctx={}, tier={}",
@@ -1820,7 +1904,12 @@ pub async fn run_fleet_suites(
                         o.op.overall_tier.as_deref().unwrap_or("n/a"),
                     ));
                 }
-                Err(e) => parts.push(format!("context: error {e}")),
+                Some(Err(e)) => parts.push(format!("context: error {e}")),
+                None => {
+                    tracing::warn!("intake: suite context wall-clock-capped at {cap_secs}s for {model}; partial results kept, moving on");
+                    parts.push(format!("context: wall-clock-capped at {cap_secs}s (partial)"));
+                    capped_suites.push("context".to_string());
+                }
             }
         }
         let needs = suites.iter().any(|s| s == "code" || s == "agent" || s == "tool_routing");
@@ -1832,17 +1921,27 @@ pub async fn run_fleet_suites(
         }
         if suites.iter().any(|s| s == "code") {
             if let Some(id) = profile_id {
-                match run_code(model.clone(), resolve_langs(model), id).await {
-                    Ok(s) => parts.push(format!("code: {s}")),
-                    Err(e) => parts.push(format!("code: error {e}")),
+                match with_suite_cap(cap, run_code(model.clone(), resolve_langs(model), id)).await {
+                    Some(Ok(s)) => parts.push(format!("code: {s}")),
+                    Some(Err(e)) => parts.push(format!("code: error {e}")),
+                    None => {
+                        tracing::warn!("intake: suite code wall-clock-capped at {cap_secs}s for {model}; partial results kept, moving on");
+                        parts.push(format!("code: wall-clock-capped at {cap_secs}s (partial)"));
+                        capped_suites.push("code".to_string());
+                    }
                 }
             }
         }
         if suites.iter().any(|s| s == "agent") {
             if let Some(id) = profile_id {
-                match run_agent(model.clone(), id).await {
-                    Ok(s) => parts.push(format!("agent: {s}")),
-                    Err(e) => parts.push(format!("agent: error {e}")),
+                match with_suite_cap(cap, run_agent(model.clone(), id)).await {
+                    Some(Ok(s)) => parts.push(format!("agent: {s}")),
+                    Some(Err(e)) => parts.push(format!("agent: error {e}")),
+                    None => {
+                        tracing::warn!("intake: suite agent wall-clock-capped at {cap_secs}s for {model}; partial results kept, moving on");
+                        parts.push(format!("agent: wall-clock-capped at {cap_secs}s (partial)"));
+                        capped_suites.push("agent".to_string());
+                    }
                 }
             }
         }
@@ -1850,9 +1949,14 @@ pub async fn run_fleet_suites(
         // instead of context/code/agent. The driver creates its own profile row
         // (like the diffusion suite) and cleanly skips a non-embedding candidate.
         if suites.iter().any(|s| s == "embedding_retrieval") {
-            match run_embedding_retrieval_suite(model).await {
-                Ok(o) => parts.push(format!("embedding_retrieval: {}", o.summary)),
-                Err(e) => parts.push(format!("embedding_retrieval: error {e}")),
+            match with_suite_cap(cap, run_embedding_retrieval_suite(model)).await {
+                Some(Ok(o)) => parts.push(format!("embedding_retrieval: {}", o.summary)),
+                Some(Err(e)) => parts.push(format!("embedding_retrieval: error {e}")),
+                None => {
+                    tracing::warn!("intake: suite embedding_retrieval wall-clock-capped at {cap_secs}s for {model}; partial results kept, moving on");
+                    parts.push(format!("embedding_retrieval: wall-clock-capped at {cap_secs}s (partial)"));
+                    capped_suites.push("embedding_retrieval".to_string());
+                }
             }
         }
         // S125 SUITE-TOOL: the tool-routing suite is self-contained (it resolves
@@ -1861,14 +1965,19 @@ pub async fn run_fleet_suites(
         // code/agent. Requested only when a model's resolved suites include it.
         if suites.iter().any(|s| s == "tool_routing") {
             if let Some(id) = profile_id {
-                match run_tool_routing_suite(model, id, None).await {
-                    Ok(o) => parts.push(format!(
+                match with_suite_cap(cap, run_tool_routing_suite(model, id, None)).await {
+                    Some(Ok(o)) => parts.push(format!(
                         "tool_routing: {} scenarios ({} rows), correct@1={}",
                         o.scenarios_run,
                         o.rows_written,
                         o.correct_tool_at_1.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "n/a".into()),
                     )),
-                    Err(e) => parts.push(format!("tool_routing: error {e}")),
+                    Some(Err(e)) => parts.push(format!("tool_routing: error {e}")),
+                    None => {
+                        tracing::warn!("intake: suite tool_routing wall-clock-capped at {cap_secs}s for {model}; partial results kept, moving on");
+                        parts.push(format!("tool_routing: wall-clock-capped at {cap_secs}s (partial)"));
+                        capped_suites.push("tool_routing".to_string());
+                    }
                 }
             }
         }
@@ -1879,12 +1988,17 @@ pub async fn run_fleet_suites(
         // agent profile_id. A missing corpus / backend is a clean per-model note,
         // never a panic that aborts the fleet sweep.
         if suites.iter().any(|s| s == "vision_qa") {
-            match run_vision_qa_suite(model).await {
-                Ok(v) => parts.push(format!(
+            match with_suite_cap(cap, run_vision_qa_suite(model)).await {
+                Some(Ok(v)) => parts.push(format!(
                     "vision_qa: {} items, acc={:.2}, halluc={:.2}",
                     v.items_run, v.accuracy, v.hallucination_rate
                 )),
-                Err(e) => parts.push(format!("vision_qa: error {e}")),
+                Some(Err(e)) => parts.push(format!("vision_qa: error {e}")),
+                None => {
+                    tracing::warn!("intake: suite vision_qa wall-clock-capped at {cap_secs}s for {model}; partial results kept, moving on");
+                    parts.push(format!("vision_qa: wall-clock-capped at {cap_secs}s (partial)"));
+                    capped_suites.push("vision_qa".to_string());
+                }
             }
         }
 
@@ -1894,12 +2008,17 @@ pub async fn run_fleet_suites(
         // agent path. A per-query error is folded into the returned summary; an
         // error here (e.g. missing corpus) degrades this model's line only.
         if suites.iter().any(|s| s == "reranking") {
-            match run_reranking_suite(model).await {
-                Ok(o) => parts.push(format!(
+            match with_suite_cap(cap, run_reranking_suite(model)).await {
+                Some(Ok(o)) => parts.push(format!(
                     "reranking: uplift={:.3} ndcg={:.3} queries={}",
                     o.avg_ndcg_uplift, o.avg_reranked_ndcg, o.queries_run
                 )),
-                Err(e) => parts.push(format!("reranking: error {e}")),
+                Some(Err(e)) => parts.push(format!("reranking: error {e}")),
+                None => {
+                    tracing::warn!("intake: suite reranking wall-clock-capped at {cap_secs}s for {model}; partial results kept, moving on");
+                    parts.push(format!("reranking: wall-clock-capped at {cap_secs}s (partial)"));
+                    capped_suites.push("reranking".to_string());
+                }
             }
         }
         // S125 SUITE-STT: whisper/ASR models are served behind Chord's
@@ -1909,12 +2028,17 @@ pub async fn run_fleet_suites(
         // like every other Chord-served suite (replacing the old before-the-gate
         // early return). Self-contained — creates its own `openai`-provider row.
         if suites.iter().any(|s| s == "stt") {
-            match run_stt_suite(model).await {
-                Ok(o) => parts.push(format!(
+            match with_suite_cap(cap, run_stt_suite(model)).await {
+                Some(Ok(o)) => parts.push(format!(
                     "stt: clips={} avg_wer={:.3} avg_rtf={:.2}",
                     o.clips_run, o.avg_wer, o.avg_rtf
                 )),
-                Err(e) => parts.push(format!("stt: error {e}")),
+                Some(Err(e)) => parts.push(format!("stt: error {e}")),
+                None => {
+                    tracing::warn!("intake: suite stt wall-clock-capped at {cap_secs}s for {model}; partial results kept, moving on");
+                    parts.push(format!("stt: wall-clock-capped at {cap_secs}s (partial)"));
+                    capped_suites.push("stt".to_string());
+                }
             }
         }
         // SUITE-IMG: image-generation suite. Self-contained (its own profile row
@@ -1924,12 +2048,17 @@ pub async fn run_fleet_suites(
         // skipped at an Ollama load gate — it reaches this dispatch in a fleet
         // sweep and runs via its own Chord-served path.
         if suites.iter().any(|s| s == "image_generation") {
-            match run_image_generation_suite(model).await {
-                Ok(o) => parts.push(format!(
+            match with_suite_cap(cap, run_image_generation_suite(model)).await {
+                Some(Ok(o)) => parts.push(format!(
                     "image_generation: {}/{} ok, avg_time_ms={:.0}",
                     o.success_count, o.prompts_run, o.avg_time_to_image_ms
                 )),
-                Err(e) => parts.push(format!("image_generation: error {e}")),
+                Some(Err(e)) => parts.push(format!("image_generation: error {e}")),
+                None => {
+                    tracing::warn!("intake: suite image_generation wall-clock-capped at {cap_secs}s for {model}; partial results kept, moving on");
+                    parts.push(format!("image_generation: wall-clock-capped at {cap_secs}s (partial)"));
+                    capped_suites.push("image_generation".to_string());
+                }
             }
         }
         // SUITE-DOC: document_parsing goes through Chord's `/v1/documents/parse`
@@ -1937,27 +2066,43 @@ pub async fn run_fleet_suites(
         // it dispatches directly here (like the diffusion suite) rather than via
         // an injected closure. A NotConfigured corpus is recorded, not fatal.
         if suites.iter().any(|s| s == "document_parsing") {
-            match run_document_parsing_suite(model).await {
-                Ok(o) => parts.push(format!(
+            match with_suite_cap(cap, run_document_parsing_suite(model)).await {
+                Some(Ok(o)) => parts.push(format!(
                     "document_parsing: cases={} avg_field_acc={:.2}",
                     o.cases_run, o.avg_field_accuracy
                 )),
-                Err(e) => parts.push(format!("document_parsing: error {e}")),
+                Some(Err(e)) => parts.push(format!("document_parsing: error {e}")),
+                None => {
+                    tracing::warn!("intake: suite document_parsing wall-clock-capped at {cap_secs}s for {model}; partial results kept, moving on");
+                    parts.push(format!("document_parsing: wall-clock-capped at {cap_secs}s (partial)"));
+                    capped_suites.push("document_parsing".to_string());
+                }
             }
         }
         // S125 SUITE-TTS: self-contained driver (creates its own `openai`-provider
         // profile row via `run_tts_suite`, like the diffusion suite), so it does not
         // share the context/code/agent `profile_id` above.
         if suites.iter().any(|s| s == "tts") {
-            match run_tts_suite(model).await {
-                Ok(o) => parts.push(format!(
+            match with_suite_cap(cap, run_tts_suite(model)).await {
+                Some(Ok(o)) => parts.push(format!(
                     "tts: cases={} avg_wer={:.2} avg_rtf={}",
                     o.cases_run,
                     o.avg_loopback_wer,
                     o.avg_rtf.map(|r| format!("{r:.2}")).unwrap_or_else(|| "n/a".into()),
                 )),
-                Err(e) => parts.push(format!("tts: error {e}")),
+                Some(Err(e)) => parts.push(format!("tts: error {e}")),
+                None => {
+                    tracing::warn!("intake: suite tts wall-clock-capped at {cap_secs}s for {model}; partial results kept, moving on");
+                    parts.push(format!("tts: wall-clock-capped at {cap_secs}s (partial)"));
+                    capped_suites.push("tts".to_string());
+                }
             }
+        }
+
+        // S125: surface which suites (if any) were wall-clock-capped in the
+        // one-line summary too, so it is visible without inspecting the struct.
+        if !capped_suites.is_empty() {
+            parts.push(format!("[wall-clock-capped: {}]", capped_suites.join(",")));
         }
 
         evict_model(&client, model).await;
@@ -1966,6 +2111,7 @@ pub async fn run_fleet_suites(
             suites,
             summary: parts.join("; "),
             skipped: false,
+            capped_suites,
         });
     }
 
@@ -2149,6 +2295,127 @@ mod tests {
     fn tier_cap_never_empties() {
         let tiers = cap_tiers(&FULL_TIERS, 1);
         assert_eq!(tiers, vec![2000]);
+    }
+
+    /// S125 (SUITE-WALLCLOCK): the size→cap mapping and the env-override
+    /// precedence, exercised purely via `suite_wallclock_cap_core` (no env):
+    /// >=100b → 20 min, >=30b → 40 min, else None; a positive env override wins
+    /// over ANY size; a `0`/`None` override falls through to the size mapping.
+    #[test]
+    fn suite_wallclock_cap_core_mapping_and_override() {
+        use std::time::Duration;
+        // Size mapping (no override).
+        assert_eq!(suite_wallclock_cap_core(None, Some(120)), Some(Duration::from_secs(20 * 60)));
+        assert_eq!(suite_wallclock_cap_core(None, Some(100)), Some(Duration::from_secs(20 * 60)));
+        assert_eq!(suite_wallclock_cap_core(None, Some(70)), Some(Duration::from_secs(40 * 60)));
+        assert_eq!(suite_wallclock_cap_core(None, Some(32)), Some(Duration::from_secs(40 * 60)));
+        assert_eq!(suite_wallclock_cap_core(None, Some(30)), Some(Duration::from_secs(40 * 60)));
+        assert_eq!(suite_wallclock_cap_core(None, Some(13)), None);
+        assert_eq!(suite_wallclock_cap_core(None, Some(8)), None);
+        assert_eq!(suite_wallclock_cap_core(None, None), None);
+        // Positive env override WINS over the size mapping (incl. an 8b that the
+        // size mapping would leave uncapped, and a 120b it would cap at 20 min).
+        assert_eq!(suite_wallclock_cap_core(Some(600), Some(8)), Some(Duration::from_secs(600)));
+        assert_eq!(suite_wallclock_cap_core(Some(600), Some(120)), Some(Duration::from_secs(600)));
+        // A `0` override is ignored → fall through to the size mapping.
+        assert_eq!(suite_wallclock_cap_core(Some(0), Some(120)), Some(Duration::from_secs(20 * 60)));
+        assert_eq!(suite_wallclock_cap_core(Some(0), Some(8)), None);
+    }
+
+    /// S125: end-to-end through the model NAME → cap path
+    /// (`suite_wallclock_cap_for` parses the `<N>b` size AND reads the env
+    /// override). Kept as ONE test so the single global env var
+    /// `INTAKE_SUITE_WALLCLOCK_CAP_SEC` (read only by this function) is
+    /// manipulated serially and can't race a sibling test.
+    /// - No override → size mapping: 120b → 20 min, 70b/32b → 40 min, 8b/embed → None.
+    /// - `=600` → forces 600s for EVERY model (wins over the size mapping).
+    #[test]
+    fn suite_wallclock_cap_for_by_name_and_env() {
+        use std::time::Duration;
+        // Deterministic size mapping (ensure no override lingering).
+        std::env::remove_var("INTAKE_SUITE_WALLCLOCK_CAP_SEC");
+        assert_eq!(suite_wallclock_cap_for("gpt-oss:120b"), Some(Duration::from_secs(20 * 60)));
+        assert_eq!(suite_wallclock_cap_for("llama3:70b"), Some(Duration::from_secs(40 * 60)));
+        assert_eq!(suite_wallclock_cap_for("qwen2.5-coder:32b"), Some(Duration::from_secs(40 * 60)));
+        assert_eq!(suite_wallclock_cap_for("llama3:8b"), None);
+        assert_eq!(suite_wallclock_cap_for("nomic-embed-text:latest"), None);
+
+        // Env override wins — even for an 8b the size mapping leaves uncapped, and
+        // even over a huge model's size-derived cap.
+        std::env::set_var("INTAKE_SUITE_WALLCLOCK_CAP_SEC", "600");
+        assert_eq!(suite_wallclock_cap_for("llama3:8b"), Some(Duration::from_secs(600)));
+        assert_eq!(suite_wallclock_cap_for("gpt-oss:120b"), Some(Duration::from_secs(600)));
+
+        // Cleared → back to the size mapping.
+        std::env::remove_var("INTAKE_SUITE_WALLCLOCK_CAP_SEC");
+        assert_eq!(suite_wallclock_cap_for("llama3:8b"), None);
+    }
+
+    /// S125 driver-level: a suite future that sleeps far beyond the cap is aborted
+    /// by `with_suite_cap` (recorded as capped/`None`), and the per-model loop
+    /// CONTINUES to the following suite — no whole-model failure. Uses a paused
+    /// clock so the timeout fires deterministically with no real waiting.
+    #[tokio::test(start_paused = true)]
+    async fn with_suite_cap_aborts_slow_suite_and_continues() {
+        use crate::error::ToolError;
+        use std::time::Duration;
+        use tokio::time::sleep;
+
+        let cap = Some(Duration::from_secs(10));
+        // Mirror the run_fleet_suites per-suite loop bookkeeping.
+        let mut parts: Vec<String> = Vec::new();
+        let mut capped: Vec<String> = Vec::new();
+
+        // Suite A completes within the cap.
+        match with_suite_cap(cap, async {
+            sleep(Duration::from_secs(1)).await;
+            Ok::<i32, ToolError>(1)
+        })
+        .await
+        {
+            Some(Ok(v)) => parts.push(format!("a: {v}")),
+            Some(Err(e)) => parts.push(format!("a: error {e}")),
+            None => capped.push("a".to_string()),
+        }
+        // Suite B hangs FAR beyond the cap → aborted (None), not an error.
+        match with_suite_cap(cap, async {
+            sleep(Duration::from_secs(10_000)).await;
+            Ok::<i32, ToolError>(2)
+        })
+        .await
+        {
+            Some(Ok(v)) => parts.push(format!("b: {v}")),
+            Some(Err(e)) => parts.push(format!("b: error {e}")),
+            None => capped.push("b".to_string()),
+        }
+        // Suite C — AFTER the capped one — still runs → the loop continued.
+        match with_suite_cap(cap, async {
+            sleep(Duration::from_secs(2)).await;
+            Ok::<i32, ToolError>(3)
+        })
+        .await
+        {
+            Some(Ok(v)) => parts.push(format!("c: {v}")),
+            Some(Err(e)) => parts.push(format!("c: error {e}")),
+            None => capped.push("c".to_string()),
+        }
+
+        // The slow suite was capped; the surrounding suites completed; the loop
+        // never bailed out (no whole-model failure).
+        assert_eq!(parts, vec!["a: 1", "c: 3"]);
+        assert_eq!(capped, vec!["b"]);
+    }
+
+    /// S125: `with_suite_cap(None, …)` awaits the future normally (no timeout
+    /// wrapper) and yields its output.
+    #[tokio::test]
+    async fn with_suite_cap_none_awaits_normally() {
+        use crate::error::ToolError;
+        let out = with_suite_cap(None, async { Ok::<i32, ToolError>(42) }).await;
+        match out {
+            Some(Ok(v)) => assert_eq!(v, 42),
+            other => panic!("expected Some(Ok(42)), got a different variant: {}", other.is_some()),
+        }
     }
 
     /// The escalation stop predicate fires ONLY on a genuine capacity limit —
