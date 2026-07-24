@@ -1034,6 +1034,97 @@ pub async fn run_reranking_suite(model_name: &str) -> Result<RerankingSuiteOutco
     })
 }
 
+/// Outcome of the image-generation suite (SUITE-IMG) for the tool return summary.
+pub struct ImageGenSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub prompts_run: usize,
+    pub success_count: usize,
+    pub avg_time_to_image_ms: f64,
+    /// One-line-per-prompt summary, in corpus order.
+    pub per_prompt: Vec<String>,
+}
+
+/// Run the image-generation suite (SUITE-IMG) end-to-end against `model_name`:
+/// for each prompt in the corpus ([`crate::intake::newcats::image_generation::load_prompts`],
+/// `INTAKE_CORPUS_DIR/image_generation.json` with an in-source default set), run
+/// one generation through [`crate::intake::infer::imagegen_with_metrics`] (which
+/// routes an `openai`-kind model onto Chord's `/v1/images/generations` route —
+/// sd-turbo diffusers behind Chord), derive a
+/// [`crate::intake::newcats::image_generation::GenerationOutcome`] from the
+/// normalized [`crate::intake::infer::ImageGenMetrics`], and write its success /
+/// time-to-image / VRAM rows via
+/// [`crate::intake::newcats::image_generation::score_and_write`].
+///
+/// Mirrors [`run_diffusion_suite`]: creates its own `model_profiles` row
+/// (provider `"openai"`, since an image-generation backend never goes through
+/// [`run_context_suite`]), and a per-prompt generation error is recorded
+/// (`success = false`, whatever timing/VRAM is available) rather than aborting
+/// the whole suite — the same "failure is still useful signal" convention every
+/// other `newcats` category follows. CLIP prompt-adherence is left NOT MEASURED
+/// (`clip_score = None`) — no CLIP scorer is wired on this box (scaffolded).
+pub async fn run_image_generation_suite(model_name: &str) -> Result<ImageGenSuiteOutcome, ToolError> {
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::imagegen_with_metrics;
+    use crate::intake::newcats::image_generation::{self, GenerationOutcome};
+
+    let profile_id = create_profile_row_for_provider(model_name, "openai").await?;
+    let pool = storage::get_pool().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(e.to_string()))?;
+    let model_id = ModelId::from(model_name);
+    let prompts = image_generation::load_prompts();
+
+    let mut per_prompt = Vec::with_capacity(prompts.len());
+    let mut time_sum = 0.0;
+    let mut success_count = 0usize;
+    let mut n = 0usize;
+
+    for p in &prompts {
+        let metrics = imagegen_with_metrics(&client, model_name, &p.prompt, Duration::from_secs(600)).await;
+        let backend_tag = metrics
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Gpu);
+        let outcome = GenerationOutcome {
+            success: metrics.success,
+            time_to_image_ms: metrics.time_to_image_ms,
+            // `None` VRAM is recorded as 0 in the row (the field is non-optional);
+            // the metric doc notes a 0 here means "unreadable", not "measured 0".
+            vram_peak_mb: metrics.vram_peak_mb.unwrap_or(0),
+            failure_reason: metrics.error.clone(),
+            // CLIP not measured on this box (no CLIP scorer wired) — scaffolded.
+            clip_score: None,
+        };
+        time_sum += outcome.time_to_image_ms as f64;
+        if outcome.success {
+            success_count += 1;
+        }
+        n += 1;
+
+        image_generation::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, &outcome).await?;
+
+        per_prompt.push(if let Some(err) = &metrics.error {
+            format!("{}: error ({err})", p.label)
+        } else {
+            format!(
+                "{}: success={} time_ms={} vram_mb={}",
+                p.label, outcome.success, outcome.time_to_image_ms, outcome.vram_peak_mb,
+            )
+        });
+    }
+
+    Ok(ImageGenSuiteOutcome {
+        profile_id,
+        prompts_run: n,
+        success_count,
+        avg_time_to_image_ms: if n > 0 { time_sum / n as f64 } else { 0.0 },
+        per_prompt,
+    })
+}
+
 /// Disk-usage percentage for a mount via `df`, or None if it can't be read.
 fn disk_pct(mount: &str) -> Option<u8> {
     let out = std::process::Command::new("df")
@@ -1216,6 +1307,23 @@ pub async fn run_fleet_suites(
                     o.avg_ndcg_uplift, o.avg_reranked_ndcg, o.queries_run
                 )),
                 Err(e) => parts.push(format!("reranking: error {e}")),
+            }
+        }
+        // SUITE-IMG: image-generation suite. Self-contained (its own profile row
+        // + `openai` backend via Chord's `/v1/images/generations`), so it does
+        // not share the Ollama `profile_id` above. Note: this fleet path first
+        // `load_model`s each model via the Ollama control API, so an `openai`-kind
+        // image backend (sd-turbo) reached here would typically be skipped at that
+        // gate — the direct single-model tool path is the primary entry point for
+        // now; this branch keeps the suite wired into the fleet driver for when an
+        // image model is Ollama-loadable / the load gate is relaxed.
+        if suites.iter().any(|s| s == "image_generation") {
+            match run_image_generation_suite(model).await {
+                Ok(o) => parts.push(format!(
+                    "image_generation: {}/{} ok, avg_time_ms={:.0}",
+                    o.success_count, o.prompts_run, o.avg_time_to_image_ms
+                )),
+                Err(e) => parts.push(format!("image_generation: error {e}")),
             }
         }
 

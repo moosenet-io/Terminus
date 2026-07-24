@@ -970,6 +970,197 @@ async fn openai_rerank(
     m.latency_ms = started.elapsed().as_millis() as i64;
 }
 
+/// Normalized result of a single image-generation request via the unified path.
+///
+/// DIFFERENT metric shape from [`InferMetrics`]/[`EmbedMetrics`] (matches
+/// `newcats::image_generation`'s convention): a generation probe is NOT
+/// token/accuracy-based. `success` is whether the backend returned a non-empty
+/// image; `time_to_image_ms` is the wall-clock round-trip (recorded even on a
+/// failure — a slow OOM is still signal); `vram_peak_mb` is a best-effort
+/// single post-call sysfs read (same sense `InferMetrics::vram_mb` uses).
+/// The raw image bytes are deliberately NOT retained — only whether one was
+/// produced — so a probe never buffers megabytes of PNG. On any failure
+/// (transport, HTTP, parse, or a backend kind that can't generate images)
+/// `error` is set and `success` is false — callers never panic.
+#[derive(Debug, Clone, Default)]
+pub struct ImageGenMetrics {
+    /// Whether a non-empty image was returned (`data[0].b64_json`/`url`).
+    pub success: bool,
+    /// Wall-clock synthesis time, ms. Recorded on EVERY exit once the round-trip
+    /// starts (transport error included — a timeout is real elapsed time).
+    pub time_to_image_ms: i64,
+    /// Peak VRAM observed during the attempt, MB; `None` if unreadable — never
+    /// fabricated as `0` (best-effort post-call sysfs read).
+    pub vram_peak_mb: Option<u64>,
+    pub error: Option<String>,
+    /// Backend that served the request (for attribution).
+    pub backend: Option<String>,
+    /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
+    pub hardware: Option<String>,
+}
+
+/// Generate an image for `prompt` with `model` through Chord's unified
+/// backend-routing path (`POST {base}/v1/images/generations`).
+///
+/// The image-generation analogue of [`infer_with_metrics`]/[`embed_with_metrics`]:
+/// it resolves the model's tagged backend via [`resolve_backend`] and dispatches
+/// to that backend's image-generation endpoint. `newcats::image_generation` is a
+/// *client* of this function — it never opens a raw socket.
+///
+/// Backend support: the OpenAI-compatible image route (`/v1/images/generations`,
+/// served by Chord in front of the sd-turbo diffusers backend) is implemented via
+/// the `openai` arm. Any other backend kind returns a clear, non-silent error so
+/// a non-image model is skipped cleanly upstream, not crashed. Never panics —
+/// every failure lands in `ImageGenMetrics::error`.
+pub async fn imagegen_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+) -> ImageGenMetrics {
+    let backend = resolve_backend(model);
+    let mut m = ImageGenMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        // Chord's `/v1/images/generations` proxy (sd-turbo diffusers, :8095) or any
+        // OpenAI-compatible image server. Mirrors the `openai` arm of
+        // `infer_with_metrics`/`embed_with_metrics` exactly: the bearer token is
+        // optional and resolved from the backend's `api_key_env` at call time
+        // (never stored, never logged).
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_imagegen(
+                client,
+                &backend.url,
+                model,
+                prompt,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
+        other => {
+            // No image-generation wire path for this backend kind: a clear,
+            // non-silent error the runner turns into a clean "skip" (not a crash).
+            m.error = Some(format!(
+                "backend '{}' kind '{other}' does not support image generation",
+                backend.name
+            ));
+        }
+    }
+    // Best-effort peak VRAM (single post-call sysfs read); `None` if unreadable.
+    m.vram_peak_mb = vram_used_mb();
+    m
+}
+
+/// OpenAI-compatible image generation (`POST {base}/v1/images/generations`). The
+/// image-generation twin of [`openai_infer`]/[`openai_embed`]: profiles any backend
+/// speaking the OpenAI images wire protocol — Chord's proxy in front of the sd-turbo
+/// diffusers serve, or any compatible server. `time_to_image_ms` is measured LOCALLY
+/// (wall clock) and is recorded on EVERY exit path (transport error included);
+/// `auth` is an optional bearer token resolved from the backend's `api_key_env` —
+/// never logged. Success is decided by a non-empty `data[0].b64_json` OR `data[0].url`;
+/// the image bytes themselves are NOT retained. Body reads are bounded (32 MiB cap,
+/// [`read_body_capped`]) — a server can stream an unbounded body. A missing/empty image
+/// (some servers 200 with an empty `data` array) is a clean, non-silent error so the
+/// runner records a failed generation rather than crashing. Never panics — every failure
+/// lands in `m.error`, and `success` is never fabricated true.
+async fn openai_imagegen(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut ImageGenMetrics,
+) {
+    let body = serde_json::json!({ "model": model, "prompt": prompt, "n": 1 });
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/images/generations", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            m.error = Some(e.to_string());
+            // Record wall-clock latency on EVERY exit path, transport error
+            // included (a timeout is real elapsed time), per the metric contract.
+            m.time_to_image_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    // Record wall-clock time as soon as the round-trip completes, so an HTTP-error
+    // response (e.g. a 500 from a VRAM ceiling) still carries a time_to_image number.
+    m.time_to_image_ms = started.elapsed().as_millis() as i64;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        // Bounded error-body read (DoS) — a non-2xx backend can stream an
+        // unbounded body just as a 200 can.
+        let txt = read_text_capped(resp, MAX_RESPONSE_BYTES).await;
+        m.error = Some(format!("openai imagegen HTTP {code}: {txt}"));
+        m.time_to_image_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    // Bounded body read (DoS) — never `resp.json()` an uncapped body.
+    let bytes = match read_body_capped(resp, MAX_RESPONSE_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            m.error = Some(format!("openai imagegen response read error: {e}"));
+            m.time_to_image_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            m.error = Some(format!("openai imagegen response parse error: {e}"));
+            m.time_to_image_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    // Some OpenAI-compatible servers 200 with an `{"error": {...}}` body; surface it
+    // rather than treating the run as a success with no image.
+    if let Some(err) = v.pointer("/error/message").and_then(|e| e.as_str()) {
+        m.error = Some(err.to_string());
+        return;
+    }
+    // OpenAI images schema: { "data": [ { "b64_json": "..."} | { "url": "..." } ] }.
+    let image = v
+        .pointer("/data/0/b64_json")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            v.pointer("/data/0/url")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+        });
+    match image {
+        Some(_) => m.success = true,
+        None => {
+            m.error = Some("image generation returned no image (empty data)".to_string());
+        }
+    }
+}
+
 /// Subset of Ollama `/api/embeddings` response we consume.
 #[derive(Deserialize)]
 struct OllamaEmbedResponse {
@@ -2575,5 +2766,153 @@ mod tests {
         // Cap well below the 4096-byte body → clean cap error, never a 4KiB read.
         let err = read_body_capped(resp, 512).await.unwrap_err();
         assert!(err.contains("cap"), "expected a cap error, got: {err}");
+    }
+
+    // SUITE-IMG (S125): OpenAI-compatible image-generation arm parses
+    // `data[0].b64_json`, marks success, records a wall-clock time, and leaves
+    // `error` unset. Mirrors `openai_embed_parses_data_embedding`.
+    #[tokio::test]
+    async fn openai_imagegen_parses_b64_image_and_success() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/images/generations");
+                then.status(200).json_body(serde_json::json!({
+                    "created": 1,
+                    "data": [{ "b64_json": "aGVsbG8=" }]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ImageGenMetrics::default();
+        openai_imagegen(
+            &client,
+            &server.base_url(),
+            "sd-turbo",
+            "a red cube on a white table",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert!(m.success);
+        assert!(m.error.is_none());
+        assert!(m.time_to_image_ms >= 0);
+    }
+
+    // A `url`-form image also counts as success (some servers return a URL).
+    #[tokio::test]
+    async fn openai_imagegen_parses_url_image_and_success() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/images/generations");
+                then.status(200).json_body(serde_json::json!({
+                    "data": [{ "url": "https://example.invalid/img.png" }]
+                }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ImageGenMetrics::default();
+        openai_imagegen(
+            &client,
+            &server.base_url(),
+            "sd-turbo",
+            "prompt",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.success);
+        assert!(m.error.is_none());
+    }
+
+    // Hardening: an HTTP error surfaces cleanly (bounded error-body read) AND
+    // records a wall-clock time on the error exit path — a slow OOM is signal.
+    #[tokio::test]
+    async fn openai_imagegen_surfaces_http_error_and_records_time() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/images/generations");
+                then.status(500).body("out of memory");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ImageGenMetrics::default();
+        openai_imagegen(
+            &client,
+            &server.base_url(),
+            "m",
+            "prompt",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(!m.success);
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.time_to_image_ms >= 0);
+    }
+
+    // Hardening: an empty `data` array (some servers 200 with no image) is a
+    // clean error, never a fabricated success.
+    #[tokio::test]
+    async fn openai_imagegen_empty_data_is_clean_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/images/generations");
+                then.status(200).json_body(serde_json::json!({ "data": [] }));
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ImageGenMetrics::default();
+        openai_imagegen(
+            &client,
+            &server.base_url(),
+            "m",
+            "prompt",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(!m.success);
+        assert!(m.error.as_deref().unwrap_or("").contains("no image"));
+    }
+
+    // Hardening: a malformed (non-JSON) 200 body is rejected as a clean parse
+    // error via the bounded-read path — never a fabricated success.
+    #[tokio::test]
+    async fn openai_imagegen_rejects_non_json_success() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/images/generations");
+                then.status(200).body("not json at all");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = ImageGenMetrics::default();
+        openai_imagegen(
+            &client,
+            &server.base_url(),
+            "m",
+            "prompt",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(!m.success);
+        assert!(m.error.as_deref().unwrap_or("").contains("parse error"));
     }
 }

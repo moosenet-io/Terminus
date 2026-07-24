@@ -485,6 +485,14 @@ pub fn default_suites_for(model_name: &str) -> Vec<String> {
     let n = model_name.to_lowercase();
     let v = if n.contains("diffusiongemma") || n.contains("dgem") {
         vec!["diffusion"]
+    } else if n.contains("sd-turbo")
+        || n.contains("stable-diffusion")
+        || n.contains("sdxl")
+        || n.contains("flux")
+    {
+        // SUITE-IMG: text-to-image models default to the image-generation suite
+        // (the Ollama-based context/code/agent suites don't apply to them).
+        vec!["image_generation"]
     } else if is_embedding_model(&n) {
         // SUITE-EMB (TERM #508): an embedding model can't run the chat-shaped
         // context/code/agent suites — its default is the IR-retrieval suite.
@@ -619,7 +627,7 @@ impl RustTool for ModelIntake {
                 "model_name": { "type": "string", "description": "Ollama model name, e.g. 'gpt-oss:20b'" },
                 "suites": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing", "vision_qa", "reranking"] },
+                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing", "vision_qa", "reranking", "image_generation"] },
                     "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other suites don't apply to it. 'tool_routing' profiles function-calling over Chord's OpenAI-compatible /v1/chat/completions (correct-tool@1, parameter validity, decoy rejection, multi-step) — a first-class generalization of the 'agent' suite's tool-selection path. 'vision_qa' profiles a vision/VLM model on image-QA via Chord's chat/vision route (accuracy, caption similarity, hallucination, latency, VRAM)."
                 },
                 "tiers": {
@@ -927,6 +935,22 @@ impl RustTool for ModelIntake {
                 res.queries_run, res.avg_ndcg_uplift, res.avg_reranked_ndcg, res.avg_latency_ms,
             ));
             for line in &res.per_query {
+                out.push_str(&format!("  {line}\n"));
+            }
+            out.push('\n');
+        }
+
+        // SUITE-IMG: image-generation suite (its own profile row + `openai`
+        // backend via Chord's `/v1/images/generations`, sd-turbo behind it).
+        // Self-contained — does not use the Ollama `profile_id` above.
+        if suites.iter().any(|s| s == "image_generation") {
+            let res = runner::run_image_generation_suite(model_name).await?;
+            out.push_str("=== Image-generation suite ===\n");
+            out.push_str(&format!(
+                "prompts run: {}\nsuccessful: {}/{}\navg time_to_image_ms: {:.0}\n",
+                res.prompts_run, res.success_count, res.prompts_run, res.avg_time_to_image_ms,
+            ));
+            for line in &res.per_prompt {
                 out.push_str(&format!("  {line}\n"));
             }
             out.push('\n');
@@ -1474,6 +1498,9 @@ mod tests {
         assert_eq!(default_suites_for("nomic-embed-text:latest"), vec!["embedding_retrieval"]);
         assert_eq!(default_suites_for("bge-large-en"), vec!["embedding_retrieval"]);
         assert_eq!(default_suites_for("mxbai-embed-large"), vec!["embedding_retrieval"]);
+        // SUITE-IMG: text-to-image models route to the image-generation suite.
+        assert_eq!(default_suites_for("sd-turbo"), vec!["image_generation"]);
+        assert_eq!(default_suites_for("stable-diffusion-3.5"), vec!["image_generation"]);
     }
 
     #[test]

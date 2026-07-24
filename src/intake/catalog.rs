@@ -96,6 +96,12 @@ const VISION_QA_DIMENSION: &str = "vision_description";
 /// SUITE-RRK: the reranking suite's test-family tag (nDCG uplift + latency,
 /// distinct from the other families).
 pub const TEST_TYPE_RERANKING: &str = "reranking";
+/// SUITE-IMG (S125): the image-generation suite's test-family tag. Distinct from
+/// `TEST_TYPE_DIFFUSION` — image generation (text→image, sd-turbo behind Chord's
+/// `/v1/images/generations`) and the diffusion-language probe are separate suites
+/// with separate `task_category`s (`newcats::image_generation::TASK_CATEGORY ==
+/// "image_generation"` vs `newcats::diffusion::TASK_CATEGORY == "diffusion"`).
+pub const TEST_TYPE_IMAGE_GENERATION: &str = "image_generation";
 
 /// The single serving/context-profile leaf category.
 pub const SERVING_CATEGORY: &str = "context_profile";
@@ -113,6 +119,9 @@ pub const TOOL_ROUTING_CATEGORY: &str = "tool_routing";
 /// is derived by matching it (duplicated as a string here, matching how
 /// `ASSISTANT_DIMENSIONS` duplicates the `assistant/dim*.rs` `DIMENSION` consts).
 pub const RERANKING_CATEGORY: &str = "rerank_relevance";
+/// SUITE-IMG: the image-generation leaf category — the `dimension` the suite
+/// writes (`newcats::image_generation::DIMENSION == "text_to_image"`).
+pub const IMAGE_GENERATION_CATEGORY: &str = "text_to_image";
 
 /// A cell's coverage status. `not_run` is FIRST-CLASS — representing gaps is the
 /// catalog's whole job.
@@ -658,6 +667,38 @@ pub fn build_catalog(inputs: &CatalogInputs) -> Vec<ModelCatalog> {
             _ => not_run_cell(&model, TEST_TYPE_RERANKING, RERANKING_CATEGORY),
         };
         cells.push(rerank_cell);
+
+        // ---- image-generation cell (SUITE-IMG) -------------------------------
+        // The suite writes `assistant_dimension_score` rows with dimension
+        // `text_to_image` (task_category `image_generation`), which surface here
+        // as an `AssistantCell` with that dimension (the assistant reader groups
+        // by (model, dimension) and does NOT filter task_category — see
+        // `newcats::mod`). It is NOT one of `ASSISTANT_DIMENSIONS`, so it is not
+        // emitted as an assistant cell above; instead it becomes its own
+        // image-generation coverage cell. `Run` when measured, else `not_run`.
+        let imagegen_row = inputs
+            .assistant
+            .iter()
+            .find(|a| a.model_name == model && a.dimension == IMAGE_GENERATION_CATEGORY);
+        let imagegen_cell = match imagegen_row {
+            Some(a) if a.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_IMAGE_GENERATION.to_string(),
+                task_category: IMAGE_GENERATION_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                // Image generation is a success/hardware probe, not a pass-rate;
+                // only sample count + recency are meaningful (like the serving cell).
+                pass_rate: None,
+                n_samples: Some(a.n_samples),
+                score_stddev: a.score_stddev,
+                low_confidence: Some(a.n_samples <= 1),
+                last_run_at: a.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_IMAGE_GENERATION, IMAGE_GENERATION_CATEGORY),
+        };
+        cells.push(imagegen_cell);
 
         // ---- serving facts (fleet card) --------------------------------------
         let serving = ServingFacts {

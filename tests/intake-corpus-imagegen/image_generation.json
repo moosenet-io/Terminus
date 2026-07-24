@@ -1,0 +1,27 @@
+[
+  {
+    "label": "object",
+    "prompt": "a single red cube resting on a plain white table, studio lighting",
+    "clip_reference": "a red cube on a white table"
+  },
+  {
+    "label": "scene",
+    "prompt": "a quiet mountain lake at sunrise with pine trees along the shore",
+    "clip_reference": "a mountain lake at sunrise"
+  },
+  {
+    "label": "portrait",
+    "prompt": "a friendly golden retriever sitting in a grassy park on a sunny day",
+    "clip_reference": "a golden retriever in a park"
+  },
+  {
+    "label": "style",
+    "prompt": "a watercolor painting of a sailboat on a calm sea",
+    "clip_reference": "a watercolor sailboat"
+  },
+  {
+    "label": "typography",
+    "prompt": "a minimalist poster with the word OPEN in bold black letters on a yellow background",
+    "clip_reference": "a poster with the word open"
+  }
+]

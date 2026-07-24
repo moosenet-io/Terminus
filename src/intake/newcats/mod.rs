@@ -23,8 +23,16 @@
 //!     `infer::vision_infer_with_metrics`. Catalog family `TEST_TYPE_VISION_QA`.
 //!   - [`image_generation`]    — `task_category = "image_generation"`: DIFFERENT
 //!     metric shape (no tokens/accuracy) — success bool, time-to-image ms,
-//!     VRAM peak MB. No generation backend exists on this box yet; only the
-//!     scoring/write path is exercised (against a mock result).
+//!     VRAM peak MB, plus a SCAFFOLDED CLIP prompt-adherence metric (emitted
+//!     only when a CLIP score is measured; NOT measured on this box → cleanly
+//!     absent). SUITE-IMG (S125): now WIRED — a `TEST_TYPE_IMAGE_GENERATION`
+//!     const + catalog cell, a `run_image_generation_suite` driver in
+//!     `runner.rs`, and a live backend call through
+//!     `intake::infer::imagegen_with_metrics` (Chord's OpenAI-compatible
+//!     `/v1/images/generations` route, sd-turbo diffusers behind it). Prompts
+//!     load from `INTAKE_CORPUS_DIR/image_generation.json` with an in-source
+//!     default set. Unit tests still exercise the scoring/write path against a
+//!     mock `GenerationOutcome` and the backend parse-path via httpmock.
 //!   - [`voice_transcription`] — `task_category = "voice_transcription"`: ASR
 //!     transcript vs reference, scored by word-error-rate (WER).
 //!   - [`diffusion`]           — `task_category = "diffusion"` (MINT-DIFF-01):
