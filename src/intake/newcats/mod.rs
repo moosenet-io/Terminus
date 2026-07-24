@@ -35,6 +35,12 @@
 //!     mock `GenerationOutcome` and the backend parse-path via httpmock.
 //!   - [`voice_transcription`] — `task_category = "voice_transcription"`: ASR
 //!     transcript vs reference, scored by word-error-rate (WER).
+//!   - [`tts`]                  — `task_category = "tts"` (S125 SUITE-TTS):
+//!     text-to-speech via Chord `/v1/audio/speech`, scored END-TO-END by an
+//!     STT-loopback (synthesize → transcribe → WER vs the input text) plus a
+//!     scaffold acoustic MOS-proxy and a Real-Time Factor (RTF). Like
+//!     `diffusion`, emits both a QUALITY dimension (`tts_intelligibility`) and a
+//!     PERFORMANCE dimension (`tts_performance`).
 //!   - [`diffusion`]           — `task_category = "diffusion"` (MINT-DIFF-01):
 //!     diffusion-language-model (DiffusionGemma/dgem) probe. Unlike the other
 //!     four, emits TWO dimensions per use-case: use-case QUALITY
@@ -89,4 +95,5 @@ pub mod image_parsing;
 pub mod reranking;
 pub mod text_similarity;
 pub mod tool_routing;
+pub mod tts;
 pub mod voice_transcription;

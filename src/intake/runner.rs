@@ -1355,6 +1355,120 @@ pub async fn run_document_parsing_suite(model_name: &str) -> Result<DocParseSuit
     })
 }
 
+/// Outcome of the TTS suite (S125 SUITE-TTS) for the tool return summary.
+pub struct TtsSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub cases_run: usize,
+    pub avg_loopback_wer: f64,
+    pub avg_rtf: Option<f64>,
+    /// One-line-per-case summary, in [`crate::intake::newcats::tts::load_cases`] order.
+    pub per_case: Vec<String>,
+}
+
+/// Run the TTS suite (S125 SUITE-TTS) end-to-end against `model_name`: for each
+/// case in [`crate::intake::newcats::tts::load_cases`], synthesize speech through
+/// Chord's `/v1/audio/speech` ([`crate::intake::infer::synthesize_with_metrics`]),
+/// transcribe the produced audio back through the SHARED STT arm
+/// ([`crate::intake::infer::transcribe_with_metrics`] — the SUITE-STT hand-rolled
+/// multipart transcribe, deduped at integration), derive a
+/// [`crate::intake::newcats::tts::TtsOutcome`], and write the intelligibility
+/// (STT-loopback WER + MOS-proxy) and performance (synthesis_ms + RTF) rows via
+/// [`crate::intake::newcats::tts::score_and_write`].
+///
+/// The STT loopback model is resolved from `TTS_LOOPBACK_STT_MODEL` (a model
+/// name / registry key only — never a host/IP; defaults to `"faster-whisper"`),
+/// and the synthesis voice from `TTS_VOICE` (default `"en_US-lessac-medium"`).
+///
+/// Creates its own `model_profiles` row (provider `"openai"`, matching the Chord
+/// OpenAI-compatible backend kind these routes speak). A per-case failure is
+/// recorded (skipped from the averages) rather than aborting the whole suite —
+/// matches every other `newcats` category's "failure is still useful signal"
+/// convention.
+pub async fn run_tts_suite(model_name: &str) -> Result<TtsSuiteOutcome, ToolError> {
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::{synthesize_with_metrics, transcribe_with_metrics};
+    use crate::intake::newcats::tts::{self, TtsOutcome};
+
+    let profile_id = create_profile_row_for_provider(model_name, "openai").await?;
+    let pool = storage::get_pool().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(e.to_string()))?;
+    let model_id = ModelId::from(model_name);
+
+    // Loopback STT model + synthesis voice: names only, from env (no host/IP).
+    let stt_model = std::env::var("TTS_LOOPBACK_STT_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "faster-whisper".to_string());
+    let voice = std::env::var("TTS_VOICE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "en_US-lessac-medium".to_string());
+
+    let cases = tts::load_cases();
+    let mut per_case = Vec::with_capacity(cases.len());
+    let mut wer_sum = 0.0;
+    let mut rtf_sum = 0.0;
+    let mut rtf_n = 0usize;
+    let mut n = 0usize;
+
+    for case in &cases {
+        // 1) Synthesize.
+        let speech =
+            synthesize_with_metrics(&client, model_name, &case.text, &voice, Duration::from_secs(120)).await;
+        if let Some(err) = &speech.error {
+            per_case.push(format!("{}: synth error ({err})", case.label));
+            continue;
+        }
+        let backend_tag = speech
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Gpu);
+
+        // 2) Transcribe the produced audio (STT loopback) — via the SHARED
+        // SUITE-STT multipart transcribe (deduped). A `filename` is required by
+        // that arm's multipart shape; the synthesized audio is WAV.
+        let stt =
+            transcribe_with_metrics(&client, &stt_model, &speech.audio, "tts-loopback.wav", Duration::from_secs(120)).await;
+        if let Some(err) = &stt.error {
+            per_case.push(format!("{}: stt-loopback error ({err})", case.label));
+            continue;
+        }
+
+        // 3) Derive outcome (duration/MOS from the WAV) and score.
+        let outcome = TtsOutcome::from_audio(stt.transcript.clone(), speech.latency_ms, &speech.audio);
+        let wer = tts::loopback_wer(&outcome.loopback_transcript, &case.text);
+        let rtf = tts::real_time_factor(outcome.synthesis_ms, outcome.audio_duration_s);
+        wer_sum += wer;
+        if let Some(r) = rtf {
+            rtf_sum += r;
+            rtf_n += 1;
+        }
+        n += 1;
+
+        tts::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, case, &outcome).await?;
+
+        per_case.push(format!(
+            "{}: wer={wer:.2} synth_ms={} rtf={} mos={}",
+            case.label,
+            outcome.synthesis_ms,
+            rtf.map(|r| format!("{r:.2}")).unwrap_or_else(|| "n/a".into()),
+            outcome.mos_proxy.map(|v| format!("{v:.2}")).unwrap_or_else(|| "n/a".into()),
+        ));
+    }
+
+    Ok(TtsSuiteOutcome {
+        profile_id,
+        cases_run: n,
+        avg_loopback_wer: if n > 0 { wer_sum / n as f64 } else { 0.0 },
+        avg_rtf: if rtf_n > 0 { Some(rtf_sum / rtf_n as f64) } else { None },
+        per_case,
+    })
+}
+
 /// Disk-usage percentage for a mount via `df`, or None if it can't be read.
 fn disk_pct(mount: &str) -> Option<u8> {
     let out = std::process::Command::new("df")
@@ -1588,6 +1702,20 @@ pub async fn run_fleet_suites(
                     o.cases_run, o.avg_field_accuracy
                 )),
                 Err(e) => parts.push(format!("document_parsing: error {e}")),
+            }
+        }
+        // S125 SUITE-TTS: self-contained driver (creates its own `openai`-provider
+        // profile row via `run_tts_suite`, like the diffusion suite), so it does not
+        // share the context/code/agent `profile_id` above.
+        if suites.iter().any(|s| s == "tts") {
+            match run_tts_suite(model).await {
+                Ok(o) => parts.push(format!(
+                    "tts: cases={} avg_wer={:.2} avg_rtf={}",
+                    o.cases_run,
+                    o.avg_loopback_wer,
+                    o.avg_rtf.map(|r| format!("{r:.2}")).unwrap_or_else(|| "n/a".into()),
+                )),
+                Err(e) => parts.push(format!("tts: error {e}")),
             }
         }
 

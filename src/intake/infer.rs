@@ -1614,6 +1614,171 @@ async fn openai_transcribe(
     m.latency_ms = started.elapsed().as_millis() as i64;
 }
 
+// ── S125 SUITE-TTS: text-to-speech (`/v1/audio/speech`) + STT-loopback ────────
+// The STT-loopback reuses the SHARED `transcribe_with_metrics` / `openai_transcribe`
+// (proper hand-rolled multipart) defined above for SUITE-STT — SUITE-TTS does NOT
+// carry its own duplicate transcription arm (deduped at integration, S125 batch-2).
+
+/// Normalized result of one text-to-speech synthesis request (S125 SUITE-TTS).
+///
+/// `audio` is the raw synthesized audio (WAV bytes when the backend honors a
+/// `wav` `response_format`); `content_type` is the response MIME (for
+/// attribution / a future decoder); `latency_ms` is the wall-clock round-trip.
+/// On any failure (transport, HTTP, empty body, or a backend kind that can't
+/// synthesize) `error` is set and `audio` is empty — callers never panic and
+/// never see fabricated audio. Mirrors [`EmbedMetrics`] (no `oom` field).
+#[derive(Debug, Clone, Default)]
+pub struct SpeechMetrics {
+    pub audio: Vec<u8>,
+    pub content_type: Option<String>,
+    pub latency_ms: i64,
+    pub error: Option<String>,
+    /// Backend that served the request (for attribution).
+    pub backend: Option<String>,
+    /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
+    pub hardware: Option<String>,
+}
+
+/// Synthesize `input` to speech for `model` through Chord's unified backend
+/// routing (`/v1/audio/speech`). The TTS analogue of [`embed_with_metrics`]:
+/// resolves the model's tagged backend via [`resolve_backend`] and dispatches to
+/// that backend's speech endpoint. The SUITE-TTS harness is a *client* of this —
+/// it never opens an HTTP path to piper directly.
+///
+/// Backend support: the OpenAI-compatible speech path (`/v1/audio/speech`) is
+/// implemented (Chord's proxy in front of piper `en_US-lessac-medium`). Any other
+/// backend kind returns a clear, non-silent error so a non-TTS model is skipped
+/// cleanly upstream, not crashed. Never panics — every failure lands in
+/// `SpeechMetrics::error`.
+pub async fn synthesize_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    input: &str,
+    voice: &str,
+    timeout: Duration,
+) -> SpeechMetrics {
+    let backend = resolve_backend(model);
+    let mut m = SpeechMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        // Any OpenAI-compatible speech backend — Chord's `/v1/audio/speech` proxy.
+        // Mirrors the `embed_with_metrics` "openai" arm exactly: the bearer token
+        // is optional and resolved from the backend's `api_key_env` at call time
+        // (never stored, never logged).
+        "openai" => {
+            let auth = backend
+                .api_key_env
+                .as_deref()
+                .and_then(|k| std::env::var(k).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            openai_speech(
+                client,
+                &backend.url,
+                model,
+                input,
+                voice,
+                timeout,
+                auth.as_deref(),
+                &mut m,
+            )
+            .await;
+        }
+        other => {
+            m.error = Some(format!(
+                "backend '{}' kind '{other}' does not support speech synthesis",
+                backend.name
+            ));
+        }
+    }
+    m
+}
+
+/// OpenAI-compatible text-to-speech (`POST {base}/v1/audio/speech`). The speech
+/// twin of [`openai_embed`]/[`openai_infer`]: builds a `{model, input, voice,
+/// response_format}` body, POSTs it, measures LOCAL wall-clock latency (recorded
+/// on EVERY exit path), and RECEIVES AUDIO BYTES (not JSON) on success.
+/// `response_format` is requested as `wav` so the SUITE-TTS scorer can derive
+/// duration/RMS from a PCM header; the body read is bounded (32 MiB cap,
+/// [`read_body_capped`]); `auth` is an optional bearer token resolved from the
+/// backend's `api_key_env` — never logged. An empty body is a clean, non-silent
+/// error (skip, not crash). Never panics — every failure lands in `m.error`,
+/// audio is never fabricated.
+async fn openai_speech(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    input: &str,
+    voice: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    m: &mut SpeechMetrics,
+) {
+    let body = serde_json::json!({
+        "model": model,
+        "input": input,
+        "voice": voice,
+        "response_format": "wav",
+    });
+    let started = std::time::Instant::now();
+    let mut req = client
+        .post(format!("{}/v1/audio/speech", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(timeout);
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            m.error = Some(e.to_string());
+            // Record wall-clock latency on EVERY exit path, transport error included.
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        // Bounded error-body read (DoS) — a non-2xx backend can stream too.
+        let txt = read_text_capped(resp, MAX_RESPONSE_BYTES).await;
+        m.error = Some(format!("openai speech HTTP {code}: {txt}"));
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    // Capture the MIME before consuming the body.
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    // Bounded body read (DoS) — never read an uncapped audio body into memory.
+    let bytes = match read_body_capped(resp, MAX_RESPONSE_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            m.error = Some(format!("openai speech body read error: {e}"));
+            m.latency_ms = started.elapsed().as_millis() as i64;
+            return;
+        }
+    };
+    if bytes.is_empty() {
+        m.error = Some("openai speech endpoint returned an empty audio body".to_string());
+        m.latency_ms = started.elapsed().as_millis() as i64;
+        return;
+    }
+    m.audio = bytes;
+    m.content_type = content_type;
+    m.latency_ms = started.elapsed().as_millis() as i64;
+}
+
 /// Subset of Ollama `/api/embeddings` response we consume.
 #[derive(Deserialize)]
 struct OllamaEmbedResponse {
@@ -3618,5 +3783,94 @@ mod tests {
         .await;
         assert!(m.error.as_deref().unwrap_or("").contains("parse error"));
         assert!(m.transcript.is_empty());
+    }
+
+    // S125 SUITE-TTS: the speech arm POSTs to /v1/audio/speech and receives raw
+    // audio bytes, recording them + the content-type and leaving `error` unset.
+    #[tokio::test]
+    async fn openai_speech_parses_audio_body() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/audio/speech");
+                then.status(200)
+                    .header("content-type", "audio/wav")
+                    .body(b"RIFF____WAVEfake-pcm-bytes".to_vec());
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = SpeechMetrics::default();
+        openai_speech(
+            &client,
+            &server.base_url(),
+            "piper",
+            "hello world",
+            "en_US-lessac-medium",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        mock.assert_async().await;
+        assert!(!m.audio.is_empty());
+        assert_eq!(m.content_type.as_deref(), Some("audio/wav"));
+        assert!(m.error.is_none());
+        assert!(m.latency_ms >= 0);
+    }
+
+    // Hardening: an HTTP error surfaces cleanly (bounded error-body read) and
+    // records latency on the error exit path; audio is never fabricated.
+    #[tokio::test]
+    async fn openai_speech_surfaces_http_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/audio/speech");
+                then.status(500).body("boom");
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = SpeechMetrics::default();
+        openai_speech(
+            &client,
+            &server.base_url(),
+            "piper",
+            "hi",
+            "v",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("500"));
+        assert!(m.audio.is_empty());
+        assert!(m.latency_ms >= 0);
+    }
+
+    // Hardening: an empty audio body is a clean, non-silent error (skip, not crash).
+    #[tokio::test]
+    async fn openai_speech_empty_body_is_clean_error() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/v1/audio/speech");
+                then.status(200).body(Vec::<u8>::new());
+            })
+            .await;
+        let client = reqwest::Client::new();
+        let mut m = SpeechMetrics::default();
+        openai_speech(
+            &client,
+            &server.base_url(),
+            "piper",
+            "hi",
+            "v",
+            std::time::Duration::from_secs(10),
+            None,
+            &mut m,
+        )
+        .await;
+        assert!(m.error.as_deref().unwrap_or("").contains("empty audio"));
+        assert!(m.audio.is_empty());
     }
 }
