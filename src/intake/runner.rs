@@ -625,6 +625,12 @@ pub async fn run_stt_suite(model_name: &str) -> Result<SttSuiteOutcome, ToolErro
         .build()
         .map_err(|e| ToolError::Http(e.to_string()))?;
     let model_id = ModelId::from(model_name);
+    // FK fix (S125): `assistant_dimension_score.run_id` REFERENCES
+    // `assistant_profile_run(id)`, NOT `model_profiles(id)`. Create the run
+    // parent ONCE per driver invocation and score every row against it. The
+    // `profile_id` above remains the catalog/model_profiles id (used in the
+    // returned outcome + `model_id`), not the FK target.
+    let run_id = crate::intake::assistant::schema::insert_run(&pool).await?;
 
     let mut per_clip = Vec::with_capacity(manifest.len());
     let mut wer_sum = 0.0;
@@ -676,7 +682,7 @@ pub async fn run_stt_suite(model_name: &str) -> Result<SttSuiteOutcome, ToolErro
 
         voice_transcription::score_and_write(
             &pool,
-            profile_id,
+            run_id,
             model_id.clone(),
             backend_tag,
             &entry.reference,
@@ -728,6 +734,10 @@ pub async fn run_diffusion_suite(model_name: &str) -> Result<DiffusionSuiteOutco
         .build()
         .map_err(|e| ToolError::Http(e.to_string()))?;
     let model_id = ModelId::from(model_name);
+    // FK fix (S125): score rows FK to `assistant_profile_run(id)`, not
+    // `model_profiles(id)`. Same class as the eight S125 suite drivers — create
+    // the run parent once, score against it.
+    let run_id = crate::intake::assistant::schema::insert_run(&pool).await?;
 
     let mut per_use_case = Vec::with_capacity(diffusion::USE_CASES.len());
     let mut quality_sum = 0.0;
@@ -752,7 +762,7 @@ pub async fn run_diffusion_suite(model_name: &str) -> Result<DiffusionSuiteOutco
         time_sum += outcome.time_to_output_ms as f64;
         n += 1;
 
-        diffusion::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, use_case, &outcome).await?;
+        diffusion::score_and_write(&pool, run_id, model_id.clone(), backend_tag, use_case, &outcome).await?;
 
         per_use_case.push(if let Some(err) = &metrics.error {
             format!("{}: error ({err})", use_case.label)
@@ -814,7 +824,10 @@ pub async fn run_embedding_retrieval_suite(
     // fleet, so GPU is the default attribution (a future refinement can thread the
     // observed `EmbedMetrics::hardware` through the embedder).
     let embedder = ChordEmbedder::new(ModelId::from(model_name), BackendTag::Gpu);
-    let summary = er::score_and_write(&pool, profile_id, &embedder, &public, domain.as_ref()).await?;
+    // FK fix (S125): score rows FK to `assistant_profile_run(id)`, not
+    // `model_profiles(id)`. Create the run parent once, then write against it.
+    let run_id = crate::intake::assistant::schema::insert_run(&pool).await?;
+    let summary = er::score_and_write(&pool, run_id, &embedder, &public, domain.as_ref()).await?;
 
     Ok(EmbeddingRetrievalSuiteOutcome {
         profile_id,
@@ -897,6 +910,10 @@ pub async fn run_tool_routing_suite(
     let pool = storage::get_pool().await?;
     let model_id = ModelId::from(model_name);
     let timeout = tool_routing_timeout();
+    // FK fix (S125): the `profile_id` PARAM is a `model_profiles(id)`; score rows
+    // FK to `assistant_profile_run(id)`. Create the run parent once per invocation
+    // and score every scenario against it (profile_id stays for the outcome).
+    let run_id = crate::intake::assistant::schema::insert_run(&pool).await?;
 
     // Per-metric tallies (sum, count) so the summary reports means without a
     // re-query. Order: correct_tool@1, param_validity, decoy_reject, multi_step.
@@ -933,7 +950,7 @@ pub async fn run_tool_routing_suite(
             e.0 += score.value;
             e.1 += 1;
         }
-        rows_written += tool_routing::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, sc, &outcome).await?;
+        rows_written += tool_routing::score_and_write(&pool, run_id, model_id.clone(), backend_tag, sc, &outcome).await?;
     }
 
     let mean = |m: &str| tally.get(m).and_then(|(s, n)| if *n > 0 { Some(*s / *n as f64) } else { None });
@@ -1002,6 +1019,9 @@ pub async fn run_vision_qa_suite(model_name: &str) -> Result<VisionQaSuiteOutcom
         .build()
         .map_err(|e| ToolError::Http(e.to_string()))?;
     let model_id = ModelId::from(model_name);
+    // FK fix (S125): score rows FK to `assistant_profile_run(id)`, not
+    // `model_profiles(id)`. Create the run parent once, score against it.
+    let run_id = crate::intake::assistant::schema::insert_run(&pool).await?;
 
     let mut per_item = Vec::with_capacity(items.len());
     let mut acc_sum = 0.0;
@@ -1039,7 +1059,7 @@ pub async fn run_vision_qa_suite(model_name: &str) -> Result<VisionQaSuiteOutcom
         lat_sum += outcome.latency_ms as f64;
         n += 1;
 
-        image_parsing::score_and_write_vqa(&pool, profile_id, model_id.clone(), backend_tag, item, &outcome).await?;
+        image_parsing::score_and_write_vqa(&pool, run_id, model_id.clone(), backend_tag, item, &outcome).await?;
 
         per_item.push(if let Some(err) = &metrics.error {
             format!("{}: error ({err})", item.image_file)
@@ -1101,6 +1121,9 @@ pub async fn run_reranking_suite(model_name: &str) -> Result<RerankingSuiteOutco
         .build()
         .map_err(|e| ToolError::Http(e.to_string()))?;
     let model_id = ModelId::from(model_name);
+    // FK fix (S125): score rows FK to `assistant_profile_run(id)`, not
+    // `model_profiles(id)`. Create the run parent once, score against it.
+    let run_id = crate::intake::assistant::schema::insert_run(&pool).await?;
 
     let mut per_query = Vec::with_capacity(corpus.len());
     let mut uplift_sum = 0.0;
@@ -1142,7 +1165,7 @@ pub async fn run_reranking_suite(model_name: &str) -> Result<RerankingSuiteOutco
         latency_sum += outcome.latency_ms as f64;
         n += 1;
 
-        reranking::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, query, &outcome)
+        reranking::score_and_write(&pool, run_id, model_id.clone(), backend_tag, query, &outcome)
             .await?;
 
         per_query.push(format!(
@@ -1201,6 +1224,9 @@ pub async fn run_image_generation_suite(model_name: &str) -> Result<ImageGenSuit
         .build()
         .map_err(|e| ToolError::Http(e.to_string()))?;
     let model_id = ModelId::from(model_name);
+    // FK fix (S125): score rows FK to `assistant_profile_run(id)`, not
+    // `model_profiles(id)`. Create the run parent once, score against it.
+    let run_id = crate::intake::assistant::schema::insert_run(&pool).await?;
     let prompts = image_generation::load_prompts();
 
     let mut per_prompt = Vec::with_capacity(prompts.len());
@@ -1231,7 +1257,7 @@ pub async fn run_image_generation_suite(model_name: &str) -> Result<ImageGenSuit
         }
         n += 1;
 
-        image_generation::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, &outcome).await?;
+        image_generation::score_and_write(&pool, run_id, model_id.clone(), backend_tag, &outcome).await?;
 
         per_prompt.push(if let Some(err) = &metrics.error {
             format!("{}: error ({err})", p.label)
@@ -1291,6 +1317,9 @@ pub async fn run_document_parsing_suite(model_name: &str) -> Result<DocParseSuit
         .build()
         .map_err(|e| ToolError::Http(e.to_string()))?;
     let model_id = ModelId::from(model_name);
+    // FK fix (S125): score rows FK to `assistant_profile_run(id)`, not
+    // `model_profiles(id)`. Create the run parent once, score against it.
+    let run_id = crate::intake::assistant::schema::insert_run(&pool).await?;
 
     let mut per_case = Vec::with_capacity(cases.len());
     let mut accuracy_sum = 0.0;
@@ -1331,7 +1360,7 @@ pub async fn run_document_parsing_suite(model_name: &str) -> Result<DocParseSuit
         latency_sum += outcome.latency_ms as f64;
         n += 1;
 
-        document_parsing::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, &truth, &outcome)
+        document_parsing::score_and_write(&pool, run_id, model_id.clone(), backend_tag, &truth, &outcome)
             .await?;
 
         per_case.push(if let Some(err) = &metrics.error {
@@ -1407,6 +1436,10 @@ pub async fn run_tts_suite(model_name: &str) -> Result<TtsSuiteOutcome, ToolErro
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "en_US-lessac-medium".to_string());
 
+    // FK fix (S125): score rows FK to `assistant_profile_run(id)`, not
+    // `model_profiles(id)`. Create the run parent once, score against it.
+    let run_id = crate::intake::assistant::schema::insert_run(&pool).await?;
+
     let cases = tts::load_cases();
     let mut per_case = Vec::with_capacity(cases.len());
     let mut wer_sum = 0.0;
@@ -1449,7 +1482,7 @@ pub async fn run_tts_suite(model_name: &str) -> Result<TtsSuiteOutcome, ToolErro
         }
         n += 1;
 
-        tts::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, case, &outcome).await?;
+        tts::score_and_write(&pool, run_id, model_id.clone(), backend_tag, case, &outcome).await?;
 
         per_case.push(format!(
             "{}: wer={wer:.2} synth_ms={} rtf={} mos={}",
@@ -1999,5 +2032,123 @@ mod tests {
         .await;
         assert!(r.is_err());
         assert_eq!(calls.get(), 3, "should attempt exactly the bound, then give up");
+    }
+
+    /// Regression test for the S125 suite-driver FK bug: the eight (nine incl.
+    /// diffusion) new-category suite drivers were passing the `model_profiles`
+    /// id returned by `create_profile_row_for_provider` straight into a suite's
+    /// `score_and_write(..)` as its `run_id`. But `assistant_dimension_score`
+    /// has `run_id UUID NOT NULL REFERENCES assistant_profile_run(id)`, so every
+    /// live `model_intake` on a real Postgres died with
+    /// `violates foreign key constraint "assistant_dimension_score_run_id_fkey"`.
+    /// The unit tests missed it because they exercised pure scoring, never the
+    /// FK-enforcing write. This test drives the REAL write path against a live
+    /// Postgres two ways:
+    ///
+    ///   * POSITIVE — a `run_id` obtained THE WAY THE DRIVERS NOW DO IT
+    ///     (`assistant::schema::insert_run`, an `assistant_profile_run` parent)
+    ///     makes `reranking::score_and_write` (→ `insert_dimension_score_with_category`)
+    ///     SUCCEED and land rows.
+    ///   * NEGATIVE — feeding the `model_profiles` id (the OLD, broken argument)
+    ///     as `run_id` reproduces the exact FK violation, proving the constraint
+    ///     is enforced and that the regression, if reintroduced, would be caught.
+    ///
+    /// Gated on a reachable Postgres (same convention as the `assistant::schema`
+    /// regression tests): skips (passes trivially) when neither
+    /// `INTAKE_DATABASE_URL` nor `DATABASE_URL` is configured, so it stays green
+    /// with no live DB while running for real whenever one is available. NOTE:
+    /// this is the real guard for this bug class — a live pg is required to
+    /// actually exercise the FK; with no DB the test only skips.
+    #[tokio::test]
+    async fn suite_driver_run_id_is_assistant_profile_run_fk_safe() {
+        use crate::intake::assistant::schema::{insert_run, migrate};
+        use crate::intake::assistant::{BackendTag, ModelId};
+        use crate::intake::newcats::reranking::{self, RerankOutcome, RerankQuery};
+
+        let pool = match storage::get_pool().await {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!(
+                    "skipping suite_driver_run_id_is_assistant_profile_run_fk_safe: \
+                     no INTAKE_DATABASE_URL/DATABASE_URL configured"
+                );
+                return;
+            }
+        };
+        if migrate(&pool).await.is_err() {
+            eprintln!(
+                "skipping suite_driver_run_id_is_assistant_profile_run_fk_safe: \
+                 migrate() failed (DB unreachable or not provisioned)"
+            );
+            return;
+        }
+
+        // Reproduce a driver's exact preamble: a `model_profiles` row (catalog
+        // id) via the shared helper, and a SEPARATE `assistant_profile_run`
+        // parent for the scores. These are DIFFERENT tables — the whole bug was
+        // conflating the two ids.
+        let model_name = format!("s125-fk-regress-{}", uuid::Uuid::new_v4());
+        let profile_id = create_profile_row_for_provider(&model_name, "openai")
+            .await
+            .expect("create_profile_row_for_provider (model_profiles id)");
+        let run_id = insert_run(&pool).await.expect("insert_run (assistant_profile_run id)");
+        assert_ne!(profile_id, run_id, "the two ids must not collide");
+
+        let model_id = ModelId::from(model_name.as_str());
+        let query = RerankQuery {
+            query_id: "q1".to_string(),
+            query: "what is the capital".to_string(),
+            passages: vec!["irrelevant".to_string(), "relevant".to_string()],
+            relevance: vec![0.0, 1.0],
+            baseline_order: vec![0, 1],
+        };
+        let outcome = RerankOutcome { reranked_order: vec![1, 0], latency_ms: 12 };
+
+        // POSITIVE: the fixed driver contract — score against the
+        // assistant_profile_run id — must write cleanly (no FK violation).
+        reranking::score_and_write(&pool, run_id, model_id.clone(), BackendTag::Gpu, &query, &outcome)
+            .await
+            .expect("score_and_write with an assistant_profile_run run_id must succeed");
+
+        let written: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM assistant_dimension_score WHERE run_id = $1")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count written rows");
+        assert!(written > 0, "the suite write path must have persisted at least one score row");
+
+        // NEGATIVE: the OLD, broken argument — the model_profiles id as run_id —
+        // must be REJECTED by the FK, reproducing the exact production failure.
+        let err = reranking::score_and_write(
+            &pool,
+            profile_id,
+            model_id.clone(),
+            BackendTag::Gpu,
+            &query,
+            &outcome,
+        )
+        .await
+        .expect_err("passing a model_profiles id as run_id MUST violate the assistant_profile_run FK");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("foreign key") || msg.contains("assistant_dimension_score_run_id_fkey"),
+            "the failure must be the run_id FK violation (the reported prod bug), got: {msg}"
+        );
+
+        // Cleanup: rows are scoped to this run/model, so this only removes what
+        // this test inserted.
+        let _ = sqlx::query("DELETE FROM assistant_dimension_score WHERE run_id = $1")
+            .bind(run_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM assistant_profile_run WHERE id = $1")
+            .bind(run_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM model_profiles WHERE id = $1")
+            .bind(profile_id)
+            .execute(&pool)
+            .await;
     }
 }
