@@ -542,21 +542,33 @@ pub fn is_non_ollama_daemon(model_name: &str) -> bool {
 
 /// SUITE-STT: whether a model is a speech-to-text (ASR) model reached through
 /// Chord's OpenAI-compatible `/v1/audio/transcriptions` route rather than the
-/// Ollama load path. Name-heuristic (whisper family), same style as
-/// [`is_non_ollama_daemon`]. Pure. Expects an already-lowercased name.
+/// Ollama load path. Name-heuristic (whisper / `stt` / asr / transcrib), same
+/// style as [`is_non_ollama_daemon`]. STT always wins over TTS: any name
+/// carrying one of these signals is classified stt, and [`is_tts_model`] is
+/// guarded to return false for it, so the two predicates are provably disjoint.
+/// Pure. Expects an already-lowercased name.
 pub fn is_stt_model(model_name_lower: &str) -> bool {
-    model_name_lower.contains("whisper") || model_name_lower.contains("stt")
+    model_name_lower.contains("whisper")
+        || model_name_lower.contains("stt")
+        || model_name_lower.contains("asr")
+        || model_name_lower.contains("transcrib")
 }
 
 /// S125 SUITE-TTS: whether a model is a text-to-speech (TTS) model reached through
 /// Chord's OpenAI-compatible synthesis route rather than the Ollama load path.
-/// Name-heuristic (piper / coqui / vits / a bare `tts` tag), same style as
-/// [`is_stt_model`]. Note `"stt"` and `"tts"` are disjoint substrings, so a
-/// whisper/ASR name never trips this and vice-versa. Pure. Expects an
-/// already-lowercased name.
+/// Name-heuristic (piper / vits / a `tts` tag), same style as [`is_stt_model`].
+/// Provably disjoint from [`is_stt_model`]: STT wins, so this returns false for
+/// any name carrying a speech-to-text signal even when it also carries a TTS
+/// marker (e.g. `coqui-stt`, `my-stt-tts`). A bare `coqui` is deliberately NOT a
+/// TTS signal — coqui ships both STT and TTS models, so only a `tts`-bearing
+/// coqui name (`coqui-tts`) routes here. Pure. Expects an already-lowercased name.
 pub fn is_tts_model(model_name_lower: &str) -> bool {
+    // STT always wins -> the predicates are disjoint by construction.
+    if is_stt_model(model_name_lower) {
+        return false;
+    }
+    // Require a TTS-specific signal (bare `coqui` is ambiguous, so excluded).
     model_name_lower.contains("piper")
-        || model_name_lower.contains("coqui")
         || model_name_lower.contains("vits")
         || model_name_lower.contains("tts")
 }
@@ -1669,16 +1681,58 @@ mod tests {
 
     #[test]
     fn is_tts_model_matches_tts_family_and_is_disjoint_from_stt() {
+        // Genuine TTS names (piper / vits / a `tts` tag) route tts-only.
         assert!(is_tts_model("piper-en_US-lessac-medium"));
-        assert!(is_tts_model("coqui-xtts-v2"));
+        assert!(is_tts_model("coqui-xtts-v2")); // `xtts` carries the `tts` tag
+        assert!(is_tts_model("coqui-tts"));
         assert!(is_tts_model("some-vits-model"));
         assert!(is_tts_model("my-tts-voice"));
-        // Disjoint from the ASR family: a whisper/stt name is NOT a tts model,
-        // and a tts name is NOT an stt model.
+        assert!(!is_stt_model("piper-en_US-lessac-medium"));
+        assert!(!is_stt_model("coqui-tts"));
+
+        // STT wins on any speech-to-text signal, even alongside a tts marker.
+        // `coqui-stt` and `my-stt-tts` satisfy the raw tts substrings but must
+        // classify stt-only.
+        assert!(is_stt_model("coqui-stt"));
+        assert!(!is_tts_model("coqui-stt"));
+        assert!(is_stt_model("my-stt-tts"));
+        assert!(!is_tts_model("my-stt-tts"));
+        assert!(is_stt_model("whisper"));
+        assert!(!is_tts_model("whisper"));
         assert!(!is_tts_model("faster-whisper:small"));
         assert!(!is_tts_model("my-stt-model"));
-        assert!(!is_stt_model("piper-en_US-lessac-medium"));
+
+        // A bare `coqui` (no tts/stt marker) is ambiguous and routes to NEITHER
+        // predicate — coqui ships both families, so a bare tag is not a signal.
+        assert!(!is_tts_model("coqui"));
+        assert!(!is_stt_model("coqui"));
+
+        // Non-audio models trip neither predicate.
         assert!(!is_tts_model("qwen3:8b"));
+        assert!(!is_stt_model("qwen3:8b"));
+
+        // Exhaustive disjointness: NO name may satisfy both predicates at once.
+        for name in [
+            "piper-en_US-lessac-medium",
+            "coqui-xtts-v2",
+            "coqui-tts",
+            "coqui-stt",
+            "my-stt-tts",
+            "some-vits-model",
+            "my-tts-voice",
+            "whisper",
+            "faster-whisper:small",
+            "my-stt-model",
+            "coqui",
+            "qwen3:8b",
+            "asr-conformer",
+            "transcribe-net",
+        ] {
+            assert!(
+                !(is_stt_model(name) && is_tts_model(name)),
+                "name {name:?} satisfied BOTH is_stt_model and is_tts_model"
+            );
+        }
     }
 
     #[test]

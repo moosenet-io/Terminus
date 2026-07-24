@@ -1570,6 +1570,69 @@ mod tests {
         );
     }
 
+    /// CB-01: the coverage matrix must carry a cell for EVERY one of the 8 new
+    /// S125 modalities (regardless of whether the suite is a batch-1 assistant
+    /// reader or a batch-2 `read_task_category_cells` reader), so a model with no
+    /// rows shows an explicit `not_run` gap per modality — never a silently
+    /// omitted row. Note the `stt` modality's emitted `test_type` is
+    /// `voice_transcription` (there is no separate `TEST_TYPE_STT`).
+    #[test]
+    fn catalog_covers_all_s125_modalities() {
+        let mut inp = base_inputs();
+        inp.fleet = vec![FleetModel {
+            model_name: "blank".into(),
+            in_current_fleet: true,
+            vram_footprint_gb: None,
+        }];
+        let cat = build_catalog(&inp);
+        let m = cat.iter().find(|m| m.model_name == "blank").unwrap();
+
+        // (test_type, task_category) for each of the 8 S125 modalities.
+        let s125: [(&str, &str); 8] = [
+            (TEST_TYPE_EMBEDDING_RETRIEVAL, EMBEDDING_RETRIEVAL_CATEGORY),
+            (TEST_TYPE_RERANKING, RERANKING_CATEGORY),
+            (TEST_TYPE_VISION_QA, VISION_QA_CATEGORY),
+            (TEST_TYPE_TOOL_ROUTING, TOOL_ROUTING_CATEGORY),
+            (TEST_TYPE_DOCUMENT_PARSING, DOCUMENT_PARSING_CATEGORY),
+            (TEST_TYPE_IMAGE_GENERATION, IMAGE_GENERATION_CATEGORY),
+            (TEST_TYPE_VOICE_TRANSCRIPTION, VOICE_TRANSCRIPTION_CATEGORY), // stt
+            (TEST_TYPE_TTS, TTS_CATEGORY),
+        ];
+        for (tt, tc) in s125 {
+            let matches: Vec<&CatalogCell> =
+                m.cells.iter().filter(|c| c.test_type == tt).collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "expected exactly one coverage cell for modality {tt}, found {}",
+                matches.len()
+            );
+            let c = matches[0];
+            assert_eq!(c.task_category, tc, "wrong task_category for {tt}");
+            assert_eq!(
+                c.status,
+                CoverageStatus::NotRun,
+                "modality {tt} must account as not_run for a model with no rows"
+            );
+        }
+
+        // The pre-existing modalities remain present alongside the S125 eight.
+        for tt in [
+            TEST_TYPE_CODER,
+            TEST_TYPE_ASSISTANT,
+            TEST_TYPE_SERVING,
+            TEST_TYPE_AGENT,
+        ] {
+            assert!(
+                m.cells.iter().any(|c| c.test_type == tt),
+                "pre-existing modality {tt} missing from coverage matrix"
+            );
+        }
+
+        // Every cell is a not_run gap, and not_run_count agrees with the total.
+        assert_eq!(m.not_run_count, m.cells.len());
+    }
+
     /// A `non_viable_vram` model → `non_viable` coder cells (read off the failure
     /// axis, NOT inferred from aggregates — there are none for a skip).
     #[test]
