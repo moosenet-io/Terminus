@@ -1495,6 +1495,49 @@ fn disk_pressure() -> Option<String> {
     None
 }
 
+/// BT-03: whether the fleet warm path should issue the Ollama `load_model`
+/// pre-warm for a model of the given backend `kind`. ONLY true `ollama`-kind
+/// models go through the Ollama control API; every other kind (`openai`/
+/// `daemon`/`llama-server`) is a Chord-/registry-served model brought up by its
+/// own [`crate::intake::lifecycle::ensure_up`] on the FIRST request, so the fleet
+/// path must NOT send it to the Ollama load gate. Sending it there silently
+/// skipped every Chord-served suite (VLM/rerank/stt/tts/doc/image/embedding) in a
+/// fleet sweep — the exact BT-03 defect. Pure.
+fn needs_ollama_warm(backend_kind: &str) -> bool {
+    backend_kind == "ollama"
+}
+
+/// DR-01: run an async warm step with a bounded retry + fixed backoff before
+/// giving up (the warm was previously one-shot). `attempts` is clamped to ≥1;
+/// between failed attempts it sleeps `backoff` — pass `Duration::ZERO` in tests
+/// to keep them clock-free (no `Instant`/wall-time flakiness). Returns the LAST
+/// error if every attempt fails. Generic over the warm closure so it is
+/// unit-testable with a mock that never touches the network.
+async fn warm_with_backoff<F, Fut>(
+    attempts: usize,
+    backoff: Duration,
+    mut warm: F,
+) -> Result<(), ToolError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), ToolError>>,
+{
+    let attempts = attempts.max(1);
+    let mut last: Option<ToolError> = None;
+    for i in 0..attempts {
+        match warm().await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                if i + 1 < attempts && !backoff.is_zero() {
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| ToolError::Http("warm failed with no error captured".into())))
+}
+
 /// Fleet run that picks suites PER MODEL by purpose (or an explicit override),
 /// with the overnight VRAM lifecycle. `resolve_suites` maps a model name to its
 /// suite list; `resolve_langs` maps a model name to its code-suite languages;
@@ -1529,12 +1572,27 @@ pub async fn run_fleet_suites(
         // path, a job-registry update for the async path) — never touches I/O
         // itself, so it can't turn a fast/pure sweep into a slow one.
         on_progress(i, total, model, &suites.join("+"));
-        // Self-heal: skip a model rather than fail the run on a full disk.
+        // DR-01: CONVERGENT sweep — when the caller's `resolve_suites` has already
+        // pruned this model's settled (`run`/`non_viable`) cells (via
+        // `catalog::pending_suites`) and nothing is left to run, record a clean
+        // "converged" skip and move on rather than load a backend and run zero
+        // suites. Its cells are left as-is so a later sweep re-checks them.
+        if suites.is_empty() {
+            out.push(FleetSuiteResult {
+                model: model.clone(),
+                suites,
+                summary: "skipped: no pending suites (coverage already settled)".into(),
+                skipped: true,
+            });
+            continue;
+        }
+        // Self-heal: skip a model rather than fail the run on a full disk. The
+        // cells stay `not_run`, so a later (post-cleanup) sweep RESUMES them.
         if let Some(reason) = disk_pressure() {
             out.push(FleetSuiteResult {
                 model: model.clone(),
                 suites: suites.clone(),
-                summary: format!("skipped: disk pressure — {reason}"),
+                summary: format!("skipped: disk pressure — {reason} (left not_run, resumable)"),
                 skipped: true,
             });
             continue;
@@ -1548,35 +1606,37 @@ pub async fn run_fleet_suites(
             });
             continue;
         }
-        // SUITE-STT: an STT model is served behind Chord's OpenAI-compatible
-        // `/v1/audio/transcriptions` route, NOT loadable by the Ollama
-        // `load_model` path below — run its standalone suite directly (its own
-        // profile row, mirroring the diffusion daemon handling) and move on,
-        // rather than fall through and fail the Ollama load.
-        if suites.iter().any(|s| s == "stt") {
-            let summary = match run_stt_suite(model).await {
-                Ok(o) => format!(
-                    "stt: clips={} avg_wer={:.3} avg_rtf={:.2}",
-                    o.clips_run, o.avg_wer, o.avg_rtf
-                ),
-                Err(e) => format!("stt: error {e}"),
-            };
-            out.push(FleetSuiteResult {
-                model: model.clone(),
-                suites,
-                summary,
-                skipped: false,
-            });
-            continue;
-        }
-        if let Err(e) = load_model(&client, model).await {
-            out.push(FleetSuiteResult {
-                model: model.clone(),
-                suites,
-                summary: format!("load failed: {e}"),
-                skipped: true,
-            });
-            continue;
+        // BT-03: resolve the backend ONCE and gate the Ollama pre-warm on its
+        // kind. Non-`ollama` (openai/daemon/llama-server) models are Chord-/
+        // registry-served and brought up by their own lifecycle on first request
+        // — they must NOT go through the Ollama `load_model` gate (that silently
+        // skipped every Chord-served suite in a fleet sweep). Only `ollama`-kind
+        // models are warmed here; all suites (stt/tts/vqa/rerank/img/doc/embedding)
+        // then reach their backend uniformly via the unified dispatch below,
+        // replacing the old per-suite "before-the-gate" hacks.
+        let backend_kind = crate::intake::infer::resolve_backend(model).kind;
+        if needs_ollama_warm(&backend_kind) {
+            // DR-01: bounded retry + short backoff before marking a model
+            // unavailable (was one-shot). A warm failure caused by disk pressure
+            // is a clean, RESUMABLE skip (cells left `not_run`), never a hard
+            // abort of the whole sweep.
+            let warm =
+                warm_with_backoff(3, Duration::from_secs(2), || load_model(&client, model)).await;
+            if let Err(e) = warm {
+                let summary = match disk_pressure() {
+                    Some(reason) => format!(
+                        "skipped: disk pressure during warm — {reason} (left not_run, resumable)"
+                    ),
+                    None => format!("load failed after retries: {e}"),
+                };
+                out.push(FleetSuiteResult {
+                    model: model.clone(),
+                    suites,
+                    summary,
+                    skipped: true,
+                });
+                continue;
+            }
         }
 
         let mut profile_id: Option<uuid::Uuid> = None;
@@ -1674,14 +1734,27 @@ pub async fn run_fleet_suites(
                 Err(e) => parts.push(format!("reranking: error {e}")),
             }
         }
+        // S125 SUITE-STT: whisper/ASR models are served behind Chord's
+        // `/v1/audio/transcriptions` route (a non-`ollama` `openai`-kind backend).
+        // With the backend-aware warm gate above they are no longer force-loaded
+        // via Ollama, so the suite is now dispatched here in the unified section
+        // like every other Chord-served suite (replacing the old before-the-gate
+        // early return). Self-contained — creates its own `openai`-provider row.
+        if suites.iter().any(|s| s == "stt") {
+            match run_stt_suite(model).await {
+                Ok(o) => parts.push(format!(
+                    "stt: clips={} avg_wer={:.3} avg_rtf={:.2}",
+                    o.clips_run, o.avg_wer, o.avg_rtf
+                )),
+                Err(e) => parts.push(format!("stt: error {e}")),
+            }
+        }
         // SUITE-IMG: image-generation suite. Self-contained (its own profile row
         // + `openai` backend via Chord's `/v1/images/generations`), so it does
-        // not share the Ollama `profile_id` above. Note: this fleet path first
-        // `load_model`s each model via the Ollama control API, so an `openai`-kind
-        // image backend (sd-turbo) reached here would typically be skipped at that
-        // gate — the direct single-model tool path is the primary entry point for
-        // now; this branch keeps the suite wired into the fleet driver for when an
-        // image model is Ollama-loadable / the load gate is relaxed.
+        // not share the Ollama `profile_id` above. BT-03: with the backend-aware
+        // warm gate, an `openai`-kind image backend (sd-turbo) is NO LONGER
+        // skipped at an Ollama load gate — it reaches this dispatch in a fleet
+        // sweep and runs via its own Chord-served path.
         if suites.iter().any(|s| s == "image_generation") {
             match run_image_generation_suite(model).await {
                 Ok(o) => parts.push(format!(
@@ -1848,5 +1921,83 @@ mod tests {
         assert_eq!(FULL_TIERS.len(), 9);
         assert_eq!(FULL_TIERS[0], 2000);
         assert_eq!(FULL_TIERS[8], 128000);
+    }
+
+    // BT-03 (TASK #15): the fleet warm gate is backend-aware — only ollama-kind
+    // models are pre-warmed via the Ollama control API; every other kind is
+    // Chord-/registry-served and must NOT be sent to `load_model`.
+    #[test]
+    fn fleet_warm_gate_only_ollama() {
+        assert!(needs_ollama_warm("ollama"));
+        assert!(!needs_ollama_warm("openai"));
+        assert!(!needs_ollama_warm("daemon"));
+        assert!(!needs_ollama_warm("llama-server"));
+    }
+
+    // BT-03: an `openai`-kind model resolved from a registry is NOT sent to the
+    // Ollama warm gate; an `ollama`-kind model still is. Exercises the real
+    // `resolve_backend_at` core against a fixture registry (no env, no network).
+    #[test]
+    fn openai_model_not_sent_to_ollama_warm() {
+        use crate::intake::infer::resolve_backend_at;
+        let reg = r#"{
+            "models": {
+                "sd-turbo": {"backend": "chord"},
+                "qwen3:8b": {"backend": "ollama"}
+            },
+            "backends": {
+                "chord":  {"url": "http://chord.invalid", "kind": "openai"},
+                "ollama": {"url": "http://ollama.invalid", "kind": "ollama"}
+            }
+        }"#;
+        let path = std::env::temp_dir().join(format!("mint-reg-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, reg).unwrap();
+        let p = path.to_str().unwrap();
+
+        let openai = resolve_backend_at("sd-turbo", p, "http://fallback.invalid", None);
+        assert_eq!(openai.kind, "openai");
+        assert!(!needs_ollama_warm(&openai.kind), "openai model must skip ollama warm");
+
+        let ollama = resolve_backend_at("qwen3:8b", p, "http://fallback.invalid", None);
+        assert_eq!(ollama.kind, "ollama");
+        assert!(needs_ollama_warm(&ollama.kind), "ollama model must be warmed");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // DR-01: bounded retry succeeds on a later attempt (mock warm, ZERO backoff so
+    // the test is clock-free — no Instant/wall-time flakiness).
+    #[tokio::test]
+    async fn warm_retries_then_succeeds_on_second_attempt() {
+        use std::cell::Cell;
+        let calls = Cell::new(0usize);
+        let r = warm_with_backoff(3, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                if n < 2 {
+                    Err(ToolError::Http("transient warm fail".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(calls.get(), 2, "should stop retrying once it succeeds");
+    }
+
+    // DR-01: gives up after the bounded number of attempts, returning the error.
+    #[tokio::test]
+    async fn warm_gives_up_after_bounded_attempts() {
+        use std::cell::Cell;
+        let calls = Cell::new(0usize);
+        let r = warm_with_backoff(3, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            async { Err::<(), _>(ToolError::Http("always fails".into())) }
+        })
+        .await;
+        assert!(r.is_err());
+        assert_eq!(calls.get(), 3, "should attempt exactly the bound, then give up");
     }
 }
