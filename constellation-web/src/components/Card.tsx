@@ -90,7 +90,7 @@ export function Card({
 }: CardProps) {
   const [expanded, setExpanded] = useState(defaultExpanded);
   const emphasisStyle: React.CSSProperties = {
-    ...(accent ? { position: 'relative', borderColor: 'var(--border-strong)', boxShadow: 'var(--shadow-md), var(--glow-violet-soft), var(--inset-hi)' } : {}),
+    ...(accent ? { position: 'relative', borderColor: 'var(--line-accent)', boxShadow: 'var(--shadow-md), var(--glow-violet-soft), var(--inset-hi)' } : {}),
     ...(glow ? { boxShadow: 'var(--shadow-md), var(--glow-violet), var(--inset-hi)' } : {}),
   };
   const accentOverlay = accent ? <AccentHairline /> : null;
