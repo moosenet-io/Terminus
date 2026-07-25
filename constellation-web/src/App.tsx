@@ -3,7 +3,7 @@
 // (with a 2-cycle stale-while-degrading grace so one flaky poll never yanks a module's nav
 // entry); routes ONLY the panels whose module is currently available — no hardcoded page table.
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
-import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { GlobalBar } from './components/GlobalBar';
 import type { Density } from './components/GlobalBar';
 import { ModuleRail } from './components/ModuleRail';
@@ -18,8 +18,22 @@ import { getAggregationClient } from './lib/aggregationClient';
 import type { HealthStatus } from './lib/aggregationClient';
 import type { FeedItem } from './lib/activityFeed';
 import { getAvailableModules, getAvailablePanels } from './lib/moduleRegistry';
+import type { ModuleDescriptor } from './lib/moduleRegistry';
 import { setCurrentPath, REFRESH_HEALTH_EVENT } from './lib/shellBridge';
 import { OverviewPanel } from './panels/overview/OverviewPanel';
+import { ModuleDetail } from './panels/overview/ModuleDetail';
+
+/** CGUI-04 (TERM #527): the `/:moduleId/detail` route element — the reusable "Inside a client"
+ *  detail view for whichever available module the operator drilled into (from an Overview card).
+ *  An unknown/unavailable module id falls back to the overview, matching the wildcard's posture.
+ *  The module id is the first path segment, so the shell's `activeModuleId` derivation keeps the
+ *  module rail mounted — "same shell, deeper zoom". */
+function ModuleDetailRoute({ modules, health }: { modules: ModuleDescriptor[]; health: HealthStatus[] }) {
+  const { moduleId } = useParams();
+  const module = modules.find(m => m.id === moduleId);
+  if (!module) return <Navigate to="/overview" replace />;
+  return <ModuleDetail module={module} health={health.find(h => h.system === module.healthSystem)} />;
+}
 
 /** A system stays reported `available` (degraded) through this many consecutive misses —
  *  whether an explicit `available:false`, disappearing from the health payload entirely, or a
@@ -344,6 +358,11 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
                 const Component = panel.component;
                 return <Route key={panel.id} path={panel.path} element={<Component />} />;
               })}
+              {/* CGUI-04 (TERM #527): reusable module detail view. A static panel path like
+                  /harmony/dashboard (registered above) out-ranks this param route for that exact
+                  path; only /:moduleId/detail (e.g. /terminus/detail) resolves here. */}
+              <Route path="/:moduleId/detail" element={<ModuleDetailRoute modules={modules} health={health} />} />
+
               {/* Backward-compat: the pre-CONST-16 'Status' panels lived at /status/*; keep old
                   bookmarks/links working by redirecting to their re-homed harmony.* paths. */}
               <Route path="/status/analytics" element={<Navigate to="/harmony/analytics" replace />} />

@@ -15,16 +15,16 @@
 // `.h-card-interactive` so region-7's hover (violet-400 border + glow-violet,shadow-lg,
 // -2px lift) comes for free.
 import { useState } from 'react';
-import type { CSSProperties, DragEvent, KeyboardEvent } from 'react';
-import { Link } from 'react-router-dom';
-import type { ModuleDescriptor, ModuleId, PanelDescriptor } from '../../lib/moduleRegistry';
+import type { CSSProperties, DragEvent, KeyboardEvent, MouseEvent } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import type { ModuleDescriptor, PanelDescriptor } from '../../lib/moduleRegistry';
 import { getPanelsByModule } from '../../lib/moduleRegistry';
 import type { HealthStatus } from '../../lib/aggregationClient';
 import type { Density } from '../../components/GlobalBar';
 import { StatusPill } from '../../components/StatusPill';
 import type { PillState } from '../../components/StatusPill';
 import { Badge } from '../../components/Badge';
-import type { NodeKind } from '../../components/NodeBadge';
+import { MODULE_META, KIND_COLOR, moduleDetailPath } from './moduleMeta';
 
 /** The §3.2 card-state quartet. OverviewPanel derives online/idle/error from live health;
  *  'disabled' is produced locally when the operator flips the region-6 enable toggle off. */
@@ -46,38 +46,6 @@ interface ModuleCardProps {
   onRemove: () => void;
   dragHandlers: ModuleCardDragHandlers;
 }
-
-/** Per-module flow metadata. `kind` drives the region-1 node-dot colour + the region-3 role
- *  accent (the semantic-direction law, §2.4). Descriptions are the module's one-line role.
- *  NOTE: kind/role here is a curated heuristic — the fleet exposes no machine-readable flow
- *  role yet, so this is the "sensible placeholder" the item calls for; it renders every region
- *  truthfully rather than leaving it empty. All fleet modules run local-inference at
- *  $0.00/day, so every card is a free (green) cost tier. */
-interface ModuleMeta {
-  kind: NodeKind;
-  /** UPPERCASE flow role shown in the kind's accent colour (CORE/SOURCE/ENDPOINT/CLOUD). */
-  role: string;
-  desc: string;
-  /** false → paid/opt-in (amber badge); true → free $0/day (green badge). */
-  free: boolean;
-}
-
-const MODULE_META: Record<ModuleId, ModuleMeta> = {
-  harmony:  { kind: 'core',     role: 'CORE',     desc: 'autonomous build orchestrator', free: true },
-  chord:    { kind: 'core',     role: 'CORE',     desc: 'llm proxy + inference router',  free: true },
-  terminus: { kind: 'core',     role: 'CORE',     desc: 'mcp tool hub + fleet infra',    free: true },
-  lumina:   { kind: 'endpoint', role: 'ENDPOINT', desc: 'assistant surface',             free: true },
-  muse:     { kind: 'endpoint', role: 'ENDPOINT', desc: 'media library + acquisition',   free: true },
-  models:   { kind: 'source',   role: 'SOURCE',   desc: 'model library',                 free: true },
-  mint:     { kind: 'source',   role: 'SOURCE',   desc: 'model benchmarks',              free: true },
-};
-
-const KIND_COLOR: Record<NodeKind, string> = {
-  source:   'var(--node-source)',   // blue
-  core:     'var(--node-core)',      // violet
-  endpoint: 'var(--node-endpoint)',  // green
-  cloud:    'var(--node-cloud)',     // amber
-};
 
 /** Card state → DS StatusPill state (§8). 'disabled' shows an inert idle pill labelled "off". */
 const PILL_STATE: Record<CardState, PillState> = {
@@ -103,13 +71,28 @@ export function ModuleCard({ module, health, state, density, onMove, onRemove, d
   // Region-6 enable toggle. Off → the whole card renders as the §3.2 disabled state.
   const [enabled, setEnabled] = useState(true);
   const effState: CardState = enabled ? state : 'disabled';
+  const navigate = useNavigate();
 
   const meta = MODULE_META[module.id];
   const kindColor = KIND_COLOR[meta.kind];
   const panels = getPanelsByModule(module.id);
-  const firstPanel = panels[0];
   const logPanel = logsPanel(panels);
   const compact = density === 'compact';
+
+  // CGUI-04 (TERM #527): drilling into a module opens its reusable DETAIL view ("same shell,
+  // deeper zoom", guide-spec §4) — reached from region-6 "Configure" AND from a click on the
+  // card body itself. A body click that lands on any interactive/affordance control is left to
+  // that control; only "empty" body clicks drill in, so reordering/removing/toggling never
+  // accidentally navigates. The exclusion list covers: buttons, links, the enable switch, AND
+  // the region-1 reorder drag handle (`.const-modcard__drag`) — the handle is a drag/no-op
+  // affordance (review fix: a click on it must NOT navigate).
+  const INERT_SELECTOR = 'button, a, [role="switch"], .const-modcard__drag';
+  const openDetail = () => navigate(moduleDetailPath(module.id));
+  const onCardClick = (e: MouseEvent<HTMLDivElement>) => {
+    if (effState === 'disabled') return; // inert card body (region-6 off) — nothing to open
+    if ((e.target as HTMLElement).closest(INERT_SELECTOR)) return;
+    openDetail();
+  };
 
   // Region-5 telemetry — wired to the real health probe detail (the one live per-module
   // signal the aggregation client exposes). [ok] for healthy/idle, [!!] for error.
@@ -135,6 +118,16 @@ export function ModuleCard({ module, health, state, density, onMove, onRemove, d
   ].filter(Boolean).join(' ');
 
   const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    // Enter/Space on the focused card (no modifier) drills into the detail view — the keyboard
+    // equivalent of an "empty body" click. Ignored when it originates on an inner control so a
+    // keyboard press on the toggle/actions still does its own thing.
+    if (!e.metaKey && !e.ctrlKey && (e.key === 'Enter' || e.key === ' ')) {
+      if ((e.target as HTMLElement).closest(INERT_SELECTOR)) return;
+      if (effState === 'disabled') return;
+      e.preventDefault();
+      openDetail();
+      return;
+    }
     if (!(e.metaKey || e.ctrlKey)) return;
     if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); onMove(-1); }
     if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); onMove(1); }
@@ -151,9 +144,10 @@ export function ModuleCard({ module, health, state, density, onMove, onRemove, d
   return (
     <div
       role="group"
-      aria-label={`${module.title} module card, ${effState}`}
+      aria-label={`${module.title} module card, ${effState} — open detail`}
       tabIndex={0}
       onKeyDown={handleKeyDown}
+      onClick={onCardClick}
       className={className}
       style={cardStyle}
       draggable={dragHandlers.draggable}
@@ -166,6 +160,7 @@ export function ModuleCard({ module, health, state, density, onMove, onRemove, d
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
         <span
           aria-hidden
+          className="const-modcard__drag"
           title="Drag to reorder (or focus + ⌘/Ctrl+arrow)"
           style={{ cursor: 'grab', color: 'var(--text-400)', fontSize: 'var(--fs-body)', lineHeight: 1 }}
         >
@@ -291,15 +286,14 @@ export function ModuleCard({ module, health, state, density, onMove, onRemove, d
           />
         </button>
 
-        {/* Fixed-order actions: Configure · Logs · × */}
+        {/* Fixed-order actions: Configure · Logs · ×
+            CGUI-04: "Configure" now opens the reusable module DETAIL view (§4) — the depth
+            surface (metric tiles, position-in-flow, configuration, live log) every module
+            reaches — rather than jumping straight to the module's first panel. */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
-          {firstPanel ? (
-            <Link to={firstPanel.path} style={{ fontSize: 'var(--fs-xs)', color: 'var(--accent-bright)', textDecoration: 'none' }}>
-              Configure
-            </Link>
-          ) : (
-            <span title="No configuration surface yet" style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-400)' }}>Configure</span>
-          )}
+          <Link to={moduleDetailPath(module.id)} style={{ fontSize: 'var(--fs-xs)', color: 'var(--accent-bright)', textDecoration: 'none' }}>
+            Configure
+          </Link>
           {logPanel ? (
             <Link to={logPanel.path} style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-300)', textDecoration: 'none' }}>
               Logs
