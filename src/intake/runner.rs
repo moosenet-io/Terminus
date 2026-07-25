@@ -709,6 +709,71 @@ pub async fn list_chat_models(client: &reqwest::Client) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// S125 (exhaustive all-categories fleet): the SPECIALIZED (non-chat) suites. A
+/// registry model whose [`crate::intake::default_suites_for`] routing hits any of
+/// these is a category the plain chat list ([`list_chat_models`]) would miss —
+/// embedding models are explicitly filtered out of `/api/tags`, and rerank / stt /
+/// tts / doc-parse / image-gen / diffusion backends are Chord serves that never
+/// appear as Ollama chat tags at all. `vision_qa` counts too: a VLM that is only in
+/// the registry (not pulled into Ollama) would otherwise be skipped.
+const SPECIALIZED_SUITES: &[&str] = &[
+    "embedding_retrieval",
+    "reranking",
+    "vision_qa",
+    "document_parsing",
+    "image_generation",
+    "stt",
+    "tts",
+    "diffusion",
+];
+
+/// Pure core of the registry-union step in [`list_all_profilable_models`]: given the
+/// model names already in the chat list and the MINT registry's model names, return
+/// the registry models that (a) are not already present in the chat list and (b) are
+/// routed by [`crate::intake::default_suites_for`] to at least one SPECIALIZED
+/// (non-chat) suite. Preserves the given `registry_models` order and dedups. Pure —
+/// unit-tested (the network `list_chat_models` half is not).
+pub fn specialized_registry_additions(
+    chat_models: &[String],
+    registry_models: &[String],
+) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = chat_models.iter().cloned().collect();
+    let mut out = Vec::new();
+    for name in registry_models {
+        if seen.contains(name) {
+            continue;
+        }
+        let suites = crate::intake::default_suites_for(name);
+        if suites.iter().any(|s| SPECIALIZED_SUITES.contains(&s.as_str())) {
+            seen.insert(name.clone());
+            out.push(name.clone());
+        }
+    }
+    out
+}
+
+/// S125 (exhaustive all-categories fleet): the union of the live Ollama chat models
+/// ([`list_chat_models`]) PLUS every MINT-registry model (`MODEL_REGISTRY_PATH`, the
+/// same source [`crate::intake::infer::resolve_backend`] reads) that
+/// [`crate::intake::default_suites_for`] routes to a specialized non-chat suite
+/// (embedding_retrieval / reranking / vision_qa / document_parsing / image_generation
+/// / stt / tts / diffusion).
+///
+/// Why: an auto fleet sweep used to seed itself from `list_chat_models` alone, so it
+/// only ever profiled CHAT models — embedding / vision / rerank / stt / tts / doc-parse
+/// / image-gen models were never queued and their suites never ran. Unioning the
+/// registry's specialized models in makes the sweep exhaustive across ALL categories.
+/// Chat models come first (unchanged order), then the specialized additions in registry
+/// order; the whole set is deduped. Cold / unavailable models warm-fail and skip
+/// cleanly (DR-01), so pulling a not-yet-served backend into the list is harmless.
+pub async fn list_all_profilable_models(client: &reqwest::Client) -> Vec<String> {
+    let mut out = list_chat_models(client).await;
+    let additions =
+        specialized_registry_additions(&out, &crate::intake::infer::registry_model_names());
+    out.extend(additions);
+    out
+}
+
 /// One model's result in a fleet run.
 pub struct FleetModelResult {
     pub model: String,
@@ -838,7 +903,7 @@ pub async fn run_stt_suite(model_name: &str) -> Result<SttSuiteOutcome, ToolErro
     let mut n = 0usize;
 
     for entry in &manifest {
-        let audio_path = dir.join(&entry.audio_file);
+        let audio_path = voice_transcription::stt_dir(&dir).join(&entry.audio_file);
         let audio_bytes = match std::fs::read(&audio_path) {
             Ok(b) => b,
             Err(e) => {
@@ -1201,8 +1266,10 @@ pub async fn run_vision_qa_suite(model_name: &str) -> Result<VisionQaSuiteOutcom
     use crate::intake::infer::vision_infer_with_metrics;
     use crate::intake::newcats::image_parsing::{self, VisionQaOutcome};
 
-    // Unified corpus resolver (DR-02): INTAKE_CORPUS_DIR points at the vision_qa
-    // corpus dir (manifest.json + images). Missing var ⇒ clean NotConfigured.
+    // Unified corpus resolver (DR-02): INTAKE_CORPUS_DIR is the corpus BASE; the
+    // vision_qa corpus (manifest.json + images) lives in its `vision_qa/` subdir
+    // (S125 co-location, so it no longer collides with stt's manifest.json at the
+    // bare root). Missing var ⇒ clean NotConfigured.
     let corpus_dir = crate::intake::code::corpus_dir()?;
     let items = image_parsing::load_vision_qa_manifest(&corpus_dir)?;
     if items.is_empty() {
@@ -1229,7 +1296,7 @@ pub async fn run_vision_qa_suite(model_name: &str) -> Result<VisionQaSuiteOutcom
     let mut n = 0usize;
 
     for item in &items {
-        let img_path = corpus_dir.join(&item.image_file);
+        let img_path = image_parsing::vision_qa_dir(&corpus_dir).join(&item.image_file);
         let bytes = match std::fs::read(&img_path) {
             Ok(b) => b,
             Err(e) => {
@@ -2139,6 +2206,69 @@ mod tests {
 
     fn t(ctx: i32, tp: f64, recall: i32, oom: bool) -> TierSummary {
         TierSummary { context_tokens: ctx, throughput: Some(tp), recall: Some(recall), oom }
+    }
+
+    // S125 (exhaustive all-categories fleet): the fleet default model set must
+    // include at least one model routed to EACH specialized suite when the MINT
+    // registry contains such models. Drives the same pure path
+    // `list_all_profilable_models` uses for its registry half
+    // (`infer::registry_model_names_at` -> `specialized_registry_additions`), with a
+    // fixture registry, so no Ollama/network is touched.
+    #[test]
+    fn fleet_default_set_covers_every_specialized_category() {
+        // A fixture registry whose model tags exercise every specialized suite.
+        let fixture = r#"{
+            "models": {
+                "qwen3:8b": {},
+                "nomic-embed-text:latest": {},
+                "jina-reranker-v2:latest": {},
+                "qwen2.5-vl:7b": {},
+                "docling-parse:latest": {},
+                "flux-schnell:latest": {},
+                "whisper-large-v3:latest": {},
+                "piper-en-us:latest": {},
+                "diffusiongemma:latest": {}
+            },
+            "backends": {}
+        }"#;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mint-reg-fleet-allcat-{}.json", std::process::id()));
+        std::fs::write(&path, fixture).unwrap();
+
+        let registry_models =
+            crate::intake::infer::registry_model_names_at(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+
+        // No chat models pre-listed: the additions must, on their own, cover every
+        // specialized category via `default_suites_for` routing.
+        let additions = specialized_registry_additions(&[], &registry_models);
+
+        for suite in [
+            "embedding_retrieval",
+            "vision_qa",
+            "reranking",
+            "stt",
+            "tts",
+            "document_parsing",
+            "image_generation",
+        ] {
+            let covered = additions.iter().any(|m| {
+                crate::intake::default_suites_for(m)
+                    .iter()
+                    .any(|s| s == suite)
+            });
+            assert!(covered, "fleet default set missing a model routed to `{suite}`");
+        }
+
+        // A plain chat model in the registry must NOT be pulled in by the specialized
+        // union (it is already covered by `list_chat_models`), and one already in the
+        // chat list must not be duplicated.
+        assert!(!additions.iter().any(|m| m == "qwen3:8b"));
+        let with_chat = specialized_registry_additions(
+            &["nomic-embed-text:latest".to_string()],
+            &registry_models,
+        );
+        assert!(!with_chat.iter().any(|m| m == "nomic-embed-text:latest"));
     }
 
     #[test]

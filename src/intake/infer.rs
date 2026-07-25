@@ -130,6 +130,31 @@ fn registry_path() -> Option<String> {
     std::env::var("MODEL_REGISTRY_PATH").ok().filter(|s| !s.trim().is_empty())
 }
 
+/// S125 (exhaustive all-categories fleet): every model NAME present in the MINT
+/// model registry (`MODEL_REGISTRY_PATH`), read from the SAME registry file
+/// [`resolve_backend`] uses — so it sees the Chord backends plus the embed / VLM /
+/// rerank / stt / tts / doc-parse / image-gen models. Empty when the registry is
+/// unset / absent / legacy-or-invalid format (the same graceful-degrade contract
+/// as `resolve_backend`: a missing registry is not an error, just no discovery).
+pub fn registry_model_names() -> Vec<String> {
+    registry_model_names_at(registry_path().as_deref().unwrap_or(""))
+}
+
+/// Testable core of [`registry_model_names`] — reads an explicit path, no env.
+/// Order is unspecified (a `HashMap` of model tags); callers dedup and, where
+/// order matters, keep the chat models first.
+pub fn registry_model_names_at(registry_path: &str) -> Vec<String> {
+    let text = match std::fs::read_to_string(registry_path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let reg: RegFile = match serde_json::from_str(&text) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    reg.models.keys().cloned().collect()
+}
+
 /// Process-global backend override for profiling: when set, EVERY model resolves
 /// to this backend regardless of its tag. Lets the harness evaluate a model on a
 /// SPECIFIC hardware (e.g. the same model on `llama-gpu` AND `ollama`) for the

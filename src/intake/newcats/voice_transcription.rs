@@ -85,11 +85,25 @@ pub struct SttManifestEntry {
     pub reference: String,
 }
 
-/// Load the STT corpus manifest (`<dir>/manifest.json`). A missing/unreadable/
-/// malformed manifest is a clean [`ToolError`], never a panic — the runner
-/// turns it into a skip, exactly like the corpus resolvers in `code.rs`.
+/// S125 (corpus co-location): the stt corpus lives in an `stt/` SUBDIR of
+/// `INTAKE_CORPUS_DIR` — manifest at `<corpus>/stt/manifest.json`, audio at
+/// `<corpus>/stt/<audio_file>` — so its `manifest.json` no longer collides with the
+/// vision_qa corpus's `manifest.json` (which now lives under `<corpus>/vision_qa/`).
+/// Both suites can therefore share one INTAKE_CORPUS_DIR.
+pub const STT_SUBDIR: &str = "stt";
+
+/// The stt corpus subdirectory under `INTAKE_CORPUS_DIR`. The runner resolves audio
+/// bytes through this same helper so manifest and clips stay co-located.
+pub fn stt_dir(dir: &Path) -> std::path::PathBuf {
+    dir.join(STT_SUBDIR)
+}
+
+/// Load the STT corpus manifest from the `stt/` subdir of `dir`
+/// (`<dir>/stt/manifest.json`). A missing/unreadable/malformed manifest is a clean
+/// [`ToolError`], never a panic — the runner turns it into a skip, exactly like the
+/// corpus resolvers in `code.rs`.
 pub fn load_manifest(dir: &Path) -> Result<Vec<SttManifestEntry>, ToolError> {
-    let path = dir.join("manifest.json");
+    let path = stt_dir(dir).join("manifest.json");
     let raw = std::fs::read_to_string(&path).map_err(|e| {
         ToolError::NotConfigured(format!("stt corpus manifest not found at {}: {e}", path.display()))
     })?;

@@ -193,13 +193,26 @@ pub struct VisionQaItem {
     pub answer: String,
 }
 
+/// S125 (corpus co-location): the vision_qa corpus lives in a `vision_qa/` SUBDIR
+/// of `INTAKE_CORPUS_DIR` — manifest at `<corpus>/vision_qa/manifest.json`, images
+/// at `<corpus>/vision_qa/<image_file>` — so its `manifest.json` no longer collides
+/// with the stt corpus's `manifest.json` (which now lives under `<corpus>/stt/`).
+/// Both suites can therefore share one INTAKE_CORPUS_DIR.
+pub const VISION_QA_SUBDIR: &str = "vision_qa";
+
+/// The vision_qa corpus subdirectory under `INTAKE_CORPUS_DIR`. The runner resolves
+/// image bytes through this same helper so manifest and images stay co-located.
+pub fn vision_qa_dir(corpus_dir: &Path) -> std::path::PathBuf {
+    corpus_dir.join(VISION_QA_SUBDIR)
+}
+
 /// Load and parse the vision-QA `manifest.json` (a JSON ARRAY of
-/// [`VisionQaItem`]) from `corpus_dir`. The images live alongside it
-/// (`corpus_dir/<image_file>`); this parses only the manifest. A missing file
-/// or malformed JSON is a clean [`ToolError`], never a panic — the runner turns
-/// it into a diagnosable failure rather than a crash.
+/// [`VisionQaItem`]) from the `vision_qa/` subdir of `corpus_dir`. The images live
+/// alongside it (`corpus_dir/vision_qa/<image_file>`); this parses only the
+/// manifest. A missing file or malformed JSON is a clean [`ToolError`], never a
+/// panic — the runner turns it into a diagnosable failure rather than a crash.
 pub fn load_vision_qa_manifest(corpus_dir: &Path) -> Result<Vec<VisionQaItem>, ToolError> {
-    let path = corpus_dir.join("manifest.json");
+    let path = vision_qa_dir(corpus_dir).join("manifest.json");
     let raw = std::fs::read_to_string(&path).map_err(|e| {
         ToolError::NotConfigured(format!(
             "vision_qa manifest unreadable at {}: {e}",
@@ -510,8 +523,10 @@ mod tests {
     /// backend-independent parse-path test (no big corpus committed).
     #[test]
     fn fixture_manifest_parses_into_items() {
+        // Pass the corpus BASE dir; the loader joins the `vision_qa/` subdir, so the
+        // fixture stays at its existing testdata/vision_qa/manifest.json path.
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/intake/newcats/testdata/vision_qa");
+            .join("src/intake/newcats/testdata");
         let items = load_vision_qa_manifest(&dir).expect("fixture manifest parses");
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].image_file, "img_001.png");

@@ -1305,7 +1305,12 @@ async fn run_fleet_sweep(args: &Value, job_id: Option<&str>) -> Result<String, T
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| ToolError::Http(e.to_string()))?;
-        models = runner::list_chat_models(&client).await;
+        // S125 (exhaustive all-categories fleet): seed from ALL profilable models —
+        // chat models PLUS the registry's specialized (embedding / vision / rerank /
+        // stt / tts / doc-parse / image-gen / diffusion) models — not just chat, so
+        // every category's suite actually runs in an auto sweep. `default_suites_for`
+        // still routes each model to its own suite(s); cold ones warm-fail and skip.
+        models = runner::list_all_profilable_models(&client).await;
     }
     if models.is_empty() {
         return Err(ToolError::NotConfigured("no models to profile (catalog empty)".into()));
