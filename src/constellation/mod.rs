@@ -113,6 +113,16 @@ fn protected_router(state: Arc<McpServerState>) -> Router {
         .route("/api/terminus/mint/failures", get(models_api::mint_failures))
         .route("/api/terminus/mint/context-profiles", get(models_api::mint_context_profiles))
         .route("/api/terminus/mint/activity", get(models_api::mint_activity))
+        // CGUI-07 (TERM #530): per-category read endpoints for the 8 NEW MINT
+        // categories (embedding_retrieval / reranking / image_parsing /
+        // document_parsing / image_generation / voice_transcription / tts /
+        // tool_routing). Runs for a new category go through the widened
+        // `/api/terminus/mint/runs?suite={category}` above.
+        .route("/api/terminus/mint/category/:category/summary", get(models_api::mint_category_summary))
+        .route("/api/terminus/mint/category/:category/dimensions", get(models_api::mint_category_dimensions))
+        .route("/api/terminus/mint/category/:category/matrix", get(models_api::mint_category_matrix))
+        .route("/api/terminus/mint/category/:category/box", get(models_api::mint_category_box))
+        .route("/api/terminus/mint/category/:category/failures", get(models_api::mint_category_failures))
         // CONST-19: Muse proxy namespace.
         .route("/api/muse/*path", any(proxy::proxy_muse))
         .with_state(state)
@@ -706,6 +716,13 @@ mod tests {
             "/api/terminus/mint/failures",
             "/api/terminus/mint/context-profiles",
             "/api/terminus/mint/activity",
+            // CGUI-07: per-category endpoints (one representative category —
+            // the auth guard is category-agnostic).
+            "/api/terminus/mint/category/embedding_retrieval/summary",
+            "/api/terminus/mint/category/embedding_retrieval/dimensions",
+            "/api/terminus/mint/category/embedding_retrieval/matrix",
+            "/api/terminus/mint/category/embedding_retrieval/box",
+            "/api/terminus/mint/category/embedding_retrieval/failures",
         ]
     }
 
