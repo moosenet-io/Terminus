@@ -12,7 +12,7 @@
 // are SVG fills, not tokenized UI chrome. Raw px are the design's exact geometry (600px body,
 // 400px panel, 190px log, the 295 235 410 490 viewBox) — same pixel-parity posture the DS
 // primitives (Card/NodeBadge/StatusPill) already take. adherence-lint runs in warn mode.
-import { createElement, useEffect, useReducer, useRef, useState, type ReactElement } from 'react';
+import { createElement, useEffect, useReducer, useRef, useState, type CSSProperties, type ReactElement } from 'react';
 import { StatusPill, type PillState } from '../../components/StatusPill';
 import {
   ForestEngine, SPECS, STAGES, TYPE_DOT, TICK_MS, hashStr, mulberry32, leafPath,
@@ -172,13 +172,13 @@ function buildForestSvg(e: ForestEngine): ReactElement {
 }
 
 // ── small style helpers ─────────────────────────────────────────────────────────────────────
-const monoLabel: React.CSSProperties = { fontFamily: 'var(--font-mono)', fontSize: '10px', letterSpacing: '.14em', color: 'var(--text-500)' };
-const secondaryBtn: React.CSSProperties = {
+const monoLabel: CSSProperties = { fontFamily: 'var(--font-mono)', fontSize: '10px', letterSpacing: '.14em', color: 'var(--text-500)' };
+const secondaryBtn: CSSProperties = {
   fontFamily: 'var(--font-sans)', fontWeight: 600, fontSize: '13px', padding: '8px 15px',
   borderRadius: 'var(--radius-md)', cursor: 'pointer', color: 'var(--text-200)',
   border: '1px solid var(--border-strong)', background: 'linear-gradient(180deg,var(--space-600),var(--space-700))',
 };
-const objectCard: React.CSSProperties = {
+const objectCard: CSSProperties = {
   padding: '18px', borderRadius: 'var(--radius-lg)', border: '1px solid var(--line-default)',
   background: 'linear-gradient(180deg,var(--space-700),var(--space-800))', boxShadow: 'var(--shadow-md), var(--inset-hi)',
 };

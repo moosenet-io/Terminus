@@ -109,6 +109,51 @@ describe('pipeline run', () => {
   });
 });
 
+describe('RATE scales the whole animation (§2.5)', () => {
+  /** Runs a spec to completion at the given speed, recording every non-progress timer delay the
+   *  engine schedules (the trunk-grow 60ms, the finish→joining, →join, and →reload timers). */
+  function scheduledDelaysAtSpeed(speed: number): number[] {
+    const delays: number[] = [];
+    const e = new ForestEngine({
+      storage: memStorage(),
+      schedule: (fn, ms) => { delays.push(ms); fn(); return 0 as unknown as ReturnType<typeof setTimeout>; },
+      clearScheduled: () => {},
+    });
+    e.loadSpec('auth-service', 12);
+    e.speed = speed;
+    e.start();
+    let guard = 0;
+    while (e.phase === 'building' && guard < 100000) { e.tickIfRunning(); guard++; }
+    return delays;
+  }
+
+  it('halves the merge→join→reload wall-clock at RATE 2 vs RATE 1', () => {
+    const slow = scheduledDelaysAtSpeed(1);
+    const fast = scheduledDelaysAtSpeed(2);
+    // The finish sequence schedules 1400/speed (joining), 3300/speed (join), 1600/speed (reload).
+    expect(slow).toContain(1400); // joining timer at speed 1
+    expect(slow).toContain(3300); // join timer at speed 1
+    expect(slow).toContain(1600); // reload timer at speed 1
+    expect(fast).toContain(700);  // joining timer at speed 2 (1400/2)
+    expect(fast).toContain(1650); // join timer at speed 2 (3300/2)
+    expect(fast).toContain(800);  // reload timer at speed 2 (1600/2)
+  });
+
+  it('drains a failed issue\'s retry countdown faster at higher RATE', () => {
+    const e = new ForestEngine(testOpts());
+    e.loadSpec('auth-service', 12);
+    // Manufacture a failed issue with a fixed retry budget, then tick once at each speed.
+    const mk = () => { const i = { ...e.issues[0], status: 'failed' as const, failT: 5 }; return i; };
+    const slowIssue = mk(); e.issues = [slowIssue, ...e.issues.slice(1)]; e.speed = 0.5; e.step();
+    const slowFailT = e.issues[0].failT;
+    e.loadSpec('auth-service', 12);
+    const fastIssue = mk(); e.issues = [fastIssue, ...e.issues.slice(1)]; e.speed = 2.5; e.step();
+    const fastFailT = e.issues[0].failT;
+    // 5 - 0.5 = 4.5 (slow) vs 5 - 2.5 = 2.5 (fast) — higher RATE burns the countdown faster.
+    expect(slowFailT).toBeGreaterThan(fastFailT);
+  });
+});
+
 describe('controls', () => {
   it('setSize renames the spec to custom and rebuilds', () => {
     const e = new ForestEngine(testOpts());

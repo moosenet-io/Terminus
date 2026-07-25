@@ -234,7 +234,9 @@ export class ForestEngine {
     this.ticks++;
     for (const it of this.issues) {
       if (it.status === 'failed') {
-        it.failT--;
+        // Drain the retry countdown at the RATE factor too (not a flat 1/tick), so RATE governs
+        // the failure→retry wall-clock exactly like it governs pipeline progress (§2.5).
+        it.failT -= this.speed;
         if (it.failT <= 0) { it.status = 'building'; it.retried = true; this.log('[..]', 'var(--flux-amber)', `#${it.id} ${STAGES[it.stage]} retry`); }
         continue;
       }
@@ -268,8 +270,11 @@ export class ForestEngine {
   private finish(): void {
     this.phase = 'commit'; this.running = false;
     this.log('[ok]', 'var(--flux-green-soft)', `branch ${this.specName} — all issues merged`); this.bump();
-    this.timers.push(this.schedule(() => { this.phase = 'joining'; this.bump(); }, 1400));
-    this.timers.push(this.schedule(() => { this.joinForest(); }, 3300));
+    // Scale the merge→join→reload sequence by RATE too (§2.5: RATE governs the WHOLE animation).
+    // Divide because a higher RATE means faster = shorter wall-clock, mirroring how RATE speeds
+    // per-stage progress. `speed` is clamped to [0.5, 2.5] by the slider, so never zero.
+    this.timers.push(this.schedule(() => { this.phase = 'joining'; this.bump(); }, 1400 / this.speed));
+    this.timers.push(this.schedule(() => { this.joinForest(); }, 3300 / this.speed));
   }
   private joinForest(): void {
     const rng = mulberry32(hashStr(this.specName) + this.shipped * 131 + this.forest.length);
@@ -277,7 +282,7 @@ export class ForestEngine {
     this.shipped = this.forest.length; this.saveForest();
     this.phase = 'shipped';
     this.log('[ok]', 'var(--flux-green-soft)', `forest +1 — ${this.shipped} specs shipped`); this.bump();
-    this.timers.push(this.schedule(() => { this.forest.forEach(f => (f.isNew = false)); this.loadSpec(this.specName, this.size); }, 1600));
+    this.timers.push(this.schedule(() => { this.forest.forEach(f => (f.isNew = false)); this.loadSpec(this.specName, this.size); }, 1600 / this.speed));
   }
 
   // ── control surface (called by the panel's header buttons/sliders) ──
