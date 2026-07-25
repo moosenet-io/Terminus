@@ -46,6 +46,8 @@ import { OverviewPanel as LuminaOverviewPanel } from './lumina/OverviewPanel';
 import { DashboardPanel as MuseDashboardPanel } from './muse/DashboardPanel';
 import { TastePanel as MuseTastePanel } from './muse/TastePanel';
 import { ChannelsPanel as MuseChannelsPanel } from './muse/ChannelsPanel';
+import { OverviewPanel as MintOverviewPanel } from './mint/OverviewPanel';
+import { CategoryReportPanel as MintCategoryReportPanel } from './mint/CategoryReportPanel';
 import { Tasks } from '../pages/Tasks';
 import { Agents } from '../pages/Agents';
 import { PRs } from '../pages/PRs';
@@ -70,6 +72,11 @@ registerModule({ id: 'muse', title: 'Muse', icon: '🎬', healthSystem: 'muse', 
 // LGUI-05: lumina module registration only -- no panels yet (LGUI-06 adds lumina.overview
 // first). Ordered AFTER Muse per LUMINA-GUI-SPEC §2.
 registerModule({ id: 'lumina', title: 'Lumina', icon: '✦', healthSystem: 'lumina', order: 4 });
+// CGUI-10 (TERM #533): the MINT benchmark module — reserved-but-unbuilt until now. Ordered
+// after Lumina and before Terminus per LUMINA-GUI-SPEC §2 (… Muse · Lumina · Models · MINT ·
+// Terminus). Terminus-backed (its data source is the terminus namespace), so it binds to the
+// always-available terminus health entry. Models (order 5) lands with CGUI-09.
+registerModule({ id: 'mint', title: 'MINT', icon: '◈', healthSystem: 'terminus', order: 6 });
 registerModule({ id: 'terminus', title: 'Terminus', icon: '⚙', healthSystem: 'terminus', order: 7 });
 
 // ── Harmony ──────────────────────────────────────────────────────────────────
@@ -262,6 +269,32 @@ registerPanel({
   icon: '📺',
   available: true,
   component: MuseChannelsPanel,
+});
+
+// ── MINT (CGUI-10, TERM #533) ────────────────────────────────────────────────
+// The benchmark/profiling module. Two panels: a cross-category Overview and the per-category
+// Report surface (radar / heatmap / distribution / ranking / failures+runs), both driven by the
+// CGUI-08 `client.mint.*` data client. Health-bound to terminus (always available), so the tab
+// shows whenever the shell can reach terminus.
+
+registerPanel({
+  id: 'mint.overview',
+  system: 'mint',
+  title: 'Overview',
+  path: '/mint/overview',
+  icon: '◈',
+  available: true,
+  component: MintOverviewPanel,
+});
+
+registerPanel({
+  id: 'mint.categories',
+  system: 'mint',
+  title: 'Category Reports',
+  path: '/mint/categories',
+  icon: '📊',
+  available: true,
+  component: MintCategoryReportPanel,
 });
 
 // ── Terminus ─────────────────────────────────────────────────────────────────
