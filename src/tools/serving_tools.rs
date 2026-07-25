@@ -39,7 +39,7 @@ use serde_json::{json, Value};
 
 use crate::config;
 use crate::error::ToolError;
-use crate::intake::serving::schema;
+use crate::intake::serving::{runner, schema};
 use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
@@ -396,6 +396,99 @@ impl RustTool for ServingProfileRefresh {
 }
 
 // ---------------------------------------------------------------------------
+// serving_profile_seed
+// ---------------------------------------------------------------------------
+
+/// Populate the `serving_profile` table from the embedded STATIC baseline
+/// (`serving_seed.json`) WITHOUT any GPU measurement, so Chord's arch-aware
+/// routing (which reads model×backend exclusions from that table) activates even
+/// though the serving-measurement sweep has never run.
+///
+/// This is a PURE DATA LOAD: it never launches a model, acquires the GPU, or
+/// measures anything. It reuses the serving module's own seed parser
+/// ([`runner::load_seed`]), field mapping ([`runner::seed_profile_for`]), table
+/// self-provisioning ([`schema::migrate`], `CREATE TABLE IF NOT EXISTS`), and the
+/// canonical idempotent write path ([`schema::upsert_serving_profile`],
+/// `ON CONFLICT (model_id, backend_tag) DO UPDATE`).
+///
+/// ## Upsert semantics (the seed is the INITIAL baseline, not a permanent winner)
+/// Every row is UPSERTed on `(model_id, backend_tag)`. Re-invoking is idempotent
+/// (same rows, no duplicates). Crucially, a later REAL measurement sweep
+/// (`runner::run_with`) writes through the SAME key and UPDATEs these rows in
+/// place — the baseline never blocks a measured verdict from overwriting it.
+pub struct ServingProfileSeed;
+
+#[async_trait]
+impl RustTool for ServingProfileSeed {
+    fn name(&self) -> &str {
+        "serving_profile_seed"
+    }
+
+    fn description(&self) -> &str {
+        "Seed the serving_profile table from the embedded static baseline (no GPU \
+         measurement), activating Chord's arch-aware routing. Idempotent upsert on \
+         (model_id, backend_tag); a later real measurement sweep updates rows in \
+         place. Pure data load — never launches or measures a model."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _args: Value) -> Result<String, ToolError> {
+        // 1. Parse the embedded baseline (no DB, no GPU). A parse failure is a
+        //    clean ToolError, never a panic (the embedded JSON always parses).
+        let cells = runner::load_seed()?;
+
+        // 2. Map every seed cell to its baseline ServingProfile row up front. A
+        //    malformed/unmappable cell is SKIPPED (recorded), never fatal.
+        let mut profiles = Vec::new();
+        let mut skipped: Vec<Value> = Vec::new();
+        for cell in &cells {
+            match runner::seed_profile_for(cell) {
+                Ok(p) => profiles.push(p),
+                Err(reason) => skipped.push(json!({
+                    "model_id": cell.model_id,
+                    "backend_tag": cell.backend_tag,
+                    "reason": reason,
+                })),
+            }
+        }
+
+        // 3. Ensure the table exists (self-provisioning; the app never requires an
+        //    operator DDL) then UPSERT every mapped row under one seed run_id.
+        //    DB unconfigured/unreachable ⇒ the generic, sanitized store error.
+        let pool = schema::get_pool().await.map_err(|_| store_unavailable())?;
+        schema::migrate(&pool)
+            .await
+            .map_err(|_| store_unavailable())?;
+
+        let run_id = uuid::Uuid::new_v4();
+        let mut rows_seeded = 0usize;
+        let mut models = std::collections::BTreeSet::new();
+        for p in &profiles {
+            schema::upsert_serving_profile(&pool, run_id, p)
+                .await
+                .map_err(|_| store_unavailable())?;
+            rows_seeded += 1;
+            models.insert(p.model_id.as_str().to_string());
+        }
+
+        let summary = json!({
+            "status": "ok",
+            "rows_seeded": rows_seeded,
+            "distinct_models": models.len(),
+            "skipped_count": skipped.len(),
+            "skipped": skipped,
+            "note": "Baseline load from embedded serving_seed.json — no GPU \
+                     measurement. Idempotent upsert on (model_id, backend_tag); a \
+                     later real measurement sweep updates these rows in place.",
+        });
+        Ok(serde_json::to_string_pretty(&summary).unwrap_or_else(|_| summary.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -403,6 +496,7 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(ServingProfileGet));
     registry.register_or_replace(Box::new(ServingResidencyStatus));
     registry.register_or_replace(Box::new(ServingProfileRefresh));
+    registry.register_or_replace(Box::new(ServingProfileSeed));
 }
 
 // ---------------------------------------------------------------------------
@@ -420,13 +514,23 @@ mod tests {
     }
 
     #[test]
-    fn all_three_have_metadata() {
+    fn all_tools_have_metadata() {
         meta_ok(&ServingProfileGet);
         meta_ok(&ServingResidencyStatus);
         meta_ok(&ServingProfileRefresh);
+        meta_ok(&ServingProfileSeed);
         assert_eq!(ServingProfileGet.name(), "serving_profile_get");
         assert_eq!(ServingResidencyStatus.name(), "serving_residency_status");
         assert_eq!(ServingProfileRefresh.name(), "serving_profile_refresh");
+        assert_eq!(ServingProfileSeed.name(), "serving_profile_seed");
+    }
+
+    #[test]
+    fn seed_takes_no_args() {
+        assert!(ServingProfileSeed.parameters()["properties"]
+            .as_object()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -557,12 +661,13 @@ mod tests {
     }
 
     #[test]
-    fn registration_adds_three() {
+    fn registration_adds_four() {
         let mut reg = ToolRegistry::new();
         register(&mut reg);
         assert!(reg.contains("serving_profile_get"));
         assert!(reg.contains("serving_residency_status"));
         assert!(reg.contains("serving_profile_refresh"));
-        assert_eq!(reg.len(), 3);
+        assert!(reg.contains("serving_profile_seed"));
+        assert_eq!(reg.len(), 4);
     }
 }
