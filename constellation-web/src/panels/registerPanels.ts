@@ -41,6 +41,8 @@ import { EngineDiagramPanel } from './status/EngineDiagramPanel';
 import { DashboardPanel } from './harmony/DashboardPanel';
 import { ProjectsPanel } from './harmony/ProjectsPanel';
 import { HarmonyForestPanel } from './harmony/HarmonyForestPanel';
+import { BackendsPanel } from './chord/BackendsPanel';
+import { OverviewPanel as LuminaOverviewPanel } from './lumina/OverviewPanel';
 import { DashboardPanel as MuseDashboardPanel } from './muse/DashboardPanel';
 import { TastePanel as MuseTastePanel } from './muse/TastePanel';
 import { ChannelsPanel as MuseChannelsPanel } from './muse/ChannelsPanel';
@@ -218,6 +220,18 @@ registerPanel({
   component: Playground,
 });
 
+// CGUI-06 (TERM #529): Backends — Chord-managed backend roster + named-alias routing table.
+// Deepens the (previously thin) Chord module beyond Inference/Providers/Playground.
+registerPanel({
+  id: 'chord.backends',
+  system: 'chord',
+  title: 'Backends',
+  path: '/chord/backends',
+  icon: '🧩',
+  available: true,
+  component: BackendsPanel,
+});
+
 // ── Muse (CONST-20) ──────────────────────────────────────────────────────────
 
 registerPanel({
@@ -295,6 +309,16 @@ registerPanel({
 });
 
 // ── Lumina ───────────────────────────────────────────────────────────────────
-// No panels registered yet -- see the module-registration comment above (LGUI-05); the
-// CONST-04 stub (`lumina.config`, `available: false`) is removed. LGUI-06 registers the
-// first real panel (`lumina.overview`).
+// CGUI-06 (TERM #529): Lumina was a registered module with ZERO panels (an empty tab). This
+// lands its first real panel — an operational overview of the lumina-core agent — so the
+// module is no longer empty. Anticipates the full LGUI-06..12 surface
+// (chat/memory/persona/routing/tools/access/setup), which will register alongside it.
+registerPanel({
+  id: 'lumina.overview',
+  system: 'lumina',
+  title: 'Overview',
+  path: '/lumina/overview',
+  icon: '✦',
+  available: true,
+  component: LuminaOverviewPanel,
+});
