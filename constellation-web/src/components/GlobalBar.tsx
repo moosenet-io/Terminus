@@ -74,8 +74,9 @@ export function GlobalBar({
         height: 52,
         flexShrink: 0,
         borderBottom: '1px solid var(--border-subtle)',
-        // Translucent so the fixed deep-space backdrop reads through the bar (guide §0 frame).
-        background: 'linear-gradient(180deg, rgba(22,17,44,0.72), rgba(13,11,26,0.55))',
+        // Translucent so the fixed backdrop reads through the bar (guide §0 frame).
+        // M1: neutral-dark tint (was violet rgba(22,17,44)/rgba(13,11,26)).
+        background: 'linear-gradient(180deg, rgba(20,20,25,0.72), rgba(10,10,13,0.55))',
         backdropFilter: 'blur(8px)',
       }}
     >
@@ -92,9 +93,16 @@ export function GlobalBar({
             height: 28,
             cursor: 'pointer',
             flexShrink: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
           }}
         >
-          ☰
+          {/* POL-05: inline Lucide-style menu glyph (was the ☰ character). */}
+          <svg aria-hidden width={16} height={16} viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" strokeWidth={1.5} strokeLinecap="round">
+            <path d="M3 6h18M3 12h18M3 18h18" />
+          </svg>
         </button>
       )}
 
@@ -220,9 +228,14 @@ export function GlobalBar({
           <span
             title="Health poll degraded — showing last known status"
             aria-label="Health poll degraded"
-            style={{ color: 'var(--status-warning)', fontSize: 'var(--text-sm)' }}
+            style={{ color: 'var(--status-warning)', display: 'flex', alignItems: 'center' }}
           >
-            ⚠
+            {/* POL-05: inline Lucide-style alert-triangle (was the ⚠ character). */}
+            <svg aria-hidden width={16} height={16} viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
+              <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+              <path d="M12 9v4M12 17h.01" />
+            </svg>
           </span>
         )}
         {/* Account circle — blue avatar with the account initial; a plain button so Sign out is

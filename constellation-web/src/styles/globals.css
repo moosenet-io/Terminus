@@ -6,21 +6,26 @@
    degradation, table skins) are kept from CONST-04; only values change. */
 
 :root {
-  /* ── Surfaces — "deep space" (page → chip, darkest to lightest) ─────────────── */
-  --space-900: #0D0B1A;
-  --space-800: #110E22;
-  --space-700: #161130;
-  --space-600: #1A1333;
-  --space-500: #221A40;
-  --space-400: #2C2350;
+  /* ── Surfaces — neutral deep-dark (page → chip, darkest to lightest) ─────────────
+     S127 TGUI2 POL-1 / M1: desaturated ~65% off the old violet-tinted "deep space"
+     surfaces toward Linear/Grafana neutral-dark. Only a whisper of violet remains — the
+     brand now lives in the ACCENT + node dots, not the ambient surface hue. Prior violet
+     values kept in the trailing comment for provenance. */
+  --space-900: #0A0A0D; /* was #0D0B1A */
+  --space-800: #0F0F14; /* was #110E22 */
+  --space-700: #141419; /* was #161130 */
+  --space-600: #18181F; /* was #1A1333 */
+  --space-500: #1C1C24; /* was #221A40 */
+  --space-400: #26262F; /* was #2C2350 — proportional neutral step */
   --bg-page: var(--space-900);
   --bg-panel: var(--space-700);
   --bg-elevated: var(--space-600);
   --bg-hover: var(--space-500);
   --surface-card: var(--space-700);
   --surface-chip: var(--space-400);
-  --grad-space: linear-gradient(135deg, #0D0B1A 0%, #1A1333 100%);
-  --grad-card: linear-gradient(180deg, var(--space-700), var(--space-800));
+  --grad-space: linear-gradient(135deg, #0A0A0D 0%, #18181F 100%); /* was 135deg #0D0B1A→#1A1333 */
+  /* Keep the IDEA of a vertical card gradient for depth, drop the purple (M1). */
+  --grad-card: linear-gradient(180deg, #16161C, #111116); /* was space-700→space-800 (violet) */
 
   /* ── Brand accent — violet ramp ───────────────────────────────────────────── */
   --violet-700: #5B21B6;
@@ -57,6 +62,12 @@
   --status-error: var(--flux-rose);
   --status-info: var(--flux-blue);
 
+  /* M5: progress is NOT status — a completion bar renders as a single desaturated-violet
+     fill on a neutral track, never the red→amber→green status ramp (which read as "warning"
+     on trivial in-progress work). Genuine status still uses the semantic hues above. */
+  --progress-fill: rgba(124, 58, 237, 0.55);
+  --progress-track: rgba(255, 255, 255, 0.06);
+
   /* ── Ink ─────────────────────────────────────────────────────────────────── */
   --text-100: #F4F2FB;
   --text-200: #C7C3D6;
@@ -69,10 +80,14 @@
   --text-muted: var(--text-300);
   --text-faint: var(--text-500);
 
-  /* ── Lines — violet-alpha hairlines ──────────────────────────────────────── */
-  --line-soft: rgba(168, 85, 247, 0.14);
-  --line-default: rgba(168, 85, 247, 0.22);
-  --line-strong: rgba(168, 85, 247, 0.40);
+  /* ── Lines — neutral white-alpha hairlines (M2) ──────────────────────────────
+     S127 TGUI2 POL-1 / M2: structural hairlines are neutral white-alpha; violet is
+     reserved ONLY for the active/accent edge (--line-accent), applied to selected nav,
+     focused inputs, primary buttons and accent cards. Prior violet hairlines in comments. */
+  --line-soft: rgba(255, 255, 255, 0.06);   /* was rgba(168,85,247,0.14) */
+  --line-default: rgba(255, 255, 255, 0.09); /* was rgba(168,85,247,0.22) */
+  --line-strong: rgba(255, 255, 255, 0.14);  /* was rgba(168,85,247,0.40) */
+  --line-accent: rgba(168, 85, 247, 0.40);   /* violet — active/accent/focus edge ONLY */
   --border: var(--line-default);
   --border-strong: var(--line-strong);
   --border-width: 1px;
@@ -126,8 +141,10 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
   --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.55);
-  --glow-violet: 0 0 24px rgba(124, 58, 237, 0.45);
-  --glow-violet-soft: 0 0 12px rgba(168, 85, 247, 0.30);
+  /* M3: glow is an INTERACTION signal only (hover/active/primary/focus), never ambient.
+     Cut ~35% so elevation reads crisp (Linear) rather than neon. */
+  --glow-violet: 0 0 16px rgba(124, 58, 237, 0.28);      /* was 0 0 24px .45 */
+  --glow-violet-soft: 0 0 8px rgba(168, 85, 247, 0.20);  /* was 0 0 12px .30 */
   --glow-blue: 0 0 18px rgba(59, 130, 246, 0.45);
   --glow-green: 0 0 18px rgba(16, 185, 129, 0.45);
   --glow-amber: 0 0 18px rgba(245, 158, 11, 0.45);
@@ -190,7 +207,10 @@
   --bg-surface-overlay: var(--surface-chip);
   --border-subtle: var(--line-soft);
   --border-default: var(--line-default);
-  --border-emphasis: var(--line-strong);
+  /* M2: "emphasis" means active/selected (violet accent edge), not merely a stronger
+     structural hairline — repointed off --line-strong (now neutral) to --line-accent so
+     selected nav tabs / emphasized edges keep the single brand accent. */
+  --border-emphasis: var(--line-accent);
   --text-primary: var(--text-100);
   --text-secondary: var(--text-200);
   --text-tertiary: var(--text-300);
@@ -307,26 +327,22 @@ body {
      the GlobalBar z-index:2, and the content row position:relative;z-index:1 — all above this). */
   z-index: -1;
   pointer-events: none;
+  /* S127 TGUI2 POL-1 / M4 — CALM the data-page backdrop. This is the fixed frame behind ALL
+     six data pages, so it must read as near-flat neutral-dark, not "deep space dust".
+     - nebula radials dropped to Stripe-corner subtlety (violet .16→.05, blue .10→.03)
+     - the green forest-ground tint is removed; the vertical gradient is now neutral-dark only
+     - the twinkling starfield (::after) is REMOVED entirely from data pages (see below)
+     Full starfield + forest gradient survive ONLY on the Forest Build hero (its own <svg> grove)
+     and the login surface (its own paint) — neither depends on this element. */
   background:
-    radial-gradient(70% 55% at 14% 2%, rgba(124, 58, 237, 0.16), transparent 60%),
-    radial-gradient(60% 55% at 88% 8%, rgba(59, 130, 246, 0.10), transparent 62%),
-    linear-gradient(180deg, #0D0B1A 0%, #130F26 46%, #16112C 72%, #0F1A18 100%);
+    radial-gradient(70% 55% at 14% 2%, rgba(124, 58, 237, 0.05), transparent 60%),
+    radial-gradient(60% 55% at 88% 8%, rgba(59, 130, 246, 0.03), transparent 62%),
+    linear-gradient(180deg, #0A0A0D 0%, #0D0D12 55%, #0A0A0D 100%);
 }
-.const-backdrop::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  opacity: 0.75;
-  background-repeat: no-repeat;
-  background-image:
-    radial-gradient(1.2px 1.2px at 12% 18%, #ffffff, transparent),
-    radial-gradient(1.1px 1.1px at 33% 62%, #cbd5ff, transparent),
-    radial-gradient(1.3px 1.3px at 58% 12%, #e9d5ff, transparent),
-    radial-gradient(1.2px 1.2px at 76% 48%, #dbeafe, transparent),
-    radial-gradient(1.1px 1.1px at 47% 84%, #ffffff, transparent),
-    radial-gradient(1.4px 1.4px at 90% 28%, #e9d5ff, transparent);
-  animation: lumina-twinkle 6s var(--ease-in-out) infinite;
-}
+/* M4: the six-dot twinkling starfield that used to live on `.const-backdrop::after` is
+   intentionally removed — on data pages it read as sensor-noise dust floating through the
+   content (design-direction Tell #3). The starfield identity anchor is retained via the
+   `.h-starfield` component treatment, used only on Forest/login surfaces. */
 
 /* Card — brand: gradient fill, violet hairline, glow on hover (§2.3) */
 .h-card {
@@ -373,9 +389,10 @@ body {
    toggled back ON. A child re-declaring pointer-events:auto overrides the inert ancestor. */
 .const-modcard--disabled .const-modcard__toggle { pointer-events: auto; }
 
-/* Accent card variant — violet-gradient border-mask + strong line (§2.3 Card row) */
+/* Accent card variant — the ONE place a resting card keeps the violet edge (active/live
+   elements only, §2.4). M2: uses --line-accent (violet), not the now-neutral --border-strong. */
 .h-card-accent {
-  border-color: var(--border-strong);
+  border-color: var(--line-accent);
   box-shadow: var(--shadow-md), var(--glow-violet-soft), var(--inset-hi);
 }
 

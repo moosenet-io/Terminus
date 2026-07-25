@@ -53,10 +53,10 @@ function MetricsSection() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 'var(--space-3)', height: '100%' }}>
         <MetricCard label="Library Size" value={data ? String(data.library_size) : '—'} />
         <MetricCard label="Active Channels" value={data ? String(data.active_channels) : '—'} />
+        {/* M5: a pending-items COUNT is not a warning — render mono-white, not amber. */}
         <MetricCard
           label="Pending Items"
           value={data ? String(data.pending_items) : '—'}
-          valueColor={data && data.pending_items > 0 ? 'warning' : 'primary'}
         />
         <MetricCard label="Last Ingest" value={data ? formatRelativeTime(data.last_ingest_at) : '—'} />
       </div>
