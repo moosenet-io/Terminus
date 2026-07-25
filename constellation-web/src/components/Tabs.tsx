@@ -19,10 +19,25 @@ export interface TabsProps {
   tabs: TabItem[];
   activeId: string;
   onSelect: (id: string) => void;
+  /** Namespace for the generated tab/tabpanel DOM ids — MUST match the `idBase` the parent
+   *  passes to `tabId`/`tabPanelId` when it renders the tab panels, so `aria-controls` (here)
+   *  and `aria-labelledby` (on the panel) reference each other. Keep it unique per Tabs instance
+   *  on the page. */
+  idBase: string;
   'aria-label'?: string;
 }
 
-export function Tabs({ tabs, activeId, onSelect, 'aria-label': ariaLabel }: TabsProps) {
+/** DOM id of a tab BUTTON — the panel's `aria-labelledby` points back here. */
+export function tabId(idBase: string, id: string): string {
+  return `${idBase}-tab-${id}`;
+}
+
+/** DOM id of a tab PANEL — the tab's `aria-controls` points here. */
+export function tabPanelId(idBase: string, id: string): string {
+  return `${idBase}-panel-${id}`;
+}
+
+export function Tabs({ tabs, activeId, onSelect, idBase, 'aria-label': ariaLabel }: TabsProps) {
   const refs = useRef<Record<string, HTMLButtonElement | null>>({});
 
   const move = (dir: -1 | 1) => {
@@ -51,8 +66,10 @@ export function Tabs({ tabs, activeId, onSelect, 'aria-label': ariaLabel }: Tabs
           <button
             key={t.id}
             ref={el => { refs.current[t.id] = el; }}
+            id={tabId(idBase, t.id)}
             role="tab"
             aria-selected={active}
+            aria-controls={tabPanelId(idBase, t.id)}
             tabIndex={active ? 0 : -1}
             onClick={() => onSelect(t.id)}
             onKeyDown={e => {

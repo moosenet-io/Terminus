@@ -25,17 +25,21 @@ function formatElapsed(secs: number): string {
   return `${s}s`;
 }
 
-function providerIcon(p: string): string {
+/** POL-13 (§9, no-emoji): an active tool-use provider badge — a node-dot (coloured by the
+ *  provider's infra kind) + a short mono code, replacing the old pictographic desktop/cloud
+ *  glyphs (and the branch/menu symbols) so no emoji render in the provider badges. `title`
+ *  keeps the full provider name for hover/screen-reader. */
+function providerBadge(p: string): { code: string; color: string } {
   const lower = p.toLowerCase();
-  if (lower.includes('ollama') || lower.includes('local')) return '🖥';
-  if (lower.includes('gitea') || lower.includes('git')) return '⎇';
-  if (lower.includes('plane')) return '☰';
-  return '☁';
+  if (lower.includes('ollama') || lower.includes('local')) return { code: 'LOC', color: 'var(--text-500)' };
+  if (lower.includes('gitea') || lower.includes('git')) return { code: 'GIT', color: 'var(--node-source)' };
+  if (lower.includes('plane')) return { code: 'PLN', color: 'var(--node-core)' };
+  return { code: p.slice(0, 3).toUpperCase(), color: 'var(--node-cloud)' };
 }
 
 /** Map provider codename → infrastructure type tag (POL-13 §9, no-emoji): a short mono code +
  *  a node-dot colour (GPU=blue source, CPU/local=neutral, cloud=amber) replaces the old
- *  🗄/💾/☁ emoji. */
+ *  drive/disk/cloud emoji. */
 function providerTypeIcon(provider?: string): { code: string; color: string; label: string } | null {
   if (!provider) return null;
   const p = provider.toLowerCase();
@@ -301,12 +305,16 @@ export function AgentLane({ agent, inTriageMode = false }: Props) {
                 </span>
               ) : null;
             })()}
-            {/* Active tool-use providers (plane, gitea, etc.) */}
-            {agent.active_providers.map(p => (
-              <span key={p} title={p} style={{ fontSize: 14 }}>
-                {providerIcon(p)}
-              </span>
-            ))}
+            {/* Active tool-use providers (plane, gitea, etc.) — node-dot + short code, no emoji. */}
+            {agent.active_providers.map(p => {
+              const b = providerBadge(p);
+              return (
+                <span key={p} title={p} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontFamily: 'var(--font-mono)', fontSize: 10, letterSpacing: 'var(--ls-mono)', color: 'var(--text-tertiary)' }}>
+                  <span aria-hidden style={{ width: 6, height: 6, borderRadius: '50%', background: b.color, flexShrink: 0 }} />
+                  {b.code}
+                </span>
+              );
+            })}
           </div>
         </>
       )}

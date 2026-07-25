@@ -30,7 +30,7 @@ import { PanelRoot } from '../../components/PanelRoot';
 import { NodeBadge } from '../../components/NodeBadge';
 import { Badge } from '../../components/Badge';
 import { Button } from '../../components/Button';
-import { Tabs } from '../../components/Tabs';
+import { Tabs, tabId, tabPanelId } from '../../components/Tabs';
 import { StatusPill } from '../../components/StatusPill';
 import type { PillState } from '../../components/StatusPill';
 import {
@@ -183,6 +183,17 @@ export function ModuleDetail({ module, health }: ModuleDetailProps) {
   // above the tabs (key vitals are always visible); each tab zooms one region.
   const [activeTab, setActiveTab] = useState<'overview' | 'config' | 'flow' | 'logs'>('overview');
 
+  // POL-09 FIX (review): full tablist/tab/tabpanel ARIA wiring. Each rendered panel gets
+  // role="tabpanel" + a matching id + aria-labelledby back to its tab; the tab carries
+  // aria-controls to this id (in Tabs). idBase namespaces the ids to this view.
+  const TAB_ID_BASE = 'module-detail';
+  const tabPanelAttrs = (id: string) => ({
+    id: tabPanelId(TAB_ID_BASE, id),
+    role: 'tabpanel' as const,
+    'aria-labelledby': tabId(TAB_ID_BASE, id),
+    tabIndex: 0,
+  });
+
   // TOOLS MOUNTED — the one metric we can source live today, and only for the terminus tool
   // hub: sum the aggregation client's per-terminus-module tool counts. Every other module has
   // no per-module tool count exposed yet (CGUI-08) → em-dash placeholder.
@@ -319,6 +330,7 @@ export function ModuleDetail({ module, health }: ModuleDetailProps) {
 
       {/* ===== TABS (§3.4) ===== */}
       <Tabs
+        idBase={TAB_ID_BASE}
         aria-label={`${module.title} detail sections`}
         activeId={activeTab}
         onSelect={id => setActiveTab(id as typeof activeTab)}
@@ -332,21 +344,21 @@ export function ModuleDetail({ module, health }: ModuleDetailProps) {
 
       {/* ===== OVERVIEW TAB — the at-a-glance: flow diagram + configuration side by side ===== */}
       {activeTab === 'overview' && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 'var(--space-5)' }}>
+        <div {...tabPanelAttrs('overview')} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 'var(--space-5)' }}>
           {flowSection}
           {configSection}
         </div>
       )}
 
       {/* ===== FLOW TAB — the position-in-flow diagram, full width ===== */}
-      {activeTab === 'flow' && flowSection}
+      {activeTab === 'flow' && <div {...tabPanelAttrs('flow')}>{flowSection}</div>}
 
       {/* ===== CONFIG TAB — the configuration panel, full width ===== */}
-      {activeTab === 'config' && configSection}
+      {activeTab === 'config' && <div {...tabPanelAttrs('config')}>{configSection}</div>}
 
       {/* ===== LOGS TAB — the live streaming log ===== */}
       {activeTab === 'logs' && (
-        <section style={{ ...panel, display: 'flex', flexDirection: 'column', minHeight: 220 }}>
+        <section {...tabPanelAttrs('logs')} style={{ ...panel, display: 'flex', flexDirection: 'column', minHeight: 220 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', padding: 'var(--space-3) var(--space-4) var(--space-2)' }}>
             {/* green header dot (guide §4) — 7px + glow, DS-parity geometry. */}
             <span aria-hidden style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--flux-green)', boxShadow: 'var(--glow-green)', flexShrink: 0 }} />
