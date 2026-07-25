@@ -282,8 +282,9 @@ export interface WsConnection {
 // only the two allowlisted, non-secret keys below may ever be read or written. Any other key
 // (including via a loosely-typed caller) throws rather than silently writing an unreviewed key.
 
-/** The only two keys the prefs seam will ever store — both non-secret UI state. */
-export type PrefsKey = 'layout' | 'density';
+/** The keys the prefs seam will store — all non-secret UI state. `crate` (CGUI-12) is the
+ *  operator's last-selected Overview crate tab, persisted so the shell reopens on the same crate. */
+export type PrefsKey = 'layout' | 'density' | 'crate';
 
 export interface PrefsClient {
   /** Returns the stored value for an allowlisted key, or `null` if unset/unparsable. */
@@ -297,7 +298,7 @@ export interface PrefsClient {
 // Defined here (ahead of both adapters) since each adapter's object literal references
 // `prefsClient` directly.
 
-const PREFS_ALLOWLIST: readonly PrefsKey[] = ['layout', 'density'];
+const PREFS_ALLOWLIST: readonly PrefsKey[] = ['layout', 'density', 'crate'];
 const PREFS_STORAGE_PREFIX = 'constellation.prefs.';
 
 function assertAllowedPrefsKey(key: string): asserts key is PrefsKey {

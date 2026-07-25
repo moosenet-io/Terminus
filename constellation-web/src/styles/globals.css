@@ -261,6 +261,49 @@ body {
   outline-offset: 2px;
 }
 
+/* ── CGUI-12: deep-space backdrop (guide §0) ─────────────────────────────────────
+   The fixed frame the whole shell lives in front of — a single element pinned behind
+   every screen (z-index:0), so "the frame never moves; only the canvas scrolls". Two
+   stacked layers per the guide:
+     A. two nebula radials (violet top-left, blue top-right) over a vertical gradient that
+        ends green-tinted (#0F1A18) toward the bottom — the forest ground.
+     B. a six-dot starfield (::after), opacity ~.75, gently twinkling.
+   The raw rgba/hex/px below are intentional guide-§0 visual literals (this is CSS, not TSX,
+   so the adherence lint — which only scans .ts/.tsx — does not flag them; they are kept
+   verbatim from the brand guide rather than tokenised so the backdrop matches pixel-for-pixel).
+   Reduced motion: the ::after twinkle is an animation, so the global
+   prefers-reduced-motion rule (interactions.css) already stills it. */
+.const-backdrop {
+  position: fixed;
+  inset: 0;
+  /* z-index:-1 (not 0): the backdrop is a POSITIONED element, so at z-index:0 it would paint
+     AFTER — i.e. on top of — its non-positioned in-flow siblings (the rail + canvas row),
+     obscuring /overview. A negative z-index parks it behind the shell's in-flow content while
+     staying inside the shell's stacking context (the shell column is position:relative;z-index:1,
+     the GlobalBar z-index:2, and the content row position:relative;z-index:1 — all above this). */
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(70% 55% at 14% 2%, rgba(124, 58, 237, 0.16), transparent 60%),
+    radial-gradient(60% 55% at 88% 8%, rgba(59, 130, 246, 0.10), transparent 62%),
+    linear-gradient(180deg, #0D0B1A 0%, #130F26 46%, #16112C 72%, #0F1A18 100%);
+}
+.const-backdrop::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  opacity: 0.75;
+  background-repeat: no-repeat;
+  background-image:
+    radial-gradient(1.2px 1.2px at 12% 18%, #ffffff, transparent),
+    radial-gradient(1.1px 1.1px at 33% 62%, #cbd5ff, transparent),
+    radial-gradient(1.3px 1.3px at 58% 12%, #e9d5ff, transparent),
+    radial-gradient(1.2px 1.2px at 76% 48%, #dbeafe, transparent),
+    radial-gradient(1.1px 1.1px at 47% 84%, #ffffff, transparent),
+    radial-gradient(1.4px 1.4px at 90% 28%, #e9d5ff, transparent);
+  animation: lumina-twinkle 6s var(--ease-in-out) infinite;
+}
+
 /* Card — brand: gradient fill, violet hairline, glow on hover (§2.3) */
 .h-card {
   background: var(--grad-card);
