@@ -20,7 +20,7 @@ import { StatusPill } from '../../components/StatusPill';
 import { MetricCard } from '../../components/MetricCard';
 import { getAggregationClient } from '../../lib/aggregationClient';
 import type { ModelListEntry, ModelsListQuery } from '../../types/mint';
-import { deriveServingState, deriveCostTier, coverageBadges, matchesQuery, fmtPct, fmtGb } from './modelsData';
+import { deriveServingState, deriveCostTier, coverageBadges, fmtPct, fmtGb } from './modelsData';
 import { ModelDetailView } from './ModelDetailView';
 
 type Scope = 'all' | 'fleet' | 'brochure';
@@ -41,43 +41,80 @@ const selectStyle: React.CSSProperties = {
   padding: 'var(--space-1) var(--space-2)',
 };
 
+/** Roster page size — the backend clamps `limit` to [1, 500]; 50 matches its default. */
+const PAGE_SIZE = 50;
+
 export function RosterPanel() {
   const [models, setModels] = useState<ModelListEntry[] | null>(null);
+  // S127 (DATA-04): the SERVER's full-roster total (entries before pagination), reported as the
+  // "Models" count instead of the loaded page size — so the metric shows the true scale, not 50.
+  const [total, setTotal] = useState(0);
   const [refreshedAt, setRefreshedAt] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   const [selected, setSelected] = useState<ModelListEntry | null>(null);
 
-  // Filters (scope/serving drive the query; search is client-side on top).
+  // Filters. scope/serving/search are ALL server-side query params (models.list `q`), so they
+  // filter the FULL roster, not just the loaded page — and `total`/pagination stay correct with a
+  // search applied. `search` is the live input; `qParam` is its debounced value that drives the
+  // fetch (so we don't hit the API on every keystroke).
   const [scope, setScope] = useState<Scope>('all');
   const [servingOnly, setServingOnly] = useState(false);
   const [search, setSearch] = useState('');
+  const [qParam, setQParam] = useState('');
+  // S127 (DATA-04): server-side pagination — the offset of the current page into the full roster.
+  const [offset, setOffset] = useState(0);
+
+  // Reset to the first page whenever a query-changing filter changes (a stale offset could point
+  // past the new, smaller result set).
+  const changeScope = (s: Scope) => { setScope(s); setOffset(0); };
+  const changeServing = (on: boolean) => { setServingOnly(on); setOffset(0); };
+
+  // FIX 3 (S127 review): debounce the search box into `qParam` and RESET the page — otherwise a
+  // search on page N (offset 50) would filter only those 50 already-loaded rows and miss the rest
+  // of the roster. Now the term goes to the backend `q` and paging restarts from the full result.
+  useEffect(() => {
+    const id = setTimeout(() => {
+      setQParam(prev => {
+        const next = search.trim();
+        if (next !== prev) setOffset(0); // new search term → back to the first page
+        return next;
+      });
+    }, 250);
+    return () => clearTimeout(id);
+  }, [search]);
 
   useEffect(() => {
     let cancelled = false;
     setModels(null);
     setFailed(false);
-    const query: ModelsListQuery = { scope };
+    const query: ModelsListQuery = { scope, limit: PAGE_SIZE, offset };
     if (servingOnly) query.serving = true;
+    if (qParam) query.q = qParam; // server-side full-roster search
     getAggregationClient()
       .models.list(query)
-      .then(res => { if (!cancelled) { setModels(res.models); setRefreshedAt(res.refreshed_at); } })
-      .catch(() => { if (!cancelled) { setModels([]); setFailed(true); } });
+      .then(res => { if (!cancelled) { setModels(res.models); setTotal(res.total); setRefreshedAt(res.refreshed_at); } })
+      .catch(() => { if (!cancelled) { setModels([]); setTotal(0); setFailed(true); } });
     return () => { cancelled = true; };
-  }, [scope, servingOnly]);
+  }, [scope, servingOnly, offset, qParam]);
 
-  const visible = useMemo(
-    () => (models ?? []).filter(m => matchesQuery(m, search)),
-    [models, search],
-  );
+  // The loaded page is already server-filtered by `qParam`; render it as-is (no client re-filter,
+  // which previously scoped search to just the current page).
+  const visible = models ?? [];
 
   const summary = useMemo(() => {
     const rows = models ?? [];
     return {
-      total: rows.length,
+      // Full-roster count from the server (not the page size); serving/fleet are page-scoped.
+      total,
       serving: rows.filter(m => m.serving_now).length,
       fleet: rows.filter(m => m.in_current_fleet).length,
     };
-  }, [models]);
+  }, [models, total]);
+
+  const pageStart = total === 0 ? 0 : offset + 1;
+  const pageEnd = Math.min(offset + (models?.length ?? 0), total);
+  const hasPrev = offset > 0;
+  const hasNext = offset + PAGE_SIZE < total;
 
   // Detail view — master/detail swap inside the same panel/route.
   if (selected) {
@@ -117,7 +154,7 @@ export function RosterPanel() {
               <button
                 key={s.id}
                 type="button"
-                onClick={() => setScope(s.id)}
+                onClick={() => changeScope(s.id)}
                 style={{
                   ...selectStyle,
                   cursor: 'pointer',
@@ -132,10 +169,38 @@ export function RosterPanel() {
           })}
         </div>
         <label style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--space-1)', fontSize: 'var(--fs-sm)', color: 'var(--text-secondary)', cursor: 'pointer' }}>
-          <input type="checkbox" checked={servingOnly} onChange={e => setServingOnly(e.target.checked)} />
+          <input type="checkbox" checked={servingOnly} onChange={e => changeServing(e.target.checked)} />
           Serving only
         </label>
       </div>
+
+      {/* S127 (DATA-04): pagination over the full server roster. `search` filters only the loaded
+          page; the Prev/Next controls page the full set the "Models" metric counts. */}
+      {total > PAGE_SIZE && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+            {pageStart}–{pageEnd} of {total}
+          </span>
+          <div style={{ display: 'inline-flex', gap: 'var(--space-1)' }}>
+            <button
+              type="button"
+              onClick={() => setOffset(o => Math.max(0, o - PAGE_SIZE))}
+              disabled={!hasPrev}
+              style={{ ...selectStyle, cursor: hasPrev ? 'pointer' : 'not-allowed', opacity: hasPrev ? 1 : 0.5 }}
+            >
+              Prev
+            </button>
+            <button
+              type="button"
+              onClick={() => setOffset(o => o + PAGE_SIZE)}
+              disabled={!hasNext}
+              style={{ ...selectStyle, cursor: hasNext ? 'pointer' : 'not-allowed', opacity: hasNext ? 1 : 0.5 }}
+            >
+              Next
+            </button>
+          </div>
+        </div>
+      )}
 
       {refreshedAt && (
         <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>

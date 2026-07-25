@@ -4,11 +4,15 @@
 // elsewhere in the app (that's an acceptance-criterion grep check, keep it true).
 //
 // Two implementations of the same typed interface:
-//   - mockAdapter: canned in-memory data, no network. Default — lets the app build/run/typecheck
-//     with no backend present.
 //   - httpAdapter: real same-origin fetch against `/api/{system}/...`, cookie-based session auth.
+//   - mockAdapter: canned in-memory data, no network — for explicit offline/dev use only.
 //
-// Selection is via `import.meta.env.VITE_AGG_MODE` ('mock' | 'http'), default 'mock'.
+// S127 TGUI2 (Part B) — adapter selection, http-default + runtime-selectable (see resolveMode
+// at the bottom of this file). The old build-time-only switch defaulted to `mock`, so a
+// production build that forgot `VITE_AGG_MODE=http` shipped the ENTIRE app as fixtures (the
+// "4-5 items / smoke-and-mirrors" defect). The default is now INVERTED: any build served to a
+// browser talks to the real backend (http); `mock` must be explicitly opted into. So an
+// unconfigured build degrades to real-backend-with-empty-states, never silent fake data.
 // This is deliberately the *only* seam CONST-02 (the real Terminus-side aggregation layer)
 // needs to fill in — the httpAdapter below defines exactly the endpoints/shapes it must serve.
 
@@ -282,9 +286,10 @@ export interface WsConnection {
 // only the two allowlisted, non-secret keys below may ever be read or written. Any other key
 // (including via a loosely-typed caller) throws rather than silently writing an unreviewed key.
 
-/** The keys the prefs seam will store — all non-secret UI state. `crate` (CGUI-12) is the
- *  operator's last-selected Overview crate tab, persisted so the shell reopens on the same crate. */
-export type PrefsKey = 'layout' | 'density' | 'crate';
+/** The keys the prefs seam will store — all non-secret UI state. `core` (S127) is the operator's
+ *  last-selected Overview core tab (Lumina/Chord/Terminus/Harmony/Muse), persisted so the shell
+ *  reopens on the same core. */
+export type PrefsKey = 'layout' | 'density' | 'core';
 
 export interface PrefsClient {
   /** Returns the stored value for an allowlisted key, or `null` if unset/unparsable. */
@@ -298,7 +303,7 @@ export interface PrefsClient {
 // Defined here (ahead of both adapters) since each adapter's object literal references
 // `prefsClient` directly.
 
-const PREFS_ALLOWLIST: readonly PrefsKey[] = ['layout', 'density', 'crate'];
+const PREFS_ALLOWLIST: readonly PrefsKey[] = ['layout', 'density', 'core'];
 const PREFS_STORAGE_PREFIX = 'constellation.prefs.';
 
 function assertAllowedPrefsKey(key: string): asserts key is PrefsKey {
@@ -1112,7 +1117,14 @@ const mockAdapter: AggregationClient = {
       if (query?.category) models = models.filter(m => m.category === query.category);
       if (query?.status) models = models.filter(m => m.brochure_status === query.status);
       if (query?.serving != null) models = models.filter(m => m.serving_now === query.serving);
-      return delay({ total: models.length, refreshed_at: MOCK_MODELS_LIST.refreshed_at, models });
+      // S127 (DATA-04): mirror the backend's paginate() — `total` is the FULL filtered count
+      // (the true roster scale), `models` is only the requested page. offset/limit default to
+      // 0 / 50 and the server clamps limit to [1, 500].
+      const total = models.length;
+      const offset = Math.max(0, query?.offset ?? 0);
+      const limit = Math.min(500, Math.max(1, query?.limit ?? 50));
+      const page = models.slice(offset, offset + limit);
+      return delay({ total, refreshed_at: MOCK_MODELS_LIST.refreshed_at, models: page });
     },
     async model(name: string) {
       return delay(mockModelDetail(name));
@@ -1454,11 +1466,41 @@ const httpAdapter: AggregationClient = {
 };
 
 // ── Selection ─────────────────────────────────────────────────────────────
-
-function resolveMode(): 'mock' | 'http' {
-  const raw = (import.meta as unknown as { env?: Record<string, string | undefined> }).env
+//
+// S127 TGUI2 (Part B / DATA-01+02): http-DEFAULT + runtime-selectable. Precedence, highest first:
+//   1. Build-time `import.meta.env.VITE_AGG_MODE` === 'http' | 'mock' — an explicit build wins.
+//   2. Runtime `window.__AGG_MODE__` === 'http' | 'mock' — the server MAY inject this into
+//      index.html to force a mode on a single embedded bundle without a rebuild.
+//   3. Runtime opt-IN to mock only: `?mock` in the URL, or `localStorage['constellation.aggMode']
+//      === 'mock'` — for offline/dev against a bundle that would otherwise go to the real backend.
+//   4. Any other browser context → 'http' (the SPA is served same-origin by the real terminus
+//      binary in production, so the real backend is right there — INVERTED from the old default).
+//   5. No `window` at all (unit tests / SSR) → 'mock', so tests stay offline + deterministic.
+// A mock bundle can therefore never ship silently: mock is only ever reached by an explicit
+// build flag, an explicit server injection, or an explicit per-session opt-in.
+export function resolveMode(): 'mock' | 'http' {
+  const buildMode = (import.meta as unknown as { env?: Record<string, string | undefined> }).env
     ?.VITE_AGG_MODE;
-  return raw === 'http' ? 'http' : 'mock';
+  if (buildMode === 'http') return 'http';
+  if (buildMode === 'mock') return 'mock';
+
+  // Non-browser (vitest node env, SSR): offline mock, deterministic.
+  if (typeof window === 'undefined') return 'mock';
+
+  const injected = (window as unknown as { __AGG_MODE__?: string }).__AGG_MODE__;
+  if (injected === 'http') return 'http';
+  if (injected === 'mock') return 'mock';
+
+  try {
+    if (new URLSearchParams(window.location.search).has('mock')) return 'mock';
+    if (window.localStorage.getItem('constellation.aggMode') === 'mock') return 'mock';
+  } catch {
+    // URL/storage unavailable (private mode etc.) — fall through to the real-backend default.
+  }
+
+  // Served same-origin by the real backend → talk to it. Unreachable panels fail-open to a
+  // clean empty/loading state (each adapter method degrades), never to fake data.
+  return 'http';
 }
 
 let cached: AggregationClient | null = null;
@@ -1467,6 +1509,12 @@ let cached: AggregationClient | null = null;
 export function getAggregationClient(): AggregationClient {
   if (!cached) {
     cached = resolveMode() === 'http' ? httpAdapter : mockAdapter;
+    if (typeof console !== 'undefined' && resolveMode() === 'mock' && typeof window !== 'undefined') {
+      // Visible-in-devtools signal that this session is on fixtures, so a mock bundle is never
+      // mistaken for real data (the S127 "smoke-and-mirrors" trap). Harmless in production
+      // (production defaults to http, so this never fires there).
+      console.warn('[constellation] aggregation adapter = MOCK (fixtures) — not live backend data.');
+    }
   }
   return cached;
 }

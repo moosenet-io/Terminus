@@ -9,7 +9,7 @@ import type { ModuleDescriptor, ModuleId } from '../../lib/moduleRegistry';
 import type { HealthStatus } from '../../lib/aggregationClient';
 import { getAggregationClient } from '../../lib/aggregationClient';
 import type { Density } from '../../components/GlobalBar';
-import type { CrateDescriptor } from '../../lib/crates';
+import type { CoreDescriptor } from '../../lib/cores';
 import { Button } from '../../components/Button';
 import { ModuleCard } from './ModuleCard';
 import type { CardState } from './ModuleCard';
@@ -39,10 +39,10 @@ export function reconcileOrder(persistedOrder: string[], availableIds: string[])
 }
 
 interface OverviewPanelProps {
-  /** CGUI-12 (§3.1): the active crate — names the breadcrumb + canvas title, and (upstream) has
-   *  already scoped `modules` to its members. Optional so any test/story that predates the crate
-   *  model keeps compiling; falls back to an "overview" heading with no crate name. */
-  crate?: CrateDescriptor;
+  /** S127 (§3.1): the active core — names the breadcrumb + canvas title, and (upstream) has
+   *  already scoped `modules` to its members. Optional so any test/story that predates the core
+   *  model keeps compiling; falls back to an "overview" heading with no core name. */
+  core?: CoreDescriptor;
   modules: ModuleDescriptor[];
   health: HealthStatus[];
   degradedSystems: Set<string>;
@@ -53,7 +53,7 @@ interface OverviewPanelProps {
   feedItems?: FeedItem[];
 }
 
-export function OverviewPanel({ crate, modules, health, degradedSystems, density, feedItems }: OverviewPanelProps) {
+export function OverviewPanel({ core, modules, health, degradedSystems, density, feedItems }: OverviewPanelProps) {
   const client = useMemo(() => getAggregationClient(), []);
   const [layout, setLayout] = useState<LayoutPrefs>(
     () => client.prefs.get<LayoutPrefs>('layout') ?? DEFAULT_LAYOUT,
@@ -115,11 +115,11 @@ export function OverviewPanel({ crate, modules, health, degradedSystems, density
     );
   }
 
-  const crateName = crate?.title ?? 'overview';
+  const coreName = core?.title ?? 'overview';
 
   return (
     <div style={{ padding: 'var(--space-5)', overflow: 'auto', flex: 1 }}>
-      {/* Canvas header (§3.1): breadcrumb `{crate} / overview` + title + Edit layout (ghost) +
+      {/* Canvas header (§3.1): breadcrumb `{core} / overview` + title + Edit layout (ghost) +
           "+ Add widget" (primary). */}
       <div
         style={{
@@ -141,7 +141,7 @@ export function OverviewPanel({ crate, modules, health, degradedSystems, density
               marginBottom: 'var(--space-1)',
             }}
           >
-            {crateName} <span style={{ color: 'var(--text-500)' }}>/</span> overview
+            {coreName} <span style={{ color: 'var(--text-500)' }}>/</span> overview
           </div>
           <h1
             style={{
@@ -153,7 +153,7 @@ export function OverviewPanel({ crate, modules, health, degradedSystems, density
               lineHeight: 'var(--lh-heading)',
             }}
           >
-            {crateName}
+            {coreName}
           </h1>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flexShrink: 0 }}>
