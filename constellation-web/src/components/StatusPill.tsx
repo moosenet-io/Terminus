@@ -57,6 +57,8 @@ export function StatusPill({ state, label, pulse, style }: StatusPillProps) {
         color: 'var(--text-200)',
         background: 'var(--space-700)',
         border: '1px solid var(--border)',
+        // DS-exact component padding (§8 StatusPill) + 7px dot / -3px ping ring below —
+        // intentional raw px, NOT tokenized (preserves DS pixel-parity). lint warns expected.
         padding: '4px 11px 4px 9px',
         borderRadius: 'var(--radius-pill)',
         ...style,

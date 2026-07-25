@@ -42,6 +42,7 @@
   --flux-green-soft: #34D399;
   --flux-amber: #F59E0B;
   --flux-rose: #F43F5E;
+  --flux-rose-soft: #FB7185;
   --node-source: var(--flux-blue);
   --node-core: var(--violet-500);
   --node-endpoint: var(--flux-green);
@@ -490,7 +491,7 @@ body {
 .h-badge-violet { background: rgba(168, 85, 247, 0.14); border-color: rgba(168, 85, 247, 0.32); color: var(--violet-300); }
 .h-badge-green, .h-badge-blue-green { background: rgba(16, 185, 129, 0.14); border-color: rgba(16, 185, 129, 0.32); color: var(--flux-green-soft); }
 .h-badge-amber { background: rgba(245, 158, 11, 0.14); border-color: rgba(245, 158, 11, 0.34); color: var(--flux-amber); }
-.h-badge-red, .h-badge-rose { background: rgba(244, 63, 94, 0.14); border-color: rgba(244, 63, 94, 0.34); color: #FB7185; }
+.h-badge-red, .h-badge-rose { background: rgba(244, 63, 94, 0.14); border-color: rgba(244, 63, 94, 0.34); color: var(--flux-rose-soft); }
 .h-badge-blue { background: rgba(59, 130, 246, 0.14); border-color: rgba(59, 130, 246, 0.32); color: var(--flux-blue-soft); }
 .h-badge-teal { background: var(--accent-soft); color: var(--accent); }
 .h-badge-dim, .h-badge-neutral { background: rgba(255, 255, 255, 0.05); border-color: var(--border); color: var(--text-300); }

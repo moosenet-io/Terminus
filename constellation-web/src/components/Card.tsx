@@ -47,9 +47,12 @@ function AccentHairline() {
         position: 'absolute',
         inset: 0,
         borderRadius: 'inherit',
+        // DS-exact 1px hairline (§8 Card accent mask) — intentional raw px, NOT tokenized
+        // (this is the border-mask thickness; tokenizing breaks DS pixel-parity). lint warns expected.
         padding: '1px',
         background: 'linear-gradient(180deg, rgba(168, 85, 247, 0.5), rgba(124, 58, 237, 0.04))',
-        WebkitMask: 'linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0)',
+        // mask only depends on alpha; `black` keyword avoids a raw-hex literal (was #000).
+        WebkitMask: 'linear-gradient(black 0 0) content-box, linear-gradient(black 0 0)',
         WebkitMaskComposite: 'xor',
         maskComposite: 'exclude',
         pointerEvents: 'none',
@@ -98,7 +101,7 @@ export function Card({
         <div
           className="h-card-header"
           onClick={() => { setExpanded(e => !e); onClick?.(); }}
-          style={{ transition: `background var(--dur-fast) var(--ease-out)` }}
+          style={{ transition: `background var(--dur-fast) var(--ease-out)`, ...(padding ? { padding } : {}) }}
         >
           <div style={{ flex: 1 }}>{header ?? children}</div>
           {/* Chevron only when there is a distinct header (i.e. a separate body to reveal).
@@ -118,7 +121,7 @@ export function Card({
             collapse/expand transition via data-expanded so children never fail to render. */}
         {header != null && (
           <div className="h-expandable-body" data-expanded={expanded}
-            style={{ borderTop: '1px solid var(--border)', padding: 'var(--space-3) var(--space-4)' }}>
+            style={{ borderTop: '1px solid var(--border)', padding: padding ?? 'var(--space-3) var(--space-4)' }}>
             {children}
           </div>
         )}

@@ -19,7 +19,7 @@ const TONE_DOT: Record<BadgeTone, string> = {
   blue: 'var(--flux-blue-soft)',
   green: 'var(--flux-green-soft)',
   amber: 'var(--flux-amber)',
-  rose: '#FB7185',
+  rose: 'var(--flux-rose-soft)',
   neutral: 'var(--text-300)',
 };
 

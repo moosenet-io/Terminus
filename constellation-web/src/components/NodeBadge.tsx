@@ -37,6 +37,8 @@ export function NodeBadge({ name, role, kind = 'core', mono = true, pulse = fals
         background: `linear-gradient(180deg, ${k.soft}, var(--space-800))`,
         border: `1px solid ${k.bd}`,
         borderRadius: 'var(--radius-md)',
+        // DS-exact component padding (§8 NodeBadge) + 9px dot below — intentional raw px,
+        // NOT tokenized (tokenizing would break DS pixel-parity). adherence-lint warns expected.
         padding: '9px 14px',
         boxShadow: 'var(--shadow-sm), var(--inset-hi)',
         ...style,
