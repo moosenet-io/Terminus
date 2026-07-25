@@ -43,6 +43,7 @@ import { ProjectsPanel } from './harmony/ProjectsPanel';
 import { HarmonyForestPanel } from './harmony/HarmonyForestPanel';
 import { BackendsPanel } from './chord/BackendsPanel';
 import { OverviewPanel as LuminaOverviewPanel } from './lumina/OverviewPanel';
+import { RosterPanel as ModelsRosterPanel } from './models/RosterPanel';
 import { DashboardPanel as MuseDashboardPanel } from './muse/DashboardPanel';
 import { TastePanel as MuseTastePanel } from './muse/TastePanel';
 import { ChannelsPanel as MuseChannelsPanel } from './muse/ChannelsPanel';
@@ -70,6 +71,11 @@ registerModule({ id: 'muse', title: 'Muse', icon: '🎬', healthSystem: 'muse', 
 // LGUI-05: lumina module registration only -- no panels yet (LGUI-06 adds lumina.overview
 // first). Ordered AFTER Muse per LUMINA-GUI-SPEC §2.
 registerModule({ id: 'lumina', title: 'Lumina', icon: '✦', healthSystem: 'lumina', order: 4 });
+// CGUI-09 (TERM #532): the Models module. Per LUMINA-GUI-SPEC §2 order (…Muse · Lumina ·
+// Models · MINT · Terminus), Models takes order 5. It is a terminus-backed module — its data
+// source is the terminus models API (CONST-21), so it binds to the always-available terminus
+// health entry (moduleRegistry: models/mint/terminus bind healthSystem 'terminus').
+registerModule({ id: 'models', title: 'Models', icon: '◆', healthSystem: 'terminus', order: 5 });
 registerModule({ id: 'terminus', title: 'Terminus', icon: '⚙', healthSystem: 'terminus', order: 7 });
 
 // ── Harmony ──────────────────────────────────────────────────────────────────
@@ -262,6 +268,21 @@ registerPanel({
   icon: '📺',
   available: true,
   component: MuseChannelsPanel,
+});
+
+// ── Models (CGUI-09) ─────────────────────────────────────────────────────────
+// The Models module's primary panel — a master-detail roster (rich model cards + per-model
+// dimension radar). Driven entirely by the CGUI-08 data client (client.models.*); the
+// reserved `models` ModuleId now surfaces as a real global-bar tab with a panel.
+
+registerPanel({
+  id: 'models.roster',
+  system: 'models',
+  title: 'Roster',
+  path: '/models/roster',
+  icon: '◆',
+  available: true,
+  component: ModelsRosterPanel,
 });
 
 // ── Terminus ─────────────────────────────────────────────────────────────────
