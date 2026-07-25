@@ -1,0 +1,97 @@
+// CGUI-05 (TERM #528): unit coverage for the pure per-tool depth derivation. Component/DOM
+// rendering isn't covered (no jsdom in this project — same convention as the other logic-only
+// suites); these lock the shapes the Tools catalog renders from.
+import { describe, it, expect } from 'vitest';
+import {
+  deriveToolDetail, paramsFor, lastInvocationFor, CATEGORY_BADGE,
+} from './toolCatalog';
+
+describe('deriveToolDetail — real vs derived facts', () => {
+  it('keeps name/module/enabled as the real facts', () => {
+    const d = deriveToolDetail('plane', 'plane_create_work_item', true);
+    expect(d.name).toBe('plane_create_work_item');
+    expect(d.module).toBe('plane');
+    expect(d.enabled).toBe(true);
+  });
+
+  it('buckets the verb into a category', () => {
+    expect(deriveToolDetail('plane', 'plane_list_work_items', true).category).toBe('read');
+    expect(deriveToolDetail('plane', 'plane_create_work_item', true).category).toBe('write');
+    expect(deriveToolDetail('plane', 'plane_delete_work_item', true).category).toBe('admin');
+    expect(deriveToolDetail('plane', 'plane_search_work_items', true).category).toBe('search');
+  });
+
+  it('humanises the description from the action tokens', () => {
+    expect(deriveToolDetail('gitea', 'gitea_merge_pr', true).description).toBe('Merge pr');
+    expect(deriveToolDetail('plane', 'plane_create_work_item', true).description).toBe('Create work item');
+  });
+
+  it('sources rate-limit + auth identity from the owning module policy', () => {
+    expect(deriveToolDetail('plane', 'plane_get_project', true).auth).toBe('PLANE_API_KEY');
+    expect(deriveToolDetail('gitea', 'gitea_list_repos', true).rateLimit).toBe('60 / min');
+    // unknown module falls back to the vault-managed default rather than throwing
+    expect(deriveToolDetail('mystery', 'mystery_do_thing', true).auth).toBe('vault-managed');
+  });
+
+  it('suppresses telemetry for a disabled tool', () => {
+    expect(deriveToolDetail('nexus', 'nexus_list_items', false).lastInvocation).toBeNull();
+  });
+});
+
+describe('paramsFor — derived schema is never empty', () => {
+  it('gives list a paginated read schema', () => {
+    const p = paramsFor('list', ['work', 'items']);
+    expect(p.map(x => x.name)).toEqual(['limit', 'cursor']);
+    expect(p.every(x => !x.required)).toBe(true);
+  });
+
+  it('requires a query for search and an id for get', () => {
+    expect(paramsFor('search', ['work', 'items'])[0]).toMatchObject({ name: 'query', required: true });
+    expect(paramsFor('get', ['project'])[0]).toMatchObject({ name: 'project_id', required: true });
+  });
+
+  it('update carries both an id and a fields patch', () => {
+    const p = paramsFor('update', ['work', 'item']);
+    expect(p.map(x => x.name)).toContain('fields');
+    expect(p.some(x => x.name.endsWith('_id') && x.required)).toBe(true);
+  });
+
+  it('always returns at least one representative row for an unknown verb', () => {
+    expect(paramsFor('frobnicate', ['thing']).length).toBeGreaterThan(0);
+  });
+});
+
+describe('lastInvocationFor — deterministic synthetic telemetry', () => {
+  it('is stable for the same name (no render flicker)', () => {
+    const now = Date.parse('2026-07-25T04:00:00Z');
+    expect(lastInvocationFor('plane_list_projects', now)).toEqual(lastInvocationFor('plane_list_projects', now));
+  });
+
+  it('produces ok/error results and a relative ago label when present', () => {
+    const now = Date.parse('2026-07-25T04:00:00Z');
+    const inv = lastInvocationFor('gitea_list_repos', now);
+    if (inv) {
+      expect(['ok', 'error']).toContain(inv.result);
+      expect(inv.ago).toMatch(/(s|m|h|d) ago$/);
+    }
+  });
+
+  it('marks a realistic share of tools as never-invoked (null)', () => {
+    const now = Date.parse('2026-07-25T04:00:00Z');
+    // Scan a broad synthetic namespace — the ~1-in-6 null branch must fire for some, and NOT
+    // for all (so the panel still shows live telemetry on most rows).
+    const names = Array.from({ length: 60 }, (_, i) => `mod_action_${i}`);
+    const results = names.map(n => lastInvocationFor(n, now));
+    expect(results.some(r => r === null)).toBe(true);
+    expect(results.some(r => r !== null)).toBe(true);
+  });
+});
+
+describe('CATEGORY_BADGE', () => {
+  it('maps every category to a Badge tone', () => {
+    expect(CATEGORY_BADGE.read).toBe('blue');
+    expect(CATEGORY_BADGE.write).toBe('green');
+    expect(CATEGORY_BADGE.search).toBe('amber');
+    expect(CATEGORY_BADGE.admin).toBe('rose');
+  });
+});
