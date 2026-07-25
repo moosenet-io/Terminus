@@ -3,7 +3,7 @@
 // suites); these lock the shapes the Tools catalog renders from.
 import { describe, it, expect } from 'vitest';
 import {
-  deriveToolDetail, paramsFor, lastInvocationFor, CATEGORY_BADGE,
+  deriveToolDetail, paramsFor, lastInvocationFor, CATEGORY_BADGE, FIXTURE_NOW,
 } from './toolCatalog';
 
 describe('deriveToolDetail — real vs derived facts', () => {
@@ -35,6 +35,18 @@ describe('deriveToolDetail — real vs derived facts', () => {
 
   it('suppresses telemetry for a disabled tool', () => {
     expect(deriveToolDetail('nexus', 'nexus_list_items', false).lastInvocation).toBeNull();
+  });
+
+  it('is fully deterministic with default args (no wall-clock) — same input, same output', () => {
+    // The codex-flagged bug: a Date.now() default made identical fixture inputs produce
+    // different lastInvocation.ts across calls. It must now be stable across calls.
+    const a = deriveToolDetail('plane', 'plane_get_project', true);
+    const b = deriveToolDetail('plane', 'plane_get_project', true);
+    expect(a).toEqual(b);
+    expect(a.lastInvocation).toEqual(b.lastInvocation);
+    // and the default epoch is the fixed FIXTURE_NOW constant, not the wall clock
+    expect(deriveToolDetail('plane', 'plane_get_project', true))
+      .toEqual(deriveToolDetail('plane', 'plane_get_project', true, FIXTURE_NOW));
   });
 });
 

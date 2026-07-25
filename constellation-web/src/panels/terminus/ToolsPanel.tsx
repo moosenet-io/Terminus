@@ -68,10 +68,13 @@ export function ToolsPanel() {
   const allTools: ToolDetail[] = useMemo(() => {
     if (!config) return [];
     const out: ToolDetail[] = [];
-    const now = Date.now();
+    // Determinism: the catalog must render identically offline (same fixture → same telemetry),
+    // so we DON'T pass a wall-clock `now` — deriveToolDetail defaults to the fixed FIXTURE_NOW
+    // epoch. The synthetic last-invocation stamps are a placeholder anyway (real per-tool
+    // invocation stream lands with the CGUI-08 data client).
     for (const m of config.modules) {
       for (const tool of m.tools ?? []) {
-        out.push(deriveToolDetail(m.name, tool, m.enabled, now));
+        out.push(deriveToolDetail(m.name, tool, m.enabled));
       }
     }
     return out;

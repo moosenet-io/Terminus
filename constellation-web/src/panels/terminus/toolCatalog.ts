@@ -164,6 +164,12 @@ const MODULE_POLICY: Record<string, ModulePolicy> = {
 const DEFAULT_POLICY: ModulePolicy = { auth: 'vault-managed', rate: '60 / min' };
 
 // ── deterministic synthetic telemetry (stand-in, CGUI-08) ──────────────────────────────────────
+// Fixed base epoch for all synthetic "last invocation" stamps. The whole GUI must render
+// deterministically offline (same fixture input → identical output across calls, so snapshot
+// tests and offline renders are stable) — so the telemetry NEVER reads the wall clock. This is
+// a placeholder anchor; when the CGUI-08 real invocation stream lands it supplies real stamps.
+export const FIXTURE_NOW = Date.parse('2026-07-25T04:00:00Z');
+
 /** FNV-1a-ish hash so per-tool telemetry is stable across renders (no flicker) yet varied. */
 function hashName(name: string): number {
   let h = 2166136261;
@@ -189,7 +195,7 @@ function relativeAgo(ms: number): string {
  * ~1 in 6 tools read as never-invoked (null); ~1 in 8 of the rest as an error. `now` injectable
  * for testing. NOT live data — placeholder until the CGUI-08 invocation stream exists.
  */
-export function lastInvocationFor(name: string, now: number = Date.now()): ToolLastInvocation | null {
+export function lastInvocationFor(name: string, now: number = FIXTURE_NOW): ToolLastInvocation | null {
   const h = hashName(name);
   if (h % 6 === 0) return null; // never invoked
   const ageMs = (h % 5400) * 1000; // 0..90 min back, deterministic
@@ -205,7 +211,7 @@ export function deriveToolDetail(
   module: string,
   name: string,
   enabled: boolean,
-  now: number = Date.now(),
+  now: number = FIXTURE_NOW,
 ): ToolDetail {
   const { verb, nounWords } = splitAction(name, module);
   const policy = MODULE_POLICY[module] ?? DEFAULT_POLICY;
