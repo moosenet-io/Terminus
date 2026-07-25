@@ -31,7 +31,8 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
 } from '../../viz/recharts';
 import { rechartsGridProps, rechartsTickStyle } from '../../viz/theme';
-import { CATEGORICAL_HEX, CHART_CHROME, SlotAssigner } from '../../viz/palette';
+import { CATEGORICAL_HEX, CHART_CHROME, SlotAssigner, sequentialColor } from '../../viz/palette';
+import { FilterSelect } from '../../components/Toolbar';
 import { useMintSection } from '../../hooks/useMint';
 import {
   MINT_CATEGORY_META, categoryById, DEFAULT_CATEGORY_ID, metricLabel, formatMetricValue,
@@ -99,19 +100,19 @@ function CategoryPicker({ selected, onSelect }: { selected: string; onSelect: (i
 
 // ── Section 1: capability radar ──────────────────────────────────────────────────
 
-function RadarSection({ cat }: { cat: CategoryMeta }) {
+function RadarSection({ cat, epoch }: { cat: CategoryMeta; epoch?: string }) {
   const testType = legacyTestType(cat);
   const summary = useMintSection(
-    cat.kind === 'newcat' ? c => c.mint.categorySummary(cat.clientKey!) : null,
-    `radar-sum:${cat.id}`,
+    cat.kind === 'newcat' ? c => c.mint.categorySummary(cat.clientKey!, epoch) : null,
+    `radar-sum:${cat.id}:${epoch ?? ''}`,
   );
   const dims = useMintSection(
-    cat.kind === 'persona' ? c => c.mint.dimensions() : null,
-    `radar-dim:${cat.id}`,
+    cat.kind === 'persona' ? c => c.mint.dimensions(epoch ? { epoch } : undefined) : null,
+    `radar-dim:${cat.id}:${epoch ?? ''}`,
   );
   const matrix = useMintSection(
-    cat.kind === 'legacy' ? c => c.mint.matrix() : null,
-    `radar-mat:${cat.id}`,
+    cat.kind === 'legacy' ? c => c.mint.matrix(epoch) : null,
+    `radar-mat:${cat.id}:${epoch ?? ''}`,
   );
   const { view, setView } = useTableView();
 
@@ -123,13 +124,17 @@ function RadarSection({ cat }: { cat: CategoryMeta }) {
   const loading = summary.loading || dims.loading || matrix.loading;
   const degraded = summary.degraded || dims.degraded || matrix.degraded;
   const empty = !loading && !degraded && (vm.axes.length === 0 || vm.series.length === 0);
+  // POL-08: a polygon radar needs >=3 spokes. With 1-2 dimensions nivo draws a degenerate
+  // line/sliver that reads as "broken" — so we render the numbers as a clean table instead and
+  // say why, rather than plotting a misleading shape. (3+ axes plot as an intentional radar.)
+  const degenerate = !empty && !loading && !degraded && vm.axes.length > 0 && vm.axes.length < 3;
 
   const shownModels = vm.series.slice(0, 4);
   const legend = shownModels.map((s, i) => ({ id: s.model, label: s.model, color: CATEGORICAL_HEX[i] }));
 
   const columns: DataTableColumn<{ axis: string; i: number }>[] = [
     { key: 'axis', header: 'Dimension', render: r => metricLabel(vm.axes[r.i]) },
-    ...shownModels.map((s, si) => ({
+    ...shownModels.map(s => ({
       key: s.model, header: s.model, align: 'right' as const,
       render: (r: { i: number }) => (s.values[r.i] ?? 0).toFixed(2),
     })),
@@ -145,36 +150,53 @@ function RadarSection({ cat }: { cat: CategoryMeta }) {
   return (
     <ChartCard
       title="Capability Radar"
-      subtitle={subtitle}
-      controls={<TableViewControls view={view} onChange={setView} />}
+      subtitle={degenerate ? `Only ${vm.axes.length} dimension${vm.axes.length === 1 ? '' : 's'} available — a radar needs ≥3, shown as a table` : subtitle}
+      controls={degenerate ? undefined : <TableViewControls view={view} onChange={setView} />}
       height={320}
       loading={loading}
       degraded={degraded}
       empty={empty}
       emptyMessage="No profiling data for this category yet"
       emptyHint={cat.kind === 'legacy' ? `The ${cat.legacySuite} suite has no catalog-matrix columns — see Recent Runs below for its suite-scoped data` : 'Radar builds up once MINT profiles models in this category'}
-      footer={<ChartLegend entries={legend} />}
+      footer={degenerate ? undefined : <ChartLegend entries={legend} />}
     >
-      <TableView view={view} columns={columns} rows={tableRows} rowKey={r => r.axis}>
-        <Suspense fallback={<ChartSkeleton height={320} />}>
-          <MintRadarChart vm={vm} />
-        </Suspense>
-      </TableView>
+      {degenerate ? (
+        <DataTable columns={columns} rows={tableRows} rowKey={r => r.axis} />
+      ) : (
+        <TableView view={view} columns={columns} rows={tableRows} rowKey={r => r.axis}>
+          <Suspense fallback={<ChartSkeleton height={320} />}>
+            <MintRadarChart vm={vm} />
+          </Suspense>
+        </TableView>
+      )}
     </ChartCard>
   );
 }
 
 // ── Section 2: coverage heatmap ──────────────────────────────────────────────────
 
-function HeatmapSection({ cat }: { cat: CategoryMeta }) {
+function HeatmapRampLegend() {
+  // The sequential capability ramp the heatmap cells use (0 → 1), shown so a sparse 2-row matrix
+  // still reads with a legend/scale rather than looking like a broken chart.
+  const ramp = `linear-gradient(90deg, ${sequentialColor(0)}, ${sequentialColor(0.5)}, ${sequentialColor(1)})`;
+  return (
+    <div className="h-ramp-legend">
+      <span>lower</span>
+      <span className="h-ramp-bar" aria-hidden style={{ background: ramp }} />
+      <span>higher capability</span>
+    </div>
+  );
+}
+
+function HeatmapSection({ cat, epoch }: { cat: CategoryMeta; epoch?: string }) {
   const testType = legacyTestType(cat);
   const catMatrix = useMintSection(
-    cat.kind === 'newcat' ? c => c.mint.categoryMatrix(cat.clientKey!) : null,
-    `heat-cat:${cat.id}`,
+    cat.kind === 'newcat' ? c => c.mint.categoryMatrix(cat.clientKey!, epoch) : null,
+    `heat-cat:${cat.id}:${epoch ?? ''}`,
   );
   const fleetMatrix = useMintSection(
-    cat.kind === 'legacy' || cat.kind === 'persona' ? c => c.mint.matrix() : null,
-    `heat-mat:${cat.id}`,
+    cat.kind === 'legacy' || cat.kind === 'persona' ? c => c.mint.matrix(epoch) : null,
+    `heat-mat:${cat.id}:${epoch ?? ''}`,
   );
   const { view, setView } = useTableView();
 
@@ -213,12 +235,13 @@ function HeatmapSection({ cat }: { cat: CategoryMeta }) {
       title="Coverage Heatmap"
       subtitle={subtitle}
       controls={<TableViewControls view={view} onChange={setView} />}
-      height={Math.max(200, vm.models.length * 42 + 96)}
+      height={Math.max(220, vm.models.length * 48 + 120)}
       loading={loading}
       degraded={degraded}
       empty={empty}
       emptyMessage="No coverage matrix for this category yet"
       emptyHint={cat.kind === 'legacy' ? `The ${cat.legacySuite} suite has no catalog-matrix cells — its data is in Recent Runs below` : 'Each cell fills in as a model is profiled on that metric'}
+      footer={!empty && view === 'chart' ? <HeatmapRampLegend /> : undefined}
     >
       <TableView view={view} columns={columns} rows={vm.models.map(model => ({ model }))} rowKey={r => r.model}>
         <Suspense fallback={<ChartSkeleton height={200} />}>
@@ -233,10 +256,10 @@ function HeatmapSection({ cat }: { cat: CategoryMeta }) {
 
 const LEGACY_BOX_METRICS = ['total_time_ms', 'code_quality_score'];
 
-function DistributionSection({ cat }: { cat: CategoryMeta }) {
+function DistributionSection({ cat, epoch }: { cat: CategoryMeta; epoch?: string }) {
   const summary = useMintSection(
-    cat.kind === 'newcat' ? c => c.mint.categorySummary(cat.clientKey!) : null,
-    `dist-sum:${cat.id}`,
+    cat.kind === 'newcat' ? c => c.mint.categorySummary(cat.clientKey!, epoch) : null,
+    `dist-sum:${cat.id}:${epoch ?? ''}`,
   );
   // The `mint.box` endpoint reads CODE runs only (server-side), so a legacy distribution is
   // meaningful ONLY for the code suite — never borrow code timings under context/agent.
@@ -247,14 +270,14 @@ function DistributionSection({ cat }: { cat: CategoryMeta }) {
   const activeMetric = metric ?? metricOptions[0] ?? null;
 
   const catBox = useMintSection(
-    cat.kind === 'newcat' && activeMetric ? c => c.mint.categoryBox(cat.clientKey!, activeMetric) : null,
-    `dist-catbox:${cat.id}:${activeMetric ?? ''}`,
+    cat.kind === 'newcat' && activeMetric ? c => c.mint.categoryBox(cat.clientKey!, activeMetric, epoch) : null,
+    `dist-catbox:${cat.id}:${activeMetric ?? ''}:${epoch ?? ''}`,
   );
   const legacyBox = useMintSection(
     cat.kind === 'legacy' && cat.legacySuite === 'code'
-      ? c => c.mint.box(activeMetric ? { metric: activeMetric as 'total_time_ms' | 'code_quality_score' } : undefined)
+      ? c => c.mint.box({ ...(activeMetric ? { metric: activeMetric as 'total_time_ms' | 'code_quality_score' } : {}), ...(epoch ? { epoch } : {}) })
       : null,
-    `dist-legbox:${cat.id}:${activeMetric ?? ''}`,
+    `dist-legbox:${cat.id}:${activeMetric ?? ''}:${epoch ?? ''}`,
   );
   const { view, setView } = useTableView();
 
@@ -327,19 +350,19 @@ function DistributionSection({ cat }: { cat: CategoryMeta }) {
 
 // ── Section 4: ranking (Pareto) ──────────────────────────────────────────────────
 
-function RankingSection({ cat }: { cat: CategoryMeta }) {
+function RankingSection({ cat, epoch }: { cat: CategoryMeta; epoch?: string }) {
   const testType = legacyTestType(cat);
   const summary = useMintSection(
-    cat.kind === 'newcat' ? c => c.mint.categorySummary(cat.clientKey!) : null,
-    `rank-sum:${cat.id}`,
+    cat.kind === 'newcat' ? c => c.mint.categorySummary(cat.clientKey!, epoch) : null,
+    `rank-sum:${cat.id}:${epoch ?? ''}`,
   );
   const dims = useMintSection(
-    cat.kind === 'persona' ? c => c.mint.dimensions() : null,
-    `rank-dim:${cat.id}`,
+    cat.kind === 'persona' ? c => c.mint.dimensions(epoch ? { epoch } : undefined) : null,
+    `rank-dim:${cat.id}:${epoch ?? ''}`,
   );
   const matrix = useMintSection(
-    cat.kind === 'legacy' ? c => c.mint.matrix() : null,
-    `rank-mat:${cat.id}`,
+    cat.kind === 'legacy' ? c => c.mint.matrix(epoch) : null,
+    `rank-mat:${cat.id}:${epoch ?? ''}`,
   );
   const { view, setView } = useTableView();
 
@@ -416,18 +439,18 @@ function RankingSection({ cat }: { cat: CategoryMeta }) {
 
 // ── Section 5: failures + run history ────────────────────────────────────────────
 
-function FailuresSection({ cat }: { cat: CategoryMeta }) {
+function FailuresSection({ cat, epoch }: { cat: CategoryMeta; epoch?: string }) {
   const catFailures = useMintSection(
-    cat.kind === 'newcat' ? c => c.mint.categoryFailures(cat.clientKey!) : null,
-    `fail-cat:${cat.id}`,
+    cat.kind === 'newcat' ? c => c.mint.categoryFailures(cat.clientKey!, epoch) : null,
+    `fail-cat:${cat.id}:${epoch ?? ''}`,
   );
   // `mint.failures()` counts CODE-run failure classes fleet-wide — it is not scoped per legacy
   // suite, so it is honest only for the code suite and the (explicitly aggregate) persona view.
   // Context/agent get a clear not-applicable state rather than borrowed code-failure counts.
   const failuresApplies = cat.kind === 'newcat' || cat.kind === 'persona' || (cat.kind === 'legacy' && cat.legacySuite === 'code');
   const legacyFailures = useMintSection(
-    (cat.kind === 'persona' || (cat.kind === 'legacy' && cat.legacySuite === 'code')) ? c => c.mint.failures() : null,
-    `fail-leg:${cat.id}`,
+    (cat.kind === 'persona' || (cat.kind === 'legacy' && cat.legacySuite === 'code')) ? c => c.mint.failures(epoch ? { epoch } : undefined) : null,
+    `fail-leg:${cat.id}:${epoch ?? ''}`,
   );
   const { view, setView } = useTableView();
 
@@ -510,11 +533,11 @@ function FailuresSection({ cat }: { cat: CategoryMeta }) {
   );
 }
 
-function RunsSection({ cat }: { cat: CategoryMeta }) {
+function RunsSection({ cat, epoch }: { cat: CategoryMeta; epoch?: string }) {
   const suite = cat.kind === 'newcat' ? cat.clientKey! : cat.legacySuite;
   const runs = useMintSection(
-    suite ? c => c.mint.runs({ suite }) : null,
-    `runs:${cat.id}`,
+    suite ? c => c.mint.runs({ suite, ...(epoch ? { epoch } : {}) }) : null,
+    `runs:${cat.id}:${epoch ?? ''}`,
   );
   const rows: MintRunRow[] = runs.data?.runs ?? [];
   const empty = !runs.loading && !runs.degraded && rows.length === 0;
@@ -524,7 +547,9 @@ function RunsSection({ cat }: { cat: CategoryMeta }) {
     { key: 'metric', header: 'Metric', render: r => (r.metric ? metricLabel(String(r.metric)) : '—') },
     { key: 'value', header: 'Value', align: 'right', render: r => (typeof r.value === 'number' ? formatMetricValue(String(r.metric ?? ''), r.value) : '—') },
     { key: 'backend', header: 'Backend', render: r => String(r.backend_tag ?? '—') },
-    { key: 'conf', header: 'Conf.', render: r => (r.low_confidence ? <Badge tone="amber">low</Badge> : <Badge tone="green">ok</Badge>) },
+    // M6: only the genuine warning (low confidence) carries color; "ok" is a neutral chip so a
+    // run table isn't a green/amber rainbow down the column.
+    { key: 'conf', header: 'Conf.', render: r => (r.low_confidence ? <Badge tone="amber" dot dotColor="var(--flux-amber)">low</Badge> : <Badge tone="neutral">ok</Badge>) },
     { key: 'when', header: 'When', render: r => (r.created_at ? new Date(String(r.created_at)).toLocaleString() : '—') },
   ];
 
@@ -546,9 +571,28 @@ function RunsSection({ cat }: { cat: CategoryMeta }) {
 
 // ── Panel ─────────────────────────────────────────────────────────────────────
 
+// M6: the kind tag is a neutral outline chip with a tiny semantic leading dot, not a saturated
+// violet/blue/green pill — the category header stays monochrome like the rest of the chrome.
+const KIND_DOT: Record<CategoryMeta['kind'], string> = {
+  newcat: 'var(--violet-300)',
+  legacy: 'var(--flux-blue-soft)',
+  persona: 'var(--flux-green-soft)',
+};
+
 export function CategoryReportPanel() {
   const [selected, setSelected] = useState<string>(DEFAULT_CATEGORY_ID);
+  const [epoch, setEpoch] = useState('');
   const cat = categoryById(selected) ?? MINT_CATEGORY_META[0];
+
+  // Epoch/time-range selector — the harness-cutover epochs come from the activity endpoint's
+  // markers; '' = the current epoch (server default). Threaded into every section so a switch
+  // re-reads the whole report at that epoch.
+  const activity = useMintSection(c => c.mint.activity('all'), 'mint-epochs');
+  const epochOptions = useMemo(
+    () => (activity.data?.epochs ?? []).map(e => ({ value: e.epoch, label: e.note ? `${e.epoch} — ${e.note}` : e.epoch })),
+    [activity.data],
+  );
+  const selectedEpoch = epoch || undefined;
 
   return (
     <PanelRoot style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
@@ -558,22 +602,27 @@ export function CategoryReportPanel() {
 
       <CategoryPicker selected={selected} onSelect={setSelected} />
 
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
-        <span style={{ fontSize: 'var(--fs-h3)', fontWeight: 'var(--fw-semibold)', color: 'var(--text-100)' }}>{cat.label}</span>
-        <Badge tone={cat.kind === 'newcat' ? 'violet' : cat.kind === 'legacy' ? 'blue' : 'green'} mono>{cat.kind}</Badge>
-        <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--text-muted)' }}>{cat.blurb}</span>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 'var(--space-3)', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 'var(--fs-h3)', fontWeight: 'var(--fw-semibold)', color: 'var(--text-100)' }}>{cat.label}</span>
+          <Badge tone="neutral" dot dotColor={KIND_DOT[cat.kind]} mono>{cat.kind}</Badge>
+          <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--text-muted)' }}>{cat.blurb}</span>
+        </div>
+        {epochOptions.length > 0 && (
+          <FilterSelect label="Epoch" value={epoch} onChange={setEpoch} options={epochOptions} allLabel="Current" />
+        )}
       </div>
 
-      {/* key on category id so every section refetches cleanly on a category switch */}
-      <div key={cat.id} style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: 'var(--space-4)' }}>
-          <RadarSection cat={cat} />
-          <HeatmapSection cat={cat} />
+      {/* key on category id + epoch so every section refetches cleanly on a switch */}
+      <div key={`${cat.id}:${epoch}`} style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(22.5rem, 1fr))', gap: 'var(--space-4)' }}>
+          <RadarSection cat={cat} epoch={selectedEpoch} />
+          <HeatmapSection cat={cat} epoch={selectedEpoch} />
         </div>
-        <RankingSection cat={cat} />
-        <DistributionSection cat={cat} />
-        <FailuresSection cat={cat} />
-        <RunsSection cat={cat} />
+        <RankingSection cat={cat} epoch={selectedEpoch} />
+        <DistributionSection cat={cat} epoch={selectedEpoch} />
+        <FailuresSection cat={cat} epoch={selectedEpoch} />
+        <RunsSection cat={cat} epoch={selectedEpoch} />
       </div>
     </PanelRoot>
   );

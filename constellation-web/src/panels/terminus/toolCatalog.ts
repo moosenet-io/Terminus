@@ -36,6 +36,8 @@ export interface ToolLastInvocation {
   result: 'ok' | 'error';
   /** Pre-humanised "3m ago" relative label (computed against `now`). */
   ago: string;
+  /** Synthetic call latency in ms (deterministic in the tool name) — the POL-06 Latency column. */
+  latencyMs: number;
 }
 
 export interface ToolDetail {
@@ -200,7 +202,16 @@ export function lastInvocationFor(name: string, now: number = FIXTURE_NOW): Tool
   if (h % 6 === 0) return null; // never invoked
   const ageMs = (h % 5400) * 1000; // 0..90 min back, deterministic
   const result: 'ok' | 'error' = h % 8 === 3 ? 'error' : 'ok';
-  return { ts: new Date(now - ageMs).toISOString(), result, ago: relativeAgo(ageMs) };
+  // Deterministic latency stand-in: ~20–1020ms, varied by a different slice of the hash so it
+  // doesn't track the age. Errors read slower (a timeout-ish tail) for a truthful feel.
+  const base = 20 + ((h >>> 7) % 1000);
+  const latencyMs = result === 'error' ? base + 800 : base;
+  return { ts: new Date(now - ageMs).toISOString(), result, ago: relativeAgo(ageMs), latencyMs };
+}
+
+/** Humanise a latency in ms for the Latency column (mono). */
+export function fmtLatency(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms}ms`;
 }
 
 /**
@@ -235,4 +246,14 @@ export const CATEGORY_BADGE: Record<ToolCategory, 'blue' | 'green' | 'amber' | '
   write: 'green',
   search: 'amber',
   admin: 'rose',
+};
+
+// S127 TGUI2 M6: the kind chip is now a NEUTRAL outline chip carrying only a tiny leading dot in
+// its semantic color (read/write/search/admin scannability) — the chip body stays neutral so a
+// data-dense row has at most one saturated token (its status pill). These are the dot inks.
+export const CATEGORY_DOT_COLOR: Record<ToolCategory, string> = {
+  read: 'var(--flux-blue-soft)',
+  write: 'var(--flux-green-soft)',
+  search: 'var(--flux-amber)',
+  admin: 'var(--flux-rose-soft)',
 };

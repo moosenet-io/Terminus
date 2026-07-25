@@ -3,7 +3,8 @@
 // suites); these lock the shapes the Tools catalog renders from.
 import { describe, it, expect } from 'vitest';
 import {
-  deriveToolDetail, paramsFor, lastInvocationFor, CATEGORY_BADGE, FIXTURE_NOW,
+  deriveToolDetail, paramsFor, lastInvocationFor, CATEGORY_BADGE, CATEGORY_DOT_COLOR,
+  fmtLatency, FIXTURE_NOW,
 } from './toolCatalog';
 
 describe('deriveToolDetail — real vs derived facts', () => {
@@ -105,5 +106,36 @@ describe('CATEGORY_BADGE', () => {
     expect(CATEGORY_BADGE.write).toBe('green');
     expect(CATEGORY_BADGE.search).toBe('amber');
     expect(CATEGORY_BADGE.admin).toBe('rose');
+  });
+});
+
+// S127 TGUI2 POL-06/M6: the Latency column + the neutral-chip semantic dot colors.
+describe('latency telemetry (POL-06)', () => {
+  it('attaches a deterministic latency to an invoked tool', () => {
+    const a = lastInvocationFor('gitea_list_repos', FIXTURE_NOW);
+    const b = lastInvocationFor('gitea_list_repos', FIXTURE_NOW);
+    if (a && b) {
+      expect(a.latencyMs).toBe(b.latencyMs);
+      expect(a.latencyMs).toBeGreaterThan(0);
+    }
+  });
+
+  it('threads latency onto the derived detail and drops it for a disabled tool', () => {
+    const d = deriveToolDetail('plane', 'plane_get_project', true);
+    expect(d.lastInvocation === null || typeof d.lastInvocation.latencyMs === 'number').toBe(true);
+    expect(deriveToolDetail('plane', 'plane_get_project', false).lastInvocation).toBeNull();
+  });
+
+  it('formats ms under a second and seconds above', () => {
+    expect(fmtLatency(240)).toBe('240ms');
+    expect(fmtLatency(1500)).toBe('1.50s');
+  });
+});
+
+describe('CATEGORY_DOT_COLOR (M6)', () => {
+  it('gives every kind a CSS-var semantic dot ink for the neutral chip', () => {
+    for (const cat of ['read', 'write', 'search', 'admin'] as const) {
+      expect(CATEGORY_DOT_COLOR[cat]).toMatch(/^var\(--/);
+    }
   });
 });
