@@ -43,7 +43,10 @@ interface BadgeProps {
 }
 
 export function Badge({ tone = 'neutral', children, dot, glowDot = false, dotColor, mono = false, className, style }: BadgeProps) {
-  const showDot = dot ?? glowDot;
+  // Render the leading dot whenever an explicit `dotColor` is supplied — the M6 neutral-chip
+  // pattern is a neutral body + a semantic dot, and forgetting `dot` at a call site must not
+  // silently drop that dot (which would strip the only kind/status signal from the chip).
+  const showDot = (dot ?? glowDot) || dotColor != null;
   const dotInk = dotColor ?? TONE_DOT[tone];
   return (
     <span

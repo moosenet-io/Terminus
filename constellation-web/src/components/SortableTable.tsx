@@ -89,7 +89,14 @@ export function SortableTable<T>({
 
   return (
     <div>
-      <div style={{ overflowX: 'auto' }}>
+      {/* The table owns its OWN scroll region (both axes). This is deliberate: the sticky
+          `thead` needs a scroll container that actually scrolls, and the ancestors between here
+          and the panel (the wrapping Card is `overflow:hidden`, PanelRoot scrolls the whole
+          canvas) can't serve as that container without the header sticking to a box that grows
+          with content and never pins. A capped-height self-scroll keeps the header pinned while
+          the body scrolls, and also carries horizontal overflow for wide column sets. The
+          pagination footer sits OUTSIDE this region so it stays visible. */}
+      <div style={{ overflow: 'auto', maxHeight: '70vh' }}>
         <table className="h-dtable">
           <thead>
             <tr>
