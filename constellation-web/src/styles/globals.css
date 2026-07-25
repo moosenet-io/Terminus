@@ -244,6 +244,17 @@ body {
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
+/* CGUI-02 (TERM #525): panel-scroll custom scrollbar used by <PanelRoot>.
+   The scroll container itself carries `height:100%; min-height:0; overflow-y:auto`
+   (min-height:0 on the flex child is the load-bearing bit); this class only styles
+   its scrollbar per the guide-spec §5 `.hf-scroll` treatment (width 8px, violet
+   thumb radius 8px, transparent track). */
+.hf-scroll { scrollbar-width: thin; scrollbar-color: rgba(168, 85, 247, 0.25) transparent; }
+.hf-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.hf-scroll::-webkit-scrollbar-track { background: transparent; }
+.hf-scroll::-webkit-scrollbar-thumb { background: rgba(168, 85, 247, 0.25); border-radius: 8px; }
+.hf-scroll::-webkit-scrollbar-thumb:hover { background: rgba(168, 85, 247, 0.40); }
+
 /* Global focus ring (§2.6 accessibility) */
 :focus-visible {
   outline: var(--focus-ring);
