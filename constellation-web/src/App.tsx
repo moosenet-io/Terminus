@@ -6,13 +6,11 @@ import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { GlobalBar } from './components/GlobalBar';
 import type { Density } from './components/GlobalBar';
-import { ModuleRail } from './components/ModuleRail';
 import type { RailVariant } from './components/ModuleRail';
-import { CrateModuleRail } from './components/CrateModuleRail';
+import { CoreRail } from './components/CoreRail';
 import { DeepSpaceBackdrop } from './components/DeepSpaceBackdrop';
-import { CRATES, CRATE_ORDER, crateForModule, getCrate, modulesInCrate } from './lib/crates';
-import type { CrateId } from './lib/crates';
-import { moduleDetailPath } from './panels/overview/moduleMeta';
+import { CORES, CORE_ORDER, coreForModule, getCore, modulesInCore } from './lib/cores';
+import type { CoreId } from './lib/cores';
 import { Login } from './components/Login';
 import { CommandPalette } from './components/CommandPalette';
 import { ToastProvider, useToastContext } from './components/Toast';
@@ -78,12 +76,11 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
   const [density, setDensity] = useState<Density>(
     () => getAggregationClient().prefs.get<Density>('density') ?? 'comfortable',
   );
-  // CGUI-12 (§3.1): the active Overview crate tab. Persisted client-side (there is no backend
-  // crate entity — the crate model is a curated grouping/filter, see lib/crates.ts); restored on
-  // load, defaulting to the first crate.
-  const [activeCrate, setActiveCrate] = useState<CrateId>(() => {
-    const saved = getAggregationClient().prefs.get<CrateId>('crate');
-    return saved && CRATE_ORDER.includes(saved) ? saved : CRATE_ORDER[0];
+  // S127 TGUI2 (§3.1): the active Overview core tab. Persisted client-side (the core model is the
+  // real constellation grouping, see lib/cores.ts); restored on load, defaulting to the first core.
+  const [activeCore, setActiveCore] = useState<CoreId>(() => {
+    const saved = getAggregationClient().prefs.get<CoreId>('core');
+    return saved && CORE_ORDER.includes(saved) ? saved : CORE_ORDER[0];
   });
   const [drawerOpen, setDrawerOpen] = useState(false);
   // CONST-25: the command palette's open state lives here (not in GlobalBar) so Ctrl/Cmd+K
@@ -278,51 +275,43 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
     if (!segment || segment === 'overview') return null;
     return modules.find(m => m.id === segment)?.id ?? null;
   }, [location.pathname, modules]);
-  const activeModule = modules.find(m => m.id === activeModuleId) ?? null;
-
-  const handleSelectModule = (id: string) => {
-    const firstPanel = panels.find(p => p.system === id);
-    navigate(firstPanel ? firstPanel.path : '/overview');
-  };
-
-  // CGUI-12: the crate-scoped rail drills into a module's DETAIL view ("same shell, deeper
-  // zoom", §4) — same target as an Overview card click — rather than the module's first panel.
-  const handleSelectModuleDetail = (id: string) => {
-    navigate(moduleDetailPath(id as ModuleId));
-  };
 
   const handleDensityChange = (d: Density) => {
     setDensity(d);
     getAggregationClient().prefs.set('density', d);
   };
 
-  // CGUI-12: selecting a crate scopes the Overview (rail + card canvas) to that crate's modules
-  // and returns to the overview. Persisted so the shell reopens on the same crate.
-  const handleSelectCrate = useCallback(
-    (id: CrateId) => {
-      setActiveCrate(id);
-      getAggregationClient().prefs.set('crate', id);
+  // S127: selecting a core scopes the Overview (rail + card canvas) to that core's member
+  // modules and returns to the overview. Persisted so the shell reopens on the same core.
+  const handleSelectCore = useCallback(
+    (id: CoreId) => {
+      setActiveCore(id);
+      getAggregationClient().prefs.set('core', id);
       navigate('/overview');
     },
     [navigate],
   );
 
-  // Keep the active crate tab in sync when the operator drills into a module from elsewhere
-  // (deep link, card click, palette) whose crate differs from the current tab — the crate tab
-  // should always reflect where you are. Persist so a reload keeps the synced crate.
+  // Keep the active core tab in sync when the operator drills into a panel from elsewhere
+  // (deep link, card click, palette, rail) whose core differs from the current tab — the core
+  // tab should always reflect where you are. Persist so a reload keeps the synced core.
   useEffect(() => {
     if (!activeModuleId) return;
-    const crate = crateForModule(activeModuleId as Parameters<typeof crateForModule>[0]);
-    setActiveCrate(prev => {
-      if (prev === crate) return prev;
-      getAggregationClient().prefs.set('crate', crate);
-      return crate;
+    const core = coreForModule(activeModuleId as ModuleId);
+    setActiveCore(prev => {
+      if (prev === core) return prev;
+      getAggregationClient().prefs.set('core', core);
+      return core;
     });
   }, [activeModuleId]);
 
-  // The active crate's available modules — scopes the Overview rail + card canvas (§3.1).
-  const crateModules = useMemo(() => modulesInCrate(activeCrate, modules), [activeCrate, modules]);
-  const crateDescriptor = getCrate(activeCrate);
+  // The core to render nav for: whichever a drilled-in panel belongs to, else the selected tab.
+  // Using this derived value (not just `activeCore` state) makes the rail + tab highlight follow
+  // a deep-link on the very first render, before the sync effect above has run.
+  const effectiveCore = activeModuleId ? coreForModule(activeModuleId as ModuleId) : activeCore;
+  // The active core's available member modules (in core order) — scopes the rail + card canvas.
+  const coreModules = useMemo(() => modulesInCore(effectiveCore, modules), [effectiveCore, modules]);
+  const coreDescriptor = getCore(effectiveCore);
 
   return (
     <div style={{ position: 'relative', zIndex: 1, display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
@@ -331,9 +320,9 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
           fills so the gradient/nebula/starfield reads through the translucent bar + canvas gaps. */}
       <DeepSpaceBackdrop />
       <GlobalBar
-        crates={CRATES}
-        activeCrateId={activeCrate}
-        onSelectCrate={handleSelectCrate}
+        cores={CORES}
+        activeCoreId={effectiveCore}
+        onSelectCore={handleSelectCore}
         density={density}
         onDensityChange={handleDensityChange}
         username={username}
@@ -358,30 +347,19 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
           the deep-space backdrop (which is position:fixed;z-index:-1) — without it, this
           non-positioned in-flow row would be painted UNDER the positioned backdrop and obscured. */}
       <div style={{ position: 'relative', zIndex: 1, flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
-        {/* Left rail: drilled into a module → its panel rail (unchanged CONST-16 behaviour);
-            otherwise the Overview crate rail — the active crate's modules grouped by flow role
-            (§3.1). Only mounted once health has loaded so the crate rail never flashes empty. */}
-        {activeModule ? (
-          <ModuleRail
-            module={activeModule}
+        {/* Left rail (§3.1): always the active CORE's rail — a flat panel list for a single-member
+            core, or labelled TERMINUS / MODELS / MINT sub-groups for Terminus. Rows navigate to
+            their real panel path. Only mounted once health has loaded so it never flashes empty. */}
+        {healthLoaded && (
+          <CoreRail
+            core={coreDescriptor}
+            modules={coreModules}
+            health={health}
+            degradedSystems={degradedSystems}
             variant={railVariant}
             drawerOpen={drawerOpen}
             onCloseDrawer={() => setDrawerOpen(false)}
           />
-        ) : (
-          healthLoaded && (
-            <CrateModuleRail
-              crate={crateDescriptor}
-              modules={crateModules}
-              health={health}
-              degradedSystems={degradedSystems}
-              activeModuleId={null}
-              onSelectModule={handleSelectModuleDetail}
-              variant={railVariant}
-              drawerOpen={drawerOpen}
-              onCloseDrawer={() => setDrawerOpen(false)}
-            />
-          )
         )}
 
         {/* CGUI-02 (TERM 525): the canvas is the scroll container — the global bar + module
@@ -414,8 +392,8 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
                 path="/overview"
                 element={
                   <OverviewPanel
-                    crate={crateDescriptor}
-                    modules={crateModules}
+                    core={coreDescriptor}
+                    modules={coreModules}
                     health={health}
                     degradedSystems={degradedSystems}
                     density={density}

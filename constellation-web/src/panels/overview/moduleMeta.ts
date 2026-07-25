@@ -13,22 +13,26 @@ import type { NodeKind } from '../../components/NodeBadge';
 
 export interface ModuleMeta {
   kind: NodeKind;
-  /** UPPERCASE flow role shown in the kind's accent colour (CORE/SOURCE/ENDPOINT/CLOUD). */
+  /** UPPERCASE identity role shown in the kind's accent colour. S127: the five constellation
+   *  members read `CORE`; Terminus's intake subsystems (Models/MINT) read `SUBSYSTEM`. The
+   *  node-dot `kind` colour is kept for visual variety, but the role no longer implies a
+   *  SOURCE/ENDPOINT/CLOUD flow taxonomy the operator never asked for. */
   role: string;
   desc: string;
   /** false → paid/opt-in (amber badge); true → free $0/day (green badge). */
   free: boolean;
 }
 
-/** All fleet modules run local-inference at $0.00/day, so every card is a free (green) tier. */
+/** All fleet modules run local-inference at $0.00/day, so every card is a free (green) tier.
+ *  `role` is core identity (CORE / SUBSYSTEM); `kind` stays the node-dot colour source. */
 export const MODULE_META: Record<ModuleId, ModuleMeta> = {
-  harmony:  { kind: 'core',     role: 'CORE',     desc: 'autonomous build orchestrator', free: true },
-  chord:    { kind: 'core',     role: 'CORE',     desc: 'llm proxy + inference router',  free: true },
-  terminus: { kind: 'core',     role: 'CORE',     desc: 'mcp tool hub + fleet infra',    free: true },
-  lumina:   { kind: 'endpoint', role: 'ENDPOINT', desc: 'assistant surface',             free: true },
-  muse:     { kind: 'endpoint', role: 'ENDPOINT', desc: 'media library + acquisition',   free: true },
-  models:   { kind: 'source',   role: 'SOURCE',   desc: 'model library',                 free: true },
-  mint:     { kind: 'source',   role: 'SOURCE',   desc: 'model benchmarks',              free: true },
+  harmony:  { kind: 'core',     role: 'CORE',      desc: 'autonomous build orchestrator', free: true },
+  chord:    { kind: 'core',     role: 'CORE',      desc: 'llm proxy + inference router',  free: true },
+  terminus: { kind: 'core',     role: 'CORE',      desc: 'mcp tool hub + fleet infra',    free: true },
+  lumina:   { kind: 'endpoint', role: 'CORE',      desc: 'assistant surface',             free: true },
+  muse:     { kind: 'endpoint', role: 'CORE',      desc: 'media library + acquisition',   free: true },
+  models:   { kind: 'source',   role: 'SUBSYSTEM', desc: 'model library',                 free: true },
+  mint:     { kind: 'source',   role: 'SUBSYSTEM', desc: 'model benchmarks',              free: true },
 };
 
 /** The canonical route for a module's detail view (§4). Kept here so the Overview card's

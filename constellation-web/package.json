@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "build:verify": "npm run build && node scripts/assert-http-bundle.mjs",
+    "assert-http-bundle": "node scripts/assert-http-bundle.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

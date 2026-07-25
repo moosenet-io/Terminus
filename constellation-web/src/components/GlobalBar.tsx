@@ -1,28 +1,31 @@
-// CONST-16 / CGUI-12: the two-tier shell's top bar (guide-spec §3.1). The persistent global
-// frame: wordmark (violet node dot + "terminus") · three crate tabs (lumina-core / chord-proxy /
-// terminus-rs, active = violet-filled pill) · a search field ("search tools… ⌘K") · a
-// Comfortable/Compact density toggle (segmented, active violet) · an account circle.
+// CONST-16 / S127 TGUI2: the two-tier shell's top bar (guide-spec §3.1). The persistent global
+// frame: wordmark (violet node dot + "terminus") · the FIVE constellation CORE tabs (Lumina /
+// Chord / Terminus / Harmony / Muse, active = violet-filled pill) · a search field
+// ("search tools… ⌘K") · a Comfortable/Compact density toggle (segmented, active violet) · an
+// account circle.
 //
-// CGUI-12 note — the app models MODULES, not crates (there is no backend crate entity). So the
-// crate tabs are a CLIENT-SIDE grouping/filter (see lib/crates.ts): selecting a crate scopes the
-// left rail + card canvas to that crate's modules. This replaces the earlier CONST-16 per-module
-// tab strip, whose module navigation now lives in the crate-scoped left rail (guide §3.1).
+// S127 note — this replaces CGUI-12's fictional 3-"crate" strip (lumina-core/chord-proxy/
+// terminus-rs) with the REAL constellation members (see lib/cores.ts). Each core's node dot is
+// coloured by its kind (violet core / green endpoint). Selecting a core scopes the left rail +
+// card canvas to that core's member modules; Terminus owns Models + MINT as sub-sections.
 //
 // CONST-25: the ⌘K search button just calls `onOpenPalette` — the palette's own open state,
 // keyboard shortcut, and markup live in App.tsx's Shell + `CommandPalette.tsx`, so Ctrl/Cmd+K
 // works everywhere the shell is mounted, not only while this bar has focus.
 import type { FeedItem } from '../lib/activityFeed';
-import type { CrateDescriptor, CrateId } from '../lib/crates';
+import type { CoreDescriptor, CoreId } from '../lib/cores';
+import { coreKind } from '../lib/cores';
+import { KIND_COLOR } from '../panels/overview/moduleMeta';
 import { Wordmark } from './Wordmark';
 import { NotificationBell } from './NotificationBell';
 
 export type Density = 'comfortable' | 'compact';
 
 interface GlobalBarProps {
-  /** The three guide crates rendered as tabs. */
-  crates: readonly CrateDescriptor[];
-  activeCrateId: CrateId;
-  onSelectCrate: (id: CrateId) => void;
+  /** The five constellation cores rendered as tabs. */
+  cores: readonly CoreDescriptor[];
+  activeCoreId: CoreId;
+  onSelectCore: (id: CoreId) => void;
   density: Density;
   onDensityChange: (d: Density) => void;
   username?: string | null;
@@ -47,9 +50,9 @@ function accountInitial(username?: string | null): string {
 }
 
 export function GlobalBar({
-  crates,
-  activeCrateId,
-  onSelectCrate,
+  cores,
+  activeCoreId,
+  onSelectCore,
   density,
   onDensityChange,
   username,
@@ -95,29 +98,32 @@ export function GlobalBar({
         </button>
       )}
 
-      {/* Wordmark → the active crate's overview (App wires onSelectCrate to also navigate). */}
+      {/* Wordmark → the active core's overview (App wires onSelectCore to also navigate). */}
       <button
-        onClick={() => onSelectCrate(activeCrateId)}
+        onClick={() => onSelectCore(activeCoreId)}
         style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0, flexShrink: 0 }}
         aria-label="Go to overview"
       >
         <Wordmark />
       </button>
 
-      {/* Crate tabs — active = violet-filled pill (§3.1). Exposed as an ARIA tablist so a
-          screen reader announces the selected crate (aria-selected) and the tab count. */}
+      {/* Core tabs — active = violet-filled pill (§3.1). Exposed as an ARIA tablist so a
+          screen reader announces the selected core (aria-selected) and the tab count. Each dot
+          takes the core's kind colour (violet core / green endpoint) so the row reads
+          semantically; the active tab additionally glows. */}
       <nav
         role="tablist"
-        aria-label="Crates"
+        aria-label="Cores"
         style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flex: 1, overflowX: 'auto' }}
       >
-        {crates.map(c => {
-          const active = c.id === activeCrateId;
+        {cores.map(c => {
+          const active = c.id === activeCoreId;
+          const dot = KIND_COLOR[coreKind(c.id)];
           return (
             <button
               key={c.id}
               role="tab"
-              onClick={() => onSelectCrate(c.id)}
+              onClick={() => onSelectCore(c.id)}
               aria-selected={active}
               aria-current={active ? 'page' : undefined}
               style={{
@@ -143,8 +149,8 @@ export function GlobalBar({
                   width: 6,
                   height: 6,
                   borderRadius: '50%',
-                  background: active ? 'var(--node-core)' : 'var(--text-500)',
-                  boxShadow: active ? '0 0 7px var(--node-core)' : 'none',
+                  background: active ? dot : 'var(--text-500)',
+                  boxShadow: active ? `0 0 7px ${dot}` : 'none',
                   flexShrink: 0,
                 }}
               />
