@@ -1644,6 +1644,106 @@ pub async fn read_task_category_cells(
     }
 }
 
+/// CGUI-07 (TERM #530): one raw `assistant_dimension_score` row for a single
+/// new-MINT-category `task_category` (embedding_retrieval / reranking /
+/// image_parsing / document_parsing / image_generation / voice_transcription /
+/// tts / tool_routing), joined to its run for `harness_version`. This is the
+/// generic per-category read behind `/api/terminus/mint/category/{cat}/*` and
+/// the widened `/api/terminus/mint/runs?suite={cat}` — the handler shapes these
+/// rows in-memory (summary/dimensions/matrix/box/failures), exactly as
+/// `mint_box`/`list_models` already do fleet-scale in-memory aggregation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskCategoryScoreRow {
+    pub run_id: Uuid,
+    pub model_id: String,
+    pub backend_tag: String,
+    pub dimension: String,
+    pub metric: String,
+    pub value: f64,
+    pub std_dev: Option<f64>,
+    pub judge: String,
+    pub low_confidence: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub harness_version: Option<String>,
+}
+
+/// Read every `assistant_dimension_score` row for `task_category`, newest
+/// first, optionally scoped to one `epoch` (`assistant_profile_run.
+/// harness_version`). `task_category` and `epoch` are BOUND parameters ($1/$2),
+/// never spliced. `value`/`std_dev` are cast to `::double precision` so a
+/// NUMERIC-typed column can never panic sqlx's `f64` decode (the S125
+/// `read_agent_rollups` precedent). Fail-open: an absent
+/// `assistant_dimension_score`/`assistant_profile_run` table (un-migrated DB)
+/// or absent column degrades to an empty vec — never a hard error.
+pub async fn read_task_category_scores(
+    pool: &PgPool,
+    task_category: &str,
+    epoch: Option<&str>,
+) -> Result<Vec<TaskCategoryScoreRow>, ToolError> {
+    let mut sql = String::from(
+        "SELECT s.run_id, s.model_id, s.backend_tag, s.dimension, s.metric, \
+         s.value::double precision, s.std_dev::double precision, s.judge, \
+         s.low_confidence, s.created_at, r.harness_version \
+         FROM assistant_dimension_score s \
+         LEFT JOIN assistant_profile_run r ON r.id = s.run_id \
+         WHERE s.task_category = $1",
+    );
+    if epoch.is_some() {
+        sql.push_str(" AND r.harness_version = $2");
+    }
+    sql.push_str(" ORDER BY s.created_at DESC");
+
+    type Row = (
+        Uuid,
+        String,
+        String,
+        String,
+        String,
+        f64,
+        Option<f64>,
+        String,
+        bool,
+        chrono::DateTime<chrono::Utc>,
+        Option<String>,
+    );
+    let mut query = sqlx::query_as::<_, Row>(&sql).bind(task_category);
+    if let Some(e) = epoch {
+        query = query.bind(e.to_string());
+    }
+    match query.fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(
+                |(run_id, model_id, backend_tag, dimension, metric, value, std_dev, judge, low_confidence, created_at, harness_version)| {
+                    TaskCategoryScoreRow {
+                        run_id,
+                        model_id,
+                        backend_tag,
+                        dimension,
+                        metric,
+                        value,
+                        std_dev,
+                        judge,
+                        low_confidence,
+                        created_at,
+                        harness_version,
+                    }
+                },
+            )
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read {task_category} scores: {msg}"
+                )))
+            }
+        }
+    }
+}
+
 /// Latest serving/operational profile per model (the fleet card's serving
 /// facts). Tolerates the operational-profile table being absent → empty vec.
 pub async fn read_serving_rows(pool: &PgPool) -> Result<Vec<ServingRow>, ToolError> {
