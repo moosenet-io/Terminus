@@ -20,7 +20,7 @@ import { StatusPill } from '../../components/StatusPill';
 import { MetricCard } from '../../components/MetricCard';
 import { getAggregationClient } from '../../lib/aggregationClient';
 import type { ModelListEntry, ModelsListQuery } from '../../types/mint';
-import { deriveServingState, deriveCostTier, coverageBadges, matchesQuery, fmtPct, fmtGb } from './modelsData';
+import { deriveServingState, deriveCostTier, coverageBadges, fmtPct, fmtGb } from './modelsData';
 import { ModelDetailView } from './ModelDetailView';
 
 type Scope = 'all' | 'fleet' | 'brochure';
@@ -53,17 +53,35 @@ export function RosterPanel() {
   const [failed, setFailed] = useState(false);
   const [selected, setSelected] = useState<ModelListEntry | null>(null);
 
-  // Filters (scope/serving drive the query; search is client-side over the loaded page).
+  // Filters. scope/serving/search are ALL server-side query params (models.list `q`), so they
+  // filter the FULL roster, not just the loaded page — and `total`/pagination stay correct with a
+  // search applied. `search` is the live input; `qParam` is its debounced value that drives the
+  // fetch (so we don't hit the API on every keystroke).
   const [scope, setScope] = useState<Scope>('all');
   const [servingOnly, setServingOnly] = useState(false);
   const [search, setSearch] = useState('');
+  const [qParam, setQParam] = useState('');
   // S127 (DATA-04): server-side pagination — the offset of the current page into the full roster.
   const [offset, setOffset] = useState(0);
 
   // Reset to the first page whenever a query-changing filter changes (a stale offset could point
-  // past the new result set). Search stays client-side, so it does not reset the page.
+  // past the new, smaller result set).
   const changeScope = (s: Scope) => { setScope(s); setOffset(0); };
   const changeServing = (on: boolean) => { setServingOnly(on); setOffset(0); };
+
+  // FIX 3 (S127 review): debounce the search box into `qParam` and RESET the page — otherwise a
+  // search on page N (offset 50) would filter only those 50 already-loaded rows and miss the rest
+  // of the roster. Now the term goes to the backend `q` and paging restarts from the full result.
+  useEffect(() => {
+    const id = setTimeout(() => {
+      setQParam(prev => {
+        const next = search.trim();
+        if (next !== prev) setOffset(0); // new search term → back to the first page
+        return next;
+      });
+    }, 250);
+    return () => clearTimeout(id);
+  }, [search]);
 
   useEffect(() => {
     let cancelled = false;
@@ -71,17 +89,17 @@ export function RosterPanel() {
     setFailed(false);
     const query: ModelsListQuery = { scope, limit: PAGE_SIZE, offset };
     if (servingOnly) query.serving = true;
+    if (qParam) query.q = qParam; // server-side full-roster search
     getAggregationClient()
       .models.list(query)
       .then(res => { if (!cancelled) { setModels(res.models); setTotal(res.total); setRefreshedAt(res.refreshed_at); } })
       .catch(() => { if (!cancelled) { setModels([]); setTotal(0); setFailed(true); } });
     return () => { cancelled = true; };
-  }, [scope, servingOnly, offset]);
+  }, [scope, servingOnly, offset, qParam]);
 
-  const visible = useMemo(
-    () => (models ?? []).filter(m => matchesQuery(m, search)),
-    [models, search],
-  );
+  // The loaded page is already server-filtered by `qParam`; render it as-is (no client re-filter,
+  // which previously scoped search to just the current page).
+  const visible = models ?? [];
 
   const summary = useMemo(() => {
     const rows = models ?? [];

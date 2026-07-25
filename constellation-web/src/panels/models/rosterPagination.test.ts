@@ -31,3 +31,24 @@ describe('models.list pagination contract (DATA-04)', () => {
     expect(beyond.total).toBe(full.total);
   });
 });
+
+describe('models.list server-side search contract (FIX 3)', () => {
+  it('applies the search term server-side to the FULL roster, not just a page', async () => {
+    const full = await mockAdapter.models.list();
+    const qwen = await mockAdapter.models.list({ q: 'qwen' });
+    // search narrows the whole set, and the total reflects the filtered scale (not the raw roster).
+    expect(qwen.total).toBeLessThan(full.total);
+    expect(qwen.total).toBe(qwen.models.length);
+    expect(qwen.models.every(m => m.model_name.includes('qwen') || (m.family ?? '').includes('qwen'))).toBe(true);
+  });
+
+  it('keeps total correct when a search is combined with pagination', async () => {
+    // `b` matches more than one fixture row (…32b, bge-m3): total is the filtered count, and a
+    // one-row page still reports that full filtered total — the RosterPanel metric reads this.
+    const full = await mockAdapter.models.list({ q: 'b' });
+    expect(full.total).toBeGreaterThan(1);
+    const firstPage = await mockAdapter.models.list({ q: 'b', limit: 1, offset: 0 });
+    expect(firstPage.total).toBe(full.total);
+    expect(firstPage.models).toHaveLength(1);
+  });
+});
