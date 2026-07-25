@@ -171,6 +171,8 @@ export function ModuleCard({ module, health, state, density, onMove, onRemove, d
         >
           ⠿
         </span>
+        {/* Node-dot: 9px + `0 0 8px` glow is intentional DS-parity geometry (matches the
+            NodeBadge/StatusPill dot in CGUI-01); adherence-lint px warnings are expected. */}
         <span
           aria-hidden
           title={`${meta.role.toLowerCase()} node`}
@@ -250,9 +252,14 @@ export function ModuleCard({ module, health, state, density, onMove, onRemove, d
         }}
       >
         {/* Enable toggle — a pill switch, green track when on. */}
+        {/* Toggle geometry (34×18 track, 12px knob) is intentional DS-parity component
+            geometry — same posture as StatusPill/NodeBadge in CGUI-01; adherence-lint px
+            warnings on these numeric literals are expected, not a violation. The __toggle
+            class keeps this control clickable while the rest of a disabled card is inert. */}
         <button
           type="button"
           role="switch"
+          className="const-modcard__toggle"
           aria-checked={enabled}
           aria-label={enabled ? `Disable ${module.title}` : `Enable ${module.title}`}
           onClick={() => setEnabled(e => !e)}

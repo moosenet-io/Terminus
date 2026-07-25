@@ -291,6 +291,9 @@ body {
   opacity: 0.5;
   pointer-events: none; /* inert — no hover lift, no action clicks */
 }
+/* CGUI-03 review FIX A: the enable toggle must stay live so a card toggled OFF can be
+   toggled back ON. A child re-declaring pointer-events:auto overrides the inert ancestor. */
+.const-modcard--disabled .const-modcard__toggle { pointer-events: auto; }
 
 /* Accent card variant — violet-gradient border-mask + strong line (§2.3 Card row) */
 .h-card-accent {
