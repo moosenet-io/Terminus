@@ -1,37 +1,44 @@
-// CONST-17: NodeBadge — the signature flow node primitive (§2.3). Kind-colored glowing 9px
-// dot (source/core/endpoint/cloud — the semantic-color law, §2.4) + bold mono name + muted
-// role line, kind-tinted gradient chip. Optional `pulse` for the active core (lumina-corepulse).
+// CONST-17 / CGUI-01: NodeBadge — the signature flow-node primitive, reconciled EXACTLY
+// to the DS NodeBadge (_ds_bundle NodeBadge.jsx §8): kind-tinted gradient chip
+// (soft → --space-800), kind-colored hairline, a 9px glowing kind-colored dot (the
+// semantic-color law §2.4), bold mono name + muted sans role line. `pulse` breathes the
+// core dot (lumina-corepulse). `kind` encodes directionality: source (inbound) /
+// core (processing) / endpoint (outbound) / cloud (gated).
 export type NodeKind = 'source' | 'core' | 'endpoint' | 'cloud';
 
-const KIND_COLOR: Record<NodeKind, string> = {
-  source: 'var(--node-source)',
-  core: 'var(--node-core)',
-  endpoint: 'var(--node-endpoint)',
-  cloud: 'var(--node-cloud)',
+interface KindStyle { color: string; soft: string; bd: string; glow: string; }
+
+const KINDS: Record<NodeKind, KindStyle> = {
+  source:   { color: 'var(--flux-blue)',  soft: 'rgba(59, 130, 246, 0.16)', bd: 'rgba(59, 130, 246, 0.45)', glow: 'var(--glow-blue)' },
+  core:     { color: 'var(--violet-400)', soft: 'rgba(168, 85, 247, 0.14)', bd: 'var(--line-strong)',        glow: 'var(--glow-violet)' },
+  endpoint: { color: 'var(--flux-green)', soft: 'rgba(16, 185, 129, 0.12)', bd: 'rgba(16, 185, 129, 0.40)', glow: 'var(--glow-green)' },
+  cloud:    { color: 'var(--flux-amber)', soft: 'rgba(245, 158, 11, 0.12)', bd: 'rgba(245, 158, 11, 0.42)', glow: 'var(--glow-amber)' },
 };
 
 interface NodeBadgeProps {
-  kind: NodeKind;
   name: string;
   role?: string;
-  /** Active-core emphasis (lumina-corepulse, §2.3) — reserve for the one live/primary node. */
+  kind?: NodeKind;
+  /** DS contract prop (§8 NodeBadge): render the name in JetBrains Mono (default true). */
+  mono?: boolean;
+  /** Active-core emphasis — breathes the dot via lumina-corepulse (§2.3). */
   pulse?: boolean;
   style?: React.CSSProperties;
 }
 
-export function NodeBadge({ kind, name, role, pulse = false, style }: NodeBadgeProps) {
-  const color = KIND_COLOR[kind];
+export function NodeBadge({ name, role, kind = 'core', mono = true, pulse = false, style }: NodeBadgeProps) {
+  const k = KINDS[kind];
   return (
     <span
-      className={pulse ? 'lumina-corepulse' : undefined}
       style={{
         display: 'inline-flex',
         alignItems: 'center',
-        gap: 8,
-        padding: '6px 10px',
+        gap: 10,
+        background: `linear-gradient(180deg, ${k.soft}, var(--space-800))`,
+        border: `1px solid ${k.bd}`,
         borderRadius: 'var(--radius-md)',
-        background: `linear-gradient(135deg, color-mix(in srgb, ${color} 18%, var(--space-700)), var(--space-700))`,
-        border: '1px solid var(--border)',
+        padding: '9px 14px',
+        boxShadow: 'var(--shadow-sm), var(--inset-hi)',
         ...style,
       }}
     >
@@ -41,17 +48,24 @@ export function NodeBadge({ kind, name, role, pulse = false, style }: NodeBadgeP
           width: 9,
           height: 9,
           borderRadius: '50%',
-          background: color,
-          boxShadow: `0 0 8px ${color}`,
-          flexShrink: 0,
+          flex: 'none',
+          background: k.color,
+          boxShadow: k.glow,
+          animation: pulse ? 'lumina-corepulse 3.2s var(--ease-in-out) infinite' : 'none',
         }}
       />
-      <span style={{ display: 'flex', flexDirection: 'column', lineHeight: 'var(--lh-tight)' }}>
-        <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 'var(--fw-bold)', fontSize: 'var(--fs-sm)', color: 'var(--text-100)' }}>
+      <span style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
+        <span style={{
+          fontFamily: mono ? 'var(--font-mono)' : 'var(--font-sans)',
+          fontSize: 'var(--fs-sm)',
+          fontWeight: 'var(--fw-bold)',
+          letterSpacing: 'var(--ls-mono)',
+          color: 'var(--text-100)',
+        }}>
           {name}
         </span>
         {role && (
-          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)', color: 'var(--text-muted)' }}>
+          <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-300)', lineHeight: 1.3 }}>
             {role}
           </span>
         )}

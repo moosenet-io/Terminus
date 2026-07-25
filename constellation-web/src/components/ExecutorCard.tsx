@@ -19,15 +19,15 @@ export function ExecutorCard({ summary }: Props) {
         <div className="h-flex h-gap-sm">
           <span className={`h-dot ${activeCount > 0 ? 'h-dot-green h-pulse' : 'h-dot-dim'}`} />
           <span style={{ fontWeight: 600, fontSize: 13 }}>Engine</span>
-          <span style={{ fontSize: 12, color: 'var(--h-text-dim)' }}>— {statusText}</span>
+          <span style={{ fontSize: 12, color: 'var(--text-200)' }}>— {statusText}</span>
         </div>
-        <span style={{ color: 'var(--h-text-muted)', fontSize: 12, transform: expanded ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }}>▼</span>
+        <span style={{ color: 'var(--text-300)', fontSize: 12, transform: expanded ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }}>▼</span>
       </div>
 
       {expanded && (
         <div className="h-card-body" style={{ padding: workers.length === 0 ? '16px 14px' : 0 }}>
           {workers.length === 0 ? (
-            <div style={{ color: 'var(--h-text-muted)', fontSize: 13, textAlign: 'center' }}>
+            <div style={{ color: 'var(--text-300)', fontSize: 13, textAlign: 'center' }}>
               No agents active
             </div>
           ) : (
@@ -68,10 +68,10 @@ function AgentRow({ worker }: { worker: Worker }) {
     : worker.status === 'failed' ? '✗ failed'
     : '○ idle';
 
-  const statusColor = worker.status === 'working' ? 'var(--h-green)'
-    : worker.status === 'waiting' ? 'var(--h-amber)'
-    : worker.status === 'stalled' || worker.status === 'failed' ? 'var(--h-red)'
-    : 'var(--h-text-muted)';
+  const statusColor = worker.status === 'working' ? 'var(--flux-green)'
+    : worker.status === 'waiting' ? 'var(--flux-amber)'
+    : worker.status === 'stalled' || worker.status === 'failed' ? 'var(--flux-rose)'
+    : 'var(--text-300)';
 
   return (
     <div style={{
@@ -79,20 +79,20 @@ function AgentRow({ worker }: { worker: Worker }) {
       alignItems: 'center',
       gap: 10,
       padding: '8px 14px',
-      borderBottom: '1px solid var(--h-border)',
+      borderBottom: '1px solid var(--border)',
     }}>
       <span className={`h-dot ${dotClass}`} style={{ flexShrink: 0 }} />
-      <span style={{ width: 70, fontSize: 12, fontWeight: 600, color: 'var(--h-teal)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+      <span style={{ width: 70, fontSize: 12, fontWeight: 600, color: 'var(--accent)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {worker.provider}
       </span>
-      <span className="h-truncate h-flex-1" style={{ fontSize: 12, color: 'var(--h-text-dim)' }}>
+      <span className="h-truncate h-flex-1" style={{ fontSize: 12, color: 'var(--text-200)' }}>
         {worker.task_id ? `${worker.task_id}` : ''}{worker.task_title ? `: ${worker.task_title}` : '—'}
       </span>
-      <span style={{ fontSize: 11, color: statusColor, flexShrink: 0, fontFamily: 'var(--h-font-mono)' }}>
+      <span style={{ fontSize: 11, color: statusColor, flexShrink: 0, fontFamily: 'var(--font-mono)' }}>
         {statusLabel}
       </span>
       {worker.status !== 'idle' && (
-        <span className="h-mono" style={{ fontSize: 11, color: 'var(--h-text-muted)', flexShrink: 0 }}>
+        <span className="h-mono" style={{ fontSize: 11, color: 'var(--text-300)', flexShrink: 0 }}>
           {formatElapsed(elapsed)}
         </span>
       )}

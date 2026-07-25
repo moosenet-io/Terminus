@@ -19,15 +19,21 @@ const SIZE_CLASS: Record<ButtonSize, string> = {
 interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: ButtonVariant;
   size?: ButtonSize;
+  /** DS contract: leading icon slot, rendered before children (§8 Button). */
+  iconLeft?: React.ReactNode;
+  /** DS contract: trailing icon slot, rendered after children (§8 Button). */
+  iconRight?: React.ReactNode;
 }
 
-export function Button({ variant = 'secondary', size = 'md', className, children, ...rest }: ButtonProps) {
+export function Button({ variant = 'secondary', size = 'md', iconLeft, iconRight, className, children, ...rest }: ButtonProps) {
   return (
     <button
       className={`h-btn ${VARIANT_CLASS[variant]} ${SIZE_CLASS[size]}${className ? ` ${className}` : ''}`}
       {...rest}
     >
+      {iconLeft}
       {children}
+      {iconRight}
     </button>
   );
 }

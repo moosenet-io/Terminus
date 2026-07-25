@@ -31,31 +31,31 @@ export function Sessions() {
   }, []);
 
   const statusColor = (s: string) => {
-    if (s === 'active') return 'var(--h-green)';
-    if (s === 'completed') return 'var(--h-teal)';
-    if (s === 'interrupted') return 'var(--h-amber)';
-    return 'var(--h-text-muted)';
+    if (s === 'active') return 'var(--flux-green)';
+    if (s === 'completed') return 'var(--accent)';
+    if (s === 'interrupted') return 'var(--flux-amber)';
+    return 'var(--text-300)';
   };
 
   return (
     <div style={{ padding: 16, overflowY: 'auto', height: '100%' }}>
-      <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--h-teal)', marginBottom: 16 }}>Sessions</h2>
+      <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--accent)', marginBottom: 16 }}>Sessions</h2>
 
       {loading ? <div className="h-skeleton" style={{ height: 100 }} /> : sessions.length === 0 ? (
-        <div style={{ color: 'var(--h-text-muted)', fontSize: 13 }}>No sessions yet. Sessions are created automatically when you run a build.</div>
+        <div style={{ color: 'var(--text-300)', fontSize: 13 }}>No sessions yet. Sessions are created automatically when you run a build.</div>
       ) : (
         <div style={{ display: 'grid', gap: 8 }}>
           {sessions.map(s => (
             <div key={s.id} onClick={() => setSelected(selected?.id === s.id ? null : s)}
-              className="h-card" style={{ cursor: 'pointer', border: selected?.id === s.id ? '1px solid var(--h-teal)' : undefined }}>
+              className="h-card" style={{ cursor: 'pointer', border: selected?.id === s.id ? '1px solid var(--accent)' : undefined }}>
               <div className="h-card-header" style={{ cursor: 'pointer' }}>
                 <div>
                   <span style={{ fontWeight: 600, fontSize: 13 }}>{s.name}</span>
-                  <span style={{ fontSize: 11, color: 'var(--h-text-muted)', marginLeft: 8 }}>{s.project}</span>
+                  <span style={{ fontSize: 11, color: 'var(--text-300)', marginLeft: 8 }}>{s.project}</span>
                 </div>
                 <div style={{ display: 'flex', gap: 12, alignItems: 'center', fontSize: 12 }}>
                   <span style={{ color: statusColor(s.status) }}>{s.status}</span>
-                  <span style={{ color: 'var(--h-text-muted)' }}>{s.started_at.slice(0, 10)}</span>
+                  <span style={{ color: 'var(--text-300)' }}>{s.started_at.slice(0, 10)}</span>
                 </div>
               </div>
               {selected?.id === s.id && (
@@ -74,8 +74,8 @@ export function Sessions() {
                         : 'ongoing'],
                     ].map(([label, value]) => (
                       <div key={String(label)} style={{ textAlign: 'center' }}>
-                        <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--h-teal)' }}>{value}</div>
-                        <div style={{ fontSize: 10, color: 'var(--h-text-muted)', marginTop: 2 }}>{label}</div>
+                        <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--accent)' }}>{value}</div>
+                        <div style={{ fontSize: 10, color: 'var(--text-300)', marginTop: 2 }}>{label}</div>
                       </div>
                     ))}
                   </div>

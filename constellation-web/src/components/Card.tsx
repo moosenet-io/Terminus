@@ -30,8 +30,32 @@ interface CardProps {
   /** §2.3: persistent brand-emphasis glow. Reserve for live/primary elements (§2.4) —
    *  never ambient decoration. */
   glow?: boolean;
-  /** §2.3: violet-gradient border-mask + strong hairline — emphasis without full glow. */
+  /** §2.3 / §8: violet-gradient border-mask + strong hairline — emphasis without full glow. */
   accent?: boolean;
+  /** DS contract prop (§8 Card): override the variant's default padding (e.g. 'var(--space-5)'). */
+  padding?: string;
+}
+
+// DS Card `accent` treatment (§8): a masked gradient-hairline border overlay — the luminous
+// "processing center" edge. DS uses inset:-1px; our Card container is overflow:hidden for its
+// variants, so we inset:0 to sit precisely on the border's inner edge without being clipped.
+function AccentHairline() {
+  return (
+    <span
+      aria-hidden
+      style={{
+        position: 'absolute',
+        inset: 0,
+        borderRadius: 'inherit',
+        padding: '1px',
+        background: 'linear-gradient(180deg, rgba(168, 85, 247, 0.5), rgba(124, 58, 237, 0.04))',
+        WebkitMask: 'linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0)',
+        WebkitMaskComposite: 'xor',
+        maskComposite: 'exclude',
+        pointerEvents: 'none',
+      }}
+    />
+  );
 }
 
 const baseCard: React.CSSProperties = {
@@ -58,16 +82,19 @@ export function Card({
   defaultExpanded = false,
   glow = false,
   accent = false,
+  padding,
 }: CardProps) {
   const [expanded, setExpanded] = useState(defaultExpanded);
   const emphasisStyle: React.CSSProperties = {
-    ...(accent ? { borderColor: 'var(--border-strong)', boxShadow: 'var(--shadow-md), var(--glow-violet-soft), var(--inset-hi)' } : {}),
+    ...(accent ? { position: 'relative', borderColor: 'var(--border-strong)', boxShadow: 'var(--shadow-md), var(--glow-violet-soft), var(--inset-hi)' } : {}),
     ...(glow ? { boxShadow: 'var(--shadow-md), var(--glow-violet), var(--inset-hi)' } : {}),
   };
+  const accentOverlay = accent ? <AccentHairline /> : null;
 
   if (variant === 'expandable') {
     return (
       <div className={className} style={{ ...baseCard, ...emphasisStyle, ...style }}>
+        {accentOverlay}
         <div
           className="h-card-header"
           onClick={() => { setExpanded(e => !e); onClick?.(); }}
@@ -104,8 +131,9 @@ export function Card({
       <div
         className={`h-card-interactive${className ? ` ${className}` : ''}`}
         onClick={onClick}
-        style={{ padding: paddingMap.interactive, ...emphasisStyle, ...style }}
+        style={{ padding: padding ?? paddingMap.interactive, ...emphasisStyle, ...style }}
       >
+        {accentOverlay}
         {children}
       </div>
     );
@@ -115,8 +143,9 @@ export function Card({
     <div
       className={`h-card${className ? ` ${className}` : ''}`}
       onClick={onClick}
-      style={{ padding: paddingMap[variant], ...emphasisStyle, ...style }}
+      style={{ padding: padding ?? paddingMap[variant], ...emphasisStyle, ...style }}
     >
+      {accentOverlay}
       {children}
     </div>
   );

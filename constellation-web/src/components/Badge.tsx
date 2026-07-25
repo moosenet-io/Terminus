@@ -13,19 +13,22 @@ const TONE_CLASS: Record<BadgeTone, string> = {
   neutral: 'h-badge-neutral',
 };
 
+// DS dot color = the tone's foreground ink (Badge.jsx: `background: t.fg`).
 const TONE_DOT: Record<BadgeTone, string> = {
-  violet: 'var(--violet-400)',
-  blue: 'var(--flux-blue)',
-  green: 'var(--flux-green)',
+  violet: 'var(--violet-300)',
+  blue: 'var(--flux-blue-soft)',
+  green: 'var(--flux-green-soft)',
   amber: 'var(--flux-amber)',
-  rose: 'var(--flux-rose)',
-  neutral: 'var(--text-400)',
+  rose: '#FB7185',
+  neutral: 'var(--text-300)',
 };
 
 interface BadgeProps {
   tone?: BadgeTone;
   children: React.ReactNode;
-  /** Small glowing dot before the label — use only when the tone IS the semantic (§2.4). */
+  /** DS contract prop (§8 Badge): leading 6px glowing dot in the tone's ink. */
+  dot?: boolean;
+  /** @deprecated use `dot` — retained so existing callers don't break. */
   glowDot?: boolean;
   /** JetBrains Mono rendering for cost/tier badges. */
   mono?: boolean;
@@ -33,13 +36,14 @@ interface BadgeProps {
   style?: React.CSSProperties;
 }
 
-export function Badge({ tone = 'neutral', children, glowDot = false, mono = false, className, style }: BadgeProps) {
+export function Badge({ tone = 'neutral', children, dot, glowDot = false, mono = false, className, style }: BadgeProps) {
+  const showDot = dot ?? glowDot;
   return (
     <span
       className={`h-badge ${TONE_CLASS[tone]}${mono ? ' h-badge-mono' : ''}${className ? ` ${className}` : ''}`}
       style={style}
     >
-      {glowDot && (
+      {showDot && (
         <span
           aria-hidden
           style={{
@@ -47,7 +51,7 @@ export function Badge({ tone = 'neutral', children, glowDot = false, mono = fals
             height: 6,
             borderRadius: '50%',
             background: TONE_DOT[tone],
-            boxShadow: `0 0 6px ${TONE_DOT[tone]}`,
+            boxShadow: `0 0 8px ${TONE_DOT[tone]}`,
             flexShrink: 0,
           }}
         />

@@ -103,7 +103,7 @@ export function Dashboard({ status, executorSummary, loading, error, onRetry }: 
   if (error) {
     return (
       <div style={{ padding: 32, textAlign: 'center' }}>
-        <div style={{ color: 'var(--h-red)', marginBottom: 12 }}>⚠ {error}</div>
+        <div style={{ color: 'var(--flux-rose)', marginBottom: 12 }}>⚠ {error}</div>
         <button className="h-btn h-btn-ghost" onClick={onRetry}>Retry</button>
       </div>
     );
