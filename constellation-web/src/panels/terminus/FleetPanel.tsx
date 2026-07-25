@@ -4,6 +4,7 @@
 // `/api/terminus/config` (workerCount + module/tool totals).
 import { useEffect, useRef, useState } from 'react';
 import { Card, CardTitle } from '../../components/Card';
+import { PanelRoot } from '../../components/PanelRoot';
 import { MetricCard } from '../../components/MetricCard';
 import { StatusPill } from '../../components/StatusPill';
 import { Sparkline } from '../../viz/Sparkline';
@@ -108,7 +109,7 @@ export function FleetPanel() {
   const enabledCount = config?.modules.filter(m => m.enabled).length ?? 0;
 
   return (
-    <div style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+    <PanelRoot style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
       <CardTitle subtitle="Live per-system availability, uptime history, and mesh/broker summary">
         Terminus — Fleet
       </CardTitle>
@@ -137,6 +138,6 @@ export function FleetPanel() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 'var(--space-3)' }}>
         {systemsToRender(buffers).map(s => systemCard(s, buffers))}
       </div>
-    </div>
+    </PanelRoot>
   );
 }

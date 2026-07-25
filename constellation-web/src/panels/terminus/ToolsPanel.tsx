@@ -8,6 +8,7 @@
 // import for CONST-25's registry here.
 import { useEffect, useMemo, useState } from 'react';
 import { Card, CardTitle } from '../../components/Card';
+import { PanelRoot } from '../../components/PanelRoot';
 import { Badge } from '../../components/Badge';
 import { SkeletonList } from '../../components/Skeleton';
 import { DataTable } from '../../components/DataTable';
@@ -85,7 +86,7 @@ export function ToolsPanel() {
   ];
 
   return (
-    <div style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+    <PanelRoot style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
       <CardTitle subtitle="Every registered tool, grouped by module — searchable and paged for large catalogs">
         Terminus — Tools
       </CardTitle>
@@ -179,6 +180,6 @@ export function ToolsPanel() {
           )}
         </>
       )}
-    </div>
+    </PanelRoot>
   );
 }
