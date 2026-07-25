@@ -241,6 +241,20 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setPaletteOpen(o => !o);
+      } else if (
+        // POL-12: bare "/" opens the palette (Stripe/GitHub pattern) — but only when the
+        // operator is NOT typing into a field, so "/" stays literal in inputs/textareas/
+        // contentEditable and the palette's own search box.
+        e.key === '/' &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !(e.target instanceof HTMLInputElement) &&
+        !(e.target instanceof HTMLTextAreaElement) &&
+        !(e.target instanceof HTMLElement && e.target.isContentEditable)
+      ) {
+        e.preventDefault();
+        setPaletteOpen(true);
       } else if (e.key === 'Escape') {
         setPaletteOpen(false);
       }
@@ -328,6 +342,8 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
         username={username}
         onLogout={onLogout}
         pollDegraded={pollDegraded}
+        health={health}
+        degradedSystems={degradedSystems}
         onOpenMenu={railVariant === 'drawer' ? () => setDrawerOpen(true) : undefined}
         onOpenPalette={() => setPaletteOpen(true)}
         feedItems={feedItems}
@@ -368,6 +384,12 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
             overflow-y:auto is the safety net so any panel that does not manage its own scroll
             still scrolls here instead of clipping. overflow-x stays hidden (no sideways scroll). */}
         <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+          {/* POL-03 (§3.7): cap the canvas content at --content-max (~1280px) and CENTER it.
+              This is the single biggest "tech-demo → product" lever — short pages stop being
+              anchored top-left in a huge canvas with a yawning void to the right; every panel
+              now composes as a centered column. The wrapper is flex-column + min-height:0 so a
+              panel's own PanelRoot scroll frame (height:100%) still fills and scrolls inside it. */}
+          <div style={{ width: '100%', maxWidth: 'var(--content-max)', margin: '0 auto', flex: 1, minHeight: 0, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
           {!healthLoaded ? (
             // First health poll hasn't settled yet — `modules`/`panels` are necessarily empty
             // right now (health starts as []). Render a loading placeholder WITHOUT mounting
@@ -423,6 +445,7 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
               <Route path="*" element={<Navigate to="/overview" replace />} />
             </Routes>
           )}
+          </div>
         </div>
       </div>
     </div>

@@ -30,6 +30,7 @@ import { PanelRoot } from '../../components/PanelRoot';
 import { NodeBadge } from '../../components/NodeBadge';
 import { Badge } from '../../components/Badge';
 import { Button } from '../../components/Button';
+import { Tabs, tabId, tabPanelId } from '../../components/Tabs';
 import { StatusPill } from '../../components/StatusPill';
 import type { PillState } from '../../components/StatusPill';
 import {
@@ -107,7 +108,7 @@ const LOG_CAP = 40;
 // ── small style helpers ──────────────────────────────────────────────────────────────────────
 const panel: CSSProperties = {
   borderRadius: 'var(--radius-lg)',
-  border: '1px solid var(--line-default)',
+  border: 'var(--border-width) solid var(--line-default)',
   background: 'linear-gradient(180deg,var(--space-700),var(--space-800))',
   boxShadow: 'var(--shadow-md), var(--inset-hi)',
 };
@@ -177,6 +178,22 @@ export function ModuleDetail({ module, health }: ModuleDetailProps) {
   const healthState: 'online' | 'idle' | 'error' = health?.available === false ? 'error' : 'online';
   const pill = PILL_FOR[healthState];
 
+  // POL-09 (§3.4): the detail view is tabbed (Overview / Config / Flow / Logs) rather than one
+  // long scroll, matching professional resource-detail panes. The metric strip stays pinned
+  // above the tabs (key vitals are always visible); each tab zooms one region.
+  const [activeTab, setActiveTab] = useState<'overview' | 'config' | 'flow' | 'logs'>('overview');
+
+  // POL-09 FIX (review): full tablist/tab/tabpanel ARIA wiring. Each rendered panel gets
+  // role="tabpanel" + a matching id + aria-labelledby back to its tab; the tab carries
+  // aria-controls to this id (in Tabs). idBase namespaces the ids to this view.
+  const TAB_ID_BASE = 'module-detail';
+  const tabPanelAttrs = (id: string) => ({
+    id: tabPanelId(TAB_ID_BASE, id),
+    role: 'tabpanel' as const,
+    'aria-labelledby': tabId(TAB_ID_BASE, id),
+    tabIndex: 0,
+  });
+
   // TOOLS MOUNTED — the one metric we can source live today, and only for the terminus tool
   // hub: sum the aggregation client's per-terminus-module tool counts. Every other module has
   // no per-module tool count exposed yet (CGUI-08) → em-dash placeholder.
@@ -228,6 +245,41 @@ export function ModuleDetail({ module, health }: ModuleDetailProps) {
     if (el) el.scrollTop = el.scrollHeight;
   }, [log]);
 
+  // Extracted so the Overview tab (compact, 2-col) and the dedicated Flow/Config tabs
+  // (full-width) render the SAME section without duplicating markup.
+  const flowSection = (
+    <section style={{ ...panel, padding: 'var(--space-4)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+      <div style={panelHeader}>Position in flow</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+        <NodeBadge name={flow.source.name} role={flow.source.role} kind={flow.source.kind} />
+        <Connector reduced={reduced} />
+        <NodeBadge name={flow.core.name} role={flow.core.role} kind={flow.core.kind} pulse={!reduced} />
+        <Connector gradient reduced={reduced} />
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
+          {flow.endpoints.map(ep => (
+            <NodeBadge key={ep.name} name={ep.name} role={ep.role} kind={ep.kind} />
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+
+  const configSection = (
+    <section style={{ ...panel, padding: 'var(--space-4)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+      <div style={panelHeader}>Configuration</div>
+      <div style={{ display: 'flex', flexDirection: 'column' }}>
+        {config.map((row: ConfigRow, i) => (
+          <div key={row.key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 'var(--space-3)', padding: 'var(--space-3) 0', borderTop: i === 0 ? undefined : 'var(--border-width) solid var(--line-soft)' }}>
+            <span style={{ fontFamily: 'var(--font-sans)', fontSize: 'var(--fs-sm)', color: 'var(--text-300)' }}>{row.key}</span>
+            {row.badge
+              ? <Badge tone={row.badge.tone as BadgeToneName} mono>{row.badge.label}</Badge>
+              : <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)', color: 'var(--text-100)' }}>{row.value}</span>}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+
   return (
     <PanelRoot style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-5)', padding: 'var(--space-5)' }}>
       {/* ===== HEADER ===== */}
@@ -267,7 +319,7 @@ export function ModuleDetail({ module, health }: ModuleDetailProps) {
       {/* ===== 4 METRIC TILES ===== */}
       <div style={{ ...panel, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', overflow: 'hidden' }}>
         {metrics.map((m, i) => (
-          <div key={m.label} style={{ padding: 'var(--space-4)', borderLeft: i === 0 ? undefined : '1px solid var(--line-soft)' }}>
+          <div key={m.label} style={{ padding: 'var(--space-4)', borderLeft: i === 0 ? undefined : 'var(--border-width) solid var(--line-soft)' }}>
             <div style={{ ...monoFigure, color: m.figure === '—' ? 'var(--text-500)' : (m.label === 'spend today' ? 'var(--flux-green)' : 'var(--text-100)') }}>
               {m.figure}
             </div>
@@ -276,66 +328,62 @@ export function ModuleDetail({ module, health }: ModuleDetailProps) {
         ))}
       </div>
 
-      {/* ===== 2-COL ROW: POSITION IN FLOW + CONFIGURATION ===== */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 'var(--space-5)' }}>
-        {/* POSITION IN FLOW */}
-        <section style={{ ...panel, padding: 'var(--space-4)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
-          <div style={panelHeader}>Position in flow</div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
-            <NodeBadge name={flow.source.name} role={flow.source.role} kind={flow.source.kind} />
-            <Connector reduced={reduced} />
-            <NodeBadge name={flow.core.name} role={flow.core.role} kind={flow.core.kind} pulse={!reduced} />
-            <Connector gradient reduced={reduced} />
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
-              {flow.endpoints.map(ep => (
-                <NodeBadge key={ep.name} name={ep.name} role={ep.role} kind={ep.kind} />
-              ))}
-            </div>
-          </div>
-        </section>
+      {/* ===== TABS (§3.4) ===== */}
+      <Tabs
+        idBase={TAB_ID_BASE}
+        aria-label={`${module.title} detail sections`}
+        activeId={activeTab}
+        onSelect={id => setActiveTab(id as typeof activeTab)}
+        tabs={[
+          { id: 'overview', label: 'Overview' },
+          { id: 'config', label: 'Config' },
+          { id: 'flow', label: 'Flow' },
+          { id: 'logs', label: 'Logs', badge: String(log.length) },
+        ]}
+      />
 
-        {/* CONFIGURATION */}
-        <section style={{ ...panel, padding: 'var(--space-4)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
-          <div style={panelHeader}>Configuration</div>
-          <div style={{ display: 'flex', flexDirection: 'column' }}>
-            {config.map((row: ConfigRow, i) => (
-              <div key={row.key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 'var(--space-3)', padding: 'var(--space-3) 0', borderTop: i === 0 ? undefined : '1px solid var(--line-soft)' }}>
-                <span style={{ fontFamily: 'var(--font-sans)', fontSize: 'var(--fs-sm)', color: 'var(--text-300)' }}>{row.key}</span>
-                {row.badge
-                  ? <Badge tone={row.badge.tone as BadgeToneName} mono>{row.badge.label}</Badge>
-                  : <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)', color: 'var(--text-100)' }}>{row.value}</span>}
+      {/* ===== OVERVIEW TAB — the at-a-glance: flow diagram + configuration side by side ===== */}
+      {activeTab === 'overview' && (
+        <div {...tabPanelAttrs('overview')} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 'var(--space-5)' }}>
+          {flowSection}
+          {configSection}
+        </div>
+      )}
+
+      {/* ===== FLOW TAB — the position-in-flow diagram, full width ===== */}
+      {activeTab === 'flow' && <div {...tabPanelAttrs('flow')}>{flowSection}</div>}
+
+      {/* ===== CONFIG TAB — the configuration panel, full width ===== */}
+      {activeTab === 'config' && <div {...tabPanelAttrs('config')}>{configSection}</div>}
+
+      {/* ===== LOGS TAB — the live streaming log ===== */}
+      {activeTab === 'logs' && (
+        <section {...tabPanelAttrs('logs')} style={{ ...panel, display: 'flex', flexDirection: 'column', minHeight: 220 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', padding: 'var(--space-3) var(--space-4) var(--space-2)' }}>
+            {/* green header dot (guide §4) — 7px + glow, DS-parity geometry. */}
+            <span aria-hidden style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--flux-green)', boxShadow: 'var(--glow-green)', flexShrink: 0 }} />
+            <span style={panelHeader}>Live log — {module.title}</span>
+          </div>
+          <div
+            ref={logScrollRef}
+            className="hf-scroll"
+            role="log"
+            aria-live="polite"
+            aria-relevant="additions"
+            aria-label={`Live log — ${module.title}`}
+            style={{ flex: 1, minHeight: 0, maxHeight: 360, overflowY: 'auto', padding: '0 var(--space-4) var(--space-4)', display: 'flex', flexDirection: 'column', gap: 'var(--space-1)', fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)', lineHeight: 1.6 }}
+          >
+            {log.map((ln, i) => (
+              <div key={i}>
+                <span style={{ color: 'var(--text-500)' }}>{ln.time}</span>{' '}
+                <span style={{ color: ln.tag === '[ok]' ? 'var(--flux-green)' : 'var(--flux-blue)' }}>{ln.tag}</span>{' '}
+                <span style={{ color: 'var(--text-200)' }}>{ln.event}</span>{' '}
+                <span style={{ color: 'var(--text-500)' }}>cost={ln.cost}</span>
               </div>
             ))}
           </div>
         </section>
-      </div>
-
-      {/* ===== LIVE LOG (full width, scrolls) ===== */}
-      <section style={{ ...panel, display: 'flex', flexDirection: 'column', minHeight: 220 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', padding: 'var(--space-3) var(--space-4) var(--space-2)' }}>
-          {/* green header dot (guide §4) — 7px + glow, DS-parity geometry. */}
-          <span aria-hidden style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--flux-green)', boxShadow: 'var(--glow-green)', flexShrink: 0 }} />
-          <span style={panelHeader}>Live log — {module.title}</span>
-        </div>
-        <div
-          ref={logScrollRef}
-          className="hf-scroll"
-          role="log"
-          aria-live="polite"
-          aria-relevant="additions"
-          aria-label={`Live log — ${module.title}`}
-          style={{ flex: 1, minHeight: 0, maxHeight: 260, overflowY: 'auto', padding: '0 var(--space-4) var(--space-4)', display: 'flex', flexDirection: 'column', gap: 'var(--space-1)', fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)', lineHeight: 1.6 }}
-        >
-          {log.map((ln, i) => (
-            <div key={i}>
-              <span style={{ color: 'var(--text-500)' }}>{ln.time}</span>{' '}
-              <span style={{ color: ln.tag === '[ok]' ? 'var(--flux-green)' : 'var(--flux-blue)' }}>{ln.tag}</span>{' '}
-              <span style={{ color: 'var(--text-200)' }}>{ln.event}</span>{' '}
-              <span style={{ color: 'var(--text-500)' }}>cost={ln.cost}</span>
-            </div>
-          ))}
-        </div>
-      </section>
+      )}
     </PanelRoot>
   );
 }
