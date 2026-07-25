@@ -8,7 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "lint:adherence": "node scripts/adherence-lint.mjs"
   },
   "dependencies": {
     "@nivo/core": "0.99.0",

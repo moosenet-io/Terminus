@@ -8,9 +8,9 @@ interface ProviderCardProps {
 
 function tierColor(tier: ProviderTier): string {
   switch (tier) {
-    case 'premium': return 'var(--h-purple, #a78bfa)';
-    case 'standard': return 'var(--h-teal)';
-    default: return 'var(--h-text-muted)';
+    case 'premium': return 'var(--violet-400)';
+    case 'standard': return 'var(--accent)';
+    default: return 'var(--text-300)';
   }
 }
 
@@ -25,15 +25,15 @@ function statusDotClass(provider: Provider): string {
 }
 
 function rateLimitColor(pct: number): string {
-  if (pct >= 100) return 'var(--h-red, #f87171)';
-  if (pct >= 80) return 'var(--h-yellow, #facc15)';
-  return 'var(--h-green, #4ade80)';
+  if (pct >= 100) return 'var(--flux-rose)';
+  if (pct >= 80) return 'var(--flux-amber)';
+  return 'var(--flux-green)';
 }
 
 function costColor(pct: number): string {
-  if (pct >= 100) return 'var(--h-red, #f87171)';
-  if (pct >= 80) return 'var(--h-yellow, #facc15)';
-  return 'var(--h-green, #4ade80)';
+  if (pct >= 100) return 'var(--flux-rose)';
+  if (pct >= 80) return 'var(--flux-amber)';
+  return 'var(--flux-green)';
 }
 
 function fmtTokens(n: number): string {
@@ -58,7 +58,7 @@ function Sparkline({ data }: { data: number[] }) {
       <polyline
         points={pts}
         fill="none"
-        stroke="var(--h-teal)"
+        stroke="var(--accent)"
         strokeWidth={1.5}
         strokeLinejoin="round"
         strokeLinecap="round"
@@ -117,7 +117,7 @@ export function ProviderCard({ provider, onToggle }: ProviderCardProps) {
             padding: '1px 5px',
             borderRadius: 3,
             background: provider.type === 'local' ? 'rgba(20,184,166,0.15)' : 'rgba(167,139,250,0.15)',
-            color: provider.type === 'local' ? 'var(--h-teal)' : 'var(--h-purple, #a78bfa)',
+            color: provider.type === 'local' ? 'var(--accent)' : 'var(--violet-400)',
           }}>
             {provider.type}
           </span>
@@ -131,7 +131,7 @@ export function ProviderCard({ provider, onToggle }: ProviderCardProps) {
               borderRadius: 9,
               border: 'none',
               cursor: toggling ? 'wait' : 'pointer',
-              background: provider.enabled ? 'var(--h-teal)' : 'var(--h-border, #334155)',
+              background: provider.enabled ? 'var(--accent)' : 'var(--border)',
               position: 'relative',
               padding: 0,
               flexShrink: 0,
@@ -146,7 +146,7 @@ export function ProviderCard({ provider, onToggle }: ProviderCardProps) {
               width: 14,
               height: 14,
               borderRadius: '50%',
-              background: '#fff',
+              background: 'var(--accent-on)',
               transition: 'left 0.15s',
             }} />
           </button>
@@ -162,14 +162,14 @@ export function ProviderCard({ provider, onToggle }: ProviderCardProps) {
             border: '1px solid rgba(248,113,113,0.3)',
             fontSize: 11,
           }}>
-            <div style={{ color: 'var(--h-red, #f87171)', marginBottom: 6 }}>
+            <div style={{ color: 'var(--flux-rose)', marginBottom: 6 }}>
               {provider.active_tasks} active task{provider.active_tasks !== 1 ? 's' : ''} — disable anyway?
             </div>
             <div style={{ display: 'flex', gap: 6 }}>
               <button
                 className="h-btn"
                 onClick={confirmDisable}
-                style={{ fontSize: 10, padding: '2px 8px', background: 'var(--h-red, #f87171)', color: '#fff', border: 'none' }}
+                style={{ fontSize: 10, padding: '2px 8px', background: 'var(--flux-rose)', color: 'var(--accent-on)', border: 'none' }}
               >
                 Disable
               </button>
@@ -186,10 +186,10 @@ export function ProviderCard({ provider, onToggle }: ProviderCardProps) {
 
         {/* Latency */}
         {provider.latency_ms !== null && provider.enabled && (
-          <div style={{ fontSize: 11, color: 'var(--h-text-muted)', marginBottom: 8 }}>
+          <div style={{ fontSize: 11, color: 'var(--text-300)', marginBottom: 8 }}>
             {provider.latency_ms}ms latency
             {provider.status === 'degraded' && (
-              <span style={{ marginLeft: 6, color: 'var(--h-yellow, #facc15)' }}>⚠ degraded</span>
+              <span style={{ marginLeft: 6, color: 'var(--flux-amber)' }}>degraded</span>
             )}
           </div>
         )}
@@ -204,11 +204,11 @@ export function ProviderCard({ provider, onToggle }: ProviderCardProps) {
               fontVariantNumeric: 'tabular-nums',
             }}>
               ${cost.used_usd.toFixed(2)}
-              <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--h-text-muted)', marginLeft: 4 }}>
+              <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--text-300)', marginLeft: 4 }}>
                 / ${cost.budget_usd.toFixed(2)}
               </span>
             </div>
-            <div style={{ marginTop: 4, height: 4, borderRadius: 2, background: 'var(--h-border, #334155)', overflow: 'hidden' }}>
+            <div style={{ marginTop: 4, height: 4, borderRadius: 2, background: 'var(--border)', overflow: 'hidden' }}>
               <div style={{
                 height: '100%',
                 width: `${Math.min(cost.pct_used, 100)}%`,
@@ -216,24 +216,24 @@ export function ProviderCard({ provider, onToggle }: ProviderCardProps) {
                 transition: 'width 0.3s',
               }} />
             </div>
-            <div style={{ fontSize: 10, color: 'var(--h-text-muted)', marginTop: 2 }}>
+            <div style={{ fontSize: 10, color: 'var(--text-300)', marginTop: 2 }}>
               {cost.pct_used.toFixed(0)}% budget used
             </div>
           </div>
         )}
 
         {/* Usage stats */}
-        <div style={{ fontSize: 11, color: 'var(--h-text-dim)', marginBottom: 8 }}>
+        <div style={{ fontSize: 11, color: 'var(--text-200)', marginBottom: 8 }}>
           {fmtTokens(usage.tokens_24h)} tokens · {usage.requests_24h} requests (24h)
         </div>
 
         {/* Rate limit bar */}
         <div style={{ marginBottom: 8 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--h-text-muted)', marginBottom: 2 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-300)', marginBottom: 2 }}>
             <span>Rate limit</span>
             <span style={{ color: rateLimitColor(usage.rate_limit_pct) }}>{usage.rate_limit_pct.toFixed(0)}%</span>
           </div>
-          <div style={{ height: 3, borderRadius: 2, background: 'var(--h-border, #334155)', overflow: 'hidden' }}>
+          <div style={{ height: 3, borderRadius: 2, background: 'var(--border)', overflow: 'hidden' }}>
             <div style={{
               height: '100%',
               width: `${Math.min(usage.rate_limit_pct, 100)}%`,
@@ -259,7 +259,7 @@ export function ProviderCard({ provider, onToggle }: ProviderCardProps) {
                 padding: '1px 5px',
                 borderRadius: 3,
                 background: 'rgba(255,255,255,0.05)',
-                border: '1px solid var(--h-border, #334155)',
+                border: '1px solid var(--border)',
                 color: tierColor(m.tier),
               }} title={`Context: ${m.context_window.toLocaleString()} tokens`}>
                 {m.name}
@@ -278,7 +278,7 @@ export function ProviderCard({ provider, onToggle }: ProviderCardProps) {
             padding: '1px 5px',
             borderRadius: 3,
             background: 'rgba(255,255,255,0.08)',
-            color: 'var(--h-text-muted)',
+            color: 'var(--text-300)',
             letterSpacing: '0.05em',
             textTransform: 'uppercase',
           }}>
