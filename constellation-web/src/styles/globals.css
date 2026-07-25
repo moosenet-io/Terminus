@@ -577,6 +577,79 @@ body {
 .h-table tr:last-child td { border-bottom: none; }
 .h-table tr:hover td { background: var(--bg-hover); }
 
+/* S127 TGUI2 POL-06/08 — dense professional data table (Cloudflare/Linear density).
+   Sortable header buttons, tighter rows, sticky header, expandable detail rows, pagination. */
+.h-dtable { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+.h-dtable thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--bg-panel);
+  color: var(--text-400);
+  font-family: var(--font-mono); font-size: var(--fs-mono-sm); font-weight: var(--fw-medium);
+  text-transform: uppercase; letter-spacing: var(--ls-label);
+  text-align: left; padding: 6px 10px;
+  border-bottom: var(--border-width) solid var(--border);
+  white-space: nowrap;
+}
+.h-dtable tbody td { padding: 5px 10px; border-bottom: var(--border-width) solid var(--line-soft); vertical-align: middle; }
+.h-dtable tbody tr:last-child td { border-bottom: none; }
+.h-dtable tbody tr.h-dtable-row:hover td { background: var(--bg-hover); }
+.h-dtable-num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right; }
+/* sortable header trigger */
+.h-dtable-sortbtn {
+  all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;
+  font: inherit; letter-spacing: inherit; text-transform: inherit; color: inherit; width: 100%;
+}
+.h-dtable-sortbtn:hover { color: var(--text-200); }
+.h-dtable-sortbtn:focus-visible { outline: var(--border-width) solid var(--accent); outline-offset: 2px; }
+.h-dtable-caret { font-size: 9px; line-height: 1; opacity: 0.5; }
+.h-dtable-caret[data-active="true"] { opacity: 1; color: var(--text-200); }
+/* expandable */
+.h-dtable-row-expandable td { cursor: pointer; }
+.h-dtable-chevron { display: inline-block; color: var(--text-tertiary); font-size: var(--fs-xs); transition: transform var(--dur-fast) var(--ease-out); }
+.h-dtable-chevron[data-open="true"] { transform: rotate(90deg); }
+.h-dtable-detail-td { padding: 0 !important; background: var(--space-800); }
+.h-dtable-detail-inner { padding: var(--space-3); border-bottom: var(--border-width) solid var(--border); }
+/* pagination footer */
+.h-dtable-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space-3);
+  padding-top: var(--space-2); flex-wrap: wrap;
+}
+.h-dtable-count { font-family: var(--font-mono); font-size: var(--fs-mono-sm); color: var(--text-400); }
+.h-pagebtn {
+  font-family: var(--font-mono); font-size: var(--fs-mono-sm);
+  background: var(--space-700); color: var(--text-secondary);
+  border: var(--border-width) solid var(--border); border-radius: var(--radius-sm);
+  padding: 3px 10px; cursor: pointer;
+}
+.h-pagebtn:hover:not(:disabled) { border-color: var(--line-accent); color: var(--text-primary); }
+.h-pagebtn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* S127 TGUI2 POL-07 — contextual toolbar (Linear pattern): neutral search + filters. */
+.h-toolbar { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+.h-toolbar-spacer { flex: 1 1 auto; }
+.h-input, .h-select {
+  background: var(--space-700); color: var(--text-primary);
+  border: var(--border-width) solid var(--border); border-radius: var(--radius-md);
+  padding: 5px 10px; font-size: var(--fs-sm);
+}
+.h-input::placeholder { color: var(--text-500); }
+.h-input:focus-visible, .h-select:focus-visible { outline: none; border-color: var(--line-accent); }
+.h-select { font-family: var(--font-mono); font-size: var(--fs-mono-sm); cursor: pointer; }
+/* neutral segmented control — subtle active state, never a rainbow at rest */
+.h-seg { display: inline-flex; gap: 2px; background: var(--space-800); border-radius: var(--radius-sm); padding: 2px; }
+.h-seg-btn {
+  font-family: var(--font-mono); font-size: var(--fs-mono-sm);
+  text-transform: uppercase; letter-spacing: var(--ls-label);
+  padding: 3px 10px; border-radius: var(--radius-xs); border: none; cursor: pointer;
+  background: transparent; color: var(--text-muted);
+}
+.h-seg-btn[data-active="true"] { background: var(--space-600); color: var(--text-primary); box-shadow: inset 0 0 0 1px var(--line-accent); }
+.h-seg-btn:hover:not([data-active="true"]) { color: var(--text-secondary); }
+
+/* S127 TGUI2 POL-08 — sequential color-ramp legend for the coverage heatmap. */
+.h-ramp-legend { display: flex; align-items: center; gap: var(--space-2); font-family: var(--font-mono); font-size: var(--fs-mono-sm); color: var(--text-400); }
+.h-ramp-bar { height: 8px; width: 120px; border-radius: var(--radius-pill); border: var(--border-width) solid var(--border); }
+
 /* Progress bar */
 .h-progress { height: 4px; border-radius: var(--radius-sm); background: var(--bg-surface-raised); overflow: hidden; }
 .h-progress-fill { height: 100%; border-radius: var(--radius-sm); transition: width 0.3s var(--ease-out); }

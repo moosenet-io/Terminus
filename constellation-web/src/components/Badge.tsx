@@ -30,14 +30,24 @@ interface BadgeProps {
   dot?: boolean;
   /** @deprecated use `dot` — retained so existing callers don't break. */
   glowDot?: boolean;
+  /**
+   * S127 TGUI2 M6 — override the leading dot's color independently of the chip body. Lets a
+   * NEUTRAL outline chip carry a tiny semantic leading dot (read/write/admin scannability)
+   * while the chip body stays neutral — the "one colored token per row" rule. Pass a CSS var.
+   */
+  dotColor?: string;
   /** JetBrains Mono rendering for cost/tier badges. */
   mono?: boolean;
   className?: string;
   style?: React.CSSProperties;
 }
 
-export function Badge({ tone = 'neutral', children, dot, glowDot = false, mono = false, className, style }: BadgeProps) {
-  const showDot = dot ?? glowDot;
+export function Badge({ tone = 'neutral', children, dot, glowDot = false, dotColor, mono = false, className, style }: BadgeProps) {
+  // Render the leading dot whenever an explicit `dotColor` is supplied — the M6 neutral-chip
+  // pattern is a neutral body + a semantic dot, and forgetting `dot` at a call site must not
+  // silently drop that dot (which would strip the only kind/status signal from the chip).
+  const showDot = (dot ?? glowDot) || dotColor != null;
+  const dotInk = dotColor ?? TONE_DOT[tone];
   return (
     <span
       className={`h-badge ${TONE_CLASS[tone]}${mono ? ' h-badge-mono' : ''}${className ? ` ${className}` : ''}`}
@@ -50,8 +60,9 @@ export function Badge({ tone = 'neutral', children, dot, glowDot = false, mono =
             width: 6,
             height: 6,
             borderRadius: '50%',
-            background: TONE_DOT[tone],
-            boxShadow: `0 0 8px ${TONE_DOT[tone]}`,
+            background: dotInk,
+            // S127 M6: no glow halo on the neutral-chip semantic dot (data-dense rows stay crisp,
+            // per M3 "no ambient glow"); the solid 6px dot alone carries the scannability cue.
             flexShrink: 0,
           }}
         />
