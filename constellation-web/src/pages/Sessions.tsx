@@ -1,6 +1,7 @@
 // TRCI-03: Session grouping — list and detail views.
 import { useState, useEffect } from 'react';
 import { getAggregationClient } from '../lib/aggregationClient';
+import { onEnterOrSpace } from '../lib/a11y';
 
 interface Session {
   id: string;
@@ -47,6 +48,8 @@ export function Sessions() {
         <div style={{ display: 'grid', gap: 8 }}>
           {sessions.map(s => (
             <div key={s.id} onClick={() => setSelected(selected?.id === s.id ? null : s)}
+              onKeyDown={onEnterOrSpace(() => setSelected(selected?.id === s.id ? null : s))}
+              role="button" tabIndex={0} aria-expanded={selected?.id === s.id}
               className="h-card" style={{ cursor: 'pointer', border: selected?.id === s.id ? '1px solid var(--accent)' : undefined }}>
               <div className="h-card-header" style={{ cursor: 'pointer' }}>
                 <div>

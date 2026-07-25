@@ -14,6 +14,7 @@
 // primitives (Card/NodeBadge/StatusPill) already take. adherence-lint runs in warn mode.
 import { createElement, useEffect, useReducer, useRef, useState, type CSSProperties, type ReactElement } from 'react';
 import { StatusPill, type PillState } from '../../components/StatusPill';
+import { onEnterOrSpace } from '../../lib/a11y';
 import {
   ForestEngine, SPECS, STAGES, TYPE_DOT, TICK_MS, hashStr, mulberry32, leafPath,
   type Issue, type Phase,
@@ -255,13 +256,13 @@ export function HarmonyForestPanel() {
         </div>
 
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <span onClick={() => engine.toggleAnnotate()} role="button" tabIndex={0}
+          <span onClick={() => engine.toggleAnnotate()} onKeyDown={onEnterOrSpace(() => engine.toggleAnnotate())} role="button" tabIndex={0} aria-pressed={engine.annotate}
             style={{ fontFamily: 'var(--font-mono)', fontSize: '11px', padding: '7px 12px', borderRadius: 'var(--radius-sm)', cursor: 'pointer', border: `1px solid ${engine.annotate ? 'var(--line-strong)' : 'var(--line-soft)'}`, background: engine.annotate ? 'rgba(124,58,237,0.2)' : 'transparent', color: engine.annotate ? 'var(--violet-200)' : 'var(--text-300)' }}>Spec layer</span>
-          <span onClick={() => engine.reset()} role="button" tabIndex={0} style={secondaryBtn}>Reset</span>
+          <span onClick={() => engine.reset()} onKeyDown={onEnterOrSpace(() => engine.reset())} role="button" tabIndex={0} style={secondaryBtn}>Reset</span>
           {engine.phase === 'building' && (
-            <span onClick={() => engine.togglePause()} role="button" tabIndex={0} style={{ ...secondaryBtn, color: 'var(--text-100)' }}>{engine.running ? 'Pause' : 'Resume'}</span>
+            <span onClick={() => engine.togglePause()} onKeyDown={onEnterOrSpace(() => engine.togglePause())} role="button" tabIndex={0} style={{ ...secondaryBtn, color: 'var(--text-100)' }}>{engine.running ? 'Pause' : 'Resume'}</span>
           )}
-          <span onClick={() => engine.grow()} role="button" tabIndex={0}
+          <span onClick={() => engine.grow()} onKeyDown={onEnterOrSpace(() => engine.grow())} role="button" tabIndex={0}
             style={{ fontFamily: 'var(--font-sans)', fontWeight: 600, fontSize: '13px', padding: '8px 18px', borderRadius: 'var(--radius-md)', cursor: 'pointer', color: 'var(--accent-on)', background: 'var(--grad-accent)', boxShadow: 'var(--glow-violet-soft)' }}>{simLabel}</span>
         </div>
       </header>

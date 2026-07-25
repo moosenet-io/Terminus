@@ -104,8 +104,10 @@ export function GlobalBar({
         <Wordmark />
       </button>
 
-      {/* Crate tabs — active = violet-filled pill (§3.1). */}
+      {/* Crate tabs — active = violet-filled pill (§3.1). Exposed as an ARIA tablist so a
+          screen reader announces the selected crate (aria-selected) and the tab count. */}
       <nav
+        role="tablist"
         aria-label="Crates"
         style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flex: 1, overflowX: 'auto' }}
       >
@@ -114,7 +116,9 @@ export function GlobalBar({
           return (
             <button
               key={c.id}
+              role="tab"
               onClick={() => onSelectCrate(c.id)}
+              aria-selected={active}
               aria-current={active ? 'page' : undefined}
               style={{
                 display: 'flex',

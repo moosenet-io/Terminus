@@ -1,6 +1,7 @@
 // TRCI-02: Prompt version registry viewer with side-by-side diff.
 import { useState, useEffect } from 'react';
 import { getAggregationClient } from '../lib/aggregationClient';
+import { onEnterOrSpace } from '../lib/a11y';
 
 interface PromptVersion {
   id: string;
@@ -82,7 +83,8 @@ export function Prompts() {
           {filtered.map(v => {
             const isSel = selected.includes(v.id);
             return (
-              <div key={v.id} onClick={() => toggleSelect(v.id)} className="h-card"
+              <div key={v.id} onClick={() => toggleSelect(v.id)} onKeyDown={onEnterOrSpace(() => toggleSelect(v.id))}
+                role="button" tabIndex={0} aria-pressed={isSel} className="h-card"
                 style={{ cursor: 'pointer', border: `1px solid ${isSel ? 'var(--accent)' : 'var(--border)'}`, background: isSel ? 'var(--accent-soft)' : undefined }}>
                 <div className="h-card-body">
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>

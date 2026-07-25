@@ -2,6 +2,7 @@
 import { useState, useEffect, useRef } from 'react';
 import type { ExecutorSummary } from '../hooks/useExecutorState';
 import type { Worker } from '../types/api';
+import { onEnterOrSpace } from '../lib/a11y';
 
 interface Props { summary: ExecutorSummary; }
 
@@ -15,9 +16,10 @@ export function ExecutorCard({ summary }: Props) {
 
   return (
     <div className="h-card">
-      <div className="h-card-header" onClick={() => setExpanded(e => !e)}>
+      <div className="h-card-header" role="button" tabIndex={0} aria-expanded={expanded}
+        onClick={() => setExpanded(e => !e)} onKeyDown={onEnterOrSpace(() => setExpanded(e => !e))}>
         <div className="h-flex h-gap-sm">
-          <span className={`h-dot ${activeCount > 0 ? 'h-dot-green h-pulse' : 'h-dot-dim'}`} />
+          <span aria-hidden className={`h-dot ${activeCount > 0 ? 'h-dot-green h-pulse' : 'h-dot-dim'}`} />
           <span style={{ fontWeight: 600, fontSize: 13 }}>Engine</span>
           <span style={{ fontSize: 12, color: 'var(--text-200)' }}>— {statusText}</span>
         </div>

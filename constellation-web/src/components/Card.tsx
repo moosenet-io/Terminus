@@ -2,6 +2,7 @@
 // CONST-17: restyled to the Terminus brand (§2.3) — gradient fill, violet hairline/glow,
 // new `glow`/`accent` emphasis props. API kept: same 4 variants, same StatusColor union.
 import { useState } from 'react';
+import { onEnterOrSpace } from '../lib/a11y';
 
 type CardVariant = 'metric' | 'content' | 'interactive' | 'expandable';
 
@@ -100,7 +101,11 @@ export function Card({
         {accentOverlay}
         <div
           className="h-card-header"
+          role="button"
+          tabIndex={0}
+          aria-expanded={header != null ? expanded : undefined}
           onClick={() => { setExpanded(e => !e); onClick?.(); }}
+          onKeyDown={onEnterOrSpace(() => { setExpanded(e => !e); onClick?.(); })}
           style={{ transition: `background var(--dur-fast) var(--ease-out)`, ...(padding ? { padding } : {}) }}
         >
           <div style={{ flex: 1 }}>{header ?? children}</div>
@@ -134,6 +139,10 @@ export function Card({
       <div
         className={`h-card-interactive${className ? ` ${className}` : ''}`}
         onClick={onClick}
+        // A clickable card is a custom control: make it keyboard-reachable + Enter/Space
+        // operable when it actually carries an onClick (CGUI-13). Purely presentational
+        // interactive cards (no handler) stay non-focusable.
+        {...(onClick ? { role: 'button', tabIndex: 0, onKeyDown: onEnterOrSpace(onClick) } : {})}
         style={{ padding: padding ?? paddingMap.interactive, ...emphasisStyle, ...style }}
       >
         {accentOverlay}
@@ -146,6 +155,7 @@ export function Card({
     <div
       className={`h-card${className ? ` ${className}` : ''}`}
       onClick={onClick}
+      {...(onClick ? { role: 'button', tabIndex: 0, onKeyDown: onEnterOrSpace(onClick) } : {})}
       style={{ padding: padding ?? paddingMap[variant], ...emphasisStyle, ...style }}
     >
       {accentOverlay}
