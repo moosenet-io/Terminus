@@ -276,7 +276,12 @@ body {
 .const-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 0;
+  /* z-index:-1 (not 0): the backdrop is a POSITIONED element, so at z-index:0 it would paint
+     AFTER — i.e. on top of — its non-positioned in-flow siblings (the rail + canvas row),
+     obscuring /overview. A negative z-index parks it behind the shell's in-flow content while
+     staying inside the shell's stacking context (the shell column is position:relative;z-index:1,
+     the GlobalBar z-index:2, and the content row position:relative;z-index:1 — all above this). */
+  z-index: -1;
   pointer-events: none;
   background:
     radial-gradient(70% 55% at 14% 2%, rgba(124, 58, 237, 0.16), transparent 60%),

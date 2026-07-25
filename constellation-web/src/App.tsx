@@ -354,7 +354,10 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
         role={sessionRole}
       />
 
-      <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
+      {/* position:relative + zIndex:1 makes this rail+canvas row a real stacking context ABOVE
+          the deep-space backdrop (which is position:fixed;z-index:-1) — without it, this
+          non-positioned in-flow row would be painted UNDER the positioned backdrop and obscured. */}
+      <div style={{ position: 'relative', zIndex: 1, flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
         {/* Left rail: drilled into a module → its panel rail (unchanged CONST-16 behaviour);
             otherwise the Overview crate rail — the active crate's modules grouped by flow role
             (§3.1). Only mounted once health has loaded so the crate rail never flashes empty. */}
