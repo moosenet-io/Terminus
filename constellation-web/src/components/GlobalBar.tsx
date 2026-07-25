@@ -1,51 +1,55 @@
-// CONST-16: the two-tier shell's top bar (§3.1). Replaces Sidebar as the module switcher —
-// module tabs (from `getAvailableModules(health)`, in `order`) carry a health dot; plus the
-// wordmark, a ⌘K search/palette trigger, the density toggle, and the account chip.
+// CONST-16 / CGUI-12: the two-tier shell's top bar (guide-spec §3.1). The persistent global
+// frame: wordmark (violet node dot + "terminus") · three crate tabs (lumina-core / chord-proxy /
+// terminus-rs, active = violet-filled pill) · a search field ("search tools… ⌘K") · a
+// Comfortable/Compact density toggle (segmented, active violet) · an account circle.
 //
-// CONST-25: the ⌘K trigger button here just calls `onOpenPalette` — the palette's own open
-// state, keyboard shortcut, and markup live in App.tsx's Shell + `CommandPalette.tsx` now (so
-// Ctrl/Cmd+K works everywhere the shell is mounted, not only while this bar has focus). This
-// file no longer owns any palette state itself.
-import { useNavigate } from 'react-router-dom';
-import type { ModuleDescriptor } from '../lib/moduleRegistry';
-import type { HealthStatus } from '../lib/aggregationClient';
+// CGUI-12 note — the app models MODULES, not crates (there is no backend crate entity). So the
+// crate tabs are a CLIENT-SIDE grouping/filter (see lib/crates.ts): selecting a crate scopes the
+// left rail + card canvas to that crate's modules. This replaces the earlier CONST-16 per-module
+// tab strip, whose module navigation now lives in the crate-scoped left rail (guide §3.1).
+//
+// CONST-25: the ⌘K search button just calls `onOpenPalette` — the palette's own open state,
+// keyboard shortcut, and markup live in App.tsx's Shell + `CommandPalette.tsx`, so Ctrl/Cmd+K
+// works everywhere the shell is mounted, not only while this bar has focus.
 import type { FeedItem } from '../lib/activityFeed';
+import type { CrateDescriptor, CrateId } from '../lib/crates';
 import { Wordmark } from './Wordmark';
 import { NotificationBell } from './NotificationBell';
 
 export type Density = 'comfortable' | 'compact';
 
 interface GlobalBarProps {
-  modules: ModuleDescriptor[];
-  health: HealthStatus[];
-  /** healthSystem ids currently inside the 2-cycle stale-while-degrading grace window. */
-  degradedSystems: Set<string>;
-  activeModuleId: string | null;
-  onSelectModule: (id: string) => void;
+  /** The three guide crates rendered as tabs. */
+  crates: readonly CrateDescriptor[];
+  activeCrateId: CrateId;
+  onSelectCrate: (id: CrateId) => void;
   density: Density;
   onDensityChange: (d: Density) => void;
   username?: string | null;
   onLogout?: () => void;
   /** True when the last health poll failed outright (network/backend down); the bar shows a
-   *  degraded indicator while continuing to render the last known module set (edge case §10). */
+   *  degraded indicator while continuing to render the last known state (edge case §10). */
   pollDegraded: boolean;
   /** Present only in the <760px "drawer" rail variant — renders a menu trigger before the
-   *  wordmark that opens the ModuleRail drawer. */
+   *  wordmark that opens the module rail drawer. */
   onOpenMenu?: () => void;
   /** CONST-25: opens the full CommandPalette (owned by App.tsx's Shell). */
   onOpenPalette: () => void;
   /** CONST-26 (§3.3): the shell's merged activity feed — backs the bell menu here. Optional so
-   *  every existing caller of `GlobalBar` keeps compiling untouched; the bell simply doesn't
-   *  render when omitted. */
+   *  every existing caller keeps compiling untouched; the bell simply doesn't render when omitted. */
   feedItems?: FeedItem[];
 }
 
+/** First (uppercase) glyph of the account label, for the account circle. */
+function accountInitial(username?: string | null): string {
+  const c = (username ?? '').trim()[0];
+  return c ? c.toUpperCase() : '@';
+}
+
 export function GlobalBar({
-  modules,
-  health,
-  degradedSystems,
-  activeModuleId,
-  onSelectModule,
+  crates,
+  activeCrateId,
+  onSelectCrate,
   density,
   onDensityChange,
   username,
@@ -55,13 +59,11 @@ export function GlobalBar({
   onOpenPalette,
   feedItems,
 }: GlobalBarProps) {
-  const navigate = useNavigate();
-
-  const healthFor = (systemId: string) => health.find(h => h.system === systemId);
-
   return (
     <div
       style={{
+        position: 'relative',
+        zIndex: 2,
         display: 'flex',
         alignItems: 'center',
         gap: 'var(--space-4)',
@@ -69,7 +71,9 @@ export function GlobalBar({
         height: 52,
         flexShrink: 0,
         borderBottom: '1px solid var(--border-subtle)',
-        background: 'rgba(0,0,0,0.2)',
+        // Translucent so the fixed deep-space backdrop reads through the bar (guide §0 frame).
+        background: 'linear-gradient(180deg, rgba(22,17,44,0.72), rgba(13,11,26,0.55))',
+        backdropFilter: 'blur(8px)',
       }}
     >
       {onOpenMenu && (
@@ -91,67 +95,69 @@ export function GlobalBar({
         </button>
       )}
 
+      {/* Wordmark → the active crate's overview (App wires onSelectCrate to also navigate). */}
       <button
-        onClick={() => navigate('/overview')}
+        onClick={() => onSelectCrate(activeCrateId)}
         style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0, flexShrink: 0 }}
-        aria-label="Go to Overview"
+        aria-label="Go to overview"
       >
         <Wordmark />
       </button>
 
+      {/* Crate tabs — active = violet-filled pill (§3.1). */}
       <nav
-        aria-label="Modules"
-        style={{ display: 'flex', alignItems: 'center', gap: 2, overflowX: 'auto', flex: 1, height: '100%' }}
+        aria-label="Crates"
+        style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flex: 1, overflowX: 'auto' }}
       >
-        {modules.map(m => {
-          const h = healthFor(m.healthSystem);
-          const active = m.id === activeModuleId;
-          const degraded = degradedSystems.has(m.healthSystem);
-          const dotColor = degraded
-            ? 'var(--status-warning)'
-            : h?.available
-              ? 'var(--status-success)'
-              : 'var(--text-tertiary)';
+        {crates.map(c => {
+          const active = c.id === activeCrateId;
           return (
             <button
-              key={m.id}
-              onClick={() => onSelectModule(m.id)}
+              key={c.id}
+              onClick={() => onSelectCrate(c.id)}
               aria-current={active ? 'page' : undefined}
-              title={degraded ? `${m.title} — degraded (stale-while-recovering)` : m.title}
               style={{
                 display: 'flex',
                 alignItems: 'center',
-                gap: 6,
-                background: 'none',
-                border: 'none',
+                gap: 'var(--space-2)',
+                background: active ? 'var(--accent-soft)' : 'transparent',
+                border: active ? '1px solid var(--border-emphasis)' : '1px solid transparent',
+                borderRadius: 'var(--radius-pill)',
                 cursor: 'pointer',
-                padding: '0 var(--space-3)',
-                height: '100%',
-                color: active ? 'var(--text-primary)' : 'var(--text-secondary)',
-                fontSize: 'var(--text-base)',
+                padding: 'var(--space-1) var(--space-3)',
+                color: active ? 'var(--text-primary)' : 'var(--text-tertiary)',
+                fontFamily: 'var(--font-mono)',
+                fontSize: 'var(--fs-mono-sm)',
+                letterSpacing: 'var(--ls-mono)',
                 fontWeight: active ? 600 : 400,
-                borderBottom: active ? '2px solid var(--accent-primary)' : '2px solid transparent',
                 whiteSpace: 'nowrap',
               }}
             >
               <span
                 aria-hidden
-                style={{ width: 6, height: 6, borderRadius: '50%', background: dotColor, flexShrink: 0 }}
+                style={{
+                  width: 6,
+                  height: 6,
+                  borderRadius: '50%',
+                  background: active ? 'var(--node-core)' : 'var(--text-500)',
+                  boxShadow: active ? '0 0 7px var(--node-core)' : 'none',
+                  flexShrink: 0,
+                }}
               />
-              <span aria-hidden>{m.icon}</span>
-              {m.title}
+              {c.title}
             </button>
           );
         })}
-        {modules.length === 0 && (
-          <span style={{ color: 'var(--text-tertiary)', fontSize: 'var(--text-sm)' }}>No modules available</span>
-        )}
       </nav>
 
+      {/* Search field / ⌘K palette trigger. */}
       <button
         onClick={onOpenPalette}
-        aria-label="Open command palette"
+        aria-label="Search tools"
         style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 'var(--space-2)',
           background: 'var(--bg-surface)',
           border: '1px solid var(--border-default)',
           color: 'var(--text-tertiary)',
@@ -162,9 +168,11 @@ export function GlobalBar({
           flexShrink: 0,
         }}
       >
-        search… <kbd style={{ fontFamily: 'var(--font-mono)' }}>⌘K</kbd>
+        search tools…{' '}
+        <kbd style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)' }}>⌘K</kbd>
       </button>
 
+      {/* Density toggle — segmented, active = violet (§3.1). */}
       <div
         role="group"
         aria-label="Density"
@@ -187,7 +195,7 @@ export function GlobalBar({
               border: 'none',
               cursor: 'pointer',
               textTransform: 'capitalize',
-              background: density === d ? 'var(--accent-primary-subtle)' : 'transparent',
+              background: density === d ? 'var(--accent-soft)' : 'transparent',
               color: density === d ? 'var(--accent-primary)' : 'var(--text-tertiary)',
             }}
           >
@@ -207,34 +215,53 @@ export function GlobalBar({
             ⚠
           </span>
         )}
-        {username && (
-          <span
-            title={username}
-            style={{
-              fontSize: 'var(--text-sm)',
-              color: 'var(--text-secondary)',
-              maxWidth: 120,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-            }}
-          >
-            {username}
-          </span>
-        )}
-        {onLogout && (
+        {/* Account circle — blue avatar with the account initial; a plain button so Sign out is
+            still reachable (title carries the full username). */}
+        {onLogout ? (
           <button
             onClick={onLogout}
+            title={username ? `${username} — sign out` : 'Sign out'}
+            aria-label={username ? `${username}, sign out` : 'Sign out'}
             style={{
-              background: 'none',
-              border: 'none',
-              color: 'var(--text-tertiary)',
+              width: 28,
+              height: 28,
+              borderRadius: '50%',
+              flexShrink: 0,
+              background: 'rgba(59,130,246,0.18)',
+              border: '1px solid var(--node-source)',
+              color: 'var(--flux-blue-soft)',
+              fontFamily: 'var(--font-sans)',
+              fontWeight: 600,
+              fontSize: 'var(--fs-sm)',
               cursor: 'pointer',
-              fontSize: 'var(--text-xs)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
             }}
           >
-            Sign out
+            {accountInitial(username)}
           </button>
+        ) : (
+          <span
+            aria-hidden
+            style={{
+              width: 28,
+              height: 28,
+              borderRadius: '50%',
+              flexShrink: 0,
+              background: 'rgba(59,130,246,0.18)',
+              border: '1px solid var(--node-source)',
+              color: 'var(--flux-blue-soft)',
+              fontFamily: 'var(--font-sans)',
+              fontWeight: 600,
+              fontSize: 'var(--fs-sm)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+          >
+            {accountInitial(username)}
+          </span>
         )}
       </div>
     </div>
