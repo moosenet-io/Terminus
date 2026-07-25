@@ -6,6 +6,7 @@
 // degrade pattern). Paged + filterable by system/method/principal.
 import { useEffect, useMemo, useState } from 'react';
 import { Card, CardTitle } from '../../components/Card';
+import { PanelRoot } from '../../components/PanelRoot';
 import { Badge } from '../../components/Badge';
 import { SkeletonList } from '../../components/Skeleton';
 import { DataTable } from '../../components/DataTable';
@@ -101,7 +102,7 @@ export function ActivityPanel() {
   }
 
   return (
-    <div style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+    <PanelRoot style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
       <CardTitle subtitle="Recent cross-system requests, filterable by system/method/principal">
         Terminus — Activity
       </CardTitle>
@@ -165,6 +166,6 @@ export function ActivityPanel() {
           )}
         </>
       )}
-    </div>
+    </PanelRoot>
   );
 }
