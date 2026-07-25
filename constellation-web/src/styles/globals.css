@@ -244,6 +244,17 @@ body {
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
+/* CGUI-02 (TERM #525): panel-scroll custom scrollbar used by <PanelRoot>.
+   The scroll container itself carries `height:100%; min-height:0; overflow-y:auto`
+   (min-height:0 on the flex child is the load-bearing bit); this class only styles
+   its scrollbar per the guide-spec §5 `.hf-scroll` treatment (width 8px, violet
+   thumb radius 8px, transparent track). */
+.hf-scroll { scrollbar-width: thin; scrollbar-color: rgba(168, 85, 247, 0.25) transparent; }
+.hf-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.hf-scroll::-webkit-scrollbar-track { background: transparent; }
+.hf-scroll::-webkit-scrollbar-thumb { background: rgba(168, 85, 247, 0.25); border-radius: 8px; }
+.hf-scroll::-webkit-scrollbar-thumb:hover { background: rgba(168, 85, 247, 0.40); }
+
 /* Global focus ring (§2.6 accessibility) */
 :focus-visible {
   outline: var(--focus-ring);
@@ -280,6 +291,20 @@ body {
   box-shadow: var(--glow-violet), var(--shadow-lg);
   transform: translateY(-2px);
 }
+
+/* CGUI-03: Overview module-card state modifiers. The card body reuses `.h-card-interactive`
+   for the §3.2 region-7 hover behaviour (lift -2px + violet border + glow-violet,shadow-lg);
+   these single-class modifiers layer the resting-state treatment on top. Placed AFTER
+   `.h-card-interactive` so the resting border wins over the class default, while the higher-
+   specificity `.h-card-interactive:hover` still overrides on hover. */
+.const-modcard--error { border-color: var(--flux-rose); }
+.const-modcard--disabled {
+  opacity: 0.5;
+  pointer-events: none; /* inert — no hover lift, no action clicks */
+}
+/* CGUI-03 review FIX A: the enable toggle must stay live so a card toggled OFF can be
+   toggled back ON. A child re-declaring pointer-events:auto overrides the inert ancestor. */
+.const-modcard--disabled .const-modcard__toggle { pointer-events: auto; }
 
 /* Accent card variant — violet-gradient border-mask + strong line (§2.3 Card row) */
 .h-card-accent {

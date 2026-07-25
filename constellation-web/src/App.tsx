@@ -302,7 +302,12 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
           />
         )}
 
-        <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+        {/* CGUI-02 (TERM 525): the canvas is the scroll container — the global bar + module
+            rail stay a fixed frame, only this column scrolls. Panels route through <PanelRoot>
+            (height:100% + min-height:0 + overflow-y:auto) so they scroll internally; this
+            overflow-y:auto is the safety net so any panel that does not manage its own scroll
+            still scrolls here instead of clipping. overflow-x stays hidden (no sideways scroll). */}
+        <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
           {!healthLoaded ? (
             // First health poll hasn't settled yet — `modules`/`panels` are necessarily empty
             // right now (health starts as []). Render a loading placeholder WITHOUT mounting
