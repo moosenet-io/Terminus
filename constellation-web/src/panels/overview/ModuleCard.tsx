@@ -81,13 +81,16 @@ export function ModuleCard({ module, health, state, density, onMove, onRemove, d
 
   // CGUI-04 (TERM #527): drilling into a module opens its reusable DETAIL view ("same shell,
   // deeper zoom", guide-spec §4) — reached from region-6 "Configure" AND from a click on the
-  // card body itself. A body click that lands on any interactive control (drag handle aside)
-  // — a button, link, or the enable switch — is left to that control; only "empty" body
-  // clicks drill in, so reordering/removing/toggling never accidentally navigates.
+  // card body itself. A body click that lands on any interactive/affordance control is left to
+  // that control; only "empty" body clicks drill in, so reordering/removing/toggling never
+  // accidentally navigates. The exclusion list covers: buttons, links, the enable switch, AND
+  // the region-1 reorder drag handle (`.const-modcard__drag`) — the handle is a drag/no-op
+  // affordance (review fix: a click on it must NOT navigate).
+  const INERT_SELECTOR = 'button, a, [role="switch"], .const-modcard__drag';
   const openDetail = () => navigate(moduleDetailPath(module.id));
   const onCardClick = (e: MouseEvent<HTMLDivElement>) => {
     if (effState === 'disabled') return; // inert card body (region-6 off) — nothing to open
-    if ((e.target as HTMLElement).closest('button, a, [role="switch"]')) return;
+    if ((e.target as HTMLElement).closest(INERT_SELECTOR)) return;
     openDetail();
   };
 
@@ -119,7 +122,7 @@ export function ModuleCard({ module, health, state, density, onMove, onRemove, d
     // equivalent of an "empty body" click. Ignored when it originates on an inner control so a
     // keyboard press on the toggle/actions still does its own thing.
     if (!e.metaKey && !e.ctrlKey && (e.key === 'Enter' || e.key === ' ')) {
-      if ((e.target as HTMLElement).closest('button, a, [role="switch"]')) return;
+      if ((e.target as HTMLElement).closest(INERT_SELECTOR)) return;
       if (effState === 'disabled') return;
       e.preventDefault();
       openDetail();
@@ -157,6 +160,7 @@ export function ModuleCard({ module, health, state, density, onMove, onRemove, d
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
         <span
           aria-hidden
+          className="const-modcard__drag"
           title="Drag to reorder (or focus + ⌘/Ctrl+arrow)"
           style={{ cursor: 'grab', color: 'var(--text-400)', fontSize: 'var(--fs-body)', lineHeight: 1 }}
         >
