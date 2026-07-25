@@ -270,7 +270,10 @@ body {
    transitions collapse to ~0 so state changes stay instant rather than janky.
    NOTE: SVG SMIL (<animate>/<animateMotion>) is NOT a CSS animation and cannot be reached
    by this rule — those loops are withheld in render code via the useReducedMotion hook
-   (Forest sap/halo, ModuleDetail flow-pulse connector, TaskTree node halos). */
+   (Forest sap/halo, ModuleDetail flow-pulse connector, TaskTree node halos).
+   NOTE (review): disabling functional animation here is INTENTIONAL and guide-mandated — it
+   applies only when the user has explicitly opted into reduced motion, and the 1ms transition
+   still fires `transitionend`, so JS transition callbacks are not broken. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
