@@ -55,6 +55,26 @@ export function categoryById(id: string): CategoryMeta | undefined {
   return MINT_CATEGORY_META.find(c => c.id === id);
 }
 
+/**
+ * The `mint.matrix()` `test_type` a legacy suite's catalog cells are stored under — used to
+ * client-scope the fleet matrix so the code / context / agent tabs show DIFFERENT columns
+ * rather than the same aggregate. The catalog matrix carries `coder`/`assistant`/`serving`/
+ * `agent` test_types; `code`→`coder` and `agent`→`agent` scope cleanly. `context` has no
+ * catalog-matrix representation (its runs live in a separate table read via
+ * `mint.runs({suite:'context'})`), so it maps to `context` which simply yields no matrix
+ * columns — the Context tab is then driven by its (genuinely suite-scoped) Recent Runs table,
+ * never by borrowed aggregate data.
+ */
+export function legacyTestType(cat: CategoryMeta): string | undefined {
+  if (cat.kind !== 'legacy') return undefined;
+  switch (cat.legacySuite) {
+    case 'code': return 'coder';
+    case 'agent': return 'agent';
+    case 'context': return 'context';
+    default: return undefined;
+  }
+}
+
 export const DEFAULT_CATEGORY_ID = MINT_CATEGORY_META[0].id;
 
 // ── Metric-scale knowledge ────────────────────────────────────────────────────

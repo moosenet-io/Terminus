@@ -97,7 +97,9 @@ export function heatmapFromCategory(matrix: MintCategoryMatrixResponse | null): 
     if (!cell[c.model]) cell[c.model] = {};
     cell[c.model][c.metric] = {
       value: c.mean,
-      quality: metricUnitScore(c.metric, c.mean),
+      // null mean = not run → quality null (rendered as an EMPTY cell, excluded from the
+      // color scale) rather than 0 (which would paint a not-run cell as a bad score).
+      quality: c.mean == null ? null : metricUnitScore(c.metric, c.mean),
       n: c.n,
       lowConfidence: c.low_confidence,
     };
@@ -158,24 +160,72 @@ export function radarFromDimensions(dims: MintDimensionsResponse | null): RadarV
   return { axes, series };
 }
 
-/** Heatmap from the fleet-wide legacy matrix (model × test_type/task_category, colored by
- *  pass_rate which is already a 0–1 capability score). */
-export function heatmapFromLegacyMatrix(matrix: MintMatrixResponse | null): HeatmapVM {
-  const models = matrix?.models ?? [];
-  const metrics = (matrix?.columns ?? []).map(c => `${c.test_type}/${c.task_category}`);
+/**
+ * Heatmap from the fleet-wide legacy matrix (model × test_type/task_category, colored by
+ * pass_rate which is already a 0–1 capability score). When `testType` is given the matrix is
+ * SCOPED to that test_type (`coder` for the code suite, `agent` for the agent suite) so each
+ * legacy category tab shows genuinely suite-specific columns rather than the same fleet
+ * aggregate. Columns are then labeled by their task_category alone (the test_type is implied by
+ * the scoped tab). A null pass_rate is a not-run cell → quality null (empty), never a 0 score.
+ */
+export function heatmapFromLegacyMatrix(matrix: MintMatrixResponse | null, testType?: string): HeatmapVM {
+  const cols = (matrix?.columns ?? []).filter(c => !testType || c.test_type === testType);
+  const metrics = cols.map(c => (testType ? c.task_category : `${c.test_type}/${c.task_category}`));
+  // Only models that have at least one cell in the scoped columns appear as rows.
+  const scopedCells = (matrix?.cells ?? []).filter(c => !testType || c.col.test_type === testType);
+  const models = Array.from(new Set(scopedCells.map(c => c.model)));
   const cell: HeatmapVM['cell'] = {};
   for (const m of models) cell[m] = {};
-  for (const c of matrix?.cells ?? []) {
-    const key = `${c.col.test_type}/${c.col.task_category}`;
+  for (const c of scopedCells) {
+    const key = testType ? c.col.task_category : `${c.col.test_type}/${c.col.task_category}`;
     if (!cell[c.model]) cell[c.model] = {};
     cell[c.model][key] = {
       value: c.pass_rate,
-      quality: c.pass_rate,
+      quality: c.pass_rate == null ? null : c.pass_rate,
       n: c.n_samples,
       lowConfidence: c.low_confidence,
     };
   }
   return { models, metrics, cell };
+}
+
+/** Capability radar for a legacy suite, scoped by test_type: axes = the suite's task_categories,
+ *  each model's value = its pass_rate on that column (0–1, null → 0). Differs per suite. */
+export function radarFromLegacyMatrix(matrix: MintMatrixResponse | null, testType: string): RadarVM {
+  const cols = (matrix?.columns ?? []).filter(c => c.test_type === testType);
+  const axes = cols.map(c => c.task_category);
+  const scopedCells = (matrix?.cells ?? []).filter(c => c.col.test_type === testType);
+  const models = Array.from(new Set(scopedCells.map(c => c.model)));
+  const byModel = new Map<string, Map<string, number | null>>();
+  for (const c of scopedCells) {
+    if (!byModel.has(c.model)) byModel.set(c.model, new Map());
+    byModel.get(c.model)!.set(c.col.task_category, c.pass_rate);
+  }
+  const series = models.map(model => ({
+    model,
+    values: axes.map(tc => {
+      const v = byModel.get(model)?.get(tc);
+      return v == null ? 0 : v;
+    }),
+  }));
+  return { axes, series };
+}
+
+/** Ranking rows for a legacy suite, scoped by test_type: rank models by their MEAN pass_rate
+ *  across the suite's columns (null cells excluded from the mean). Differs per suite. */
+export function rankingFromLegacyMatrix(matrix: MintMatrixResponse | null, testType: string): RankRow[] {
+  const scopedCells = (matrix?.cells ?? []).filter(c => c.col.test_type === testType);
+  const byModel = new Map<string, number[]>();
+  for (const c of scopedCells) {
+    if (c.pass_rate == null) continue;
+    if (!byModel.has(c.model)) byModel.set(c.model, []);
+    byModel.get(c.model)!.push(c.pass_rate);
+  }
+  const rows: RankRow[] = Array.from(byModel.entries()).map(([model, vals]) => {
+    const mean = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+    return { model, value: Math.round(mean * 1000) / 1000, score: mean };
+  });
+  return rows.sort((a, b) => b.score - a.score);
 }
 
 export function boxFromLegacy(box: MintBoxResponse | null, metric: string | null): BoxVM {

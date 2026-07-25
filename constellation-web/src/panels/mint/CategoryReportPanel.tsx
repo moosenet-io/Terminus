@@ -35,13 +35,13 @@ import { CATEGORICAL_HEX, CHART_CHROME, SlotAssigner } from '../../viz/palette';
 import { useMintSection } from '../../hooks/useMint';
 import {
   MINT_CATEGORY_META, categoryById, DEFAULT_CATEGORY_ID, metricLabel, formatMetricValue,
-  metricUnitScore,
+  legacyTestType,
   type CategoryMeta,
 } from './categoryMeta';
 import {
-  radarFromCategory, radarFromDimensions, heatmapFromCategory, heatmapFromLegacyMatrix,
-  boxFromCategory, boxFromLegacy, failuresFromCategory, failuresFromLegacy,
-  rankingFromCategory, rankingFromDimensions, metricsOfCategory,
+  radarFromCategory, radarFromDimensions, radarFromLegacyMatrix, heatmapFromCategory,
+  heatmapFromLegacyMatrix, boxFromCategory, boxFromLegacy, failuresFromCategory, failuresFromLegacy,
+  rankingFromCategory, rankingFromDimensions, rankingFromLegacyMatrix, metricsOfCategory,
   type RadarVM, type HeatmapVM, type RankRow, type FailuresVM,
 } from './transforms';
 import type { MintRunRow } from '../../types/mint';
@@ -98,22 +98,28 @@ function CategoryPicker({ selected, onSelect }: { selected: string; onSelect: (i
 // ── Section 1: capability radar ──────────────────────────────────────────────────
 
 function RadarSection({ cat }: { cat: CategoryMeta }) {
+  const testType = legacyTestType(cat);
   const summary = useMintSection(
     cat.kind === 'newcat' ? c => c.mint.categorySummary(cat.clientKey!) : null,
     `radar-sum:${cat.id}`,
   );
   const dims = useMintSection(
-    cat.kind !== 'newcat' ? c => c.mint.dimensions() : null,
+    cat.kind === 'persona' ? c => c.mint.dimensions() : null,
     `radar-dim:${cat.id}`,
+  );
+  const matrix = useMintSection(
+    cat.kind === 'legacy' ? c => c.mint.matrix() : null,
+    `radar-mat:${cat.id}`,
   );
   const { view, setView } = useTableView();
 
-  const vm: RadarVM = useMemo(
-    () => (cat.kind === 'newcat' ? radarFromCategory(summary.data) : radarFromDimensions(dims.data)),
-    [cat.kind, summary.data, dims.data],
-  );
-  const loading = summary.loading || dims.loading;
-  const degraded = summary.degraded || dims.degraded;
+  const vm: RadarVM = useMemo(() => {
+    if (cat.kind === 'newcat') return radarFromCategory(summary.data);
+    if (cat.kind === 'persona') return radarFromDimensions(dims.data);
+    return radarFromLegacyMatrix(matrix.data, testType ?? '');
+  }, [cat.kind, summary.data, dims.data, matrix.data, testType]);
+  const loading = summary.loading || dims.loading || matrix.loading;
+  const degraded = summary.degraded || dims.degraded || matrix.degraded;
   const empty = !loading && !degraded && (vm.axes.length === 0 || vm.series.length === 0);
 
   const shownModels = vm.series.slice(0, 4);
@@ -128,17 +134,23 @@ function RadarSection({ cat }: { cat: CategoryMeta }) {
   ];
   const tableRows = vm.axes.map((axis, i) => ({ axis, i }));
 
+  const subtitle = cat.kind === 'newcat'
+    ? 'Per-model unit scores across this category’s metrics (higher = better)'
+    : cat.kind === 'persona'
+      ? 'Assistant capability dimensions per model (fleet-normalized)'
+      : `Per-model pass rate across the ${cat.legacySuite} suite’s task categories`;
+
   return (
     <ChartCard
       title="Capability Radar"
-      subtitle={cat.kind === 'newcat' ? 'Per-model unit scores across this category’s metrics (higher = better)' : 'Assistant capability dimensions per model (normalized)'}
+      subtitle={subtitle}
       controls={<TableViewControls view={view} onChange={setView} />}
       height={320}
       loading={loading}
       degraded={degraded}
       empty={empty}
       emptyMessage="No profiling data for this category yet"
-      emptyHint="Radar builds up once MINT profiles models in this category"
+      emptyHint={cat.kind === 'legacy' ? `The ${cat.legacySuite} suite has no catalog-matrix columns — see Recent Runs below for its suite-scoped data` : 'Radar builds up once MINT profiles models in this category'}
       footer={<ChartLegend entries={legend} />}
     >
       <TableView view={view} columns={columns} rows={tableRows} rowKey={r => r.axis}>
@@ -153,25 +165,25 @@ function RadarSection({ cat }: { cat: CategoryMeta }) {
 // ── Section 2: coverage heatmap ──────────────────────────────────────────────────
 
 function HeatmapSection({ cat }: { cat: CategoryMeta }) {
+  const testType = legacyTestType(cat);
   const catMatrix = useMintSection(
     cat.kind === 'newcat' ? c => c.mint.categoryMatrix(cat.clientKey!) : null,
     `heat-cat:${cat.id}`,
   );
-  const legacyMatrix = useMintSection(
-    cat.kind === 'legacy' ? c => c.mint.matrix() : null,
-    `heat-leg:${cat.id}`,
+  const fleetMatrix = useMintSection(
+    cat.kind === 'legacy' || cat.kind === 'persona' ? c => c.mint.matrix() : null,
+    `heat-mat:${cat.id}`,
   );
   const { view, setView } = useTableView();
 
-  const applies = cat.kind !== 'persona';
   const vm: HeatmapVM = useMemo(() => {
     if (cat.kind === 'newcat') return heatmapFromCategory(catMatrix.data);
-    if (cat.kind === 'legacy') return heatmapFromLegacyMatrix(legacyMatrix.data);
-    return { models: [], metrics: [], cell: {} };
-  }, [cat.kind, catMatrix.data, legacyMatrix.data]);
+    if (cat.kind === 'legacy') return heatmapFromLegacyMatrix(fleetMatrix.data, testType);
+    return heatmapFromLegacyMatrix(fleetMatrix.data); // persona: full fleet capability matrix
+  }, [cat.kind, catMatrix.data, fleetMatrix.data, testType]);
 
-  const loading = catMatrix.loading || legacyMatrix.loading;
-  const degraded = catMatrix.degraded || legacyMatrix.degraded;
+  const loading = catMatrix.loading || fleetMatrix.loading;
+  const degraded = catMatrix.degraded || fleetMatrix.degraded;
   const empty = !loading && !degraded && (vm.models.length === 0 || vm.metrics.length === 0);
 
   const metricIdByLabel = useMemo(() => {
@@ -188,25 +200,23 @@ function HeatmapSection({ cat }: { cat: CategoryMeta }) {
     })),
   ];
 
-  if (!applies) {
-    return (
-      <ChartCard title="Coverage Heatmap" height={80} empty emptyMessage="Not applicable for the persona radar" emptyHint="Persona is a single capability radar; see the radar above">
-        <div />
-      </ChartCard>
-    );
-  }
+  const subtitle = cat.kind === 'newcat'
+    ? 'Model × metric — color encodes capability, label shows the raw value'
+    : cat.kind === 'legacy'
+      ? `Model × task-category pass rate, scoped to the ${cat.legacySuite} suite`
+      : 'Fleet capability matrix — model × (test type / task category) pass rate';
 
   return (
     <ChartCard
       title="Coverage Heatmap"
-      subtitle="Model × metric — color encodes capability, label shows the raw value"
+      subtitle={subtitle}
       controls={<TableViewControls view={view} onChange={setView} />}
       height={Math.max(200, vm.models.length * 42 + 96)}
       loading={loading}
       degraded={degraded}
       empty={empty}
       emptyMessage="No coverage matrix for this category yet"
-      emptyHint="Each cell fills in as a model is profiled on that metric"
+      emptyHint={cat.kind === 'legacy' ? `The ${cat.legacySuite} suite has no catalog-matrix cells — its data is in Recent Runs below` : 'Each cell fills in as a model is profiled on that metric'}
     >
       <TableView view={view} columns={columns} rows={vm.models.map(model => ({ model }))} rowKey={r => r.model}>
         <Suspense fallback={<ChartSkeleton height={200} />}>
@@ -226,8 +236,11 @@ function DistributionSection({ cat }: { cat: CategoryMeta }) {
     cat.kind === 'newcat' ? c => c.mint.categorySummary(cat.clientKey!) : null,
     `dist-sum:${cat.id}`,
   );
+  // The `mint.box` endpoint reads CODE runs only (server-side), so a legacy distribution is
+  // meaningful ONLY for the code suite — never borrow code timings under context/agent.
+  const boxApplies = cat.kind === 'newcat' || (cat.kind === 'legacy' && cat.legacySuite === 'code');
   const catMetrics = useMemo(() => metricsOfCategory(summary.data), [summary.data]);
-  const metricOptions = cat.kind === 'newcat' ? catMetrics : cat.kind === 'legacy' ? LEGACY_BOX_METRICS : [];
+  const metricOptions = cat.kind === 'newcat' ? catMetrics : (cat.kind === 'legacy' && cat.legacySuite === 'code') ? LEGACY_BOX_METRICS : [];
   const [metric, setMetric] = useState<string | null>(null);
   const activeMetric = metric ?? metricOptions[0] ?? null;
 
@@ -236,7 +249,7 @@ function DistributionSection({ cat }: { cat: CategoryMeta }) {
     `dist-catbox:${cat.id}:${activeMetric ?? ''}`,
   );
   const legacyBox = useMintSection(
-    cat.kind === 'legacy'
+    cat.kind === 'legacy' && cat.legacySuite === 'code'
       ? c => c.mint.box(activeMetric ? { metric: activeMetric as 'total_time_ms' | 'code_quality_score' } : undefined)
       : null,
     `dist-legbox:${cat.id}:${activeMetric ?? ''}`,
@@ -250,6 +263,17 @@ function DistributionSection({ cat }: { cat: CategoryMeta }) {
   const box = { loading: catBox.loading || legacyBox.loading, degraded: catBox.degraded || legacyBox.degraded };
   const empty = !box.loading && !box.degraded && vm.groups.length === 0;
   const fmt = (v: number) => formatMetricValue(activeMetric ?? '', v);
+
+  if (!boxApplies) {
+    const why = cat.kind === 'persona'
+      ? 'Persona is a capability radar, not a timed-run distribution'
+      : `Timing distribution is recorded for the code suite only, not the ${cat.legacySuite} suite`;
+    return (
+      <ChartCard title="Distribution" height={96} empty emptyMessage="No distribution for this category" emptyHint={why}>
+        <div />
+      </ChartCard>
+    );
+  }
 
   const columns: DataTableColumn<typeof vm.groups[number]>[] = [
     { key: 'model', header: 'Model', render: r => r.model },
@@ -302,29 +326,37 @@ function DistributionSection({ cat }: { cat: CategoryMeta }) {
 // ── Section 4: ranking (Pareto) ──────────────────────────────────────────────────
 
 function RankingSection({ cat }: { cat: CategoryMeta }) {
+  const testType = legacyTestType(cat);
   const summary = useMintSection(
     cat.kind === 'newcat' ? c => c.mint.categorySummary(cat.clientKey!) : null,
     `rank-sum:${cat.id}`,
   );
   const dims = useMintSection(
-    cat.kind !== 'newcat' ? c => c.mint.dimensions() : null,
+    cat.kind === 'persona' ? c => c.mint.dimensions() : null,
     `rank-dim:${cat.id}`,
+  );
+  const matrix = useMintSection(
+    cat.kind === 'legacy' ? c => c.mint.matrix() : null,
+    `rank-mat:${cat.id}`,
   );
   const { view, setView } = useTableView();
 
   const primaryMetric = cat.kind === 'newcat' ? metricsOfCategory(summary.data)[0] ?? null : null;
-  const rows: RankRow[] = useMemo(
-    () => (cat.kind === 'newcat' ? rankingFromCategory(summary.data, primaryMetric) : rankingFromDimensions(dims.data)),
-    [cat.kind, summary.data, dims.data, primaryMetric],
-  );
-  const loading = summary.loading || dims.loading;
-  const degraded = summary.degraded || dims.degraded;
+  const rows: RankRow[] = useMemo(() => {
+    if (cat.kind === 'newcat') return rankingFromCategory(summary.data, primaryMetric);
+    if (cat.kind === 'persona') return rankingFromDimensions(dims.data);
+    return rankingFromLegacyMatrix(matrix.data, testType ?? '');
+  }, [cat.kind, summary.data, dims.data, matrix.data, primaryMetric, testType]);
+  const loading = summary.loading || dims.loading || matrix.loading;
+  const degraded = summary.degraded || dims.degraded || matrix.degraded;
   const empty = !loading && !degraded && rows.length === 0;
   const tick = rechartsTickStyle();
 
   const subtitle = cat.kind === 'newcat' && primaryMetric
     ? `Models ranked by ${metricLabel(primaryMetric)} capability`
-    : 'Models ranked by mean assistant-capability score';
+    : cat.kind === 'persona'
+      ? 'Models ranked by mean assistant-capability score'
+      : `Models ranked by mean ${cat.legacySuite}-suite pass rate`;
 
   const columns: DataTableColumn<RankRow>[] = [
     { key: 'rank', header: '#', align: 'right', render: r => String(rows.indexOf(r) + 1) },
@@ -387,8 +419,12 @@ function FailuresSection({ cat }: { cat: CategoryMeta }) {
     cat.kind === 'newcat' ? c => c.mint.categoryFailures(cat.clientKey!) : null,
     `fail-cat:${cat.id}`,
   );
+  // `mint.failures()` counts CODE-run failure classes fleet-wide — it is not scoped per legacy
+  // suite, so it is honest only for the code suite and the (explicitly aggregate) persona view.
+  // Context/agent get a clear not-applicable state rather than borrowed code-failure counts.
+  const failuresApplies = cat.kind === 'newcat' || cat.kind === 'persona' || (cat.kind === 'legacy' && cat.legacySuite === 'code');
   const legacyFailures = useMintSection(
-    cat.kind !== 'newcat' ? c => c.mint.failures() : null,
+    (cat.kind === 'persona' || (cat.kind === 'legacy' && cat.legacySuite === 'code')) ? c => c.mint.failures() : null,
     `fail-leg:${cat.id}`,
   );
   const { view, setView } = useTableView();
@@ -402,12 +438,21 @@ function FailuresSection({ cat }: { cat: CategoryMeta }) {
   const empty = !loading && !degraded && vm.models.length === 0;
   const tick = rechartsTickStyle();
 
+  // NB: all hooks must run unconditionally — keep this useMemo ABOVE the early return below.
   const classColors = useMemo(() => {
     const assigner = new SlotAssigner();
     const map: Record<string, string> = {};
     vm.classes.forEach(cls => { map[cls] = assigner.colorFor(cls); });
     return map;
   }, [vm.classes]);
+
+  if (!failuresApplies) {
+    return (
+      <ChartCard title="Failure Classes" height={96} empty emptyMessage="No suite-scoped failure classes" emptyHint={`Failure-class counts are recorded for the code suite only, not the ${cat.legacySuite} suite — see Recent Runs below`}>
+        <div />
+      </ChartCard>
+    );
+  }
 
   const chartData = vm.models.map(m => ({ model: m.model, ...m.counts }));
 
@@ -422,7 +467,7 @@ function FailuresSection({ cat }: { cat: CategoryMeta }) {
   return (
     <ChartCard
       title="Failure Classes"
-      subtitle="Per-model run outcomes by class"
+      subtitle={cat.kind === 'persona' ? 'Fleet-wide run outcomes by class (aggregate)' : 'Per-model run outcomes by class'}
       controls={<TableViewControls view={view} onChange={setView} />}
       height={Math.max(180, vm.models.length * 40 + 60)}
       loading={loading}

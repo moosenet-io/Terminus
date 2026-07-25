@@ -3,7 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   MINT_CATEGORY_META, categoryById, DEFAULT_CATEGORY_ID, metricUnitScore, metricLabel,
-  formatMetricValue, LOWER_IS_BETTER,
+  formatMetricValue, LOWER_IS_BETTER, legacyTestType,
 } from './categoryMeta';
 import { MINT_CATEGORIES } from '../../types/mint';
 
@@ -28,6 +28,15 @@ describe('MINT_CATEGORY_META', () => {
     expect(categoryById(DEFAULT_CATEGORY_ID)?.id).toBe(DEFAULT_CATEGORY_ID);
     expect(categoryById('nope')).toBeUndefined();
     expect(DEFAULT_CATEGORY_ID).toBe(MINT_CATEGORY_META[0].id);
+  });
+
+  it('legacyTestType scopes each legacy suite to a distinct matrix test_type', () => {
+    expect(legacyTestType(categoryById('code')!)).toBe('coder');
+    expect(legacyTestType(categoryById('agent')!)).toBe('agent');
+    expect(legacyTestType(categoryById('context')!)).toBe('context');
+    // non-legacy categories are never matrix-scoped
+    expect(legacyTestType(categoryById('persona')!)).toBeUndefined();
+    expect(legacyTestType(categoryById('embedding_retrieval')!)).toBeUndefined();
   });
 });
 
