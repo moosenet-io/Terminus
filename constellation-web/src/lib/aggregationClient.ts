@@ -678,6 +678,11 @@ function mockWsConnect(handlers: WsHandlers): WsConnection {
 // typechecked, and demoed with zero backend. Shapes are 1:1 with `models_api.rs` — the same
 // contract the httpAdapter's real fetches consume. Values are plausible, not real.
 
+/** Fixed base epoch for every CGUI-08 mock timestamp — deterministic, evaluated once at
+ *  module load (never `Date.now()` at request time), so repeated calls and snapshot tests
+ *  see byte-identical payloads. 2026-07-21T12:00:00Z. */
+const MOCK_NOW_MS = Date.UTC(2026, 6, 21, 12, 0, 0);
+
 /** The 8 assistant-suite radar axes (mirrors `ASSISTANT_DIMENSIONS` in models_api.rs). */
 const MOCK_ASSISTANT_DIMENSIONS = [
   'conversation_depth', 'tool_chaining', 'memory_integration', 'personality_latent',
@@ -729,8 +734,12 @@ function mockMetricValue(metric: string, modelIdx: number, metricIdx: number): n
 }
 
 function mockCategoryLastRun(modelIdx: number, metricIdx: number): string {
-  return new Date(Date.now() - (modelIdx * 3600_000 + metricIdx * 600_000)).toISOString();
+  return new Date(MOCK_NOW_MS - (modelIdx * 3600_000 + metricIdx * 600_000)).toISOString();
 }
+
+/** The legacy MINT suites (their own dedicated readers), accepted by `mint.runs` alongside the
+ *  8 new categories — mirrors the backend allowlist in `mint_runs`. */
+const MOCK_LEGACY_SUITES = new Set<string>(['code', 'context', 'agent']);
 
 /** Resolve a category key (canonical or alias) to its canonical form, mirroring the backend's
  *  `newcat_task_category`. Returns null for an unknown key — the mock adapter treats that like
@@ -832,21 +841,21 @@ function mockCategoryFailures(cat: MintCategory): MintCategoryFailuresResponse {
 
 const MOCK_MODELS_LIST: ModelsListResponse = {
   total: 3,
-  refreshed_at: new Date(Date.now() - 30 * 60000).toISOString(),
+  refreshed_at: new Date(MOCK_NOW_MS - 30 * 60000).toISOString(),
   models: [
     {
       model_name: 'qwen2.5-coder:32b', family: 'qwen2.5-coder', params_b: 32, quant: 'Q4_K_M',
       category: 'code', brochure_status: 'in_fleet', in_current_fleet: true, discovery_score: 0.91,
       vram_gb: 21.5, size_b: 32, serving_now: true,
       coverage: { coder: true, assistant: true, serving: true, agent: false },
-      best_pass_rate: 0.78, last_run_at: new Date(Date.now() - 2 * 3600_000).toISOString(),
+      best_pass_rate: 0.78, last_run_at: new Date(MOCK_NOW_MS - 2 * 3600_000).toISOString(),
     },
     {
       model_name: 'bge-m3', family: 'bge', params_b: 0.57, quant: null,
       category: 'embedding_retrieval', brochure_status: 'in_fleet', in_current_fleet: true,
       discovery_score: 0.84, vram_gb: 2.1, size_b: 0.57, serving_now: false,
       coverage: { coder: false, assistant: true, serving: true, agent: false },
-      best_pass_rate: null, last_run_at: new Date(Date.now() - 26 * 3600_000).toISOString(),
+      best_pass_rate: null, last_run_at: new Date(MOCK_NOW_MS - 26 * 3600_000).toISOString(),
     },
     {
       model_name: 'flux.1-schnell', family: 'flux', params_b: 12, quant: 'fp8',
@@ -877,17 +886,17 @@ function mockModelDetail(name: string): ModelDetailResponse {
       status: entry.brochure_status ?? 'candidate', gfx1151_class: 'green',
       size_b: entry.size_b, vram_footprint_gb: entry.vram_gb, discovery_source: 'mock',
       discovery_score: entry.discovery_score,
-      discovered_at: new Date(Date.now() - 10 * 86400_000).toISOString(),
-      last_seen_at: new Date(Date.now() - 86400_000).toISOString(),
-      fetched_at: new Date(Date.now() - 86400_000).toISOString(),
-      marked_for_fleet_at: entry.in_current_fleet ? new Date(Date.now() - 5 * 86400_000).toISOString() : null,
+      discovered_at: new Date(MOCK_NOW_MS - 10 * 86400_000).toISOString(),
+      last_seen_at: new Date(MOCK_NOW_MS - 86400_000).toISOString(),
+      fetched_at: new Date(MOCK_NOW_MS - 86400_000).toISOString(),
+      marked_for_fleet_at: entry.in_current_fleet ? new Date(MOCK_NOW_MS - 5 * 86400_000).toISOString() : null,
       evicted_at: null, rationale: 'mock candidate',
     },
     serving: entry.serving_now
       ? [{
           backend_tag: 'gpu', best_runtime: 'llama.cpp', tok_s: 63.4, vram_or_ram_peak_gb: entry.vram_gb,
           cold_load_s: 4.2, keep_warm: true, fallback_runtime: 'vulkan', exclusion_reason: null,
-          recheck_trigger: null, provenance: 'mock', updated_at: new Date().toISOString(),
+          recheck_trigger: null, provenance: 'mock', updated_at: new Date(MOCK_NOW_MS).toISOString(),
         }]
       : [],
     operational: entry.coverage.coder
@@ -918,7 +927,7 @@ const MOCK_MINT_SUMMARY: MintSummaryResponse = {
   fleet_best_model: { model: 'qwen2.5-coder:32b', pass_hat_3: 0.81 },
   gpu_hours: 214.6,
   epoch: 'coder-v2',
-  became_current_at: new Date(Date.now() - 20 * 86400_000).toISOString(),
+  became_current_at: new Date(MOCK_NOW_MS - 20 * 86400_000).toISOString(),
 };
 
 const MOCK_MINT_DIMENSIONS: MintDimensionsResponse = {
@@ -951,12 +960,12 @@ const MOCK_MINT_MATRIX: MintMatrixResponse = {
     {
       model: 'qwen2.5-coder:32b', col: { test_type: 'coder', task_category: 'code_generation' },
       status: 'run', pass_rate: 0.78, n_samples: 40, score_stddev: 0.05, low_confidence: false,
-      last_run_at: new Date(Date.now() - 2 * 3600_000).toISOString(), harness_version: 'coder-v2',
+      last_run_at: new Date(MOCK_NOW_MS - 2 * 3600_000).toISOString(), harness_version: 'coder-v2',
     },
     {
       model: 'bge-m3', col: { test_type: 'assistant', task_category: 'embedding_retrieval' },
       status: 'run', pass_rate: 0.82, n_samples: 30, score_stddev: 0.03, low_confidence: false,
-      last_run_at: new Date(Date.now() - 26 * 3600_000).toISOString(), harness_version: 'a1',
+      last_run_at: new Date(MOCK_NOW_MS - 26 * 3600_000).toISOString(), harness_version: 'a1',
     },
     {
       model: 'bge-m3', col: { test_type: 'coder', task_category: 'code_generation' },
@@ -972,12 +981,12 @@ const MOCK_MINT_RUNS: MintRunsResponse = {
     {
       run_id: 'run-code-1', model: 'qwen2.5-coder:32b', metric: 'code_quality_score', value: 0.79,
       dimension: 'code_generation', backend_tag: 'gpu', judge: 'harness', low_confidence: false,
-      created_at: new Date(Date.now() - 2 * 3600_000).toISOString(), harness_version: 'coder-v2',
+      created_at: new Date(MOCK_NOW_MS - 2 * 3600_000).toISOString(), harness_version: 'coder-v2',
     },
     {
       run_id: 'run-code-2', model: 'qwen2.5-coder:32b', metric: 'total_time_ms', value: 4200,
       dimension: 'code_generation', backend_tag: 'gpu', judge: 'harness', low_confidence: false,
-      created_at: new Date(Date.now() - 3 * 3600_000).toISOString(), harness_version: 'coder-v2',
+      created_at: new Date(MOCK_NOW_MS - 3 * 3600_000).toISOString(), harness_version: 'coder-v2',
     },
   ],
 };
@@ -1046,7 +1055,7 @@ const MOCK_MINT_CONTEXT_PROFILES: MintContextProfilesResponse = {
 
 const MOCK_MINT_ACTIVITY: MintActivityResponse = {
   days: Array.from({ length: 14 }, (_, i) => {
-    const d = new Date(Date.now() - (13 - i) * 86400_000);
+    const d = new Date(MOCK_NOW_MS - (13 - i) * 86400_000);
     return {
       date: d.toISOString().slice(0, 10),
       code: 20 + (i % 5) * 6,
@@ -1055,7 +1064,7 @@ const MOCK_MINT_ACTIVITY: MintActivityResponse = {
     };
   }),
   epochs: [
-    { epoch: 'coder-v2', became_current_at: new Date(Date.now() - 20 * 86400_000).toISOString(), note: 'v2 harness cutover' },
+    { epoch: 'coder-v2', became_current_at: new Date(MOCK_NOW_MS - 20 * 86400_000).toISOString(), note: 'v2 harness cutover' },
   ],
 };
 
@@ -1113,10 +1122,20 @@ const mockAdapter: AggregationClient = {
     async dimensions() { return delay(MOCK_MINT_DIMENSIONS); },
     async matrix() { return delay(MOCK_MINT_MATRIX); },
     async runs(query?: MintRunsQuery) {
+      // Validate the suite exactly like the backend's widened allowlist (models_api.rs
+      // `mint_runs`): legacy `code|context|agent`, any of the 8 new categories, or a category
+      // alias succeeds; a truly-unknown suite is a 400-equivalent throw (parity with the mock's
+      // categorySummary guard) — never a silent fall-through to the canned legacy page.
+      const suite = query?.suite ?? 'code';
+      const cat = mockResolveCategory(suite);
+      if (!cat && !MOCK_LEGACY_SUITES.has(suite)) {
+        throw new Error(
+          `HTTP 400 — unrecognized suite '${suite}' (expected one of: code, context, agent, ` +
+          `${Object.keys(MOCK_MINT_CATEGORY_METRICS).join(', ')} (category aliases: vision_qa, stt))`,
+        );
+      }
       // A new-category suite reads the category's rows via the summary fixture, shaped as runs;
       // legacy code/context/agent return the canned run page.
-      const suite = query?.suite;
-      const cat = suite ? mockResolveCategory(suite) : null;
       if (cat) {
         const summary = mockCategorySummary(cat);
         const runs: MintRunsResponse['runs'] = summary.models.flatMap(m =>

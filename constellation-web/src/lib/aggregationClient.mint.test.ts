@@ -101,6 +101,34 @@ describe('CGUI-08 MINT data-client — legacy views (mock adapter)', () => {
     expect(r.runs.length).toBeGreaterThan(0);
     expect(r.runs[0].metric).toBeDefined();
   });
+
+  it('runs() accepts legacy suites, categories, and aliases', async () => {
+    for (const suite of ['code', 'context', 'agent', 'reranking', 'vision_qa', 'stt', 'asr_transcription'] as const) {
+      await expect(mockAdapter.mint.runs({ suite })).resolves.toBeDefined();
+    }
+  });
+
+  it('runs() rejects a truly-unknown suite (backend 400 parity)', async () => {
+    // @ts-expect-error — deliberately invalid suite to exercise the guard
+    await expect(mockAdapter.mint.runs({ suite: 'not_a_category' })).rejects.toThrow(/400/);
+  });
+});
+
+describe('CGUI-08 MINT data-client — determinism (mock adapter)', () => {
+  it('repeated calls return byte-identical payloads (no request-time Date.now)', async () => {
+    const [a, b] = await Promise.all([
+      mockAdapter.mint.categorySummary('embedding_retrieval'),
+      mockAdapter.mint.categorySummary('embedding_retrieval'),
+    ]);
+    expect(JSON.stringify(a)).toBe(JSON.stringify(b));
+    const [m1, m2] = await Promise.all([
+      mockAdapter.models.model('qwen2.5-coder:32b'),
+      mockAdapter.models.model('qwen2.5-coder:32b'),
+    ]);
+    expect(JSON.stringify(m1)).toBe(JSON.stringify(m2));
+    const [s1, s2] = await Promise.all([mockAdapter.mint.summary(), mockAdapter.mint.summary()]);
+    expect(JSON.stringify(s1)).toBe(JSON.stringify(s2));
+  });
 });
 
 describe('CGUI-08 MINT data-client — per-category views (mock adapter)', () => {
