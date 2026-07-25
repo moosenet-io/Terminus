@@ -292,6 +292,20 @@ body {
   transform: translateY(-2px);
 }
 
+/* CGUI-03: Overview module-card state modifiers. The card body reuses `.h-card-interactive`
+   for the §3.2 region-7 hover behaviour (lift -2px + violet border + glow-violet,shadow-lg);
+   these single-class modifiers layer the resting-state treatment on top. Placed AFTER
+   `.h-card-interactive` so the resting border wins over the class default, while the higher-
+   specificity `.h-card-interactive:hover` still overrides on hover. */
+.const-modcard--error { border-color: var(--flux-rose); }
+.const-modcard--disabled {
+  opacity: 0.5;
+  pointer-events: none; /* inert — no hover lift, no action clicks */
+}
+/* CGUI-03 review FIX A: the enable toggle must stay live so a card toggled OFF can be
+   toggled back ON. A child re-declaring pointer-events:auto overrides the inert ancestor. */
+.const-modcard--disabled .const-modcard__toggle { pointer-events: auto; }
+
 /* Accent card variant — violet-gradient border-mask + strong line (§2.3 Card row) */
 .h-card-accent {
   border-color: var(--border-strong);

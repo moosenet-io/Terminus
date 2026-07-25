@@ -118,7 +118,18 @@ export function OverviewPanel({ modules, health, degradedSystems, density, feedI
           const mod = modules.find(m => m.id === (id as ModuleId));
           if (!mod) return null;
           const h = health.find(x => x.system === mod.healthSystem);
-          const state: CardState = degradedSystems.has(mod.healthSystem) ? 'idle' : 'online';
+          // §3.2 states: a FAILING probe renders the rose 'error' state. Backend failure
+          // details are free-form strings ("chord probe timed out", "upstream status 503",
+          // "chord unreachable: …") — none reliably prefixed "error" — so we key off
+          // availability/degradation, never a string prefix (CGUI-03 review FIX B). A module
+          // reaches this canvas either healthy (available) or failing-within-grace (App forces
+          // available:true during the grace window but flags it in `degradedSystems`); both a
+          // raw available:false and grace-window degradation mean the probe is failing.
+          // Otherwise 'online'. ('idle' and 'disabled' are card-supported states — 'disabled'
+          // is produced by the card's own enable toggle — but the Overview derives only
+          // online/error from live health.)
+          const failing = h?.available === false || degradedSystems.has(mod.healthSystem);
+          const state: CardState = failing ? 'error' : 'online';
           return (
             <ModuleCard
               key={id}

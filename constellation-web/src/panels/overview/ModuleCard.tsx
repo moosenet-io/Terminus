@@ -1,18 +1,33 @@
-// CONST-16: the Overview card canvas' per-module card — the brand guide's seven-region
-// anatomy (§3.1), built against today's tokens (CONST-17's token sheet is a value-only swap on
-// top, per the item description: "build against the alias layer if 17 hasn't merged").
+// CGUI-03 (TERM #526): the rich seven-region Overview module card (guide spec §3.2 + §8).
+// Rebuilds the flat CONST-16 card onto the DS primitives shipped by CGUI-01 (StatusPill,
+// Badge) and the brand token sheet. Region order is fixed and identical across every
+// registered module:
+//   1. drag handle ⠿ + kind node-dot (source blue / core violet / endpoint green / cloud
+//      amber) + module name (Inter 600, --text-100)
+//   2. StatusPill (online/idle/error; ping ring only when online)
+//   3. kind+role line — tracked mono, flow role in the kind's accent colour + muted desc
+//   4. metric row (CALLS/H · P50 · COST, cost green at $0) + right-aligned tonal cost badge
+//   5. last telemetry log line (wired to the real health.detail) — hidden in compact density
+//   6. enable toggle (green when on) + fixed-order actions Configure · Logs · ×
+//   7. whole-card hover lift (§8 Card interactive, via the .h-card-interactive class)
+// The container itself is the guide's "rich card": gradient fill (--grad-card = space-700→
+// space-800) + hairline violet border + --inset-hi + --shadow-md, all carried by
+// `.h-card-interactive` so region-7's hover (violet-400 border + glow-violet,shadow-lg,
+// -2px lift) comes for free.
 import { useState } from 'react';
 import type { CSSProperties, DragEvent, KeyboardEvent } from 'react';
 import { Link } from 'react-router-dom';
-import type { ModuleDescriptor } from '../../lib/moduleRegistry';
+import type { ModuleDescriptor, ModuleId, PanelDescriptor } from '../../lib/moduleRegistry';
 import { getPanelsByModule } from '../../lib/moduleRegistry';
 import type { HealthStatus } from '../../lib/aggregationClient';
 import type { Density } from '../../components/GlobalBar';
+import { StatusPill } from '../../components/StatusPill';
+import type { PillState } from '../../components/StatusPill';
+import { Badge } from '../../components/Badge';
+import type { NodeKind } from '../../components/NodeBadge';
 
-/** The §2.6 card-state quartet. Only 'online'/'idle' are currently produced by OverviewPanel
- *  (from module availability + the grace window); 'error'/'disabled' are supported here for
- *  forward-compat with panel-level data-fetch errors and an explicit disable action, neither of
- *  which exists yet in this item's scope. */
+/** The §3.2 card-state quartet. OverviewPanel derives online/idle/error from live health;
+ *  'disabled' is produced locally when the operator flips the region-6 enable toggle off. */
 export type CardState = 'online' | 'idle' | 'error' | 'disabled';
 
 export interface ModuleCardDragHandlers {
@@ -32,127 +47,200 @@ interface ModuleCardProps {
   dragHandlers: ModuleCardDragHandlers;
 }
 
-const STATE_BORDER: Record<CardState, string> = {
-  online: 'var(--border-subtle)',
-  idle: 'var(--border-subtle)',
-  error: 'var(--status-error)',
-  disabled: 'var(--border-subtle)',
+/** Per-module flow metadata. `kind` drives the region-1 node-dot colour + the region-3 role
+ *  accent (the semantic-direction law, §2.4). Descriptions are the module's one-line role.
+ *  NOTE: kind/role here is a curated heuristic — the fleet exposes no machine-readable flow
+ *  role yet, so this is the "sensible placeholder" the item calls for; it renders every region
+ *  truthfully rather than leaving it empty. All fleet modules run local-inference at
+ *  $0.00/day, so every card is a free (green) cost tier. */
+interface ModuleMeta {
+  kind: NodeKind;
+  /** UPPERCASE flow role shown in the kind's accent colour (CORE/SOURCE/ENDPOINT/CLOUD). */
+  role: string;
+  desc: string;
+  /** false → paid/opt-in (amber badge); true → free $0/day (green badge). */
+  free: boolean;
+}
+
+const MODULE_META: Record<ModuleId, ModuleMeta> = {
+  harmony:  { kind: 'core',     role: 'CORE',     desc: 'autonomous build orchestrator', free: true },
+  chord:    { kind: 'core',     role: 'CORE',     desc: 'llm proxy + inference router',  free: true },
+  terminus: { kind: 'core',     role: 'CORE',     desc: 'mcp tool hub + fleet infra',    free: true },
+  lumina:   { kind: 'endpoint', role: 'ENDPOINT', desc: 'assistant surface',             free: true },
+  muse:     { kind: 'endpoint', role: 'ENDPOINT', desc: 'media library + acquisition',   free: true },
+  models:   { kind: 'source',   role: 'SOURCE',   desc: 'model library',                 free: true },
+  mint:     { kind: 'source',   role: 'SOURCE',   desc: 'model benchmarks',              free: true },
 };
 
-const STATE_DOT: Record<CardState, string> = {
-  online: 'var(--status-success)',
-  idle: 'var(--text-tertiary)',
-  error: 'var(--status-error)',
-  disabled: 'var(--text-tertiary)',
+const KIND_COLOR: Record<NodeKind, string> = {
+  source:   'var(--node-source)',   // blue
+  core:     'var(--node-core)',      // violet
+  endpoint: 'var(--node-endpoint)',  // green
+  cloud:    'var(--node-cloud)',     // amber
 };
+
+/** Card state → DS StatusPill state (§8). 'disabled' shows an inert idle pill labelled "off". */
+const PILL_STATE: Record<CardState, PillState> = {
+  online: 'online',
+  idle: 'idle',
+  error: 'error',
+  disabled: 'idle',
+};
+
+const PILL_LABEL: Record<CardState, string> = {
+  online: 'online',
+  idle: 'idle',
+  error: 'error',
+  disabled: 'off',
+};
+
+/** Pick the module's most "logs-like" panel for the region-6 Logs action, else its first. */
+function logsPanel(panels: PanelDescriptor[]): PanelDescriptor | undefined {
+  return panels.find(p => /log|activ|audit|session/i.test(p.id) || /log|activ|audit|session/i.test(p.title)) ?? panels[0];
+}
 
 export function ModuleCard({ module, health, state, density, onMove, onRemove, dragHandlers }: ModuleCardProps) {
-  const [expanded, setExpanded] = useState(false);
+  // Region-6 enable toggle. Off → the whole card renders as the §3.2 disabled state.
+  const [enabled, setEnabled] = useState(true);
+  const effState: CardState = enabled ? state : 'disabled';
+
+  const meta = MODULE_META[module.id];
+  const kindColor = KIND_COLOR[meta.kind];
   const panels = getPanelsByModule(module.id);
   const firstPanel = panels[0];
+  const logPanel = logsPanel(panels);
   const compact = density === 'compact';
 
-  const style: CSSProperties = {
-    background: 'var(--bg-surface)',
-    border: `1px solid ${STATE_BORDER[state]}`,
-    borderRadius: 'var(--radius-lg)',
-    boxShadow: 'var(--shadow-card)',
-    padding: compact ? 'var(--space-3)' : 'var(--space-4)',
+  // Region-5 telemetry — wired to the real health probe detail (the one live per-module
+  // signal the aggregation client exposes). [ok] for healthy/idle, [!!] for error.
+  const detail = health?.detail ?? (health?.available ? 'reachable' : 'unknown');
+  const logTag = effState === 'error' ? '[!!]' : '[ok]';
+  const logColor = effState === 'error' ? 'var(--flux-rose)' : 'var(--flux-green)';
+  const logLine = `${module.id}.health ${detail}`;
+
+  const cardStyle: CSSProperties = {
+    position: 'relative',
     display: 'flex',
     flexDirection: 'column',
     gap: 'var(--space-2)',
-    opacity: state === 'disabled' ? 0.5 : 1,
+    padding: compact ? 'var(--space-3)' : 'var(--space-4)',
+    cursor: 'default',
   };
+
+  const className = [
+    'h-card-interactive',
+    'const-modcard',
+    effState === 'error' ? 'const-modcard--error' : '',
+    effState === 'disabled' ? 'const-modcard--disabled' : '',
+  ].filter(Boolean).join(' ');
 
   const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (!(e.metaKey || e.ctrlKey)) return;
-    if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
-      e.preventDefault();
-      onMove(-1);
-    }
-    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
-      e.preventDefault();
-      onMove(1);
-    }
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); onMove(-1); }
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); onMove(1); }
+  };
+
+  const labelStyle: CSSProperties = {
+    fontFamily: 'var(--font-mono)',
+    fontSize: 'var(--fs-mono-sm)',
+    textTransform: 'uppercase',
+    letterSpacing: 'var(--ls-mono)',
+    color: 'var(--text-400)',
   };
 
   return (
     <div
       role="group"
-      aria-label={`${module.title} module card, ${state}`}
+      aria-label={`${module.title} module card, ${effState}`}
       tabIndex={0}
       onKeyDown={handleKeyDown}
-      style={style}
+      className={className}
+      style={cardStyle}
       draggable={dragHandlers.draggable}
       onDragStart={dragHandlers.onDragStart}
       onDragOver={dragHandlers.onDragOver}
       onDrop={dragHandlers.onDrop}
     >
-      {/* Region 1: drag handle + semantic node dot + module name */}
+      {/* Region 1: drag handle + KIND node-dot + module name. Row also carries the region-2
+          StatusPill, right-aligned (§3.2 rows 1–2 share the header line). */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
-        <span aria-hidden title="Drag to reorder (or focus + ⌘/Ctrl+arrow)" style={{ cursor: 'grab', color: 'var(--text-tertiary)' }}>
-          ⠿
-        </span>
-        <span aria-hidden style={{ width: 8, height: 8, borderRadius: '50%', background: STATE_DOT[state], flexShrink: 0 }} />
-        <span style={{ fontWeight: 600, color: 'var(--text-primary)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-          {module.icon} {module.title}
-        </span>
-        <button
-          onClick={() => setExpanded(e => !e)}
-          aria-expanded={expanded}
-          aria-label={expanded ? 'Collapse card' : 'Expand card'}
-          style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', cursor: 'pointer', fontSize: 'var(--text-xs)' }}
-        >
-          {expanded ? '▾' : '▸'}
-        </button>
-      </div>
-
-      {/* Region 2: StatusPill */}
-      <div
-        style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 6,
-          alignSelf: 'flex-start',
-          fontFamily: 'var(--font-mono)',
-          fontSize: 'var(--text-xs)',
-          textTransform: 'uppercase',
-          letterSpacing: '0.05em',
-          color: STATE_DOT[state],
-          background: 'var(--bg-surface-raised)',
-          padding: '2px 8px',
-          borderRadius: 10,
-        }}
-      >
         <span
           aria-hidden
-          style={{
-            width: 7,
-            height: 7,
-            borderRadius: '50%',
-            background: STATE_DOT[state],
-            animation: state === 'online' ? 'h-pulse 1.8s ease-out infinite' : 'none',
-          }}
+          title="Drag to reorder (or focus + ⌘/Ctrl+arrow)"
+          style={{ cursor: 'grab', color: 'var(--text-400)', fontSize: 'var(--fs-body)', lineHeight: 1 }}
+        >
+          ⠿
+        </span>
+        {/* Node-dot: 9px + `0 0 8px` glow is intentional DS-parity geometry (matches the
+            NodeBadge/StatusPill dot in CGUI-01); adherence-lint px warnings are expected. */}
+        <span
+          aria-hidden
+          title={`${meta.role.toLowerCase()} node`}
+          style={{ width: 9, height: 9, borderRadius: '50%', background: kindColor, boxShadow: `0 0 8px ${kindColor}`, flexShrink: 0 }}
         />
-        {state}
+        <span
+          style={{
+            fontFamily: 'var(--font-sans)',
+            fontWeight: 'var(--fw-semibold)',
+            color: 'var(--text-100)',
+            flex: 1,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {module.title}
+        </span>
+        {/* Region 2: StatusPill — ping ring only when online (DS default). */}
+        <StatusPill state={PILL_STATE[effState]} label={PILL_LABEL[effState]} />
       </div>
 
-      {/* Region 3: kind/role line */}
-      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>
-        <span style={{ color: 'var(--accent-primary)' }}>module</span> · {panels.length} panel{panels.length === 1 ? '' : 's'}
+      {/* Region 3: kind + role line — tracked mono, role in the kind accent + muted desc. */}
+      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)', letterSpacing: 'var(--ls-mono)', color: 'var(--text-300)' }}>
+        <span style={{ color: kindColor, fontWeight: 'var(--fw-semibold)' }}>{meta.role}</span>
+        {' · '}
+        {meta.desc}
       </div>
 
-      {/* Region 4: metric row */}
-      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-sm)', color: 'var(--text-primary)' }}>
-        status: {health?.detail ?? (health?.available ? 'reachable' : 'unknown')}
+      {/* Region 4: metric row (3 mono figures) + right-aligned tonal cost badge. calls/h + p50
+          are not yet exposed per-module → placeholder em-dash figures; COST is a real $0. */}
+      <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', gap: 'var(--space-2)' }}>
+        <div style={{ display: 'flex', gap: 'var(--space-4)' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono)', color: 'var(--text-100)' }}>—</span>
+            <span style={labelStyle}>calls/h</span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono)', color: 'var(--text-100)' }}>—</span>
+            <span style={labelStyle}>p50</span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono)', color: 'var(--flux-green)' }}>$0</span>
+            <span style={labelStyle}>cost</span>
+          </div>
+        </div>
+        <Badge tone={meta.free ? 'green' : 'amber'} mono>
+          {meta.free ? '$0/day' : 'opt-in'}
+        </Badge>
       </div>
 
-      {/* Region 5: last activity (hidden in Compact density, §3.1) */}
+      {/* Region 5: last telemetry log line (hidden in compact density, §3.2). */}
       {!compact && (
-        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>last activity: n/a</div>
+        <div
+          style={{
+            fontFamily: 'var(--font-mono)',
+            fontSize: 'var(--fs-mono-sm)',
+            color: 'var(--text-400)',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          <span style={{ color: logColor }}>{logTag}</span> {logLine}
+        </div>
       )}
 
-      {/* Region 6: enable/hide toggle + quick actions (fixed order: Open · Configure) */}
+      {/* Region 6: enable toggle (green when on) + fixed-order actions Configure · Logs · × */}
       <div
         style={{
           display: 'flex',
@@ -160,53 +248,76 @@ export function ModuleCard({ module, health, state, density, onMove, onRemove, d
           justifyContent: 'space-between',
           marginTop: 'auto',
           paddingTop: 'var(--space-2)',
+          borderTop: 'var(--border-width) solid var(--border)',
         }}
       >
+        {/* Enable toggle — a pill switch, green track when on. */}
+        {/* Toggle geometry (34×18 track, 12px knob) is intentional DS-parity component
+            geometry — same posture as StatusPill/NodeBadge in CGUI-01; adherence-lint px
+            warnings on these numeric literals are expected, not a violation. The __toggle
+            class keeps this control clickable while the rest of a disabled card is inert. */}
         <button
-          onClick={onRemove}
-          title="Hide this card (restore it via '+ Add widget' below)"
-          style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', fontSize: 'var(--text-xs)', cursor: 'pointer' }}
-        >
-          Hide
-        </button>
-        <div style={{ display: 'flex', gap: 'var(--space-3)' }}>
-          {firstPanel ? (
-            <Link to={firstPanel.path} style={{ fontSize: 'var(--text-xs)', color: 'var(--accent-primary)', textDecoration: 'none' }}>
-              Open
-            </Link>
-          ) : (
-            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>Open</span>
-          )}
-          <span
-            title="No configuration surface yet"
-            style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', cursor: 'default' }}
-          >
-            Configure
-          </span>
-        </div>
-      </div>
-
-      {/* Region 7: card body widget when expanded */}
-      {expanded && (
-        <div
+          type="button"
+          role="switch"
+          className="const-modcard__toggle"
+          aria-checked={enabled}
+          aria-label={enabled ? `Disable ${module.title}` : `Enable ${module.title}`}
+          onClick={() => setEnabled(e => !e)}
           style={{
-            borderTop: '1px solid var(--border-subtle)',
-            paddingTop: 'var(--space-2)',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 4,
+            position: 'relative',
+            width: 34,
+            height: 18,
+            flexShrink: 0,
+            borderRadius: 'var(--radius-pill)',
+            border: 'var(--border-width) solid var(--border)',
+            background: enabled ? 'var(--flux-green)' : 'var(--space-500)',
+            cursor: 'pointer',
+            transition: 'background var(--dur-fast) var(--ease-out)',
+            padding: 0,
           }}
         >
-          {panels.length === 0 && (
-            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>No panels registered yet.</span>
-          )}
-          {panels.map(p => (
-            <Link key={p.id} to={p.path} style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)', textDecoration: 'none' }}>
-              {p.icon ?? '•'} {p.title}
+          <span
+            aria-hidden
+            style={{
+              position: 'absolute',
+              top: 2,
+              left: enabled ? 18 : 2,
+              width: 12,
+              height: 12,
+              borderRadius: '50%',
+              background: 'var(--text-100)',
+              transition: 'left var(--dur-fast) var(--ease-out)',
+            }}
+          />
+        </button>
+
+        {/* Fixed-order actions: Configure · Logs · × */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
+          {firstPanel ? (
+            <Link to={firstPanel.path} style={{ fontSize: 'var(--fs-xs)', color: 'var(--accent-bright)', textDecoration: 'none' }}>
+              Configure
             </Link>
-          ))}
+          ) : (
+            <span title="No configuration surface yet" style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-400)' }}>Configure</span>
+          )}
+          {logPanel ? (
+            <Link to={logPanel.path} style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-300)', textDecoration: 'none' }}>
+              Logs
+            </Link>
+          ) : (
+            <span title="No log surface yet" style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-400)' }}>Logs</span>
+          )}
+          <button
+            type="button"
+            onClick={onRemove}
+            aria-label={`Remove ${module.title} card`}
+            title="Remove this card (restore it via '+ Add widget' below)"
+            style={{ background: 'none', border: 'none', color: 'var(--text-400)', fontSize: 'var(--fs-body)', lineHeight: 1, cursor: 'pointer', padding: 0 }}
+          >
+            ×
+          </button>
         </div>
-      )}
+      </div>
     </div>
   );
 }
