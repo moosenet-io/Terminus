@@ -9,6 +9,8 @@ import type { ModuleDescriptor, ModuleId } from '../../lib/moduleRegistry';
 import type { HealthStatus } from '../../lib/aggregationClient';
 import { getAggregationClient } from '../../lib/aggregationClient';
 import type { Density } from '../../components/GlobalBar';
+import type { CrateDescriptor } from '../../lib/crates';
+import { Button } from '../../components/Button';
 import { ModuleCard } from './ModuleCard';
 import type { CardState } from './ModuleCard';
 import { ActivityFeedCard } from './ActivityFeedCard';
@@ -37,6 +39,10 @@ export function reconcileOrder(persistedOrder: string[], availableIds: string[])
 }
 
 interface OverviewPanelProps {
+  /** CGUI-12 (§3.1): the active crate — names the breadcrumb + canvas title, and (upstream) has
+   *  already scoped `modules` to its members. Optional so any test/story that predates the crate
+   *  model keeps compiling; falls back to an "overview" heading with no crate name. */
+  crate?: CrateDescriptor;
   modules: ModuleDescriptor[];
   health: HealthStatus[];
   degradedSystems: Set<string>;
@@ -47,12 +53,16 @@ interface OverviewPanelProps {
   feedItems?: FeedItem[];
 }
 
-export function OverviewPanel({ modules, health, degradedSystems, density, feedItems }: OverviewPanelProps) {
+export function OverviewPanel({ crate, modules, health, degradedSystems, density, feedItems }: OverviewPanelProps) {
   const client = useMemo(() => getAggregationClient(), []);
   const [layout, setLayout] = useState<LayoutPrefs>(
     () => client.prefs.get<LayoutPrefs>('layout') ?? DEFAULT_LAYOUT,
   );
   const [dragId, setDragId] = useState<string | null>(null);
+  // CGUI-12: the "Add to canvas" widget tray + edit affordances are a client-side view toggle
+  // (there is no layout-editing backend beyond the `client.prefs` layout the cards already
+  // persist). "Edit layout" toggles it; "+ Add widget" opens it.
+  const [editing, setEditing] = useState(false);
 
   const availableIds = useMemo(() => modules.map(m => m.id as string), [modules]);
   const orderedIds = useMemo(
@@ -105,8 +115,57 @@ export function OverviewPanel({ modules, health, degradedSystems, density, feedI
     );
   }
 
+  const crateName = crate?.title ?? 'overview';
+
   return (
     <div style={{ padding: 'var(--space-5)', overflow: 'auto', flex: 1 }}>
+      {/* Canvas header (§3.1): breadcrumb `{crate} / overview` + title + Edit layout (ghost) +
+          "+ Add widget" (primary). */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'flex-end',
+          justifyContent: 'space-between',
+          gap: 'var(--space-4)',
+          flexWrap: 'wrap',
+          marginBottom: 'var(--space-5)',
+        }}
+      >
+        <div style={{ minWidth: 0 }}>
+          <div
+            style={{
+              fontFamily: 'var(--font-mono)',
+              fontSize: 'var(--fs-mono-sm)',
+              letterSpacing: 'var(--ls-mono)',
+              color: 'var(--text-400)',
+              marginBottom: 'var(--space-1)',
+            }}
+          >
+            {crateName} <span style={{ color: 'var(--text-500)' }}>/</span> overview
+          </div>
+          <h1
+            style={{
+              margin: 0,
+              fontFamily: 'var(--font-sans)',
+              fontSize: 'var(--fs-h3)',
+              fontWeight: 'var(--fw-semibold)',
+              color: 'var(--text-100)',
+              lineHeight: 'var(--lh-heading)',
+            }}
+          >
+            {crateName}
+          </h1>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flexShrink: 0 }}>
+          <Button variant="ghost" size="sm" aria-pressed={editing} onClick={() => setEditing(e => !e)}>
+            Edit layout
+          </Button>
+          <Button variant="primary" size="sm" onClick={() => setEditing(true)}>
+            + Add widget
+          </Button>
+        </div>
+      </div>
+
       <div
         style={{
           display: 'grid',
@@ -158,29 +217,66 @@ export function OverviewPanel({ modules, health, degradedSystems, density, feedI
         {feedItems && <ActivityFeedCard items={feedItems} />}
       </div>
 
-      {hiddenIds.length > 0 && (
-        <div style={{ marginTop: 'var(--space-4)', display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
-          {hiddenIds.map(id => {
-            const mod = modules.find(m => m.id === (id as ModuleId));
-            if (!mod) return null;
-            return (
-              <button
-                key={id}
-                onClick={() => addCard(id)}
-                style={{
-                  background: 'var(--bg-surface)',
-                  border: '1px dashed var(--border-default)',
-                  color: 'var(--text-tertiary)',
-                  borderRadius: 'var(--radius-md)',
-                  padding: 'var(--space-1) var(--space-3)',
-                  fontSize: 'var(--text-sm)',
-                  cursor: 'pointer',
-                }}
-              >
-                + Add widget · {mod.title}
-              </button>
-            );
-          })}
+      {/* "Add to canvas" widget tray (§3.1) — the modules removed from the canvas, restorable
+          with a `+`. Opened by "Edit layout" / "+ Add widget". Empty-state string is the guide's
+          "Every module is on the canvas." */}
+      {editing && (
+        <div
+          className="h-card"
+          style={{
+            marginTop: 'var(--space-5)',
+            padding: 'var(--space-4)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 'var(--space-3)',
+          }}
+        >
+          <div
+            style={{
+              fontFamily: 'var(--font-mono)',
+              fontSize: 'var(--fs-label)',
+              textTransform: 'uppercase',
+              letterSpacing: 'var(--ls-label)',
+              color: 'var(--text-400)',
+            }}
+          >
+            Add to canvas
+          </div>
+          {hiddenIds.length === 0 ? (
+            <div style={{ color: 'var(--text-tertiary)', fontSize: 'var(--text-sm)' }}>
+              Every module is on the canvas.
+            </div>
+          ) : (
+            <div style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
+              {hiddenIds.map(id => {
+                const mod = modules.find(m => m.id === (id as ModuleId));
+                if (!mod) return null;
+                return (
+                  <button
+                    key={id}
+                    onClick={() => addCard(id)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 'var(--space-2)',
+                      background: 'var(--bg-surface)',
+                      border: '1px dashed var(--border-default)',
+                      color: 'var(--text-secondary)',
+                      borderRadius: 'var(--radius-md)',
+                      padding: 'var(--space-1) var(--space-3)',
+                      fontSize: 'var(--text-sm)',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <span aria-hidden style={{ color: 'var(--accent-bright)' }}>
+                      +
+                    </span>
+                    {mod.title}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
     </div>

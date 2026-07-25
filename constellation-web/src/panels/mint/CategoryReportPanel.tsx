@@ -46,7 +46,9 @@ import {
 } from './transforms';
 import type { MintRunRow } from '../../types/mint';
 
-const RadarChart = lazy(() => import('../../viz/RadarChart'));
+// CGUI-10: the MINT multi-series radar (MintRadarChart), distinct from CGUI-09's single-series
+// Models radar (viz/RadarChart.tsx). Both lazy-load into the reserved `viz` nivo chunk.
+const MintRadarChart = lazy(() => import('../../viz/MintRadarChart'));
 const HeatmapChart = lazy(() => import('../../viz/HeatmapChart'));
 
 // ── Category picker ─────────────────────────────────────────────────────────────
@@ -155,7 +157,7 @@ function RadarSection({ cat }: { cat: CategoryMeta }) {
     >
       <TableView view={view} columns={columns} rows={tableRows} rowKey={r => r.axis}>
         <Suspense fallback={<ChartSkeleton height={320} />}>
-          <RadarChart vm={vm} />
+          <MintRadarChart vm={vm} />
         </Suspense>
       </TableView>
     </ChartCard>
