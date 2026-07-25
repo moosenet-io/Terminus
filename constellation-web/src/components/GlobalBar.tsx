@@ -15,9 +15,11 @@
 import type { FeedItem } from '../lib/activityFeed';
 import type { CoreDescriptor, CoreId } from '../lib/cores';
 import { coreKind } from '../lib/cores';
+import type { HealthStatus } from '../lib/aggregationClient';
 import { KIND_COLOR } from '../panels/overview/moduleMeta';
 import { Wordmark } from './Wordmark';
 import { NotificationBell } from './NotificationBell';
+import { HealthChip } from './HealthChip';
 
 export type Density = 'comfortable' | 'compact';
 
@@ -33,6 +35,10 @@ interface GlobalBarProps {
   /** True when the last health poll failed outright (network/backend down); the bar shows a
    *  degraded indicator while continuing to render the last known state (edge case §10). */
   pollDegraded: boolean;
+  /** POL-11: the shell's live health snapshot + grace-degraded set, backing the global
+   *  HealthChip. Optional so any pre-POL-11 caller keeps compiling (chip falls back to empty). */
+  health?: HealthStatus[];
+  degradedSystems?: Set<string>;
   /** Present only in the <760px "drawer" rail variant — renders a menu trigger before the
    *  wordmark that opens the module rail drawer. */
   onOpenMenu?: () => void;
@@ -61,6 +67,8 @@ export function GlobalBar({
   onOpenMenu,
   onOpenPalette,
   feedItems,
+  health = [],
+  degradedSystems = new Set<string>(),
 }: GlobalBarProps) {
   return (
     <div
@@ -73,7 +81,7 @@ export function GlobalBar({
         padding: '0 var(--space-4)',
         height: 52,
         flexShrink: 0,
-        borderBottom: '1px solid var(--border-subtle)',
+        borderBottom: 'var(--border-width) solid var(--border-subtle)',
         // Translucent so the fixed backdrop reads through the bar (guide §0 frame).
         // M1: neutral-dark tint (was violet rgba(22,17,44)/rgba(13,11,26)).
         background: 'linear-gradient(180deg, rgba(20,20,25,0.72), rgba(10,10,13,0.55))',
@@ -86,7 +94,7 @@ export function GlobalBar({
           aria-label="Open module navigation"
           style={{
             background: 'none',
-            border: '1px solid var(--border-default)',
+            border: 'var(--border-width) solid var(--border-default)',
             borderRadius: 'var(--radius-md)',
             color: 'var(--text-secondary)',
             width: 28,
@@ -139,7 +147,7 @@ export function GlobalBar({
                 alignItems: 'center',
                 gap: 'var(--space-2)',
                 background: active ? 'var(--accent-soft)' : 'transparent',
-                border: active ? '1px solid var(--border-emphasis)' : '1px solid transparent',
+                border: active ? 'var(--border-width) solid var(--border-emphasis)' : 'var(--border-width) solid transparent',
                 borderRadius: 'var(--radius-pill)',
                 cursor: 'pointer',
                 padding: 'var(--space-1) var(--space-3)',
@@ -177,7 +185,7 @@ export function GlobalBar({
           alignItems: 'center',
           gap: 'var(--space-2)',
           background: 'var(--bg-surface)',
-          border: '1px solid var(--border-default)',
+          border: 'var(--border-width) solid var(--border-default)',
           color: 'var(--text-tertiary)',
           borderRadius: 'var(--radius-md)',
           padding: 'var(--space-1) var(--space-3)',
@@ -187,7 +195,9 @@ export function GlobalBar({
         }}
       >
         search tools…{' '}
+        {/* POL-12: both the ⌘K (from anywhere) and "/" (when not typing) shortcuts open it. */}
         <kbd style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)' }}>⌘K</kbd>
+        <kbd style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)', color: 'var(--text-500)' }}>/</kbd>
       </button>
 
       {/* Density toggle — segmented, active = violet (§3.1). */}
@@ -196,7 +206,7 @@ export function GlobalBar({
         aria-label="Density"
         style={{
           display: 'flex',
-          border: '1px solid var(--border-default)',
+          border: 'var(--border-width) solid var(--border-default)',
           borderRadius: 'var(--radius-md)',
           overflow: 'hidden',
           flexShrink: 0,
@@ -223,21 +233,10 @@ export function GlobalBar({
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flexShrink: 0 }}>
+        {/* POL-11: always-visible global health + spend chip. Subsumes the old standalone
+            poll-degraded ⚠ triangle — a failed poll now elevates THIS chip to amber. */}
+        <HealthChip health={health} degradedSystems={degradedSystems} pollDegraded={pollDegraded} />
         {feedItems && <NotificationBell items={feedItems} />}
-        {pollDegraded && (
-          <span
-            title="Health poll degraded — showing last known status"
-            aria-label="Health poll degraded"
-            style={{ color: 'var(--status-warning)', display: 'flex', alignItems: 'center' }}
-          >
-            {/* POL-05: inline Lucide-style alert-triangle (was the ⚠ character). */}
-            <svg aria-hidden width={16} height={16} viewBox="0 0 24 24" fill="none"
-                 stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
-              <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
-              <path d="M12 9v4M12 17h.01" />
-            </svg>
-          </span>
-        )}
         {/* Account circle — blue avatar with the account initial; a plain button so Sign out is
             still reachable (title carries the full username). */}
         {onLogout ? (
@@ -251,7 +250,7 @@ export function GlobalBar({
               borderRadius: '50%',
               flexShrink: 0,
               background: 'rgba(59,130,246,0.18)',
-              border: '1px solid var(--node-source)',
+              border: 'var(--border-width) solid var(--node-source)',
               color: 'var(--flux-blue-soft)',
               fontFamily: 'var(--font-sans)',
               fontWeight: 600,
@@ -273,7 +272,7 @@ export function GlobalBar({
               borderRadius: '50%',
               flexShrink: 0,
               background: 'rgba(59,130,246,0.18)',
-              border: '1px solid var(--node-source)',
+              border: 'var(--border-width) solid var(--node-source)',
               color: 'var(--flux-blue-soft)',
               fontFamily: 'var(--font-sans)',
               fontWeight: 600,

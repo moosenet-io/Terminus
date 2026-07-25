@@ -103,7 +103,14 @@ export function Dashboard({ status, executorSummary, loading, error, onRetry }: 
   if (error) {
     return (
       <div style={{ padding: 32, textAlign: 'center' }}>
-        <div style={{ color: 'var(--flux-rose)', marginBottom: 12 }}>⚠ {error}</div>
+        {/* POL-13 (§9, no-emoji): inline Lucide-style alert-triangle replaces the ⚠ glyph. */}
+        <div style={{ color: 'var(--flux-rose)', marginBottom: 12, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <svg aria-hidden width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+            <path d="M12 9v4M12 17h.01" />
+          </svg>
+          {error}
+        </div>
         <button className="h-btn h-btn-ghost" onClick={onRetry}>Retry</button>
       </div>
     );
@@ -130,7 +137,14 @@ export function Dashboard({ status, executorSummary, loading, error, onRetry }: 
               fontWeight: 700, fontSize: 13,
               color: 'var(--status-warning)',
               letterSpacing: '0.05em',
-            }}>⚠ TRIAGE MODE</span>
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+            }}>
+              <svg aria-hidden width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+                <path d="M12 9v4M12 17h.01" />
+              </svg>
+              TRIAGE MODE
+            </span>
             <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>
               Resolving {triageDetail.current_task_id} — Step {triageDetail.current_step}/5 ({triageDetail.current_step_name}) — {triageDetail.held_count} task{triageDetail.held_count !== 1 ? 's' : ''} held
             </span>
@@ -205,7 +219,12 @@ export function Dashboard({ status, executorSummary, loading, error, onRetry }: 
             color: 'var(--text-tertiary)',
             fontSize: 'var(--text-sm)',
           }}>
-            <div style={{ fontSize: 32, marginBottom: 8 }}>🌱</div>
+            {/* POL-13 (§9, no-emoji): node-dot ring glyph replaces the 🌱 emoji. */}
+            <div aria-hidden style={{ marginBottom: 8, display: 'flex', justifyContent: 'center' }}>
+              <span style={{ width: 32, height: 32, borderRadius: '50%', border: '1px solid var(--border-default)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>
+                <span style={{ width: 12, height: 12, borderRadius: '50%', background: 'var(--node-endpoint)', opacity: 0.8 }} />
+              </span>
+            </div>
             <div style={{ fontWeight: 500 }}>No active specs</div>
             <div style={{ fontSize: 'var(--text-xs)', marginTop: 4 }}>
               Start a build to grow the tree

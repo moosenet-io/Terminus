@@ -33,16 +33,17 @@ function providerIcon(p: string): string {
   return '☁';
 }
 
-/** Map provider codename → infrastructure type icon.
- *  Cloud providers → ☁  llama-server → 🗄  Ollama/local → 💾  unknown → ? */
-function providerTypeIcon(provider?: string): { icon: string; label: string } | null {
+/** Map provider codename → infrastructure type tag (POL-13 §9, no-emoji): a short mono code +
+ *  a node-dot colour (GPU=blue source, CPU/local=neutral, cloud=amber) replaces the old
+ *  🗄/💾/☁ emoji. */
+function providerTypeIcon(provider?: string): { code: string; color: string; label: string } | null {
   if (!provider) return null;
   const p = provider.toLowerCase();
-  if (p === 'llama') return { icon: '🗄', label: 'llama-server (GPU)' };
-  if (p === 'local') return { icon: '💾', label: 'Ollama (local)' };
+  if (p === 'llama') return { code: 'GPU', color: 'var(--node-source)', label: 'llama-server (GPU)' };
+  if (p === 'local') return { code: 'CPU', color: 'var(--text-500)', label: 'Ollama (local)' };
   if (p === 'claude' || p === 'codex' || p === 'gemini')
-    return { icon: '☁', label: `${provider} (cloud)` };
-  return { icon: '?', label: provider };
+    return { code: 'CLD', color: 'var(--node-cloud)', label: `${provider} (cloud)` };
+  return { code: '?', color: 'var(--text-500)', label: provider };
 }
 
 /** Colored tier badge: quick=green, standard=blue, deep=purple. */
@@ -294,7 +295,10 @@ export function AgentLane({ agent, inTriageMode = false }: Props) {
             {isActive && (() => {
               const pt = providerTypeIcon(agent.provider);
               return pt ? (
-                <span title={pt.label} style={{ fontSize: 14, flexShrink: 0 }}>{pt.icon}</span>
+                <span title={pt.label} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexShrink: 0, fontFamily: 'var(--font-mono)', fontSize: 10, letterSpacing: 'var(--ls-mono)', color: 'var(--text-tertiary)' }}>
+                  <span aria-hidden style={{ width: 6, height: 6, borderRadius: '50%', background: pt.color, flexShrink: 0 }} />
+                  {pt.code}
+                </span>
               ) : null;
             })()}
             {/* Active tool-use providers (plane, gitea, etc.) */}

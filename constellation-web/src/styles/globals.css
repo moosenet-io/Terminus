@@ -136,6 +136,10 @@
   --radius-pill: 999px;
   --maxw-prose: 68ch;
   --maxw-content: 1120px;
+  /* S127 TGUI2 POL-03: the canvas content cap. Main content is centered and capped at this
+     width so short pages read as a composed column rather than top-left-anchored in a huge
+     canvas with a yawning void to the right/below (the "tech-demo" tell). Additive token. */
+  --content-max: 1280px;
 
   /* ── Elevation + glow (glow = brand emphasis, reserved: see §2.4) ───────────── */
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);

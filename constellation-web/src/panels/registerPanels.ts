@@ -67,9 +67,9 @@ import { Analytics } from '../pages/Analytics';
 // muse takes CONST-16's old lumina slot and lumina follows it.) ──────────────────────────
 
 registerModule({ id: 'harmony', title: 'Harmony', icon: '⌂', healthSystem: 'harmony', order: 1 });
-registerModule({ id: 'chord', title: 'Chord', icon: '⚡', healthSystem: 'chord', order: 2 });
+registerModule({ id: 'chord', title: 'Chord', icon: '◈', healthSystem: 'chord', order: 2 });
 // CONST-19 registered the muse module; CONST-20 adds its three panels below.
-registerModule({ id: 'muse', title: 'Muse', icon: '🎬', healthSystem: 'muse', order: 3 });
+registerModule({ id: 'muse', title: 'Muse', icon: '◎', healthSystem: 'muse', order: 3 });
 // LGUI-05: lumina module registration only -- no panels yet (LGUI-06 adds lumina.overview
 // first). Ordered AFTER Muse per LUMINA-GUI-SPEC §2.
 registerModule({ id: 'lumina', title: 'Lumina', icon: '✦', healthSystem: 'lumina', order: 4 });
@@ -102,7 +102,7 @@ registerPanel({
   system: 'harmony',
   title: 'Projects',
   path: '/harmony/projects',
-  icon: '📁',
+  icon: '▸',
   available: true,
   component: ProjectsPanel,
 });
@@ -122,7 +122,7 @@ registerPanel({
   system: 'harmony',
   title: 'Agents',
   path: '/harmony/agents',
-  icon: '🤖',
+  icon: '◍',
   available: true,
   component: Agents,
 });
@@ -142,7 +142,7 @@ registerPanel({
   system: 'harmony',
   title: 'Prompts',
   path: '/harmony/prompts',
-  icon: '📝',
+  icon: '▤',
   available: true,
   component: Prompts,
 });
@@ -152,7 +152,7 @@ registerPanel({
   system: 'harmony',
   title: 'Sessions',
   path: '/harmony/sessions',
-  icon: '⏱',
+  icon: '◔',
   available: true,
   component: Sessions,
 });
@@ -162,7 +162,7 @@ registerPanel({
   system: 'harmony',
   title: 'Audit Log',
   path: '/harmony/audit',
-  icon: '📋',
+  icon: '▣',
   available: true,
   component: AuditLog,
 });
@@ -175,7 +175,7 @@ registerPanel({
   system: 'harmony',
   title: 'Forest Build',
   path: '/harmony/forest',
-  icon: '🌲',
+  icon: '▲',
   available: true,
   component: HarmonyForestPanel,
 });
@@ -186,7 +186,7 @@ registerPanel({
   system: 'harmony',
   title: 'Analytics',
   path: '/harmony/analytics',
-  icon: '📊',
+  icon: '▥',
   available: true,
   component: Analytics,
 });
@@ -208,7 +208,7 @@ registerPanel({
   system: 'chord',
   title: 'Inference',
   path: '/chord/inference',
-  icon: '⚡',
+  icon: '◈',
   available: true,
   component: Inference,
 });
@@ -218,7 +218,7 @@ registerPanel({
   system: 'chord',
   title: 'Providers',
   path: '/chord/providers',
-  icon: '🔌',
+  icon: '◉',
   available: true,
   component: Providers,
 });
@@ -240,7 +240,7 @@ registerPanel({
   system: 'chord',
   title: 'Backends',
   path: '/chord/backends',
-  icon: '🧩',
+  icon: '⬡',
   available: true,
   component: BackendsPanel,
 });
@@ -252,7 +252,7 @@ registerPanel({
   system: 'muse',
   title: 'Dashboard',
   path: '/muse/dashboard',
-  icon: '🎬',
+  icon: '◎',
   available: true,
   component: MuseDashboardPanel,
 });
@@ -262,7 +262,7 @@ registerPanel({
   system: 'muse',
   title: 'Taste',
   path: '/muse/taste',
-  icon: '📈',
+  icon: '◹',
   available: true,
   component: MuseTastePanel,
 });
@@ -272,7 +272,7 @@ registerPanel({
   system: 'muse',
   title: 'Channels',
   path: '/muse/channels',
-  icon: '📺',
+  icon: '▭',
   available: true,
   component: MuseChannelsPanel,
 });
@@ -313,7 +313,7 @@ registerPanel({
   system: 'mint',
   title: 'Category Reports',
   path: '/mint/categories',
-  icon: '📊',
+  icon: '▥',
   available: true,
   component: MintCategoryReportPanel,
 });
@@ -337,7 +337,7 @@ registerPanel({
   system: 'terminus',
   title: 'Fleet',
   path: '/terminus/fleet',
-  icon: '🛰',
+  icon: '⬢',
   available: true,
   component: FleetPanel,
 });
@@ -347,7 +347,7 @@ registerPanel({
   system: 'terminus',
   title: 'Tools',
   path: '/terminus/tools',
-  icon: '🧰',
+  icon: '▧',
   available: true,
   component: ToolsPanel,
 });
@@ -357,7 +357,7 @@ registerPanel({
   system: 'terminus',
   title: 'Activity',
   path: '/terminus/activity',
-  icon: '📡',
+  icon: '⌒',
   available: true,
   component: ActivityPanel,
 });
