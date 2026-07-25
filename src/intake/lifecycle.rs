@@ -377,6 +377,14 @@ where
 {
     let start = Instant::now();
     loop {
+        // Enforce the ceiling at loop entry so we never START a fresh probe cycle
+        // past the deadline (codex T5): the health (≤3s) + unit-state (≤2s) probes
+        // below must not be launched once the budget is spent. A single in-flight
+        // iteration may still overshoot by that bounded ~5s, which the 110s hard
+        // cap keeps strictly under lumina's 120s client timeout.
+        if start.elapsed() >= max {
+            return Err(NotReady::Timeout);
+        }
         if is_healthy().await {
             return Ok(());
         }
