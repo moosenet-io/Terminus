@@ -320,6 +320,10 @@ export function ModuleDetail({ module, health }: ModuleDetailProps) {
         <div
           ref={logScrollRef}
           className="hf-scroll"
+          role="log"
+          aria-live="polite"
+          aria-relevant="additions"
+          aria-label={`Live log — ${module.title}`}
           style={{ flex: 1, minHeight: 0, maxHeight: 260, overflowY: 'auto', padding: '0 var(--space-4) var(--space-4)', display: 'flex', flexDirection: 'column', gap: 'var(--space-1)', fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)', lineHeight: 1.6 }}
         >
           {log.map((ln, i) => (

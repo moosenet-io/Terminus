@@ -261,6 +261,27 @@ body {
   outline-offset: 2px;
 }
 
+/* ── CGUI-13 (TERM #536): authoritative prefers-reduced-motion kill-switch ─────────
+   The SINGLE app-wide source of truth for reduced motion (the earlier interactions.css
+   duplicate was folded into this so there is exactly one rule). Per the brand guide's
+   hard rule, every looping/continuous decorative animation is disabled outright —
+   starfield/backdrop twinkle, data-flow pulses, StatusPill ping, NodeBadge core-pulse,
+   h-pulse dots, shimmer skeletons, Forest fog/spin/rise/grow, activity streams. One-shot
+   transitions collapse to ~0 so state changes stay instant rather than janky.
+   NOTE: SVG SMIL (<animate>/<animateMotion>) is NOT a CSS animation and cannot be reached
+   by this rule — those loops are withheld in render code via the useReducedMotion hook
+   (Forest sap/halo, ModuleDetail flow-pulse connector, TaskTree node halos). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition-duration: 1ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* ── CGUI-12: deep-space backdrop (guide §0) ─────────────────────────────────────
    The fixed frame the whole shell lives in front of — a single element pinned behind
    every screen (z-index:0), so "the frame never moves; only the canvas scrolls". Two
