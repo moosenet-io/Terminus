@@ -118,7 +118,13 @@ export function OverviewPanel({ modules, health, degradedSystems, density, feedI
           const mod = modules.find(m => m.id === (id as ModuleId));
           if (!mod) return null;
           const h = health.find(x => x.system === mod.healthSystem);
-          const state: CardState = degradedSystems.has(mod.healthSystem) ? 'idle' : 'online';
+          // §3.2 states: an error probe → 'error' (rose), the degrade grace-window → 'idle',
+          // otherwise 'online'. ('disabled' is produced inside the card by its enable toggle.)
+          const state: CardState = h?.detail?.toLowerCase().startsWith('error')
+            ? 'error'
+            : degradedSystems.has(mod.healthSystem)
+              ? 'idle'
+              : 'online';
           return (
             <ModuleCard
               key={id}
