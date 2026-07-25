@@ -40,6 +40,7 @@ import { ActivityPanel } from './terminus/ActivityPanel';
 import { EngineDiagramPanel } from './status/EngineDiagramPanel';
 import { DashboardPanel } from './harmony/DashboardPanel';
 import { ProjectsPanel } from './harmony/ProjectsPanel';
+import { HarmonyForestPanel } from './harmony/HarmonyForestPanel';
 import { DashboardPanel as MuseDashboardPanel } from './muse/DashboardPanel';
 import { TastePanel as MuseTastePanel } from './muse/TastePanel';
 import { ChannelsPanel as MuseChannelsPanel } from './muse/ChannelsPanel';
@@ -149,6 +150,19 @@ registerPanel({
   icon: '📋',
   available: true,
   component: AuditLog,
+});
+
+// CGUI-11 (TERM #534): the Harmony Forest Build orchestrator screen — a self-contained animated
+// build visualization (spec "grows" as an SVG tree; leaves = issues; a persisted forest = shipped
+// specs). Driven by a built-in simulation (forestEngine.ts), not live data in this item.
+registerPanel({
+  id: 'harmony.forest',
+  system: 'harmony',
+  title: 'Forest Build',
+  path: '/harmony/forest',
+  icon: '🌲',
+  available: true,
+  component: HarmonyForestPanel,
 });
 
 // Re-homed from the legacy 'Status' group (spec §5.1/§10 CONST-16).
