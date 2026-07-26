@@ -53,7 +53,31 @@ pub async fn get_pool() -> Result<PgPool, ToolError> {
 /// indexes, and the `model_full_profile` view. The CHECK constraints mirror the
 /// in-Rust [`ServingProfile::validate`] gate so a contradictory enum combo is
 /// rejected at BOTH the application boundary and the DB boundary.
+///
+/// Composed of two independent steps: [`ensure_serving_profile_table`] (the
+/// `serving_profile` table + its indexes — all a writer/UPSERT needs) and
+/// [`create_full_profile_view`] (the heavyweight `model_full_profile` aggregation
+/// view over the *evolving* `code_profile_runs` / `assistant_dimension_score`
+/// schemas). A caller that only needs to WRITE serving rows (e.g. the baseline
+/// seeder) should call the table helper alone — the view rebuild is a separate
+/// concern that can fail on schema drift it does not own, and is not needed to
+/// upsert a row.
 pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
+    ensure_serving_profile_table(pool).await?;
+    create_full_profile_view(pool).await?;
+    Ok(())
+}
+
+/// Ensure ONLY the `serving_profile` table + its indexes exist (the UPSERT
+/// conflict key + the two read indexes). Idempotent (`CREATE ... IF NOT EXISTS`).
+///
+/// This is the minimal schema a serving-row writer needs — it deliberately does
+/// NOT touch the `model_full_profile` view, whose rebuild depends on the evolving
+/// `code_profile_runs` / `assistant_dimension_score` schemas and can fail
+/// independently of the serving table. The baseline seeder
+/// (`serving_profile_seed` tool) calls THIS, not [`migrate`], so a view-rebuild
+/// failure never masks a perfectly writable serving table as "store unavailable".
+pub async fn ensure_serving_profile_table(pool: &PgPool) -> Result<(), ToolError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS serving_profile ( \
             id BIGSERIAL PRIMARY KEY, \
@@ -120,8 +144,6 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
     .execute(pool)
     .await
     .map_err(|e| ToolError::Database(format!("create idx_serving_profile_recheck: {e}")))?;
-
-    create_full_profile_view(pool).await?;
 
     Ok(())
 }
@@ -352,6 +374,85 @@ mod tests {
     #[test]
     fn harness_version_is_stamped() {
         assert_eq!(HARNESS_VERSION, "s85-srv-01");
+    }
+
+    /// The `serving_profile_seed` tool calls [`ensure_serving_profile_table`], NOT
+    /// [`migrate`], precisely so it never triggers the `model_full_profile` view
+    /// rebuild — that heavyweight aggregation view depends on the evolving
+    /// `code_profile_runs` / `assistant_dimension_score` schemas and can fail on
+    /// drift the seeder does not own, which the tool would otherwise mask as
+    /// "store unavailable". This regression test proves the table-ensure path
+    /// provisions the writer's needs (table + UPSERT unique index) WITHOUT
+    /// creating the view: its existence is exactly what it was before the call (on
+    /// a fresh DB where the view is absent, that means it stays absent).
+    ///
+    /// Gated on a reachable Postgres, same convention as the sibling view tests:
+    /// skips (passes trivially) when neither `INTAKE_DATABASE_URL` nor
+    /// `DATABASE_URL` is configured — view/table existence is genuinely only
+    /// verifiable against real Postgres.
+    #[tokio::test]
+    async fn ensure_serving_profile_table_does_not_create_the_full_profile_view() {
+        async fn view_exists(pool: &PgPool, view: &str) -> bool {
+            let row: Option<(i64,)> = sqlx::query_as(
+                "SELECT 1 FROM information_schema.views \
+                 WHERE table_name = $1 LIMIT 1",
+            )
+            .bind(view)
+            .fetch_optional(pool)
+            .await
+            .expect("probe view existence");
+            row.is_some()
+        }
+
+        let pool = match get_pool().await {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!(
+                    "skipping ensure_serving_profile_table_does_not_create_the_full_profile_view: \
+                     no INTAKE_DATABASE_URL/DATABASE_URL configured"
+                );
+                return;
+            }
+        };
+
+        // Whether the aggregation view exists BEFORE the seeder's table-ensure.
+        let view_before = view_exists(&pool, "model_full_profile").await;
+
+        // The exact path the seed tool takes.
+        ensure_serving_profile_table(&pool)
+            .await
+            .expect("ensure_serving_profile_table must succeed on its own");
+
+        // It provisions what a writer/UPSERT needs: the table (a known column) and
+        // its UPSERT conflict unique index.
+        assert!(
+            column_exists(&pool, "serving_profile", "exclusion_reason")
+                .await
+                .expect("probe serving_profile column"),
+            "ensure_serving_profile_table must create the serving_profile table"
+        );
+        let idx: Option<(String,)> = sqlx::query_as(
+            "SELECT indexname FROM pg_indexes \
+             WHERE tablename = 'serving_profile' \
+               AND indexname = 'uq_serving_profile_model_backend' LIMIT 1",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("probe unique index");
+        assert!(
+            idx.is_some(),
+            "ensure_serving_profile_table must create the UPSERT unique index"
+        );
+
+        // The crux: it must NOT have created/altered the model_full_profile view.
+        // Its existence is unchanged by the table-ensure call — in particular, on
+        // a fresh DB where the view was absent, it stays absent (the seed path
+        // never rebuilds the heavyweight aggregation view).
+        let view_after = view_exists(&pool, "model_full_profile").await;
+        assert_eq!(
+            view_before, view_after,
+            "ensure_serving_profile_table must not create or drop model_full_profile"
+        );
     }
 
     #[test]

@@ -455,11 +455,17 @@ impl RustTool for ServingProfileSeed {
             }
         }
 
-        // 3. Ensure the table exists (self-provisioning; the app never requires an
-        //    operator DDL) then UPSERT every mapped row under one seed run_id.
+        // 3. Ensure ONLY the serving_profile table + indexes exist (self-
+        //    provisioning; no operator DDL). We deliberately do NOT call the full
+        //    schema::migrate(), which also rebuilds the heavyweight
+        //    model_full_profile aggregation VIEW over the evolving
+        //    code_profile_runs / assistant_dimension_score schemas — that view
+        //    rebuild can fail on schema drift the seeder does not own, and is not
+        //    needed to UPSERT a serving row. The view is owned by the
+        //    measurement/schema path, not the baseline seeder.
         //    DB unconfigured/unreachable ⇒ the generic, sanitized store error.
         let pool = schema::get_pool().await.map_err(|_| store_unavailable())?;
-        schema::migrate(&pool)
+        schema::ensure_serving_profile_table(&pool)
             .await
             .map_err(|_| store_unavailable())?;
 
