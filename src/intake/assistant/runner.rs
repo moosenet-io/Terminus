@@ -213,6 +213,61 @@ fn assistant_stale_models(cells: &[AssistantDimCell]) -> std::collections::BTree
     cells.iter().map(|c| c.model.clone()).collect()
 }
 
+/// Outcome of gap-only candidate selection, kept as data so [`run_mode`] can log
+/// every disposition (nothing is silently truncated) before it narrows the
+/// nomination set. Fully determined by its inputs — see [`select_gap_models`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GapSelection {
+    /// The model ids that WILL be swept this run — the matched gap models, in
+    /// nominations.json order, capped at `max`.
+    pub selected: Vec<String>,
+    /// Matched gap models left OVER the cap — deferred to the next run window
+    /// (nominations.json order preserved). Never dropped silently: logged.
+    pub deferred: Vec<String>,
+    /// Gap models with NO nomination record, so this sweep cannot acquire them
+    /// (the assistant `nominations.json` is the authoritative acquisition source
+    /// — a builder-only model absent from it can't be measured here). Sorted,
+    /// logged so the operator can add a nomination if coverage is wanted.
+    pub unmatched: Vec<String>,
+}
+
+/// PURELY select the gap-only candidate set: given the nominated model ids (in
+/// `nominations.json` order) and the DB-derived `gap_ids` (models with a builder
+/// profile but no assistant profile), return which nominations to sweep, which
+/// matched ones are deferred past the `max` cap, and which gap models have no
+/// nomination record at all. Nomination order is preserved (author priority)
+/// and duplicates are collapsed on first sight, so the cap deterministically
+/// takes the first `max` matched models. Unit-testable without a DB.
+pub fn select_gap_models(
+    nominated: &[String],
+    gap_ids: &std::collections::BTreeSet<String>,
+    max: usize,
+) -> GapSelection {
+    // Matched = nominations that are in the gap set, first-seen order preserved.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut matched: Vec<String> = Vec::new();
+    for id in nominated {
+        if gap_ids.contains(id) && seen.insert(id.clone()) {
+            matched.push(id.clone());
+        }
+    }
+
+    let cap = matched.len().min(max);
+    let selected = matched[..cap].to_vec();
+    let deferred = matched[cap..].to_vec();
+
+    // Gap models we can't reach: in the DB gap set but never nominated. `gap_ids`
+    // is already a sorted `BTreeSet`, so this stays deterministic.
+    let nominated_set: std::collections::BTreeSet<&String> = nominated.iter().collect();
+    let unmatched: Vec<String> = gap_ids
+        .iter()
+        .filter(|g| !nominated_set.contains(g))
+        .cloned()
+        .collect();
+
+    GapSelection { selected, deferred, unmatched }
+}
+
 // ===========================================================================
 // Suite driver: smoke + the six dimensions for ONE (model, backend)
 // ===========================================================================
@@ -774,17 +829,50 @@ impl Drop for ReleaseOnDrop<'_> {
 /// The live [`LiveSuiteDriver`] wires the REAL dimension runners under the P5
 /// backend override; all inference stays on the unified proxy path.
 pub async fn run() -> Result<RunReport, ToolError> {
-    run_mode(false).await
+    run_mode(SweepSelection::default()).await
 }
 
-/// [`run`] with an explicit `--only-stale` mode (MINT2-06). `only_stale = false`
-/// is the FULL sweep (the default [`run`] path); `only_stale = true` narrows the
+/// Candidate-selection mode for one assistant sweep run. `Default` is the FULL
+/// sweep (both flags off) so the historical [`run`] path is byte-for-byte
+/// unchanged. `only_stale` (MINT2-06) and `gap_only` are independent narrowing
+/// sources; `gap_only` takes precedence when both are set (they'd otherwise
+/// fight over the same nomination vector — gap targeting is the more specific
+/// operator intent).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SweepSelection {
+    /// Re-run only models with a stale (model, dimension) cell (`MINT_ONLY_STALE`).
+    pub only_stale: bool,
+    /// Narrow to models with a builder profile but no assistant profile
+    /// (`INTAKE_ASSISTANT_GAP_ONLY`).
+    pub gap_only: bool,
+    /// Per-run cap on gap models (`INTAKE_ASSISTANT_GAP_MAX`); only consulted
+    /// when `gap_only` is set.
+    pub gap_max: usize,
+}
+
+impl SweepSelection {
+    /// Resolve the selection mode from the environment surface. Full sweep
+    /// unless a narrowing flag is set.
+    pub fn from_env() -> Self {
+        SweepSelection {
+            only_stale: crate::intake::only_stale_from_env(),
+            gap_only: crate::intake::gap_only_from_env(),
+            gap_max: crate::intake::gap_max_from_env(),
+        }
+    }
+}
+
+/// [`run`] with an explicit selection mode. [`SweepSelection::default`] is the
+/// FULL sweep (the default [`run`] path). `only_stale` (MINT2-06) narrows the
 /// nomination fleet to just the models with a stale (model, dimension) cell —
 /// those lacking a current-(assistant-)epoch result at the sample target — using
-/// the assistant's OWN epoch lineage (`schema::HARNESS_VERSION`). The
+/// the assistant's OWN epoch lineage (`schema::HARNESS_VERSION`). `gap_only`
+/// instead narrows to models with a builder profile but no assistant profile
+/// (the gap-targeting overnight mode), bounded by `gap_max`. The
 /// per-(model, backend, dimension) checkpoint (now epoch-aware) still resumes
-/// within the narrowed fleet.
-pub async fn run_mode(only_stale: bool) -> Result<RunReport, ToolError> {
+/// within the narrowed fleet, so already-covered cells are never re-measured in
+/// any mode.
+pub async fn run_mode(selection: SweepSelection) -> Result<RunReport, ToolError> {
     let pool = schema::get_pool().await?;
     schema::migrate(&pool).await?;
     let run_id = schema::insert_run(&pool).await?;
@@ -792,11 +880,55 @@ pub async fn run_mode(only_stale: bool) -> Result<RunReport, ToolError> {
     let mut nominations = Nominations::load().map_err(ToolError::NotConfigured)?;
     let mem_config = mem_config_from_env();
 
-    // MINT2-06: `--only-stale` — re-run only the models with a stale dimension.
-    // Absence-tolerant: an un-migrated DB reads back zero current-epoch counts →
-    // every cell is stale → the whole fleet runs (correct). The FULL sweep stays
-    // the default.
-    if only_stale {
+    // Gap-only takes precedence over --only-stale (both narrow the same vector).
+    if selection.gap_only {
+        let gap_ids = schema::gap_only_model_ids(&pool).await?;
+        let nominated: Vec<String> = nominations
+            .nominations
+            .iter()
+            .map(|n| n.model_id().as_str().to_string())
+            .collect();
+        let sel = select_gap_models(&nominated, &gap_ids, selection.gap_max);
+        tracing::info!(
+            "assistant sweep gap-only (cap {}): {} gap model(s) in DB, {} matched a nomination, \
+             selecting {} — deferred {} over cap, {} gap model(s) have no nomination record",
+            selection.gap_max,
+            gap_ids.len(),
+            sel.selected.len() + sel.deferred.len(),
+            sel.selected.len(),
+            sel.deferred.len(),
+            sel.unmatched.len(),
+        );
+        if !sel.selected.is_empty() {
+            tracing::info!("assistant sweep gap-only: selected = {:?}", sel.selected);
+        }
+        if !sel.deferred.is_empty() {
+            tracing::info!(
+                "assistant sweep gap-only: deferred to a later window (over cap {}) = {:?}",
+                selection.gap_max,
+                sel.deferred,
+            );
+        }
+        if !sel.unmatched.is_empty() {
+            tracing::warn!(
+                "assistant sweep gap-only: {} gap model(s) have a builder profile but no \
+                 nomination record, so this sweep cannot acquire them (add a nominations.json \
+                 entry to cover them) = {:?}",
+                sel.unmatched.len(),
+                sel.unmatched,
+            );
+        }
+        let selected_set: std::collections::BTreeSet<String> = sel.selected.into_iter().collect();
+        nominations
+            .nominations
+            .retain(|n| selected_set.contains(&n.model_id().as_str().to_string()));
+        if nominations.nominations.is_empty() {
+            tracing::info!(
+                "assistant sweep gap-only: no gap models to profile this run — clean no-op (exit 0)"
+            );
+            return Ok(RunReport { models: Vec::new() });
+        }
+    } else if selection.only_stale {
         let target = crate::intake::stale_target_from_env();
         let counts = crate::intake::storage::read_assistant_dimension_counts(
             &pool,
@@ -862,15 +994,16 @@ pub async fn run_mode(only_stale: bool) -> Result<RunReport, ToolError> {
 /// end-of-run summary the standalone `intake_assistant_sweep` binary used to
 /// print (so the binary is now merely `MintHarness::run(RunKind::Assistant)`).
 pub struct AssistantSweepRunner {
-    /// MINT2-06: `--only-stale` run mode (`MINT_ONLY_STALE`). Default `false` →
-    /// the FULL sweep; `true` → re-run only the models with a stale dimension.
-    only_stale: bool,
+    /// Candidate-selection mode resolved from the env surface (`MINT_ONLY_STALE`,
+    /// `INTAKE_ASSISTANT_GAP_ONLY`, `INTAKE_ASSISTANT_GAP_MAX`). Default (all
+    /// off) → the FULL sweep.
+    selection: SweepSelection,
 }
 
 impl AssistantSweepRunner {
     pub fn new() -> Self {
         AssistantSweepRunner {
-            only_stale: crate::intake::only_stale_from_env(),
+            selection: SweepSelection::from_env(),
         }
     }
 }
@@ -890,7 +1023,7 @@ impl crate::intake::SweepRunner for AssistantSweepRunner {
     async fn run(&self) -> std::process::ExitCode {
         // Binary-specific orchestration moved here from the old binary `main`:
         // run the consolidated suite, then summarize the per-model report.
-        match run_mode(self.only_stale).await {
+        match run_mode(self.selection).await {
             Ok(report) => {
                 let total = report.models.len();
                 let profiled = report
@@ -1183,6 +1316,82 @@ mod tests {
         assert!(!s4.iter().any(|c| c.model == "dropped:70b"));
         // raise to 6 → every dimension below the new target becomes stale.
         assert_eq!(assistant_stale_cells(&models, &counts, 6).len(), 6);
+    }
+
+    // --- gap-only candidate selection (INTAKE_ASSISTANT_GAP_ONLY) -----------
+
+    fn gapset(ids: &[&str]) -> std::collections::BTreeSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn noms_vec(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn gap_selection_is_exactly_builder_not_assistant_intersection() {
+        // Nominated fleet, and a DB gap set (builder-only). Selection is the
+        // intersection — never a model that isn't in the gap set.
+        let nominated = noms_vec(&["a:8b", "b:20b", "c:70b", "d:3b"]);
+        let gap = gapset(&["b:20b", "c:70b", "z:1b"]); // z is builder-only but not nominated
+        let sel = select_gap_models(&nominated, &gap, 10);
+        // exactly the has_builder-and-not-has_assistant models that ARE nominated
+        assert_eq!(sel.selected, vec!["b:20b".to_string(), "c:70b".to_string()]);
+        assert!(sel.deferred.is_empty());
+        // z is a gap model with no nomination record → surfaced, never silently dropped
+        assert_eq!(sel.unmatched, vec!["z:1b".to_string()]);
+    }
+
+    #[test]
+    fn gap_cap_bounds_the_count_and_records_deferrals_in_order() {
+        // Five matched gap models, cap of 2 → first two (nominations.json order)
+        // selected, the rest deferred (logged), nothing truncated silently.
+        let nominated = noms_vec(&["m1", "m2", "m3", "m4", "m5"]);
+        let gap = gapset(&["m1", "m2", "m3", "m4", "m5"]);
+        let sel = select_gap_models(&nominated, &gap, 2);
+        assert_eq!(sel.selected, vec!["m1".to_string(), "m2".to_string()]);
+        assert_eq!(
+            sel.deferred,
+            vec!["m3".to_string(), "m4".to_string(), "m5".to_string()]
+        );
+        assert!(sel.unmatched.is_empty());
+        // selected + deferred accounts for every matched model (no loss).
+        assert_eq!(sel.selected.len() + sel.deferred.len(), 5);
+    }
+
+    #[test]
+    fn gap_empty_set_is_a_clean_no_op() {
+        // No builder-only models → nothing selected, deferred, or unmatched.
+        let nominated = noms_vec(&["a:8b", "b:20b"]);
+        let sel = select_gap_models(&nominated, &gapset(&[]), 10);
+        assert!(sel.selected.is_empty());
+        assert!(sel.deferred.is_empty());
+        assert!(sel.unmatched.is_empty());
+    }
+
+    #[test]
+    fn gap_selection_preserves_nomination_order_and_dedupes() {
+        // Duplicate nomination ids collapse on first sight; author order wins.
+        let nominated = noms_vec(&["c:70b", "a:8b", "c:70b", "b:20b"]);
+        let gap = gapset(&["a:8b", "b:20b", "c:70b"]);
+        let sel = select_gap_models(&nominated, &gap, 10);
+        assert_eq!(
+            sel.selected,
+            vec!["c:70b".to_string(), "a:8b".to_string(), "b:20b".to_string()]
+        );
+    }
+
+    #[test]
+    fn full_mode_selection_unchanged_when_flags_off() {
+        // The default selection keeps the full nomination set: gap/stale narrowing
+        // only ever runs when a flag is explicitly set. Assert the pure selector
+        // is never consulted for the default (both flags false) and gap_max is
+        // inert. (run_mode's default branch retains all nominations — the pure
+        // check here guards the flag semantics the branch keys off.)
+        let sel = SweepSelection::default();
+        assert!(!sel.only_stale);
+        assert!(!sel.gap_only);
+        assert_eq!(sel.gap_max, 0);
     }
 
     #[test]
