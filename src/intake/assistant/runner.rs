@@ -268,6 +268,32 @@ pub fn select_gap_models(
     GapSelection { selected, deferred, unmatched }
 }
 
+/// Build the actual sweep nomination list from a DEDUPED, ordered list of
+/// selected model ids: exactly ONE nomination record per id — the FIRST record
+/// for that id in `source` (preserving authoring priority) — emitted in
+/// `selected` order. This is why gap targeting must REBUILD rather than
+/// `retain`-by-membership: `nominations.json` may list a model more than once,
+/// and a membership filter would keep EVERY duplicate record, so the model would
+/// be acquired/measured multiple times and the gap cap would be silently
+/// exceeded. Keyed by the same `model_id().as_str()` identity `select_gap_models`
+/// matches on. Pure — unit-testable without a DB. An id in `selected` with no
+/// matching record is skipped (can't happen from the run path, where `selected`
+/// is a subset of the nominated ids, but keeps the helper total).
+pub fn dedup_nominations_in_selected_order(
+    source: &Nominations,
+    selected: &[String],
+) -> Vec<Nomination> {
+    let mut by_id: std::collections::HashMap<String, &Nomination> =
+        std::collections::HashMap::new();
+    for n in &source.nominations {
+        by_id.entry(n.model_id().as_str().to_string()).or_insert(n);
+    }
+    selected
+        .iter()
+        .filter_map(|id| by_id.get(id).map(|n| (*n).clone()))
+        .collect()
+}
+
 // ===========================================================================
 // Suite driver: smoke + the six dimensions for ONE (model, backend)
 // ===========================================================================
@@ -918,10 +944,12 @@ pub async fn run_mode(selection: SweepSelection) -> Result<RunReport, ToolError>
                 sel.unmatched,
             );
         }
-        let selected_set: std::collections::BTreeSet<String> = sel.selected.into_iter().collect();
-        nominations
-            .nominations
-            .retain(|n| selected_set.contains(&n.model_id().as_str().to_string()));
+        // Rebuild the sweep input as ONE record per selected model, in selected
+        // order — NOT a `retain` by membership, which would keep every duplicate
+        // nomination record for a selected model (re-measuring it and exceeding
+        // the cap). See `dedup_nominations_in_selected_order`.
+        nominations.nominations =
+            dedup_nominations_in_selected_order(&nominations, &sel.selected);
         if nominations.nominations.is_empty() {
             tracing::info!(
                 "assistant sweep gap-only: no gap models to profile this run — clean no-op (exit 0)"
@@ -1367,6 +1395,44 @@ mod tests {
         assert!(sel.selected.is_empty());
         assert!(sel.deferred.is_empty());
         assert!(sel.unmatched.is_empty());
+    }
+
+    #[test]
+    fn gap_rebuild_yields_exactly_one_record_per_selected_model() {
+        // Regression (gpt56): nominations.json lists m1 TWICE. Gap = {m1,m2},
+        // cap 1 → selected = [m1]. The sweep input must contain EXACTLY ONE m1
+        // record — a `retain`-by-membership would keep BOTH m1 records, so m1
+        // would be acquired/measured twice and the cap-of-1 silently exceeded.
+        let source = noms(
+            r#"{"nominations":[
+                {"id":"m1","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull"},
+                {"id":"m1","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull"},
+                {"id":"m2","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull"}
+            ]}"#,
+        );
+        let sel = select_gap_models(&noms_vec(&["m1", "m1", "m2"]), &gapset(&["m1", "m2"]), 1);
+        assert_eq!(sel.selected, vec!["m1".to_string()]);
+
+        let rebuilt = dedup_nominations_in_selected_order(&source, &sel.selected);
+        assert_eq!(rebuilt.len(), 1, "exactly one m1 record reaches the sweep, not two");
+        assert_eq!(rebuilt[0].id, "m1");
+    }
+
+    #[test]
+    fn gap_rebuild_preserves_selected_order_one_record_each() {
+        // Two selected models, source has a duplicate of each: rebuild is one
+        // record per model, in SELECTED order (not source order).
+        let source = noms(
+            r#"{"nominations":[
+                {"id":"b:20b","size_b":20,"gfx1151_class":"confirmed","acquisition":"ollama_pull"},
+                {"id":"a:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull"},
+                {"id":"a:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull"}
+            ]}"#,
+        );
+        let selected = vec!["a:8b".to_string(), "b:20b".to_string()];
+        let rebuilt = dedup_nominations_in_selected_order(&source, &selected);
+        let ids: Vec<&str> = rebuilt.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["a:8b", "b:20b"]);
     }
 
     #[test]

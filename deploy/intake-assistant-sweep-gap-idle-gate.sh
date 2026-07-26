@@ -13,7 +13,28 @@
 #   3. Runs the gap-only sweep under `timeout $SWEEP_MAX_LEASE_SECS` with
 #      INTAKE_ASSISTANT_GAP_ONLY=1 INTAKE_ASSISTANT_GAP_MAX=$INTAKE_ASSISTANT_GAP_MAX.
 #   4. ALWAYS restores Chord: POST $CHORD_CONTROL_URL/admin/activate in an EXIT
-#      trap, so a failed/killed/timed-out sweep can NEVER leave Chord drained.
+#      trap, so a failed/timed-out sweep can NEVER leave Chord drained.
+#
+# ── SIGKILL safety — two independent layers (codex finding) ──
+# A Bash EXIT trap does NOT run on SIGKILL, so the wrapper's own /admin/activate
+# is only a best-effort FAST PATH. The GUARANTEED backstop is server-side:
+#   * VERIFIED in Chord/src/admin/idle.rs: POST /admin/idle records a
+#     ResumeManifest with watchdog_deadline = entered_at + CHORD_IDLE_WATCHDOG_SECS
+#     (DEFAULT_WATCHDOG_SECS = 3600s). A background watchdog_loop auto-activates
+#     once that deadline passes — and it defers ONLY for a *compiler* GPU lease
+#     (holder label matches compiler/build/bld). This assistant sweep is a
+#     NON-compiler GPU holder, so the watchdog WILL auto-reactivate Chord at the
+#     deadline even if THIS wrapper is SIGKILLed and never POSTs /admin/activate.
+#     The manifest is also persisted (CHORD_STATE_DIR), so a Chord restart mid-idle
+#     still reloads Idle and the watchdog bounds it. => Chord is never left drained.
+#   * Locally: `timeout --signal=TERM --kill-after=$KILL_AFTER $MAX_LEASE` force-
+#     KILLs a TERM-ignoring sweep $KILL_AFTER seconds after TERM, so the wrapper
+#     regains control and runs its restore well before systemd's TimeoutStartSec.
+# Ordering the operator MUST preserve when tuning:
+#     MAX_LEASE + KILL_AFTER + restore-margin  <  service TimeoutStartSec
+#                                              <  CHORD_IDLE_WATCHDOG_SECS (backstop)
+# so the fast path always wins in the normal/hung case, and the server-side
+# watchdog is the last-resort catch for a SIGKILLed wrapper.
 #
 # ── Auth (verified against src/compiler/idle_lease.rs + src/federation/mod.rs) ──
 # Chord's /admin/idle and /admin/activate handlers gate on
@@ -45,11 +66,20 @@ log() { printf '%s intake-gap-gate: %s\n' "$(date -Is)" "$*" >&2; }
 # ── Config (env, safe defaults; S1) ───────────────────────────────────────────
 CHORD_CONTROL_URL="${CHORD_CONTROL_URL:-}"
 IDLE_THRESHOLD="${SWEEP_IDLE_THRESHOLD_SECS:-1800}"
-MAX_LEASE="${SWEEP_MAX_LEASE_SECS:-3600}"
+# Kept comfortably BELOW Chord's server-side watchdog (CHORD_IDLE_WATCHDOG_SECS,
+# default 3600) so the wrapper's own restore always wins before the backstop.
+MAX_LEASE="${SWEEP_MAX_LEASE_SECS:-3000}"
+# Grace after SIGTERM before `timeout` SIGKILLs a stuck sweep — the wrapper needs
+# this window back to run its /admin/activate restore.
+KILL_AFTER="${SWEEP_KILL_AFTER_SECS:-60}"
 SWEEP_BIN="${INTAKE_ASSISTANT_SWEEP_BIN:-/opt/intake/intake_assistant_sweep}"
 GAP_MAX="${INTAKE_ASSISTANT_GAP_MAX:-10}"
 GPU_LOCK="${GPU_AUTHORITY_LOCK_PATH:-/run/gpu-authority.lock}"
 HTTP_TIMEOUT="${SWEEP_CONTROL_HTTP_TIMEOUT_SECS:-10}"
+# Diagnostic label sent as the idle `reason`. Deliberately NOT compiler/build/bld
+# — Chord's watchdog only defers auto-reactivate for a compiler GPU LEASE, but a
+# clear non-compiler reason keeps the idle/activate audit trail honest.
+IDLE_REASON="${SWEEP_IDLE_REASON:-assistant-gap-sweep}"
 
 if [[ -z "$CHORD_CONTROL_URL" ]]; then
   log "CHORD_CONTROL_URL is unset — cannot reach Chord's control API; exiting 0 (nothing done)."
@@ -75,11 +105,14 @@ mint_jwt() {
 }
 
 # POST an authed control action; returns curl's exit (non-zero on transport fail).
+# Sends the optional {"reason":...} body Chord's IdleBody accepts (diagnostics only).
 chord_post() {
   local path="$1" jwt
   jwt="$(mint_jwt)" || return 1
   curl -fsS --max-time "$HTTP_TIMEOUT" -X POST \
        -H "Authorization: Bearer ${jwt}" \
+       -H "Content-Type: application/json" \
+       --data "{\"reason\":\"${IDLE_REASON}\"}" \
        "${CHORD_CONTROL_URL%/}${path}" >/dev/null
 }
 
@@ -142,17 +175,20 @@ fi
 # From here on Chord is drained → reactivate on ANY exit path.
 trap activate EXIT
 
-log "Chord drained (/admin/idle). Running gap-only sweep (cap ${GAP_MAX}) under ${MAX_LEASE}s lease."
+log "Chord drained (/admin/idle). Running gap-only sweep (cap ${GAP_MAX}) under ${MAX_LEASE}s lease (+${KILL_AFTER}s kill grace)."
 
 # ── 3. Run the bounded gap-only sweep ──────────────────────────────────────────
+# Finite escalation: SIGTERM at $MAX_LEASE, then SIGKILL $KILL_AFTER later if the
+# sweep ignores TERM — so control ALWAYS returns to this wrapper (and its restore)
+# well before systemd's TimeoutStartSec would SIGKILL the wrapper itself.
 rc=0
 INTAKE_ASSISTANT_GAP_ONLY=1 INTAKE_ASSISTANT_GAP_MAX="$GAP_MAX" \
-  timeout --signal=TERM "$MAX_LEASE" "$SWEEP_BIN" || rc=$?
+  timeout --signal=TERM --kill-after="$KILL_AFTER" "$MAX_LEASE" "$SWEEP_BIN" || rc=$?
 
 if [[ "$rc" == "0" ]]; then
   log "gap-only sweep completed cleanly."
-elif [[ "$rc" == "124" ]]; then
-  log "gap-only sweep hit the ${MAX_LEASE}s max-lease and was terminated (bounded, expected under long runs)."
+elif [[ "$rc" == "124" || "$rc" == "137" ]]; then
+  log "gap-only sweep hit the ${MAX_LEASE}s max-lease (rc=$rc) and was terminated (bounded; restore still runs below)."
 else
   log "gap-only sweep exited non-zero (rc=$rc) — see the sweep's own logs."
 fi

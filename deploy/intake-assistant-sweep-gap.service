@@ -40,9 +40,14 @@ Environment=INTAKE_ASSISTANT_GAP_MAX=10
 # Minimum fleet idle (seconds, from GET /admin/activity's `idle_secs`) before the
 # sweep may start. 1800 = 30 min quiet.
 Environment=SWEEP_IDLE_THRESHOLD_SECS=1800
-# Hard max-lease around the sweep — the wrapper wraps it in `timeout`, so Chord is
-# never left drained by a hung sweep. Keep comfortably above a bounded gap run.
-Environment=SWEEP_MAX_LEASE_SECS=3600
+# Hard max-lease around the sweep: the wrapper runs it under
+# `timeout --signal=TERM --kill-after=SWEEP_KILL_AFTER_SECS SWEEP_MAX_LEASE_SECS`.
+# Kept comfortably BELOW Chord's server-side idle watchdog (CHORD_IDLE_WATCHDOG_SECS,
+# default 3600s) so the wrapper's own /admin/activate restore always wins first.
+Environment=SWEEP_MAX_LEASE_SECS=3000
+# SIGTERM→SIGKILL grace: gives the wrapper control back to run its restore if the
+# sweep ignores TERM.
+Environment=SWEEP_KILL_AFTER_SECS=60
 
 # REQUIRED secret (referenced BY NAME only): the env var named
 # TERMINUS_PRIMARY_CHORD_JWT_SECRET must be present in this host's runtime
@@ -53,10 +58,16 @@ Environment=SWEEP_MAX_LEASE_SECS=3600
 # and /admin/activate. Provision it the same way chord.service already receives
 # its own secrets (EnvironmentFile from the <secret-manager>-materialized env), not inline.
 
-# systemd's own ceiling as a backstop to the wrapper's `timeout` (belt + braces:
-# if the wrapper itself wedges, systemd still SIGTERMs, and the wrapper's trap
-# fires on SIGTERM to reactivate Chord). Slightly above SWEEP_MAX_LEASE_SECS.
-TimeoutStartSec=3900
+# systemd ceiling — the MIDDLE of the three ordered bounds:
+#   SWEEP_MAX_LEASE_SECS + SWEEP_KILL_AFTER_SECS + restore-margin  (3000+60+~180)
+#     <  TimeoutStartSec (3300)
+#       <  Chord's CHORD_IDLE_WATCHDOG_SECS (default 3600, the SIGKILL-safe backstop)
+# So: the wrapper's own restore wins in the normal/hung case; if systemd SIGKILLs a
+# wedged wrapper (EXIT trap does NOT run on SIGKILL), Chord's server-side watchdog
+# still auto-reactivates at its deadline — Chord is never left drained.
+# NOTE: this needs `sudo systemctl kill -s SIGKILL` behavior only as a last resort;
+# the wrapper's --kill-after already bounds the sweep well under this ceiling.
+TimeoutStartSec=3300
 Nice=10
 IOSchedulingClass=idle
 
