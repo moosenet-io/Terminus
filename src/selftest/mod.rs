@@ -986,10 +986,32 @@ async fn check_inference(profile: &SelftestProfile) -> Vec<CheckResult> {
     out
 }
 
+/// Build the tool-router canary POST body, matching Chord's `AgenticRequest`
+/// contract (Chord/src/agentic/context.rs). REQUIRED fields — `messages`,
+/// `user_id`, `model` — must ALL be present or axum's `Json` extractor rejects
+/// the request with HTTP 422 before the router ever runs (the false-positive
+/// this canary previously triggered by omitting `user_id`). Tool restriction is
+/// expressed via `permissions` (a real optional field), NOT `allowed_tools`
+/// (which Chord does not know), so the probe genuinely exercises a
+/// tool-restricted execution.
+fn tool_router_canary_body(model: &str, user_id: &str) -> Value {
+    json!({
+        "model": model,
+        "user_id": user_id,
+        "messages": [{
+            "role": "user",
+            "content": "What is the current UTC time? Use the time_now tool and answer briefly."
+        }],
+        // Chord's tool-restriction field (NOT `allowed_tools`).
+        "permissions": ["time_now", "utc_now"],
+    })
+}
+
 /// Tool-router canary: force a known read-only tool through Chord's
-/// `/v1/agent/execute` and assert a plausible, non-error response. Best-effort
-/// on the exact request/response shape (the orchestrator live-verifies on
-/// deploy); a missing endpoint (404) is the CRITICAL signal this catches.
+/// `/v1/agent/execute` and assert a plausible, non-error response. A missing
+/// endpoint (404) or a 5xx/timeout is the CRITICAL router-failure signal; a 4xx
+/// request-contract rejection is surfaced distinctly (our-bug / contract drift)
+/// so it can never masquerade as a router outage.
 async fn check_tool_router(profile: &SelftestProfile) -> CheckResult {
     let base = crate::config::chord_personal_federation_url();
     let timeout = chat_timeout();
@@ -999,6 +1021,13 @@ async fn check_tool_router(profile: &SelftestProfile) -> CheckResult {
         .first()
         .map(|p| p.name.clone())
         .unwrap_or_else(|| "lumina".to_string());
+    // Chord requires a non-empty `user_id`; use the agent identity if we have
+    // one, else a stable "selftest" principal.
+    let user_id = if profile.agent_identity.trim().is_empty() {
+        "selftest".to_string()
+    } else {
+        profile.agent_identity.clone()
+    };
 
     let client = match http_client(timeout) {
         Ok(c) => c,
@@ -1014,14 +1043,7 @@ async fn check_tool_router(profile: &SelftestProfile) -> CheckResult {
         }
     };
 
-    let body = json!({
-        "model": model,
-        "messages": [{
-            "role": "user",
-            "content": "What is the current UTC time? Use the time_now tool and answer briefly."
-        }],
-        "allowed_tools": ["time_now", "utc_now"],
-    });
+    let body = tool_router_canary_body(&model, &user_id);
     let url = format!("{}/v1/agent/execute", base.trim_end_matches('/'));
     let mut req = client.post(&url).json(&body);
     if let Some(tok) = service_bearer() {
@@ -1031,25 +1053,40 @@ async fn check_tool_router(profile: &SelftestProfile) -> CheckResult {
     let (status, detail) = match req.send().await {
         Ok(resp) => {
             let code = resp.status();
+            let c = code.as_u16();
             if code.is_success() {
                 (
                     CheckStatus::Pass,
-                    "agent/execute accepted a tool-forced request".to_string(),
+                    "agent/execute accepted a tool-restricted request".to_string(),
                 )
-            } else if code.as_u16() == 404 {
+            } else if c == 404 {
+                // Endpoint absent = real router outage.
                 (
                     CheckStatus::Fail,
                     "agent/execute endpoint missing (404)".to_string(),
                 )
-            } else if code.as_u16() == 401 || code.as_u16() == 403 {
+            } else if c == 401 || c == 403 {
                 (
                     CheckStatus::Fail,
-                    format!("agent/execute auth rejected ({})", code.as_u16()),
+                    format!("agent/execute auth rejected ({c})"),
+                )
+            } else if code.is_client_error() {
+                // Any OTHER 4xx (notably 422) is a REQUEST-CONTRACT problem —
+                // our canary body vs Chord's AgenticRequest, or contract drift —
+                // NOT a router outage. Surface it distinctly so it can never
+                // masquerade as (or escalate like) a real Chord/router failure.
+                (
+                    CheckStatus::Fail,
+                    format!(
+                        "tool_router request rejected HTTP {c} — canary body vs \
+                         AgenticRequest contract mismatch (not a router outage)"
+                    ),
                 )
             } else {
+                // 5xx = a real Chord/router-side failure.
                 (
                     CheckStatus::Fail,
-                    format!("agent/execute → HTTP {}", code.as_u16()),
+                    format!("agent/execute → HTTP {c} (router/Chord failure)"),
                 )
             }
         }
@@ -2057,6 +2094,36 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register(&mut reg);
         assert!(reg.contains("agent_selftest"));
+    }
+
+    // ── tool_router canary body matches Chord's AgenticRequest contract ────
+
+    #[test]
+    fn tool_router_canary_body_has_required_fields_and_permissions() {
+        let body = tool_router_canary_body("lumina", "lumina");
+        // All three REQUIRED AgenticRequest fields present (omitting `user_id`
+        // was the 422 false-positive root cause).
+        assert_eq!(body["model"], "lumina");
+        assert_eq!(body["user_id"], "lumina");
+        assert!(body["messages"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false));
+        // Tool restriction uses `permissions` (a real Chord field), NOT the
+        // bogus `allowed_tools`.
+        assert_eq!(body["permissions"], json!(["time_now", "utc_now"]));
+        assert!(
+            body.get("allowed_tools").is_none(),
+            "must not send `allowed_tools` — Chord's field is `permissions`"
+        );
+    }
+
+    #[test]
+    fn tool_router_canary_user_id_falls_back_when_identity_blank() {
+        // `check_tool_router` uses "selftest" when the profile identity is
+        // blank; assert the body helper carries whatever principal it's given.
+        let body = tool_router_canary_body("m", "selftest");
+        assert_eq!(body["user_id"], "selftest");
     }
 
     #[test]
