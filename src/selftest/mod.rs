@@ -23,12 +23,16 @@
 //! per-tool report fastest.
 //!
 //! ## Safety model (the sweep never mutates)
-//! The sweep classifies every tool tri-state and NEVER calls a
-//! write/destructive/guarded tool. The skip decision is driven by a STATIC
-//! deny-policy over the tool name ([`is_write_destructive`]) plus a
-//! "needs required args ⇒ don't fabricate args, classify from schema" rule
-//! ([`decide_probe_action`]). When in doubt, it SKIPS — coverage is always
-//! traded away in favour of never mutating/spending/notifying.
+//! The sweep is FAIL-CLOSED. A tool is only ever CALLED when it is
+//! affirmatively known read-only — its name matches the curated read-only
+//! allowlist ([`is_safe_read`], the PRIMARY gate) AND it is not vetoed by the
+//! write/destructive deny set ([`is_write_destructive`], a belt-and-suspenders
+//! SECOND gate) AND it takes no required args. EVERYTHING else — unknown or
+//! ambiguous — is SKIPPED without calling. This is the fail-closed lesson
+//! (allowlist > denylist): a denylist fails OPEN because it can never enumerate
+//! every mutating verb (e.g. `ledger_transfer`/`ledger_append`), so it is never
+//! the primary gate. See [`decide_probe_action`]. When in doubt, it SKIPS —
+//! coverage is always traded away in favour of never mutating/spending/notifying.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -152,7 +156,13 @@ impl SelftestProfile {
                     severity: Severity::Degraded,
                 },
             ],
-            critical_tools: vec!["time_now".to_string(), "engram_query".to_string()],
+            // Hub-reachable tools whose absence/breakage from the EGRESS catalog
+            // is itself a failure. Scoped to tools actually served by
+            // `register_all` — `engram_query` is a lumina-core IN-PROCESS tool
+            // (checked by the memory/embeddings canary + the later in-process
+            // phase), NOT in the Terminus catalog, so listing it here would
+            // false-flag "missing" on every run.
+            critical_tools: vec!["time_now".to_string()],
         }
     }
 
@@ -305,10 +315,122 @@ const WRITE_VERB_TOKENS: &[&str] = &[
     "seed",
     "insert",
     "upsert",
+    // Reviewer-named gaps (codex/free) — a denylist can never be complete, so
+    // these are belt-and-suspenders only; the AFFIRMATIVE read-only allowlist
+    // ([`is_safe_read`]) is the primary, fail-closed gate.
+    "transfer",
+    "append",
+    "submit",
+    "schedule",
+    "queue",
+    "invoke",
+    "call",
+    "process",
+    "handle",
+    "transform",
+    "modify",
+    "change",
+    "toggle",
+    "pay",
+    "spend",
+    "buy",
+    "sell",
+    "order",
+    "book",
+    "cancel",
+    "notify",
+    "email",
+    "message",
+    "reply",
+    "comment",
+    "assign",
+    "close",
+    "open",
+    "resolve",
+    "escalate",
+    "promote",
+    "demote",
+    "ban",
+    "unban",
 ];
 
 /// Name prefixes that mark an entire tool family as unsafe to probe.
 const WRITE_PREFIXES: &[&str] = &["<host>", "ansible"];
+
+/// AFFIRMATIVE read-only allowlist — the PRIMARY, fail-closed gate. A tool is
+/// only ever CALLED if its name affirmatively matches one of these read/query
+/// semantics AND it is not in the deny set. Everything else — unknown or
+/// ambiguous — is SKIPPED without calling. This is the fail-closed lesson
+/// (allowlist > denylist): a denylist fails OPEN (any mutating tool whose name
+/// lacks a denied token gets probed), so we never rely on it as the primary
+/// gate. Matched as whole `_`-separated tokens (so `forget` never matches
+/// `get`, and a mutating tool needs an actual read token to be eligible — and
+/// even then the deny gate still vetoes it).
+const SAFE_READ_TOKENS: &[&str] = &[
+    "status",
+    "health",
+    "summary",
+    "list",
+    "get",
+    "show",
+    "info",
+    "search",
+    "query",
+    "read",
+    "check",
+    "stats",
+    "activity",
+    "ping",
+    "whoami",
+    "models",
+    "catalog",
+    "balance",
+    "recommend",
+    "describe",
+    "count",
+    "capabilities",
+    "version",
+    "today",
+    "recent",
+    "recently",
+    "history",
+    "view",
+    "inspect",
+    "preview",
+    "diff",
+    "log",
+    "logs",
+    "peek",
+    "snapshot",
+    "state",
+    "metrics",
+    "usage",
+    "report",
+    "available",
+    "domain",
+    "deck",
+    "on",
+    "detail",
+    "details",
+    "current",
+    "latest",
+];
+
+/// Exact tool names that are known read-only but whose names contain no
+/// [`SAFE_READ_TOKENS`] token (e.g. the authoritative clock). Curated, not
+/// pattern-derived — extend only with tools verified read-only.
+const SAFE_READ_EXACT: &[&str] = &["time_now", "utc_now", "weather", "echo"];
+
+/// Affirmative, fail-closed read-only test: `true` only when the tool's name
+/// matches a curated safe-read token or exact name. Callers must ALSO confirm
+/// the deny gate ([`is_write_destructive`]) does not veto it.
+pub fn is_safe_read(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if SAFE_READ_EXACT.contains(&lower.as_str()) {
+        return true;
+    }
+    lower.split('_').any(|tok| SAFE_READ_TOKENS.contains(&tok))
+}
 
 /// Returns `true` if a tool must NEVER be probed (write/destructive/guarded),
 /// based purely on its name.
@@ -339,24 +461,41 @@ pub fn schema_has_required(parameters: &Value) -> bool {
 }
 
 /// The action the sweep should take for a given tool, decided WITHOUT calling
-/// it. Skip (destructive) takes precedence over everything; a tool that would
-/// need fabricated args is classified `NeedsArgs` from its schema rather than
-/// probed with guessed values.
+/// it. The default is SKIP — a tool is only ever probed when affirmatively
+/// known read-only. Skip carries a reason so the report says WHY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeAction {
-    /// Never call — destructive/guarded.
-    Skip,
-    /// Has required params — classify `needs_args` without calling.
+    /// Vetoed by the deny gate (write/destructive/guarded token/prefix).
+    SkipDestructive,
+    /// Not affirmatively read-only — the fail-closed default. Never called.
+    SkipNotAllowlisted,
+    /// On the read-only allowlist but has required params — classify
+    /// `needs_args` from the schema without fabricating arguments.
     NeedsArgs,
-    /// Safe to probe with an empty (`{}`) argument set.
+    /// Affirmatively read-only and safe to probe with an empty (`{}`) arg set.
     Probe,
 }
 
-/// Decide, from the tool's name + schema alone, whether to skip it, classify
-/// it as needs-args, or probe it with `{}`.
+/// Decide, from the tool's name + schema alone, whether to skip it (and why),
+/// classify it as needs-args, or probe it with `{}`.
+///
+/// FAIL-CLOSED ordering:
+///   1. Deny gate (belt-and-suspenders): any write/destructive token/prefix ⇒
+///      `SkipDestructive`. This wins even over an allowlist match, so a tool
+///      like `queue_status` that matched a read token but ALSO carries a deny
+///      token is still skipped.
+///   2. Allowlist gate (PRIMARY): not affirmatively read-only ⇒
+///      `SkipNotAllowlisted`. This is the fail-closed default — unknown or
+///      ambiguous names are NEVER called (e.g. `ledger_transfer`,
+///      `ledger_append`, `relay_*` all fall here even though `transfer`/
+///      `append` might be missing from a denylist).
+///   3. Read-only + required params ⇒ `NeedsArgs` (no fabricated args).
+///   4. Read-only + no required params ⇒ `Probe`.
 pub fn decide_probe_action(name: &str, parameters: &Value) -> ProbeAction {
     if is_write_destructive(name) {
-        ProbeAction::Skip
+        ProbeAction::SkipDestructive
+    } else if !is_safe_read(name) {
+        ProbeAction::SkipNotAllowlisted
     } else if schema_has_required(parameters) {
         ProbeAction::NeedsArgs
     } else {
@@ -369,6 +508,13 @@ pub fn decide_probe_action(name: &str, parameters: &Value) -> ProbeAction {
 pub fn classify_probe(result: Option<&Result<String, ToolError>>) -> ProbeStatus {
     match result {
         None => ProbeStatus::Broken, // timed out
+        // LOW (acknowledged, no behaviour change): a handful of tools fold a
+        // backend failure into an `Ok(json)` body carrying an `"error"` key
+        // (e.g. the `lumina_*` web tools) rather than returning `Err`. Those
+        // are classified `working` here because they returned a non-error
+        // result at the tool-contract level — deep-parsing every tool's JSON
+        // for an embedded error convention would be brittle and tool-specific,
+        // so it is deliberately out of scope for the sweep's coarse tri-state.
         Some(Ok(_)) => ProbeStatus::Working,
         Some(Err(ToolError::NotConfigured(_))) => ProbeStatus::NotConfigured,
         Some(Err(ToolError::InvalidArgument(_))) => ProbeStatus::NeedsArgs,
@@ -471,50 +617,67 @@ pub fn rollup_by_prefix(matrix: &[ToolProbe]) -> Value {
 // Timeouts (env-overridable, bounded defaults)
 // ---------------------------------------------------------------------------
 
-fn probe_timeout() -> Duration {
-    let secs = std::env::var("SELFTEST_PROBE_TIMEOUT_SECS")
+/// Clamp helper: parse an env u64, clamp into `[min, max]`, else `default`. A
+/// misconfig can neither hang the sweep (unbounded timeout) nor fork-bomb it
+/// (unbounded concurrency).
+fn clamped_env_u64(key: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(key)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(4);
-    Duration::from_secs(secs)
+        .map(|v| v.clamp(min, max))
+        .unwrap_or(default)
+}
+
+fn probe_timeout() -> Duration {
+    // ≥1s, ≤30s (FIX 2 — bound the knob).
+    Duration::from_secs(clamped_env_u64("SELFTEST_PROBE_TIMEOUT_SECS", 4, 1, 30))
 }
 
 fn chat_timeout() -> Duration {
-    let secs = std::env::var("SELFTEST_CHAT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(20);
-    Duration::from_secs(secs)
+    // ≥1s, ≤60s (lumina-deep may cold-load; still bounded).
+    Duration::from_secs(clamped_env_u64("SELFTEST_CHAT_TIMEOUT_SECS", 20, 1, 60))
 }
 
 /// Max number of tool probes to run concurrently in the sweep, so a catalog of
 /// ~200 tools doesn't serialize into minutes of unreachable-backend waits.
+/// Clamped ≥1, ≤64 (FIX 2 — a misconfig can't fork-bomb the sweep).
 fn probe_concurrency() -> usize {
-    std::env::var("SELFTEST_PROBE_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|c| *c > 0)
-        .unwrap_or(16)
+    clamped_env_u64("SELFTEST_PROBE_CONCURRENCY", 16, 1, 64) as usize
 }
 
 // ---------------------------------------------------------------------------
 // The per-tool functional sweep
 // ---------------------------------------------------------------------------
 
-/// Run the per-tool functional sweep against a freshly-built copy of the same
-/// registry `agent_selftest` itself lives in. Building a fresh `ToolRegistry`
-/// via `register_all` is the established in-crate pattern (see
-/// `registry::personal_only_tool_metadata`) — the tool has no handle to the
-/// live registry it was dispatched from, and rebuilding is cheap (each tool
-/// module's `register` only constructs boxed structs + reqwest clients).
+/// Process-wide cached sweep registry, built exactly ONCE (FIX 3).
 ///
-/// `self_name` is skipped so the sweep never recurses into itself.
+/// `register_all` is NOT side-effect-free: `crate::compiler::register` spawns a
+/// durable-queue scheduler loop when it runs inside a tokio runtime with Redis
+/// configured (guarded by a global `AtomicBool` so it can only ever spawn once
+/// process-wide), and a few modules (`council`, `cortex`) allocate in-memory
+/// stores. To avoid re-triggering those on every sweep, the sweep's registry is
+/// built once here and reused. Reads (`list()`, `call()`) are `&self` and
+/// concurrency-safe, so a shared `Arc` is sufficient. Note the live process
+/// already built its own registry via `register_all`; this is a second,
+/// long-lived copy dedicated to self-test probing (the compiler spawn-guard
+/// makes the second `register_all` a no-op for the scheduler).
+static SWEEP_REGISTRY: std::sync::OnceLock<Arc<ToolRegistry>> = std::sync::OnceLock::new();
+
+fn sweep_registry() -> Arc<ToolRegistry> {
+    SWEEP_REGISTRY
+        .get_or_init(|| {
+            let mut registry = ToolRegistry::new();
+            register_all(&mut registry);
+            Arc::new(registry)
+        })
+        .clone()
+}
+
+/// Run the per-tool functional sweep against the cached sweep registry (the
+/// same catalog `agent_selftest` itself lives in). `self_name` is skipped so
+/// the sweep never recurses into itself.
 async fn run_tool_sweep(self_name: &str) -> Vec<ToolProbe> {
-    let mut registry = ToolRegistry::new();
-    register_all(&mut registry);
-    let registry = Arc::new(registry);
+    let registry = sweep_registry();
     let catalog: Vec<ToolInfo> = registry.list();
 
     let timeout = probe_timeout();
@@ -540,9 +703,13 @@ async fn run_tool_sweep(self_name: &str) -> Vec<ToolProbe> {
 async fn probe_one_tool(registry: &ToolRegistry, info: &ToolInfo, timeout: Duration) -> ToolProbe {
     let start = Instant::now();
     let (status, detail) = match decide_probe_action(&info.name, &info.parameters) {
-        ProbeAction::Skip => (
+        ProbeAction::SkipDestructive => (
             ProbeStatus::Skipped,
             "write/destructive/guarded — not probed".to_string(),
+        ),
+        ProbeAction::SkipNotAllowlisted => (
+            ProbeStatus::Skipped,
+            "not on read-only allowlist — not probed (fail-closed)".to_string(),
         ),
         ProbeAction::NeedsArgs => (
             ProbeStatus::NeedsArgs,
@@ -650,6 +817,11 @@ async fn check_inference(profile: &SelftestProfile) -> Vec<CheckResult> {
     let mut out = Vec::new();
     for proxy in &profile.named_proxies {
         let start = Instant::now();
+        // LOW (acknowledged, no behaviour change): when the `/v1/models`
+        // pre-flight itself failed (`model_ids == None`), we do NOT claim the
+        // proxy is "missing from the catalog" — `unwrap_or(false)` means the
+        // 404 detail simply omits the extra "(not present…)" note rather than
+        // asserting an absence we couldn't actually confirm.
         let missing_from_catalog = model_ids
             .as_ref()
             .map(|ids| !ids.iter().any(|id| id == &proxy.name))
@@ -838,8 +1010,11 @@ async fn check_embeddings() -> CheckResult {
     let model = crate::config::embeddings_model();
     let timeout = Duration::from_millis(crate::config::embeddings_timeout_ms());
 
-    // The exact known-broken condition: no service JWT secret ⇒ Chord's
-    // auth_check rejects, engram silently stores without embeddings.
+    // No service JWT could be minted ⇒ Chord's auth_check rejects and engram
+    // silently stores without embeddings. FIX 5: `mint_service_jwt` can fail
+    // for reasons other than an unset secret (bad/rotated key, clock skew), so
+    // the detail names the neutral category — "embeddings auth/JWT
+    // unavailable" — without over-claiming the specific cause.
     let bearer = service_bearer();
     if bearer.is_none() {
         return CheckResult {
@@ -848,8 +1023,7 @@ async fn check_embeddings() -> CheckResult {
             severity: Severity::Critical,
             status: CheckStatus::Fail,
             latency_ms: start.elapsed().as_millis() as u64,
-            detail: "embeddings auth not provisioned (service JWT secret unset) — \
-                     engram stores WITHOUT embeddings"
+            detail: "embeddings auth/JWT unavailable — engram stores WITHOUT embeddings"
                 .to_string(),
         };
     }
@@ -999,6 +1173,73 @@ async fn check_prometheus() -> CheckResult {
 }
 
 // ---------------------------------------------------------------------------
+// Critical-tools cross-check (FIX 4)
+// ---------------------------------------------------------------------------
+
+/// Cross-check the profile's declared `critical_tools` against the sweep
+/// matrix. A critical tool that is ABSENT from the catalog, or present-but-
+/// `broken`, is a CRITICAL failure; present-but-`not_configured` is DEGRADED (a
+/// provisioning gap, not an outright break). `working` / `needs_args` /
+/// `skipped` all mean "present in the catalog" and therefore pass — a skipped
+/// (e.g. write) critical tool is still confirmed present even though the sweep
+/// never called it. Returns `None` when the profile declares no critical tools.
+/// Tool names are configuration identifiers (not secrets) so they may appear in
+/// the detail string.
+pub fn check_critical_tools(
+    profile: &SelftestProfile,
+    matrix: &[ToolProbe],
+) -> Option<CheckResult> {
+    if profile.critical_tools.is_empty() {
+        return None;
+    }
+    let mut missing = Vec::new();
+    let mut broken = Vec::new();
+    let mut not_configured = Vec::new();
+    for want in &profile.critical_tools {
+        match matrix.iter().find(|p| &p.name == want) {
+            None => missing.push(want.as_str()),
+            Some(p) => match p.status.as_str() {
+                "broken" => broken.push(want.as_str()),
+                "not_configured" => not_configured.push(want.as_str()),
+                _ => {} // working / needs_args / skipped = present in catalog
+            },
+        }
+    }
+
+    let (severity, status, detail) = if !missing.is_empty() || !broken.is_empty() {
+        (
+            Severity::Critical,
+            CheckStatus::Fail,
+            format!("missing: {missing:?}; broken: {broken:?}"),
+        )
+    } else if !not_configured.is_empty() {
+        (
+            Severity::Degraded,
+            CheckStatus::Fail,
+            format!("not_configured: {not_configured:?}"),
+        )
+    } else {
+        (
+            Severity::Critical,
+            CheckStatus::Pass,
+            format!(
+                "all {} critical tool(s) present & functional",
+                profile.critical_tools.len()
+            ),
+        )
+    };
+
+    Some(CheckResult {
+        id: "critical_tools".to_string(),
+        capability: "tools".to_string(),
+        severity,
+        status,
+        latency_ms: 0,
+        detail,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Top-level run
 // ---------------------------------------------------------------------------
 
@@ -1037,6 +1278,11 @@ pub async fn run(profile: &SelftestProfile, self_name: &str) -> SelftestReport {
         latency_ms: matrix.iter().map(|p| p.latency_ms).max().unwrap_or(0),
         detail: format!("{} tools probed; {} broken", matrix.len(), broken_count),
     });
+
+    // FIX 4: flag any declared critical tool that is absent/broken/unprovisioned.
+    if let Some(crit_check) = check_critical_tools(profile, &matrix) {
+        checks.push(crit_check);
+    }
 
     let overall = compute_overall(&checks, sweep_has_broken);
     let tool_counts = count_by_status(&matrix);
@@ -1223,19 +1469,20 @@ mod tests {
 
     #[test]
     fn decide_probe_action_skip_beats_needs_args() {
-        // Destructive AND has required params ⇒ still Skip (never call).
+        // Destructive AND has required params ⇒ still SkipDestructive (never call).
         let params = json!({"required": ["id"]});
         assert_eq!(
             decide_probe_action("plane_delete_issue", &params),
-            ProbeAction::Skip
+            ProbeAction::SkipDestructive
         );
     }
 
     #[test]
     fn decide_probe_action_needs_args_for_required_read_tool() {
+        // On the read allowlist (`search`) but has required params ⇒ needs_args.
         let params = json!({"required": ["query"]});
         assert_eq!(
-            decide_probe_action("engram_query", &params),
+            decide_probe_action("skills_search", &params),
             ProbeAction::NeedsArgs
         );
     }
@@ -1244,6 +1491,90 @@ mod tests {
     fn decide_probe_action_probe_for_no_required_read_tool() {
         let params = json!({"type": "object", "properties": {}});
         assert_eq!(decide_probe_action("time_now", &params), ProbeAction::Probe);
+    }
+
+    // ── FIX 1: fail-closed allowlist is the PRIMARY gate ──────────────────
+
+    #[test]
+    fn is_safe_read_matches_read_semantics_and_exact_names() {
+        for name in &[
+            "media_domain_status",
+            "soma_status",
+            "myelin_today",
+            "dura_constellation_health",
+            "gitea_list_identities",
+            "net_ping",
+            "time_now", // exact-name allowlist (no read token)
+            "utc_now",
+        ] {
+            assert!(is_safe_read(name), "{name} should be read-safe");
+        }
+    }
+
+    #[test]
+    fn is_safe_read_rejects_unknown_and_mutating_names() {
+        // None of these carry a read token — the fail-closed default is SKIP.
+        for name in &[
+            "ledger_transfer",
+            "ledger_append",
+            "relay_dispatch",
+            "thing_submit",
+            "job_schedule",
+            "task_enqueue",
+            "widget_frobnicate",
+        ] {
+            assert!(!is_safe_read(name), "{name} must NOT be read-safe");
+        }
+    }
+
+    #[test]
+    fn fail_closed_mutating_no_arg_tool_is_skipped_not_probed() {
+        // The exact CRITICAL flaw the reviewer named: a mutating tool with a
+        // benign-looking no-arg name. `transfer`/`append` may be MISSING from a
+        // denylist, but the allowlist is fail-closed so these are SKIPPED.
+        let no_args = json!({"type": "object", "properties": {}});
+        assert_eq!(
+            decide_probe_action("ledger_transfer", &no_args),
+            ProbeAction::SkipDestructive // caught by the belt-and-suspenders deny gate too
+        );
+        // A mutating tool whose verb is NOT in the deny set still never gets
+        // probed — it falls through to the allowlist's fail-closed default.
+        assert_eq!(
+            decide_probe_action("widget_frobnicate", &no_args),
+            ProbeAction::SkipNotAllowlisted
+        );
+        assert_eq!(
+            decide_probe_action("account_liquidate", &no_args),
+            ProbeAction::SkipNotAllowlisted
+        );
+    }
+
+    #[test]
+    fn fail_closed_known_read_tools_are_probed() {
+        let no_args = json!({"type": "object", "properties": {}});
+        assert_eq!(
+            decide_probe_action("media_domain_status", &no_args),
+            ProbeAction::Probe
+        );
+        assert_eq!(
+            decide_probe_action("time_now", &no_args),
+            ProbeAction::Probe
+        );
+        assert_eq!(
+            decide_probe_action("soma_status", &no_args),
+            ProbeAction::Probe
+        );
+    }
+
+    #[test]
+    fn deny_gate_vetoes_even_an_allowlist_match() {
+        // `queue_status` matches the read token `status` but ALSO carries the
+        // denied `queue` token — deny wins, never probed.
+        let no_args = json!({"type": "object", "properties": {}});
+        assert_eq!(
+            decide_probe_action("queue_status", &no_args),
+            ProbeAction::SkipDestructive
+        );
     }
 
     // ── classify_probe: outcome → status ──────────────────────────────────
@@ -1427,6 +1758,60 @@ mod tests {
         assert_eq!(p.named_proxies.len(), 1);
         assert_eq!(p.named_proxies[0].name, "aria");
         assert!(p.critical_tools.is_empty());
+    }
+
+    // ── FIX 4: critical-tools cross-check ─────────────────────────────────
+
+    fn profile_with_criticals(tools: &[&str]) -> SelftestProfile {
+        let mut p = SelftestProfile::lumina();
+        p.critical_tools = tools.iter().map(|s| s.to_string()).collect();
+        p
+    }
+
+    #[test]
+    fn critical_tools_none_declared_yields_no_check() {
+        let mut p = SelftestProfile::lumina();
+        p.critical_tools.clear();
+        assert!(check_critical_tools(&p, &[]).is_none());
+    }
+
+    #[test]
+    fn critical_tools_absent_is_critical_fail() {
+        let p = profile_with_criticals(&["time_now"]);
+        // Empty matrix ⇒ the tool is missing from the catalog.
+        let c = check_critical_tools(&p, &[]).unwrap();
+        assert_eq!(c.severity, Severity::Critical);
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert!(c.detail.contains("time_now"));
+    }
+
+    #[test]
+    fn critical_tools_broken_is_critical_fail() {
+        let p = profile_with_criticals(&["time_now"]);
+        let matrix = vec![probe("time_now", "broken")];
+        let c = check_critical_tools(&p, &matrix).unwrap();
+        assert_eq!(c.severity, Severity::Critical);
+        assert_eq!(c.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn critical_tools_not_configured_is_degraded_fail() {
+        let p = profile_with_criticals(&["time_now"]);
+        let matrix = vec![probe("time_now", "not_configured")];
+        let c = check_critical_tools(&p, &matrix).unwrap();
+        assert_eq!(c.severity, Severity::Degraded);
+        assert_eq!(c.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn critical_tools_working_or_needs_args_pass() {
+        let p = profile_with_criticals(&["time_now", "engram_query"]);
+        let matrix = vec![
+            probe("time_now", "working"),
+            probe("engram_query", "needs_args"),
+        ];
+        let c = check_critical_tools(&p, &matrix).unwrap();
+        assert_eq!(c.status, CheckStatus::Pass);
     }
 
     // ── tool metadata + registration ──────────────────────────────────────
