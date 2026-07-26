@@ -56,7 +56,7 @@
 # ── DESIGN ARTIFACT — do NOT run from a dev box; the orchestrator installs the
 #    unit files as an OPS action on the GPU host. ──
 #
-# Requires: bash, curl, openssl, jq (or falls back to a grep/sed idle_secs parse
+# Requires: bash, curl, python3 (JWT signing), jq (or falls back to a grep/sed idle_secs parse
 # if jq is absent). Exit 0 on: swept OK, or skipped-because-busy (both are
 # "nothing wrong"). Non-zero only if the sweep itself failed to complete.
 set -euo pipefail
@@ -86,22 +86,39 @@ if [[ -z "$CHORD_CONTROL_URL" ]]; then
   exit 0
 fi
 
-b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
-
 # Mint the short-lived Chord service JWT (HS256, sub=lumina, exp=now+120).
+#
+# SECURITY (S6/S7): the HMAC key MUST NOT appear in any process's argv — a
+# concurrent same-host process could read it from `ps`/`/proc/<pid>/cmdline`.
+# `openssl dgst -hmac "$secret"` would leak it that way, so we sign in python3
+# instead: it reads TERMINUS_PRIMARY_CHORD_JWT_SECRET from os.environ (the same
+# environment the unit already passes it through) and it never touches argv. The
+# token shape is identical to jsonwebtoken's HS256 default: header
+# {"alg":"HS256","typ":"JWT"}, claims {"sub":"lumina","exp":now+120}, base64url
+# (no padding), joined `header.payload.signature`.
 mint_jwt() {
-  local secret="<REDACTED-SECRET>"
-  if [[ -z "$secret" ]]; then
+  if [[ -z "${TERMINUS_PRIMARY_CHORD_JWT_SECRET:-}" ]]; then
     log "TERMINUS_PRIMARY_CHORD_JWT_SECRET is unset — cannot auth to Chord control API."
     return 1
   fi
-  local header payload signing_input sig
-  header="$(printf '%s' '{"alg":"HS256","typ":"JWT"}' | b64url)"
-  payload="$(printf '{"sub":"lumina","exp":%d}' "$(( $(date +%s) + 120 ))" | b64url)"
-  signing_input="${header}.${payload}"
-  sig="$(printf '%s' "$signing_input" \
-        | openssl dgst -sha256 -hmac "$secret" -binary | b64url)"
-  printf '%s.%s' "$signing_input" "$sig"
+  python3 - <<'PY'
+import base64, hashlib, hmac, os, sys, time
+
+secret = os.environ.get("TERMINUS_PRIMARY_CHORD_JWT_SECRET", "")
+if not secret:
+    sys.exit(1)
+
+
+def b64u(raw: bytes) -> bytes:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+
+header = b64u(b'{"alg":"HS256","typ":"JWT"}')
+payload = b64u(('{"sub":"lumina","exp":%d}' % (int(time.time()) + 120)).encode())
+signing_input = header + b"." + payload
+sig = b64u(hmac.new(secret.encode(), signing_input, hashlib.sha256).digest())
+sys.stdout.write((signing_input + b"." + sig).decode())
+PY
 }
 
 # POST an authed control action; returns curl's exit (non-zero on transport fail).
