@@ -167,6 +167,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::review::register(registry);
     crate::routines::register(registry);
     crate::seer::register(registry);
+    crate::selftest::register(registry); // agent_selftest — hub-side self-test tool
     crate::sentinel::register(registry);
     crate::soma::register(registry);
     crate::skills::register(registry);
