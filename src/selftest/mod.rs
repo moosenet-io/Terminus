@@ -366,6 +366,15 @@ const WRITE_PREFIXES: &[&str] = &["<host>", "ansible"];
 /// gate. Matched as whole `_`-separated tokens (so `forget` never matches
 /// `get`, and a mutating tool needs an actual read token to be eligible — and
 /// even then the deny gate still vetoes it).
+///
+/// STRICTLY read-SEMANTIC verbs/nouns ONLY. A token that a MUTATING tool could
+/// plausibly contain is NOT allowed here — it re-opens the fail-open hole. The
+/// canonical example is `on`: it would allowlist `power_on` / `toggle_on` /
+/// `turn_on` (all writes). Ambiguous tokens (`on`, `deck`, `today`, `recent`,
+/// `recently`, `log`, `logs`, `view`, `state`, `available`, `domain`,
+/// `current`, `latest`) were deliberately DROPPED; the specific legitimate read
+/// tools that only matched via them are covered by exact name in
+/// [`SAFE_READ_EXACT`] instead.
 const SAFE_READ_TOKENS: &[&str] = &[
     "status",
     "health",
@@ -390,36 +399,44 @@ const SAFE_READ_TOKENS: &[&str] = &[
     "count",
     "capabilities",
     "version",
-    "today",
-    "recent",
-    "recently",
     "history",
-    "view",
-    "inspect",
-    "preview",
-    "diff",
-    "log",
-    "logs",
-    "peek",
-    "snapshot",
-    "state",
     "metrics",
     "usage",
     "report",
-    "available",
-    "domain",
-    "deck",
-    "on",
     "detail",
-    "details",
-    "current",
-    "latest",
+    "inspect",
+    "preview",
+    "diff",
+    "snapshot",
+    "peek",
 ];
 
 /// Exact tool names that are known read-only but whose names contain no
-/// [`SAFE_READ_TOKENS`] token (e.g. the authoritative clock). Curated, not
-/// pattern-derived — extend only with tools verified read-only.
-const SAFE_READ_EXACT: &[&str] = &["time_now", "utc_now", "weather", "echo"];
+/// [`SAFE_READ_TOKENS`] token (e.g. the authoritative clock, or reads that only
+/// matched via a now-dropped ambiguous token like `today`/`recent`/`on`).
+/// Curated, not pattern-derived — every entry was verified read-only from its
+/// tool description; extend only with tools likewise verified. The deny gate
+/// ([`is_write_destructive`]) still runs first, so an exact-listed name that
+/// somehow carried a write token would still be vetoed.
+const SAFE_READ_EXACT: &[&str] = &[
+    "time_now",
+    "utc_now",
+    "weather",
+    "echo",
+    // Reads that only matched via the dropped `on`/`deck` tokens.
+    "media_on_deck",
+    // Reads that only matched via the dropped `today`/`recent`/`recently` tokens.
+    "vitals_today",
+    "vitals_recent",
+    "myelin_today",
+    "ledger_recent",
+    "seer_recent",
+    "google_calendar_today",
+    "media_recently_added",
+    // Reads that only matched via the dropped `logs` token.
+    "vector_logs",
+    "portainer_container_logs",
+];
 
 /// Affirmative, fail-closed read-only test: `true` only when the tool's name
 /// matches a curated safe-read token or exact name. Callers must ALSO confirm
@@ -1508,6 +1525,70 @@ mod tests {
             "utc_now",
         ] {
             assert!(is_safe_read(name), "{name} should be read-safe");
+        }
+    }
+
+    #[test]
+    fn on_token_write_family_is_not_read_safe() {
+        // The `_on`-suffixed write family: `on` was REMOVED from the allowlist
+        // tokens precisely because it would allowlist these mutating tools.
+        // None must be probed.
+        for name in &["power_on", "toggle_on", "turn_on", "enable_on", "lights_on"] {
+            assert!(
+                !is_safe_read(name),
+                "{name} is a write and must NOT be read-safe"
+            );
+            // And end-to-end: they resolve to a Skip action, never Probe.
+            let no_args = json!({"type": "object", "properties": {}});
+            assert!(
+                matches!(
+                    decide_probe_action(name, &no_args),
+                    ProbeAction::SkipDestructive | ProbeAction::SkipNotAllowlisted
+                ),
+                "{name} must be skipped, not probed"
+            );
+        }
+    }
+
+    #[test]
+    fn media_on_deck_is_read_safe_via_exact_name() {
+        // The one legit read tool that used to match via `on`/`deck` — now
+        // covered by exact name so it still probes.
+        assert!(is_safe_read("media_on_deck"));
+        let no_args = json!({"type": "object", "properties": {}});
+        assert_eq!(
+            decide_probe_action("media_on_deck", &no_args),
+            ProbeAction::Probe
+        );
+    }
+
+    #[test]
+    fn dropped_token_read_tools_covered_by_exact_name() {
+        // Reads that only matched via now-dropped ambiguous tokens
+        // (today/recent/logs) stay allowlisted via SAFE_READ_EXACT.
+        for name in &[
+            "vitals_today",
+            "vitals_recent",
+            "myelin_today",
+            "ledger_recent",
+            "seer_recent",
+            "google_calendar_today",
+            "media_recently_added",
+            "vector_logs",
+            "portainer_container_logs",
+        ] {
+            assert!(is_safe_read(name), "{name} should stay read-safe via exact");
+        }
+        // But the WRITE tools that shared those tokens are NOT covered.
+        for name in &[
+            "vitals_log_weight", // write
+            "odyssey_log_trip",  // write
+            "vitals_log_sleep",  // write
+        ] {
+            assert!(
+                !is_safe_read(name),
+                "{name} (a write) must NOT be read-safe"
+            );
         }
     }
 
