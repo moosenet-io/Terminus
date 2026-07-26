@@ -256,6 +256,41 @@ pub fn only_stale_from_env() -> bool {
     parse_only_stale(std::env::var("MINT_ONLY_STALE").ok().as_deref())
 }
 
+/// Parse the assistant-sweep gap-only run-mode flag from a raw env value
+/// (`INTAKE_ASSISTANT_GAP_ONLY`). Truthy = `1`/`true`/`yes`/`on`
+/// (case-insensitive); anything else (including unset) is `false` so the FULL
+/// assistant sweep stays the default. Pure over its input. Reuses the exact
+/// truthiness rule as [`parse_only_stale`] for one consistent flag grammar.
+pub fn parse_gap_only(raw: Option<&str>) -> bool {
+    parse_only_stale(raw)
+}
+
+/// Whether the assistant sweep should run in gap-only candidate-selection mode
+/// (`INTAKE_ASSISTANT_GAP_ONLY`, default `false` → full nomination set). When
+/// on, the candidate set is narrowed to models with a builder profile but no
+/// assistant profile (see `runner::select_gap_models`).
+pub fn gap_only_from_env() -> bool {
+    parse_gap_only(std::env::var("INTAKE_ASSISTANT_GAP_ONLY").ok().as_deref())
+}
+
+/// Parse the gap-only per-run model cap from a raw env value
+/// (`INTAKE_ASSISTANT_GAP_MAX`). Clamped to at least `1` (a cap of `0`/negative
+/// would profile nothing, defeating the point); a missing/unparseable value
+/// falls back to the default of `10` so an overnight gap run is bounded. Pure
+/// over its input.
+pub fn parse_gap_max(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|n| *n >= 1)
+        .map(|n| n as usize)
+        .unwrap_or(10)
+}
+
+/// The gap-only per-run model cap from the environment
+/// (`INTAKE_ASSISTANT_GAP_MAX`, default `10`).
+pub fn gap_max_from_env() -> usize {
+    parse_gap_max(std::env::var("INTAKE_ASSISTANT_GAP_MAX").ok().as_deref())
+}
+
 // ---------------------------------------------------------------------------
 // Unified MINT harness (MINT2-04)
 // ---------------------------------------------------------------------------
@@ -1963,6 +1998,28 @@ mod tests {
         assert!(parse_only_stale(Some("true")));
         assert!(parse_only_stale(Some("YES")));
         assert!(parse_only_stale(Some(" On ")));
+    }
+
+    #[test]
+    fn parse_gap_only_is_false_unless_explicitly_truthy() {
+        assert!(!parse_gap_only(None), "unset → full sweep (default)");
+        assert!(!parse_gap_only(Some("")));
+        assert!(!parse_gap_only(Some("0")));
+        assert!(!parse_gap_only(Some("off")));
+        assert!(parse_gap_only(Some("1")));
+        assert!(parse_gap_only(Some("true")));
+        assert!(parse_gap_only(Some(" On ")));
+    }
+
+    #[test]
+    fn parse_gap_max_defaults_to_ten_and_clamps() {
+        assert_eq!(parse_gap_max(None), 10, "unset → default 10");
+        assert_eq!(parse_gap_max(Some("")), 10);
+        assert_eq!(parse_gap_max(Some("garbage")), 10);
+        assert_eq!(parse_gap_max(Some("0")), 10, "0 is not a useful cap → default");
+        assert_eq!(parse_gap_max(Some("-4")), 10, "negative → default");
+        assert_eq!(parse_gap_max(Some(" 3 ")), 3);
+        assert_eq!(parse_gap_max(Some("25")), 25);
     }
 
     #[test]
