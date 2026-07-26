@@ -22,17 +22,26 @@
 //! invocable immediately via the loopback door and gives the operator the
 //! per-tool report fastest.
 //!
-//! ## Safety model (the sweep never mutates)
-//! The sweep is FAIL-CLOSED. A tool is only ever CALLED when it is
-//! affirmatively known read-only — its name matches the curated read-only
-//! allowlist ([`is_safe_read`], the PRIMARY gate) AND it is not vetoed by the
-//! write/destructive deny set ([`is_write_destructive`], a belt-and-suspenders
-//! SECOND gate) AND it takes no required args. EVERYTHING else — unknown or
-//! ambiguous — is SKIPPED without calling. This is the fail-closed lesson
-//! (allowlist > denylist): a denylist fails OPEN because it can never enumerate
-//! every mutating verb (e.g. `ledger_transfer`/`ledger_append`), so it is never
-//! the primary gate. See [`decide_probe_action`]. When in doubt, it SKIPS —
-//! coverage is always traded away in favour of never mutating/spending/notifying.
+//! ## Safety model (the sweep never mutates) — LAYERED, fail-closed
+//! A tool is only ever CALLED when EVERY gate below allows it; each gate can
+//! only demote toward skip, never promote to a call (full detail on
+//! [`decide_probe_action`], including the accepted residual risk):
+//!   1. **Guarded registry (AUTHORITATIVE).** [`crate::approval::is_guarded`] on
+//!      the bare name is the fleet's canonical machine-readable classifier for
+//!      approval-gated/dangerous tools (<secret-manager>/ansible/openhands/routines/
+//!      pg_ddl/pg_admin/pg_execute/git_public_mirror_*). Checked FIRST and
+//!      independent of any name heuristic, so a guarded tool whose name contains
+//!      a read token (e.g. `infisical_get_secret`, `openhands_get_status`) is
+//!      still skipped. This is the guarantee a name allowlist alone cannot give.
+//!   2. **Destructive-name deny** ([`is_write_destructive`]) — second veto.
+//!   3. **Required-args** — classified `needs_args`, never called.
+//!   4. **Read-only allowlist** ([`is_safe_read`]) — the fail-closed default:
+//!      only an affirmatively read-named, no-required-args tool reaches `Probe`;
+//!      EVERYTHING else is SKIPPED. This is the fail-closed lesson (allowlist >
+//!      denylist): a denylist fails OPEN because it can never enumerate every
+//!      mutating verb (`ledger_transfer`/`ledger_append`).
+//! When in doubt it SKIPS — coverage is always traded away in favour of never
+//! mutating/spending/notifying.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -477,17 +486,36 @@ pub fn schema_has_required(parameters: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Strip any federation/namespace prefix from an advertised tool name, yielding
+/// the BARE name the guarded registry / the gateway key on. Mesh-federated
+/// tools are advertised as `<namespace>__<bare>` (see
+/// `crate::mesh::merge::split_namespaced`, the same derivation `mcp_server.rs`
+/// uses before calling `approval::is_guarded`); a name with no `__` boundary is
+/// already bare and returned unchanged.
+pub fn bare_tool_name(name: &str) -> &str {
+    crate::mesh::merge::split_namespaced(name)
+        .map(|(_ns, bare)| bare)
+        .unwrap_or(name)
+}
+
 /// The action the sweep should take for a given tool, decided WITHOUT calling
 /// it. The default is SKIP — a tool is only ever probed when affirmatively
-/// known read-only. Skip carries a reason so the report says WHY.
+/// known read-only AND not vetoed by any stronger gate. Skip carries a reason
+/// so the report says WHY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeAction {
-    /// Vetoed by the deny gate (write/destructive/guarded token/prefix).
+    /// Vetoed by the fleet's machine-readable guarded registry
+    /// (`crate::approval::is_guarded`) — the STRONGEST, authoritative gate.
+    /// Approval-gated/dangerous tools (<secret-manager>/ansible/openhands/routines/
+    /// pg_ddl/pg_admin/pg_execute/git_public_mirror_*) are skipped by REGISTRY,
+    /// independent of what their name looks like.
+    SkipGuarded,
+    /// Vetoed by the destructive-name deny gate (write/mutation token/prefix).
     SkipDestructive,
     /// Not affirmatively read-only — the fail-closed default. Never called.
     SkipNotAllowlisted,
-    /// On the read-only allowlist but has required params — classify
-    /// `needs_args` from the schema without fabricating arguments.
+    /// Has required params — classified `needs_args` from the schema without
+    /// fabricating arguments (never called).
     NeedsArgs,
     /// Affirmatively read-only and safe to probe with an empty (`{}`) arg set.
     Probe,
@@ -496,27 +524,51 @@ pub enum ProbeAction {
 /// Decide, from the tool's name + schema alone, whether to skip it (and why),
 /// classify it as needs-args, or probe it with `{}`.
 ///
-/// FAIL-CLOSED ordering:
-///   1. Deny gate (belt-and-suspenders): any write/destructive token/prefix ⇒
-///      `SkipDestructive`. This wins even over an allowlist match, so a tool
-///      like `queue_status` that matched a read token but ALSO carries a deny
-///      token is still skipped.
-///   2. Allowlist gate (PRIMARY): not affirmatively read-only ⇒
-///      `SkipNotAllowlisted`. This is the fail-closed default — unknown or
-///      ambiguous names are NEVER called (e.g. `ledger_transfer`,
-///      `ledger_append`, `relay_*` all fall here even though `transfer`/
-///      `append` might be missing from a denylist).
-///   3. Read-only + required params ⇒ `NeedsArgs` (no fabricated args).
-///   4. Read-only + no required params ⇒ `Probe`.
+/// LAYERED, fail-closed safety model — strongest/most-authoritative gate wins,
+/// in this order (each gate can only ever DEMOTE toward skip, never promote to
+/// a call):
+///   1. **Guarded registry (AUTHORITATIVE).** `crate::approval::is_guarded` on
+///      the BARE name is the fleet's canonical, machine-readable classifier for
+///      approval-gated/dangerous tools. It is checked FIRST and independent of
+///      any name heuristic, so e.g. `infisical_get_secret` / `infisical_status`
+///      / `openhands_get_status` — which *contain read tokens* — are still
+///      `SkipGuarded`, never probed. This is the guarantee a name-token
+///      allowlist alone cannot provide.
+///   2. **Destructive-name deny (second veto).** Any write/mutation token or
+///      `<host>*`/`ansible*` prefix ⇒ `SkipDestructive`, even if a read token also
+///      matched (`queue_status`).
+///   3. **Required-args.** Any tool with required params ⇒ `NeedsArgs` — never
+///      called, no fabricated arguments.
+///   4. **Read-only allowlist (fail-closed default).** Only a bare name that
+///      affirmatively matches [`is_safe_read`] with NO required args reaches
+///      `Probe`. Everything else ⇒ `SkipNotAllowlisted`.
+///
+/// ## Accepted residual risk
+/// A NON-guarded, read-token-named, no-required-args tool could in principle be
+/// probed. That residual is bounded because: (a) `is_guarded` authoritatively
+/// skips the entire dangerous/approval-gated class regardless of name; (b) the
+/// destructive-verb denylist is a second veto; (c) the full current 381-tool
+/// catalog was audited by hand so no real write tool matches the read
+/// allowlist; and (d) any tool reaching `Probe` is BY DEFINITION non-guarded —
+/// i.e. benign and not approval-gated. The only forward risk is a NEW,
+/// unaudited tool that both carries a read token and is not registered as
+/// guarded — lower-severity by construction (non-guarded ⇒ not dangerous), and
+/// the mitigation is to register genuinely dangerous tools in
+/// `approval::GUARDED_BARE_NAMES`, which this gate then honours automatically.
 pub fn decide_probe_action(name: &str, parameters: &Value) -> ProbeAction {
-    if is_write_destructive(name) {
+    // All gates key on the BARE name so a federation-prefixed guarded tool
+    // (`ns__infisical_get_secret`) is still caught.
+    let bare = bare_tool_name(name);
+    if crate::approval::is_guarded(bare) {
+        ProbeAction::SkipGuarded
+    } else if is_write_destructive(bare) {
         ProbeAction::SkipDestructive
-    } else if !is_safe_read(name) {
-        ProbeAction::SkipNotAllowlisted
     } else if schema_has_required(parameters) {
         ProbeAction::NeedsArgs
-    } else {
+    } else if is_safe_read(bare) {
         ProbeAction::Probe
+    } else {
+        ProbeAction::SkipNotAllowlisted
     }
 }
 
@@ -720,9 +772,13 @@ async fn run_tool_sweep(self_name: &str) -> Vec<ToolProbe> {
 async fn probe_one_tool(registry: &ToolRegistry, info: &ToolInfo, timeout: Duration) -> ToolProbe {
     let start = Instant::now();
     let (status, detail) = match decide_probe_action(&info.name, &info.parameters) {
+        ProbeAction::SkipGuarded => (
+            ProbeStatus::Skipped,
+            "approval-gated/guarded (registry) — not probed".to_string(),
+        ),
         ProbeAction::SkipDestructive => (
             ProbeStatus::Skipped,
-            "write/destructive/guarded — not probed".to_string(),
+            "write/destructive — not probed".to_string(),
         ),
         ProbeAction::SkipNotAllowlisted => (
             ProbeStatus::Skipped,
@@ -1656,6 +1712,95 @@ mod tests {
             decide_probe_action("queue_status", &no_args),
             ProbeAction::SkipDestructive
         );
+    }
+
+    // ── AUTHORITATIVE guarded-registry veto (codex's ask) ──────────────────
+
+    #[test]
+    fn guarded_registry_tools_are_skip_guarded_even_with_read_token_names() {
+        // These are all in `approval::GUARDED_BARE_NAMES`. Several CONTAIN read
+        // tokens (status/list/get) so a name-only allowlist would have PROBED
+        // them — the machine-readable registry authoritatively skips them.
+        let no_args = json!({"type": "object", "properties": {}});
+        for name in &[
+            "infisical_status",       // read token `status`
+            "infisical_list_secrets", // read token `list`
+            "infisical_get_secret",   // read token `get`
+            "infisical_get_secrets_batch",
+            "openhands_get_status",         // read tokens `get` + `status`
+            "openhands_list_conversations", // read token `list`
+            "ansible_last_run_status",      // read token `status`
+            "ansible_run_playbook",
+            "routines_pending",
+            "routines_approve",
+            "pg_ddl",
+            "pg_admin",
+            "pg_execute",
+            "git_public_mirror_push",
+        ] {
+            assert!(
+                crate::approval::is_guarded(name),
+                "test premise: {name} must be in the guarded registry"
+            );
+            assert_eq!(
+                decide_probe_action(name, &no_args),
+                ProbeAction::SkipGuarded,
+                "{name} must be SkipGuarded (registry veto), never probed"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_tool_name_strips_federation_namespace() {
+        assert_eq!(
+            bare_tool_name("myupstream__infisical_get_secret"),
+            "infisical_get_secret"
+        );
+        // No `__` boundary ⇒ already bare.
+        assert_eq!(bare_tool_name("time_now"), "time_now");
+        // Only the FIRST `__` is the namespace boundary.
+        assert_eq!(bare_tool_name("ns__foo__bar"), "foo__bar");
+    }
+
+    #[test]
+    fn federation_prefixed_guarded_tool_is_still_skip_guarded() {
+        // The guard must survive a namespace prefix (bare-name derivation).
+        let no_args = json!({"type": "object", "properties": {}});
+        assert_eq!(
+            decide_probe_action("someupstream__infisical_get_secret", &no_args),
+            ProbeAction::SkipGuarded
+        );
+        assert_eq!(
+            decide_probe_action("fleet__pg_ddl", &no_args),
+            ProbeAction::SkipGuarded
+        );
+    }
+
+    #[test]
+    fn guarded_veto_wins_even_over_needs_args() {
+        // A guarded tool WITH required params is still SkipGuarded (the guard is
+        // layer 1, above the required-args layer) — never NeedsArgs, never probed.
+        let with_required = json!({"required": ["project"]});
+        assert_eq!(
+            decide_probe_action("infisical_get_secret", &with_required),
+            ProbeAction::SkipGuarded
+        );
+    }
+
+    #[test]
+    fn probed_tools_are_never_guarded() {
+        // Anything that reaches Probe is by definition non-guarded (the accepted
+        // residual: probeable ⇒ benign, not approval-gated).
+        let no_args = json!({"type": "object", "properties": {}});
+        for name in &[
+            "time_now",
+            "media_domain_status",
+            "soma_status",
+            "media_on_deck",
+        ] {
+            assert!(!crate::approval::is_guarded(name));
+            assert_eq!(decide_probe_action(name, &no_args), ProbeAction::Probe);
+        }
     }
 
     // ── classify_probe: outcome → status ──────────────────────────────────
