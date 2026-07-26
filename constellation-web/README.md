@@ -19,12 +19,20 @@ same-origin `/api/{harmony,chord,lumina,muse,terminus}/*` calls, cookie-based
 
 It has two implementations of the same `AggregationClient` interface:
 
-- **`mockAdapter`** — canned, in-memory data. Default. Lets the whole app build, run, and be
-  reviewed with zero backend present.
 - **`httpAdapter`** — real fetch against `/api/...`, the same origin the SPA is served from.
+  **Default in any browser** (the SPA is served same-origin by the real terminus binary in
+  production, so the backend is right there).
+- **`mockAdapter`** — canned, in-memory data. Explicit opt-in only; lets the app build, run, and
+  be reviewed with zero backend present.
 
-Selected via the `VITE_AGG_MODE` env var (`mock` | `http`), default `mock`. Swapping to a
-real backend is a build-time env change, not a code change.
+S127 TGUI2 — the adapter default is **http**, and selection is runtime-selectable (see
+`resolveMode()` in `src/lib/aggregationClient.ts`). Precedence: build-time `VITE_AGG_MODE`
+(`http`|`mock`) › server-injected `window.__AGG_MODE__` › runtime mock opt-in (`?mock` URL param
+or `localStorage['constellation.aggMode']='mock'`) › **http** in any browser › `mock` only when
+there is no `window` (unit tests/SSR). This inverts the old build-time-only default (which was
+`mock`, so a build that forgot `VITE_AGG_MODE=http` shipped the entire app as fixtures). A
+mock-only bundle can no longer ship silently; `npm run build:verify` asserts the emitted bundle
+can reach the http adapter (`scripts/assert-http-bundle.mjs`).
 
 **Endpoints/shapes CONST-02 (the real Terminus-side aggregation layer) needs to serve** —
 this is the contract the httpAdapter already assumes:
@@ -481,8 +489,9 @@ npm run test       # vitest run — currently: fleetRingBuffer.test.ts (CONST-28
 npm run build       # tsc --noEmit && vite build -> dist/
 ```
 
-Set `VITE_AGG_MODE=http` (e.g. in `.env.local`) to point the app at a real backend instead
-of the mock adapter.
+The app talks to the real backend (http adapter) by default in any browser. To force offline
+fixtures during dev, opt into mock explicitly: `VITE_AGG_MODE=mock npm run dev`, or append
+`?mock` to the URL, or set `localStorage['constellation.aggMode']='mock'`.
 
 ## Embedded build (CONST-15)
 
@@ -491,13 +500,14 @@ of the mock adapter.
 `include_dir!("$CARGO_MANIFEST_DIR/constellation-web/dist")`). This is deliberate: the fleet's build-on-dest pipeline
 (`constellation-updater`, moosenet-spec v3.23) runs a **cargo-only** build on the deploy
 host with no npm/node toolchain — the committed dist is what makes that possible. The
-embedded UI is always served same-origin by the binary in production, so it is always
-built with `VITE_AGG_MODE=http` (never the mock adapter).
+embedded UI is served same-origin by the binary in production, so it talks to the real backend
+(the http adapter is the default — S127 TGUI2; no `VITE_AGG_MODE` flag is required, and a
+mock-only bundle can no longer ship silently).
 
 **Whenever the UI changes, rebuild and recommit `dist/`:**
 
 ```sh
-VITE_AGG_MODE=http npm run build
+npm run build:verify   # tsc + vite build, then asserts the bundle can reach the http adapter
 git add -f constellation-web/dist
 ```
 

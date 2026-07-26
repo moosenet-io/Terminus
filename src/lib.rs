@@ -88,6 +88,7 @@ pub mod reminder;
 pub mod review;
 pub mod routines;
 pub mod seer;
+pub mod selftest; // agent_selftest — hub-side per-tool + cross-service self-test
 pub mod sentinel;
 pub mod soma;
 pub mod skills;

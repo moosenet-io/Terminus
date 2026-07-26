@@ -21,7 +21,9 @@
 use sqlx::PgPool;
 
 use crate::error::ToolError;
-use crate::intake::discovery::schema::{CandidateStatus, DiscoveryCandidate, FleetCategory};
+use crate::intake::discovery::schema::{
+    CandidateStatus, DiscoveryCandidate, FleetCategory, Modality,
+};
 
 /// True when a Postgres error text indicates a MISSING RELATION (the
 /// `model_discovery_candidate` table does not exist — an un-migrated host),
@@ -41,29 +43,64 @@ fn is_missing_relation_error(msg: &str) -> bool {
 /// [`DiscoveryCandidate`] field order.
 const READ_BROCHURE_SQL: &str = "SELECT model_name, hf_repo, category, status, gfx1151_class, \
      size_b, vram_footprint_gb, discovery_source, discovery_score, discovered_at, last_seen_at, \
-     fetched_at, marked_for_fleet_at, evicted_at, retained_profile, rationale \
+     fetched_at, marked_for_fleet_at, evicted_at, retained_profile, rationale, modality \
      FROM model_discovery_candidate ORDER BY model_name";
 
 /// Row shape the brochure SELECT decodes into, before `category`/`status` are
-/// parsed into their Rust enums.
-type BrochureRowTuple = (
-    String,                                // model_name
-    String,                                // hf_repo
-    String,                                // category
-    String,                                // status
-    String,                                // gfx1151_class
-    Option<f64>,                           // size_b
-    Option<f64>,                           // vram_footprint_gb
-    String,                                // discovery_source
-    Option<f64>,                           // discovery_score
-    chrono::DateTime<chrono::Utc>,         // discovered_at
-    chrono::DateTime<chrono::Utc>,         // last_seen_at
-    Option<chrono::DateTime<chrono::Utc>>, // fetched_at
-    Option<chrono::DateTime<chrono::Utc>>, // marked_for_fleet_at
-    Option<chrono::DateTime<chrono::Utc>>, // evicted_at
-    Option<serde_json::Value>,             // retained_profile
-    Option<String>,                        // rationale
-);
+/// parsed into their Rust enums. A named struct with a MANUAL
+/// [`sqlx::FromRow`] impl (by column name) rather than a tuple: with CB-02's
+/// `modality` column the brochure now has 17 columns, and sqlx only implements
+/// `FromRow` for tuples up to arity 16 — a 17-tuple does not decode. The `sqlx`
+/// pin in this crate is built WITHOUT the `macros`/`derive` feature (see
+/// `Cargo.toml`), so `#[derive(sqlx::FromRow)]` is unavailable; the impl is
+/// hand-written via `Row::try_get`, matching the manual-decode pattern used
+/// elsewhere (e.g. `scribe::graph::rules_store`). Field names match the
+/// `READ_BROCHURE_SQL` column list one-for-one.
+struct BrochureRow {
+    model_name: String,
+    hf_repo: String,
+    category: String,
+    status: String,
+    gfx1151_class: String,
+    size_b: Option<f64>,
+    vram_footprint_gb: Option<f64>,
+    discovery_source: String,
+    discovery_score: Option<f64>,
+    discovered_at: chrono::DateTime<chrono::Utc>,
+    last_seen_at: chrono::DateTime<chrono::Utc>,
+    fetched_at: Option<chrono::DateTime<chrono::Utc>>,
+    marked_for_fleet_at: Option<chrono::DateTime<chrono::Utc>>,
+    evicted_at: Option<chrono::DateTime<chrono::Utc>>,
+    retained_profile: Option<serde_json::Value>,
+    rationale: Option<String>,
+    /// CB-02; NULL = unclassified.
+    modality: Option<String>,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for BrochureRow {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        Ok(BrochureRow {
+            model_name: row.try_get("model_name")?,
+            hf_repo: row.try_get("hf_repo")?,
+            category: row.try_get("category")?,
+            status: row.try_get("status")?,
+            gfx1151_class: row.try_get("gfx1151_class")?,
+            size_b: row.try_get("size_b")?,
+            vram_footprint_gb: row.try_get("vram_footprint_gb")?,
+            discovery_source: row.try_get("discovery_source")?,
+            discovery_score: row.try_get("discovery_score")?,
+            discovered_at: row.try_get("discovered_at")?,
+            last_seen_at: row.try_get("last_seen_at")?,
+            fetched_at: row.try_get("fetched_at")?,
+            marked_for_fleet_at: row.try_get("marked_for_fleet_at")?,
+            evicted_at: row.try_get("evicted_at")?,
+            retained_profile: row.try_get("retained_profile")?,
+            rationale: row.try_get("rationale")?,
+            modality: row.try_get("modality")?,
+        })
+    }
+}
 
 /// Read every persisted brochure row. NEVER recomputes/filters — that's
 /// `tool.rs`'s pure [`crate::intake::discovery::tool::filter_candidates`]
@@ -77,7 +114,7 @@ type BrochureRowTuple = (
 /// `as_str()`-derived values, but a read-side parse failure must surface
 /// loudly rather than silently drop/default a row.
 pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, ToolError> {
-    let rows = match sqlx::query_as::<_, BrochureRowTuple>(READ_BROCHURE_SQL)
+    let rows = match sqlx::query_as::<_, BrochureRow>(READ_BROCHURE_SQL)
         .fetch_all(pool)
         .await
     {
@@ -98,25 +135,26 @@ pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, Too
     };
 
     let mut out = Vec::with_capacity(rows.len());
-    for (
-        model_name,
-        hf_repo,
-        category,
-        status,
-        gfx1151_class,
-        size_b,
-        vram_footprint_gb,
-        discovery_source,
-        discovery_score,
-        discovered_at,
-        last_seen_at,
-        fetched_at,
-        marked_for_fleet_at,
-        evicted_at,
-        retained_profile,
-        rationale,
-    ) in rows
-    {
+    for row in rows {
+        let BrochureRow {
+            model_name,
+            hf_repo,
+            category,
+            status,
+            gfx1151_class,
+            size_b,
+            vram_footprint_gb,
+            discovery_source,
+            discovery_score,
+            discovered_at,
+            last_seen_at,
+            fetched_at,
+            marked_for_fleet_at,
+            evicted_at,
+            retained_profile,
+            rationale,
+            modality,
+        } = row;
         let category = FleetCategory::from_str(&category).map_err(|e| {
             ToolError::Database(format!(
                 "model_discovery_candidate row '{model_name}' has an unparseable category \
@@ -129,6 +167,20 @@ pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, Too
                  '{status}': {e}"
             ))
         })?;
+        // `modality` is NULLABLE (CB-02): a NULL column is an unclassified
+        // candidate (`None`), NOT an error. A NON-NULL but unparseable value is
+        // surfaced loudly — same "never silently drop/default a row" contract as
+        // category/status above (DISC-03 only ever writes `Modality::as_str()`
+        // values, so this should be unreachable in practice).
+        let modality = match modality {
+            None => None,
+            Some(s) => Some(Modality::from_str(&s).map_err(|e| {
+                ToolError::Database(format!(
+                    "model_discovery_candidate row '{model_name}' has an unparseable modality \
+                     '{s}': {e}"
+                ))
+            })?),
+        };
         out.push(DiscoveryCandidate {
             model_name,
             hf_repo,
@@ -146,6 +198,7 @@ pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, Too
             evicted_at,
             retained_profile,
             rationale,
+            modality,
         });
     }
     Ok(out)

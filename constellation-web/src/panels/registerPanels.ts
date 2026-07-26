@@ -40,9 +40,15 @@ import { ActivityPanel } from './terminus/ActivityPanel';
 import { EngineDiagramPanel } from './status/EngineDiagramPanel';
 import { DashboardPanel } from './harmony/DashboardPanel';
 import { ProjectsPanel } from './harmony/ProjectsPanel';
+import { HarmonyForestPanel } from './harmony/HarmonyForestPanel';
+import { BackendsPanel } from './chord/BackendsPanel';
+import { OverviewPanel as LuminaOverviewPanel } from './lumina/OverviewPanel';
+import { RosterPanel as ModelsRosterPanel } from './models/RosterPanel';
 import { DashboardPanel as MuseDashboardPanel } from './muse/DashboardPanel';
 import { TastePanel as MuseTastePanel } from './muse/TastePanel';
 import { ChannelsPanel as MuseChannelsPanel } from './muse/ChannelsPanel';
+import { OverviewPanel as MintOverviewPanel } from './mint/OverviewPanel';
+import { CategoryReportPanel as MintCategoryReportPanel } from './mint/CategoryReportPanel';
 import { Tasks } from '../pages/Tasks';
 import { Agents } from '../pages/Agents';
 import { PRs } from '../pages/PRs';
@@ -61,12 +67,22 @@ import { Analytics } from '../pages/Analytics';
 // muse takes CONST-16's old lumina slot and lumina follows it.) ──────────────────────────
 
 registerModule({ id: 'harmony', title: 'Harmony', icon: '⌂', healthSystem: 'harmony', order: 1 });
-registerModule({ id: 'chord', title: 'Chord', icon: '⚡', healthSystem: 'chord', order: 2 });
+registerModule({ id: 'chord', title: 'Chord', icon: '◈', healthSystem: 'chord', order: 2 });
 // CONST-19 registered the muse module; CONST-20 adds its three panels below.
-registerModule({ id: 'muse', title: 'Muse', icon: '🎬', healthSystem: 'muse', order: 3 });
+registerModule({ id: 'muse', title: 'Muse', icon: '◎', healthSystem: 'muse', order: 3 });
 // LGUI-05: lumina module registration only -- no panels yet (LGUI-06 adds lumina.overview
 // first). Ordered AFTER Muse per LUMINA-GUI-SPEC §2.
 registerModule({ id: 'lumina', title: 'Lumina', icon: '✦', healthSystem: 'lumina', order: 4 });
+// CGUI-09 (TERM #532): the Models module. Per LUMINA-GUI-SPEC §2 order (…Muse · Lumina ·
+// Models · MINT · Terminus), Models takes order 5. It is a terminus-backed module — its data
+// source is the terminus models API (CONST-21), so it binds to the always-available terminus
+// health entry (moduleRegistry: models/mint/terminus bind healthSystem 'terminus').
+registerModule({ id: 'models', title: 'Models', icon: '◆', healthSystem: 'terminus', order: 5 });
+// CGUI-10 (TERM #533): the MINT benchmark module — reserved-but-unbuilt until now. Ordered
+// after Models and before Terminus per LUMINA-GUI-SPEC §2 (… Muse · Lumina · Models · MINT ·
+// Terminus). Terminus-backed (its data source is the terminus namespace), so it binds to the
+// always-available terminus health entry.
+registerModule({ id: 'mint', title: 'MINT', icon: '◈', healthSystem: 'terminus', order: 6 });
 registerModule({ id: 'terminus', title: 'Terminus', icon: '⚙', healthSystem: 'terminus', order: 7 });
 
 // ── Harmony ──────────────────────────────────────────────────────────────────
@@ -86,7 +102,7 @@ registerPanel({
   system: 'harmony',
   title: 'Projects',
   path: '/harmony/projects',
-  icon: '📁',
+  icon: '▸',
   available: true,
   component: ProjectsPanel,
 });
@@ -106,7 +122,7 @@ registerPanel({
   system: 'harmony',
   title: 'Agents',
   path: '/harmony/agents',
-  icon: '🤖',
+  icon: '◍',
   available: true,
   component: Agents,
 });
@@ -126,7 +142,7 @@ registerPanel({
   system: 'harmony',
   title: 'Prompts',
   path: '/harmony/prompts',
-  icon: '📝',
+  icon: '▤',
   available: true,
   component: Prompts,
 });
@@ -136,7 +152,7 @@ registerPanel({
   system: 'harmony',
   title: 'Sessions',
   path: '/harmony/sessions',
-  icon: '⏱',
+  icon: '◔',
   available: true,
   component: Sessions,
 });
@@ -146,9 +162,22 @@ registerPanel({
   system: 'harmony',
   title: 'Audit Log',
   path: '/harmony/audit',
-  icon: '📋',
+  icon: '▣',
   available: true,
   component: AuditLog,
+});
+
+// CGUI-11 (TERM #534): the Harmony Forest Build orchestrator screen — a self-contained animated
+// build visualization (spec "grows" as an SVG tree; leaves = issues; a persisted forest = shipped
+// specs). Driven by a built-in simulation (forestEngine.ts), not live data in this item.
+registerPanel({
+  id: 'harmony.forest',
+  system: 'harmony',
+  title: 'Forest Build',
+  path: '/harmony/forest',
+  icon: '▲',
+  available: true,
+  component: HarmonyForestPanel,
 });
 
 // Re-homed from the legacy 'Status' group (spec §5.1/§10 CONST-16).
@@ -157,7 +186,7 @@ registerPanel({
   system: 'harmony',
   title: 'Analytics',
   path: '/harmony/analytics',
-  icon: '📊',
+  icon: '▥',
   available: true,
   component: Analytics,
 });
@@ -179,7 +208,7 @@ registerPanel({
   system: 'chord',
   title: 'Inference',
   path: '/chord/inference',
-  icon: '⚡',
+  icon: '◈',
   available: true,
   component: Inference,
 });
@@ -189,7 +218,7 @@ registerPanel({
   system: 'chord',
   title: 'Providers',
   path: '/chord/providers',
-  icon: '🔌',
+  icon: '◉',
   available: true,
   component: Providers,
 });
@@ -204,6 +233,18 @@ registerPanel({
   component: Playground,
 });
 
+// CGUI-06 (TERM #529): Backends — Chord-managed backend roster + named-alias routing table.
+// Deepens the (previously thin) Chord module beyond Inference/Providers/Playground.
+registerPanel({
+  id: 'chord.backends',
+  system: 'chord',
+  title: 'Backends',
+  path: '/chord/backends',
+  icon: '⬡',
+  available: true,
+  component: BackendsPanel,
+});
+
 // ── Muse (CONST-20) ──────────────────────────────────────────────────────────
 
 registerPanel({
@@ -211,7 +252,7 @@ registerPanel({
   system: 'muse',
   title: 'Dashboard',
   path: '/muse/dashboard',
-  icon: '🎬',
+  icon: '◎',
   available: true,
   component: MuseDashboardPanel,
 });
@@ -221,7 +262,7 @@ registerPanel({
   system: 'muse',
   title: 'Taste',
   path: '/muse/taste',
-  icon: '📈',
+  icon: '◹',
   available: true,
   component: MuseTastePanel,
 });
@@ -231,9 +272,50 @@ registerPanel({
   system: 'muse',
   title: 'Channels',
   path: '/muse/channels',
-  icon: '📺',
+  icon: '▭',
   available: true,
   component: MuseChannelsPanel,
+});
+
+// ── Models (CGUI-09) ─────────────────────────────────────────────────────────
+// The Models module's primary panel — a master-detail roster (rich model cards + per-model
+// dimension radar). Driven entirely by the CGUI-08 data client (client.models.*); the
+// reserved `models` ModuleId now surfaces as a real global-bar tab with a panel.
+
+registerPanel({
+  id: 'models.roster',
+  system: 'models',
+  title: 'Roster',
+  path: '/models/roster',
+  icon: '◆',
+  available: true,
+  component: ModelsRosterPanel,
+});
+
+// ── MINT (CGUI-10, TERM #533) ────────────────────────────────────────────────
+// The benchmark/profiling module. Two panels: a cross-category Overview and the per-category
+// Report surface (radar / heatmap / distribution / ranking / failures+runs), both driven by the
+// CGUI-08 `client.mint.*` data client. Health-bound to terminus (always available), so the tab
+// shows whenever the shell can reach terminus.
+
+registerPanel({
+  id: 'mint.overview',
+  system: 'mint',
+  title: 'Overview',
+  path: '/mint/overview',
+  icon: '◈',
+  available: true,
+  component: MintOverviewPanel,
+});
+
+registerPanel({
+  id: 'mint.categories',
+  system: 'mint',
+  title: 'Category Reports',
+  path: '/mint/categories',
+  icon: '▥',
+  available: true,
+  component: MintCategoryReportPanel,
 });
 
 // ── Terminus ─────────────────────────────────────────────────────────────────
@@ -255,7 +337,7 @@ registerPanel({
   system: 'terminus',
   title: 'Fleet',
   path: '/terminus/fleet',
-  icon: '🛰',
+  icon: '⬢',
   available: true,
   component: FleetPanel,
 });
@@ -265,7 +347,7 @@ registerPanel({
   system: 'terminus',
   title: 'Tools',
   path: '/terminus/tools',
-  icon: '🧰',
+  icon: '▧',
   available: true,
   component: ToolsPanel,
 });
@@ -275,12 +357,22 @@ registerPanel({
   system: 'terminus',
   title: 'Activity',
   path: '/terminus/activity',
-  icon: '📡',
+  icon: '⌒',
   available: true,
   component: ActivityPanel,
 });
 
 // ── Lumina ───────────────────────────────────────────────────────────────────
-// No panels registered yet -- see the module-registration comment above (LGUI-05); the
-// CONST-04 stub (`lumina.config`, `available: false`) is removed. LGUI-06 registers the
-// first real panel (`lumina.overview`).
+// CGUI-06 (TERM #529): Lumina was a registered module with ZERO panels (an empty tab). This
+// lands its first real panel — an operational overview of the lumina-core agent — so the
+// module is no longer empty. Anticipates the full LGUI-06..12 surface
+// (chat/memory/persona/routing/tools/access/setup), which will register alongside it.
+registerPanel({
+  id: 'lumina.overview',
+  system: 'lumina',
+  title: 'Overview',
+  path: '/lumina/overview',
+  icon: '✦',
+  available: true,
+  component: LuminaOverviewPanel,
+});

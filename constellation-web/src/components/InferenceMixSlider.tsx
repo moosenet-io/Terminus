@@ -68,7 +68,7 @@ export function InferenceMixSlider({ initialValue = 1 }: Props) {
                 disabled={saving}
                 style={{
                   width: 36, height: 20, borderRadius: 10, border: 'none', cursor: 'pointer',
-                  background: limited ? 'var(--h-amber)' : 'var(--h-bg-hover)',
+                  background: limited ? 'var(--flux-amber)' : 'var(--bg-elevated)',
                   position: 'relative', transition: 'background 0.2s',
                 }}
                 title={limited ? 'Limited mode active — GPU only' : 'Enable limited mode (GPU only)'}
@@ -90,7 +90,7 @@ export function InferenceMixSlider({ initialValue = 1 }: Props) {
           </div>
         ) : (
           <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)' }}>
-            <span style={{ color: 'var(--h-teal)', fontWeight: 600 }}>{preset.name}</span>
+            <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{preset.name}</span>
             {' · '}{preset.workers} workers · {preset.costPerDay}
           </div>
         )}

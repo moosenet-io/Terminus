@@ -5,7 +5,24 @@
 // structural diff. Replaces the old Sidebar header block as the shell's one wordmark.
 export function Wordmark() {
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', lineHeight: 1.15, userSelect: 'none' }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', userSelect: 'none' }}>
+      {/* CGUI-12 (§3.1): the wordmark leads with a violet node dot — the node-dot system is the
+          brand's native icon language (§9), so the shell identity opens with a `core`-violet dot
+          + "terminus". 9px + `0 0 8px` glow is intentional DS-parity dot geometry (matches the
+          NodeBadge/StatusPill/card node-dots); the adherence-lint px warning on it is expected. */}
+      <span
+        aria-hidden
+        title="terminus"
+        style={{
+          width: 9,
+          height: 9,
+          borderRadius: '50%',
+          background: 'var(--node-core)',
+          boxShadow: '0 0 8px var(--node-core)',
+          flexShrink: 0,
+        }}
+      />
+    <div style={{ display: 'flex', flexDirection: 'column', lineHeight: 1.15 }}>
       <span
         style={{
           fontFamily: 'var(--font-sans)',
@@ -15,7 +32,7 @@ export function Wordmark() {
           color: 'var(--text-primary)',
         }}
       >
-        Terminus<span style={{ color: 'var(--accent-primary)' }}>.</span>
+        terminus<span style={{ color: 'var(--accent-primary)' }}>.</span>
       </span>
       <span
         style={{
@@ -44,6 +61,7 @@ export function Wordmark() {
         />
         <span style={{ color: 'var(--accent-primary)' }}>WEB GUI SYSTEM</span>
       </span>
+    </div>
     </div>
   );
 }

@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 
 use crate::error::ToolError;
 use crate::intake::discovery::hf_client::{HfCategory, HfHubClient, HfModelSummary};
-use crate::intake::discovery::schema::{CandidateStatus, DiscoveryCandidate, FleetCategory};
+use crate::intake::discovery::schema::{CandidateStatus, DiscoveryCandidate, FleetCategory, Modality};
 use crate::intake::discovery::upsert::upsert_candidate;
 use crate::intake::storage as intake_storage;
 use crate::registry::ToolRegistry;
@@ -71,6 +71,11 @@ fn candidate_from(summary: &HfModelSummary, cat: HfCategory, now: chrono::DateTi
         hf_repo: summary.hf_repo.clone(),
         category: fleet_category(cat),
         status: CandidateStatus::Discovered,
+        // CB-02: classify the finer profiling modality from the HF listing's
+        // pipeline_tag + tags, so a later fleet sweep can auto-route this
+        // candidate to the right suite (Modality::suite). `None` when the
+        // listing carried no signal the classifier recognized.
+        modality: Modality::classify(summary.pipeline_tag.as_deref(), &summary.tags),
         // Fit is unknown from a listing (no parameter count); the fetch/measure
         // step sets 'confirmed'/'experimental'. 'unknown' is the brochure's
         // documented sentinel for exactly this.
@@ -326,6 +331,49 @@ mod tests {
         assert!(c.size_b.is_none() && c.vram_footprint_gb.is_none(), "size unknown from a listing");
         assert!(c.discovery_score.unwrap() > 0.0);
         assert_eq!(c.discovery_source, "huggingface_hub");
+    }
+
+    fn summary_tagged(repo: &str, pipeline_tag: Option<&str>, tags: &[&str]) -> HfModelSummary {
+        HfModelSummary {
+            hf_repo: repo.to_string(),
+            pipeline_tag: pipeline_tag.map(|s| s.to_string()),
+            downloads: 10,
+            likes: 1,
+            trending_score: 1.0,
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn candidate_from_classifies_modality_from_the_listing() {
+        let now = chrono::Utc::now();
+        // A text-generation LLM (the default summary) → text_generation modality.
+        let text = candidate_from(&summary("org/chat", 1, 1, 1.0), HfCategory::Assistant, now);
+        assert_eq!(text.modality, Some(Modality::TextGeneration));
+
+        // A vision-language model listed under `visual` → vlm (NOT lumped with image_gen).
+        let vlm = candidate_from(
+            &summary_tagged("org/vlm", Some("image-text-to-text"), &[]),
+            HfCategory::Visual,
+            now,
+        );
+        assert_eq!(vlm.modality, Some(Modality::Vlm));
+
+        // An embedding model → embedding modality (suite embedding_retrieval).
+        let emb = candidate_from(
+            &summary_tagged("org/emb", Some("feature-extraction"), &[]),
+            HfCategory::Embedding,
+            now,
+        );
+        assert_eq!(emb.modality, Some(Modality::Embedding));
+
+        // An ASR/STT model under `voice` → stt (voice no longer means "any voice").
+        let stt = candidate_from(
+            &summary_tagged("org/asr", Some("automatic-speech-recognition"), &[]),
+            HfCategory::Voice,
+            now,
+        );
+        assert_eq!(stt.modality, Some(Modality::Stt));
     }
 
     #[test]

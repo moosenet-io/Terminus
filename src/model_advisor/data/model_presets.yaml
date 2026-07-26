@@ -282,3 +282,63 @@ cpu_only:
     quant: Q4_K_M
     vram_gb: 0
     description: Smallest model for CPU inference
+# ── Multimodal fleet (CB-03, S125) ───────────────────────────────────────────
+# The <host>-class per-modality fleet: one concrete backend per non-chat modality,
+# each role name aligned to the Chord capability taxonomy so the offline advisor
+# and the online selector agree. Sized so the full modality set fits a ~21GB
+# budget; the modality serves are on-demand (lazy-start / idle-reap on the shared
+# Chord GPU pool), so they are not all VRAM-resident at once. Selected when the
+# budget is ~21GB, or by asking for a modality use_case on a multimodal host.
+multimodal_pvf1:
+  description: <host> multimodal fleet — per-modality backends (VLM/OCR/STT/TTS/rerank/embed/image-gen/tool-router)
+  vram_allocation_gb: 21
+  kernel_params: {}
+  ollama_env:
+    OLLAMA_KEEP_ALIVE: '-1'
+    OLLAMA_NUM_PARALLEL: '2'
+  models:
+  - name: qwen3.5:4b
+    role: primary
+    quant: Q4_K_M
+    vram_gb: 3
+    description: Lightweight chat base — the fallback for any modality without a dedicated model
+  - name: llava:7b
+    role: vlm
+    quant: Q4_K_M
+    vram_gb: 5
+    description: Vision-language model — image understanding / captioning (Chord /v1/chat/completions image part)
+  - name: sd-turbo
+    role: image_gen
+    quant: F16
+    vram_gb: 4
+    description: Text-to-image (diffusion) — Chord /v1/images/generations
+  - name: docling
+    role: doc
+    quant: F16
+    vram_gb: 1
+    description: Document parsing / OCR pipeline — Chord /v1/documents/parse
+  - name: faster-whisper-small
+    role: stt
+    quant: F16
+    vram_gb: 1
+    description: Speech-to-text (ASR) — Chord /v1/audio/transcriptions
+  - name: piper-lessac-medium
+    role: tts
+    quant: F16
+    vram_gb: 1
+    description: Text-to-speech (en_US-lessac-medium) — Chord /v1/audio/speech
+  - name: bge-reranker-v2-m3
+    role: rerank
+    quant: Q8_0
+    vram_gb: 1
+    description: Cross-encoder reranker — Chord /v1/rerank
+  - name: qwen3-embedding:0.6b
+    role: embed
+    quant: Q4_K_M
+    vram_gb: 1
+    description: Text embeddings @1024 dims — Chord /v1/embeddings
+  - name: qwen3.5:4b
+    role: tool_router
+    quant: Q4_K_M
+    vram_gb: 3
+    description: Fast tool-routing / function-call dispatch model

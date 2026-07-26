@@ -3,11 +3,14 @@
 // (with a 2-cycle stale-while-degrading grace so one flaky poll never yanks a module's nav
 // entry); routes ONLY the panels whose module is currently available — no hardcoded page table.
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
-import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { GlobalBar } from './components/GlobalBar';
 import type { Density } from './components/GlobalBar';
-import { ModuleRail } from './components/ModuleRail';
 import type { RailVariant } from './components/ModuleRail';
+import { CoreRail } from './components/CoreRail';
+import { DeepSpaceBackdrop } from './components/DeepSpaceBackdrop';
+import { CORES, CORE_ORDER, coreForModule, getCore, modulesInCore } from './lib/cores';
+import type { CoreId } from './lib/cores';
 import { Login } from './components/Login';
 import { CommandPalette } from './components/CommandPalette';
 import { ToastProvider, useToastContext } from './components/Toast';
@@ -18,8 +21,22 @@ import { getAggregationClient } from './lib/aggregationClient';
 import type { HealthStatus } from './lib/aggregationClient';
 import type { FeedItem } from './lib/activityFeed';
 import { getAvailableModules, getAvailablePanels } from './lib/moduleRegistry';
+import type { ModuleDescriptor, ModuleId } from './lib/moduleRegistry';
 import { setCurrentPath, REFRESH_HEALTH_EVENT } from './lib/shellBridge';
 import { OverviewPanel } from './panels/overview/OverviewPanel';
+import { ModuleDetail } from './panels/overview/ModuleDetail';
+
+/** CGUI-04 (TERM #527): the `/:moduleId/detail` route element — the reusable "Inside a client"
+ *  detail view for whichever available module the operator drilled into (from an Overview card).
+ *  An unknown/unavailable module id falls back to the overview, matching the wildcard's posture.
+ *  The module id is the first path segment, so the shell's `activeModuleId` derivation keeps the
+ *  module rail mounted — "same shell, deeper zoom". */
+function ModuleDetailRoute({ modules, health }: { modules: ModuleDescriptor[]; health: HealthStatus[] }) {
+  const { moduleId } = useParams();
+  const module = modules.find(m => m.id === moduleId);
+  if (!module) return <Navigate to="/overview" replace />;
+  return <ModuleDetail module={module} health={health.find(h => h.system === module.healthSystem)} />;
+}
 
 /** A system stays reported `available` (degraded) through this many consecutive misses —
  *  whether an explicit `available:false`, disappearing from the health payload entirely, or a
@@ -59,6 +76,12 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
   const [density, setDensity] = useState<Density>(
     () => getAggregationClient().prefs.get<Density>('density') ?? 'comfortable',
   );
+  // S127 TGUI2 (§3.1): the active Overview core tab. Persisted client-side (the core model is the
+  // real constellation grouping, see lib/cores.ts); restored on load, defaulting to the first core.
+  const [activeCore, setActiveCore] = useState<CoreId>(() => {
+    const saved = getAggregationClient().prefs.get<CoreId>('core');
+    return saved && CORE_ORDER.includes(saved) ? saved : CORE_ORDER[0];
+  });
   const [drawerOpen, setDrawerOpen] = useState(false);
   // CONST-25: the command palette's open state lives here (not in GlobalBar) so Ctrl/Cmd+K
   // works everywhere the shell is mounted, not just while the bar has DOM focus.
@@ -218,6 +241,20 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setPaletteOpen(o => !o);
+      } else if (
+        // POL-12: bare "/" opens the palette (Stripe/GitHub pattern) — but only when the
+        // operator is NOT typing into a field, so "/" stays literal in inputs/textareas/
+        // contentEditable and the palette's own search box.
+        e.key === '/' &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !(e.target instanceof HTMLInputElement) &&
+        !(e.target instanceof HTMLTextAreaElement) &&
+        !(e.target instanceof HTMLElement && e.target.isContentEditable)
+      ) {
+        e.preventDefault();
+        setPaletteOpen(true);
       } else if (e.key === 'Escape') {
         setPaletteOpen(false);
       }
@@ -252,31 +289,61 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
     if (!segment || segment === 'overview') return null;
     return modules.find(m => m.id === segment)?.id ?? null;
   }, [location.pathname, modules]);
-  const activeModule = modules.find(m => m.id === activeModuleId) ?? null;
-
-  const handleSelectModule = (id: string) => {
-    const firstPanel = panels.find(p => p.system === id);
-    navigate(firstPanel ? firstPanel.path : '/overview');
-  };
 
   const handleDensityChange = (d: Density) => {
     setDensity(d);
     getAggregationClient().prefs.set('density', d);
   };
 
+  // S127: selecting a core scopes the Overview (rail + card canvas) to that core's member
+  // modules and returns to the overview. Persisted so the shell reopens on the same core.
+  const handleSelectCore = useCallback(
+    (id: CoreId) => {
+      setActiveCore(id);
+      getAggregationClient().prefs.set('core', id);
+      navigate('/overview');
+    },
+    [navigate],
+  );
+
+  // Keep the active core tab in sync when the operator drills into a panel from elsewhere
+  // (deep link, card click, palette, rail) whose core differs from the current tab — the core
+  // tab should always reflect where you are. Persist so a reload keeps the synced core.
+  useEffect(() => {
+    if (!activeModuleId) return;
+    const core = coreForModule(activeModuleId as ModuleId);
+    setActiveCore(prev => {
+      if (prev === core) return prev;
+      getAggregationClient().prefs.set('core', core);
+      return core;
+    });
+  }, [activeModuleId]);
+
+  // The core to render nav for: whichever a drilled-in panel belongs to, else the selected tab.
+  // Using this derived value (not just `activeCore` state) makes the rail + tab highlight follow
+  // a deep-link on the very first render, before the sync effect above has run.
+  const effectiveCore = activeModuleId ? coreForModule(activeModuleId as ModuleId) : activeCore;
+  // The active core's available member modules (in core order) — scopes the rail + card canvas.
+  const coreModules = useMemo(() => modulesInCore(effectiveCore, modules), [effectiveCore, modules]);
+  const coreDescriptor = getCore(effectiveCore);
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
+    <div style={{ position: 'relative', zIndex: 1, display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
+      {/* CGUI-12 (§0): the fixed deep-space backdrop sits behind the whole shell (z-index:0);
+          this shell column is z-index:1 above it, and its panels/cards carry their own opaque
+          fills so the gradient/nebula/starfield reads through the translucent bar + canvas gaps. */}
+      <DeepSpaceBackdrop />
       <GlobalBar
-        modules={modules}
-        health={health}
-        degradedSystems={degradedSystems}
-        activeModuleId={activeModuleId}
-        onSelectModule={handleSelectModule}
+        cores={CORES}
+        activeCoreId={effectiveCore}
+        onSelectCore={handleSelectCore}
         density={density}
         onDensityChange={handleDensityChange}
         username={username}
         onLogout={onLogout}
         pollDegraded={pollDegraded}
+        health={health}
+        degradedSystems={degradedSystems}
         onOpenMenu={railVariant === 'drawer' ? () => setDrawerOpen(true) : undefined}
         onOpenPalette={() => setPaletteOpen(true)}
         feedItems={feedItems}
@@ -292,17 +359,37 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
         role={sessionRole}
       />
 
-      <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
-        {activeModule && (
-          <ModuleRail
-            module={activeModule}
+      {/* position:relative + zIndex:1 makes this rail+canvas row a real stacking context ABOVE
+          the deep-space backdrop (which is position:fixed;z-index:-1) — without it, this
+          non-positioned in-flow row would be painted UNDER the positioned backdrop and obscured. */}
+      <div style={{ position: 'relative', zIndex: 1, flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
+        {/* Left rail (§3.1): always the active CORE's rail — a flat panel list for a single-member
+            core, or labelled TERMINUS / MODELS / MINT sub-groups for Terminus. Rows navigate to
+            their real panel path. Only mounted once health has loaded so it never flashes empty. */}
+        {healthLoaded && (
+          <CoreRail
+            core={coreDescriptor}
+            modules={coreModules}
+            health={health}
+            degradedSystems={degradedSystems}
             variant={railVariant}
             drawerOpen={drawerOpen}
             onCloseDrawer={() => setDrawerOpen(false)}
           />
         )}
 
-        <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+        {/* CGUI-02 (TERM 525): the canvas is the scroll container — the global bar + module
+            rail stay a fixed frame, only this column scrolls. Panels route through <PanelRoot>
+            (height:100% + min-height:0 + overflow-y:auto) so they scroll internally; this
+            overflow-y:auto is the safety net so any panel that does not manage its own scroll
+            still scrolls here instead of clipping. overflow-x stays hidden (no sideways scroll). */}
+        <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+          {/* POL-03 (§3.7): cap the canvas content at --content-max (~1280px) and CENTER it.
+              This is the single biggest "tech-demo → product" lever — short pages stop being
+              anchored top-left in a huge canvas with a yawning void to the right; every panel
+              now composes as a centered column. The wrapper is flex-column + min-height:0 so a
+              panel's own PanelRoot scroll frame (height:100%) still fills and scrolls inside it. */}
+          <div style={{ width: '100%', maxWidth: 'var(--content-max)', margin: '0 auto', flex: 1, minHeight: 0, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
           {!healthLoaded ? (
             // First health poll hasn't settled yet — `modules`/`panels` are necessarily empty
             // right now (health starts as []). Render a loading placeholder WITHOUT mounting
@@ -327,7 +414,8 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
                 path="/overview"
                 element={
                   <OverviewPanel
-                    modules={modules}
+                    core={coreDescriptor}
+                    modules={coreModules}
                     health={health}
                     degradedSystems={degradedSystems}
                     density={density}
@@ -339,6 +427,11 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
                 const Component = panel.component;
                 return <Route key={panel.id} path={panel.path} element={<Component />} />;
               })}
+              {/* CGUI-04 (TERM #527): reusable module detail view. A static panel path like
+                  /harmony/dashboard (registered above) out-ranks this param route for that exact
+                  path; only /:moduleId/detail (e.g. /terminus/detail) resolves here. */}
+              <Route path="/:moduleId/detail" element={<ModuleDetailRoute modules={modules} health={health} />} />
+
               {/* Backward-compat: the pre-CONST-16 'Status' panels lived at /status/*; keep old
                   bookmarks/links working by redirecting to their re-homed harmony.* paths. */}
               <Route path="/status/analytics" element={<Navigate to="/harmony/analytics" replace />} />
@@ -352,6 +445,7 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
               <Route path="*" element={<Navigate to="/overview" replace />} />
             </Routes>
           )}
+          </div>
         </div>
       </div>
     </div>

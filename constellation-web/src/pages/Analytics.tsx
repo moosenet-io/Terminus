@@ -59,7 +59,7 @@ function TwinChart<T>({ columns, rows, rowKey, children }: {
 
 function EmptyState({ message }: { message: string }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 200, color: 'var(--h-text-muted)', fontSize: 13 }}>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 200, color: 'var(--text-300)', fontSize: 13 }}>
       {message}
     </div>
   );
@@ -96,10 +96,10 @@ function TaskCompletionChart({ period, project }: { period: Period; project: str
           <CartesianGrid {...GRID_PROPS} />
           <XAxis dataKey="hour" tick={CHART_STYLE} tickFormatter={s => s.slice(11, 16)} />
           <YAxis tick={CHART_STYLE} />
-          <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} />
+          <Tooltip contentStyle={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', fontSize: 11 }} />
           <Legend wrapperStyle={{ fontSize: 11 }} />
-          <Line type="monotone" dataKey="completed" stroke="var(--h-green)" strokeWidth={2} dot={false} name="Completed" />
-          <Line type="monotone" dataKey="failed" stroke="var(--h-red)" strokeWidth={1.5} dot={false} name="Failed" />
+          <Line type="monotone" dataKey="completed" stroke="var(--flux-green)" strokeWidth={2} dot={false} name="Completed" />
+          <Line type="monotone" dataKey="failed" stroke="var(--flux-rose)" strokeWidth={1.5} dot={false} name="Failed" />
         </LineChart>
       </ResponsiveContainer>
     </TwinChart>
@@ -121,7 +121,7 @@ function ProviderComparisonChart({ period }: { period: Period }) {
   }, [period]);
 
   const metricLabels = { avg_latency_ms: 'Latency (ms)', success_rate: 'Success Rate', avg_cost: 'Avg Cost ($)', avg_quality: 'Quality Score' };
-  const metricColors: Record<string, string> = { avg_latency_ms: 'var(--h-amber)', success_rate: 'var(--h-green)', avg_cost: 'var(--h-red)', avg_quality: 'var(--h-teal)' };
+  const metricColors: Record<string, string> = { avg_latency_ms: 'var(--flux-amber)', success_rate: 'var(--flux-green)', avg_cost: 'var(--flux-rose)', avg_quality: 'var(--accent)' };
 
   if (loading) return <div className="h-skeleton" style={{ height: 200 }} />;
   if (!data.length) return <EmptyState message="No provider data" />;
@@ -131,7 +131,7 @@ function ProviderComparisonChart({ period }: { period: Period }) {
       <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
         {Object.entries(metricLabels).map(([k, label]) => (
           <button key={k} onClick={() => setMetric(k as typeof metric)}
-            style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, border: `1px solid ${metric === k ? 'var(--h-teal)' : 'var(--h-border)'}`, background: metric === k ? 'var(--h-bg-active)' : 'var(--h-bg-card)', color: metric === k ? 'var(--h-teal)' : 'var(--h-text-dim)', cursor: 'pointer' }}>
+            style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, border: `1px solid ${metric === k ? 'var(--accent)' : 'var(--border)'}`, background: metric === k ? 'var(--accent-soft)' : 'var(--bg-panel)', color: metric === k ? 'var(--accent)' : 'var(--text-200)', cursor: 'pointer' }}>
             {label}
           </button>
         ))}
@@ -150,7 +150,7 @@ function ProviderComparisonChart({ period }: { period: Period }) {
             <CartesianGrid {...GRID_PROPS} />
             <XAxis dataKey="name" tick={CHART_STYLE} />
             <YAxis tick={CHART_STYLE} />
-            <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} />
+            <Tooltip contentStyle={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', fontSize: 11 }} />
             <Bar dataKey={metric} fill={metricColors[metric]} name={metricLabels[metric]} />
           </BarChart>
         </ResponsiveContainer>
@@ -187,8 +187,8 @@ function CostTrackingChart({ period }: { period: Period }) {
           <CartesianGrid {...GRID_PROPS} />
           <XAxis dataKey="date" tick={CHART_STYLE} />
           <YAxis tick={CHART_STYLE} tickFormatter={v => `$${v.toFixed(2)}`} />
-          <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} formatter={(v) => [`$${Number(v).toFixed(4)}`, 'Cost']} />
-          <Line type="monotone" dataKey="cost_usd" stroke="var(--h-amber)" strokeWidth={2} dot={false} name="Daily Cost" />
+          <Tooltip contentStyle={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', fontSize: 11 }} formatter={(v) => [`$${Number(v).toFixed(4)}`, 'Cost']} />
+          <Line type="monotone" dataKey="cost_usd" stroke="var(--flux-amber)" strokeWidth={2} dot={false} name="Daily Cost" />
         </LineChart>
       </ResponsiveContainer>
     </TwinChart>
@@ -224,8 +224,8 @@ function BuildDurationChart({ period }: { period: Period }) {
           <CartesianGrid {...GRID_PROPS} />
           <XAxis dataKey="range" tick={CHART_STYLE} />
           <YAxis tick={CHART_STYLE} />
-          <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} />
-          <Bar dataKey="count" fill="var(--h-blue)" name="Tasks" />
+          <Tooltip contentStyle={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', fontSize: 11 }} />
+          <Bar dataKey="count" fill="var(--flux-blue)" name="Tasks" />
         </BarChart>
       </ResponsiveContainer>
     </TwinChart>
@@ -271,8 +271,8 @@ function QualityScoreChart({ period }: { period: Period }) {
           <CartesianGrid {...GRID_PROPS} />
           <XAxis dataKey="name" tick={CHART_STYLE} />
           <YAxis tick={CHART_STYLE} domain={[0, 1]} tickFormatter={v => v.toFixed(1)} />
-          <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} formatter={(v) => [Number(v).toFixed(2), 'Avg Quality']} />
-          <Bar dataKey="avg_quality" fill="var(--h-teal)" name="Avg Quality" />
+          <Tooltip contentStyle={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', fontSize: 11 }} formatter={(v) => [Number(v).toFixed(2), 'Avg Quality']} />
+          <Bar dataKey="avg_quality" fill="var(--accent)" name="Avg Quality" />
         </BarChart>
       </ResponsiveContainer>
     </TwinChart>
@@ -295,14 +295,14 @@ export function Analytics() {
       {/* WIRE-06: Chord savings section */}
       <div style={{ marginBottom: 20 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10 }}>
-          <h3 style={{ fontSize: 14, fontWeight: 600, color: 'var(--h-teal)', margin: 0 }}>Inference Savings</h3>
+          <h3 style={{ fontSize: 14, fontWeight: 600, color: 'var(--accent)', margin: 0 }}>Inference Savings</h3>
           <div style={{ display: 'flex', gap: 6, marginLeft: 'auto' }}>
             {chordPeriods.map(p => (
               <button key={p} onClick={() => setChordPeriod(p)} style={{
                 fontSize: 11, padding: '2px 8px', borderRadius: 4,
-                border: `1px solid ${chordPeriod === p ? 'var(--h-teal)' : 'var(--h-border)'}`,
-                background: chordPeriod === p ? 'var(--h-bg-active)' : 'var(--h-bg-card)',
-                color: chordPeriod === p ? 'var(--h-teal)' : 'var(--h-text-dim)', cursor: 'pointer',
+                border: `1px solid ${chordPeriod === p ? 'var(--accent)' : 'var(--border)'}`,
+                background: chordPeriod === p ? 'var(--accent-soft)' : 'var(--bg-panel)',
+                color: chordPeriod === p ? 'var(--accent)' : 'var(--text-200)', cursor: 'pointer',
               }}>{p}</button>
             ))}
           </div>
@@ -337,14 +337,14 @@ export function Analytics() {
 
       {/* Header + controls */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
-        <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--h-teal)', margin: 0 }}>Analytics</h2>
+        <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--accent)', margin: 0 }}>Analytics</h2>
         <div style={{ display: 'flex', gap: 6, marginLeft: 'auto' }}>
           {periods.map(p => (
             <button key={p} onClick={() => setPeriod(p)} style={{
               fontSize: 11, padding: '3px 10px', borderRadius: 4,
-              border: `1px solid ${period === p ? 'var(--h-teal)' : 'var(--h-border)'}`,
-              background: period === p ? 'var(--h-bg-active)' : 'var(--h-bg-card)',
-              color: period === p ? 'var(--h-teal)' : 'var(--h-text-dim)', cursor: 'pointer',
+              border: `1px solid ${period === p ? 'var(--accent)' : 'var(--border)'}`,
+              background: period === p ? 'var(--accent-soft)' : 'var(--bg-panel)',
+              color: period === p ? 'var(--accent)' : 'var(--text-200)', cursor: 'pointer',
             }}>{p}</button>
           ))}
         </div>
@@ -357,7 +357,7 @@ export function Analytics() {
           <div className="h-card-header" style={{ cursor: 'default' }}>
             <span style={{ fontWeight: 600, fontSize: 13 }}>Task Completion Rate</span>
             <input value={project} onChange={e => setProject(e.target.value)} placeholder="Filter by project (e.g. LM)"
-              style={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', borderRadius: 4, color: 'var(--h-text)', padding: '2px 8px', fontSize: 11, outline: 'none' }} />
+              style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text-100)', padding: '2px 8px', fontSize: 11, outline: 'none' }} />
           </div>
           <div className="h-card-body"><TaskCompletionChart period={period} project={project} /></div>
         </div>
@@ -389,7 +389,7 @@ export function Analytics() {
 
       {/* TRIAGE-09: Enrichment quality section */}
       <div style={{ marginTop: 24 }}>
-        <h3 style={{ fontSize: 14, fontWeight: 600, color: 'var(--h-teal)', marginBottom: 12 }}>
+        <h3 style={{ fontSize: 14, fontWeight: 600, color: 'var(--accent)', marginBottom: 12 }}>
           Enrichment Quality (Escalation Analytics)
         </h3>
         <div className="h-card">

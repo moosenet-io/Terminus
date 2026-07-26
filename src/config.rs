@@ -97,6 +97,29 @@ pub fn judge_timeout_secs() -> u64 {
         .unwrap_or(120)
 }
 
+/// Wall-clock ceiling (seconds) for an on-demand backend to become healthy
+/// after launch, from `CHORD_ENSURE_UP_TIMEOUT_SECS`. Default 90.
+///
+/// The effective value is HARD-CLAMPED to at most [`ENSURE_UP_TIMEOUT_HARD_CAP`]
+/// (110s) — strictly below lumina's 120s `/v1/chat/completions` egress timeout —
+/// regardless of the env value. Without the clamp, setting the env to 120/180
+/// would let a slow-but-not-crashed backend equal or outlast the client,
+/// defeating the point (the caller falls back to the default Ollama backend on
+/// the returned Err, but only if it returns before the client gives up). A
+/// crashed backend unit is detected and fails fast well before this ceiling
+/// (see `intake::lifecycle::ensure_up`).
+pub fn ensure_up_timeout_secs() -> u64 {
+    let configured = env_nonempty("CHORD_ENSURE_UP_TIMEOUT_SECS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(90);
+    configured.min(ENSURE_UP_TIMEOUT_HARD_CAP)
+}
+
+/// Hard upper bound (seconds) on [`ensure_up_timeout_secs`] — strictly below
+/// lumina's 120s client egress timeout so the backend wait can never outlast
+/// the caller no matter what the env is set to.
+pub const ENSURE_UP_TIMEOUT_HARD_CAP: u64 = 110;
+
 /// Postgres URL for the intake/assistant-profile tables. Prefers
 /// `INTAKE_DATABASE_URL`, falls back to the shared `DATABASE_URL`.
 /// Returns `None` (caller raises `NotConfigured`) when neither is set.
