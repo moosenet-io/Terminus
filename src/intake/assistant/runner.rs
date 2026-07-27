@@ -906,120 +906,184 @@ pub async fn run_mode(selection: SweepSelection) -> Result<RunReport, ToolError>
     let mut nominations = Nominations::load().map_err(ToolError::NotConfigured)?;
     let mem_config = mem_config_from_env();
 
-    // Ask-4 Phase 1 (INTEGRATION OPTION i — chosen because it is the LOWER-surface
-    // integration: it only AUGMENTS the nomination vector the sweep already reads,
-    // needing no new SweepSelection mode, no precedence rules against
-    // gap_only/only_stale, and no new run branch. Option ii — a `discovery_gap`
-    // SweepSelection mode — would add all of that surface for the same effect).
+    // Ask-4 discovery pre-step dispatch. Three INDEPENDENT default-OFF flags:
+    //   INTAKE_ASSISTANT_DISCOVERY_DRY_RUN → shadow/audit mode (read + log ONLY)
+    //   INTAKE_ASSISTANT_DISCOVERY_SELECT  → Phase 1 (augment the nomination set)
+    //   INTAKE_ASSISTANT_DISCOVERY_INGEST  → Phase 2b (HF→cold-storage pull)
     //
-    // When `INTAKE_ASSISTANT_DISCOVERY_SELECT` is on, read the brochure, rank it
-    // into a small capped shortlist of assistant-relevant candidates, synthesize
-    // runtime nominations, and merge them into the curated set (curated wins any
-    // id collision). This runs BEFORE the gap_only/only_stale narrowing so the
-    // discovered models flow into the DEFAULT (full) overnight sweep — the sweep
-    // that then feeds Chord's dynamic proxy auto-promotion. When the flag is OFF
-    // (the default) this block is a no-op and `nominations` is byte-for-byte the
-    // curated `nominations.json`, so every existing mode is unchanged.
+    // PRECEDENCE (fail-safe toward no-action): DRY_RUN wins over the two action
+    // flags. When it is set, ONLY the shadow report is produced and NO live
+    // pre-step runs — no Chord ingest call, no nomination augmentation, no
+    // brochure DB write, no proxy touch — even if an action flag is also somehow
+    // set. With all three OFF (the default) this whole block is inert and
+    // `nominations` stays byte-for-byte the curated `nominations.json`, so every
+    // existing sweep mode is unchanged. See `discovery::ingest::plan_discovery_step`.
     //
-    // Phase-1 boundary: NO internet pull here. A selected candidate not already in
-    // Chord cold storage fails soft downstream (the existing acquire path records
-    // it Skipped/NonViable). HF→cold-storage ingestion is Phase 2. See
-    // `discovery::select`.
-    if crate::intake::discovery_select_from_env() {
-        use crate::intake::discovery::{select, storage as discovery_storage};
-        match discovery_storage::read_brochure(&pool).await {
-            Ok(candidates) => {
-                let total = candidates.len();
-                let cfg = select::DiscoverySelectConfig::from_env();
-                let selected = select::select_discovery_candidates(candidates, &cfg);
-                let synthesized = select::nominations_from_selected(&selected);
-                let before = nominations.nominations.len();
-                nominations.nominations = select::merge_discovery_nominations(
-                    std::mem::take(&mut nominations.nominations),
-                    synthesized,
-                );
-                let added = nominations.nominations.len() - before;
-                tracing::info!(
-                    "assistant sweep discovery-select: {} brochure candidate(s) scanned, {} selected \
-                     (cap {}, min_size_b {}), {} merged into the nomination set ({} already curated) — \
-                     selected = {:?}",
-                    total,
-                    selected.len(),
-                    cfg.top_n,
-                    cfg.min_size_b,
-                    added,
-                    selected.len().saturating_sub(added),
-                    selected.iter().map(|c| c.model_name.as_str()).collect::<Vec<_>>(),
-                );
-            }
-            Err(ToolError::NotConfigured(msg)) => {
-                tracing::info!(
-                    "assistant sweep discovery-select: brochure not configured on this host \
-                     ({msg}) — continuing with the curated nominations only"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "assistant sweep discovery-select: could not read the brochure ({e}) — \
-                     continuing with the curated nominations only (fail-soft)"
-                );
+    // SCHEDULING (Phase 3): the scheduler will invoke run_mode / this pre-step on
+    // cadence; when DRY_RUN=1 the `[ask4-shadow]` report below is produced on EACH
+    // scheduled run, giving the operator a rolling, greppable audit trail across
+    // the audit window before flipping the action flags on for real.
+    use crate::intake::discovery::ingest::DiscoveryStep;
+    match crate::intake::discovery::ingest::plan_discovery_step(
+        crate::intake::discovery_dry_run_from_env(),
+        crate::intake::discovery_select_from_env(),
+        crate::intake::discovery_ingest_from_env(),
+    ) {
+        // DRY-RUN / SHADOW: read the brochure (READ-ONLY), rank it EXACTLY as a
+        // live run would (same cap/floor/status gates), emit the structured
+        // `[ask4-shadow]` JSON report of what it WOULD select/pull/test, then
+        // return having taken ZERO action. `nominations` is left untouched.
+        DiscoveryStep::Shadow => {
+            use crate::intake::discovery::{ingest, select, storage as discovery_storage};
+            match discovery_storage::read_brochure(&pool).await {
+                Ok(candidates) => {
+                    let total = candidates.len();
+                    let sel_cfg = select::DiscoverySelectConfig::from_env();
+                    let selected = select::select_discovery_candidates(candidates, &sel_cfg);
+                    let config = ingest::ShadowConfig {
+                        cap: sel_cfg.top_n,
+                        min_size_b: sel_cfg.min_size_b,
+                        select_flag: crate::intake::discovery_select_from_env(),
+                        ingest_flag: crate::intake::discovery_ingest_from_env(),
+                        dry_run_flag: true,
+                    };
+                    let report = ingest::build_shadow_report(
+                        total,
+                        &selected,
+                        config,
+                        chrono::Utc::now().to_rfc3339(),
+                    );
+                    ingest::emit_shadow_report(&report);
+                }
+                Err(ToolError::NotConfigured(msg)) => {
+                    tracing::info!(
+                        "assistant sweep discovery-shadow: brochure not configured on this host \
+                         ({msg}) — no shadow report produced"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "assistant sweep discovery-shadow: could not read the brochure ({e}) — \
+                         no shadow report produced (fail-soft)"
+                    );
+                }
             }
         }
-    }
+        DiscoveryStep::Live {
+            select: do_select,
+            ingest: do_ingest,
+        } => {
+            // Ask-4 Phase 1 (INTEGRATION OPTION i — the LOWER-surface integration:
+            // it only AUGMENTS the nomination vector the sweep already reads, with
+            // no new SweepSelection mode, no precedence rules against
+            // gap_only/only_stale, and no new run branch). When on, read the
+            // brochure, rank it into a small capped shortlist, synthesize runtime
+            // nominations, and merge them into the curated set (curated wins any id
+            // collision). Runs BEFORE the gap_only/only_stale narrowing so the
+            // discovered models flow into the DEFAULT (full) overnight sweep. When
+            // off, `nominations` stays byte-for-byte the curated `nominations.json`.
+            //
+            // Phase-1 boundary: NO internet pull here. A selected candidate not
+            // already in Chord cold storage fails soft downstream (the acquire path
+            // records it Skipped/NonViable) UNLESS the Phase-2b ingest below staged
+            // it first. See `discovery::select`.
+            if do_select {
+                use crate::intake::discovery::{select, storage as discovery_storage};
+                match discovery_storage::read_brochure(&pool).await {
+                    Ok(candidates) => {
+                        let total = candidates.len();
+                        let cfg = select::DiscoverySelectConfig::from_env();
+                        let selected = select::select_discovery_candidates(candidates, &cfg);
+                        let synthesized = select::nominations_from_selected(&selected);
+                        let before = nominations.nominations.len();
+                        nominations.nominations = select::merge_discovery_nominations(
+                            std::mem::take(&mut nominations.nominations),
+                            synthesized,
+                        );
+                        let added = nominations.nominations.len() - before;
+                        tracing::info!(
+                            "assistant sweep discovery-select: {} brochure candidate(s) scanned, {} selected \
+                             (cap {}, min_size_b {}), {} merged into the nomination set ({} already curated) — \
+                             selected = {:?}",
+                            total,
+                            selected.len(),
+                            cfg.top_n,
+                            cfg.min_size_b,
+                            added,
+                            selected.len().saturating_sub(added),
+                            selected.iter().map(|c| c.model_name.as_str()).collect::<Vec<_>>(),
+                        );
+                    }
+                    Err(ToolError::NotConfigured(msg)) => {
+                        tracing::info!(
+                            "assistant sweep discovery-select: brochure not configured on this host \
+                             ({msg}) — continuing with the curated nominations only"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "assistant sweep discovery-select: could not read the brochure ({e}) — \
+                             continuing with the curated nominations only (fail-soft)"
+                        );
+                    }
+                }
+            }
 
-    // Ask-4 Phase 2b (HF→cold-storage INGEST pre-step) — GATED behind
-    // `INTAKE_ASSISTANT_DISCOVERY_INGEST`, INDEPENDENT of Phase 1's
-    // `INTAKE_ASSISTANT_DISCOVERY_SELECT`. When on, read + rank the brochure and,
-    // for each selected candidate not yet in cold storage, call Chord's
-    // `/api/models/ingest` endpoint (reusing the existing Chord-control JWT auth
-    // path) and advance its brochure status on success — so a discovered-but-un-
-    // stored model becomes acquirable by the sweep's existing cold-storage pull
-    // (`acquire::chord_acquire`). Runs BEFORE `run_with`'s per-model acquire so a
-    // freshly-ingested model is cold-stored by the time acquire promotes it warm.
-    // Fail-soft throughout: every non-success ingest leaves the candidate un-
-    // advanced and never blocks the rest of the sweep. When OFF (the default) no
-    // ingest call is ever made — with both flags off the sweep is byte-for-byte
-    // unchanged. Independent of select: this reads the brochure itself, so a
-    // Phase-2b-only operator can pre-stage cold storage without also merging the
-    // discovered models into THIS run's nominations.
-    if crate::intake::discovery_ingest_from_env() {
-        use crate::intake::discovery::{ingest, select, storage as discovery_storage};
-        match discovery_storage::read_brochure(&pool).await {
-            Ok(candidates) => {
-                let total = candidates.len();
-                let sel_cfg = select::DiscoverySelectConfig::from_env();
-                let selected = select::select_discovery_candidates(candidates, &sel_cfg);
-                let ingest_cfg = ingest::DiscoveryIngestConfig::from_env();
-                let ingestor = ingest::ChordIngestor;
-                let advancer = ingest::DbStatusAdvancer { pool: &pool };
-                let report =
-                    ingest::ingest_selected(&selected, &ingestor, &advancer, &ingest_cfg).await;
-                tracing::info!(
-                    "assistant sweep discovery-ingest: {} brochure candidate(s) scanned, {} selected \
-                     (cap {}), ingest report: attempted {}, cold_stored {}, already_cold {}, \
-                     failed_soft {}, advance_failed {}, capped_out {}",
-                    total,
-                    selected.len(),
-                    ingest_cfg.max_ingests,
-                    report.attempted,
-                    report.cold_stored,
-                    report.skipped_already_cold,
-                    report.failed_soft,
-                    report.advance_failed,
-                    report.capped_out,
-                );
-            }
-            Err(ToolError::NotConfigured(msg)) => {
-                tracing::info!(
-                    "assistant sweep discovery-ingest: brochure not configured on this host \
-                     ({msg}) — no ingest attempted"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "assistant sweep discovery-ingest: could not read the brochure ({e}) — \
-                     no ingest attempted (fail-soft)"
-                );
+            // Ask-4 Phase 2b (HF→cold-storage INGEST pre-step) — INDEPENDENT of
+            // Phase 1's select. When on, read + rank the brochure and, for each
+            // selected candidate not yet in cold storage, call Chord's
+            // `/api/models/ingest` endpoint (reusing the existing Chord-control JWT
+            // auth path) and advance its brochure status on success — so a
+            // discovered-but-un-stored model becomes acquirable by the sweep's
+            // existing cold-storage pull (`acquire::chord_acquire`). Runs BEFORE
+            // `run_with`'s per-model acquire so a freshly-ingested model is
+            // cold-stored by the time acquire promotes it warm. Fail-soft
+            // throughout. Never reached when DRY_RUN wins above.
+            if do_ingest {
+                use crate::intake::discovery::{ingest, select, storage as discovery_storage};
+                match discovery_storage::read_brochure(&pool).await {
+                    Ok(candidates) => {
+                        let total = candidates.len();
+                        let sel_cfg = select::DiscoverySelectConfig::from_env();
+                        let selected = select::select_discovery_candidates(candidates, &sel_cfg);
+                        let ingest_cfg = ingest::DiscoveryIngestConfig::from_env();
+                        let ingestor = ingest::ChordIngestor;
+                        let advancer = ingest::DbStatusAdvancer { pool: &pool };
+                        let report = ingest::ingest_selected(
+                            &selected,
+                            &ingestor,
+                            &advancer,
+                            &ingest_cfg,
+                        )
+                        .await;
+                        tracing::info!(
+                            "assistant sweep discovery-ingest: {} brochure candidate(s) scanned, {} selected \
+                             (cap {}), ingest report: attempted {}, cold_stored {}, already_cold {}, \
+                             failed_soft {}, advance_failed {}, capped_out {}",
+                            total,
+                            selected.len(),
+                            ingest_cfg.max_ingests,
+                            report.attempted,
+                            report.cold_stored,
+                            report.skipped_already_cold,
+                            report.failed_soft,
+                            report.advance_failed,
+                            report.capped_out,
+                        );
+                    }
+                    Err(ToolError::NotConfigured(msg)) => {
+                        tracing::info!(
+                            "assistant sweep discovery-ingest: brochure not configured on this host \
+                             ({msg}) — no ingest attempted"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "assistant sweep discovery-ingest: could not read the brochure ({e}) — \
+                             no ingest attempted (fail-soft)"
+                        );
+                    }
+                }
             }
         }
     }

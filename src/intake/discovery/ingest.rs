@@ -41,6 +41,8 @@
 
 use std::time::Duration;
 
+use serde::Serialize;
+
 use crate::error::ToolError;
 use crate::intake::chord_pull::{self, IngestOutcome};
 
@@ -246,6 +248,164 @@ fn fail_soft_reason(outcome: &IngestOutcome) -> String {
         IngestOutcome::Error { message } => format!("error: {message}"),
         IngestOutcome::Unauthorized => "unauthorized (missing/invalid CHORD_JWT)".to_string(),
         IngestOutcome::Unreachable { detail } => format!("unreachable: {detail}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Discovery pre-step dispatch (flag precedence)
+// ---------------------------------------------------------------------------
+
+/// What the discovery pre-step should do this run, resolved PURELY from the
+/// three env flags so the precedence rule is unit-testable without touching a DB
+/// or Chord. Fail-safe toward no live action: DRY-RUN wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryStep {
+    /// DRY-RUN / SHADOW: read + rank the brochure and emit a `[ask4-shadow]`
+    /// report, taking ZERO live action. Runs REGARDLESS of the action flags.
+    Shadow,
+    /// Live pre-step: run the Phase-1 select-merge and/or the Phase-2b ingest
+    /// per their individual flags (`select`/`ingest`). When both are false this
+    /// is a no-op — the default, byte-for-byte-unchanged sweep.
+    Live { select: bool, ingest: bool },
+}
+
+/// Resolve the discovery pre-step from the three flags. PRECEDENCE: `dry_run`
+/// wins over both action flags — when it is set the result is always
+/// [`DiscoveryStep::Shadow`], so no live ingest/augment/DB-write path is ever
+/// taken even if `ingest`/`select` are somehow also set (fail-safe toward
+/// no-action during the audit window). Pure over its inputs.
+pub fn plan_discovery_step(dry_run: bool, select: bool, ingest: bool) -> DiscoveryStep {
+    if dry_run {
+        DiscoveryStep::Shadow
+    } else {
+        DiscoveryStep::Live { select, ingest }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DRY-RUN / SHADOW report (audit window)
+// ---------------------------------------------------------------------------
+
+/// The greppable tag every shadow log line carries (as a `[ask4-shadow]` prefix
+/// AND the report's own `tag` field) so an operator can `grep ask4-shadow` and
+/// parse the JSON over several days.
+pub const SHADOW_TAG: &str = "ask4-shadow";
+
+/// The effective settings that produced a shadow decision — echoed so the audit
+/// shows WHICH config drove the selection.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ShadowConfig {
+    /// Per-run selection cap (`INTAKE_ASSISTANT_DISCOVERY_MAX`).
+    pub cap: usize,
+    /// Minimum size floor in billions (`INTAKE_ASSISTANT_DISCOVERY_MIN_SIZE_B`).
+    pub min_size_b: f64,
+    /// State of `INTAKE_ASSISTANT_DISCOVERY_SELECT` (would-augment when live).
+    pub select_flag: bool,
+    /// State of `INTAKE_ASSISTANT_DISCOVERY_INGEST` (would-pull when live).
+    pub ingest_flag: bool,
+    /// State of `INTAKE_ASSISTANT_DISCOVERY_DRY_RUN` (always true in a report).
+    pub dry_run_flag: bool,
+}
+
+/// One would-select candidate row in the shadow report.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ShadowCandidate {
+    pub model_name: String,
+    pub hf_repo: String,
+    pub size_b: Option<f64>,
+    pub gfx1151_class: String,
+    pub discovery_score: Option<f64>,
+    /// The candidate's CURRENT brochure status (`CandidateStatus::as_str`).
+    pub current_status: String,
+    /// Whether a LIVE run would ingest this (i.e. it is not already cold-stored).
+    pub would_ingest: bool,
+}
+
+/// The structured shadow report — serialized to ONE JSON line under the
+/// `[ask4-shadow]` tag. Machine-auditable: an operator greps the tag and parses
+/// the JSON to see exactly what the loop WOULD have done, over the audit window.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ShadowReport {
+    /// Always [`SHADOW_TAG`] — lets a JSON consumer filter without the prefix.
+    pub tag: &'static str,
+    /// Run timestamp (RFC3339). Sourced from `chrono::Utc::now()` — the same
+    /// clock `intake::jobs` already stamps its records with — injected by the
+    /// caller so the builder stays pure/testable.
+    pub timestamp: String,
+    /// Total brochure rows scanned (pre-filter).
+    pub scanned: usize,
+    /// Number selected (post-filter, capped) = `would_select.len()`.
+    pub selected: usize,
+    /// How many of the selected would trigger a real HF pull when live.
+    pub would_ingest_count: usize,
+    /// How many of the selected are already cold-stored (a live run would skip).
+    pub already_cold_count: usize,
+    /// The effective config that produced this decision.
+    pub config: ShadowConfig,
+    /// The ranked top-N candidates (full rows).
+    pub would_select: Vec<ShadowCandidate>,
+    /// Model names that are NOT already cold-stored (a live run would ingest).
+    pub would_ingest: Vec<String>,
+    /// Model names already cold-stored (a live run would skip the ingest for).
+    pub already_cold: Vec<String>,
+    /// Model names that would be fed into the assistant sweep (all selected).
+    pub would_test: Vec<String>,
+}
+
+/// Build the shadow report from the already-ranked `selected` candidates (PURE —
+/// no I/O, timestamp injected — so the field shape is unit-tested without a
+/// clock, DB, or Chord). `scanned` is the pre-filter brochure row count.
+pub fn build_shadow_report(
+    scanned: usize,
+    selected: &[DiscoveryCandidate],
+    config: ShadowConfig,
+    timestamp: String,
+) -> ShadowReport {
+    let would_select: Vec<ShadowCandidate> = selected
+        .iter()
+        .map(|c| ShadowCandidate {
+            model_name: c.model_name.clone(),
+            hf_repo: c.hf_repo.clone(),
+            size_b: c.size_b,
+            gfx1151_class: c.gfx1151_class.clone(),
+            discovery_score: c.discovery_score,
+            current_status: c.status.as_str().to_string(),
+            would_ingest: needs_ingest(c.status),
+        })
+        .collect();
+    let would_ingest: Vec<String> = selected
+        .iter()
+        .filter(|c| needs_ingest(c.status))
+        .map(|c| c.model_name.clone())
+        .collect();
+    let already_cold: Vec<String> = selected
+        .iter()
+        .filter(|c| !needs_ingest(c.status))
+        .map(|c| c.model_name.clone())
+        .collect();
+    let would_test: Vec<String> = selected.iter().map(|c| c.model_name.clone()).collect();
+
+    ShadowReport {
+        tag: SHADOW_TAG,
+        timestamp,
+        scanned,
+        selected: selected.len(),
+        would_ingest_count: would_ingest.len(),
+        already_cold_count: already_cold.len(),
+        config,
+        would_select,
+        would_ingest,
+        already_cold,
+        would_test,
+    }
+}
+
+/// Emit `report` as a single greppable `[ask4-shadow] {json}` log line. The only
+/// side effect of the whole shadow path — pure read + this log, ZERO live action.
+pub fn emit_shadow_report(report: &ShadowReport) {
+    match serde_json::to_string(report) {
+        Ok(json) => tracing::info!("[{SHADOW_TAG}] {json}"),
+        Err(e) => tracing::warn!("[{SHADOW_TAG}] failed to serialize shadow report: {e}"),
     }
 }
 
@@ -716,5 +876,184 @@ mod tests {
         assert_eq!(parse_ingest_timeout_secs(Some("0")), 900);
         assert_eq!(parse_ingest_timeout_secs(Some("bad")), 900);
         assert_eq!(parse_ingest_timeout_secs(Some("120")), 120);
+    }
+
+    // ---- DRY-RUN / shadow: precedence ----
+
+    #[test]
+    fn dry_run_wins_over_action_flags_precedence() {
+        // DRY_RUN set ⇒ always Shadow, regardless of the two action flags — so no
+        // live ingest/augment path can ever run during the audit window.
+        assert_eq!(
+            plan_discovery_step(true, false, false),
+            DiscoveryStep::Shadow
+        );
+        assert_eq!(
+            plan_discovery_step(true, true, false),
+            DiscoveryStep::Shadow
+        );
+        assert_eq!(
+            plan_discovery_step(true, false, true),
+            DiscoveryStep::Shadow
+        );
+        assert_eq!(plan_discovery_step(true, true, true), DiscoveryStep::Shadow);
+    }
+
+    #[test]
+    fn dry_run_off_yields_live_reflecting_the_action_flags() {
+        assert_eq!(
+            plan_discovery_step(false, false, false),
+            DiscoveryStep::Live {
+                select: false,
+                ingest: false
+            }
+        );
+        assert_eq!(
+            plan_discovery_step(false, true, false),
+            DiscoveryStep::Live {
+                select: true,
+                ingest: false
+            }
+        );
+        assert_eq!(
+            plan_discovery_step(false, false, true),
+            DiscoveryStep::Live {
+                select: false,
+                ingest: true
+            }
+        );
+    }
+
+    // ---- DRY-RUN / shadow: zero live action even with an action flag set ----
+
+    #[tokio::test]
+    async fn dry_run_takes_zero_chord_and_zero_db_action_even_with_ingest_flag_on() {
+        // Simulate run_mode's dispatch with DRY_RUN on AND the ingest flag on:
+        // precedence must route to Shadow, so the live `ingest_selected` path
+        // (the ONLY code that touches the Chord client + the status-advance DB
+        // write) is never taken. The mocks record ZERO calls.
+        let ingestor = FixedIngestor::new(IngestOutcome::Ingested {
+            cold_storage_ref: None,
+            bytes: None,
+        });
+        let advancer = RecordingAdvancer::new();
+        let selected = vec![cand("m1", CandidateStatus::Discovered)];
+
+        match plan_discovery_step(
+            /*dry_run*/ true, /*select*/ false, /*ingest*/ true,
+        ) {
+            DiscoveryStep::Shadow => {
+                // Shadow path: read + build report only, no ingestor/advancer use.
+                let config = ShadowConfig {
+                    cap: 5,
+                    min_size_b: 7.0,
+                    select_flag: false,
+                    ingest_flag: true,
+                    dry_run_flag: true,
+                };
+                let _report =
+                    build_shadow_report(1, &selected, config, "2026-07-27T00:00:00Z".into());
+            }
+            DiscoveryStep::Live { ingest, .. } => {
+                if ingest {
+                    // Must NOT be reached under DRY_RUN precedence.
+                    let _ = ingest_selected(&selected, &ingestor, &advancer, &cfg(5)).await;
+                }
+            }
+        }
+
+        assert!(
+            ingestor.calls.lock().unwrap().is_empty(),
+            "dry-run must make ZERO Chord ingest calls"
+        );
+        assert!(
+            advancer.hops.lock().unwrap().is_empty(),
+            "dry-run must make ZERO brochure status-advance DB writes"
+        );
+    }
+
+    // ---- DRY-RUN / shadow: report contents ----
+
+    #[test]
+    fn shadow_report_contains_expected_fields_and_ingest_partition() {
+        // Two selected: one Discovered (would ingest) + one already ColdStored
+        // (would skip). The report must partition them and echo the config.
+        let selected = vec![
+            cand("m_new", CandidateStatus::Discovered),
+            cand("m_cold", CandidateStatus::ColdStored),
+        ];
+        let config = ShadowConfig {
+            cap: 5,
+            min_size_b: 7.0,
+            select_flag: false,
+            ingest_flag: false,
+            dry_run_flag: true,
+        };
+        let report =
+            build_shadow_report(42, &selected, config.clone(), "2026-07-27T12:00:00Z".into());
+
+        assert_eq!(report.tag, "ask4-shadow");
+        assert_eq!(report.timestamp, "2026-07-27T12:00:00Z");
+        assert_eq!(report.scanned, 42);
+        assert_eq!(report.selected, 2);
+        assert_eq!(report.config, config);
+
+        // would_select carries the full ranked rows with per-row would_ingest.
+        assert_eq!(report.would_select.len(), 2);
+        let new_row = report
+            .would_select
+            .iter()
+            .find(|c| c.model_name == "m_new")
+            .unwrap();
+        assert_eq!(new_row.hf_repo, "org/m_new");
+        assert_eq!(new_row.current_status, "discovered");
+        assert_eq!(new_row.gfx1151_class, "confirmed");
+        assert_eq!(new_row.size_b, Some(8.0));
+        assert_eq!(new_row.discovery_score, Some(10.0));
+        assert!(
+            new_row.would_ingest,
+            "a Discovered candidate would be ingested live"
+        );
+        let cold_row = report
+            .would_select
+            .iter()
+            .find(|c| c.model_name == "m_cold")
+            .unwrap();
+        assert!(
+            !cold_row.would_ingest,
+            "an already-cold candidate would be skipped"
+        );
+
+        // Partition + counts.
+        assert_eq!(report.would_ingest, vec!["m_new".to_string()]);
+        assert_eq!(report.already_cold, vec!["m_cold".to_string()]);
+        assert_eq!(report.would_ingest_count, 1);
+        assert_eq!(report.already_cold_count, 1);
+        // would_test = everything selected (fed into the sweep when live).
+        assert_eq!(
+            report.would_test,
+            vec!["m_new".to_string(), "m_cold".to_string()]
+        );
+    }
+
+    #[test]
+    fn shadow_report_serializes_to_a_single_greppable_json_line() {
+        // The audit consumer greps `ask4-shadow` and parses ONE JSON line.
+        let selected = vec![cand("m1", CandidateStatus::Discovered)];
+        let config = ShadowConfig {
+            cap: 3,
+            min_size_b: 7.0,
+            select_flag: true,
+            ingest_flag: false,
+            dry_run_flag: true,
+        };
+        let report = build_shadow_report(5, &selected, config, "2026-07-27T00:00:00Z".into());
+        let json = serde_json::to_string(&report).expect("serializes");
+        // Single line (no embedded newlines) and carries the tag + key fields.
+        assert!(!json.contains('\n'));
+        assert!(json.contains("\"tag\":\"ask4-shadow\""));
+        assert!(json.contains("\"would_ingest\":[\"m1\"]"));
+        assert!(json.contains("\"cap\":3"));
+        assert!(json.contains("\"dry_run_flag\":true"));
     }
 }
