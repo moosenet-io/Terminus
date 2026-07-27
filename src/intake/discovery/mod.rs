@@ -23,6 +23,7 @@
 pub mod hf_client;
 pub mod refresh;
 pub mod schema;
+pub mod select;
 pub mod storage;
 pub mod tool;
 pub mod upsert;
