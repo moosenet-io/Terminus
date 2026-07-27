@@ -30,7 +30,7 @@
 //! ## Pure vs. impure split (testability)
 //! The load-bearing logic — deriving `size_b`/`vram_footprint_gb` from a JSON blob
 //! ([`measure_from_model_info`]) and choosing which rows to measure
-//! ([`select_unmeasured`]) — is pure and fully unit-tested here with sample JSON;
+//! ([`select_needs_enrichment`]) — is pure and fully unit-tested here with sample JSON;
 //! only [`measure_brochure`] touches HF + Postgres (DB-gated at runtime, same
 //! convention as `upsert.rs`).
 
@@ -564,24 +564,42 @@ fn effective_cap(max_arg: Option<&Value>, ceiling: usize) -> Result<usize, ToolE
     }
 }
 
-/// PURE selection: the candidates that still need measuring (`size_b` is `None`),
-/// capped at `cap`. Preserves input order (`read_brochure` returns rows ordered by
-/// `model_name`, so a capped run is deterministic and, across runs, walks the
-/// backlog stably). A `cap` of 0 selects nothing.
-pub fn select_unmeasured(
+/// Whether a candidate still NEEDS an enrich/measure pass: it has never been
+/// through the S127 enrich path (`arch IS NULL` — `arch` is the new-metadata
+/// marker) OR it was never sized (`size_b IS NULL`). PURE.
+///
+/// The `arch IS NULL` half is what lets a one-time backfill re-enrich the ~two-
+/// thirds of the brochure that were size-measured BEFORE the practical-ranking
+/// fields existed: those rows have a `size_b` but no `arch`/derived
+/// `gfx1151_class`/`license`/recency/`gated`/`is_instruct`, so the blended
+/// `fit_score` would otherwise run on empty hardware data for them. Once a row
+/// has been enriched (its `arch` is set), it stops re-selecting and the backlog
+/// stabilizes — a genuinely arch-less repo (HF exposed no arch) simply stays
+/// selected and is retried, exactly like a never-resolved size.
+pub fn needs_enrichment(c: &DiscoveryCandidate) -> bool {
+    c.arch.is_none() || c.size_b.is_none()
+}
+
+/// PURE selection: the candidates that still need an enrich/measure pass (see
+/// [`needs_enrichment`]), capped at `cap`. Preserves input order (`read_brochure`
+/// returns rows ordered by `model_name`, so a capped run is deterministic and,
+/// across runs, walks the backlog stably). A `cap` of 0 selects nothing.
+pub fn select_needs_enrichment(
     candidates: &[DiscoveryCandidate],
     cap: usize,
 ) -> Vec<&DiscoveryCandidate> {
     candidates
         .iter()
-        .filter(|c| c.size_b.is_none())
+        .filter(|c| needs_enrichment(c))
         .take(cap)
         .collect()
 }
 
 /// Outcome of one measure pass, surfaced in the tool result.
 pub struct MeasureOutcome {
-    /// How many size-NULL candidates existed before this pass (the remaining backlog).
+    /// How many candidates still NEED an enrich/measure pass (see
+    /// [`needs_enrichment`]: `arch IS NULL OR size_b IS NULL`) before this pass —
+    /// the remaining backlog.
     pub unmeasured_total: usize,
     /// How many this pass attempted (`min(unmeasured_total, cap)`).
     pub attempted: usize,
@@ -593,14 +611,20 @@ pub struct MeasureOutcome {
     pub errors: Vec<(String, String)>,
 }
 
-/// Run one measure pass over the brochure: select up to `cap` size-`NULL`
-/// candidates, fetch each repo's HF model-info metadata, derive `size_b`
-/// (+ optional `vram_footprint_gb`), and write it back via [`upsert_candidate`].
+/// Run one measure/ENRICH pass over the brochure: select up to `cap` candidates
+/// that still [`needs_enrichment`] (`arch IS NULL OR size_b IS NULL`), fetch each
+/// repo's HF model-info metadata, derive `size_b` (+ optional `vram_footprint_gb`)
+/// AND the S127 practical metadata (`arch`/`gfx1151_class`/`license`/recency/
+/// `gated`/`is_instruct`), and write it all back via [`upsert_candidate`].
 ///
-/// - Idempotent: already-measured rows (`size_b IS NOT NULL`) are never re-fetched.
+/// - Idempotent: a FULLY-enriched row (`arch` set AND `size_b` set) is never
+///   re-fetched, so the backlog stabilizes. A row already sized but not yet
+///   enriched (`arch IS NULL`) IS re-visited exactly once to backfill the new
+///   fields — the enrich step runs on re-visit (it never early-returns on an
+///   already-set `size_b`).
 /// - Fail-soft per candidate: a repo with no safetensors metadata, a 404, or a
-///   transient HF error is logged and skipped (its `size_b` stays NULL for a later
-///   run) — one bad repo never aborts the pass.
+///   transient HF error is logged and skipped (retried next run) — one bad repo
+///   never aborts the pass.
 /// - Metadata only: no weight bytes are ever downloaded.
 /// - When `dry_run` is true, candidates are selected + fetched + derived but NOTHING
 ///   is written (preview of what WOULD be measured). `pool` is `None` iff `dry_run`.
@@ -610,8 +634,11 @@ pub async fn measure_brochure(
     all_candidates: &[DiscoveryCandidate],
     cap: usize,
 ) -> MeasureOutcome {
-    let unmeasured_total = all_candidates.iter().filter(|c| c.size_b.is_none()).count();
-    let targets = select_unmeasured(all_candidates, cap);
+    let unmeasured_total = all_candidates
+        .iter()
+        .filter(|c| needs_enrichment(c))
+        .count();
+    let targets = select_needs_enrichment(all_candidates, cap);
     let attempted = targets.len();
     let mut measured = 0usize;
     let mut unresolved = 0usize;
@@ -854,6 +881,14 @@ mod tests {
             gated: None,
             quant_dtype: None,
         }
+    }
+
+    /// A FULLY-enriched candidate: both `size_b` and `arch` set, so
+    /// [`needs_enrichment`] is false and it is never reselected.
+    fn enriched(repo: &str, size_b: f64, arch: &str) -> DiscoveryCandidate {
+        let mut c = candidate(repo, Some(size_b));
+        c.arch = Some(arch.to_string());
+        c
     }
 
     // ---- size_b derivation: rule 1 (safetensors.total) ----
@@ -1241,40 +1276,59 @@ mod tests {
         assert!(effective_cap(Some(&json!("lots")), 50).is_err());
     }
 
-    // ---- select_unmeasured: only size-NULL rows, cap respected ----
+    // ---- select_needs_enrichment: arch-NULL OR size-NULL rows, cap respected ----
 
     #[test]
-    fn select_unmeasured_picks_only_null_size_rows() {
+    fn select_needs_enrichment_picks_size_null_and_arch_null_rows() {
         let cands = vec![
-            candidate("a/measured", Some(7.0)),
-            candidate("b/null", None),
-            candidate("c/measured", Some(13.0)),
-            candidate("d/null", None),
+            // Sized but NOT yet enriched (arch NULL) — the backfill case: MUST
+            // be selected even though it already has a size.
+            candidate("a/sized-not-enriched", Some(7.0)),
+            // Never sized (size NULL) — the original case.
+            candidate("b/size-null", None),
+            // Fully enriched (arch AND size set) — must NOT be reselected.
+            enriched("c/fully-enriched", 13.0, "LlamaForCausalLM"),
+            candidate("d/size-null", None),
         ];
-        let picked = select_unmeasured(&cands, 10);
+        let picked = select_needs_enrichment(&cands, 10);
         let repos: Vec<&str> = picked.iter().map(|c| c.hf_repo.as_str()).collect();
-        assert_eq!(repos, vec!["b/null", "d/null"], "only size-NULL rows");
+        assert_eq!(
+            repos,
+            vec!["a/sized-not-enriched", "b/size-null", "d/size-null"],
+            "arch-NULL (incl. already-sized) and size-NULL rows selected; fully-enriched skipped"
+        );
     }
 
     #[test]
-    fn select_unmeasured_respects_cap_and_order() {
+    fn select_needs_enrichment_respects_cap_and_order() {
         let cands = vec![
             candidate("a/null", None),
             candidate("b/null", None),
             candidate("c/null", None),
         ];
-        let picked = select_unmeasured(&cands, 2);
+        let picked = select_needs_enrichment(&cands, 2);
         assert_eq!(picked.len(), 2, "cap of 2 honored");
         assert_eq!(picked[0].hf_repo, "a/null");
         assert_eq!(picked[1].hf_repo, "b/null");
         // A cap of 0 selects nothing.
-        assert!(select_unmeasured(&cands, 0).is_empty());
+        assert!(select_needs_enrichment(&cands, 0).is_empty());
     }
 
     #[test]
-    fn select_unmeasured_empty_when_all_measured() {
+    fn select_needs_enrichment_empty_only_when_all_fully_enriched() {
+        // Both size AND arch set → nothing needs enrichment → stable, empty.
+        let done = vec![
+            enriched("a", 7.0, "Qwen3ForCausalLM"),
+            enriched("b", 8.0, "MistralForCausalLM"),
+        ];
+        assert!(select_needs_enrichment(&done, 50).is_empty());
+        // But a row sized WITHOUT an arch is still selected (the backfill).
         let cands = vec![candidate("a", Some(7.0)), candidate("b", Some(8.0))];
-        assert!(select_unmeasured(&cands, 50).is_empty());
+        assert_eq!(
+            select_needs_enrichment(&cands, 50).len(),
+            2,
+            "already-sized-but-unenriched rows are (re)selected once"
+        );
     }
 
     // ---- measure_brochure dry-run: no write, correct counts, COALESCE intent ----
@@ -1292,16 +1346,65 @@ mod tests {
         let client = HfHubClient::with_base_url(server.base_url());
         let cands = vec![
             candidate("org/a-null", None),
-            candidate("org/b-measured", Some(7.0)),
+            // Fully enriched (size AND arch) → excluded from the pass.
+            enriched("org/b-enriched", 7.0, "LlamaForCausalLM"),
             candidate("org/c-null", None),
         ];
         // pool = None (dry run) → nothing written, but derivations still counted.
         let outcome = measure_brochure(None, &client, &cands, 50).await;
-        assert_eq!(outcome.unmeasured_total, 2, "two size-NULL rows");
-        assert_eq!(outcome.attempted, 2);
+        assert_eq!(
+            outcome.unmeasured_total, 2,
+            "two rows still need enrichment"
+        );
+        assert_eq!(
+            outcome.attempted, 2,
+            "the fully-enriched row is not re-fetched"
+        );
         assert_eq!(outcome.measured, 2, "both derived a size in dry-run");
         assert_eq!(outcome.unresolved, 0);
         assert!(outcome.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn measure_brochure_re_enriches_a_sized_but_unenriched_row() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        // The mock carries BOTH size and arch (the S127 enrich fields).
+        let _mock = server.mock(|when, then| {
+            when.method(GET).path_contains("/api/models/");
+            then.status(200).json_body(json!({
+                "safetensors": { "total": 8_000_000_000u64 },
+                "config": { "architectures": ["Qwen3ForCausalLM"] },
+                "pipeline_tag": "text-generation",
+                "tags": ["chat"]
+            }));
+        });
+        let client = HfHubClient::with_base_url(server.base_url());
+        // A pre-existing measurement: it has a size but NO arch (the ~467-row
+        // backfill case). It MUST be selected + re-fetched so the new metadata
+        // reaches it — the enrich step does not early-return on an existing size.
+        let cands = vec![candidate("org/sized-no-arch", Some(7.0))];
+        let outcome = measure_brochure(None, &client, &cands, 50).await;
+        assert_eq!(
+            outcome.unmeasured_total, 1,
+            "an arch-NULL row still needs enrichment"
+        );
+        assert_eq!(
+            outcome.attempted, 1,
+            "it is re-visited, not skipped for having a size"
+        );
+        assert_eq!(outcome.measured, 1);
+        // The derivation the write WOULD persist is a real arch + gfx class.
+        let enriched_meta = enrich_from_model_info(
+            &json!({ "config": { "architectures": ["Qwen3ForCausalLM"] } }),
+            "org/sized-no-arch",
+        );
+        assert_eq!(enriched_meta.arch.as_deref(), Some("Qwen3ForCausalLM"));
+        assert_eq!(
+            classify_gfx1151(enriched_meta.arch.as_deref(), Some(7.0), 120.0),
+            "confirmed",
+            "a stored 'unknown' gfx would be replaced by this derived 'confirmed' via the upsert CASE"
+        );
     }
 
     #[tokio::test]
