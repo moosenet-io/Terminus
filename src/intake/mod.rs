@@ -309,6 +309,49 @@ pub fn discovery_select_from_env() -> bool {
     parse_discovery_select(std::env::var("INTAKE_ASSISTANT_DISCOVERY_SELECT").ok().as_deref())
 }
 
+/// Whether the assistant sweep should run the Ask-4 Phase 2b HF→cold-storage
+/// INGEST pre-step (`INTAKE_ASSISTANT_DISCOVERY_INGEST`, default `false`). When
+/// on, `run_mode` reads + ranks the brochure, then for each selected candidate
+/// not yet in cold storage calls Chord's `/api/models/ingest` endpoint and
+/// advances the brochure status on success (see `discovery::ingest`). INDEPENDENT
+/// of `INTAKE_ASSISTANT_DISCOVERY_SELECT`: this flag off (the default) means no
+/// ingest call is ever made, so — with both flags off — the sweep is byte-for-
+/// byte unchanged. Reuses [`parse_only_stale`]'s truthiness grammar. Pure over
+/// its input.
+pub fn parse_discovery_ingest(raw: Option<&str>) -> bool {
+    parse_only_stale(raw)
+}
+
+/// Whether brochure Phase-2b ingest is enabled
+/// (`INTAKE_ASSISTANT_DISCOVERY_INGEST`, default `false`).
+pub fn discovery_ingest_from_env() -> bool {
+    parse_discovery_ingest(std::env::var("INTAKE_ASSISTANT_DISCOVERY_INGEST").ok().as_deref())
+}
+
+/// Whether the assistant sweep should run the Ask-4 discovery pre-step in
+/// DRY-RUN / SHADOW mode (`INTAKE_ASSISTANT_DISCOVERY_DRY_RUN`, default
+/// `false`). This is the audit-window mode: on a normal schedule it reads the
+/// brochure (READ-ONLY), ranks it exactly as the live pre-step would, and emits
+/// a structured `[ask4-shadow]` JSON report of what it WOULD select/pull/test —
+/// then takes ZERO live action (no Chord `/api/models/ingest` call, no
+/// nomination augmentation, no `transition_status` DB write, no proxy touch).
+///
+/// PRECEDENCE (fail-safe toward no-action): when this is on, the shadow pass
+/// WINS over both `INTAKE_ASSISTANT_DISCOVERY_SELECT` and
+/// `INTAKE_ASSISTANT_DISCOVERY_INGEST` — it runs REGARDLESS of them (the action
+/// flags stay OFF during the audit) and no live pre-step runs even if an action
+/// flag is somehow also set. See `discovery::ingest::plan_discovery_step`.
+/// Reuses [`parse_only_stale`]'s truthiness grammar. Pure over its input.
+pub fn parse_discovery_dry_run(raw: Option<&str>) -> bool {
+    parse_only_stale(raw)
+}
+
+/// Whether brochure discovery DRY-RUN / shadow mode is enabled
+/// (`INTAKE_ASSISTANT_DISCOVERY_DRY_RUN`, default `false`).
+pub fn discovery_dry_run_from_env() -> bool {
+    parse_discovery_dry_run(std::env::var("INTAKE_ASSISTANT_DISCOVERY_DRY_RUN").ok().as_deref())
+}
+
 // ---------------------------------------------------------------------------
 // Unified MINT harness (MINT2-04)
 // ---------------------------------------------------------------------------

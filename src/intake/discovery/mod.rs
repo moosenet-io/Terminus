@@ -21,6 +21,7 @@
 //!   brochure rows.
 
 pub mod hf_client;
+pub mod ingest;
 pub mod refresh;
 pub mod schema;
 pub mod select;

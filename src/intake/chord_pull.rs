@@ -303,6 +303,188 @@ pub async fn acquire_via_chord(model: &str) -> AcquireOutcome {
     }
 }
 
+// ===========================================================================
+// Ask-4 Phase 2b: HF → cold-storage INGEST (Chord `POST /api/models/ingest`)
+// ===========================================================================
+//
+// Phase 2a built the ingest endpoint on the Chord side (default-OFF until
+// `CHORD_MODEL_INGEST_ENABLED=1` there). This is the Terminus-side client for
+// it — the ONE new remote call Phase 2b adds. It deliberately reuses the EXACT
+// same Chord-control auth path this module already uses for the pull endpoint:
+// base URL from [`crate::config::chord_control_url`] (`CHORD_CONTROL_URL`) and
+// the bearer token from [`chord_auth_token`] (`CHORD_JWT`) — no second secret,
+// no second door. Never panics; every failure resolves to an [`IngestOutcome`].
+//
+// ## Endpoint shape (Chord Phase 2a, read-only reference — this repo does not
+// modify Chord)
+// `POST {CHORD_CONTROL_URL}/api/models/ingest`, Bearer-JWT gated, body
+// `{"hf_repo": ..., "model_name": ..., "revision"?: ...}`. Response body carries
+// a `status` discriminant: `ingested` | `already_present` | `gated_needs_token`
+// | `too_large` | `disabled` | `error`, plus optional `cold_storage_ref`,
+// `bytes`, and `message`. A `disabled` status is what Chord returns when its own
+// `CHORD_MODEL_INGEST_ENABLED` flag is off — so even with Terminus's ingest flag
+// ON, a Chord that has not opted in is a clean fail-soft skip, never an error.
+
+/// Outcome of one [`ingest_model`] call. Distinct variants (not stringly-typed)
+/// so the ingest step can decide "advance the brochure status" vs "fail soft and
+/// skip" without re-parsing a message string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestOutcome {
+    /// `status: "ingested"` — the model was pulled from HF into cold storage
+    /// this call; `cold_storage_ref`/`bytes` echo Chord's response when present.
+    Ingested {
+        cold_storage_ref: Option<String>,
+        bytes: Option<u64>,
+    },
+    /// `status: "already_present"` — the model was already cold-stored; a no-op
+    /// on the Chord side, but from the brochure's perspective it IS now
+    /// cold-stored, so the caller advances status exactly as for `Ingested`.
+    AlreadyPresent { cold_storage_ref: Option<String> },
+    /// `status: "gated_needs_token"` — the HF repo is gated and Chord has no
+    /// token to fetch it. Fail-soft skip (a token is an ops/vault concern, not
+    /// something this sweep provisions).
+    GatedNeedsToken { message: String },
+    /// `status: "too_large"` — the model exceeds Chord's ingest size ceiling.
+    /// Fail-soft skip (disk discipline enforced on the Chord side).
+    TooLarge { message: String },
+    /// `status: "disabled"` — Chord's `CHORD_MODEL_INGEST_ENABLED` is off.
+    /// Fail-soft skip; the whole feature is a no-op until Chord opts in.
+    Disabled { message: String },
+    /// `status: "error"` (or an unknown/missing status on a 2xx) — a generic
+    /// Chord-side failure. Fail-soft skip with the reason preserved.
+    Error { message: String },
+    /// `401`/`403` — bearer JWT missing/invalid. Fail-soft skip.
+    Unauthorized,
+    /// Transport-level failure (connection refused/timeout/DNS). Fail-soft skip.
+    Unreachable { detail: String },
+}
+
+/// Request timeout for one ingest call. An HF→cold-storage pull of a multi-GB
+/// model can legitimately take a while, so this is generous. From
+/// `INTAKE_ASSISTANT_DISCOVERY_INGEST_TIMEOUT_SECS`, default 900 (15 min); a
+/// zero/unparseable value falls back to the default. The ingest STEP
+/// (`discovery::ingest`) additionally wraps each call in its own hard
+/// wall-clock bound so a hung client can never stall the sweep even if this
+/// reqwest-level timeout is somehow not honored.
+fn ingest_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("INTAKE_ASSISTANT_DISCOVERY_INGEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(900),
+    )
+}
+
+/// Best-effort read of a string field from Chord's JSON body.
+fn body_str_field(body: &serde_json::Value, key: &str) -> Option<String> {
+    body.get(key).and_then(|v| v.as_str()).map(String::from)
+}
+
+/// The `message` field, falling back to a generic label so a fail-soft log line
+/// is never empty even when Chord omits it.
+fn ingest_message(body: &serde_json::Value, fallback: &str) -> String {
+    body_str_field(body, "message").unwrap_or_else(|| fallback.to_string())
+}
+
+/// Ingest `model_name` (HF repo `hf_repo`, optional `revision`) into Chord's
+/// cold storage via `POST {CHORD_CONTROL_URL}/api/models/ingest`. Never panics —
+/// every failure mode (missing config, transport error, non-2xx, unparseable
+/// body) resolves to a value. `CHORD_CONTROL_URL` unset is a [`NotConfigured`]
+/// (no HTTP attempted), matching [`fetch_model`]'s contract.
+pub async fn ingest_model(
+    hf_repo: &str,
+    model_name: &str,
+    revision: Option<&str>,
+) -> Result<IngestOutcome, NotConfigured> {
+    let base = config::chord_control_url().ok_or_else(|| {
+        NotConfigured(
+            "CHORD_CONTROL_URL not set — model ingest requires Chord's control endpoint".into(),
+        )
+    })?;
+    let url = format!("{}/api/models/ingest", base.trim_end_matches('/'));
+    let token = chord_auth_token();
+
+    let mut payload = serde_json::json!({
+        "hf_repo": hf_repo,
+        "model_name": model_name,
+    });
+    if let Some(rev) = revision.map(str::trim).filter(|s| !s.is_empty()) {
+        payload["revision"] = serde_json::Value::String(rev.to_string());
+    }
+
+    let client = match reqwest::Client::builder().timeout(ingest_timeout()).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(IngestOutcome::Error {
+                message: format!("http client build failed: {e}"),
+            })
+        }
+    };
+
+    let mut req = client.post(&url).json(&payload);
+    if let Some(t) = &token {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(IngestOutcome::Unreachable {
+                detail: format!("chord ingest endpoint unreachable: {e}"),
+            })
+        }
+    };
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    Ok(interpret_ingest_response(status.as_u16(), &body))
+}
+
+/// Pure: map an HTTP status + parsed JSON body to an [`IngestOutcome`]. Split
+/// from the network call so the status/body → outcome mapping is unit-testable
+/// without a live Chord instance or a mock HTTP server. On a 2xx the body's
+/// `status` discriminant decides; a `401`/`403` is `Unauthorized`; any other
+/// non-2xx (or a 2xx with an unknown/missing `status`) is a generic `Error`.
+fn interpret_ingest_response(status: u16, body: &serde_json::Value) -> IngestOutcome {
+    if status == 401 || status == 403 {
+        return IngestOutcome::Unauthorized;
+    }
+    if !(200..=299).contains(&status) {
+        return IngestOutcome::Error {
+            message: ingest_message(body, &format!("HTTP {status}")),
+        };
+    }
+    match body_str_field(body, "status").as_deref() {
+        Some("ingested") => IngestOutcome::Ingested {
+            cold_storage_ref: body_str_field(body, "cold_storage_ref"),
+            bytes: body.get("bytes").and_then(|v| v.as_u64()),
+        },
+        Some("already_present") => IngestOutcome::AlreadyPresent {
+            cold_storage_ref: body_str_field(body, "cold_storage_ref"),
+        },
+        Some("gated_needs_token") => IngestOutcome::GatedNeedsToken {
+            message: ingest_message(body, "hf repo is gated and Chord has no token"),
+        },
+        Some("too_large") => IngestOutcome::TooLarge {
+            message: ingest_message(body, "model exceeds Chord ingest size ceiling"),
+        },
+        Some("disabled") => IngestOutcome::Disabled {
+            message: ingest_message(body, "Chord model ingest is disabled (CHORD_MODEL_INGEST_ENABLED off)"),
+        },
+        Some("error") => IngestOutcome::Error {
+            message: ingest_message(body, "chord reported an ingest error"),
+        },
+        other => IngestOutcome::Error {
+            message: format!(
+                "unexpected ingest status {:?}: {}",
+                other,
+                ingest_message(body, "no message")
+            ),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,6 +710,117 @@ mod tests {
                 assert_eq!(failure_class, FailureClass::NonViableUnavailable);
             }
             other => panic!("expected NonViable, got {other:?}"),
+        }
+    }
+
+    // ---- interpret_ingest_response: pure status/body → IngestOutcome ----
+
+    #[test]
+    fn ingest_response_ingested_carries_ref_and_bytes() {
+        let body = json!({"status":"ingested","cold_storage_ref":"cs://m/abc","bytes":1234});
+        assert_eq!(
+            interpret_ingest_response(200, &body),
+            IngestOutcome::Ingested {
+                cold_storage_ref: Some("cs://m/abc".to_string()),
+                bytes: Some(1234),
+            }
+        );
+        // Optional fields absent is still Ingested (they are best-effort echoes).
+        assert_eq!(
+            interpret_ingest_response(200, &json!({"status":"ingested"})),
+            IngestOutcome::Ingested { cold_storage_ref: None, bytes: None }
+        );
+    }
+
+    #[test]
+    fn ingest_response_already_present_maps_cleanly() {
+        assert_eq!(
+            interpret_ingest_response(200, &json!({"status":"already_present","cold_storage_ref":"cs://m/x"})),
+            IngestOutcome::AlreadyPresent { cold_storage_ref: Some("cs://m/x".to_string()) }
+        );
+    }
+
+    #[test]
+    fn ingest_response_fail_soft_statuses_map_to_their_variants() {
+        match interpret_ingest_response(200, &json!({"status":"gated_needs_token","message":"gated"})) {
+            IngestOutcome::GatedNeedsToken { message } => assert_eq!(message, "gated"),
+            other => panic!("expected GatedNeedsToken, got {other:?}"),
+        }
+        match interpret_ingest_response(200, &json!({"status":"too_large","message":"200GB"})) {
+            IngestOutcome::TooLarge { message } => assert_eq!(message, "200GB"),
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        match interpret_ingest_response(200, &json!({"status":"disabled"})) {
+            // message falls back to a non-empty generic label.
+            IngestOutcome::Disabled { message } => assert!(!message.is_empty()),
+            other => panic!("expected Disabled, got {other:?}"),
+        }
+        match interpret_ingest_response(200, &json!({"status":"error","message":"boom"})) {
+            IngestOutcome::Error { message } => assert_eq!(message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ingest_response_unknown_or_missing_status_is_error() {
+        match interpret_ingest_response(200, &json!({"status":"weird"})) {
+            IngestOutcome::Error { message } => assert!(message.contains("weird")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match interpret_ingest_response(200, &serde_json::Value::Null) {
+            IngestOutcome::Error { .. } => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ingest_response_401_403_is_unauthorized_and_other_non_2xx_is_error() {
+        assert_eq!(interpret_ingest_response(401, &serde_json::Value::Null), IngestOutcome::Unauthorized);
+        assert_eq!(interpret_ingest_response(403, &serde_json::Value::Null), IngestOutcome::Unauthorized);
+        match interpret_ingest_response(500, &json!({"message":"internal"})) {
+            IngestOutcome::Error { message } => assert_eq!(message, "internal"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match interpret_ingest_response(503, &serde_json::Value::Null) {
+            IngestOutcome::Error { message } => assert!(message.contains("503")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ingest_timeout_defaults_and_overrides() {
+        std::env::remove_var("INTAKE_ASSISTANT_DISCOVERY_INGEST_TIMEOUT_SECS");
+        assert_eq!(ingest_timeout(), Duration::from_secs(900));
+        std::env::set_var("INTAKE_ASSISTANT_DISCOVERY_INGEST_TIMEOUT_SECS", "0");
+        assert_eq!(ingest_timeout(), Duration::from_secs(900)); // zero rejected
+        std::env::set_var("INTAKE_ASSISTANT_DISCOVERY_INGEST_TIMEOUT_SECS", "nan");
+        assert_eq!(ingest_timeout(), Duration::from_secs(900)); // unparseable rejected
+        std::env::set_var("INTAKE_ASSISTANT_DISCOVERY_INGEST_TIMEOUT_SECS", "120");
+        assert_eq!(ingest_timeout(), Duration::from_secs(120));
+        std::env::remove_var("INTAKE_ASSISTANT_DISCOVERY_INGEST_TIMEOUT_SECS");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ingest_model_not_configured_when_control_url_unset() {
+        std::env::remove_var("CHORD_CONTROL_URL");
+        let result = ingest_model("org/model", "org/model", None).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("CHORD_CONTROL_URL"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ingest_model_unreachable_when_control_url_points_nowhere() {
+        std::env::set_var("CHORD_CONTROL_URL", "http://127.0.0.1:1");
+        std::env::set_var("INTAKE_ASSISTANT_DISCOVERY_INGEST_TIMEOUT_SECS", "2");
+        let result = ingest_model("org/model", "org/model", None).await;
+        std::env::remove_var("CHORD_CONTROL_URL");
+        std::env::remove_var("INTAKE_ASSISTANT_DISCOVERY_INGEST_TIMEOUT_SECS");
+        match result {
+            Ok(IngestOutcome::Unreachable { .. }) => {}
+            other => panic!("expected Ok(Unreachable), got {other:?}"),
         }
     }
 }
