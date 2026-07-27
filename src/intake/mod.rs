@@ -309,6 +309,25 @@ pub fn discovery_select_from_env() -> bool {
     parse_discovery_select(std::env::var("INTAKE_ASSISTANT_DISCOVERY_SELECT").ok().as_deref())
 }
 
+/// Whether the assistant sweep should run the Ask-4 Phase 2b HF→cold-storage
+/// INGEST pre-step (`INTAKE_ASSISTANT_DISCOVERY_INGEST`, default `false`). When
+/// on, `run_mode` reads + ranks the brochure, then for each selected candidate
+/// not yet in cold storage calls Chord's `/api/models/ingest` endpoint and
+/// advances the brochure status on success (see `discovery::ingest`). INDEPENDENT
+/// of `INTAKE_ASSISTANT_DISCOVERY_SELECT`: this flag off (the default) means no
+/// ingest call is ever made, so — with both flags off — the sweep is byte-for-
+/// byte unchanged. Reuses [`parse_only_stale`]'s truthiness grammar. Pure over
+/// its input.
+pub fn parse_discovery_ingest(raw: Option<&str>) -> bool {
+    parse_only_stale(raw)
+}
+
+/// Whether brochure Phase-2b ingest is enabled
+/// (`INTAKE_ASSISTANT_DISCOVERY_INGEST`, default `false`).
+pub fn discovery_ingest_from_env() -> bool {
+    parse_discovery_ingest(std::env::var("INTAKE_ASSISTANT_DISCOVERY_INGEST").ok().as_deref())
+}
+
 // ---------------------------------------------------------------------------
 // Unified MINT harness (MINT2-04)
 // ---------------------------------------------------------------------------

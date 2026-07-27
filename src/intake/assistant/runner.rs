@@ -967,6 +967,63 @@ pub async fn run_mode(selection: SweepSelection) -> Result<RunReport, ToolError>
         }
     }
 
+    // Ask-4 Phase 2b (HF→cold-storage INGEST pre-step) — GATED behind
+    // `INTAKE_ASSISTANT_DISCOVERY_INGEST`, INDEPENDENT of Phase 1's
+    // `INTAKE_ASSISTANT_DISCOVERY_SELECT`. When on, read + rank the brochure and,
+    // for each selected candidate not yet in cold storage, call Chord's
+    // `/api/models/ingest` endpoint (reusing the existing Chord-control JWT auth
+    // path) and advance its brochure status on success — so a discovered-but-un-
+    // stored model becomes acquirable by the sweep's existing cold-storage pull
+    // (`acquire::chord_acquire`). Runs BEFORE `run_with`'s per-model acquire so a
+    // freshly-ingested model is cold-stored by the time acquire promotes it warm.
+    // Fail-soft throughout: every non-success ingest leaves the candidate un-
+    // advanced and never blocks the rest of the sweep. When OFF (the default) no
+    // ingest call is ever made — with both flags off the sweep is byte-for-byte
+    // unchanged. Independent of select: this reads the brochure itself, so a
+    // Phase-2b-only operator can pre-stage cold storage without also merging the
+    // discovered models into THIS run's nominations.
+    if crate::intake::discovery_ingest_from_env() {
+        use crate::intake::discovery::{ingest, select, storage as discovery_storage};
+        match discovery_storage::read_brochure(&pool).await {
+            Ok(candidates) => {
+                let total = candidates.len();
+                let sel_cfg = select::DiscoverySelectConfig::from_env();
+                let selected = select::select_discovery_candidates(candidates, &sel_cfg);
+                let ingest_cfg = ingest::DiscoveryIngestConfig::from_env();
+                let ingestor = ingest::ChordIngestor;
+                let advancer = ingest::DbStatusAdvancer { pool: &pool };
+                let report =
+                    ingest::ingest_selected(&selected, &ingestor, &advancer, &ingest_cfg).await;
+                tracing::info!(
+                    "assistant sweep discovery-ingest: {} brochure candidate(s) scanned, {} selected \
+                     (cap {}), ingest report: attempted {}, cold_stored {}, already_cold {}, \
+                     failed_soft {}, advance_failed {}, capped_out {}",
+                    total,
+                    selected.len(),
+                    ingest_cfg.max_ingests,
+                    report.attempted,
+                    report.cold_stored,
+                    report.skipped_already_cold,
+                    report.failed_soft,
+                    report.advance_failed,
+                    report.capped_out,
+                );
+            }
+            Err(ToolError::NotConfigured(msg)) => {
+                tracing::info!(
+                    "assistant sweep discovery-ingest: brochure not configured on this host \
+                     ({msg}) — no ingest attempted"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "assistant sweep discovery-ingest: could not read the brochure ({e}) — \
+                     no ingest attempted (fail-soft)"
+                );
+            }
+        }
+    }
+
     // Gap-only takes precedence over --only-stale (both narrow the same vector).
     if selection.gap_only {
         let gap_ids = schema::gap_only_model_ids(&pool).await?;
