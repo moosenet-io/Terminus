@@ -908,6 +908,21 @@ pub fn hf_discovery_rate_limit_per_min() -> u32 {
         .unwrap_or(30)
 }
 
+/// Maximum number of brochure candidates the DISC measure pass
+/// (`model_discovery_measure`, Ask-4) will fetch HF model-info metadata for in a
+/// single run. From `INTAKE_DISCOVERY_MEASURE_MAX`, default 50 — bounds outbound
+/// HF calls per run so a one-shot backfill of a large (~850-row) brochure spaces
+/// its metadata fetches across several runs rather than hammering HF's API in one
+/// burst (the same courtesy-throttle rationale as `hf_discovery_rate_limit_per_min`;
+/// see memory `feedback_plane_ratelimit`/`mint_brochure_curator_fixed` on spacing
+/// calls out). A non-positive or unparseable override falls back to the default.
+pub fn intake_discovery_measure_max() -> usize {
+    env_nonempty("INTAKE_DISCOVERY_MEASURE_MAX")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(50)
+}
+
 // ── KGEMB-02: KG semantic-embeddings client config ────────────────────────
 // `crate::scribe::graph::vec_embed::EmbedClient` turns a node "card" (short
 // text) into a vector against a configurable endpoint. URL/model/timeout are
