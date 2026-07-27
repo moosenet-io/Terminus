@@ -22,6 +22,7 @@
 
 pub mod hf_client;
 pub mod ingest;
+pub mod measure;
 pub mod refresh;
 pub mod schema;
 pub mod select;
@@ -35,9 +36,12 @@ pub use schema::{CandidateStatus, DiscoveryCandidate, FleetCategory, Modality};
 /// `crate::intake::register` (the same Chord-served core surface
 /// `catalog::register` uses) — never the personal registry.
 ///
-/// DISC-02's read-only `model_discovery_brochure` (`tool`) plus DISC-06's
-/// `model_discovery_refresh` curator (`refresh`) that populates it.
+/// DISC-02's read-only `model_discovery_brochure` (`tool`), DISC-06's
+/// `model_discovery_refresh` curator (`refresh`) that populates it, and Ask-4's
+/// `model_discovery_measure` step (`measure`) that backfills candidates' `size_b`
+/// from HF metadata so the selector's size gate can see them.
 pub fn register(registry: &mut crate::registry::ToolRegistry) {
     tool::register(registry);
     refresh::register(registry);
+    measure::register(registry);
 }
