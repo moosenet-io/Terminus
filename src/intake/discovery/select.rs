@@ -35,8 +35,8 @@
 //! disable-able 5GB size gate (`CHORD_ALIAS_MIN_SIZE_BYTES`). A 7B model at
 //! Q4-class weights is comfortably above that 5GB gate, so nothing selected here
 //! can ever be "swept but un-promotable purely on size". The floor is env-
-//! tunable UP (never silently below the intent) via
-//! `INTAKE_ASSISTANT_DISCOVERY_MIN_SIZE_B`.
+//! tunable UP ONLY (a below-default override is clamped back up to the default —
+//! never silently below the intent) via `INTAKE_ASSISTANT_DISCOVERY_MIN_SIZE_B`.
 
 use std::collections::BTreeSet;
 
@@ -159,13 +159,17 @@ pub fn parse_discovery_max(raw: Option<&str>) -> usize {
 }
 
 /// Parse the discovery size floor (`INTAKE_ASSISTANT_DISCOVERY_MIN_SIZE_B`).
-/// A missing/unparseable/non-positive value falls back to
-/// [`DEFAULT_DISCOVERY_MIN_SIZE_B`] — the floor can be tuned UP but never
-/// silently to zero (which would let a tiny, proxy-rejectable model through).
-/// Pure over input.
+/// The floor can be tuned UP ONLY: a valid positive value BELOW
+/// [`DEFAULT_DISCOVERY_MIN_SIZE_B`] is clamped UP to that default (so an operator
+/// can never silently lower the size protection below the proxy's effective gate
+/// — see the module-doc size-floor rationale). A missing/unparseable/
+/// zero/negative/non-finite value also falls back to
+/// [`DEFAULT_DISCOVERY_MIN_SIZE_B`]. Pure over input.
 pub fn parse_discovery_min_size_b(raw: Option<&str>) -> f64 {
     raw.and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|n| n.is_finite() && *n > 0.0)
+        // Tuned-UP-only: never below the default protective floor.
+        .map(|n| n.max(DEFAULT_DISCOVERY_MIN_SIZE_B))
         .unwrap_or(DEFAULT_DISCOVERY_MIN_SIZE_B)
 }
 
@@ -197,7 +201,9 @@ pub fn select_discovery_candidates(
             Some(m) => cfg.allowed_modalities.contains(&m),
             None => cfg.allow_unclassified_modality,
         })
-        .filter(|c| matches!(c.size_b, Some(v) if v >= cfg.min_size_b))
+        // A `None`, non-finite (NaN/±∞), or below-floor size is DROPPED: a bogus
+        // infinite size must never pass the floor gate on `∞ >= floor == true`.
+        .filter(|c| matches!(c.size_b, Some(v) if v.is_finite() && v >= cfg.min_size_b))
         .filter(|c| gfx_allow.contains(&c.gfx1151_class))
         .collect();
 
@@ -714,7 +720,73 @@ mod tests {
             parse_discovery_min_size_b(Some("-1")),
             DEFAULT_DISCOVERY_MIN_SIZE_B
         );
+        // Tuned UP is honored.
         assert_eq!(parse_discovery_min_size_b(Some("13")), 13.0);
         assert_eq!(parse_discovery_min_size_b(Some(" 9.5 ")), 9.5);
+    }
+
+    #[test]
+    fn parse_discovery_min_size_clamps_below_floor_up_to_default() {
+        // A valid positive override BELOW the default is clamped UP to the floor —
+        // an operator can never silently lower the size protection.
+        assert_eq!(
+            parse_discovery_min_size_b(Some("3")),
+            DEFAULT_DISCOVERY_MIN_SIZE_B
+        );
+        assert_eq!(
+            parse_discovery_min_size_b(Some("0.5")),
+            DEFAULT_DISCOVERY_MIN_SIZE_B
+        );
+        // Exactly at the floor stays at the floor; above stays above.
+        assert_eq!(
+            parse_discovery_min_size_b(Some("7")),
+            DEFAULT_DISCOVERY_MIN_SIZE_B
+        );
+        assert_eq!(parse_discovery_min_size_b(Some("9.5")), 9.5);
+    }
+
+    #[test]
+    fn parse_discovery_min_size_rejects_non_finite_env_value() {
+        // A non-finite env value falls back to the default, never becomes the floor.
+        assert_eq!(
+            parse_discovery_min_size_b(Some("inf")),
+            DEFAULT_DISCOVERY_MIN_SIZE_B
+        );
+        assert_eq!(
+            parse_discovery_min_size_b(Some("NaN")),
+            DEFAULT_DISCOVERY_MIN_SIZE_B
+        );
+    }
+
+    #[test]
+    fn non_finite_candidate_size_is_dropped() {
+        // A bogus infinite/NaN candidate size must NOT pass the floor gate
+        // (`∞ >= 7.0` would otherwise be true), and must never be selected.
+        let cands = vec![
+            cand(
+                "infinite_size",
+                Some(f64::INFINITY),
+                Some(99.0),
+                FleetCategory::Assistant,
+                Some(Modality::TextGeneration),
+                "confirmed",
+            ),
+            cand(
+                "nan_size",
+                Some(f64::NAN),
+                Some(99.0),
+                FleetCategory::Assistant,
+                Some(Modality::TextGeneration),
+                "confirmed",
+            ),
+            asst("legit", 8.0, 5.0),
+        ];
+        let out = select_discovery_candidates(cands, &DiscoverySelectConfig::default());
+        let ids: Vec<&str> = out.iter().map(|c| c.model_name.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["legit"],
+            "only the finite-sized candidate survives"
+        );
     }
 }
