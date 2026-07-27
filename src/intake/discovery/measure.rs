@@ -246,6 +246,301 @@ fn json_as_u64(v: &Value) -> Option<u64> {
         .or_else(|| v.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
 }
 
+// ===========================================================================
+// Ask-4 ENRICH step (S127): parse practical/hardware metadata from the SAME
+// already-fetched model-info blob (no extra fetch, public metadata only).
+// ===========================================================================
+
+/// Practical/hardware metadata derived from one repo's HF model-info blob, all
+/// fail-soft (`None`/`false` when the blob didn't carry the field). Feeds the
+/// blended practical `fit_score` and the hard servability/suitability filters in
+/// [`crate::intake::discovery::select`], plus the derived `gfx1151_class`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EnrichedMetadata {
+    /// HF `createdAt` (recency lower bound).
+    pub published_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// HF `lastModified` (primary recency signal).
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// HF `cardData.license` (fallback: a `license:*` tag), lowercased.
+    pub license: Option<String>,
+    /// HF `config.architectures[0]` (fallback `config.model_type` /
+    /// `library_name`), verbatim.
+    pub arch: Option<String>,
+    /// Instruct/chat-tuned heuristic from `pipeline_tag` + `tags` + repo-id.
+    /// Always `Some(_)` from an enrich pass (we looked); `Some(false)` means
+    /// "no instruct marker found".
+    pub is_instruct: Option<bool>,
+    /// HF model-info `gated` flag (bool, or a non-`"false"` string → true).
+    pub gated: Option<bool>,
+    /// Dominant key of `safetensors.parameters` (e.g. `"BF16"`).
+    pub quant_dtype: Option<String>,
+}
+
+/// PURE enrichment: derive [`EnrichedMetadata`] from one repo's HF model-info
+/// JSON. No IO. Every field independently fail-soft — a missing/malformed field
+/// yields `None`/`false`, never a panic. `repo_id` supplies the last-resort
+/// instruct-marker source (a `-instruct`/`-it`/`-chat` suffix in the id).
+pub fn enrich_from_model_info(info: &Value, repo_id: &str) -> EnrichedMetadata {
+    EnrichedMetadata {
+        published_at: parse_hf_datetime(info.get("createdAt")),
+        updated_at: parse_hf_datetime(info.get("lastModified")),
+        license: license_from_info(info),
+        arch: arch_from_info(info),
+        is_instruct: Some(is_instruct_from_info(info, repo_id)),
+        gated: gated_from_info(info),
+        quant_dtype: quant_dtype_from_info(info),
+    }
+}
+
+/// Parse an HF RFC3339/ISO-8601 timestamp value (`createdAt`/`lastModified`)
+/// into a UTC datetime. `None` for a missing/non-string/unparseable value.
+fn parse_hf_datetime(v: Option<&Value>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = v?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(s.trim())
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// `cardData.license` (string), else the first `license:<x>` entry in `tags`.
+/// Lowercased + trimmed. `None` when neither is present.
+fn license_from_info(info: &Value) -> Option<String> {
+    if let Some(lic) = info
+        .get("cardData")
+        .and_then(|c| c.get("license"))
+        .and_then(Value::as_str)
+    {
+        let lic = lic.trim().to_lowercase();
+        if !lic.is_empty() {
+            return Some(lic);
+        }
+    }
+    // Fallback: a `license:apache-2.0`-style tag.
+    if let Some(tags) = info.get("tags").and_then(Value::as_array) {
+        for t in tags {
+            if let Some(s) = t.as_str() {
+                if let Some(rest) = s.trim().to_lowercase().strip_prefix("license:") {
+                    let rest = rest.trim().to_string();
+                    if !rest.is_empty() {
+                        return Some(rest);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `config.architectures[0]` (string), else `config.model_type`, else
+/// `library_name`. Verbatim (not lowercased — `classify_gfx1151` normalizes).
+fn arch_from_info(info: &Value) -> Option<String> {
+    if let Some(arch) = info
+        .get("config")
+        .and_then(|c| c.get("architectures"))
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(Value::as_str)
+    {
+        let arch = arch.trim();
+        if !arch.is_empty() {
+            return Some(arch.to_string());
+        }
+    }
+    if let Some(mt) = info
+        .get("config")
+        .and_then(|c| c.get("model_type"))
+        .and_then(Value::as_str)
+    {
+        let mt = mt.trim();
+        if !mt.is_empty() {
+            return Some(mt.to_string());
+        }
+    }
+    if let Some(lib) = info.get("library_name").and_then(Value::as_str) {
+        let lib = lib.trim();
+        if !lib.is_empty() {
+            return Some(lib.to_string());
+        }
+    }
+    None
+}
+
+/// Instruct/chat-tuned heuristic from `pipeline_tag` + `tags` + repo-id markers.
+/// Deliberately liberal (an instruct model is the assistant sweep's target); a
+/// base/pretrain model shows none of these markers → `false`.
+fn is_instruct_from_info(info: &Value, repo_id: &str) -> bool {
+    let pt = info
+        .get("pipeline_tag")
+        .and_then(Value::as_str)
+        .map(|s| s.to_lowercase());
+    if matches!(pt.as_deref(), Some("conversational")) {
+        return true;
+    }
+    // Tag tokens (word-boundary, not substring — avoids "editor" matching "it").
+    if let Some(tags) = info.get("tags").and_then(Value::as_array) {
+        for t in tags {
+            if let Some(s) = t.as_str() {
+                if tag_has_instruct_marker(s) {
+                    return true;
+                }
+            }
+        }
+    }
+    // Repo-id markers: "-instruct", "-chat", "-it" suffix/segment.
+    id_has_instruct_marker(repo_id)
+}
+
+/// Whether a single tag carries an instruct/chat marker as a WHOLE token
+/// (split on any non-alphanumeric), so "it" only matches a standalone "it"
+/// token, never inside "editor"/"credit".
+fn tag_has_instruct_marker(tag: &str) -> bool {
+    tag.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|tok| {
+            matches!(
+                tok,
+                "instruct"
+                    | "instruction"
+                    | "chat"
+                    | "conversational"
+                    | "it"
+                    | "sft"
+                    | "rlhf"
+                    | "dpo"
+            )
+        })
+}
+
+/// Whether a repo id carries an instruct/chat marker as a whole `-`/`_`/`/`/`.`
+/// -delimited segment (so `Qwen/Qwen3-8B-Instruct`, `.../model-it`, `.../m-chat`
+/// match, but a bare `.../edit-model` does not via the "it" trap).
+fn id_has_instruct_marker(repo_id: &str) -> bool {
+    repo_id
+        .to_lowercase()
+        .split(|c: char| c == '-' || c == '_' || c == '/' || c == '.')
+        .any(|seg| matches!(seg, "instruct" | "chat" | "it" | "sft"))
+}
+
+/// HF model-info `gated` flag. HF returns `false`, `true`, or a string
+/// (`"auto"`/`"manual"`) — any non-`"false"` string (and boolean `true`) means
+/// gated. `None` when the field is absent (unknown → treated as public
+/// downstream).
+fn gated_from_info(info: &Value) -> Option<bool> {
+    match info.get("gated") {
+        None => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(Value::String(s)) => Some(!s.eq_ignore_ascii_case("false")),
+        Some(_) => None,
+    }
+}
+
+/// The dominant (largest-parameter-count) key of `safetensors.parameters`
+/// (e.g. `{"BF16": 8e9, "F32": 2e5}` → `"BF16"`). `None` when absent/empty.
+fn quant_dtype_from_info(info: &Value) -> Option<String> {
+    let params = info
+        .get("safetensors")
+        .and_then(|s| s.get("parameters"))
+        .and_then(Value::as_object)?;
+    params
+        .iter()
+        .filter_map(|(k, v)| json_as_f64(v).map(|n| (k.clone(), n)))
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(k, _)| k)
+}
+
+// ===========================================================================
+// Ask-4 gfx1151 CLASSIFIER (S127): a PURE arch→runnability map, no IO.
+// ===========================================================================
+
+/// Classify a candidate's gfx1151 runnability from its architecture, size, and
+/// the host VRAM ceiling. PURE — no IO, fully unit-tested. Returns the
+/// free-text `gfx1151_class` string the brochure/selector use:
+///
+/// - `"no"` — UNSERVABLE: an arch with no llama.cpp handler that isn't
+///   Ollama-servable either (`gpt-oss`/`gpt_oss`, `glm4`/`glm-4`, …), OR a model
+///   that does NOT fit the VRAM ceiling. `"no"` is never in the selector's gfx
+///   allowlist, so such a candidate is always dropped before ranking.
+/// - `"experimental"` — MoE/hybrid tensor-graph arches with a known Vulkan-hang
+///   risk that must route via ROCm/Ollama (`*moe`, `mixtral`, `mamba`, `jamba`,
+///   `falcon-h1`/hybrid, `gemma4`-style, `qwen3.5-moe`).
+/// - `"confirmed"` — dense, Vulkan-validated known-good arches (`llama`,
+///   `qwen2`/`qwen3`, `mistral`, `gemma2`/`gemma3`, `phi3`/`phi4`, `granite`,
+///   `cohere`/`command-r`, `yi`, `stablelm`).
+/// - `"unknown"` — an arch is present but not in any bucket, OR no arch at all
+///   (not yet classifiable; the selector opt-in `allow_unknown_gfx` decides
+///   whether to still consider it).
+///
+/// Precedence: unservable-arch → not-fits-VRAM → MoE/hybrid → dense-known-good →
+/// unknown. `size_b == None` skips the VRAM check (can't judge fit without a
+/// size — don't reject on unknown size).
+pub fn classify_gfx1151(arch: Option<&str>, size_b: Option<f64>, vram_gb: f64) -> &'static str {
+    // No arch signal at all → not yet classifiable.
+    let arch = match arch {
+        Some(a) if !a.trim().is_empty() => a,
+        _ => return "unknown",
+    };
+    // Normalize: lowercase with every non-alphanumeric char stripped, so
+    // "Gpt-Oss", "gpt_oss", "GptOssForCausalLM" all collapse to a form where a
+    // token like "gptoss" is a plain substring.
+    let norm: String = arch
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect();
+    let has = |needle: &str| norm.contains(needle);
+
+    // 1. UNSERVABLE arches → "no" (gpt-oss is the cautionary case: no llama.cpp
+    //    handler AND not Ollama-servable → a 120s egress hang, never selectable).
+    if has("gptoss") || has("glm4") {
+        return "no";
+    }
+
+    // 2. Does NOT fit the VRAM ceiling → "no" (a known-arch model that is simply
+    //    too big for the host is unservable here just the same). ~0.6 GB/B-param
+    //    Q4-class footprint, matching acquire::Nomination::vram_footprint_gb.
+    if let Some(s) = size_b {
+        if s.is_finite() && s > 0.0 && !fits_vram(s, vram_gb) {
+            return "no";
+        }
+    }
+
+    // 3. MoE / hybrid tensor-graph → "experimental" (Vulkan-hang risk; route via
+    //    ROCm/Ollama). Checked BEFORE dense so "qwen3moe" (also contains "qwen3")
+    //    lands here, not in "confirmed".
+    for m in [
+        "moe",
+        "mixtral",
+        "mamba",
+        "jamba",
+        "falconh1",
+        "falconhybrid",
+        "gemma4",
+    ] {
+        if has(m) {
+            return "experimental";
+        }
+    }
+
+    // 4. Dense, Vulkan-validated known-good → "confirmed".
+    for d in [
+        "llama", "qwen2", "qwen3", "mistral", "gemma2", "gemma3", "phi3", "phi4", "granite",
+        "cohere", "commandr", "yi", "stablelm",
+    ] {
+        if has(d) {
+            return "confirmed";
+        }
+    }
+
+    // 5. Arch present but unmapped → "unknown".
+    "unknown"
+}
+
+/// Whether a model of `size_b` billions of params fits the `vram_gb` ceiling at
+/// the fleet's ~0.6 GB/B-param Q4-class footprint estimate (the same heuristic
+/// `acquire::Nomination::vram_footprint_gb`/`exceeds_vram` use).
+fn fits_vram(size_b: f64, vram_gb: f64) -> bool {
+    size_b * 0.6 <= vram_gb
+}
+
 /// Resolve the effective per-run cap from the optional `max` MCP arg and the
 /// configured `ceiling` (`INTAKE_DISCOVERY_MEASURE_MAX`). PURE — no IO.
 ///
@@ -322,43 +617,79 @@ pub async fn measure_brochure(
     let mut unresolved = 0usize;
     let mut errors = Vec::new();
 
+    // Host VRAM ceiling for the gfx1151 fit check (non-secret env knob, resolved
+    // once per pass). Reuses acquire's ceiling so a candidate too big for the
+    // host classifies "no" here exactly as the acquire fit check would skip it.
+    let vram_ceiling = crate::intake::assistant::acquire::vram_ceiling_gb();
+
     for cand in targets {
         match client.get_model_info(&cand.hf_repo).await {
             Ok(info) => {
                 let m = measure_from_model_info(&info, &cand.hf_repo);
-                match m.size_b {
-                    Some(size_b) if size_b > 0.0 => {
-                        match pool {
-                            // dry-run: count what WOULD be measured, write nothing.
-                            None => measured += 1,
-                            Some(p) => {
-                                // Carry the existing row forward with ONLY the
-                                // measured fields populated. upsert_candidate
-                                // COALESCE-protects size_b/vram/gfx1151 and never
-                                // touches `status`, so this writes the new size_b
-                                // (non-NULL wins) without disturbing lifecycle
-                                // state or a prior measurement.
-                                let mut updated = cand.clone();
-                                updated.size_b = Some(size_b);
-                                if m.vram_footprint_gb.is_some() {
-                                    updated.vram_footprint_gb = m.vram_footprint_gb;
-                                }
-                                match upsert_candidate(p, &updated).await {
-                                    Ok(()) => measured += 1,
-                                    Err(e) => errors.push((cand.hf_repo.clone(), e.to_string())),
-                                }
-                            }
+                // ENRICH (S127): derive practical/hardware metadata + the
+                // arch-driven gfx1151 class from the SAME already-fetched blob.
+                let enriched = enrich_from_model_info(&info, &cand.hf_repo);
+                let resolved_size = m.size_b.filter(|s| *s > 0.0);
+                let derived_gfx =
+                    classify_gfx1151(enriched.arch.as_deref(), resolved_size, vram_ceiling);
+
+                let has_size = resolved_size.is_some();
+                match pool {
+                    // dry-run: count what WOULD be measured, write nothing.
+                    None => {
+                        if has_size {
+                            measured += 1;
+                        } else {
+                            unresolved += 1;
                         }
                     }
-                    _ => {
-                        unresolved += 1;
-                        tracing::warn!(
-                            hf_repo = %cand.hf_repo,
-                            "measure: HF model-info exposed no usable size_b (no safetensors \
-                             param count / weight bytes / id token) — leaving size_b NULL, \
-                             will retry next run"
-                        );
+                    Some(p) => {
+                        // Carry the existing row forward with the measured size
+                        // (when resolved), the derived vram footprint, the
+                        // enriched practical metadata, and the derived gfx class.
+                        // upsert_candidate COALESCE-protects size_b/vram/the new
+                        // metadata columns and applies the 'unknown'-overwrite
+                        // CASE to gfx1151_class (a derived non-"unknown" class
+                        // REPLACES a stored "unknown"), and never touches
+                        // `status` — so this enriches without disturbing
+                        // lifecycle state or a prior measurement.
+                        let mut updated = cand.clone();
+                        if let Some(size_b) = resolved_size {
+                            updated.size_b = Some(size_b);
+                        }
+                        if m.vram_footprint_gb.is_some() {
+                            updated.vram_footprint_gb = m.vram_footprint_gb;
+                        }
+                        // A derived "unknown" (arch absent) is a safe no-op via
+                        // the upsert CASE; a real class fills/replaces the stored
+                        // "unknown" sentinel.
+                        updated.gfx1151_class = derived_gfx.to_string();
+                        updated.published_at = enriched.published_at.or(updated.published_at);
+                        updated.updated_at = enriched.updated_at.or(updated.updated_at);
+                        updated.license = enriched.license.clone().or(updated.license);
+                        updated.arch = enriched.arch.clone().or(updated.arch);
+                        updated.is_instruct = enriched.is_instruct.or(updated.is_instruct);
+                        updated.gated = enriched.gated.or(updated.gated);
+                        updated.quant_dtype = enriched.quant_dtype.clone().or(updated.quant_dtype);
+                        match upsert_candidate(p, &updated).await {
+                            Ok(()) => {
+                                if has_size {
+                                    measured += 1;
+                                } else {
+                                    unresolved += 1;
+                                }
+                            }
+                            Err(e) => errors.push((cand.hf_repo.clone(), e.to_string())),
+                        }
                     }
+                }
+                if !has_size {
+                    tracing::warn!(
+                        hf_repo = %cand.hf_repo,
+                        "measure: HF model-info exposed no usable size_b (no safetensors \
+                         param count / weight bytes / id token) — leaving size_b NULL, \
+                         practical metadata still enriched, will retry size next run"
+                    );
                 }
             }
             Err(e) => {
@@ -515,6 +846,13 @@ mod tests {
             evicted_at: None,
             retained_profile: None,
             rationale: None,
+            published_at: None,
+            updated_at: None,
+            license: None,
+            arch: None,
+            is_instruct: None,
+            gated: None,
+            quant_dtype: None,
         }
     }
 
@@ -648,6 +986,238 @@ mod tests {
         let info = json!({ "siblings": [ { "rfilename": "model.safetensors" } ] });
         assert_eq!(weight_file_bytes(&info), None);
         assert_eq!(measure_from_model_info(&info, "org/unsized").size_b, None);
+    }
+
+    // ---- classify_gfx1151: arch → runnability, VRAM fit, precedence ----
+
+    // A generous ceiling (this host's ~120GB GTT serving envelope) so the VRAM
+    // check never interferes unless a test wants it.
+    const BIG_VRAM: f64 = 120.0;
+
+    #[test]
+    fn classify_dense_known_good_arches_are_confirmed() {
+        for arch in [
+            "LlamaForCausalLM",
+            "Qwen2ForCausalLM",
+            "Qwen3ForCausalLM",
+            "MistralForCausalLM",
+            "Gemma2ForCausalLM",
+            "Gemma3ForCausalLM",
+            "Phi3ForCausalLM",
+            "Phi4ForCausalLM",
+            "GraniteForCausalLM",
+            "CohereForCausalLM",
+            "stablelm",
+        ] {
+            assert_eq!(
+                classify_gfx1151(Some(arch), Some(8.0), BIG_VRAM),
+                "confirmed",
+                "{arch} should be confirmed"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_moe_and_hybrid_arches_are_experimental() {
+        for arch in [
+            "Qwen3MoeForCausalLM",
+            "MixtralForCausalLM",
+            "MambaForCausalLM",
+            "JambaForCausalLM",
+            "FalconH1ForCausalLM",
+            "Gemma4ForCausalLM",
+        ] {
+            assert_eq!(
+                classify_gfx1151(Some(arch), Some(8.0), BIG_VRAM),
+                "experimental",
+                "{arch} should be experimental"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_unservable_arches_are_no_including_gpt_oss_cautionary_case() {
+        // gpt-oss: no llama.cpp handler AND not Ollama-servable — the cautionary
+        // case that must NEVER be selected, in every spelling.
+        for arch in ["GptOssForCausalLM", "gpt-oss", "gpt_oss", "GPT_OSS"] {
+            assert_eq!(
+                classify_gfx1151(Some(arch), Some(8.0), BIG_VRAM),
+                "no",
+                "{arch}"
+            );
+        }
+        // glm4 likewise.
+        for arch in ["Glm4ForCausalLM", "glm-4", "glm_4"] {
+            assert_eq!(
+                classify_gfx1151(Some(arch), Some(8.0), BIG_VRAM),
+                "no",
+                "{arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_unservable_wins_over_size_and_bucket() {
+        // gpt-oss is "no" even at a tiny size that fits comfortably.
+        assert_eq!(classify_gfx1151(Some("gpt-oss"), Some(1.0), BIG_VRAM), "no");
+    }
+
+    #[test]
+    fn classify_oversize_dense_model_is_no() {
+        // A dense-known-good arch that does NOT fit the ceiling → "no" (the
+        // fits-but-huge case: ~0.6 GB/B, so a 400B model needs ~240GB > 120GB).
+        assert_eq!(
+            classify_gfx1151(Some("LlamaForCausalLM"), Some(400.0), BIG_VRAM),
+            "no"
+        );
+        // At the boundary it still fits: 120 / 0.6 = 200B exactly fits.
+        assert_eq!(
+            classify_gfx1151(Some("LlamaForCausalLM"), Some(200.0), BIG_VRAM),
+            "confirmed"
+        );
+        assert_eq!(
+            classify_gfx1151(Some("LlamaForCausalLM"), Some(201.0), BIG_VRAM),
+            "no"
+        );
+    }
+
+    #[test]
+    fn classify_unknown_size_skips_the_vram_check() {
+        // No size → can't judge fit; classify by arch only (don't reject).
+        assert_eq!(
+            classify_gfx1151(Some("LlamaForCausalLM"), None, BIG_VRAM),
+            "confirmed"
+        );
+    }
+
+    #[test]
+    fn classify_unmapped_arch_is_unknown_and_absent_arch_is_unknown() {
+        assert_eq!(
+            classify_gfx1151(Some("SomeFutureArchForCausalLM"), Some(8.0), BIG_VRAM),
+            "unknown"
+        );
+        assert_eq!(classify_gfx1151(None, Some(8.0), BIG_VRAM), "unknown");
+        assert_eq!(
+            classify_gfx1151(Some("   "), Some(8.0), BIG_VRAM),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn classify_moe_precedence_over_dense_for_qwen3moe() {
+        // "Qwen3MoeForCausalLM" contains both "qwen3" (dense) and "moe" — MoE wins.
+        assert_eq!(
+            classify_gfx1151(Some("Qwen3MoeForCausalLM"), Some(8.0), BIG_VRAM),
+            "experimental"
+        );
+    }
+
+    // ---- enrich_from_model_info: practical metadata parsing ----
+
+    #[test]
+    fn enrich_parses_dates_license_arch_instruct_gated_quant() {
+        let info = json!({
+            "createdAt": "2026-01-15T00:00:00.000Z",
+            "lastModified": "2026-07-01T12:30:00Z",
+            "cardData": { "license": "Apache-2.0" },
+            "config": { "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3" },
+            "pipeline_tag": "text-generation",
+            "tags": ["chat", "conversational"],
+            "gated": false,
+            "safetensors": { "parameters": { "BF16": 8_000_000_000u64, "F32": 1000u64 } }
+        });
+        let e = enrich_from_model_info(&info, "Qwen/Qwen3-8B-Instruct");
+        assert_eq!(
+            e.published_at.unwrap().to_rfc3339(),
+            "2026-01-15T00:00:00+00:00"
+        );
+        assert_eq!(
+            e.updated_at.unwrap().to_rfc3339(),
+            "2026-07-01T12:30:00+00:00"
+        );
+        assert_eq!(e.license.as_deref(), Some("apache-2.0"));
+        assert_eq!(e.arch.as_deref(), Some("Qwen3ForCausalLM"));
+        assert_eq!(e.is_instruct, Some(true));
+        assert_eq!(e.gated, Some(false));
+        assert_eq!(e.quant_dtype.as_deref(), Some("BF16"));
+    }
+
+    #[test]
+    fn enrich_license_falls_back_to_a_license_tag() {
+        let info = json!({ "tags": ["text-generation", "license:mit"] });
+        assert_eq!(
+            enrich_from_model_info(&info, "org/m").license.as_deref(),
+            Some("mit")
+        );
+    }
+
+    #[test]
+    fn enrich_arch_falls_back_to_model_type_then_library_name() {
+        let by_type = json!({ "config": { "model_type": "llama" } });
+        assert_eq!(
+            enrich_from_model_info(&by_type, "org/m").arch.as_deref(),
+            Some("llama")
+        );
+        let by_lib = json!({ "library_name": "transformers" });
+        assert_eq!(
+            enrich_from_model_info(&by_lib, "org/m").arch.as_deref(),
+            Some("transformers")
+        );
+    }
+
+    #[test]
+    fn enrich_gated_reads_bool_and_string_forms() {
+        assert_eq!(gated_from_info(&json!({ "gated": true })), Some(true));
+        assert_eq!(gated_from_info(&json!({ "gated": false })), Some(false));
+        assert_eq!(gated_from_info(&json!({ "gated": "auto" })), Some(true));
+        assert_eq!(gated_from_info(&json!({ "gated": "manual" })), Some(true));
+        assert_eq!(gated_from_info(&json!({ "gated": "false" })), Some(false));
+        assert_eq!(gated_from_info(&json!({})), None);
+    }
+
+    #[test]
+    fn enrich_is_instruct_from_id_marker_and_base_model_is_false() {
+        // No tags, but the repo id ends in -Instruct.
+        let bare = json!({ "pipeline_tag": "text-generation" });
+        assert_eq!(
+            enrich_from_model_info(&bare, "org/Model-7B-Instruct").is_instruct,
+            Some(true)
+        );
+        // A base/pretrain model: no markers anywhere → Some(false), not None.
+        assert_eq!(
+            enrich_from_model_info(&bare, "org/Model-7B-Base").is_instruct,
+            Some(false)
+        );
+        // The "it" trap: a segment "editor" must NOT count as instruct.
+        assert_eq!(
+            enrich_from_model_info(&bare, "org/code-editor-model").is_instruct,
+            Some(false)
+        );
+        // A standalone "-it" segment DOES count.
+        assert_eq!(
+            enrich_from_model_info(&bare, "google/gemma-2-9b-it").is_instruct,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn enrich_is_fail_soft_on_empty_and_malformed_blobs() {
+        let e = enrich_from_model_info(&json!({}), "org/nameless");
+        assert_eq!(e.published_at, None);
+        assert_eq!(e.updated_at, None);
+        assert_eq!(e.license, None);
+        assert_eq!(e.arch, None);
+        assert_eq!(e.gated, None);
+        assert_eq!(e.quant_dtype, None);
+        // is_instruct is always Some(_) from an enrich pass (we looked).
+        assert_eq!(e.is_instruct, Some(false));
+        // Malformed shapes: no panic.
+        let weird = json!({ "createdAt": 5, "cardData": "nope", "config": 7, "tags": "x", "safetensors": 3 });
+        let e2 = enrich_from_model_info(&weird, "org/x");
+        assert_eq!(e2.published_at, None);
+        assert_eq!(e2.arch, None);
+        assert_eq!(e2.license, None);
+        assert_eq!(e2.quant_dtype, None);
     }
 
     // ---- effective_cap: `max` may only lower, never raise, the ceiling ----

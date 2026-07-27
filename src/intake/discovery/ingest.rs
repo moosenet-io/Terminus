@@ -546,6 +546,13 @@ mod tests {
             evicted_at: None,
             retained_profile: None,
             rationale: None,
+            published_at: None,
+            updated_at: None,
+            license: None,
+            arch: None,
+            is_instruct: None,
+            gated: None,
+            quant_dtype: None,
         }
     }
 
