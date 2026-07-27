@@ -170,9 +170,7 @@ impl CandidateStatus {
     /// what DISC-03's own doc comment enumerates.
     pub fn valid_transitions(&self) -> &'static [CandidateStatus] {
         match self {
-            CandidateStatus::Discovered => {
-                &[CandidateStatus::Fetching, CandidateStatus::Rejected]
-            }
+            CandidateStatus::Discovered => &[CandidateStatus::Fetching, CandidateStatus::Rejected],
             CandidateStatus::Fetching => {
                 &[CandidateStatus::ColdStored, CandidateStatus::Discovered]
             }
@@ -409,10 +407,7 @@ impl Modality {
                     || has("asr")
                 {
                     Some(Modality::Stt)
-                } else if has("text-to-image")
-                    || has("stable-diffusion")
-                    || has("diffusers")
-                {
+                } else if has("text-to-image") || has("stable-diffusion") || has("diffusers") {
                     Some(Modality::ImageGen)
                 } else {
                     None
@@ -471,6 +466,39 @@ pub struct DiscoveryCandidate {
     /// Free text, mirrors `Nomination::rationale` — DISC-08's failure reason,
     /// DISC-05's classification rationale, etc.
     pub rationale: Option<String>,
+
+    // ---- Ask-4 practical-ranking metadata (S127) ----
+    //
+    // Parsed from the ALREADY-FETCHED HF model-info blob by the MEASURE/ENRICH
+    // step (`measure::enrich_from_model_info`) — no extra fetch, public metadata
+    // only. Every field is fail-soft (`None`/`false` when the blob didn't carry
+    // it) and `COALESCE`-protected on upsert so a listing re-observation never
+    // erases an enriched value. These feed the blended practical `fit_score` and
+    // the hard servability/suitability filters in `select.rs`.
+    /// HF `createdAt` — first-published timestamp (recency lower bound). `None`
+    /// when absent/unparseable.
+    pub published_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// HF `lastModified` — last-updated timestamp (the primary recency signal).
+    /// `None` when absent/unparseable.
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// HF `cardData.license` (fallback: a `license:*` entry in `tags`), verbatim
+    /// lowercase. `None` when the card carried none.
+    pub license: Option<String>,
+    /// The model architecture: HF `config.architectures[0]` (fallback
+    /// `config.model_type` / `library_name`), verbatim. Drives
+    /// [`crate::intake::discovery::measure::classify_gfx1151`]. `None` when the
+    /// blob carried no arch signal.
+    pub arch: Option<String>,
+    /// Whether the model looks instruct/chat-tuned (from `pipeline_tag` + `tags`
+    /// + repo-id markers). `None` from a bare listing that wasn't enriched;
+    /// `Some(false)` means "enriched and no instruct marker found".
+    pub is_instruct: Option<bool>,
+    /// HF model-info `gated` flag — a gated repo cannot be auto-ingested, so the
+    /// selector drops it. `None` = unknown (treated as public/lenient).
+    pub gated: Option<bool>,
+    /// Dominant dtype key of `safetensors.parameters` (e.g. `"BF16"`, `"Q4_K_M"`)
+    /// — refines the VRAM estimate. `None` when absent.
+    pub quant_dtype: Option<String>,
 }
 
 /// The migration SQL, applied out-of-band by an operator (matching
@@ -480,9 +508,8 @@ pub struct DiscoveryCandidate {
 /// the expected guards without needing a live Postgres; the canonical copy that
 /// an operator actually applies lives in `migrations/` (see
 /// `S114-disc01-brochure.sql`), kept byte-identical to this constant.
-pub const MODEL_DISCOVERY_CANDIDATE_MIGRATION_SQL: &str = include_str!(
-    "../../../migrations/S114-disc01-brochure.sql"
-);
+pub const MODEL_DISCOVERY_CANDIDATE_MIGRATION_SQL: &str =
+    include_str!("../../../migrations/S114-disc01-brochure.sql");
 
 /// CB-02 (S125, TERM #519) additive migration: adds the nullable `modality`
 /// column (+ its query index) to `model_discovery_candidate`, so each candidate
@@ -492,9 +519,19 @@ pub const MODEL_DISCOVERY_CANDIDATE_MIGRATION_SQL: &str = include_str!(
 /// like the DISC-01 migration above. Kept byte-identical to the canonical copy
 /// in `migrations/`; the const exists so a test can assert its shape without a
 /// live Postgres.
-pub const MODEL_DISCOVERY_MODALITY_MIGRATION_SQL: &str = include_str!(
-    "../../../migrations/S125-cb02-discovery-modality.sql"
-);
+pub const MODEL_DISCOVERY_MODALITY_MIGRATION_SQL: &str =
+    include_str!("../../../migrations/S125-cb02-discovery-modality.sql");
+
+/// Ask-4 practical-ranking (S127) additive migration: adds the nullable
+/// practical/hardware metadata columns (`published_at`, `updated_at`, `license`,
+/// `arch`, `is_instruct`, `gated`, `quant_dtype`) parsed from the HF model-info
+/// blob by the MEASURE/ENRICH step, plus a `license` query index. Additive/
+/// idempotent (`ADD COLUMN IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS`),
+/// applied out-of-band by an operator exactly like the DISC-01/CB-02 migrations.
+/// Kept byte-identical to the canonical copy in `migrations/`; the const exists
+/// so a test can assert its shape without a live Postgres.
+pub const MODEL_DISCOVERY_PRACTICAL_MIGRATION_SQL: &str =
+    include_str!("../../../migrations/S127-ask4-practical-metadata.sql");
 
 #[cfg(test)]
 mod tests {
@@ -562,7 +599,11 @@ mod tests {
     fn modality_round_trips_every_variant() {
         for m in Modality::ALL {
             let s = m.as_str();
-            assert_eq!(Modality::from_str(s).expect("round trip"), m, "round trip for {s}");
+            assert_eq!(
+                Modality::from_str(s).expect("round trip"),
+                m,
+                "round trip for {s}"
+            );
         }
     }
 
@@ -616,15 +657,30 @@ mod tests {
 
     #[test]
     fn classify_pipeline_tag_maps_the_canonical_tasks() {
-        assert_eq!(Modality::classify(Some("feature-extraction"), &[]), Some(Modality::Embedding));
-        assert_eq!(Modality::classify(Some("sentence-similarity"), &[]), Some(Modality::Embedding));
-        assert_eq!(Modality::classify(Some("text-ranking"), &[]), Some(Modality::Rerank));
+        assert_eq!(
+            Modality::classify(Some("feature-extraction"), &[]),
+            Some(Modality::Embedding)
+        );
+        assert_eq!(
+            Modality::classify(Some("sentence-similarity"), &[]),
+            Some(Modality::Embedding)
+        );
+        assert_eq!(
+            Modality::classify(Some("text-ranking"), &[]),
+            Some(Modality::Rerank)
+        );
         assert_eq!(
             Modality::classify(Some("automatic-speech-recognition"), &[]),
             Some(Modality::Stt)
         );
-        assert_eq!(Modality::classify(Some("text-to-speech"), &[]), Some(Modality::Tts));
-        assert_eq!(Modality::classify(Some("text-to-image"), &[]), Some(Modality::ImageGen));
+        assert_eq!(
+            Modality::classify(Some("text-to-speech"), &[]),
+            Some(Modality::Tts)
+        );
+        assert_eq!(
+            Modality::classify(Some("text-to-image"), &[]),
+            Some(Modality::ImageGen)
+        );
         assert_eq!(
             Modality::classify(Some("document-question-answering"), &[]),
             Some(Modality::DocumentParsing)
@@ -634,13 +690,19 @@ mod tests {
     #[test]
     fn classify_splits_the_coarse_visual_role_into_vlm_and_image_gen() {
         // image-analysis / vision-QA VLM ...
-        assert_eq!(Modality::classify(Some("image-text-to-text"), &[]), Some(Modality::Vlm));
+        assert_eq!(
+            Modality::classify(Some("image-text-to-text"), &[]),
+            Some(Modality::Vlm)
+        );
         assert_eq!(
             Modality::classify(Some("visual-question-answering"), &[]),
             Some(Modality::Vlm)
         );
         // ... vs a text-to-image generator — the split CB-02 introduces.
-        assert_eq!(Modality::classify(Some("text-to-image"), &[]), Some(Modality::ImageGen));
+        assert_eq!(
+            Modality::classify(Some("text-to-image"), &[]),
+            Some(Modality::ImageGen)
+        );
     }
 
     #[test]
@@ -649,7 +711,10 @@ mod tests {
             Modality::classify(Some("automatic-speech-recognition"), &[]),
             Some(Modality::Stt)
         );
-        assert_eq!(Modality::classify(Some("text-to-speech"), &[]), Some(Modality::Tts));
+        assert_eq!(
+            Modality::classify(Some("text-to-speech"), &[]),
+            Some(Modality::Tts)
+        );
     }
 
     #[test]
@@ -657,7 +722,10 @@ mod tests {
         // A reranker listed under the coarse `embedding` bucket
         // (pipeline_tag=feature-extraction) is still routed to reranking.
         assert_eq!(
-            Modality::classify(Some("feature-extraction"), &t(&["cross-encoder", "reranker"])),
+            Modality::classify(
+                Some("feature-extraction"),
+                &t(&["cross-encoder", "reranker"])
+            ),
             Some(Modality::Rerank)
         );
         // An OCR/doc model listed under the coarse `visual` bucket goes to
@@ -702,15 +770,21 @@ mod tests {
         assert_eq!(Modality::classify(None, &t(&["socratic"])), None);
         assert_eq!(Modality::classify(None, &t(&["disaster"])), None); // contains "asr"
         assert_eq!(Modality::classify(None, &t(&["mattstseason"])), None); // contains "tts"
-        // Real whole-token tags still classify correctly.
-        assert_eq!(Modality::classify(None, &t(&["ocr"])), Some(Modality::DocumentParsing));
+                                                                           // Real whole-token tags still classify correctly.
+        assert_eq!(
+            Modality::classify(None, &t(&["ocr"])),
+            Some(Modality::DocumentParsing)
+        );
         assert_eq!(
             Modality::classify(None, &t(&["document-question-answering"])),
             Some(Modality::DocumentParsing)
         );
         assert_eq!(Modality::classify(None, &t(&["asr"])), Some(Modality::Stt));
         // A ≥4-char signal still tolerates a morphological suffix (reranker).
-        assert_eq!(Modality::classify(None, &t(&["reranker"])), Some(Modality::Rerank));
+        assert_eq!(
+            Modality::classify(None, &t(&["reranker"])),
+            Some(Modality::Rerank)
+        );
     }
 
     #[test]
@@ -719,6 +793,27 @@ mod tests {
         assert!(sql.contains("ALTER TABLE model_discovery_candidate"));
         assert!(sql.contains("ADD COLUMN IF NOT EXISTS modality"));
         assert!(sql.contains("idx_discovery_candidate_modality"));
+    }
+
+    #[test]
+    fn practical_migration_sql_adds_every_metadata_column_and_license_index() {
+        let sql = MODEL_DISCOVERY_PRACTICAL_MIGRATION_SQL;
+        assert!(sql.contains("ALTER TABLE model_discovery_candidate"));
+        for col in [
+            "published_at",
+            "updated_at",
+            "license",
+            "arch",
+            "is_instruct",
+            "gated",
+            "quant_dtype",
+        ] {
+            assert!(
+                sql.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")),
+                "practical migration must additively add column '{col}'"
+            );
+        }
+        assert!(sql.contains("idx_discovery_candidate_license"));
     }
 
     #[test]

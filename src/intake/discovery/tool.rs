@@ -222,9 +222,7 @@ fn parse_brochure_args(args: &Value) -> Result<(BrochureQuery, String), ToolErro
     let min_discovery_score = match args.get("min_discovery_score") {
         None | Some(Value::Null) => None,
         Some(v) => Some(v.as_f64().ok_or_else(|| {
-            ToolError::InvalidArgument(format!(
-                "'min_discovery_score' must be a number, got {v}"
-            ))
+            ToolError::InvalidArgument(format!("'min_discovery_score' must be a number, got {v}"))
         })?),
     };
 
@@ -383,6 +381,13 @@ mod tests {
             evicted_at: None,
             retained_profile: None,
             rationale: None,
+            published_at: None,
+            updated_at: None,
+            license: None,
+            arch: None,
+            is_instruct: None,
+            gated: None,
+            quant_dtype: None,
         }
     }
 
@@ -452,7 +457,7 @@ mod tests {
         let mut cs = fixture();
         cs[0].modality = Some(Modality::Vlm); // alpha
         cs[1].modality = Some(Modality::Embedding); // beta
-        // gamma keeps modality = None (unclassified) — must never match.
+                                                    // gamma keeps modality = None (unclassified) — must never match.
         let q = BrochureQuery {
             modality: Some(Modality::Vlm),
             ..Default::default()
@@ -535,7 +540,9 @@ mod tests {
     #[test]
     fn evicted_candidate_appears_by_default_unfiltered() {
         let (out, _note) = filter_candidates(&fixture(), &BrochureQuery::default());
-        assert!(out.iter().any(|c| c.model_name == "gamma" && c.status == CandidateStatus::Evicted));
+        assert!(out
+            .iter()
+            .any(|c| c.model_name == "gamma" && c.status == CandidateStatus::Evicted));
     }
 
     #[test]

@@ -84,6 +84,21 @@ use crate::intake::discovery::schema::{CandidateStatus, DiscoveryCandidate};
 /// from the listing and overwrites when it has a value, but a `NULL`
 /// (unclassifiable this pass) is `COALESCE`d so it never erases a modality a
 /// richer earlier listing already classified.
+///
+/// The Ask-4 practical-ranking columns (`published_at`/`updated_at`/`license`/
+/// `arch`/`is_instruct`/`gated`/`quant_dtype`, S127) are all `COALESCE`-
+/// protected identically: a MEASURE/ENRICH pass writes real values, and a later
+/// bare-listing re-observation (which carries them as `NULL`) never erases them.
+///
+/// `gfx1151_class` keeps its CASE (not COALESCE) semantics — see
+/// [`resolve_gfx1151_on_conflict`] for the pure mirror this SQL implements: a
+/// derived non-`'unknown'` value REPLACES a stored one (including replacing a
+/// prior `'unknown'` sentinel, since Ask-4 now DERIVES the class from `arch`),
+/// while an incoming `'unknown'` (a bare re-observation) preserves whatever real
+/// class an earlier enrich step recorded. This is exactly why a plain COALESCE
+/// would be wrong here: the `'unknown'` sentinel is a non-NULL string, so
+/// COALESCE would treat it as a real value and let a re-observation clobber a
+/// derived class — the CASE avoids that.
 pub async fn upsert_candidate(
     pool: &PgPool,
     candidate: &DiscoveryCandidate,
@@ -92,8 +107,10 @@ pub async fn upsert_candidate(
         "INSERT INTO model_discovery_candidate \
              (model_name, hf_repo, category, status, gfx1151_class, size_b, \
               vram_footprint_gb, discovery_source, discovery_score, \
-              discovered_at, last_seen_at, rationale, modality) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), $10, $11) \
+              discovered_at, last_seen_at, rationale, modality, \
+              published_at, updated_at, license, arch, is_instruct, gated, quant_dtype) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), $10, $11, \
+                 $12, $13, $14, $15, $16, $17, $18) \
          ON CONFLICT (model_name) DO UPDATE SET \
              hf_repo = EXCLUDED.hf_repo, \
              category = EXCLUDED.category, \
@@ -107,7 +124,14 @@ pub async fn upsert_candidate(
              size_b = COALESCE(EXCLUDED.size_b, model_discovery_candidate.size_b), \
              vram_footprint_gb = COALESCE(EXCLUDED.vram_footprint_gb, \
                                           model_discovery_candidate.vram_footprint_gb), \
-             modality = COALESCE(EXCLUDED.modality, model_discovery_candidate.modality)",
+             modality = COALESCE(EXCLUDED.modality, model_discovery_candidate.modality), \
+             published_at = COALESCE(EXCLUDED.published_at, model_discovery_candidate.published_at), \
+             updated_at = COALESCE(EXCLUDED.updated_at, model_discovery_candidate.updated_at), \
+             license = COALESCE(EXCLUDED.license, model_discovery_candidate.license), \
+             arch = COALESCE(EXCLUDED.arch, model_discovery_candidate.arch), \
+             is_instruct = COALESCE(EXCLUDED.is_instruct, model_discovery_candidate.is_instruct), \
+             gated = COALESCE(EXCLUDED.gated, model_discovery_candidate.gated), \
+             quant_dtype = COALESCE(EXCLUDED.quant_dtype, model_discovery_candidate.quant_dtype)",
     )
     .bind(&candidate.model_name)
     .bind(&candidate.hf_repo)
@@ -120,6 +144,13 @@ pub async fn upsert_candidate(
     .bind(candidate.discovery_score)
     .bind(candidate.rationale.as_deref())
     .bind(candidate.modality.map(|m| m.as_str()))
+    .bind(candidate.published_at)
+    .bind(candidate.updated_at)
+    .bind(candidate.license.as_deref())
+    .bind(candidate.arch.as_deref())
+    .bind(candidate.is_instruct)
+    .bind(candidate.gated)
+    .bind(candidate.quant_dtype.as_deref())
     .execute(pool)
     .await
     .map_err(|e| {
@@ -129,6 +160,27 @@ pub async fn upsert_candidate(
         ))
     })?;
     Ok(())
+}
+
+/// Pure mirror of the `gfx1151_class` `ON CONFLICT` CASE expression in
+/// [`upsert_candidate`]'s SQL — extracted so the "treat `'unknown'` as
+/// not-yet-classified, let a derived value overwrite it" rule is unit-testable
+/// without a live Postgres. Returns the class string the upsert would persist.
+///
+/// Rule (matches the SQL CASE byte-for-byte in intent):
+/// - `incoming == "unknown"` → keep `stored` (a bare re-observation never
+///   downgrades a real class back to the sentinel);
+/// - otherwise → take `incoming` (a DERIVED class — `"confirmed"`/
+///   `"experimental"`/`"no"`, or even a re-derived `"unknown"` is only kept out
+///   by the first arm — REPLACES the stored value, INCLUDING replacing a stored
+///   `"unknown"`; this is the Ask-4 requirement that a derived value fills an
+///   un-classified row).
+pub fn resolve_gfx1151_on_conflict<'a>(stored: &'a str, incoming: &'a str) -> &'a str {
+    if incoming == "unknown" {
+        stored
+    } else {
+        incoming
+    }
 }
 
 /// The statuses that may legally transition INTO `target`, per
@@ -163,7 +215,9 @@ fn allowed_predecessors(target: CandidateStatus) -> Vec<CandidateStatus> {
 /// permit it (e.g. `Rejected` → `Fetching`, where `Rejected` is terminal) is
 /// NOT caught here — that depends on the row's stored state, so it is only
 /// detectable once `transition_status` reads/writes the row.
-fn predecessors_for_transition(new_status: CandidateStatus) -> Result<Vec<CandidateStatus>, ToolError> {
+fn predecessors_for_transition(
+    new_status: CandidateStatus,
+) -> Result<Vec<CandidateStatus>, ToolError> {
     if new_status == CandidateStatus::Evicted {
         return Err(ToolError::InvalidArgument(
             "transition_status cannot target 'evicted' directly — call record_eviction instead, \
@@ -234,22 +288,19 @@ pub async fn transition_status(
         .bind(&predecessor_strs)
         .execute(pool)
         .await
-        .map_err(|e| {
-            ToolError::Database(format!("transition_status for '{model_name}': {e}"))
-        })?;
+        .map_err(|e| ToolError::Database(format!("transition_status for '{model_name}': {e}")))?;
 
     if result.rows_affected() == 0 {
         // Diagnostic-only: the guarded UPDATE above has already atomically
         // succeeded or failed. This SELECT just distinguishes "no such row"
         // from "row exists but its current status doesn't permit this
         // transition" for a useful error message.
-        let existing: Option<(String,)> = sqlx::query_as(
-            "SELECT status FROM model_discovery_candidate WHERE model_name = $1",
-        )
-        .bind(model_name)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| ToolError::Database(format!("lookup for '{model_name}': {e}")))?;
+        let existing: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM model_discovery_candidate WHERE model_name = $1")
+                .bind(model_name)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| ToolError::Database(format!("lookup for '{model_name}': {e}")))?;
 
         return match existing {
             None => Err(ToolError::NotFound(format!(
@@ -317,6 +368,50 @@ mod tests {
     // SQL — which transitions are legal — lives in
     // `predecessors_for_transition`/`allowed_predecessors`, which are pure
     // and fully covered here.
+
+    // ---- gfx1151_class ON CONFLICT resolution (the 'unknown'-overwrite rule) ----
+
+    #[test]
+    fn derived_gfx_class_overwrites_a_stored_unknown() {
+        // The Ask-4 case: MEASURE derives a real class for a row that was
+        // inserted with the 'unknown' sentinel — the derived value must win.
+        assert_eq!(
+            resolve_gfx1151_on_conflict("unknown", "confirmed"),
+            "confirmed"
+        );
+        assert_eq!(
+            resolve_gfx1151_on_conflict("unknown", "experimental"),
+            "experimental"
+        );
+        // A derived UNSERVABLE verdict ("no") also replaces the sentinel.
+        assert_eq!(resolve_gfx1151_on_conflict("unknown", "no"), "no");
+    }
+
+    #[test]
+    fn bare_reobservation_never_downgrades_a_real_class_to_unknown() {
+        // A discovery re-observation always carries 'unknown' (a listing exposes
+        // no arch) — it must PRESERVE whatever real class an enrich step recorded.
+        assert_eq!(
+            resolve_gfx1151_on_conflict("confirmed", "unknown"),
+            "confirmed"
+        );
+        assert_eq!(
+            resolve_gfx1151_on_conflict("experimental", "unknown"),
+            "experimental"
+        );
+        assert_eq!(resolve_gfx1151_on_conflict("no", "unknown"), "no");
+    }
+
+    #[test]
+    fn a_re_derived_real_class_replaces_an_earlier_one() {
+        // Two enrich passes both derive a real (non-unknown) class — the newer
+        // derivation wins (e.g. an arch remap between passes).
+        assert_eq!(
+            resolve_gfx1151_on_conflict("experimental", "confirmed"),
+            "confirmed"
+        );
+        assert_eq!(resolve_gfx1151_on_conflict("unknown", "unknown"), "unknown");
+    }
 
     #[test]
     fn evicted_target_is_rejected_use_record_eviction_instead() {

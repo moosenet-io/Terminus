@@ -939,7 +939,7 @@ pub async fn run_mode(selection: SweepSelection) -> Result<RunReport, ToolError>
                 Ok(candidates) => {
                     let total = candidates.len();
                     let sel_cfg = select::DiscoverySelectConfig::from_env();
-                    let selected = select::select_discovery_candidates(candidates, &sel_cfg);
+                    let selected = select::select_discovery_candidates(candidates, &sel_cfg, chrono::Utc::now());
                     let config = ingest::ShadowConfig {
                         cap: sel_cfg.top_n,
                         min_size_b: sel_cfg.min_size_b,
@@ -993,7 +993,7 @@ pub async fn run_mode(selection: SweepSelection) -> Result<RunReport, ToolError>
                     Ok(candidates) => {
                         let total = candidates.len();
                         let cfg = select::DiscoverySelectConfig::from_env();
-                        let selected = select::select_discovery_candidates(candidates, &cfg);
+                        let selected = select::select_discovery_candidates(candidates, &cfg, chrono::Utc::now());
                         let synthesized = select::nominations_from_selected(&selected);
                         let before = nominations.nominations.len();
                         nominations.nominations = select::merge_discovery_nominations(
@@ -1045,7 +1045,7 @@ pub async fn run_mode(selection: SweepSelection) -> Result<RunReport, ToolError>
                     Ok(candidates) => {
                         let total = candidates.len();
                         let sel_cfg = select::DiscoverySelectConfig::from_env();
-                        let selected = select::select_discovery_candidates(candidates, &sel_cfg);
+                        let selected = select::select_discovery_candidates(candidates, &sel_cfg, chrono::Utc::now());
                         let ingest_cfg = ingest::DiscoveryIngestConfig::from_env();
                         let ingestor = ingest::ChordIngestor;
                         let advancer = ingest::DbStatusAdvancer { pool: &pool };

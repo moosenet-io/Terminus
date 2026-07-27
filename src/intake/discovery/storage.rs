@@ -43,7 +43,8 @@ fn is_missing_relation_error(msg: &str) -> bool {
 /// [`DiscoveryCandidate`] field order.
 const READ_BROCHURE_SQL: &str = "SELECT model_name, hf_repo, category, status, gfx1151_class, \
      size_b, vram_footprint_gb, discovery_source, discovery_score, discovered_at, last_seen_at, \
-     fetched_at, marked_for_fleet_at, evicted_at, retained_profile, rationale, modality \
+     fetched_at, marked_for_fleet_at, evicted_at, retained_profile, rationale, modality, \
+     published_at, updated_at, license, arch, is_instruct, gated, quant_dtype \
      FROM model_discovery_candidate ORDER BY model_name";
 
 /// Row shape the brochure SELECT decodes into, before `category`/`status` are
@@ -75,6 +76,14 @@ struct BrochureRow {
     rationale: Option<String>,
     /// CB-02; NULL = unclassified.
     modality: Option<String>,
+    // Ask-4 practical-ranking metadata (S127); NULL = not yet enriched.
+    published_at: Option<chrono::DateTime<chrono::Utc>>,
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    license: Option<String>,
+    arch: Option<String>,
+    is_instruct: Option<bool>,
+    gated: Option<bool>,
+    quant_dtype: Option<String>,
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for BrochureRow {
@@ -98,6 +107,13 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for BrochureRow {
             retained_profile: row.try_get("retained_profile")?,
             rationale: row.try_get("rationale")?,
             modality: row.try_get("modality")?,
+            published_at: row.try_get("published_at")?,
+            updated_at: row.try_get("updated_at")?,
+            license: row.try_get("license")?,
+            arch: row.try_get("arch")?,
+            is_instruct: row.try_get("is_instruct")?,
+            gated: row.try_get("gated")?,
+            quant_dtype: row.try_get("quant_dtype")?,
         })
     }
 }
@@ -154,6 +170,13 @@ pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, Too
             retained_profile,
             rationale,
             modality,
+            published_at,
+            updated_at,
+            license,
+            arch,
+            is_instruct,
+            gated,
+            quant_dtype,
         } = row;
         let category = FleetCategory::from_str(&category).map_err(|e| {
             ToolError::Database(format!(
@@ -199,6 +222,13 @@ pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, Too
             retained_profile,
             rationale,
             modality,
+            published_at,
+            updated_at,
+            license,
+            arch,
+            is_instruct,
+            gated,
+            quant_dtype,
         });
     }
     Ok(out)
