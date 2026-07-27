@@ -246,6 +246,29 @@ fn json_as_u64(v: &Value) -> Option<u64> {
         .or_else(|| v.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
 }
 
+/// Resolve the effective per-run cap from the optional `max` MCP arg and the
+/// configured `ceiling` (`INTAKE_DISCOVERY_MEASURE_MAX`). PURE — no IO.
+///
+/// A caller-supplied `max` may only LOWER the cap: it is clamped to `ceiling`
+/// (`min(requested, ceiling)`), never allowed above it, so the advertised
+/// outbound-HF bound always holds. An absent `max` uses `ceiling` directly. A
+/// present-but-not-a-positive-integer `max` is a clean [`ToolError::InvalidArgument`].
+fn effective_cap(max_arg: Option<&Value>, ceiling: usize) -> Result<usize, ToolError> {
+    match max_arg {
+        None => Ok(ceiling),
+        Some(v) => {
+            let requested = v
+                .as_u64()
+                .filter(|n| *n > 0)
+                .map(|n| n as usize)
+                .ok_or_else(|| {
+                    ToolError::InvalidArgument("'max' must be a positive integer".into())
+                })?;
+            Ok(requested.min(ceiling))
+        }
+    }
+}
+
 /// PURE selection: the candidates that still need measuring (`size_b` is `None`),
 /// capped at `cap`. Preserves input order (`read_brochure` returns rows ordered by
 /// `model_name`, so a capped run is deterministic and, across runs, walks the
@@ -372,18 +395,14 @@ impl ModelDiscoveryMeasure {
             .get("dry_run")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // `max` arg overrides the env cap for this run; both are bounded so a
-        // single pass can't unbounded-blast HF's model-info API.
-        let cap = match args.get("max") {
-            Some(v) => v
-                .as_u64()
-                .filter(|n| *n > 0)
-                .map(|n| n as usize)
-                .ok_or_else(|| {
-                    ToolError::InvalidArgument("'max' must be a positive integer".into())
-                })?,
-            None => config::intake_discovery_measure_max(),
-        };
+        // `max` arg may lower the per-run cap for this pass, but NEVER raise it
+        // above the configured `INTAKE_DISCOVERY_MEASURE_MAX` ceiling: that env
+        // value is the advertised hard bound on outbound HF model-info calls per
+        // run, so a caller-supplied `max` is clamped down to it (a larger `max`
+        // is silently capped, not honored). This keeps the bound the tool
+        // description + config.rs comment promise actually true.
+        let ceiling = config::intake_discovery_measure_max();
+        let cap = effective_cap(args.get("max"), ceiling)?;
 
         let pool = intake_storage::get_pool().await?;
         let all = read_brochure(&pool).await?;
@@ -426,8 +445,9 @@ impl RustTool for ModelDiscoveryMeasure {
          never touches lifecycle status). This unblocks the selector's >=7B size gate, \
          which drops every size-NULL candidate. Idempotent + fail-soft: already-measured \
          rows are skipped; a repo with no safetensors metadata (or a 404) is left NULL \
-         and retried next run. Args (all optional): 'max' (positive int; override the \
-         per-run cap), 'dry_run' (bool; select+fetch+derive but write nothing). Returns \
+         and retried next run. Args (all optional): 'max' (positive int; LOWER the \
+         per-run cap for this pass — clamped to INTAKE_DISCOVERY_MEASURE_MAX, never \
+         above it), 'dry_run' (bool; select+fetch+derive but write nothing). Returns \
          per-pass counts (unmeasured_total, attempted, measured, unresolved, \
          remaining_after) + any per-candidate errors."
     }
@@ -439,7 +459,7 @@ impl RustTool for ModelDiscoveryMeasure {
                 "max": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Override the per-run measure cap (default INTAKE_DISCOVERY_MEASURE_MAX=50). Bounds outbound HF model-info calls."
+                    "description": "Lower the per-run measure cap for this pass. Clamped to INTAKE_DISCOVERY_MEASURE_MAX (default 50) — a larger value is capped down, never raised above it, so the outbound HF model-info bound always holds."
                 },
                 "dry_run": {
                     "type": "boolean",
@@ -628,6 +648,27 @@ mod tests {
         let info = json!({ "siblings": [ { "rfilename": "model.safetensors" } ] });
         assert_eq!(weight_file_bytes(&info), None);
         assert_eq!(measure_from_model_info(&info, "org/unsized").size_b, None);
+    }
+
+    // ---- effective_cap: `max` may only lower, never raise, the ceiling ----
+
+    #[test]
+    fn effective_cap_clamps_max_down_to_ceiling_never_up() {
+        // Absent `max` → the ceiling itself.
+        assert_eq!(effective_cap(None, 50).unwrap(), 50);
+        // A smaller `max` lowers the cap.
+        assert_eq!(effective_cap(Some(&json!(10)), 50).unwrap(), 10);
+        // A larger `max` is clamped DOWN to the ceiling (the bug this fixes).
+        assert_eq!(effective_cap(Some(&json!(9999)), 50).unwrap(), 50);
+        // Equal is fine.
+        assert_eq!(effective_cap(Some(&json!(50)), 50).unwrap(), 50);
+    }
+
+    #[test]
+    fn effective_cap_rejects_non_positive_or_non_integer_max() {
+        assert!(effective_cap(Some(&json!(0)), 50).is_err());
+        assert!(effective_cap(Some(&json!(-3)), 50).is_err());
+        assert!(effective_cap(Some(&json!("lots")), 50).is_err());
     }
 
     // ---- select_unmeasured: only size-NULL rows, cap respected ----
