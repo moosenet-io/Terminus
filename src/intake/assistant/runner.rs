@@ -906,6 +906,67 @@ pub async fn run_mode(selection: SweepSelection) -> Result<RunReport, ToolError>
     let mut nominations = Nominations::load().map_err(ToolError::NotConfigured)?;
     let mem_config = mem_config_from_env();
 
+    // Ask-4 Phase 1 (INTEGRATION OPTION i — chosen because it is the LOWER-surface
+    // integration: it only AUGMENTS the nomination vector the sweep already reads,
+    // needing no new SweepSelection mode, no precedence rules against
+    // gap_only/only_stale, and no new run branch. Option ii — a `discovery_gap`
+    // SweepSelection mode — would add all of that surface for the same effect).
+    //
+    // When `INTAKE_ASSISTANT_DISCOVERY_SELECT` is on, read the brochure, rank it
+    // into a small capped shortlist of assistant-relevant candidates, synthesize
+    // runtime nominations, and merge them into the curated set (curated wins any
+    // id collision). This runs BEFORE the gap_only/only_stale narrowing so the
+    // discovered models flow into the DEFAULT (full) overnight sweep — the sweep
+    // that then feeds Chord's dynamic proxy auto-promotion. When the flag is OFF
+    // (the default) this block is a no-op and `nominations` is byte-for-byte the
+    // curated `nominations.json`, so every existing mode is unchanged.
+    //
+    // Phase-1 boundary: NO internet pull here. A selected candidate not already in
+    // Chord cold storage fails soft downstream (the existing acquire path records
+    // it Skipped/NonViable). HF→cold-storage ingestion is Phase 2. See
+    // `discovery::select`.
+    if crate::intake::discovery_select_from_env() {
+        use crate::intake::discovery::{select, storage as discovery_storage};
+        match discovery_storage::read_brochure(&pool).await {
+            Ok(candidates) => {
+                let total = candidates.len();
+                let cfg = select::DiscoverySelectConfig::from_env();
+                let selected = select::select_discovery_candidates(candidates, &cfg);
+                let synthesized = select::nominations_from_selected(&selected);
+                let before = nominations.nominations.len();
+                nominations.nominations = select::merge_discovery_nominations(
+                    std::mem::take(&mut nominations.nominations),
+                    synthesized,
+                );
+                let added = nominations.nominations.len() - before;
+                tracing::info!(
+                    "assistant sweep discovery-select: {} brochure candidate(s) scanned, {} selected \
+                     (cap {}, min_size_b {}), {} merged into the nomination set ({} already curated) — \
+                     selected = {:?}",
+                    total,
+                    selected.len(),
+                    cfg.top_n,
+                    cfg.min_size_b,
+                    added,
+                    selected.len().saturating_sub(added),
+                    selected.iter().map(|c| c.model_name.as_str()).collect::<Vec<_>>(),
+                );
+            }
+            Err(ToolError::NotConfigured(msg)) => {
+                tracing::info!(
+                    "assistant sweep discovery-select: brochure not configured on this host \
+                     ({msg}) — continuing with the curated nominations only"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "assistant sweep discovery-select: could not read the brochure ({e}) — \
+                     continuing with the curated nominations only (fail-soft)"
+                );
+            }
+        }
+    }
+
     // Gap-only takes precedence over --only-stale (both narrow the same vector).
     if selection.gap_only {
         let gap_ids = schema::gap_only_model_ids(&pool).await?;

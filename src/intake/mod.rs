@@ -291,6 +291,24 @@ pub fn gap_max_from_env() -> usize {
     parse_gap_max(std::env::var("INTAKE_ASSISTANT_GAP_MAX").ok().as_deref())
 }
 
+/// Whether the assistant sweep should ALSO fold high-signal brochure-discovered
+/// models into its nomination set (Ask-4 Phase 1 — `INTAKE_ASSISTANT_DISCOVERY_SELECT`,
+/// default `false`). When on, `run_mode` reads the brochure, ranks it via
+/// `discovery::select::select_discovery_candidates`, and merges the synthesized
+/// nominations into the curated set (see `discovery::select`). When off (the
+/// default) the nomination set is byte-for-byte the curated `nominations.json`,
+/// so every existing sweep mode (full / gap-only / only-stale) is unchanged.
+/// Reuses [`parse_only_stale`]'s truthiness grammar. Pure over its input.
+pub fn parse_discovery_select(raw: Option<&str>) -> bool {
+    parse_only_stale(raw)
+}
+
+/// Whether brochure discovery-select is enabled
+/// (`INTAKE_ASSISTANT_DISCOVERY_SELECT`, default `false`).
+pub fn discovery_select_from_env() -> bool {
+    parse_discovery_select(std::env::var("INTAKE_ASSISTANT_DISCOVERY_SELECT").ok().as_deref())
+}
+
 // ---------------------------------------------------------------------------
 // Unified MINT harness (MINT2-04)
 // ---------------------------------------------------------------------------
