@@ -40,7 +40,7 @@
 
 use std::collections::BTreeSet;
 
-use super::schema::{DiscoveryCandidate, FleetCategory, Modality};
+use super::schema::{CandidateStatus, DiscoveryCandidate, FleetCategory, Modality};
 use crate::intake::assistant::acquire::{AcquisitionPath, Gfx1151Class, Nomination};
 
 /// Default per-run cap on brochure-selected candidates. Deliberately small — a
@@ -178,6 +178,9 @@ pub fn parse_discovery_min_size_b(raw: Option<&str>) -> f64 {
 /// `assistant::runner::select_gap_models`'s data-in/data-out contract.
 ///
 /// Filtering (a candidate must pass ALL to be considered):
+///   0. `status` is nominatable ([`is_nominatable_status`]) — a fail-closed gate
+///      that drops terminal/ineligible rows (`Rejected`/`Evicted`/`Swept`),
+///      since [`super::storage::read_brochure`] returns ALL statuses;
 ///   1. `category` ∈ `cfg.allowed_categories`;
 ///   2. `modality` ∈ `cfg.allowed_modalities`, OR (`modality` is `None` AND
 ///      `cfg.allow_unclassified_modality`);
@@ -196,6 +199,9 @@ pub fn select_discovery_candidates(
 
     let mut kept: Vec<DiscoveryCandidate> = candidates
         .into_iter()
+        // Fail-closed status gate FIRST: read_brochure returns all statuses, so a
+        // terminal/ineligible one (Rejected/Evicted/Swept) must never be nominated.
+        .filter(|c| is_nominatable_status(c.status))
         .filter(|c| cfg.allowed_categories.contains(&c.category))
         .filter(|c| match c.modality {
             Some(m) => cfg.allowed_modalities.contains(&m),
@@ -219,6 +225,40 @@ pub fn select_discovery_candidates(
 
     kept.truncate(cfg.top_n);
     kept
+}
+
+/// Whether a brochure candidate in this lifecycle status may be NOMINATED into
+/// the assistant sweep. FAIL-CLOSED by construction: an explicit, EXHAUSTIVE
+/// match with NO wildcard arm, so a future [`CandidateStatus`] variant forces a
+/// compile error here (a deliberate "decide, don't leak") rather than silently
+/// flowing into the sweep.
+///
+/// This gate is necessary because [`super::storage::read_brochure`] returns rows
+/// of ALL statuses (its SQL has no status predicate), so without it a terminal /
+/// ineligible candidate could be re-nominated:
+///
+/// Allowed (pre-fleet, acquirable, or already in the pipeline):
+/// - [`Discovered`](CandidateStatus::Discovered) — newly found; the core case;
+/// - [`Fetching`](CandidateStatus::Fetching) — a fetch is already in flight;
+/// - [`ColdStored`](CandidateStatus::ColdStored) — in the cold archive, so it is
+///   actually acquirable NOW (the ideal nominate state);
+/// - [`MarkedForFleet`](CandidateStatus::MarkedForFleet) — already queued for a sweep.
+///
+/// Dropped:
+/// - [`Swept`](CandidateStatus::Swept) — already has a fleet cell; re-nominating
+///   is redundant (the point is NEW models);
+/// - [`Evicted`](CandidateStatus::Evicted) — archive copy pruned; not acquirable
+///   and re-introduces churn;
+/// - [`Rejected`](CandidateStatus::Rejected) — already failed the VRAM/gfx fit
+///   check; a KNOWN-BAD model must never be swept-for-assistant.
+fn is_nominatable_status(status: CandidateStatus) -> bool {
+    match status {
+        CandidateStatus::Discovered
+        | CandidateStatus::Fetching
+        | CandidateStatus::ColdStored
+        | CandidateStatus::MarkedForFleet => true,
+        CandidateStatus::Swept | CandidateStatus::Evicted | CandidateStatus::Rejected => false,
+    }
 }
 
 /// Sort key for `discovery_score`: a real finite score maps to itself; `None`
@@ -483,6 +523,66 @@ mod tests {
         ];
         let out = select_discovery_candidates(cands, &DiscoverySelectConfig::default());
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn ineligible_statuses_are_dropped_and_eligible_kept() {
+        // read_brochure returns ALL statuses; the fail-closed status gate must
+        // drop known-bad / terminal ones and keep pre-fleet eligible ones, even
+        // when every OTHER field (category/modality/size/gfx/score) passes.
+        let with_status = |name: &str, status: CandidateStatus| {
+            let mut c = asst(name, 8.0, 99.0);
+            c.status = status;
+            c
+        };
+        let cands = vec![
+            with_status("rejected", CandidateStatus::Rejected),
+            with_status("evicted", CandidateStatus::Evicted),
+            with_status("swept", CandidateStatus::Swept),
+            with_status("discovered", CandidateStatus::Discovered),
+            with_status("cold_stored", CandidateStatus::ColdStored),
+            with_status("fetching", CandidateStatus::Fetching),
+            with_status("marked", CandidateStatus::MarkedForFleet),
+        ];
+        let mut cfg = DiscoverySelectConfig::default();
+        cfg.top_n = 100;
+        let out = select_discovery_candidates(cands, &cfg);
+        let mut ids: Vec<&str> = out.iter().map(|c| c.model_name.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["cold_stored", "discovered", "fetching", "marked"],
+            "Rejected/Evicted/Swept dropped; pre-fleet eligible states kept"
+        );
+    }
+
+    #[test]
+    fn rejected_and_evicted_never_selected_even_with_top_score() {
+        // A known-bad Rejected candidate with the HIGHEST score must not win a slot.
+        let mut rejected = asst("known_bad", 70.0, 100.0);
+        rejected.status = CandidateStatus::Rejected;
+        let mut evicted = asst("pruned", 70.0, 100.0);
+        evicted.status = CandidateStatus::Evicted;
+        let good = asst("fresh", 8.0, 1.0);
+        let out = select_discovery_candidates(
+            vec![rejected, evicted, good],
+            &DiscoverySelectConfig::default(),
+        );
+        let ids: Vec<&str> = out.iter().map(|c| c.model_name.as_str()).collect();
+        assert_eq!(ids, vec!["fresh"]);
+    }
+
+    #[test]
+    fn is_nominatable_status_is_fail_closed_allow_list() {
+        // Locks the eligibility decision (the exhaustive match is the fail-closed
+        // guard; this pins the intended allow/deny split).
+        assert!(is_nominatable_status(CandidateStatus::Discovered));
+        assert!(is_nominatable_status(CandidateStatus::Fetching));
+        assert!(is_nominatable_status(CandidateStatus::ColdStored));
+        assert!(is_nominatable_status(CandidateStatus::MarkedForFleet));
+        assert!(!is_nominatable_status(CandidateStatus::Swept));
+        assert!(!is_nominatable_status(CandidateStatus::Evicted));
+        assert!(!is_nominatable_status(CandidateStatus::Rejected));
     }
 
     #[test]
