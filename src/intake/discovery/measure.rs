@@ -990,8 +990,9 @@ mod tests {
 
     // ---- classify_gfx1151: arch → runnability, VRAM fit, precedence ----
 
-    // A generous ceiling so the VRAM check never interferes unless a test wants it.
-    const BIG_VRAM: f64 = 96.0;
+    // A generous ceiling (this host's ~120GB GTT serving envelope) so the VRAM
+    // check never interferes unless a test wants it.
+    const BIG_VRAM: f64 = 120.0;
 
     #[test]
     fn classify_dense_known_good_arches_are_confirmed() {
@@ -1064,18 +1065,18 @@ mod tests {
     #[test]
     fn classify_oversize_dense_model_is_no() {
         // A dense-known-good arch that does NOT fit the ceiling → "no" (the
-        // fits-but-huge case: ~0.6 GB/B, so a 400B model needs ~240GB > 96GB).
+        // fits-but-huge case: ~0.6 GB/B, so a 400B model needs ~240GB > 120GB).
         assert_eq!(
             classify_gfx1151(Some("LlamaForCausalLM"), Some(400.0), BIG_VRAM),
             "no"
         );
-        // At the boundary it still fits: 96 / 0.6 = 160B exactly fits.
+        // At the boundary it still fits: 120 / 0.6 = 200B exactly fits.
         assert_eq!(
-            classify_gfx1151(Some("LlamaForCausalLM"), Some(160.0), BIG_VRAM),
+            classify_gfx1151(Some("LlamaForCausalLM"), Some(200.0), BIG_VRAM),
             "confirmed"
         );
         assert_eq!(
-            classify_gfx1151(Some("LlamaForCausalLM"), Some(161.0), BIG_VRAM),
+            classify_gfx1151(Some("LlamaForCausalLM"), Some(201.0), BIG_VRAM),
             "no"
         );
     }

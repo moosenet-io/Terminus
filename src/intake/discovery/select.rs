@@ -53,12 +53,18 @@ pub const DEFAULT_DISCOVERY_MAX: usize = 5;
 /// Env: `INTAKE_ASSISTANT_DISCOVERY_MIN_SIZE_B`.
 pub const DEFAULT_DISCOVERY_MIN_SIZE_B: f64 = 7.0;
 
-/// Default MAX parameter size (billions). A candidate above this is DROPPED: a
-/// fits-but-huge model monopolizes the shared GPU pool, and (given the ~31GB
-/// system-RAM ingestion ceiling) a >~20B model is already risky to ingest via
-/// `ollama-create` — so the practical ceiling is deliberately conservative.
-/// Env: `INTAKE_ASSISTANT_DISCOVERY_MAX_SIZE_B`.
-pub const DEFAULT_DISCOVERY_MAX_SIZE_B: f64 = 70.0;
+/// Default MAX parameter size (billions). A candidate above this is DROPPED.
+/// Set to ~100B: serving-feasible under this host's ~120GB GTT VRAM envelope
+/// (~100B @ Q4 ≈ 60GB), while still bounded — a fits-but-huge model monopolizes
+/// the shared idle-reaped GPU pool. Env: `INTAKE_ASSISTANT_DISCOVERY_MAX_SIZE_B`.
+///
+/// NB (serving vs. ingestion): GTT raises the SERVING ceiling to ~120GB, but the
+/// INGESTION path (`ollama-create` converting safetensors → GGUF) is still bound
+/// by ~31GB SYSTEM RAM and OOMs on ~20B+ non-GGUF repos (GTT does not help the
+/// CPU-side conversion). So this size ceiling is the SERVING bound; the hard
+/// ingestion backstop is the Phase-2a ingest step's own byte guard
+/// (`CHORD_MODEL_INGEST_MAX_BYTES`), which favors GGUF or ≤~20B safetensors.
+pub const DEFAULT_DISCOVERY_MAX_SIZE_B: f64 = 100.0;
 
 /// Default recency half-life (days) for the `recency` fit component:
 /// `recency = exp(-age_days / HALFLIFE)`. Env:
@@ -71,12 +77,24 @@ const NEUTRAL_RECENCY_NO_DATE: f64 = 0.3;
 
 /// Size sweet-spot bounds (billions of params). `fit` plateaus at 1.0 across
 /// `[LO, HI]`, tapers down toward `FLOOR` below `LO`, and down toward `CEIL`
-/// above `HI` (a fits-but-huge model scores lower — it monopolizes the shared
-/// GPU pool; leans to favor ≤~34B given the ingestion RAM ceiling).
+/// above `HI` (a fits-but-huge model scores lower).
+///
+/// The taper endpoints are a deliberate COMPROMISE between two ceilings:
+/// - SERVING: this host's ~120GB GTT VRAM envelope makes ~100B @ Q4 (≈60GB)
+///   servable, so `CEIL` extends to ~100B (a model can still be selected there);
+/// - INGESTION: the safetensors → GGUF conversion path is bound by ~31GB SYSTEM
+///   RAM (GTT does NOT help CPU-side conversion) and OOMs on ~20B+ non-GGUF
+///   repos — so very large non-GGUF models are impractical to actually pull.
+///
+/// Net: the plateau stays at the assistant sweet spot (~8–34B) and the top-end
+/// taper is meaningful (a 100B model scores 0.2, a 70B ≈0.56 vs. 1.0 at ≤34B),
+/// so the ranking still clearly PREFERS ≤~34B while allowing a strong larger
+/// model through. The hard ingestion backstop remains the Phase-2a ingest byte
+/// guard (`CHORD_MODEL_INGEST_MAX_BYTES`), not this soft score.
 const SWEETSPOT_FLOOR_B: f64 = 7.0;
 const SWEETSPOT_LO_B: f64 = 8.0;
 const SWEETSPOT_HI_B: f64 = 34.0;
-const SWEETSPOT_CEIL_B: f64 = 70.0;
+const SWEETSPOT_CEIL_B: f64 = 100.0;
 
 /// The blended `fit_score` component weights — each env-configurable and
 /// sanitized (NaN/negative/non-finite → the per-weight default). Popularity is a
@@ -237,8 +255,9 @@ impl Default for DiscoverySelectConfig {
 /// Fallback VRAM ceiling used by [`DiscoverySelectConfig::default`] when the
 /// config is built WITHOUT env (tests). [`DiscoverySelectConfig::from_env`]
 /// overlays the real `acquire::vram_ceiling_gb()`. Matches acquire's own
-/// documented default so a defaulted config never rejects a normally-sized model.
-const DEFAULT_VRAM_CEILING_GB_FALLBACK: f64 = 96.0;
+/// documented default (~120GB, this host's GTT serving envelope) so a defaulted
+/// config never rejects a normally-sized model.
+const DEFAULT_VRAM_CEILING_GB_FALLBACK: f64 = 120.0;
 
 impl DiscoverySelectConfig {
     /// Overlay the env-tunable knobs on the conservative [`Default`]. Only the
@@ -1387,12 +1406,16 @@ mod tests {
 
     #[test]
     fn size_sweetspot_tapers_below_lo_and_above_hi() {
-        // At the 7B floor → 0.7; a fits-but-huge 70B → 0.2 (much lower).
+        // At the 7B floor → 0.7; a fits-but-huge 100B (the CEIL) → 0.2 (much lower).
         assert!((size_sweetspot(7.0) - 0.7).abs() < 1e-9);
-        assert!((size_sweetspot(70.0) - 0.2).abs() < 1e-9);
+        assert!((size_sweetspot(100.0) - 0.2).abs() < 1e-9);
+        // A 70B model tapers to ~0.56 — still well below the ≤34B plateau (1.0),
+        // so the ranking keeps preferring the assistant sweet spot.
+        assert!(size_sweetspot(70.0) > 0.5 && size_sweetspot(70.0) < 0.6);
         // Monotonic: bigger past the plateau scores strictly lower.
         assert!(size_sweetspot(40.0) < size_sweetspot(34.0));
         assert!(size_sweetspot(70.0) < size_sweetspot(40.0));
+        assert!(size_sweetspot(100.0) < size_sweetspot(70.0));
         // A midpoint below LO ramps between 0.7 and 1.0.
         assert!(size_sweetspot(7.5) > 0.7 && size_sweetspot(7.5) < 1.0);
         // Non-finite / non-positive → 0.0.
@@ -1499,7 +1522,7 @@ mod tests {
 
     #[test]
     fn a_hugely_popular_but_oversized_model_is_dropped_entirely() {
-        // 200B model: way over the 70B ceiling → filtered before ranking, even
+        // 200B model: way over the 100B ceiling → filtered before ranking, even
         // at max popularity.
         let popular_huge = practical("popular_huge", 200.0, 100.0, "confirmed", Some(true), 0);
         let modest = practical("modest_fit", 8.0, 5.0, "confirmed", Some(true), 30);
@@ -1547,9 +1570,9 @@ mod tests {
 
     #[test]
     fn hard_filter_size_ceiling_drops_over_max() {
-        // 40B is within default 70B ceiling; 80B is over.
+        // 40B is within the default 100B ceiling; 120B is over.
         let ok = practical("within", 40.0, 50.0, "confirmed", Some(true), 5);
-        let over = practical("over", 80.0, 50.0, "confirmed", Some(true), 5);
+        let over = practical("over", 120.0, 50.0, "confirmed", Some(true), 5);
         let out = select_discovery_candidates(
             vec![ok, over],
             &DiscoverySelectConfig::default(),
@@ -1563,7 +1586,7 @@ mod tests {
     fn hard_filter_vram_footprint_over_ceiling_is_dropped() {
         // 30B is under the size ceiling but its measured footprint is huge.
         let mut c = practical("footprint_hog", 30.0, 50.0, "confirmed", Some(true), 5);
-        c.vram_footprint_gb = Some(200.0); // > the 96GB fallback ceiling
+        c.vram_footprint_gb = Some(200.0); // > the 120GB fallback ceiling
         let out =
             select_discovery_candidates(vec![c], &DiscoverySelectConfig::default(), test_now());
         assert!(
