@@ -486,6 +486,38 @@ const MOCK_CHORD_HEALTH = {
 
 const MOCK_PROFILES = { profiles: {}, total_outcomes: 0, window_days: 30 };
 
+// ── MINT trade-off types (CONST-24; §7.2 C9) ────────────────────────────────
+// Only the trade-off parallel-coordinates shapes survive from the independently-built
+// CONST-23/24 MINT branch's type block — every other CONST-23/24 MINT type (summary/
+// dimensions/matrix/context-profiles/activity/pareto/box/runs/failures) was a pre-CONST-21
+// placeholder contract and is superseded by the real, merged types in `types/mint.ts` (see the
+// "Mock data for the Models/MINT surface (CGUI-08, TERM #531)" section below). There is no real
+// `/mint/tradeoffs` endpoint, so these types are consumed by `TradeoffsSection.tsx`, which
+// assembles `MintTradeoffPoint[]` client-side from the real `languageStats()` +
+// `contextProfiles()` methods rather than a dedicated backend route.
+
+export type MintTradeoffDimKey =
+  | 'mean_score' | 'pass_hat_3' | 'mean_throughput' | 'p95_latency_ms' | 'vram_gb' | 'max_context_safe';
+
+export interface MintTradeoffDim {
+  key: MintTradeoffDimKey;
+  label: string;
+  unit: string;
+  min: number; // raw units, for tick formatting
+  max: number; // raw units, for tick formatting
+  /** True for dims where a LOWER raw value is better (latency, vram) — normalized so norm=1 is
+   *  always "best" regardless of direction. */
+  invert: boolean;
+}
+
+export interface MintTradeoffPoint {
+  model: string;
+  raw: Partial<Record<MintTradeoffDimKey, number>>;
+  /** 0..1, invert already applied so 1 always means "best". Missing key -> dim not profiled for
+   *  this model (contributes to the "partial model" exclusion count). */
+  norm: Partial<Record<MintTradeoffDimKey, number>>;
+}
+
 // ── Mock data for the Muse module (CONST-19 backend; CONST-20 builds its UI
 // against these shapes -- verified routes per CONST-GUI-audit.md §4/spec §5.4) ─
 
@@ -840,6 +872,15 @@ const MOCK_GET: Record<string, unknown> = {
   // above `GROWTH_30D` for why this is one object, not two divergent stats mocks.
   'lumina /engram/stats': { ...MOCK_LUMINA_MEMORY_STATS, growth_30d: GROWTH_30D },
 };
+
+// NOTE (CONST-23/24 <-> CGUI-10/CONST-21 reconciliation): CONST-23/24 originally mocked MINT
+// through this generic pathname-dispatch table (`mockMintGetFor`, query-aware variants for
+// epoch=S110/sparse/solo-model fixtures). CONST-21 (merged to main ahead of this branch) landed
+// the REAL typed `client.mint.*` methods below (`summary()`, `dimensions()`, `box()`,
+// `languageStats()`, `contextProfiles()`, etc.) with their own dedicated mock fixtures — those
+// typed methods are what every MINT panel actually calls, so this generic-dispatch path is dead
+// for `/mint/*` and was dropped rather than carried forward. See CategoryReportPanel.tsx /
+// OverviewPanel.tsx for the live `client.mint.*` call sites.
 
 /** `GET /api/lumina/analytics?view=summary|events&days=` (§7) — `view` picks the response
  *  shape, so (unlike every other mock lookup) this needs the query string, not just the
@@ -1596,7 +1637,12 @@ const mockAdapter: AggregationClient = {
 //            &limit=&offset=, GET /models/{name} (URL-encoded full registry key),
 //            GET /mint/dimensions?models=&epoch= (comma-separated model ids), plus the rest of
 //            the mint/* surface (summary/matrix/runs/box/language-stats/failures/context-
-//            profiles/activity/category/*).
+//            profiles/activity/category/*). CGUI-08/10 build the Overview + Category Reports
+//            panels against these REAL typed methods. CONST-23/24 originally mocked MINT
+//            through the generic pathname dispatch (`GET /mint/*`, including two additive
+//            not-in-spec mocks `/mint/pareto` and `/mint/tradeoffs`); that generic path was
+//            retired during the CGUI-10/CONST-23/24 merge reconciliation since the typed client
+//            fully supersedes it.
 //            CONST-20 additions (not in the original §5.4 route list -- see aggregationClient's
 //            MOCK_MUSE_STATS/compose/maintenance comments for why): GET /stats (dashboard
 //            MetricCards row), POST /api/channels/{id}/compose, POST /api/channels/{id}/

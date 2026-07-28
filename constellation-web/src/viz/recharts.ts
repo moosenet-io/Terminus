@@ -20,6 +20,11 @@
 // all-pairs radar/boxplot/heatmap forms, is unmerged) — same Recharts-not-nivo call as the
 // scatter addition above, for the same reason (this chart doesn't need nivo's lazy `viz`
 // chunk to satisfy the §4.4 floor). See `RadarChart.tsx` for the kit wrapper built on these.
+//
+// CONST-23/24 reconciliation addition: ReferenceLine/ReferenceDot/ComposedChart — needed by
+// the MINT Context-degradation chart (max_context_safe hairlines + OOM markers on a line
+// chart), folded into CategoryReportPanel's Context section during the CGUI-10/CONST-23/24
+// merge reconciliation.
 export {
   LineChart,
   Line,
@@ -42,4 +47,7 @@ export {
   Legend,
   ResponsiveContainer,
   Cell,
+  ReferenceLine,
+  ReferenceDot,
+  ComposedChart,
 } from 'recharts';

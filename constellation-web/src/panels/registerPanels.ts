@@ -3,10 +3,12 @@
 // panel adds one line here — the shell never needs to change.
 //
 // CONST-16: also registers the ModuleDescriptor for every module that has a real presence
-// today (harmony/chord/lumina/muse/terminus). `models`/`mint` are valid `ModuleId`s (see
-// moduleRegistry.ts) but are NOT registered here yet — their modules/panels land with
-// CONST-21..24; until then they simply don't exist in the registry, so they never show up
-// as a global-bar tab (no module descriptor to match `getAvailableModules` against).
+// today (harmony/chord/lumina/muse/terminus/models/mint). `models` (CGUI-09 roster/detail +
+// CONST-22 compare, reconciled) registers one list panel + one URL-state compare panel;
+// `mint` (CGUI-10 Overview + Category Reports, reconciled with CONST-23/24's chart-type
+// additions) registers TWO panels (`mint.overview`/`mint.categories`) — NOT the single
+// sectioned `/mint` page CONST-23/24 originally proposed; see the MINT module section of
+// this repo's README for the full reconciliation writeup.
 //
 // CONST-19 registers the `muse` module descriptor only — no panels yet (CONST-20's job); a
 // module with zero registered panels is a valid, if empty, tab (`getPanelsByModule('muse')`

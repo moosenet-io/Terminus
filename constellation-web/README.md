@@ -509,16 +509,92 @@ instantiate one per chart instance, not per render). `ChartCard`/`ChartTooltip`/
 every chart composes (loading/refetch/empty/degraded states, table-view twin, textContent-
 only tooltip label insertion since series/point labels can be untrusted upstream data). For
 the advanced chart forms (radar/boxplot/heatmap/parallel-coordinates/swarmplot/scatterplot),
-CONST-17 ships the FOUNDATION only: pinned `@nivo/*` 0.99.0 packages, the shared nivo theme
+CONST-17 shipped the FOUNDATION only: pinned `@nivo/*` 0.99.0 packages, the shared nivo theme
 bridge (`theme.ts`), and a dedicated `viz` Vite chunk (`vite.config.ts` `manualChunks`) so
-the shell/panels' initial bundle doesn't pay for nivo. The chart-form wrapper components
-themselves land with the routes that use them (MINT/Models, CONST-22..24), which lazy-import
-their panels.
+the shell/panels' initial bundle doesn't pay for nivo. CONST-23 landed the first three
+chart-form wrappers on top of that foundation: `RadarChart.tsx` (C1), `HeatmapChart.tsx` (C2),
+`ScatterChart.tsx` (C4). CONST-24 lands the remaining four: `BoxPlotChart.tsx` (C3),
+`SwarmPlotChart.tsx` (C5), `FailureBarsChart.tsx` (C6, Recharts), and
+`ParallelCoordinatesChart.tsx` (C9) -- all four chart forms in §4.1's decision are now real.
+NOTE: the `vite.config.ts` comment's "lazy-loaded" framing for MINT/Models routes is
+aspirational -- this app has no `React.lazy`/route-level code-splitting anywhere yet
+(`registerPanels.ts` imports every panel eagerly, MINT included); the `viz` manualChunks split
+alone keeps both the initial (~155 KB gz) and viz (~150 KB gz) bundles under the §9 budget
+(350/250 KB gz) even without it, but true lazy-loading is still a real gap if the bundle grows.
+
+**`@nivo/parallel-coordinates`'s shipped types are broken** (CONST-24 finding): the installed
+0.99.0 package declares `"types": "./dist/types/index.d.ts"` in its own `package.json` but does
+not ship that directory -- only the `.cjs.js`/`.mjs` runtime bundles are present. Every other
+pinned nivo package in this kit ships real types; this one doesn't. `viz/nivo-parallel-
+coordinates.d.ts` is an ambient module shim declaring just the runtime-verified export surface
+(`ResponsiveParallelCoordinates`, confirmed via `node -e "require('@nivo/parallel-coordinates')"`)
+so `ParallelCoordinatesChart.tsx` can typecheck -- the one sanctioned "the library's types are
+broken" escape hatch in this kit, not a precedent for under-typing wrappers in general.
+
+**The exact-quantile / exact-value tricks** (CONST-24): both `BoxPlotChart.tsx` (C3) and
+`ParallelCoordinatesChart.tsx` (C9) need nivo to reproduce SERVER-computed values (box
+quartiles; a fixed 0..1 domain per axis) rather than deriving statistics from raw per-point
+data itself, and neither chart form exposes a "the stats are already computed" mode or a scale
+accessor to custom layers. Both wrappers work around this by feeding nivo a small synthetic
+reference dataset whose exact values make nivo's OWN interpolation reproduce the desired
+result with zero error (5 sorted points for boxplot's [min,q1,median,q3,max]; two rows pinned
+to 0 and 1 on every axis for parallel-coordinates' pixel<->value mapping) -- see the file-header
+comments in each for the exact math. This is a deliberate, documented technique, not
+incidental test-fixture noise.
 
 Grid lines are **solid 1px hairlines** (`--chart-grid`/`--chart-axis`) — the dashed
 `strokeDasharray:'3 3'` pattern from harmony-web is retired everywhere (audit §1.4). Every
 chart ships a table-view twin (`TableViewToggle`) — this is both the WCAG relief channel for
 sub-3:1 fills and a hard rule (§4.4).
+
+## MINT module (`src/panels/mint/`, CGUI-10 base + CONST-23/24 chart-type reconciliation)
+
+MINT is TWO registered panels, both terminus-backed (`mint` registers as a `ModuleId` gated on
+the `terminus` health entry, `registerPanels.ts` -- it has no independent proxy namespace; like
+`models`, its data is server-side aggregation inside Terminus itself, `GET /api/terminus/mint/*`)
+and both driven ENTIRELY by the real, live `client.mint.*` data client (`aggregationClient.ts`,
+CGUI-08):
+- **`mint.overview`** (`/mint/overview`, `OverviewPanel.tsx`) -- fleet-wide headline metrics,
+  profiling activity over time, a category coverage roll-up, and (see below) fleet-wide
+  trade-off analysis.
+- **`mint.categories`** (`/mint/categories`, `CategoryReportPanel.tsx`) -- the per-category
+  deep-dive: a grouped category picker over all 12 MINT categories (8 task-categories, 3 legacy
+  suites, the persona radar), each rendering capability radar / coverage heatmap / distribution
+  box / ranking / failure-class bars / recent runs, plus (see below) a context-degradation view
+  for the `context` legacy category.
+
+This pair superseded an independently-built, two-phase MINT UI (`CONST-23-mint-phase1` /
+`CONST-24-mint-phase2`, a single sectioned `/mint` page with its own filter bar and a bespoke
+mock-only data layer, built before CGUI-10's real backend/client landed on `main`). The two were
+reconciled by keeping CGUI-10's two-panel structure as the base (already live, already wired to
+the real backend) and porting only the CONST-23/24 chart TYPES that panel pair genuinely lacked,
+rewired to the real client:
+- **Low-n distribution honesty** (`BoxPlotChart.tsx`): a group with `n < 5` no longer renders a
+  5-number-summary box (statistically misleading from that few samples) -- it renders the
+  individual observed values (summary points + outliers) as jittered dots instead.
+- **Trade-off parallel coordinates** (`TradeoffsSection.tsx`, folded into `mint.overview`;
+  `viz/ParallelCoordinatesChart.tsx` + `viz/nivo-parallel-coordinates.d.ts`) -- a 6-dimension
+  per-model comparison (mean score, pass^3, throughput, p95 latency, VRAM, max safe context),
+  assembled CLIENT-SIDE from the real `languageStats()` and `contextProfiles()` methods (there is
+  no dedicated `/mint/tradeoffs` backend endpoint -- CONST-24's original version read one, but it
+  was a mock-only fixture with no real contract behind it).
+- **Context degradation** (`ContextDegradationSection.tsx`, folded into `mint.categories`,
+  rendered only for the `context` legacy category) -- throughput/recall over context-token
+  tiers, OOM markers, and a `max_context_safe` hairline, wired to the real `contextProfiles()`
+  method. Sibling charts, never a dual-axis chart.
+
+What was reviewed and NOT ported, because CGUI-10's existing pair already covers the same ground
+live: the CONST-23/24 filter bar (`MintFilterBar.tsx`/`mintFilters.ts` -- its model/category
+facets were backed by a mock fixture, and its language filter was explicitly a documented
+stopgap "swap for a real facet list once CONST-21 lands"; CGUI-10 instead uses a per-panel
+category picker + epoch selector against the real client), its own Overview/Coverage sections
+(redundant with `OverviewPanel.tsx`'s headline metrics + coverage roll-up), its Capability
+radar (redundant with the persona radar already in `CategoryReportPanel.tsx`), and its
+failure-class bar chart / score-beeswarm Coder section (redundant with `CategoryReportPanel.tsx`'s
+existing Failures + Distribution sections for the `code` category). `MintPage.tsx` and every
+CONST-23/24 section file were deleted once their useful chart types were folded in or explicitly
+rejected, so the module carries no dead duplicate UI.
+
 ## Model Library module (`models`, CONST-21 API + CGUI-09 roster/detail + CONST-22 compare, spec §6)
 
 A `terminus`-backed module (its `ModuleDescriptor.healthSystem` is `'terminus'` — there's no

@@ -7,6 +7,15 @@
 // brand-controllable. Horizontal layout: one row per model, shared value axis, median tick,
 // IQR box, whiskers to min/max, outlier dots. Colors are stable categorical slots (color
 // follows the model, not its rank, §4.2). Tokens only; SVG coords are unitless numbers.
+//
+// CGUI-10/CONST-23/24 reconciliation (low-n beeswarm): ported from CONST-24's BoxPlotChart,
+// whose n<5 groups rendered a jittered dot strip instead of a box (a 5-number "IQR" computed
+// from fewer than 5 samples misrepresents a spread that doesn't really exist yet). CONST-24's
+// version needed raw per-run sample values for that strip, which the real `mint.box` /
+// `mint.category/*/box` responses don't carry — so this port uses the fields the real endpoint
+// DOES return for a low-n group: the five summary points (min/q1/median/q3/max, deduped) plus
+// any recorded outliers, jittered as individual dots on the shared axis. Still fewer than 5
+// points for n<5, but every dot is a real observed value, never a synthesized quartile box.
 import { useLayoutEffect, useRef, useState } from 'react';
 import { CATEGORICAL_HEX, CHART_CHROME } from './palette';
 import type { BoxVM, BoxGroupVM } from '../panels/mint/transforms';
@@ -77,6 +86,35 @@ export function BoxPlotChart({ vm, formatValue, height }: BoxPlotChartProps) {
         {groups.map((g, i) => {
           const cy = AXIS_H + i * ROW_H + ROW_H / 2;
           const color = i < CATEGORICAL_HEX.length ? CATEGORICAL_HEX[i] : CHART_CHROME.deemphasis;
+
+          if (g.lowN) {
+            // n<5: a 5-number "IQR" computed from fewer than 5 samples misrepresents a spread
+            // that doesn't really exist yet — render every real observed value (the summary
+            // points, deduped, plus any outliers) as individual jittered dots instead of a box.
+            const rawPoints = Array.from(new Set([g.min, g.q1, g.median, g.q3, g.max, ...g.outliers]));
+            return (
+              <g key={g.model}>
+                <text x={LABEL_W - 10} y={cy + 4} textAnchor="end" fontSize={11} fill="var(--text-body)" fontFamily="var(--font-mono)">
+                  {truncate(g.model, 16)}
+                </text>
+                {rawPoints.map((v, vi) => {
+                  // Small deterministic vertical jitter so overlapping/adjacent values are
+                  // visually separable without touching the shared x-scale.
+                  const jitter = ((vi % 3) - 1) * 4;
+                  return (
+                    <circle key={vi} cx={scale(v)} cy={cy + jitter} r={5} fill={color} fillOpacity={0.85} stroke="var(--bg-panel)" strokeWidth={1.5}>
+                      <title>{`${g.model}: ${formatValue(v)}`}</title>
+                    </circle>
+                  );
+                })}
+                <text x={scale(Math.max(...rawPoints)) + 12} y={cy + 4} fontSize={11} fill="var(--flux-amber)" fontFamily="var(--font-mono)">
+                  {`⚠ n=${g.n}`}
+                </text>
+                <title>{`${g.model} · n=${g.n} (< 5 — individual values shown, not a box) · range ${formatValue(g.min)}–${formatValue(g.max)}`}</title>
+              </g>
+            );
+          }
+
           return (
             <g key={g.model}>
               {/* model label */}
@@ -107,11 +145,6 @@ export function BoxPlotChart({ vm, formatValue, height }: BoxPlotChartProps) {
                   <title>{`outlier ${formatValue(o)}`}</title>
                 </circle>
               ))}
-              {g.lowN && (
-                <text x={scale(g.max) + 8} y={cy + 4} fontSize={11} fill="var(--flux-amber)" fontFamily="var(--font-mono)">
-                  {`n=${g.n}`}
-                </text>
-              )}
               <title>{`${g.model} · median ${formatValue(g.median)} · IQR ${formatValue(g.q1)}–${formatValue(g.q3)} · n=${g.n}`}</title>
             </g>
           );
