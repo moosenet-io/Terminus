@@ -8,10 +8,11 @@ interface ProgressBarProps {
   style?: React.CSSProperties;
 }
 
-function fillColor(pct: number): string {
-  if (pct >= 80) return 'var(--status-success)';
-  if (pct >= 20) return 'var(--status-warning)';
-  return 'var(--status-error)';
+// S127 TGUI2 POL-1 / M5: progress is NOT a status signal. A completion bar renders as a
+// single desaturated-violet fill (token) regardless of pct — the old red→amber→green ramp
+// made ordinary in-progress work read as "warning/error" (design-direction Tell #4).
+function fillColor(_pct: number): string {
+  return 'var(--progress-fill)';
 }
 
 function fillGradient(pct: number): string {
@@ -28,7 +29,7 @@ export function ProgressBar({ pct, height = 6, style }: ProgressBarProps) {
         position: 'relative',
         height,
         borderRadius: 'var(--radius-sm)',
-        background: 'var(--border-subtle)',
+        background: 'var(--progress-track)',
         overflow: 'hidden',
         ...style,
       }}

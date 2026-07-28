@@ -306,8 +306,9 @@ async fn main() -> std::process::ExitCode {
                 // bounded backoff on every acquire, including the first), so
                 // `mint` no longer pre-acquires a whole-run outer guard here.
                 // MINT2-06: honor the same `--only-stale` env surface (default
-                // full sweep).
-                match runner::run_mode(terminus_rs::intake::only_stale_from_env()).await {
+                // full sweep). Also honors the gap-only surface
+                // (`INTAKE_ASSISTANT_GAP_ONLY`/`INTAKE_ASSISTANT_GAP_MAX`).
+                match runner::run_mode(runner::SweepSelection::from_env()).await {
                     Ok(report) => {
                         let total = report.models.len();
                         let profiled = report

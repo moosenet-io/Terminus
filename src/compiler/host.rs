@@ -184,9 +184,9 @@ pub fn module_web_dir(module: &str) -> Option<String> {
 /// build against the fleet-wide `BUILD_TARGET_TRIPLE` (terminus, chord):
 /// zero-behavior-change.
 ///
-/// Exists because a build host (<host>, glibc 2.41) can be newer than a deploy
-/// host (<host>, glibc 2.36) — a `gnu` binary built on the former won't start
-/// on the latter. A module whose deps allow it (no glibc-only C deps — e.g.
+/// Exists because a build host can run a newer glibc than a deploy host — a
+/// `gnu` binary built on the former won't start on the latter. A module
+/// whose deps allow it (no glibc-only C deps — e.g.
 /// harmony's rustls/ring, no openssl) can opt into a musl-static build for a
 /// portable artifact via `BUILD_MODULE_TARGET_HARMONY=x86_64-unknown-linux-musl`,
 /// independent of the global gnu default other modules keep using.

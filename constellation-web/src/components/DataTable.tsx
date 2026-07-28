@@ -14,9 +14,9 @@ interface DataTableProps<T> {
   rowKey: (row: T, index: number) => string;
   emptyMessage?: string;
   style?: React.CSSProperties;
-  /** CONST-22: optional row-click handler (e.g. `models.browse` -> `models.detail`). Rows
-   *  stay plain, non-interactive `<tr>`s when omitted — every existing caller keeps working
-   *  unchanged. */
+  /** Optional row-click handler (e.g. opening a detail Drawer, or navigating from a roster to
+   *  a detail view). Additive/opt-in — every existing caller that doesn't pass it keeps
+   *  rendering plain, non-interactive rows. */
   onRowClick?: (row: T) => void;
 }
 

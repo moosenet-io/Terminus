@@ -1,86 +1,91 @@
-// CONST-16: the two-tier shell's top bar (§3.1). Replaces Sidebar as the module switcher —
-// module tabs (from `getAvailableModules(health)`, in `order`) carry a health dot; plus the
-// wordmark, a ⌘K search/palette trigger, the density toggle, and the account chip.
-import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import type { ModuleDescriptor, PanelDescriptor } from '../lib/moduleRegistry';
-import type { HealthStatus } from '../lib/aggregationClient';
+// CONST-16 / S127 TGUI2: the two-tier shell's top bar (guide-spec §3.1). The persistent global
+// frame: wordmark (violet node dot + "terminus") · the FIVE constellation CORE tabs (Lumina /
+// Chord / Terminus / Harmony / Muse, active = violet-filled pill) · a search field
+// ("search tools… ⌘K") · a Comfortable/Compact density toggle (segmented, active violet) · an
+// account circle.
+//
+// S127 note — this replaces CGUI-12's fictional 3-"crate" strip (lumina-core/chord-proxy/
+// terminus-rs) with the REAL constellation members (see lib/cores.ts). Each core's node dot is
+// coloured by its kind (violet core / green endpoint). Selecting a core scopes the left rail +
+// card canvas to that core's member modules; Terminus owns Models + MINT as sub-sections.
+//
+// CONST-25: the ⌘K search button just calls `onOpenPalette` — the palette's own open state,
+// keyboard shortcut, and markup live in App.tsx's Shell + `CommandPalette.tsx`, so Ctrl/Cmd+K
+// works everywhere the shell is mounted, not only while this bar has focus.
 import type { FeedItem } from '../lib/activityFeed';
+import type { CoreDescriptor, CoreId } from '../lib/cores';
+import { coreKind } from '../lib/cores';
+import type { HealthStatus } from '../lib/aggregationClient';
+import { KIND_COLOR } from '../panels/overview/moduleMeta';
 import { Wordmark } from './Wordmark';
 import { NotificationBell } from './NotificationBell';
+import { HealthChip } from './HealthChip';
 
 export type Density = 'comfortable' | 'compact';
 
 interface GlobalBarProps {
-  modules: ModuleDescriptor[];
-  health: HealthStatus[];
-  /** healthSystem ids currently inside the 2-cycle stale-while-degrading grace window. */
-  degradedSystems: Set<string>;
-  activeModuleId: string | null;
-  onSelectModule: (id: string) => void;
+  /** The five constellation cores rendered as tabs. */
+  cores: readonly CoreDescriptor[];
+  activeCoreId: CoreId;
+  onSelectCore: (id: CoreId) => void;
   density: Density;
   onDensityChange: (d: Density) => void;
   username?: string | null;
   onLogout?: () => void;
   /** True when the last health poll failed outright (network/backend down); the bar shows a
-   *  degraded indicator while continuing to render the last known module set (edge case §10). */
+   *  degraded indicator while continuing to render the last known state (edge case §10). */
   pollDegraded: boolean;
+  /** POL-11: the shell's live health snapshot + grace-degraded set, backing the global
+   *  HealthChip. Optional so any pre-POL-11 caller keeps compiling (chip falls back to empty). */
+  health?: HealthStatus[];
+  degradedSystems?: Set<string>;
   /** Present only in the <760px "drawer" rail variant — renders a menu trigger before the
-   *  wordmark that opens the ModuleRail drawer. */
+   *  wordmark that opens the module rail drawer. */
   onOpenMenu?: () => void;
-  /** The SAME health-filtered panel set the Shell routes — i.e. only panels belonging to a
-   *  currently-available module. The ⌘K "go to" trigger must source from this, not the raw
-   *  registry, so it never offers a path the router would reject (CONST-16 review finding). */
-  panels: PanelDescriptor[];
+  /** CONST-25: opens the full CommandPalette (owned by App.tsx's Shell). */
+  onOpenPalette: () => void;
   /** CONST-26 (§3.3): the shell's merged activity feed — backs the bell menu here. Optional so
-   *  every existing caller of `GlobalBar` keeps compiling untouched; the bell simply doesn't
-   *  render when omitted. */
+   *  every existing caller keeps compiling untouched; the bell simply doesn't render when omitted. */
   feedItems?: FeedItem[];
 }
 
+/** First (uppercase) glyph of the account label, for the account circle. */
+function accountInitial(username?: string | null): string {
+  const c = (username ?? '').trim()[0];
+  return c ? c.toUpperCase() : '@';
+}
+
 export function GlobalBar({
-  modules,
-  health,
-  degradedSystems,
-  activeModuleId,
-  onSelectModule,
+  cores,
+  activeCoreId,
+  onSelectCore,
   density,
   onDensityChange,
   username,
   onLogout,
   pollDegraded,
   onOpenMenu,
-  panels,
+  onOpenPalette,
   feedItems,
+  health = [],
+  degradedSystems = new Set<string>(),
 }: GlobalBarProps) {
-  const [paletteOpen, setPaletteOpen] = useState(false);
-  const navigate = useNavigate();
-
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
-        e.preventDefault();
-        setPaletteOpen(o => !o);
-      }
-      if (e.key === 'Escape') setPaletteOpen(false);
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, []);
-
-  const healthFor = (systemId: string) => health.find(h => h.system === systemId);
-
   return (
     <div
       style={{
+        position: 'relative',
+        zIndex: 2,
         display: 'flex',
         alignItems: 'center',
         gap: 'var(--space-4)',
         padding: '0 var(--space-4)',
         height: 52,
         flexShrink: 0,
-        borderBottom: '1px solid var(--border-subtle)',
-        background: 'rgba(0,0,0,0.2)',
+        borderBottom: 'var(--border-width) solid var(--border-subtle)',
+        // Translucent so the fixed backdrop reads through the bar (guide §0 frame).
+        // M1: neutral-dark tint (was violet rgba(22,17,44)/rgba(13,11,26)).
+        background: 'linear-gradient(180deg, rgba(20,20,25,0.72), rgba(10,10,13,0.55))',
+        backdropFilter: 'blur(8px)',
       }}
     >
       {onOpenMenu && (
@@ -89,81 +94,98 @@ export function GlobalBar({
           aria-label="Open module navigation"
           style={{
             background: 'none',
-            border: '1px solid var(--border-default)',
+            border: 'var(--border-width) solid var(--border-default)',
             borderRadius: 'var(--radius-md)',
             color: 'var(--text-secondary)',
             width: 28,
             height: 28,
             cursor: 'pointer',
             flexShrink: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
           }}
         >
-          ☰
+          {/* POL-05: inline Lucide-style menu glyph (was the ☰ character). */}
+          <svg aria-hidden width={16} height={16} viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" strokeWidth={1.5} strokeLinecap="round">
+            <path d="M3 6h18M3 12h18M3 18h18" />
+          </svg>
         </button>
       )}
 
+      {/* Wordmark → the active core's overview (App wires onSelectCore to also navigate). */}
       <button
-        onClick={() => navigate('/overview')}
+        onClick={() => onSelectCore(activeCoreId)}
         style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0, flexShrink: 0 }}
-        aria-label="Go to Overview"
+        aria-label="Go to overview"
       >
         <Wordmark />
       </button>
 
+      {/* Core tabs — active = violet-filled pill (§3.1). Exposed as an ARIA tablist so a
+          screen reader announces the selected core (aria-selected) and the tab count. Each dot
+          takes the core's kind colour (violet core / green endpoint) so the row reads
+          semantically; the active tab additionally glows. */}
       <nav
-        aria-label="Modules"
-        style={{ display: 'flex', alignItems: 'center', gap: 2, overflowX: 'auto', flex: 1, height: '100%' }}
+        role="tablist"
+        aria-label="Cores"
+        style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flex: 1, overflowX: 'auto' }}
       >
-        {modules.map(m => {
-          const h = healthFor(m.healthSystem);
-          const active = m.id === activeModuleId;
-          const degraded = degradedSystems.has(m.healthSystem);
-          const dotColor = degraded
-            ? 'var(--status-warning)'
-            : h?.available
-              ? 'var(--status-success)'
-              : 'var(--text-tertiary)';
+        {cores.map(c => {
+          const active = c.id === activeCoreId;
+          const dot = KIND_COLOR[coreKind(c.id)];
           return (
             <button
-              key={m.id}
-              onClick={() => onSelectModule(m.id)}
+              key={c.id}
+              role="tab"
+              onClick={() => onSelectCore(c.id)}
+              aria-selected={active}
               aria-current={active ? 'page' : undefined}
-              title={degraded ? `${m.title} — degraded (stale-while-recovering)` : m.title}
               style={{
                 display: 'flex',
                 alignItems: 'center',
-                gap: 6,
-                background: 'none',
-                border: 'none',
+                gap: 'var(--space-2)',
+                background: active ? 'var(--accent-soft)' : 'transparent',
+                border: active ? 'var(--border-width) solid var(--border-emphasis)' : 'var(--border-width) solid transparent',
+                borderRadius: 'var(--radius-pill)',
                 cursor: 'pointer',
-                padding: '0 var(--space-3)',
-                height: '100%',
-                color: active ? 'var(--text-primary)' : 'var(--text-secondary)',
-                fontSize: 'var(--text-base)',
+                padding: 'var(--space-1) var(--space-3)',
+                color: active ? 'var(--text-primary)' : 'var(--text-tertiary)',
+                fontFamily: 'var(--font-mono)',
+                fontSize: 'var(--fs-mono-sm)',
+                letterSpacing: 'var(--ls-mono)',
                 fontWeight: active ? 600 : 400,
-                borderBottom: active ? '2px solid var(--accent-primary)' : '2px solid transparent',
                 whiteSpace: 'nowrap',
               }}
             >
               <span
                 aria-hidden
-                style={{ width: 6, height: 6, borderRadius: '50%', background: dotColor, flexShrink: 0 }}
+                style={{
+                  width: 6,
+                  height: 6,
+                  borderRadius: '50%',
+                  background: active ? dot : 'var(--text-500)',
+                  boxShadow: active ? `0 0 7px ${dot}` : 'none',
+                  flexShrink: 0,
+                }}
               />
-              <span aria-hidden>{m.icon}</span>
-              {m.title}
+              {c.title}
             </button>
           );
         })}
-        {modules.length === 0 && (
-          <span style={{ color: 'var(--text-tertiary)', fontSize: 'var(--text-sm)' }}>No modules available</span>
-        )}
       </nav>
 
+      {/* Search field / ⌘K palette trigger. */}
       <button
-        onClick={() => setPaletteOpen(true)}
+        onClick={onOpenPalette}
+        aria-label="Search tools"
         style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 'var(--space-2)',
           background: 'var(--bg-surface)',
-          border: '1px solid var(--border-default)',
+          border: 'var(--border-width) solid var(--border-default)',
           color: 'var(--text-tertiary)',
           borderRadius: 'var(--radius-md)',
           padding: 'var(--space-1) var(--space-3)',
@@ -172,15 +194,19 @@ export function GlobalBar({
           flexShrink: 0,
         }}
       >
-        search… <kbd style={{ fontFamily: 'var(--font-mono)' }}>⌘K</kbd>
+        search tools…{' '}
+        {/* POL-12: both the ⌘K (from anywhere) and "/" (when not typing) shortcuts open it. */}
+        <kbd style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)' }}>⌘K</kbd>
+        <kbd style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)', color: 'var(--text-500)' }}>/</kbd>
       </button>
 
+      {/* Density toggle — segmented, active = violet (§3.1). */}
       <div
         role="group"
         aria-label="Density"
         style={{
           display: 'flex',
-          border: '1px solid var(--border-default)',
+          border: 'var(--border-width) solid var(--border-default)',
           borderRadius: 'var(--radius-md)',
           overflow: 'hidden',
           flexShrink: 0,
@@ -197,7 +223,7 @@ export function GlobalBar({
               border: 'none',
               cursor: 'pointer',
               textTransform: 'capitalize',
-              background: density === d ? 'var(--accent-primary-subtle)' : 'transparent',
+              background: density === d ? 'var(--accent-soft)' : 'transparent',
               color: density === d ? 'var(--accent-primary)' : 'var(--text-tertiary)',
             }}
           >
@@ -207,145 +233,58 @@ export function GlobalBar({
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flexShrink: 0 }}>
+        {/* POL-11: always-visible global health + spend chip. Subsumes the old standalone
+            poll-degraded ⚠ triangle — a failed poll now elevates THIS chip to amber. */}
+        <HealthChip health={health} degradedSystems={degradedSystems} pollDegraded={pollDegraded} />
         {feedItems && <NotificationBell items={feedItems} />}
-        {pollDegraded && (
-          <span
-            title="Health poll degraded — showing last known status"
-            aria-label="Health poll degraded"
-            style={{ color: 'var(--status-warning)', fontSize: 'var(--text-sm)' }}
-          >
-            ⚠
-          </span>
-        )}
-        {username && (
-          <span
-            title={username}
-            style={{
-              fontSize: 'var(--text-sm)',
-              color: 'var(--text-secondary)',
-              maxWidth: 120,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-            }}
-          >
-            {username}
-          </span>
-        )}
-        {onLogout && (
+        {/* Account circle — blue avatar with the account initial; a plain button so Sign out is
+            still reachable (title carries the full username). */}
+        {onLogout ? (
           <button
             onClick={onLogout}
+            title={username ? `${username} — sign out` : 'Sign out'}
+            aria-label={username ? `${username}, sign out` : 'Sign out'}
             style={{
-              background: 'none',
-              border: 'none',
-              color: 'var(--text-tertiary)',
+              width: 28,
+              height: 28,
+              borderRadius: '50%',
+              flexShrink: 0,
+              background: 'rgba(59,130,246,0.18)',
+              border: 'var(--border-width) solid var(--node-source)',
+              color: 'var(--flux-blue-soft)',
+              fontFamily: 'var(--font-sans)',
+              fontWeight: 600,
+              fontSize: 'var(--fs-sm)',
               cursor: 'pointer',
-              fontSize: 'var(--text-xs)',
-            }}
-          >
-            Sign out
-          </button>
-        )}
-      </div>
-
-      {paletteOpen && (
-        <MiniPalette
-          panels={panels}
-          onClose={() => setPaletteOpen(false)}
-          onNavigate={path => {
-            navigate(path);
-            setPaletteOpen(false);
-          }}
-        />
-      )}
-    </div>
-  );
-}
-
-/**
- * Minimal in-shell "go to panel" overlay behind the ⌘K trigger — CONST-25 replaces this with
- * the full `CommandPalette` (actions, entity search, `registerCommand`). Deliberately named
- * differently (`MiniPalette`, local to `GlobalBar`) so it doesn't collide with that future file.
- *
- * Takes its entries from the caller's health-filtered `panels` (NOT `getAvailablePanels()`
- * directly) — otherwise it would list panels of modules that are currently unavailable, and
- * navigating to one would fall through the router's wildcard route (review finding).
- */
-function MiniPalette({
-  panels,
-  onClose,
-  onNavigate,
-}: {
-  panels: PanelDescriptor[];
-  onClose: () => void;
-  onNavigate: (path: string) => void;
-}) {
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-label="Command palette"
-      onClick={onClose}
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(0,0,0,0.5)',
-        display: 'flex',
-        alignItems: 'flex-start',
-        justifyContent: 'center',
-        paddingTop: '10vh',
-        zIndex: 1000,
-      }}
-    >
-      <div
-        onClick={e => e.stopPropagation()}
-        style={{
-          width: 480,
-          maxWidth: '90vw',
-          maxHeight: '60vh',
-          overflow: 'auto',
-          background: 'var(--bg-surface)',
-          border: '1px solid var(--border-default)',
-          borderRadius: 'var(--radius-lg)',
-          boxShadow: 'var(--shadow-card-elevated)',
-        }}
-      >
-        <div
-          style={{
-            padding: 'var(--space-3)',
-            borderBottom: '1px solid var(--border-subtle)',
-            color: 'var(--text-tertiary)',
-            fontSize: 'var(--text-xs)',
-            textTransform: 'uppercase',
-            letterSpacing: '0.08em',
-          }}
-        >
-          Go to
-        </div>
-        {panels.length === 0 && (
-          <div style={{ padding: 'var(--space-3)', color: 'var(--text-tertiary)' }}>No panels available.</div>
-        )}
-        {panels.map(p => (
-          <button
-            key={p.id}
-            onClick={() => onNavigate(p.path)}
-            style={{
               display: 'flex',
-              width: '100%',
-              textAlign: 'left',
-              gap: 'var(--space-2)',
-              background: 'none',
-              border: 'none',
-              padding: 'var(--space-2) var(--space-3)',
-              color: 'var(--text-primary)',
-              cursor: 'pointer',
-              fontSize: 'var(--text-base)',
+              alignItems: 'center',
+              justifyContent: 'center',
             }}
           >
-            <span aria-hidden>{p.icon ?? '•'}</span>
-            {p.title}
+            {accountInitial(username)}
           </button>
-        ))}
+        ) : (
+          <span
+            aria-hidden
+            style={{
+              width: 28,
+              height: 28,
+              borderRadius: '50%',
+              flexShrink: 0,
+              background: 'rgba(59,130,246,0.18)',
+              border: 'var(--border-width) solid var(--node-source)',
+              color: 'var(--flux-blue-soft)',
+              fontFamily: 'var(--font-sans)',
+              fontWeight: 600,
+              fontSize: 'var(--fs-sm)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+          >
+            {accountInitial(username)}
+          </span>
+        )}
       </div>
     </div>
   );

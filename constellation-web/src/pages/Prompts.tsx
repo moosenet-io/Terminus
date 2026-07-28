@@ -1,6 +1,7 @@
 // TRCI-02: Prompt version registry viewer with side-by-side diff.
 import { useState, useEffect } from 'react';
 import { getAggregationClient } from '../lib/aggregationClient';
+import { onEnterOrSpace } from '../lib/a11y';
 
 interface PromptVersion {
   id: string;
@@ -62,36 +63,37 @@ export function Prompts() {
   return (
     <div style={{ padding: 16, overflowY: 'auto', height: '100%', display: 'flex', flexDirection: 'column', gap: 12 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-        <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--h-teal)', margin: 0 }}>Prompt Versions</h2>
+        <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--accent)', margin: 0 }}>Prompt Versions</h2>
         <select value={stepFilter} onChange={e => setStepFilter(e.target.value)}
-          style={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', borderRadius: 4, color: 'var(--h-text)', padding: '3px 8px', fontSize: 12, outline: 'none' }}>
+          style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text-100)', padding: '3px 8px', fontSize: 12, outline: 'none' }}>
           <option value="">All steps</option>
           {steps.map(s => <option key={s} value={s}>{s}</option>)}
         </select>
         {selected.length > 0 && (
-          <span style={{ fontSize: 11, color: 'var(--h-text-muted)' }}>
+          <span style={{ fontSize: 11, color: 'var(--text-300)' }}>
             {selected.length === 2 ? 'Showing diff below' : `Select 1 more to diff`}
           </span>
         )}
       </div>
 
       {loading ? <div className="h-skeleton" style={{ height: 100 }} /> : filtered.length === 0 ? (
-        <div style={{ color: 'var(--h-text-muted)', fontSize: 13 }}>No prompt versions recorded yet. They appear here as tasks execute.</div>
+        <div style={{ color: 'var(--text-300)', fontSize: 13 }}>No prompt versions recorded yet. They appear here as tasks execute.</div>
       ) : (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 8 }}>
           {filtered.map(v => {
             const isSel = selected.includes(v.id);
             return (
-              <div key={v.id} onClick={() => toggleSelect(v.id)} className="h-card"
-                style={{ cursor: 'pointer', border: `1px solid ${isSel ? 'var(--h-teal)' : 'var(--h-border)'}`, background: isSel ? 'var(--h-bg-active)' : undefined }}>
+              <div key={v.id} onClick={() => toggleSelect(v.id)} onKeyDown={onEnterOrSpace(() => toggleSelect(v.id))}
+                role="button" tabIndex={0} aria-pressed={isSel} className="h-card"
+                style={{ cursor: 'pointer', border: `1px solid ${isSel ? 'var(--accent)' : 'var(--border)'}`, background: isSel ? 'var(--accent-soft)' : undefined }}>
                 <div className="h-card-body">
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                    <span style={{ fontSize: 11, color: 'var(--h-teal)', fontWeight: 600 }}>{v.step_type} v{v.version}</span>
-                    <span style={{ fontSize: 10, color: 'var(--h-text-muted)' }}>{v.created_at.slice(0, 10)}</span>
+                    <span style={{ fontSize: 11, color: 'var(--accent)', fontWeight: 600 }}>{v.step_type} v{v.version}</span>
+                    <span style={{ fontSize: 10, color: 'var(--text-300)' }}>{v.created_at.slice(0, 10)}</span>
                   </div>
-                  <div style={{ fontSize: 10, color: 'var(--h-text-muted)', marginBottom: 4 }} className="h-mono">{v.template_hash.slice(0, 12)}…</div>
-                  {v.trigger && <div style={{ fontSize: 10, color: 'var(--h-text-dim)' }}>{v.trigger}</div>}
-                  <div style={{ fontSize: 10, color: 'var(--h-text-muted)', marginTop: 4, maxHeight: 40, overflow: 'hidden' }}>
+                  <div style={{ fontSize: 10, color: 'var(--text-300)', marginBottom: 4 }} className="h-mono">{v.template_hash.slice(0, 12)}…</div>
+                  {v.trigger && <div style={{ fontSize: 10, color: 'var(--text-200)' }}>{v.trigger}</div>}
+                  <div style={{ fontSize: 10, color: 'var(--text-300)', marginTop: 4, maxHeight: 40, overflow: 'hidden' }}>
                     {v.template_text.slice(0, 80)}…
                   </div>
                 </div>
@@ -107,11 +109,11 @@ export function Prompts() {
           <div className="h-card-header" style={{ cursor: 'default' }}>
             <span style={{ fontWeight: 600, fontSize: 13 }}>Diff: {selA.step_type} v{selA.version} → v{selB.version}</span>
           </div>
-          <div className="h-card-body" style={{ fontFamily: 'var(--h-font-mono)', fontSize: 11 }}>
+          <div className="h-card-body" style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>
             {diff.slice(0, 200).map((line, i) => (
               <div key={i} style={{
                 background: line.type === 'add' ? 'rgba(102,255,102,0.08)' : line.type === 'remove' ? 'rgba(255,68,68,0.08)' : undefined,
-                color: line.type === 'add' ? 'var(--h-green)' : line.type === 'remove' ? 'var(--h-red)' : 'var(--h-text-dim)',
+                color: line.type === 'add' ? 'var(--flux-green)' : line.type === 'remove' ? 'var(--flux-rose)' : 'var(--text-200)',
                 padding: '1px 6px',
                 whiteSpace: 'pre-wrap',
                 wordBreak: 'break-all',
@@ -119,7 +121,7 @@ export function Prompts() {
                 {line.type === 'add' ? '+ ' : line.type === 'remove' ? '- ' : '  '}{line.text}
               </div>
             ))}
-            {diff.length > 200 && <div style={{ color: 'var(--h-text-muted)', fontSize: 10, padding: '4px 6px' }}>… {diff.length - 200} more lines</div>}
+            {diff.length > 200 && <div style={{ color: 'var(--text-300)', fontSize: 10, padding: '4px 6px' }}>… {diff.length - 200} more lines</div>}
           </div>
         </div>
       )}

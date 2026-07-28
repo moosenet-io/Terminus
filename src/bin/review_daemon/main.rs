@@ -294,6 +294,13 @@ struct DispatchBody {
     /// `provider::build_command`'s doc.
     #[serde(default)]
     reasoning_effort: Option<String>,
+    /// REVX-07/08: an explicit provider-native model override (currently only
+    /// meaningful for `codex` -- its dynamic GPT-5.6 sol/terra/luna tier
+    /// selection). Validated against `config::clamp_codex_model`'s closed
+    /// allowlist before it ever reaches `build_command_with_model`; an
+    /// unrecognized value drops to `None` (the fixed `CODEX_MODEL` default).
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// Parse + validate + dispatch a `/dispatch` request body. Returns
@@ -367,10 +374,15 @@ async fn handle_dispatch(
     // Bounded concurrency: at most MAX_CONCURRENCY subprocesses in flight.
     let _permit = state.semaphore.acquire().await;
 
-    // REVCAP-01 PART B: validate against the closed allowlist -- an
-    // unrecognized/blank/absent value drops to `None` (the pre-PART-B argv
-    // shape), never forwarded verbatim into a provider's own config syntax.
-    let reasoning_effort = config::clamp_reasoning_effort(parsed.reasoning_effort.as_deref());
+    // REVCAP-01 PART B / REVX-07: validate against the PER-PROVIDER closed
+    // allowlist -- an unrecognized/blank/absent value, or a level the
+    // requested provider doesn't support (e.g. `xhigh` for claude), drops to
+    // `None` (the pre-PART-B argv shape), never forwarded verbatim into a
+    // provider's own config syntax.
+    let reasoning_effort =
+        config::clamp_reasoning_effort_for(parsed.provider, parsed.reasoning_effort.as_deref());
+    // REVX-08: same closed-allowlist treatment for a codex model override.
+    let model = config::clamp_codex_model(parsed.model.as_deref());
 
     match run_provider(
         parsed.provider,
@@ -378,6 +390,7 @@ async fn handle_dispatch(
         &parsed.prompt,
         parsed.explore,
         reasoning_effort.as_deref(),
+        model.as_deref(),
         &stall,
         cwd.as_deref(),
         &state.sanitized_env,
@@ -421,12 +434,13 @@ async fn run_provider(
     prompt: &str,
     explore: bool,
     reasoning_effort: Option<&str>,
+    model: Option<&str>,
     stall: &StallConfig,
     cwd: Option<&std::path::Path>,
     env: &HashMap<String, String>,
     state: &AppState,
 ) -> Result<String, (&'static str, String)> {
-    let built = provider::build_command(provider, prompt, explore, reasoning_effort);
+    let built = provider::build_command_with_model(provider, prompt, explore, reasoning_effort, model);
 
     // agy is the only provider that runs inside the bwrap sandbox (see
     // sandbox.rs / egress_proxy.rs for why: agy's own tool-approval gate is
@@ -466,6 +480,11 @@ async fn run_provider(
                     // so this doesn't silently stop cleaning up such a file
                     // if a future agy provider variant ever gains one.
                     output_path: built.output_path.clone(),
+                    // TERM #495: an over-large agy prompt is delivered on stdin
+                    // rather than argv. bwrap forwards its own stdin to the
+                    // sandboxed child, so carry the payload through the wrapper
+                    // unchanged (the spawn site pipes it to bwrap's stdin).
+                    stdin_prompt: built.stdin_prompt.clone(),
                 },
             )
         } else {
@@ -631,7 +650,15 @@ async fn run_built_command(
         .args(&built.args)
         .env_clear()
         .envs(env)
-        .stdin(std::process::Stdio::null())
+        // TERM #495: an over-large prompt (a big diff) is delivered on the child's
+        // stdin instead of as an argv element (which would overflow ARG_MAX and
+        // fail spawn()). Pipe stdin only in that case; the normal path keeps the
+        // exact `Stdio::null()` behavior as before.
+        .stdin(if built.stdin_prompt.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // kill_on_drop so an early return / dropped future never leaves an orphan
@@ -645,6 +672,23 @@ async fn run_built_command(
     let mut child = command
         .spawn()
         .map_err(|e| ("other", format!("failed to spawn {}: {e}", built.binary)))?;
+
+    // TERM #495: feed the over-large prompt to the child on stdin, then close it
+    // (EOF) so the CLI stops reading and begins its review. A big-diff payload can
+    // exceed the OS pipe buffer, so write from a SPAWNED task (concurrent with the
+    // stdout/stderr pumps below) -- a blocking write here, before the readers
+    // start, could deadlock if the child writes to stdout while its stdin pipe is
+    // still full. Dropping the handle after the write closes the pipe.
+    if let Some(payload) = built.stdin_prompt.clone() {
+        if let Some(mut child_stdin) = child.stdin.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt as _;
+                let _ = child_stdin.write_all(payload.as_bytes()).await;
+                let _ = child_stdin.shutdown().await;
+                drop(child_stdin);
+            });
+        }
+    }
 
     // Drain both pipes concurrently, stamping last-output time — so a chatty child
     // never deadlocks on a full pipe AND the watchdog can distinguish progress from
@@ -746,6 +790,7 @@ mod tests {
             binary: "sh",
             args: vec!["-c".into(), "sleep 2 && echo READY".into()],
             output_path: None,
+            stdin_prompt: None,
         };
         let stall = StallConfig { timeout_secs: 30, stall_secs: Some(1) };
         let out = run_built_command(
@@ -768,6 +813,7 @@ mod tests {
             binary: "sh",
             args: vec!["-c".into(), "printf READY; sleep 60".into()],
             output_path: None,
+            stdin_prompt: None,
         };
         // stall window 1s, wall-clock backstop 30s: the stall detector (not the
         // backstop) must fire — fast — once output stops after the immediate print.
@@ -792,6 +838,7 @@ mod tests {
             binary: "sh",
             args: vec!["-c".into(), "sleep 30".into()],
             output_path: None,
+            stdin_prompt: None,
         };
         let stall = StallConfig { timeout_secs: 1, stall_secs: Some(10) };
         let out = run_built_command(

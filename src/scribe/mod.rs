@@ -1159,6 +1159,22 @@ mod tests {
     /// doc comment's note on the live test being environment-blocked).
     #[tokio::test]
     async fn generate_readme_full_flow_with_mocked_daemon() {
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // Skip gracefully in environments where this crate isn't a git
+        // checkout (e.g. the compiler test-gate building from a packaged/
+        // exported source tree without `.git`) rather than failing the
+        // suite -- `inspect::checkout` shells out to `git worktree add`,
+        // which has nothing to operate on there. Same guard as the sibling
+        // real-checkout test in `scribe::inspect` (`real_checkout_and_inspect_
+        // against_this_repo`); this test previously lacked it, which is why
+        // it was flaky in that environment (passes wherever `.git` is
+        // present, e.g. this dev-box worktree, but fails deterministically
+        // wherever it isn't).
+        if !repo.join(".git").exists() {
+            eprintln!("skipping: {} is not a git checkout", repo.display());
+            return;
+        }
+
         let server = httpmock::MockServer::start();
         server.mock(|when, then| {
             when.method(httpmock::Method::POST)
@@ -1167,7 +1183,6 @@ mod tests {
             then.status(200).json_body(json!({"text": "# Sundry\n\nUtility tools."}));
         });
 
-        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let worktree_root = std::env::temp_dir().join(format!(
             "scribe-scrb02-fullflow-{}",
             std::process::id()

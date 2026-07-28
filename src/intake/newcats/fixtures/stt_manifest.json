@@ -1,0 +1,10 @@
+[
+  {
+    "audio_file": "clip_001.wav",
+    "reference": "turn off the lights"
+  },
+  {
+    "audio_file": "clip_002.wav",
+    "reference": "set a timer for ten minutes"
+  }
+]
