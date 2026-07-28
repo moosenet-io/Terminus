@@ -1628,6 +1628,223 @@ fn cargo_build_argv(
 /// instead of stopping at the first (needed for the structured pass/fail +
 /// failing-test summary the gate returns).
 ///
+/// Known non-library cargo target kinds. Anything outside this set *and* the
+/// library set is a shape we do not recognise — see [`TargetLibVerdict`].
+const NON_LIB_KINDS: [&str; 5] = ["bin", "test", "bench", "example", "custom-build"];
+/// Library-ish cargo target kinds — the ones `cargo test --lib` selects.
+const LIB_KINDS: [&str; 6] = ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
+
+/// What a single target's `kind` array tells us.
+#[derive(Debug, PartialEq, Eq)]
+enum TargetLibVerdict {
+    /// Well-formed and library-ish.
+    Lib,
+    /// Well-formed and definitely not a library.
+    NotLib,
+    /// A shape we cannot interpret — empty, non-string, or an unknown kind
+    /// (a future cargo target type could be library-like). Treated as `Lib`
+    /// by the caller, because a wrong "no lib" silently drops library tests.
+    Unknown,
+}
+
+fn classify_target_kind(kind: Option<&Vec<Value>>) -> TargetLibVerdict {
+    let Some(kinds) = kind else {
+        return TargetLibVerdict::Unknown;
+    };
+    if kinds.is_empty() {
+        return TargetLibVerdict::Unknown;
+    }
+    let mut saw_lib = false;
+    for k in kinds {
+        match k.as_str() {
+            Some(k) if LIB_KINDS.contains(&k) => saw_lib = true,
+            Some(k) if NON_LIB_KINDS.contains(&k) => {}
+            // A non-string entry, or a kind neither list knows about.
+            _ => return TargetLibVerdict::Unknown,
+        }
+    }
+    if saw_lib {
+        TargetLibVerdict::Lib
+    } else {
+        TargetLibVerdict::NotLib
+    }
+}
+
+/// Does the package set that `cargo test` will actually SELECT contain a
+/// library target? (TERM #544)
+///
+/// Pure half of the probe, split out so it is testable without a subprocess.
+/// `metadata_json` is the output of `cargo metadata --no-deps`;
+/// `manifest_path` is the manifest the gate will pass to `cargo test`.
+///
+/// **Selection has to mirror `cargo test`'s, not just read every package.**
+/// `cargo metadata` reports every workspace member, but `cargo test` with no
+/// `-p`/`--workspace` selects only some of them — so counting a library in an
+/// unselected sibling would keep `--lib` and then fail on the binary-only
+/// package cargo actually selected, reintroducing the very bug this function
+/// exists to prevent. `workspace_default_members` is cargo's own computed
+/// answer for the given manifest and is used directly; see the inline comment
+/// for the experiment that established this.
+///
+/// Anything unparseable or unrecognised answers `true` — the safe direction,
+/// since a wrong `false` silently drops library tests.
+fn metadata_reports_lib_target(metadata_json: &str, manifest_path: &std::path::Path) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(metadata_json) else {
+        return true;
+    };
+    let Some(packages) = v.get("packages").and_then(Value::as_array) else {
+        return true;
+    };
+
+    // Mirror cargo's own package selection by simply believing cargo.
+    //
+    // This went back and forth across two review rounds, so it was settled
+    // EMPIRICALLY rather than by reasoning about the docs. Constructing a
+    // workspace whose non-virtual root package has a lib, with
+    // `default-members = ["member-a"]` where member-a is binary-only:
+    //
+    //   $ cargo test --lib                      # at the root
+    //   error: no library targets found in package `member-a`
+    //
+    // so cargo selected the DEFAULT MEMBER, not the root package that owns the
+    // manifest — a manifest-match-first rule gets this wrong. And pointing at
+    // a non-default member that does have a lib:
+    //
+    //   $ cargo test --lib --manifest-path member-b/Cargo.toml   # succeeds
+    //   $ cargo metadata --manifest-path member-b/Cargo.toml
+    //     workspace_default_members: ["member-b"]
+    //
+    // The key observation: cargo RECOMPUTES `workspace_default_members`
+    // relative to the manifest it was given. It is therefore already the
+    // authoritative answer for the selection that the matching `cargo test
+    // --manifest-path <same>` will make, in every case — root or member,
+    // virtual or not, explicit default-members or not. Nothing needs to be
+    // re-derived on top of it.
+    let selected: Vec<&Value> = v
+        .get("workspace_default_members")
+        .and_then(Value::as_array)
+        .map(|ids| {
+            let want: std::collections::HashSet<&str> =
+                ids.iter().filter_map(Value::as_str).collect();
+            packages
+                .iter()
+                .filter(|p| {
+                    p.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| want.contains(id))
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|v: &Vec<&Value>| !v.is_empty())
+        .or_else(|| {
+            // Older cargo (< 1.71) omits the field: fall back to the package
+            // this manifest defines.
+            let hit: Vec<&Value> = packages
+                .iter()
+                .filter(|p| {
+                    p.get("manifest_path")
+                        .and_then(Value::as_str)
+                        .is_some_and(|mp| std::path::Path::new(mp) == manifest_path)
+                })
+                .collect();
+            (!hit.is_empty()).then_some(hit)
+        })
+        // Last resort: everything cargo returned, which errs toward keeping
+        // `--lib`.
+        .unwrap_or_else(|| packages.iter().collect());
+
+    // Empty selection = we did not recognise the metadata (cargo always
+    // reports at least one package for a buildable tree, and default-members
+    // that match nothing is a shape we do not understand). Fail safe rather
+    // than letting `.any()` on an empty set answer a confident "no lib".
+    if selected.is_empty() {
+        return true;
+    }
+
+    selected.iter().any(|p| match p.get("targets").and_then(Value::as_array) {
+        // A package with no `targets` is a shape cargo should never emit, so
+        // we are reading something we do not understand: answer safely.
+        None => true,
+        // An EMPTY `targets: []` is likewise not a well-formed "no library"
+        // answer — real cargo always reports at least one target for a
+        // package — so it fails safe too. This does NOT weaken detection: a
+        // genuinely binary-only package reports `targets:[{kind:["bin"]}]`,
+        // which is non-empty and classifies NotLib, so `--lib` is still
+        // correctly dropped for the case this whole function exists to fix.
+        Some(targets) if targets.is_empty() => true,
+        Some(targets) => targets
+            .iter()
+            .any(|t| classify_target_kind(t.get("kind").and_then(Value::as_array)) != TargetLibVerdict::NotLib),
+    })
+}
+
+/// Does the staged crate have a library target? (TERM #544)
+///
+/// **Asks cargo rather than parsing the manifest.** Two review rounds killed a
+/// lexical scanner here, and the second is why this is a subprocess: TOML and
+/// Cargo between them have an unbounded tail of shapes a text scan gets wrong
+/// in the *dangerous* direction (silently dropping `--lib` from a crate that
+/// has a library). Quoted table keys (`["lib"]`) are equivalent to bare ones;
+/// dotted keys and inline tables can define the same table with no literal
+/// `[lib]` anywhere; and `autolib = false` removes the library target even when
+/// `src/lib.rs` exists, which no file-existence check can see. `cargo metadata`
+/// is cargo's own answer to exactly this question, so it is right by
+/// construction for all of them.
+///
+/// Cost is negligible: `--no-deps` skips dependency resolution (no registry
+/// access, no network), it runs once per test gate immediately before a build
+/// measured in minutes, and the same scope already shells out to
+/// `cargo generate-lockfile`.
+///
+/// **Fails safe.** Any failure — cargo missing, non-zero exit, unparseable
+/// output — answers `true`, preserving the pre-TERM-#544 `--lib --bins`
+/// behaviour rather than narrowing the gate for modules that work today.
+fn crate_has_lib_target(source_dir: &std::path::Path) -> bool {
+    let manifest = source_dir.join("Cargo.toml");
+    let out = std::process::Command::new("cargo")
+        .arg("metadata")
+        .arg("--no-deps")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .current_dir(source_dir)
+        .output();
+
+    match out {
+        Ok(o) if o.status.success() => {
+            // Not `from_utf8_lossy`: replacement chars could turn unreadable
+            // output into something that parses to a confident wrong answer.
+            match std::str::from_utf8(&o.stdout) {
+                Ok(text) => metadata_reports_lib_target(text, &manifest),
+                Err(_) => {
+                    tracing::warn!(
+                        "compiler: `cargo metadata` emitted non-UTF8 output while probing \
+                         for a lib target; assuming one exists (keeps --lib)"
+                    );
+                    true
+                }
+            }
+        }
+        Ok(o) => {
+            tracing::warn!(
+                status = ?o.status.code(),
+                "compiler: `cargo metadata` failed while probing for a lib target; \
+                 assuming one exists (keeps --lib, the safe direction)"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "compiler: could not run `cargo metadata` to probe for a lib target; \
+                 assuming one exists (keeps --lib, the safe direction)"
+            );
+            true
+        }
+    }
+}
+
 /// BLD-GATE-06 (TERM #419): defaults to `--lib --bins` (hermetic unit tests)
 /// rather than the whole workspace/crate — integration tests under `tests/`
 /// commonly need live services (gitea/plane/redis/network) that don't exist
@@ -1638,13 +1855,24 @@ fn cargo_build_argv(
 /// pass) — any other value (including unset) keeps the `--lib --bins`
 /// default.
 ///
+/// TERM #544: `--lib` is emitted only when the crate actually HAS a library
+/// target (`has_lib_target`, determined by [`crate_has_lib_target`]). Passing
+/// it to a binary-only crate is a hard cargo error that aborts before any test
+/// runs, which made such modules permanently ungateable.
+///
 /// Also caps the RUN-thread count (distinct from the `-j` BUILD-thread cap
 /// above) via a trailing `-- --test-threads=<N>`: at the host's full core
 /// count (~32) some suites hit test-concurrency flakiness (httpmock /
 /// GPU-exclusive-resource races) that doesn't reproduce at a lower thread
 /// count. `N` comes from env `BUILD_GATE_TEST_THREADS`, defaulting to `8`
 /// when unset, empty, non-numeric, or `0`.
-fn cargo_test_argv(profile: &str, triple: &str, jobs: u32, manifest_path: &str) -> Vec<String> {
+fn cargo_test_argv(
+    profile: &str,
+    triple: &str,
+    jobs: u32,
+    manifest_path: &str,
+    has_lib_target: bool,
+) -> Vec<String> {
     let (profile_flags, _subdir) = profile_flags_and_subdir(profile);
     let mut argv = vec![
         "cargo".to_string(),
@@ -1665,7 +1893,19 @@ fn cargo_test_argv(profile: &str, triple: &str, jobs: u32, manifest_path: &str) 
     if full_workspace {
         argv.push("--workspace".to_string());
     } else {
-        argv.push("--lib".to_string());
+        // `--lib` is a HARD ERROR for a crate with no library target:
+        //   error: no library targets found in package `muse`
+        // cargo exits before running anything, so the gate reports
+        // process_exit_success:false with 0 passed / 0 failed and no summary —
+        // indistinguishable at a glance from a build failure. That is exactly
+        // what made every binary-only module permanently ungateable (TERM #544,
+        // found while gating Muse, which has no src/lib.rs).
+        //
+        // `--bins` is always safe: every module the compiler builds has at
+        // least one binary by definition (that is what it deploys).
+        if has_lib_target {
+            argv.push("--lib".to_string());
+        }
         argv.push("--bins".to_string());
     }
 
@@ -3270,7 +3510,13 @@ impl CompilerBuild {
             .await?;
 
             let cargo_argv = if is_test_mode {
-                cargo_test_argv(&profile, &triple, resolved.caps.jobs, &manifest_str)
+                cargo_test_argv(
+                    &profile,
+                    &triple,
+                    resolved.caps.jobs,
+                    &manifest_str,
+                    crate_has_lib_target(&local_source_dir),
+                )
             } else {
                 cargo_build_argv(&profile, &triple, resolved.caps.jobs, &bin, &manifest_str)
             };
@@ -3656,7 +3902,16 @@ impl CompilerBuild {
             }
 
             let cargo_argv = if is_test_mode {
-                cargo_test_argv(&profile, &triple, resolved.caps.jobs, &remote_manifest)
+                cargo_test_argv(
+                    &profile,
+                    &triple,
+                    resolved.caps.jobs,
+                    &remote_manifest,
+                    // Probe the LOCAL staged tree: the remote build is a
+                    // relay of this exact source, so the local copy is
+                    // authoritative and needs no extra remote round-trip.
+                    crate_has_lib_target(&local_source_dir),
+                )
             } else {
                 cargo_build_argv(&profile, &triple, resolved.caps.jobs, &bin, &remote_manifest)
             };
@@ -4972,6 +5227,241 @@ mod tests {
 
     // ── BLD-COMPTEST: cargo_test_argv (mirrors the cargo_build_argv tests above) ──
 
+    // ── TERM #544: --lib is a hard error on a binary-only crate ──
+
+    /// Minimal `cargo metadata --no-deps` payloads. Only the fields the probe
+    /// reads are present — that is the whole contract with cargo here.
+    fn md(packages: &str) -> String {
+        format!(r#"{{"packages":[{packages}],"version":1}}"#)
+    }
+    fn pkg(id: &str, targets: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","name":"{id}","manifest_path":"/s/{id}/Cargo.toml","targets":[{targets}]}}"#
+        )
+    }
+    fn probe(json: &str) -> bool {
+        metadata_reports_lib_target(json, std::path::Path::new("/s/Cargo.toml"))
+    }
+
+    #[test]
+    fn metadata_probe_says_no_lib_for_a_bin_only_package() {
+        assert!(!probe(&md(&pkg("muse", r#"{"name":"muse","kind":["bin"]}"#))));
+    }
+
+    #[test]
+    fn metadata_probe_sees_every_library_crate_type() {
+        for kind in ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"] {
+            let json = md(&pkg("m", &format!(r#"{{"name":"m","kind":["{kind}"]}}"#)));
+            assert!(probe(&json), "kind {kind} must count as a library target");
+        }
+    }
+
+    #[test]
+    fn metadata_probe_sees_a_lib_alongside_bins_and_tests() {
+        let json = md(&pkg(
+            "m",
+            r#"{"name":"m","kind":["bin"]},{"name":"m","kind":["lib"]},{"name":"it","kind":["test"]}"#,
+        ));
+        assert!(probe(&json));
+    }
+
+    #[test]
+    fn metadata_probe_ignores_a_lib_in_an_unselected_workspace_member() {
+        // The round-3 finding. `cargo metadata` lists every member, but
+        // `cargo test` with no -p/--workspace selects only the default
+        // members. Counting an unselected sibling's lib would pass --lib and
+        // then fail on the binary-only package actually selected — the exact
+        // bug this function exists to prevent.
+        let json = format!(
+            r#"{{"packages":[{},{}],"workspace_default_members":["app"],"version":1}}"#,
+            pkg("app", r#"{"name":"app","kind":["bin"]}"#),
+            pkg("core", r#"{"name":"core","kind":["lib"]}"#),
+        );
+        assert!(
+            !probe(&json),
+            "a lib in an UNSELECTED member must not keep --lib"
+        );
+    }
+
+    #[test]
+    fn metadata_probe_sees_a_lib_in_a_selected_workspace_member() {
+        let json = format!(
+            r#"{{"packages":[{},{}],"workspace_default_members":["core"],"version":1}}"#,
+            pkg("app", r#"{"name":"app","kind":["bin"]}"#),
+            pkg("core", r#"{"name":"core","kind":["lib"]}"#),
+        );
+        assert!(probe(&json));
+    }
+
+    #[test]
+    fn metadata_probe_follows_workspace_default_members_even_for_a_root_package() {
+        // Measured against real cargo, not inferred. A non-virtual root whose
+        // OWN package has a lib, with default-members pointing at a binary-only
+        // member: `cargo test --lib` at that root fails with "no library
+        // targets found in package `member-a`". So the default member is what
+        // cargo selects, and a manifest-match-first rule would wrongly keep
+        // --lib here.
+        let json = format!(
+            r#"{{"packages":[{},{}],"workspace_default_members":["member-a"],"version":1}}"#,
+            r#"{"id":"member-a","name":"member-a","manifest_path":"/s/member-a/Cargo.toml","targets":[{"name":"member-a","kind":["bin"]}]}"#,
+            r#"{"id":"rootpkg","name":"rootpkg","manifest_path":"/s/Cargo.toml","targets":[{"name":"rootpkg","kind":["lib"]}]}"#,
+        );
+        assert!(
+            !metadata_reports_lib_target(&json, std::path::Path::new("/s/Cargo.toml")),
+            "cargo selects the default member, so --lib must be dropped even \
+             though the root package itself has a lib"
+        );
+    }
+
+    #[test]
+    fn metadata_probe_trusts_the_recomputed_default_members_for_a_member_manifest() {
+        // The other measured half: pointing at a non-default member that HAS a
+        // lib, cargo recomputes workspace_default_members to that member and
+        // `cargo test --lib --manifest-path member-b/Cargo.toml` succeeds.
+        let json = format!(
+            r#"{{"packages":[{},{}],"workspace_default_members":["member-b"],"version":1}}"#,
+            r#"{"id":"member-a","name":"member-a","manifest_path":"/s/member-a/Cargo.toml","targets":[{"name":"member-a","kind":["bin"]}]}"#,
+            r#"{"id":"member-b","name":"member-b","manifest_path":"/s/member-b/Cargo.toml","targets":[{"name":"member-b","kind":["lib"]}]}"#,
+        );
+        assert!(
+            metadata_reports_lib_target(&json, std::path::Path::new("/s/member-b/Cargo.toml")),
+            "the selected member has a lib, so --lib must be kept"
+        );
+    }
+
+
+    #[test]
+    fn metadata_probe_uses_default_members_only_for_a_virtual_workspace_root() {
+        // No package's manifest_path matches the probed one (virtual root), so
+        // cargo's default-member selection is what applies.
+        let json = format!(
+            r#"{{"packages":[{},{}],"workspace_default_members":["core"],"version":1}}"#,
+            pkg("app", r#"{"name":"app","kind":["bin"]}"#),
+            pkg("core", r#"{"name":"core","kind":["lib"]}"#),
+        );
+        assert!(probe(&json), "virtual root selects default members (core has a lib)");
+    }
+
+    #[test]
+    fn metadata_probe_falls_back_to_the_matching_manifest_when_defaults_are_absent() {
+        // Older cargo emits no workspace_default_members; select by manifest.
+        let json = format!(
+            r#"{{"packages":[{},{}],"version":1}}"#,
+            r#"{"id":"app","name":"app","manifest_path":"/s/Cargo.toml","targets":[{"name":"app","kind":["bin"]}]}"#,
+            pkg("core", r#"{"name":"core","kind":["lib"]}"#),
+        );
+        assert!(!probe(&json), "must select the package at the probed manifest");
+    }
+
+    #[test]
+    fn metadata_probe_fails_safe_on_an_empty_target_list_and_empty_selection() {
+        // Neither is a well-formed "no library" answer: real cargo always
+        // reports at least one package, and at least one target per package.
+        assert!(probe(&md(&pkg("m", ""))), "empty targets must fail safe");
+        assert!(probe(r#"{"packages":[],"version":1}"#), "empty packages must fail safe");
+        assert!(
+            probe(&format!(
+                r#"{{"packages":[{}],"workspace_default_members":["nonexistent"],"version":1}}"#,
+                pkg("m", r#"{"name":"m","kind":["bin"]}"#)
+            )),
+            "default-members matching no package must fail safe"
+        );
+    }
+
+    #[test]
+    fn failing_safe_on_empty_shapes_does_not_weaken_real_detection() {
+        // The guard against over-correcting: a genuinely binary-only package
+        // still reports a non-empty bin target, so --lib is still dropped for
+        // the case this function exists to fix.
+        assert!(!probe(&md(&pkg("muse", r#"{"name":"muse","kind":["bin"]}"#))));
+    }
+
+    #[test]
+    fn metadata_probe_fails_safe_on_any_kind_shape_it_cannot_interpret() {
+        // Round-3 finding: an empty/non-string/unknown kind is NOT a
+        // well-formed "no library" answer, and a future cargo target kind
+        // could be library-like. All must keep --lib.
+        for target in [
+            r#"{"name":"t","kind":[]}"#,
+            r#"{"name":"t","kind":["unknown-future-kind"]}"#,
+            r#"{"name":"t","kind":[null]}"#,
+            r#"{"name":"t","kind":["bin",123]}"#,
+            r#"{"name":"t"}"#,
+        ] {
+            assert!(
+                probe(&md(&pkg("m", target))),
+                "must fail safe (true) for target: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_probe_fails_safe_on_anything_it_cannot_read() {
+        for json in [
+            "not json at all",
+            "",
+            r#"{"version":1}"#,
+            r#"{"packages":"unexpected shape"}"#,
+            r#"{"packages":[{"name":"m"}]}"#,
+        ] {
+            assert!(probe(json), "must fail safe (true) for: {json:?}");
+        }
+    }
+
+    #[test]
+    fn classify_target_kind_is_exhaustive_about_what_it_knows() {
+        use TargetLibVerdict::*;
+        let arr = |v: serde_json::Value| v.as_array().cloned().unwrap();
+        assert_eq!(classify_target_kind(Some(&arr(json!(["lib"])))), Lib);
+        assert_eq!(classify_target_kind(Some(&arr(json!(["bin"])))), NotLib);
+        assert_eq!(classify_target_kind(Some(&arr(json!(["bin", "test"])))), NotLib);
+        assert_eq!(classify_target_kind(Some(&arr(json!(["bin", "lib"])))), Lib);
+        assert_eq!(classify_target_kind(Some(&arr(json!([])))), Unknown);
+        assert_eq!(classify_target_kind(Some(&arr(json!(["mystery"])))), Unknown);
+        assert_eq!(classify_target_kind(Some(&arr(json!([7])))), Unknown);
+        assert_eq!(classify_target_kind(None), Unknown);
+    }
+
+    #[test]
+    fn cargo_test_argv_omits_lib_for_a_binary_only_crate() {
+        // The regression this fixes. `cargo test --lib` against a crate with no
+        // library target exits immediately with "no library targets found in
+        // package <x>" — 0 passed, 0 failed, no summary — so the gate could
+        // never pass for such a module.
+        let _env = ScopedEnv::new().unset("BUILD_GATE_TESTS");
+        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", false);
+        assert!(
+            !argv.iter().any(|a| a == "--lib"),
+            "must not pass --lib when there is no lib target: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--bins"),
+            "--bins is always safe and must remain: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_test_argv_keeps_lib_when_the_crate_has_one() {
+        let _env = ScopedEnv::new().unset("BUILD_GATE_TESTS");
+        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true);
+        assert!(argv.iter().any(|a| a == "--lib"), "argv: {argv:?}");
+        assert!(argv.iter().any(|a| a == "--bins"), "argv: {argv:?}");
+    }
+
+    #[test]
+    fn workspace_opt_in_ignores_the_lib_target_flag_entirely() {
+        // BUILD_GATE_TESTS=workspace replaces --lib/--bins wholesale, so the
+        // has_lib_target answer must not leak into that path either way.
+        let _env = ScopedEnv::new().set("BUILD_GATE_TESTS", "workspace");
+        for has_lib in [true, false] {
+            let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", has_lib);
+            assert!(argv.iter().any(|a| a == "--workspace"), "argv: {argv:?}");
+            assert!(!argv.iter().any(|a| a == "--lib"), "argv: {argv:?}");
+            assert!(!argv.iter().any(|a| a == "--bins"), "argv: {argv:?}");
+        }
+    }
+
+
     #[test]
     fn cargo_test_argv_release_musl() {
         let argv = cargo_test_argv(
@@ -4979,6 +5469,7 @@ mod tests {
             "x86_64-unknown-linux-musl",
             4,
             "/src/chord/Cargo.toml",
+            true,
         );
         let j = argv.join(" ");
         assert!(j.starts_with("cargo test --locked --release"));
@@ -4993,7 +5484,7 @@ mod tests {
 
     #[test]
     fn cargo_test_argv_debug_has_no_release_flag() {
-        let argv = cargo_test_argv("debug", "t", 8, "/s/Cargo.toml");
+        let argv = cargo_test_argv("debug", "t", 8, "/s/Cargo.toml", true);
         assert!(!argv.iter().any(|a| a == "--release"));
         assert!(argv.windows(2).any(|w| w[0] == "-j" && w[1] == "8"));
         assert!(argv
@@ -5003,7 +5494,7 @@ mod tests {
 
     #[test]
     fn cargo_test_argv_named_profile() {
-        let argv = cargo_test_argv("release-dist", "t", 2, "/s/Cargo.toml");
+        let argv = cargo_test_argv("release-dist", "t", 2, "/s/Cargo.toml", true);
         assert!(argv
             .windows(2)
             .any(|w| w[0] == "--profile" && w[1] == "release-dist"));
@@ -5016,7 +5507,7 @@ mod tests {
         let _env = ScopedEnv::new()
             .unset("BUILD_GATE_TESTS")
             .unset("BUILD_GATE_TEST_THREADS");
-        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true);
         assert!(argv.iter().any(|a| a == "--lib"), "argv: {argv:?}");
         assert!(argv.iter().any(|a| a == "--bins"), "argv: {argv:?}");
         assert!(
@@ -5035,7 +5526,7 @@ mod tests {
     #[test]
     fn cargo_test_argv_build_gate_tests_workspace_opts_in() {
         let _env = ScopedEnv::new().set("BUILD_GATE_TESTS", "workspace");
-        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true);
         assert!(argv.iter().any(|a| a == "--workspace"), "argv: {argv:?}");
         assert!(
             !argv.iter().any(|a| a == "--lib"),
@@ -5050,7 +5541,7 @@ mod tests {
     #[test]
     fn cargo_test_argv_test_threads_env_override() {
         let _env = ScopedEnv::new().set("BUILD_GATE_TEST_THREADS", "4");
-        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true);
         assert!(
             argv.iter().any(|a| a == "--test-threads=4"),
             "argv: {argv:?}"
@@ -5062,13 +5553,13 @@ mod tests {
     fn cargo_test_argv_test_threads_zero_or_garbage_falls_back_to_default() {
         let argv_zero = {
             let _env = ScopedEnv::new().set("BUILD_GATE_TEST_THREADS", "0");
-            cargo_test_argv("release", "t", 4, "/s/Cargo.toml")
+            cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true)
         };
         assert!(argv_zero.iter().any(|a| a == "--test-threads=8"));
 
         let argv_garbage = {
             let _env = ScopedEnv::new().set("BUILD_GATE_TEST_THREADS", "not-a-number");
-            cargo_test_argv("release", "t", 4, "/s/Cargo.toml")
+            cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true)
         };
         assert!(argv_garbage.iter().any(|a| a == "--test-threads=8"));
     }
@@ -5153,7 +5644,7 @@ mod tests {
         // The load-bearing distinction between mode=test and mode=build: the
         // subcommand itself differs, everything else (locked/profile/target/-j/
         // manifest-path) stays parallel.
-        let test_argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        let test_argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true);
         let build_argv = cargo_build_argv("release", "t", 4, "m", "/s/Cargo.toml");
         assert_eq!(test_argv[0], "cargo");
         assert_eq!(test_argv[1], "test");
@@ -5252,7 +5743,7 @@ mod tests {
         let lockgen_scope =
             crate::compiler::scope::render_scope_argv(&lockgen_unit, &caps, &setenv, &lockgen_argv);
 
-        let test_argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        let test_argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true);
         let test_scope = crate::compiler::scope::render_scope_argv(&unit, &caps, &setenv, &test_argv);
 
         // Both are systemd-run scopes on DISTINCT unit names (never collide).
