@@ -43,14 +43,64 @@ use types::{
 
 // ─── PII gate ────────────────────────────────────────────────────────────────
 
-/// Private IP ranges that must not appear in committed content.
+/// Repos exempt from ONLY the RFC-1918 private-IP portion of the PII gate.
 ///
-/// Patterns checked:
-/// - `192.168.x.x`
-/// - `10.x.x.x`
-/// - `172.{16-31}.x.x`
-/// - Bare API key patterns: long hex strings (≥32 chars) or `sk-...` tokens  // pii-test-fixture
-pub(crate) fn pii_check(content: &str) -> Option<String> {
+/// Operator-authorized (2026-07-28): `moosenet/moosenet-infrastructure` is a
+/// PRIVATE Gitea repo with NO public GitHub mirror (never `mirror_ready`), so it
+/// is sanctioned to hold real RFC-1918 IPs for Lumina retrieval — it already
+/// contains real IPs in its older docs. This exemption is deliberately narrow:
+///   * it relaxes ONLY the private-IP check — secret/token/key/password
+///     detection stays fully active for these repos too (see `pii_check_secrets`),
+///   * it is matched by EXACT `owner/name` (never a prefix), so a repo like
+///     `moosenet/moosenet-infrastructure-public` would NOT be exempt, and
+///   * it applies to NO other repo — every mirror-ready / public-mirrored repo
+///     remains fully gated on private IPs.
+///
+/// Fail-closed: this is an explicit exact-match set that can only ever exempt the
+/// one authorized repo (or whatever exact names an operator explicitly lists via
+/// the env override). No input can make it exempt "everything" — a malformed or
+/// blank override collapses to an EMPTY effective set (gate fully ON), never to a
+/// wildcard. See [`ip_exempt_repo`] for the unset-vs-present precedence.
+const DEFAULT_IP_EXEMPT_REPOS: &[&str] = &["moosenet/moosenet-infrastructure"];
+
+/// Optional env override: comma-separated exact `owner/name` entries. When the
+/// var is PRESENT it REPLACES [`DEFAULT_IP_EXEMPT_REPOS`] entirely (whitespace-only
+/// entries are ignored); when it is UNSET the const default applies. This keeps
+/// the allowlist config-driven rather than a bare hardcode, while staying an
+/// explicit exact-match set. Setting it to a blank/garbage value is a valid way
+/// to DISABLE all IP exemptions (gate fully ON) — a safe, fail-closed direction.
+const IP_EXEMPT_REPOS_ENV: &str = "TERMINUS_PII_IP_EXEMPT_REPOS";
+
+/// True iff `owner/repo` is on the RFC-1918 IP exemption allowlist (exact match).
+///
+/// Precedence, fail-closed by construction:
+///   * env var UNSET  → use the operator-authorized [`DEFAULT_IP_EXEMPT_REPOS`].
+///   * env var PRESENT → it fully REPLACES the default; only the exact `owner/name`
+///     entries it lists are exempt. A blank/whitespace/garbage value therefore
+///     parses to an empty set → nothing is exempt → gate stays fully ON.
+///
+/// In every branch the result is an exact match against a finite, explicit set;
+/// no input can exempt anything other than a precisely-named repo, so a typo or
+/// empty config can only over-BLOCK (safe), never over-exempt.
+fn ip_exempt_repo(owner: &str, repo: &str) -> bool {
+    let full = format!("{owner}/{repo}");
+    match std::env::var(IP_EXEMPT_REPOS_ENV) {
+        // Present (even if blank): replace the default with exactly what's listed.
+        Ok(val) => val
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .any(|entry| entry == full),
+        // Unset: operator-authorized const default.
+        Err(_) => DEFAULT_IP_EXEMPT_REPOS.contains(&full.as_str()),
+    }
+}
+
+/// RFC-1918 private-IP portion of the PII gate. Split out from [`pii_check`] so
+/// that a narrowly-scoped, operator-authorized repo exemption (see
+/// [`ip_exempt_repo`]) can skip ONLY this check while every secret check in
+/// [`pii_check_secrets`] still runs.
+fn pii_check_private_ip(content: &str) -> Option<String> {
     // Private IP ranges
     let private_ip_patterns: &[(&str, &str)] = &[
         ("192.168.", "RFC-1918 192.168.x.x address"),
@@ -95,6 +145,13 @@ pub(crate) fn pii_check(content: &str) -> Option<String> {
         }
     }
 
+    None
+}
+
+/// Secret-shaped detection (API keys, long hex tokens). ALWAYS runs, including
+/// for IP-exempt repos — the operator exemption is for RFC-1918 IPs ONLY and
+/// never relaxes token/key/password detection.
+fn pii_check_secrets(content: &str) -> Option<String> {
     // API key patterns: `sk-` prefixed tokens (OpenAI-style)  // pii-test-fixture
     if content.contains("sk-") {  // pii-test-fixture
         let sk_idx = content.find("sk-").unwrap();  // pii-test-fixture
@@ -128,6 +185,41 @@ pub(crate) fn pii_check(content: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Full PII gate (private IPs + secrets), with NO repo exemption. This is the
+/// repo-agnostic guard used where no per-repo exemption applies — e.g. the PR
+/// body path. Kept as the conservative default.
+///
+/// Patterns checked:
+/// - `192.168.x.x`
+/// - `10.x.x.x`
+/// - `172.{16-31}.x.x`
+/// - Bare API key patterns: long hex strings (≥32 chars) or `sk-...` tokens  // pii-test-fixture
+pub(crate) fn pii_check(content: &str) -> Option<String> {
+    if let Some(reason) = pii_check_private_ip(content) {
+        return Some(reason);
+    }
+    pii_check_secrets(content)
+}
+
+/// Repo-aware PII gate for the sanctioned file write-path
+/// (`gitea_create_file` / `gitea_update_file`).
+///
+/// Behaves exactly like [`pii_check`] EXCEPT that, when `owner/repo` is on the
+/// narrow operator-authorized exemption allowlist (see [`ip_exempt_repo`]), the
+/// RFC-1918 private-IP check is skipped. Secret/token/key detection
+/// ([`pii_check_secrets`]) ALWAYS runs regardless of exemption, so tokens/keys/
+/// passwords stay blocked everywhere — the exemption is IP-only, one-repo-only,
+/// exact-match, and fail-closed.
+pub(crate) fn pii_check_for_repo(owner: &str, repo: &str, content: &str) -> Option<String> {
+    if !ip_exempt_repo(owner, repo) {
+        if let Some(reason) = pii_check_private_ip(content) {
+            return Some(reason);
+        }
+    }
+    // Secret detection is never exempt.
+    pii_check_secrets(content)
 }
 
 // ─── GiteaClient ─────────────────────────────────────────────────────────────
@@ -1456,8 +1548,9 @@ impl CreateFile {
             .ok_or_else(|| ToolError::InvalidArgument("'message' is required".to_string()))?;
         let owner = client.resolve_owner(args["owner"].as_str());
 
-        // PII gate
-        if let Some(reason) = pii_check(content) {
+        // PII gate (repo-aware: RFC-1918 IPs may be exempt for the private,
+        // never-mirrored infra repo; secrets stay blocked everywhere).
+        if let Some(reason) = pii_check_for_repo(owner, repo, content) {
             warn!("PII gate blocked create_file on {owner}/{repo}/{path}: {reason}");
             return Err(ToolError::InvalidArgument(format!(
                 "Content rejected by PII gate: {reason}"
@@ -1624,8 +1717,10 @@ impl UpdateFile {
             .ok_or_else(|| ToolError::InvalidArgument("'message' is required".to_string()))?;
         let owner = client.resolve_owner(args["owner"].as_str());
 
-        // PII gate before fetching SHA (fail fast)
-        if let Some(reason) = pii_check(content) {
+        // PII gate before fetching SHA (fail fast). Repo-aware: RFC-1918 IPs may
+        // be exempt for the private, never-mirrored infra repo; secrets stay
+        // blocked everywhere.
+        if let Some(reason) = pii_check_for_repo(owner, repo, content) {
             warn!("PII gate blocked update_file on {owner}/{repo}/{path}: {reason}");
             return Err(ToolError::InvalidArgument(format!(
                 "Content rejected by PII gate: {reason}"
@@ -4239,6 +4334,175 @@ mod tests {
     fn test_pii_gate_allows_clean_content() {
         let result = pii_check("# README\nThis is a normal markdown file with no secrets.");
         assert!(result.is_none(), "Clean content should pass PII gate");
+    }
+
+    // ── IP-exemption allowlist tests (moosenet/moosenet-infrastructure) ─────
+    //
+    // These exercise `pii_check_for_repo` / `ip_exempt_repo`, which read a
+    // process-global env var. Serialize them and save/restore the var so they
+    // cannot interfere with each other or with the plain `pii_check` tests.
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_exempt_env<R>(val: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(IP_EXEMPT_REPOS_ENV).ok();
+        match val {
+            Some(v) => std::env::set_var(IP_EXEMPT_REPOS_ENV, v),
+            None => std::env::remove_var(IP_EXEMPT_REPOS_ENV),
+        }
+        let out = f();
+        match prev {
+            Some(p) => std::env::set_var(IP_EXEMPT_REPOS_ENV, p),
+            None => std::env::remove_var(IP_EXEMPT_REPOS_ENV),
+        }
+        out
+    }
+
+    // RFC-1918 literals used purely as fixtures to exercise the gate itself.
+    // The literal only ever appears on these tagged definition lines; every
+    // test references the const, so no test body carries a raw private IP.
+    const FIX_192: &str = "The GPU host is at <internal-ip>"; // pii-test-fixture
+    const FIX_10: &str = "gitea <internal-ip>"; // pii-test-fixture
+    const FIX_172: &str = "svc <internal-ip>"; // pii-test-fixture
+    const FIX_IP1: &str = "host <internal-ip>"; // pii-test-fixture
+
+    #[test]
+    fn test_ip_exempt_infra_repo_allows_192_168() {
+        // Real RFC-1918 IP targeting the authorized private, never-mirrored repo → ALLOWED.
+        with_exempt_env(None, || {
+            let result = pii_check_for_repo("moosenet", "moosenet-infrastructure", FIX_192);
+            assert!(
+                result.is_none(),
+                "192.168 IP must be allowed for the exempt infra repo, got: {result:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_ip_exempt_infra_repo_allows_10_and_172() {
+        with_exempt_env(None, || {
+            assert!(
+                pii_check_for_repo("moosenet", "moosenet-infrastructure", FIX_10).is_none(),
+                "10.x must be allowed for the exempt infra repo"
+            );
+            assert!(
+                pii_check_for_repo("moosenet", "moosenet-infrastructure", FIX_172).is_none(),
+                "172.16-31.x must be allowed for the exempt infra repo"
+            );
+        });
+    }
+
+    #[test]
+    fn test_ip_gate_still_blocks_other_repo() {
+        // Same IP targeting a DIFFERENT (mirror-ready) repo → still REJECTED.
+        with_exempt_env(None, || {
+            let result = pii_check_for_repo("moosenet", "Chord", FIX_192);
+            assert!(
+                result.is_some(),
+                "192.168 IP must still be blocked for non-exempt repo moosenet/Chord"
+            );
+        });
+    }
+
+    #[test]
+    fn test_ip_exemption_is_exact_match_not_prefix() {
+        // A repo that merely shares the exempt name as a prefix must NOT be exempt.
+        with_exempt_env(None, || {
+            assert!(
+                pii_check_for_repo("moosenet", "moosenet-infrastructure-public", FIX_IP1).is_some(),
+                "prefix-only match must not be exempt (exact owner/name only)"
+            );
+            // Different owner, same repo name → not exempt either.
+            assert!(
+                pii_check_for_repo("someoneelse", "moosenet-infrastructure", FIX_IP1).is_some(),
+                "different owner must not be exempt"
+            );
+        });
+    }
+
+    #[test]
+    fn test_secret_still_blocked_in_exempt_repo() {
+        // Exemption is IP-only: tokens/keys stay blocked even for the infra repo.
+        with_exempt_env(None, || {
+            let sk = pii_check_for_repo(
+                "moosenet",
+                "moosenet-infrastructure",
+                "token=<REDACTED-SECRET>", // pii-test-fixture
+            );
+            assert!(
+                sk.is_some(),
+                "sk- token must stay blocked in the exempt repo"
+            );
+
+            let hex = pii_check_for_repo(
+                "moosenet",
+                "moosenet-infrastructure",
+                "secret=abcdef1234567890abcdef1234567890ab", // pii-test-fixture
+            );
+            assert!(
+                hex.is_some(),
+                "long hex secret must stay blocked in the exempt repo"
+            );
+        });
+    }
+
+    #[test]
+    fn test_env_override_replaces_default_allowlist() {
+        // A non-blank override REPLACES the const default (exact match, multi-entry).
+        with_exempt_env(Some("moosenet/other-private,foo/bar"), || {
+            assert!(
+                pii_check_for_repo("moosenet", "other-private", FIX_IP1).is_none(),
+                "repo listed in env override must be exempt"
+            );
+            // The const default is no longer active once the env override is set.
+            assert!(
+                pii_check_for_repo("moosenet", "moosenet-infrastructure", FIX_IP1).is_some(),
+                "const default must not apply when env override replaces it"
+            );
+        });
+    }
+
+    #[test]
+    fn test_unset_env_uses_const_default() {
+        // Env UNSET → operator-authorized const default exempts the infra repo.
+        with_exempt_env(None, || {
+            assert!(
+                pii_check_for_repo("moosenet", "moosenet-infrastructure", FIX_IP1).is_none(),
+                "unset env should fall back to the const default (infra repo exempt)"
+            );
+        });
+    }
+
+    #[test]
+    fn test_blank_or_malformed_env_gate_fully_on() {
+        // Fail-closed: a PRESENT-but-blank/garbage override replaces the default
+        // and parses to an EMPTY set → nothing exempt, gate fully ON. Crucially it
+        // must never exempt everything, and it disables even the infra default.
+        for bad in ["", "   ", ",, ,"] {
+            with_exempt_env(Some(bad), || {
+                assert!(
+                    pii_check_for_repo("moosenet", "moosenet-infrastructure", FIX_IP1).is_some(),
+                    "blank/malformed override ({bad:?}) must leave gate fully ON (nothing exempt)"
+                );
+                assert!(
+                    pii_check_for_repo("moosenet", "Chord", FIX_IP1).is_some(),
+                    "blank/malformed override ({bad:?}) must NOT exempt any repo"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn test_ip_exempt_repo_helper_exact_semantics() {
+        with_exempt_env(None, || {
+            assert!(ip_exempt_repo("moosenet", "moosenet-infrastructure"));
+            assert!(!ip_exempt_repo(
+                "moosenet",
+                "moosenet-infrastructure-public"
+            ));
+            assert!(!ip_exempt_repo("moosenet", "Chord"));
+        });
     }
 
     // ── list_repos ────────────────────────────────────────────────────────
