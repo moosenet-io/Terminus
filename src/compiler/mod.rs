@@ -1651,18 +1651,25 @@ fn metadata_reports_lib_target(metadata_json: &str) -> bool {
     let Some(packages) = v.get("packages").and_then(Value::as_array) else {
         return true;
     };
-    packages.iter().any(|p| {
-        p.get("targets")
-            .and_then(Value::as_array)
-            .is_some_and(|targets| {
-                targets.iter().any(|t| {
-                    t.get("kind").and_then(Value::as_array).is_some_and(|kinds| {
-                        kinds
-                            .iter()
-                            .any(|k| k.as_str().is_some_and(|k| LIB_KINDS.contains(&k)))
-                    })
-                })
-            })
+    // Note the `None => true` arms: a package with no `targets`, or a target
+    // with no `kind`, is a shape cargo should never emit — so it means we are
+    // reading something we do not understand, and the safe answer to "does a
+    // lib exist?" is yes. (A caught-by-its-own-test detail: an earlier version
+    // used `is_some_and`, which collapses those to `false` and would have
+    // dropped `--lib` on a payload it merely failed to recognise.)
+    //
+    // An EMPTY `targets: []` is different and correctly yields `false` — that
+    // is a well-formed statement that the package has no targets at all.
+    packages.iter().any(|p| match p.get("targets").and_then(Value::as_array) {
+        None => true,
+        Some(targets) => targets
+            .iter()
+            .any(|t| match t.get("kind").and_then(Value::as_array) {
+                None => true,
+                Some(kinds) => kinds
+                    .iter()
+                    .any(|k| k.as_str().is_some_and(|k| LIB_KINDS.contains(&k))),
+            }),
     })
 }
 
@@ -5149,6 +5156,17 @@ mod tests {
             {"name":"core","targets":[{"name":"core","kind":["lib"]}]}
         ],"version":1}"#;
         assert!(metadata_reports_lib_target(json));
+    }
+
+    #[test]
+    fn metadata_probe_says_no_lib_for_a_well_formed_empty_target_list() {
+        // Distinct from the malformed cases above: an empty `targets` array is
+        // a well-formed statement that there are no targets, so it must NOT be
+        // treated as uncertain — otherwise nothing would ever be detected as
+        // binary-only and the original bug would return.
+        assert!(!metadata_reports_lib_target(
+            r#"{"packages":[{"name":"m","targets":[]}],"version":1}"#
+        ));
     }
 
     #[test]
