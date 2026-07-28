@@ -1628,93 +1628,98 @@ fn cargo_build_argv(
 /// instead of stopping at the first (needed for the structured pass/fail +
 /// failing-test summary the gate returns).
 ///
-/// The bare name of a TOML table header, if `line` is one (TERM #544).
+/// Does the resolved package set contain a library target? (TERM #544)
 ///
-/// Handles the shapes a hand-written `Cargo.toml` actually uses:
-/// `[lib]`, `[lib] # comment`, and `[ lib ]`. Returns `None` for anything
-/// else, including array-of-table headers (`[[bin]]`), which this caller does
-/// not care about.
+/// Pure half of the probe, split out so it is testable without a subprocess.
+/// `metadata_json` is the output of `cargo metadata --no-deps`.
 ///
-/// Stripping at the first `#` is safe for the three bare names this is used
-/// for — none of them can appear as a quoted key containing a `#` — and the
-/// caller pairs it with a raw substring check anyway, so a miss here can only
-/// ever fall back to the safe answer.
-fn toml_table_header(line: &str) -> Option<&str> {
-    let line = line.trim();
-    let line = line.split('#').next().unwrap_or("").trim();
-    // Reject `[[array-of-table]]` — not a plain table header.
-    if line.starts_with("[[") {
-        return None;
-    }
-    let inner = line.strip_prefix('[')?.strip_suffix(']')?.trim();
-    if inner.is_empty() {
-        None
-    } else {
-        Some(inner)
-    }
+/// Returns `true` if ANY package exposes a library-ish target. That is the
+/// right predicate for the flag it guards: `cargo test --lib` at a workspace
+/// root succeeds as long as at least one selected package has a lib, and
+/// errors only when none does.
+///
+/// A malformed or unparseable payload answers `true` — the safe direction,
+/// since a wrong `false` silently drops library tests.
+fn metadata_reports_lib_target(metadata_json: &str) -> bool {
+    // `lib` is the common case; the rest are the other library crate-types
+    // cargo can emit, all of which `--lib` legitimately selects.
+    const LIB_KINDS: [&str; 6] = ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
+
+    let Ok(v) = serde_json::from_str::<Value>(metadata_json) else {
+        return true;
+    };
+    let Some(packages) = v.get("packages").and_then(Value::as_array) else {
+        return true;
+    };
+    packages.iter().any(|p| {
+        p.get("targets")
+            .and_then(Value::as_array)
+            .is_some_and(|targets| {
+                targets.iter().any(|t| {
+                    t.get("kind").and_then(Value::as_array).is_some_and(|kinds| {
+                        kinds
+                            .iter()
+                            .any(|k| k.as_str().is_some_and(|k| LIB_KINDS.contains(&k)))
+                    })
+                })
+            })
+    })
 }
 
 /// Does the staged crate have a library target? (TERM #544)
 ///
-/// Used to decide whether `cargo test` may be given `--lib`. Deliberately
-/// **conservative: it returns `true` unless it can positively prove there is no
-/// lib target**, so an unreadable/unexpected manifest keeps the pre-existing
-/// `--lib --bins` behaviour rather than silently narrowing what the gate runs
-/// for the modules that work today.
+/// **Asks cargo rather than parsing the manifest.** Two review rounds killed a
+/// lexical scanner here, and the second is why this is a subprocess: TOML and
+/// Cargo between them have an unbounded tail of shapes a text scan gets wrong
+/// in the *dangerous* direction (silently dropping `--lib` from a crate that
+/// has a library). Quoted table keys (`["lib"]`) are equivalent to bare ones;
+/// dotted keys and inline tables can define the same table with no literal
+/// `[lib]` anywhere; and `autolib = false` removes the library target even when
+/// `src/lib.rs` exists, which no file-existence check can see. `cargo metadata`
+/// is cargo's own answer to exactly this question, so it is right by
+/// construction for all of them.
 ///
-/// It answers `false` only for the unambiguous case: a single-package manifest
-/// with no `[workspace]` members, no explicit `[lib]` section, and no
-/// `src/lib.rs` beside it. That is precisely the binary-only shape (Muse) that
-/// `--lib` aborts on.
+/// Cost is negligible: `--no-deps` skips dependency resolution (no registry
+/// access, no network), it runs once per test gate immediately before a build
+/// measured in minutes, and the same scope already shells out to
+/// `cargo generate-lockfile`.
 ///
-/// A deliberately simple line scan rather than a TOML parse or a
-/// `cargo metadata` subprocess: this runs on the hot path of every test gate,
-/// the three facts it needs are all top-level section headers, and being wrong
-/// in the safe direction costs nothing.
+/// **Fails safe.** Any failure — cargo missing, non-zero exit, unparseable
+/// output — answers `true`, preserving the pre-TERM-#544 `--lib --bins`
+/// behaviour rather than narrowing the gate for modules that work today.
 fn crate_has_lib_target(source_dir: &std::path::Path) -> bool {
     let manifest = source_dir.join("Cargo.toml");
-    let Ok(text) = std::fs::read_to_string(&manifest) else {
-        // Can't read it — assume a lib exists (pre-TERM-#544 behaviour).
-        return true;
-    };
+    let out = std::process::Command::new("cargo")
+        .arg("metadata")
+        .arg("--no-deps")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .current_dir(source_dir)
+        .output();
 
-    // Detection is biased toward `true` on purpose, and asymmetrically so.
-    // Failing to notice `[package]` costs nothing (we return true anyway), but
-    // failing to notice `[lib]` or `[workspace]` would DROP `--lib` from a
-    // crate that has a library — the exact coverage narrowing this function
-    // exists to avoid. A review caught the first version doing precisely that
-    // on `[lib] # explicit target`, since it compared whole trimmed lines and
-    // TOML permits a comment after a table header (and whitespace inside the
-    // brackets: `[ lib ]` is equally valid).
-    //
-    // So each header is matched two ways and either is enough: a parsed header
-    // (comment-stripped, brackets removed, inner name trimmed) OR a raw
-    // substring hit. The raw pass means even a `[lib]` mentioned only in a
-    // comment keeps `--lib` — over-detection is harmless here, under-detection
-    // is not.
-    let mut has_package = false;
-    // Seeded from the raw text so a header this scanner fails to parse still
-    // counts; the loop below can only ever add to these, never clear them.
-    let mut has_workspace = text.contains("[workspace]");
-    let mut has_lib_section = text.contains("[lib]");
-    for line in text.lines() {
-        if let Some(name) = toml_table_header(line) {
-            match name {
-                "package" => has_package = true,
-                "workspace" => has_workspace = true,
-                "lib" => has_lib_section = true,
-                _ => {}
-            }
+    match out {
+        Ok(o) if o.status.success() => {
+            metadata_reports_lib_target(&String::from_utf8_lossy(&o.stdout))
+        }
+        Ok(o) => {
+            tracing::warn!(
+                status = ?o.status.code(),
+                "compiler: `cargo metadata` failed while probing for a lib target; \
+                 assuming one exists (keeps --lib, the safe direction)"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "compiler: could not run `cargo metadata` to probe for a lib target; \
+                 assuming one exists (keeps --lib, the safe direction)"
+            );
+            true
         }
     }
-
-    // A workspace (virtual or otherwise) may have members that carry libs;
-    // don't try to reason about them here, keep the old behaviour.
-    if has_workspace || has_lib_section || !has_package {
-        return true;
-    }
-
-    source_dir.join("src").join("lib.rs").exists()
 }
 
 /// BLD-GATE-06 (TERM #419): defaults to `--lib --bins` (hermetic unit tests)
@@ -5101,6 +5106,79 @@ mod tests {
 
     // ── TERM #544: --lib is a hard error on a binary-only crate ──
 
+    /// Minimal `cargo metadata --no-deps` payloads. Only the fields the probe
+    /// reads are present — that is the whole contract with cargo here.
+    fn metadata_with(targets: &str) -> String {
+        format!(r#"{{"packages":[{{"name":"m","targets":[{targets}]}}],"version":1}}"#)
+    }
+
+    #[test]
+    fn metadata_probe_says_no_lib_for_a_bin_only_package() {
+        let json = metadata_with(r#"{"name":"muse","kind":["bin"]}"#);
+        assert!(!metadata_reports_lib_target(&json));
+    }
+
+    #[test]
+    fn metadata_probe_sees_every_library_crate_type() {
+        // These are the shapes a lexical manifest scan kept getting wrong —
+        // a custom-path lib, a quoted ["lib"] key, autolib=false — all of which
+        // cargo resolves for us, so the probe only has to read the answer.
+        for kind in ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"] {
+            let json = metadata_with(&format!(r#"{{"name":"m","kind":["{kind}"]}}"#));
+            assert!(
+                metadata_reports_lib_target(&json),
+                "kind {kind} must count as a library target"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_probe_sees_a_lib_alongside_bins_and_tests() {
+        let json = metadata_with(
+            r#"{"name":"m","kind":["bin"]},{"name":"m","kind":["lib"]},{"name":"it","kind":["test"]}"#,
+        );
+        assert!(metadata_reports_lib_target(&json));
+    }
+
+    #[test]
+    fn metadata_probe_sees_a_lib_in_any_workspace_member() {
+        // `cargo test --lib` at a workspace root succeeds when at least one
+        // selected package has a lib, so "any package" is the right predicate.
+        let json = r#"{"packages":[
+            {"name":"app","targets":[{"name":"app","kind":["bin"]}]},
+            {"name":"core","targets":[{"name":"core","kind":["lib"]}]}
+        ],"version":1}"#;
+        assert!(metadata_reports_lib_target(json));
+    }
+
+    #[test]
+    fn metadata_probe_says_no_lib_when_no_workspace_member_has_one() {
+        let json = r#"{"packages":[
+            {"name":"app","targets":[{"name":"app","kind":["bin"]}]},
+            {"name":"tool","targets":[{"name":"tool","kind":["bin"]}]}
+        ],"version":1}"#;
+        assert!(!metadata_reports_lib_target(json));
+    }
+
+    #[test]
+    fn metadata_probe_fails_safe_on_anything_it_cannot_read() {
+        // A wrong `false` silently drops library tests, so every uncertain
+        // input must answer `true`.
+        for json in [
+            "not json at all",
+            "",
+            r#"{"version":1}"#,                                  // no packages key
+            r#"{"packages":"unexpected shape"}"#,
+            r#"{"packages":[{"name":"m"}]}"#,                    // package with no targets
+            r#"{"packages":[{"name":"m","targets":[{"name":"t"}]}]}"#, // target with no kind
+        ] {
+            assert!(
+                metadata_reports_lib_target(json),
+                "must fail safe (true) for: {json:?}"
+            );
+        }
+    }
+
     #[test]
     fn cargo_test_argv_omits_lib_for_a_binary_only_crate() {
         // The regression this fixes. `cargo test --lib` against a crate with no
@@ -5140,113 +5218,6 @@ mod tests {
         }
     }
 
-    /// A throwaway crate dir for the [`crate_has_lib_target`] probe tests.
-    struct ProbeDir(std::path::PathBuf);
-    impl ProbeDir {
-        fn new(tag: &str, manifest: &str) -> Self {
-            let mut p = std::env::temp_dir();
-            p.push(format!("term544-{}-{}", tag, std::process::id()));
-            let _ = std::fs::remove_dir_all(&p);
-            std::fs::create_dir_all(p.join("src")).expect("mkdir");
-            std::fs::write(p.join("Cargo.toml"), manifest).expect("write manifest");
-            Self(p)
-        }
-        fn with_lib_rs(self) -> Self {
-            std::fs::write(self.0.join("src").join("lib.rs"), "// lib").expect("write lib.rs");
-            self
-        }
-        fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-    impl Drop for ProbeDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn probe_says_no_lib_for_a_bin_only_package() {
-        let d = ProbeDir::new("binonly", "[package]\nname = \"muse\"\n\n[[bin]]\nname = \"muse\"\n");
-        assert!(!crate_has_lib_target(d.path()));
-    }
-
-    #[test]
-    fn probe_says_lib_when_src_lib_rs_exists() {
-        let d = ProbeDir::new("librs", "[package]\nname = \"t\"\n").with_lib_rs();
-        assert!(crate_has_lib_target(d.path()));
-    }
-
-    #[test]
-    fn probe_says_lib_for_an_explicit_lib_section() {
-        let d = ProbeDir::new("libsec", "[package]\nname = \"t\"\n\n[lib]\npath = \"src/other.rs\"\n");
-        assert!(crate_has_lib_target(d.path()));
-    }
-
-    #[test]
-    fn probe_sees_a_lib_header_with_a_trailing_comment_or_inner_spaces() {
-        // The review finding. TOML allows a comment after a table header and
-        // whitespace inside the brackets; the first version compared whole
-        // trimmed lines, so `[lib] # ...` was missed and a crate with an
-        // explicit library target (custom path, no src/lib.rs) silently lost
-        // --lib — the precise coverage narrowing this function exists to stop.
-        for manifest in [
-            "[package]\nname = \"x\"\n\n[lib] # explicit library target\npath = \"src/custom.rs\"\n",
-            "[package]\nname = \"x\"\n\n[ lib ]\npath = \"src/custom.rs\"\n",
-            "[package]\nname = \"x\"\n\n  [lib]\t# tabbed\npath = \"src/custom.rs\"\n",
-        ] {
-            let d = ProbeDir::new("libcomment", manifest);
-            assert!(
-                crate_has_lib_target(d.path()),
-                "must detect the lib target in: {manifest:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn probe_sees_a_workspace_header_with_a_trailing_comment() {
-        let d = ProbeDir::new("wscomment", "[workspace] # virtual\nmembers = [\"a\"]\n");
-        assert!(crate_has_lib_target(d.path()));
-    }
-
-    #[test]
-    fn probe_still_says_no_lib_for_a_genuinely_bin_only_manifest() {
-        // The hardening must not swing so far that nothing is ever detected as
-        // binary-only — that would leave the original bug in place.
-        let d = ProbeDir::new(
-            "binonly2",
-            "[package] # the app\nname = \"muse\"\n\n[[bin]] # not a lib\nname = \"muse\"\n",
-        );
-        assert!(!crate_has_lib_target(d.path()));
-    }
-
-    #[test]
-    fn toml_table_header_parses_the_shapes_that_matter() {
-        assert_eq!(toml_table_header("[lib]"), Some("lib"));
-        assert_eq!(toml_table_header("  [lib]  "), Some("lib"));
-        assert_eq!(toml_table_header("[lib] # comment"), Some("lib"));
-        assert_eq!(toml_table_header("[ lib ]"), Some("lib"));
-        assert_eq!(toml_table_header("[package]"), Some("package"));
-        // array-of-table is not a plain header
-        assert_eq!(toml_table_header("[[bin]]"), None);
-        // not a header at all
-        assert_eq!(toml_table_header("name = \"x\""), None);
-        assert_eq!(toml_table_header("# [lib] in a comment"), None);
-        assert_eq!(toml_table_header(""), None);
-    }
-
-    #[test]
-    fn probe_is_conservative_for_a_workspace_and_for_an_unreadable_manifest() {
-        // A workspace may have members carrying libs — keep the old behaviour
-        // rather than reasoning about members here.
-        let ws = ProbeDir::new("ws", "[workspace]\nmembers = [\"a\"]\n");
-        assert!(crate_has_lib_target(ws.path()));
-
-        // And an absent/unreadable manifest must never NARROW the gate.
-        let missing = std::env::temp_dir().join("term544-definitely-absent");
-        let _ = std::fs::remove_dir_all(&missing);
-        assert!(crate_has_lib_target(&missing));
-    }
 
     #[test]
     fn cargo_test_argv_release_musl() {
