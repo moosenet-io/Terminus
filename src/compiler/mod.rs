@@ -1684,9 +1684,10 @@ fn classify_target_kind(kind: Option<&Vec<Value>>) -> TargetLibVerdict {
 /// library in an unselected sibling member would answer `true`, `--lib` would
 /// be passed, and cargo would then fail on the binary-only package it actually
 /// selected — reintroducing the very bug this function exists to prevent. So
-/// selection is taken from `workspace_default_members` when cargo reports it
-/// (cargo ≥ 1.71; the fleet pins 1.97), falling back to the package whose
-/// `manifest_path` matches, and only then to "all packages".
+/// selection follows cargo's precedence: the package this manifest *defines*
+/// wins, and `workspace_default_members` applies only when the manifest
+/// defines none (a virtual workspace root), falling back last to "all
+/// packages".
 ///
 /// Anything unparseable or unrecognised answers `true` — the safe direction,
 /// since a wrong `false` silently drops library tests.
@@ -1698,41 +1699,48 @@ fn metadata_reports_lib_target(metadata_json: &str, manifest_path: &std::path::P
         return true;
     };
 
-    // Mirror cargo's own package selection.
+    // Mirror cargo's own package selection, in cargo's own precedence order.
+    //
+    // Round 4 caught this the wrong way round. `--manifest-path` pointing at a
+    // package manifest selects THAT package — `workspace_default_members` is
+    // only what cargo falls back to when the manifest defines no package of
+    // its own, i.e. a *virtual* workspace root. Preferring default-members
+    // unconditionally got both directions wrong: it could drop `--lib` for a
+    // selected member that has a library, and keep `--lib` for a selected
+    // binary-only member whose sibling has one.
     let selected: Vec<&Value> = {
-        let by_default_members = v
-            .get("workspace_default_members")
-            .and_then(Value::as_array)
-            .filter(|ids| !ids.is_empty())
-            .map(|ids| {
-                let want: std::collections::HashSet<&str> =
-                    ids.iter().filter_map(Value::as_str).collect();
-                packages
-                    .iter()
-                    .filter(|p| {
-                        p.get("id")
-                            .and_then(Value::as_str)
-                            .is_some_and(|id| want.contains(id))
-                    })
-                    .collect::<Vec<_>>()
+        // 1. The package this exact manifest defines, if any.
+        let by_manifest: Vec<&Value> = packages
+            .iter()
+            .filter(|p| {
+                p.get("manifest_path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|mp| std::path::Path::new(mp) == manifest_path)
             })
-            .filter(|v: &Vec<&Value>| !v.is_empty());
-
-        by_default_members
-            .or_else(|| {
-                // Older cargo: fall back to the package this manifest defines.
-                let hit: Vec<&Value> = packages
-                    .iter()
-                    .filter(|p| {
-                        p.get("manifest_path")
-                            .and_then(Value::as_str)
-                            .is_some_and(|mp| std::path::Path::new(mp) == manifest_path)
-                    })
-                    .collect();
-                (!hit.is_empty()).then_some(hit)
-            })
-            // Last resort: everything cargo returned.
-            .unwrap_or_else(|| packages.iter().collect())
+            .collect();
+        if !by_manifest.is_empty() {
+            by_manifest
+        } else {
+            // 2. Virtual workspace root: cargo selects the default members.
+            v.get("workspace_default_members")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    let want: std::collections::HashSet<&str> =
+                        ids.iter().filter_map(Value::as_str).collect();
+                    packages
+                        .iter()
+                        .filter(|p| {
+                            p.get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| want.contains(id))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .filter(|v: &Vec<&Value>| !v.is_empty())
+                // 3. Nothing matched (older cargo, unexpected shape): consider
+                //    everything, which errs toward keeping `--lib`.
+                .unwrap_or_else(|| packages.iter().collect())
+        }
     };
 
     selected.iter().any(|p| match p.get("targets").and_then(Value::as_array) {
@@ -5262,6 +5270,49 @@ mod tests {
             pkg("core", r#"{"name":"core","kind":["lib"]}"#),
         );
         assert!(probe(&json));
+    }
+
+    #[test]
+    fn metadata_probe_selects_the_member_the_manifest_points_at_not_the_default_members() {
+        // Round-4 finding, both directions. --manifest-path at a member selects
+        // THAT member; workspace_default_members is only cargo's fallback when
+        // the manifest defines no package of its own.
+        let core_manifest = std::path::Path::new("/s/core/Cargo.toml");
+        let json = format!(
+            r#"{{"packages":[{},{}],"workspace_default_members":["app"],"version":1}}"#,
+            pkg("app", r#"{"name":"app","kind":["bin"]}"#),
+            pkg("core", r#"{"name":"core","kind":["lib"]}"#),
+        );
+        // Selecting the library member must KEEP --lib even though the default
+        // member is binary-only.
+        assert!(
+            metadata_reports_lib_target(&json, core_manifest),
+            "selecting a member with a lib must keep --lib"
+        );
+
+        // And selecting the binary-only member must DROP --lib even though a
+        // default member elsewhere has a library.
+        let json2 = format!(
+            r#"{{"packages":[{},{}],"workspace_default_members":["core"],"version":1}}"#,
+            pkg("app", r#"{"name":"app","kind":["bin"]}"#),
+            pkg("core", r#"{"name":"core","kind":["lib"]}"#),
+        );
+        assert!(
+            !metadata_reports_lib_target(&json2, std::path::Path::new("/s/app/Cargo.toml")),
+            "selecting a binary-only member must drop --lib"
+        );
+    }
+
+    #[test]
+    fn metadata_probe_uses_default_members_only_for_a_virtual_workspace_root() {
+        // No package's manifest_path matches the probed one (virtual root), so
+        // cargo's default-member selection is what applies.
+        let json = format!(
+            r#"{{"packages":[{},{}],"workspace_default_members":["core"],"version":1}}"#,
+            pkg("app", r#"{"name":"app","kind":["bin"]}"#),
+            pkg("core", r#"{"name":"core","kind":["lib"]}"#),
+        );
+        assert!(probe(&json), "virtual root selects default members (core has a lib)");
     }
 
     #[test]
