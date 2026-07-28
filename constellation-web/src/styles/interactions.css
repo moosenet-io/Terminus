@@ -75,13 +75,8 @@ a:focus-visible, .h-link:focus-visible {
   opacity: 1;
 }
 
-/* ── Reduced motion ──────────────────────────────────────────────────────── */
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 1ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 1ms !important;
-  }
-}
+/* ── Reduced motion ──────────────────────────────────────────────────────────
+   CGUI-13 (TERM #536): the reduced-motion rule that used to live here was consolidated
+   into the SINGLE authoritative `@media (prefers-reduced-motion: reduce)` block in
+   globals.css (which now hard-disables looping animation with `animation: none`, not just
+   a shortened duration). Do not reintroduce a second reduced-motion rule here. */

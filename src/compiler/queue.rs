@@ -216,6 +216,31 @@ pub struct JobRequest {
     /// publish-and-flip build. `""`/anything other than `"test"` behaves as
     /// `"build"` (unchanged default behavior).
     pub mode: String,
+    /// PCON-01/04 (S122 root-cause fix): the commit sha `git_ref` was resolved
+    /// to at ENQUEUE/request time (before this job is durably recorded), when
+    /// SHA-staging is enabled and resolvable — `None` when SHA-staging is off
+    /// or a ref genuinely could not be resolved at request time. This is the
+    /// job's DURABLE identity: the dedupe key, the module-serialization lock
+    /// key, the GC live-set entry, and the on-disk per-sha stage dir all key
+    /// off `resolved_sha.as_deref().unwrap_or(&git_ref)` — see
+    /// [`job_identity`] — never off the mutable `git_ref` alone once a sha is
+    /// known. Resolving ONCE here (not at dispatch time) is what closes the
+    /// "ref moved while queued" race: two different refs that happen to
+    /// resolve to the same sha now dedupe onto ONE job instead of racing two
+    /// independent stagings of the identical commit.
+    pub resolved_sha: Option<String>,
+}
+
+/// The single identity a job/lease/queued-entry is keyed by everywhere
+/// (dedupe, module-serialization lock, GC live-set, on-disk stage dir name):
+/// the resolved sha when known, else the raw `git_ref` (SHA-staging off, or a
+/// ref that could not be resolved at request time — see [`JobRequest::
+/// resolved_sha`]'s doc). Centralizing this one-line rule in a single
+/// function is what PCON-04's root-cause fix depends on: every call site
+/// below uses THIS, so the queue lock, the GC live-set, and the staged
+/// directory name can never drift onto different identities for the same job.
+pub fn job_identity<'a>(git_ref: &'a str, resolved_sha: &'a Option<String>) -> &'a str {
+    resolved_sha.as_deref().unwrap_or(git_ref)
 }
 
 /// Outcome of an [`QueueStore::enqueue`].
@@ -245,6 +270,10 @@ pub struct QueuedJob {
     pub force: bool,
     /// `"build"` or `"test"` (BLD-ASYNC, TERM #421). See [`JobRequest::mode`].
     pub mode: String,
+    /// See [`JobRequest::resolved_sha`] — carried through so the dispatching
+    /// executor builds/stages against the EXACT sha resolved at enqueue time,
+    /// never re-resolving (and never re-racing) `git_ref` at dispatch time.
+    pub resolved_sha: Option<String>,
 }
 
 /// Why a [`QueueStore::claim`] did not take the job.
@@ -264,6 +293,12 @@ pub enum ClaimOutcome {
     ModuleBusy,
     /// The target host is already at its concurrency cap.
     HostFull,
+    /// PCON-09: admitting this build would exceed the host's RAM budget
+    /// (`BUILD_CONCURRENCY_MAX_RAM_MB`) — the sum of the currently-building
+    /// jobs' peaks plus this job's peak is over budget. Retry a later tick as
+    /// running builds finish and free RAM (never an OOM). Only ever returned
+    /// when the RAM gate is enabled (`max_ram_mb > 0`).
+    BudgetFull,
     /// The call was REFUSED as malformed: the caller's `module` arg does not match
     /// the job's own stored module (a buggy call that must never take a foreign
     /// module lock — A2). The job is left untouched.
@@ -278,6 +313,10 @@ pub struct Lease {
     pub git_ref: String,
     pub host: HostRole,
     pub started_at_ms: i64,
+    /// See [`JobRequest::resolved_sha`] — the GC live-set (PCON-05) MUST use
+    /// this (via [`job_identity`]), never `git_ref` alone, so a building
+    /// lease protects the SAME on-disk directory name PCON-01 staged.
+    pub resolved_sha: Option<String>,
 }
 
 /// A point-in-time view of the whole queue for `compiler_status`.
@@ -550,12 +589,20 @@ fn job_key(job_id: &str) -> String {
 fn module_lock_prefix() -> String {
     Namespace::Queue.key("modulelock:")
 }
-/// Per-module serialization lock (held for the duration of a build). The Lua now
-/// derives this key from the job hash's own module (A1/A2); retained as the
-/// canonical key constructor used by tests + the namespace assertion.
+/// PCON-04: per-`(module, ref)` serialization lock (held for the duration of a
+/// build). Previously keyed by `module` ALONE, which force-serialized every
+/// build of a module regardless of which commit — including two builds of
+/// DIFFERENT, mutually-isolated SHAs (PCON-01..03 already stage/target them
+/// disjointly, so nothing about them actually conflicts). Re-keying to
+/// `(module, ref)` means the lock now only ever contends two requests for the
+/// SAME ref/sha (which the dedupe pointer above already coalesces to one job
+/// in the common case); different-SHA jobs of one module are no longer
+/// mutually excluded by this lock. The Lua derives this key from the job
+/// hash's own module+ref (A1/A2); retained as the canonical key constructor
+/// used by tests + the namespace assertion.
 #[allow(dead_code)]
-fn module_lock_key(module: &str) -> String {
-    format!("{}{module}", module_lock_prefix())
+fn module_lock_key(module: &str, git_ref: &str) -> String {
+    format!("{}{module}:{git_ref}", module_lock_prefix())
 }
 /// The namespaced prefix for per-host in-flight sets. Passed to the Lua so
 /// `release`/`reconcile` can derive the host-slot key from the job hash's OWN
@@ -576,7 +623,15 @@ fn host_set_key(host: HostRole) -> String {
 /// KEYS: 1=dedupe 2=zset 3=seq
 /// ARGV: 1=candidate_id 2=prank 3=now 4=job_prefix 5=module 6=ref 7=prio_label
 ///       8=heavy 9=ready 10=held_ttl 11=bin(''=none) 12=force(0/1)
-///       8=heavy(0/1) 9=ready(0/1) 10=held_ttl_secs
+///       8=heavy(0/1) 9=ready(0/1) 10=held_ttl_secs 13=mode 14=resolved_sha(''=none)
+///       15=peak_mb (PCON-09: this module's resolved admission peak, MB)
+///
+/// PCON-01/04 (S122 root-cause fix): `KEYS[1]` (the dedupe pointer) is ALREADY
+/// computed by the Rust caller from [`job_identity`] — i.e. `resolved_sha` when
+/// known, else `ref` — so two requests for DIFFERENT refs that resolve to the
+/// SAME sha dedupe onto ONE job here, not two. `resolved_sha` (ARGV[14]) is
+/// additionally stored on the job hash so RELEASE/RECONCILE can re-derive that
+/// SAME identity later without a caller arg (A1).
 const ENQUEUE_LUA: &str = r#"
 local dedupe=KEYS[1]
 local zset=KEYS[2]
@@ -591,6 +646,7 @@ local held_ttl=tonumber(ARGV[10])
 local bin=ARGV[11]
 local force=ARGV[12]
 local mode=ARGV[13]
+local resolved_sha=ARGV[14]
 local existing=redis.call('GET', dedupe)
 if existing then
   local jk=jp..existing
@@ -669,7 +725,8 @@ local state='held'
 if ready=='1' then state='queued' end
 redis.call('HSET', jk, 'module', ARGV[5], 'ref', ARGV[6], 'prank', prank,
   'priority', ARGV[7], 'heavy', heavy, 'seq', seq, 'requested_at', now,
-  'coalesced', 1, 'state', state, 'bin', ARGV[11], 'force', force, 'mode', mode)
+  'coalesced', 1, 'state', state, 'bin', ARGV[11], 'force', force, 'mode', mode,
+  'resolved_sha', resolved_sha, 'peak_mb', ARGV[15])
 redis.call('SET', dedupe, id)
 if ready=='1' then
   local score=seq-(prank*1000000000000)
@@ -686,22 +743,56 @@ return {id, 1}
 "#;
 
 /// Claim queued→building under the module lock + host cap. The module-lock key is
-/// DERIVED from the job hash's OWN stored module (A2), and the caller's `module`
-/// arg is VERIFIED against it — a mismatch is refused so a buggy call can never
-/// take a foreign module lock and break per-module serialization. On success
+/// DERIVED from the job hash's OWN stored `(module, ref)` (A2; PCON-04 — ref is the
+/// resolved SHA once PCON-01's staging is active, so the lock only ever contends
+/// same-SHA jobs), and the caller's `module` arg is VERIFIED against it — a
+/// mismatch is refused so a buggy call can never take a foreign module lock and
+/// break per-`(module, ref)` serialization. On success
 /// writes the claim FENCE token + `started_at` (the reconcile lease clock).
 /// Returns `{ok(0/1), token_or_reason}`.
 /// KEYS: 1=zset 2=jobhash 3=hostset
 /// ARGV: 1=id 2=cap 3=now 4=host 5=claim_token 6=modulelock_prefix 7=expected_module
+///       8=job_prefix 9=max_ram_mb(0=off) 10=default_peak_mb 11=max_jobs(0=off) (PCON-09)
 const CLAIM_LUA: &str = r#"
 local st=redis.call('HGET', KEYS[2], 'state')
 if st~='queued' then return {0, 'not_queued'} end
 local module=redis.call('HGET', KEYS[2], 'module')
 if not module then return {0, 'rejected'} end
 if ARGV[7] ~= '' and ARGV[7] ~= module then return {0, 'rejected'} end
-local lockkey=ARGV[6]..module
+-- PCON-04 (root-cause fix): the lock is keyed by (module, identity) — see
+-- `job_identity`'s doc — where identity is the RESOLVED sha when known, else
+-- the raw ref. Two DIFFERENT-sha jobs of one module are never mutually
+-- excluded; two jobs that resolved to the SAME sha (even via different
+-- original refs) DO still contend this lock.
+local ref=redis.call('HGET', KEYS[2], 'ref') or ''
+local resolved_sha=redis.call('HGET', KEYS[2], 'resolved_sha') or ''
+local identity=ref
+if resolved_sha ~= '' then identity=resolved_sha end
+local lockkey=ARGV[6]..module..':'..identity
 if redis.call('EXISTS', lockkey)==1 then return {0, 'module_busy'} end
 if redis.call('SCARD', KEYS[3])>=tonumber(ARGV[2]) then return {0, 'host_full'} end
+-- PCON-09: host job-count cap from the resource budget (BUILD_CONCURRENCY_MAX_JOBS).
+-- Enforced HERE (not only via the caller's cap arg) so the documented cap is
+-- authoritative regardless of who calls claim. maxjobs==0 disables it.
+local maxjobs=tonumber(ARGV[11]) or 0
+if maxjobs>0 and redis.call('SCARD', KEYS[3])>=maxjobs then return {0, 'budget_full'} end
+-- PCON-09: RAM-budget admission. The host set (KEYS[3]) IS the live set of
+-- building jobs on this host; summing each member's stored peak_mb (+ this
+-- job's) and comparing to the budget bounds concurrent RAM without any
+-- separate accumulator — a job leaving the set (release/reconcile) frees its
+-- budget automatically. maxram==0 disables the gate (degrade-open / unset).
+local maxram=tonumber(ARGV[9]) or 0
+if maxram>0 then
+  local defpeak=tonumber(ARGV[10]) or 0
+  local jp=ARGV[8]
+  local total=tonumber(redis.call('HGET', KEYS[2], 'peak_mb') or defpeak) or defpeak
+  local members=redis.call('SMEMBERS', KEYS[3])
+  for i=1,#members do
+    local mp=tonumber(redis.call('HGET', jp..members[i], 'peak_mb') or defpeak) or defpeak
+    total=total+mp
+  end
+  if total>maxram then return {0, 'budget_full'} end
+end
 redis.call('ZREM', KEYS[1], ARGV[1])
 redis.call('HSET', KEYS[2], 'state', 'building', 'host', ARGV[4],
   'started_at', ARGV[3], 'claim_token', ARGV[5])
@@ -737,14 +828,21 @@ return 1
 const RELEASE_BODY: &str = r#"
 local module=redis.call('HGET', jobkey, 'module')
 local ref=redis.call('HGET', jobkey, 'ref')
+local resolved_sha=redis.call('HGET', jobkey, 'resolved_sha') or ''
+-- PCON-01/04 (root-cause fix): the ONE identity every key below derives
+-- from — the resolved sha when known, else the raw ref. Mirrors Rust's
+-- `job_identity` exactly (single rule, both sides).
+local identity=ref
+if resolved_sha ~= '' then identity=resolved_sha end
 local host=redis.call('HGET', jobkey, 'host')
 -- BLD-ASYNC (TERM #421): mode is part of the dedupe KEY, so it is re-derived
 -- here (canonicalized identically to Rust's dedupe_mode) and folded into the
 -- dedupe pointer, so a rerun/clear targets the mode-specific entry.
 local mode=redis.call('HGET', jobkey, 'mode') or 'build'
 if mode~='test' then mode='build' end
+-- PCON-04: lock key is (module, identity) — see `job_identity`'s doc.
 if module then
-  local lockkey=lockprefix..module
+  local lockkey=lockprefix..module..':'..(identity or '')
   if redis.call('GET', lockkey)==jobid then redis.call('DEL', lockkey) end
 end
 if host then
@@ -752,7 +850,7 @@ if host then
 end
 redis.call('HDEL', jobkey, 'claim_token')
 local dedupe=false
-if module and ref then dedupe=dedupeprefix..mode..':'..string.len(module)..':'..module..':'..ref end
+if module and identity then dedupe=dedupeprefix..mode..':'..string.len(module)..':'..module..':'..identity end
 local rerun=redis.call('HGET', jobkey, 'rerun')
 local rr_flag=0
 local rr_id=''
@@ -767,7 +865,8 @@ if rerun=='1' then
   local njk=jobprefix..rr_id
   redis.call('HSET', njk, 'module', module, 'ref', ref, 'prank', prank,
     'priority', prio, 'heavy', heavy, 'seq', seq, 'requested_at', nowv,
-    'coalesced', 1, 'state', 'queued', 'bin', bin, 'force', force, 'mode', mode)
+    'coalesced', 1, 'state', 'queued', 'bin', bin, 'force', force, 'mode', mode,
+    'resolved_sha', resolved_sha)
   if dedupe then redis.call('SET', dedupe, rr_id) end
   local score=seq-(prank*1000000000000)
   redis.call('ZADD', zsetkey, score, rr_id)
@@ -812,8 +911,8 @@ return {{rr_flag, rr_id}}
     )
 }
 
-/// Peek the top-N dispatchable jobs, flattened as 8 fields each:
-/// `id, module, ref, prank, heavy, bin, force, mode`.
+/// Peek the top-N dispatchable jobs, flattened as 9 fields each:
+/// `id, module, ref, prank, heavy, bin, force, mode, resolved_sha`.
 /// KEYS: 1=zset  ARGV: 1=limit 2=job_prefix
 const PEEK_LUA: &str = r#"
 local ids=redis.call('ZRANGE', KEYS[1], 0, tonumber(ARGV[1])-1)
@@ -828,12 +927,13 @@ for _, id in ipairs(ids) do
   out[#out+1]=redis.call('HGET', jk, 'bin') or ''
   out[#out+1]=redis.call('HGET', jk, 'force') or '0'
   out[#out+1]=redis.call('HGET', jk, 'mode') or ''
+  out[#out+1]=redis.call('HGET', jk, 'resolved_sha') or ''
 end
 return out
 "#;
 
-/// List the in-flight leases on one host, flattened as 4 fields each:
-/// `id, module, ref, started_at`.
+/// List the in-flight leases on one host, flattened as 5 fields each:
+/// `id, module, ref, started_at, resolved_sha`.
 /// KEYS: 1=hostset  ARGV: 1=job_prefix
 const LEASES_LUA: &str = r#"
 local ids=redis.call('SMEMBERS', KEYS[1])
@@ -844,6 +944,7 @@ for _, id in ipairs(ids) do
   out[#out+1]=redis.call('HGET', jk, 'module') or ''
   out[#out+1]=redis.call('HGET', jk, 'ref') or ''
   out[#out+1]=redis.call('HGET', jk, 'started_at') or '0'
+  out[#out+1]=redis.call('HGET', jk, 'resolved_sha') or ''
 end
 return out
 "#;
@@ -899,10 +1000,16 @@ local started=tonumber(redis.call('HGET', jobkey, 'started_at') or '0')
 if (tonumber(nowv) - started) < tonumber(ARGV[3]) then
   return 0
 end
--- Derive the module lock + host slot from the hash's OWN fields.
+-- Derive the module lock + host slot from the hash's OWN fields. PCON-04
+-- (root-cause fix): the lock is keyed by (module, identity) — the resolved
+-- sha when known, else the raw ref — see `job_identity`'s doc.
 local module=redis.call('HGET', jobkey, 'module')
+local crashref=redis.call('HGET', jobkey, 'ref') or ''
+local crashsha=redis.call('HGET', jobkey, 'resolved_sha') or ''
+local crashidentity=crashref
+if crashsha ~= '' then crashidentity=crashsha end
 if module then
-  local lockkey=lockprefix..module
+  local lockkey=lockprefix..module..':'..crashidentity
   if redis.call('GET', lockkey)==jobid then redis.call('DEL', lockkey) end
 end
 local host=redis.call('HGET', jobkey, 'host')
@@ -991,11 +1098,17 @@ fn priority_from_rank(rank: i64) -> Priority {
 /// The durable Redis-backed queue (production).
 pub struct RedisQueue {
     backend: Arc<RedisBackend>,
+    /// PCON-09: the host RAM-admission budget, read once from env at
+    /// construction. `max_ram_mb == 0` (the default) leaves the RAM gate inert.
+    budget: crate::compiler::resource::ResourceBudget,
 }
 
 impl RedisQueue {
     pub fn new(backend: Arc<RedisBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            budget: crate::compiler::resource::ResourceBudget::from_env(),
+        }
     }
 
     /// Build from the shared process-global backend; `None` when Redis is not
@@ -1010,11 +1123,17 @@ impl RedisQueue {
 impl QueueStore for RedisQueue {
     async fn enqueue(&self, req: &JobRequest) -> Result<Enqueued, QueueError> {
         let id = uuid::Uuid::new_v4().simple().to_string();
-        // BLD-ASYNC (TERM #421): the dedupe key now includes the canonical mode,
-        // so a mode=test submit gets its OWN queue entry and can never coalesce
-        // onto (or flip) a pending mode=build job of the same module@ref.
+        // PCON-01/04 (root-cause fix): dedupe on `job_identity` — the resolved
+        // sha when known, else the raw ref — NOT `git_ref` alone. This is what
+        // makes two DIFFERENT refs that resolve to the SAME sha coalesce onto
+        // ONE job instead of racing two independent stagings of the identical
+        // commit (closes the shared-remote-source clobber). BLD-ASYNC (TERM
+        // #421): the dedupe key also includes the canonical mode, so a
+        // mode=test submit gets its OWN queue entry and can never coalesce
+        // onto (or flip) a pending mode=build job of the same identity.
+        let identity = job_identity(&req.git_ref, &req.resolved_sha).to_string();
         let (dedupe, zset, seq) = (
-            dedupe_key(&req.module, &req.git_ref, &req.mode),
+            dedupe_key(&req.module, &identity, &req.mode),
             zset_key(),
             seq_key(),
         );
@@ -1031,6 +1150,15 @@ impl QueueStore for RedisQueue {
         // ARGV[13], stored on the job hash so the release/reconcile Lua can
         // re-derive the same mode-keyed dedupe key from the hash's own fields.
         let mode = dedupe_mode(&req.mode);
+        // PCON-01/04: carry the resolved sha (''=none) as ARGV[14], stored on
+        // the job hash so RELEASE/RECONCILE/CLAIM can re-derive `job_identity`
+        // without a caller arg (A1).
+        let resolved_sha = req.resolved_sha.clone().unwrap_or_default();
+        // PCON-09: resolve this module's admission peak (its configured
+        // BUILD_MODULE_PEAK_MB_<MODULE>, else the conservative default) once at
+        // enqueue and store it on the job hash, so `claim` can sum the peaks of
+        // the currently-building jobs to enforce the RAM budget atomically.
+        let peak_mb = self.budget.peak_for(&req.module).to_string();
         let script = redis::Script::new(ENQUEUE_LUA);
         let out: Result<(String, i64), ()> = self
             .backend
@@ -1052,6 +1180,8 @@ impl QueueStore for RedisQueue {
                     .arg(bin)
                     .arg(force)
                     .arg(mode)
+                    .arg(resolved_sha)
+                    .arg(peak_mb)
                     .invoke_async::<_, (String, i64)>(&mut conn)
                     .await
             })
@@ -1081,7 +1211,7 @@ impl QueueStore for RedisQueue {
             .await;
         match out {
             Ok(flat) => Ok(flat
-                .chunks_exact(8)
+                .chunks_exact(9)
                 .map(|c| QueuedJob {
                     job_id: c[0].clone(),
                     module: c[1].clone(),
@@ -1095,6 +1225,7 @@ impl QueueStore for RedisQueue {
                     } else {
                         "build".to_string()
                     },
+                    resolved_sha: Some(c[8].clone()).filter(|s| !s.is_empty()),
                 })
                 .collect()),
             Err(()) => Err(QueueError::Unavailable),
@@ -1113,6 +1244,14 @@ impl QueueStore for RedisQueue {
         let token = uuid::Uuid::new_v4().simple().to_string();
         let (lock_prefix, expected_module) = (module_lock_prefix(), module.to_string());
         let cap = cap.max(1) as i64;
+        // PCON-09: pass the job-hash prefix + the RAM budget so the atomic claim
+        // can sum the currently-building jobs' peaks against the cap.
+        let (jp, max_ram, default_peak, max_jobs) = (
+            job_prefix(),
+            self.budget.max_ram_mb as i64,
+            self.budget.default_peak_mb as i64,
+            self.budget.max_jobs as i64,
+        );
         let script = redis::Script::new(CLAIM_LUA);
         let out: Result<(i64, String), ()> = self
             .backend
@@ -1128,6 +1267,10 @@ impl QueueStore for RedisQueue {
                     .arg(token)
                     .arg(lock_prefix)
                     .arg(expected_module)
+                    .arg(jp)
+                    .arg(max_ram)
+                    .arg(default_peak)
+                    .arg(max_jobs)
                     .invoke_async::<_, (i64, String)>(&mut conn)
                     .await
             })
@@ -1137,6 +1280,7 @@ impl QueueStore for RedisQueue {
             Ok((_, reason)) => Ok(match reason.as_str() {
                 "module_busy" => ClaimOutcome::ModuleBusy,
                 "host_full" => ClaimOutcome::HostFull,
+                "budget_full" => ClaimOutcome::BudgetFull,
                 "rejected" => ClaimOutcome::Rejected,
                 _ => ClaimOutcome::NotQueued,
             }),
@@ -1343,13 +1487,14 @@ impl QueueStore for RedisQueue {
                 .await;
             match out {
                 Ok(flat) => {
-                    for c in flat.chunks_exact(4) {
+                    for c in flat.chunks_exact(5) {
                         leases.push(Lease {
                             job_id: c[0].clone(),
                             module: c[1].clone(),
                             git_ref: c[2].clone(),
                             host,
                             started_at_ms: c[3].parse().unwrap_or(0),
+                            resolved_sha: Some(c[4].clone()).filter(|s| !s.is_empty()),
                         });
                     }
                 }
@@ -1399,14 +1544,27 @@ pub(crate) mod fake {
         /// A NON-terminal transient error recorded while still building (cleared on
         /// requeue so a re-queued job carries no prior-attempt failure state).
         last_error: Option<String>,
+        /// See [`JobRequest::resolved_sha`] / [`job_identity`].
+        resolved_sha: Option<String>,
+        /// PCON-09: this module's resolved admission peak (MB), stored at enqueue
+        /// (mirrors the real job hash's `peak_mb`), summed by `claim` for the
+        /// RAM budget.
+        peak_mb: u64,
     }
 
     #[derive(Default)]
     struct State {
         jobs: HashMap<String, Job>,
         dedupe: HashMap<String, String>,       // module@ref -> id
-        module_lock: HashMap<String, String>,  // module -> id
+        // PCON-04: keyed by `module_lock_key(module, ref)` — the SAME
+        // constructor the real Lua's key shape mirrors and tests assert
+        // against (single source of truth for the key format) — not module
+        // alone.
+        module_lock: HashMap<String, String>,
         host_inflight: HashMap<&'static str, Vec<String>>,
+        /// PCON-09: the RAM-admission budget (unbounded by default — the RAM gate
+        /// is inert unless a test/operator sets a non-zero `max_ram_mb`).
+        budget: crate::compiler::resource::ResourceBudget,
         seq: i64,
         next_id: u64,
         next_token: u64,
@@ -1418,6 +1576,9 @@ pub(crate) mod fake {
         fail_releases: usize,
         /// The next N `requeue` calls fail as Unavailable (idle-abort requeue outage).
         fail_requeues: usize,
+        /// The next N `snapshot` calls fail as Unavailable (PCON-05's
+        /// fail-closed-GC test: reconcile/peek stay healthy, only snapshot fails).
+        fail_snapshots: usize,
     }
 
     /// An offline `QueueStore` mirroring the Lua semantics exactly.
@@ -1437,6 +1598,12 @@ pub(crate) mod fake {
             self.state.lock().unwrap().down = down;
         }
 
+        /// PCON-09: set the RAM-admission budget for a test (default is
+        /// unbounded, so the RAM gate is inert unless a test opts in).
+        pub(crate) fn set_budget(&self, budget: crate::compiler::resource::ResourceBudget) {
+            self.state.lock().unwrap().budget = budget;
+        }
+
         /// Make the next `n` `release` calls fail as Unavailable (a completion-
         /// time outage AFTER finalize) so the retry / reconcile paths can be
         /// exercised.
@@ -1452,6 +1619,14 @@ pub(crate) mod fake {
         /// Make the next `n` `requeue` calls fail as Unavailable (idle-abort outage).
         pub(crate) fn fail_requeues(&self, n: usize) {
             self.state.lock().unwrap().fail_requeues = n;
+        }
+
+        /// Make the next `n` `snapshot` calls fail as Unavailable, WITHOUT
+        /// affecting `peek`/`reconcile`/`claim` — isolates the PCON-05
+        /// fail-closed-GC path (snapshot fails, dispatch is otherwise healthy)
+        /// from the blanket `set_down` degradation.
+        pub(crate) fn fail_snapshots(&self, n: usize) {
+            self.state.lock().unwrap().fail_snapshots = n;
         }
 
         /// Record a NON-terminal transient error on a job (test helper), to prove
@@ -1525,6 +1700,19 @@ pub(crate) mod fake {
                 .map(|j| j.coalesced)
                 .unwrap_or(0)
         }
+
+        /// PCON-04 fidelity test helper: the job id currently holding the
+        /// `(module, identity)` lock — `identity` being `job_identity`'s output
+        /// (the resolved sha when known, else the raw ref) — looked up under
+        /// the EXACT SAME prefixed key [`module_lock_key`] constructs, i.e.
+        /// the same key shape the real Lua uses
+        /// (`lockprefix..module..':'..identity`), so a test can assert the
+        /// fake's lock storage is keyed identically to production, not just
+        /// internally self-consistent.
+        pub(crate) fn module_lock_holder(&self, module: &str, identity: &str) -> Option<String> {
+            let s = self.state.lock().unwrap();
+            s.module_lock.get(&module_lock_key(module, identity)).cloned()
+        }
     }
 
     fn score(seq: i64, prank: i64) -> i64 {
@@ -1547,13 +1735,20 @@ pub(crate) mod fake {
                 j.bin.clone(),
                 j.force,
                 j.mode.clone(),
+                j.resolved_sha.clone(),
+                j.peak_mb,
             ),
             None => return,
         };
-        let (dmod, dref, dhost, dprank, dheavy, rerun, dbin, dforce, dmode) = done;
-        // Derive the module lock + host slot from the STORED fields.
-        if s.module_lock.get(&dmod).map(String::as_str) == Some(job_id) {
-            s.module_lock.remove(&dmod);
+        let (dmod, dref, dhost, dprank, dheavy, rerun, dbin, dforce, dmode, dsha, dpeak) = done;
+        // PCON-01/04 (root-cause fix): derive the module lock + dedupe key from
+        // `job_identity` (the resolved sha when known, else the raw ref) — the
+        // SAME identity `enqueue` used to build the dedupe pointer and `claim`
+        // used to build the lock key.
+        let identity = job_identity(&dref, &dsha).to_string();
+        let lk = module_lock_key(&dmod, &identity);
+        if s.module_lock.get(&lk).map(String::as_str) == Some(job_id) {
+            s.module_lock.remove(&lk);
         }
         if let Some(h) = dhost {
             if let Some(v) = s.host_inflight.get_mut(h.as_str()) {
@@ -1564,9 +1759,11 @@ pub(crate) mod fake {
             j.claim_token = None;
         }
         // BLD-ASYNC (TERM #421): the dedupe key is mode-scoped (mirrors RELEASE_BODY).
-        let dk = dedupe_id(&dmod, &dref, &dmode);
+        let dk = dedupe_id(&dmod, &identity, &dmode);
         if rerun {
-            // Re-enqueue EXACTLY one follow-up job for the same module@ref.
+            // Re-enqueue EXACTLY one follow-up job for the same identity — the
+            // resolved sha is carried forward unchanged (a re-run re-executes the
+            // EXACT same resolved commit, never re-resolves the original ref).
             s.seq += 1;
             let seq = s.seq;
             s.next_id += 1;
@@ -1591,6 +1788,8 @@ pub(crate) mod fake {
                     rerun: false,
                     last_requeue_reason: None,
                     last_error: None,
+                    resolved_sha: dsha,
+                    peak_mb: dpeak,
                 },
             );
             s.dedupe.insert(dk, nid);
@@ -1609,9 +1808,14 @@ pub(crate) mod fake {
             if s.down {
                 return Err(QueueError::Unavailable);
             }
-            // BLD-ASYNC (TERM #421): mode-scoped dedupe key — a mode=test submit
-            // gets its own entry and never coalesces onto a pending mode=build job.
-            let dk = dedupe_id(&req.module, &req.git_ref, &req.mode);
+            // PCON-01/04 (root-cause fix): dedupe on `job_identity` (resolved sha
+            // when known, else the raw ref) — mirrors the real ENQUEUE_LUA/Rust
+            // `enqueue()` exactly, so two different refs resolving to the same
+            // sha coalesce here too. BLD-ASYNC (TERM #421): mode-scoped — a
+            // mode=test submit gets its own entry and never coalesces onto a
+            // pending mode=build job.
+            let identity = job_identity(&req.git_ref, &req.resolved_sha);
+            let dk = dedupe_id(&req.module, identity, &req.mode);
             if let Some(existing) = s.dedupe.get(&dk).cloned() {
                 let st = s.jobs.get(&existing).map(|j| j.state.clone());
                 match st.as_deref() {
@@ -1681,6 +1885,8 @@ pub(crate) mod fake {
             let seq = s.seq;
             s.next_id += 1;
             let id = format!("job-{}", s.next_id);
+            // PCON-09: resolve + store the module's admission peak at enqueue.
+            let peak_mb = s.budget.peak_for(&req.module);
             s.jobs.insert(
                 id.clone(),
                 Job {
@@ -1701,6 +1907,8 @@ pub(crate) mod fake {
                     rerun: false,
                     last_requeue_reason: None,
                     last_error: None,
+                    resolved_sha: req.resolved_sha.clone(),
+                    peak_mb,
                 },
             );
             s.dedupe.insert(dk, id.clone());
@@ -1734,6 +1942,7 @@ pub(crate) mod fake {
                     } else {
                         "build".to_string()
                     },
+                    resolved_sha: j.resolved_sha.clone(),
                 })
                 .collect())
         }
@@ -1749,20 +1958,54 @@ pub(crate) mod fake {
             if s.down {
                 return Err(QueueError::Unavailable);
             }
-            // Derive the module from the job's OWN stored field; verify the arg.
-            let stored_module = match s.jobs.get(job_id) {
-                Some(j) if j.state == "queued" => j.module.clone(),
+            // Derive the module (+ identity, for the PCON-04 lock key — PCON-01
+            // root-cause fix: resolved sha when known, else the raw ref) from the
+            // job's OWN stored fields; verify the caller's `module` arg against it.
+            let (stored_module, stored_ref, stored_sha) = match s.jobs.get(job_id) {
+                Some(j) if j.state == "queued" => {
+                    (j.module.clone(), j.git_ref.clone(), j.resolved_sha.clone())
+                }
                 Some(_) | None => return Ok(ClaimOutcome::NotQueued),
             };
             if !module.is_empty() && module != stored_module {
                 return Ok(ClaimOutcome::Rejected);
             }
-            if s.module_lock.contains_key(&stored_module) {
+            let identity = job_identity(&stored_ref, &stored_sha);
+            let lock_key = module_lock_key(&stored_module, identity);
+            if s.module_lock.contains_key(&lock_key) {
                 return Ok(ClaimOutcome::ModuleBusy);
             }
             let live = s.host_inflight.get(host.as_str()).map(Vec::len).unwrap_or(0);
             if live as u32 >= cap.max(1) {
                 return Ok(ClaimOutcome::HostFull);
+            }
+            // PCON-09: host job-count cap from the budget (mirrors CLAIM_LUA) —
+            // authoritative regardless of the caller's `cap`. 0 disables it.
+            if s.budget.max_jobs > 0 && live as u32 >= s.budget.max_jobs {
+                return Ok(ClaimOutcome::BudgetFull);
+            }
+            // PCON-09: RAM-budget admission (mirrors CLAIM_LUA). Sum the peaks of
+            // the jobs currently building on this host + this job's peak; reject
+            // if over budget. Inert when max_ram_mb == 0.
+            let budget = s.budget;
+            if budget.max_ram_mb > 0 {
+                let this_peak = s.jobs.get(job_id).map(|j| j.peak_mb).unwrap_or(0);
+                let building_peaks: Vec<u64> = s
+                    .host_inflight
+                    .get(host.as_str())
+                    .map(|ids| {
+                        ids.iter()
+                            .map(|id| s.jobs.get(id).map(|j| j.peak_mb).unwrap_or(budget.default_peak_mb))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !crate::compiler::resource::ram_admits(
+                    this_peak,
+                    building_peaks,
+                    budget.max_ram_mb,
+                ) {
+                    return Ok(ClaimOutcome::BudgetFull);
+                }
             }
             s.next_token += 1;
             let token = format!("tok-{}", s.next_token);
@@ -1773,7 +2016,7 @@ pub(crate) mod fake {
                 j.started_at = now_ms();
                 j.claim_token = Some(token.clone());
             }
-            s.module_lock.insert(stored_module, job_id.to_string());
+            s.module_lock.insert(lock_key, job_id.to_string());
             s.host_inflight
                 .entry(host.as_str())
                 .or_default()
@@ -1874,10 +2117,16 @@ pub(crate) mod fake {
             }
             // `module`/`host` args are advisory — derive from the job's OWN fields.
             let _ = (module, host);
-            let stored_module = s.jobs.get(job_id).map(|j| j.module.clone());
-            if let Some(m) = stored_module {
-                if s.module_lock.get(&m).map(String::as_str) == Some(job_id) {
-                    s.module_lock.remove(&m);
+            // PCON-01/04 (root-cause fix): the lock key is (module, identity).
+            let stored = s
+                .jobs
+                .get(job_id)
+                .map(|j| (j.module.clone(), j.git_ref.clone(), j.resolved_sha.clone()));
+            if let Some((m, r, sha)) = stored {
+                let identity = job_identity(&r, &sha).to_string();
+                let lk = module_lock_key(&m, &identity);
+                if s.module_lock.get(&lk).map(String::as_str) == Some(job_id) {
+                    s.module_lock.remove(&lk);
                 }
             }
             for v in s.host_inflight.values_mut() {
@@ -1908,7 +2157,16 @@ pub(crate) mod fake {
             let now = now_ms();
             let stale_ms = stale_after.as_millis() as i64;
             // Snapshot the building candidates + whether each finished (marker).
-            let building: Vec<(String, String, Option<HostRole>, Option<String>, i64)> = s
+            #[allow(clippy::type_complexity)]
+            let building: Vec<(
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<HostRole>,
+                Option<String>,
+                i64,
+            )> = s
                 .jobs
                 .iter()
                 .filter(|(_, j)| j.state == "building")
@@ -1916,6 +2174,8 @@ pub(crate) mod fake {
                     (
                         id.clone(),
                         j.module.clone(),
+                        j.git_ref.clone(),
+                        j.resolved_sha.clone(),
                         j.host,
                         j.outcome.clone(),
                         j.started_at,
@@ -1923,15 +2183,18 @@ pub(crate) mod fake {
                 })
                 .collect();
             let mut report = ReconcileReport::default();
-            for (id, module, _host, outcome, started) in building {
+            for (id, module, git_ref, resolved_sha, _host, outcome, started) in building {
                 if let Some(outcome) = outcome {
                     // FINISHED but not released → release only, NO rebuild.
                     release_locked(&mut s, &id, &outcome);
                     report.released.push(id);
                 } else if (now - started) >= stale_ms {
-                    // Crashed mid-build → requeue.
-                    if s.module_lock.get(&module).map(String::as_str) == Some(id.as_str()) {
-                        s.module_lock.remove(&module);
+                    // Crashed mid-build → requeue. PCON-04 (root-cause fix): lock
+                    // keyed by (module, identity) — resolved sha when known, else ref.
+                    let identity = job_identity(&git_ref, &resolved_sha);
+                    let lk = module_lock_key(&module, identity);
+                    if s.module_lock.get(&lk).map(String::as_str) == Some(id.as_str()) {
+                        s.module_lock.remove(&lk);
                     }
                     for v in s.host_inflight.values_mut() {
                         v.retain(|x| x != &id);
@@ -1949,7 +2212,11 @@ pub(crate) mod fake {
 
         async fn snapshot(&self) -> Result<QueueSnapshot, QueueError> {
             let queued = self.peek(1024).await?;
-            let s = self.state.lock().unwrap();
+            let mut s = self.state.lock().unwrap();
+            if s.fail_snapshots > 0 {
+                s.fail_snapshots -= 1;
+                return Err(QueueError::Unavailable);
+            }
             let mut leases = Vec::new();
             for (id, j) in s.jobs.iter().filter(|(_, j)| j.state == "building") {
                 leases.push(Lease {
@@ -1958,6 +2225,7 @@ pub(crate) mod fake {
                     git_ref: j.git_ref.clone(),
                     host: j.host.unwrap_or(HostRole::Primary),
                     started_at_ms: j.started_at,
+                    resolved_sha: j.resolved_sha.clone(),
                 });
             }
             Ok(QueueSnapshot { queued, leases })
@@ -1982,6 +2250,28 @@ mod tests {
             ready: true,
             force: false,
             mode: "build".to_string(),
+            resolved_sha: None,
+        }
+    }
+
+    /// A request carrying an explicit `resolved_sha` (PCON-01/04 root-cause
+    /// fix), for tests exercising identity-based dedupe/lock/GC directly.
+    fn req_with_sha(module: &str, git_ref: &str, resolved_sha: &str) -> JobRequest {
+        JobRequest {
+            resolved_sha: Some(resolved_sha.to_string()),
+            ..req(module, git_ref, Priority::Normal, false)
+        }
+    }
+
+    /// A `mode="test"` request for the same `(module, ref)` — used to obtain a
+    /// SECOND, distinct job id sharing the exact same PCON-04 `(module, ref)`
+    /// lock identity (the lock key is mode-independent, unlike the dedupe key),
+    /// since a same-`(module, ref, mode)` enqueue always coalesces onto any
+    /// existing active job rather than creating a new one.
+    fn test_req(module: &str, git_ref: &str) -> JobRequest {
+        JobRequest {
+            mode: "test".to_string(),
+            ..req(module, git_ref, Priority::Normal, false)
         }
     }
 
@@ -1990,6 +2280,112 @@ mod tests {
         match q.claim(id, module, host, cap).await.unwrap() {
             ClaimOutcome::Claimed { token } => token,
             other => panic!("expected Claimed, got {other:?}"),
+        }
+    }
+
+    // ── PCON-09: resource-aware admission (RAM budget) ───────────────────────
+
+    use crate::compiler::resource::ResourceBudget;
+
+    /// A budget with the RAM gate ON: `max_ram_mb` total, `default_peak_mb` per
+    /// module (no per-module env peak configured in these tests).
+    fn ram_budget(max_ram_mb: u64, default_peak_mb: u64) -> ResourceBudget {
+        ResourceBudget {
+            max_ram_mb,
+            max_jobs: 0,
+            min_disk_mb: 0,
+            default_peak_mb,
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_admits_two_different_shas_then_bounds_the_third() {
+        // 8192 MB budget, 4096 MB/job ⇒ exactly two concurrent; a third waits.
+        let q = InMemoryQueue::new();
+        q.set_budget(ram_budget(8192, 4096));
+        let a = q.enqueue(&req_with_sha("chord", "main", "sha-aaaaaa")).await.unwrap();
+        let b = q.enqueue(&req_with_sha("chord", "main", "sha-bbbbbb")).await.unwrap();
+        let c = q.enqueue(&req_with_sha("chord", "main", "sha-cccccc")).await.unwrap();
+        // Different SHAs of ONE module are NOT mutually excluded (PCON-04 lock is
+        // per-(module,sha)) — both admit within the RAM budget (host cap 4).
+        let _t1 = claim_ok(&q, &a.job_id, "chord", HostRole::Primary, 4).await;
+        let _t2 = claim_ok(&q, &b.job_id, "chord", HostRole::Primary, 4).await;
+        // The third exceeds the RAM budget (12288 > 8192) → BudgetFull, NOT
+        // ModuleBusy (it is not blocked by a module lock).
+        assert_eq!(
+            q.claim(&c.job_id, "chord", HostRole::Primary, 4).await.unwrap(),
+            ClaimOutcome::BudgetFull,
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_full_when_max_jobs_exceeded_even_with_ram_room() {
+        // PCON-09 FIX: BUILD_CONCURRENCY_MAX_JOBS is enforced in the claim itself.
+        // max_jobs=2, RAM unlimited (max_ram=0), a generous host cap ⇒ the third
+        // concurrent job of the host is BudgetFull purely on the job cap.
+        let q = InMemoryQueue::new();
+        q.set_budget(ResourceBudget {
+            max_ram_mb: 0,
+            max_jobs: 2,
+            min_disk_mb: 0,
+            default_peak_mb: 4096,
+        });
+        let a = q.enqueue(&req_with_sha("chord", "main", "sha-a")).await.unwrap();
+        let b = q.enqueue(&req_with_sha("chord", "main", "sha-b")).await.unwrap();
+        let c = q.enqueue(&req_with_sha("chord", "main", "sha-c")).await.unwrap();
+        let _t1 = claim_ok(&q, &a.job_id, "chord", HostRole::Primary, 16).await;
+        let _t2 = claim_ok(&q, &b.job_id, "chord", HostRole::Primary, 16).await;
+        assert_eq!(
+            q.claim(&c.job_id, "chord", HostRole::Primary, 16).await.unwrap(),
+            ClaimOutcome::BudgetFull,
+            "third concurrent job must be capped by max_jobs even with RAM room"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_full_when_peak_exceeds_remaining_ram() {
+        // 6000 MB budget, 4096 MB/job ⇒ one fits, the second is over budget.
+        let q = InMemoryQueue::new();
+        q.set_budget(ram_budget(6000, 4096));
+        let a = q.enqueue(&req_with_sha("chord", "main", "sha-a")).await.unwrap();
+        let b = q.enqueue(&req_with_sha("chord", "main", "sha-b")).await.unwrap();
+        let _t = claim_ok(&q, &a.job_id, "chord", HostRole::Primary, 4).await;
+        // 4096 (building) + 4096 (this) = 8192 > 6000 → waits (never OOMs).
+        assert_eq!(
+            q.claim(&b.job_id, "chord", HostRole::Primary, 4).await.unwrap(),
+            ClaimOutcome::BudgetFull,
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_reconcile_frees_ram_budget() {
+        // A crashed build's budget is reclaimed by the reconcile backstop, so the
+        // waiting job can then admit.
+        let q = InMemoryQueue::new();
+        q.set_budget(ram_budget(6000, 4096));
+        let a = q.enqueue(&req_with_sha("chord", "main", "sha-a")).await.unwrap();
+        let b = q.enqueue(&req_with_sha("chord", "main", "sha-b")).await.unwrap();
+        let _t = claim_ok(&q, &a.job_id, "chord", HostRole::Primary, 4).await;
+        assert_eq!(
+            q.claim(&b.job_id, "chord", HostRole::Primary, 4).await.unwrap(),
+            ClaimOutcome::BudgetFull,
+        );
+        // Reconcile with a zero lease treats the in-flight job as crashed and
+        // requeues it, freeing its host slot (and thus its RAM budget).
+        let rep = q.reconcile(std::time::Duration::ZERO).await.unwrap();
+        assert!(rep.requeued.contains(&a.job_id));
+        // Now b admits (only its own 4096 <= 6000).
+        let _t2 = claim_ok(&q, &b.job_id, "chord", HostRole::Primary, 4).await;
+    }
+
+    #[tokio::test]
+    async fn unbounded_budget_admits_many_independent_shas() {
+        // The default (unbounded) budget never blocks on RAM.
+        let q = InMemoryQueue::new(); // default = ResourceBudget::unbounded()
+        for i in 0..5 {
+            let sha = format!("sha-{i}");
+            let e = q.enqueue(&req_with_sha("chord", "main", &sha)).await.unwrap();
+            let _t = claim_ok(&q, &e.job_id, "chord", HostRole::Primary, 16).await;
         }
     }
 
@@ -2113,21 +2509,124 @@ mod tests {
         assert_eq!(order, vec!["c", "a", "b"]);
     }
 
+    #[test]
+    fn module_lock_key_has_the_exact_prefixed_shape_the_real_lua_builds() {
+        // FINDING 1 (review): pin the EXACT key string `module_lock_key`
+        // constructs — `"queue:modulelock:chord:abc"` — so a future edit to
+        // either the Rust constructor or the real Lua's
+        // `lockprefix..module..':'..ref` concatenation can't silently drift
+        // apart without a test catching it.
+        assert_eq!(module_lock_key("chord", "abc"), "queue:modulelock:chord:abc");
+        assert_eq!(module_lock_prefix(), "queue:modulelock:");
+    }
+
     #[tokio::test]
-    async fn same_module_serializes_via_module_lock() {
+    async fn fake_module_lock_is_stored_under_the_exact_production_key_shape() {
+        // FINDING 1 (review): the fake previously stored its module lock under
+        // a BARE `"{module}:{ref}"` string — internally consistent, but NOT the
+        // same key shape the real Lua uses (`lockprefix..module..':'..ref`), so
+        // the PCON-04 re-key tests weren't actually validating the production
+        // key format. The fake must now build the SAME prefixed key
+        // (`module_lock_key`, the single source of truth both sides call) —
+        // proven here by looking the held lock up through that exact
+        // constructor via `module_lock_holder`.
+        let q = InMemoryQueue::new();
+        let j1 = q.enqueue(&req("chord", "abc", Priority::Normal, false)).await.unwrap();
+        let tok = claim_ok(&q, &j1.job_id, "chord", HostRole::Primary, 4).await;
+        assert_eq!(
+            q.module_lock_holder("chord", "abc"),
+            Some(j1.job_id.clone()),
+            "the lock must be discoverable under module_lock_key's exact prefixed shape"
+        );
+        // A lookup under the OLD, un-prefixed shape must NOT find it (proves
+        // the fake isn't accidentally ALSO writing the bare form).
+        assert_ne!(module_lock_key("chord", "abc"), "chord:abc");
+        q.complete(&j1.job_id, "chord", HostRole::Primary, JobState::Done, &tok).await.unwrap();
+        assert_eq!(q.module_lock_holder("chord", "abc"), None, "released after complete");
+    }
+
+    #[tokio::test]
+    async fn same_module_same_ref_serializes_via_module_lock() {
+        // PCON-04: the lock is keyed by (module, ref) now, not module alone — two
+        // REQUESTS for the exact same ref (a real re-request, e.g. the dedupe
+        // pointer already expired/was cleared) still serialize gracefully.
         let q = InMemoryQueue::new();
         let j1 = q.enqueue(&req("chord", "r1", Priority::Normal, false)).await.unwrap();
-        let j2 = q.enqueue(&req("chord", "r2", Priority::Normal, false)).await.unwrap();
-        // First claim of module `chord` succeeds; a second (different ref, same
-        // module) is refused while the first builds — graceful serialization.
+        // A second, distinct job of the SAME (module, ref) — bypass dedupe by
+        // enqueuing under a different mode so it gets its own job id but shares
+        // the (module, ref) lock identity.
+        let j2 = q.enqueue(&test_req("chord", "r1")).await.unwrap();
+        assert_ne!(j1.job_id, j2.job_id, "distinct jobs (different mode) for test setup");
+
         let tok1 = claim_ok(&q, &j1.job_id, "chord", HostRole::Primary, 4).await;
         assert_eq!(
             q.claim(&j2.job_id, "chord", HostRole::Primary, 4).await.unwrap(),
-            ClaimOutcome::ModuleBusy
+            ClaimOutcome::ModuleBusy,
+            "same (module, ref) still serializes"
         );
-        // Once the first finishes, the module lock frees and the second claims.
+        // Once the first finishes, the (module, ref) lock frees and the second claims.
         q.complete(&j1.job_id, "chord", HostRole::Primary, JobState::Done, &tok1).await.unwrap();
         claim_ok(&q, &j2.job_id, "chord", HostRole::Primary, 4).await;
+    }
+
+    #[tokio::test]
+    async fn different_ref_same_module_no_longer_serializes_pcon04() {
+        // PCON-04: with staging/targets isolated per (module, sha) by PCON-01..03,
+        // the module lock is re-keyed to (module, ref) — so two DIFFERENT refs
+        // (in practice, two different resolved SHAs) of the SAME module are no
+        // longer force-serialized by a blanket module-wide lock; both may build
+        // concurrently, bounded only by the host cap.
+        let q = InMemoryQueue::new();
+        let j1 = q.enqueue(&req("chord", "sha-aaaa", Priority::Normal, false)).await.unwrap();
+        let j2 = q.enqueue(&req("chord", "sha-bbbb", Priority::Normal, false)).await.unwrap();
+        claim_ok(&q, &j1.job_id, "chord", HostRole::Primary, 4).await;
+        // The second, DIFFERENT-ref job of the same module claims successfully
+        // too — it is NOT ModuleBusy.
+        let outcome2 = q.claim(&j2.job_id, "chord", HostRole::Primary, 4).await.unwrap();
+        assert!(
+            matches!(outcome2, ClaimOutcome::Claimed { .. }),
+            "different-ref job of the same module must not be ModuleBusy: {outcome2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_refs_resolving_to_the_same_sha_dedupe_onto_one_job_root_cause_fix() {
+        // ROOT-CAUSE FIX (review, FINDING 3's queue-level half): two DIFFERENT
+        // original refs ("release/v1" and "main") that RESOLVED to the SAME
+        // sha at enqueue time must coalesce onto ONE job — not race two
+        // independent stagings/builds of the identical commit. This is what
+        // makes the FINDING 3 remote-relay dedup meaningful in the first
+        // place: without this, two "different" jobs would both try to relay
+        // to (and `--delete` into) the same content-addressed remote_source.
+        let q = InMemoryQueue::new();
+        let sha = "9".repeat(40);
+        let a = q.enqueue(&req_with_sha("chord", "release/v1", &sha)).await.unwrap();
+        let b = q.enqueue(&req_with_sha("chord", "main", &sha)).await.unwrap();
+        assert!(a.created, "first request creates the job");
+        assert!(!b.created, "second request (different ref, SAME resolved sha) coalesces");
+        assert_eq!(a.job_id, b.job_id, "both land on the identical job");
+        assert_eq!(q.peek(10).await.unwrap().len(), 1, "exactly one queued job, not two");
+
+        // And the module lock these two would contend on is the SAME
+        // (module, identity) — proven by claiming once and confirming the
+        // held lock is discoverable under `module_lock_key(module, sha)`.
+        let tok = claim_ok(&q, &a.job_id, "chord", HostRole::Primary, 4).await;
+        assert_eq!(q.module_lock_holder("chord", &sha), Some(a.job_id.clone()));
+        q.complete(&a.job_id, "chord", HostRole::Primary, JobState::Done, &tok).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn different_refs_same_resolved_sha_yield_identical_stage_key_root_cause_fix() {
+        // The staging/addressing half of the SAME fix: `queue::job_identity`
+        // (what `compiler::mod`'s `stage_key`/`remote_source` derive from) is
+        // IDENTICAL for two jobs that share a resolved sha, regardless of
+        // their distinct original refs — this is what makes FINDING 3's
+        // remote-relay dedup (same directory, safe reuse) actually correct.
+        let sha = "9".repeat(40);
+        let a = req_with_sha("chord", "release/v1", &sha);
+        let b = req_with_sha("chord", "main", &sha);
+        assert_eq!(job_identity(&a.git_ref, &a.resolved_sha), job_identity(&b.git_ref, &b.resolved_sha));
+        assert_eq!(job_identity(&a.git_ref, &a.resolved_sha), sha);
     }
 
     #[tokio::test]
@@ -2307,12 +2806,15 @@ mod tests {
     async fn complete_releases_module_lock_and_host_slot_atomically() {
         let q = InMemoryQueue::new();
         // j1 (module m1) claimed on primary cap=1: holds the module lock AND the
-        // one primary host slot.
+        // one primary host slot. PCON-04: the lock is (module, ref)-keyed, so
+        // j1b must share j1's exact ref to still contend the SAME lock — it uses
+        // mode=test to still land as a distinct job id.
         let j1 = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
         let j2 = q.enqueue(&req("m2", "r2", Priority::Normal, false)).await.unwrap();
-        let j1b = q.enqueue(&req("m1", "rB", Priority::Normal, false)).await.unwrap();
+        let j1b = q.enqueue(&test_req("m1", "r1")).await.unwrap();
         let tok1 = claim_ok(&q, &j1.job_id, "m1", HostRole::Primary, 1).await;
-        // While j1 builds: a different module is host-capped, and same module is locked.
+        // While j1 builds: a different module is host-capped, and same (module,
+        // ref) is locked.
         assert_eq!(
             q.claim(&j2.job_id, "m2", HostRole::Primary, 1).await.unwrap(),
             ClaimOutcome::HostFull
@@ -2333,8 +2835,10 @@ mod tests {
     #[tokio::test]
     async fn complete_on_redis_down_does_not_half_release_the_lock() {
         let q = InMemoryQueue::new();
+        // PCON-04: j1b shares j1's exact ref (same lock identity), distinguished
+        // by mode so it still lands as a separate job id.
         let j1 = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
-        let j1b = q.enqueue(&req("m1", "rB", Priority::Normal, false)).await.unwrap();
+        let j1b = q.enqueue(&test_req("m1", "r1")).await.unwrap();
         let tok1 = claim_ok(&q, &j1.job_id, "m1", HostRole::Primary, 1).await;
         // Redis goes down at release time → the LOW-LEVEL release fails as a whole;
         // NOTHING is partially released (the module lock is still held). (Uses the
@@ -2485,12 +2989,14 @@ mod tests {
         // It took no lock under the wrong name, and the job is still queued: a
         // correct claim still succeeds and same-module serialization holds.
         assert_eq!(q.state_of(&j.job_id).as_deref(), Some("queued"));
-        let j2 = q.enqueue(&req("m1", "r2", Priority::Normal, false)).await.unwrap();
+        // PCON-04: j2 shares j's exact ref (same lock identity), distinguished by
+        // mode so it still lands as a separate job id.
+        let j2 = q.enqueue(&test_req("m1", "r1")).await.unwrap();
         claim_ok(&q, &j.job_id, "m1", HostRole::Primary, 4).await;
         assert_eq!(
             q.claim(&j2.job_id, "m1", HostRole::Primary, 4).await.unwrap(),
             ClaimOutcome::ModuleBusy,
-            "the correct module lock still serializes same-module builds"
+            "the correct (module, ref) lock still serializes same-ref builds"
         );
     }
 
@@ -2772,6 +3278,7 @@ mod tests {
             bin: None,
             force: false,
             mode: "build".to_string(),
+            resolved_sha: None,
         };
 
         // 1) Dedupe/coalesce + monotonic priority bump (real ENQUEUE_LUA).
@@ -2814,12 +3321,18 @@ mod tests {
         let _: () = raw(&backend, "CONFIG", &["SET".into(), "maxmemory-policy".into(), "noeviction".into()]).await;
         assert_eq!(q.peek(10).await.unwrap().len(), 1, "queued job persists under noeviction");
 
-        // 3) Claim writes a fence token + module lock; a 2nd claim is ModuleBusy.
+        // 3) Claim writes a fence token + (module, ref) lock (PCON-04); a 2nd
+        // claim of the SAME ref (distinguished by mode, so it's a separate job)
+        // is ModuleBusy against the real CLAIM_LUA.
         let tok = match q.claim(&a.job_id, "chord", HostRole::Primary, 1).await.unwrap() {
             ClaimOutcome::Claimed { token } => token,
             o => panic!("{o:?}"),
         };
-        let j2 = q.enqueue(&mk("chord", "z", Priority::Normal, false, true)).await.unwrap();
+        let j2 = JobRequest {
+            mode: "test".to_string(),
+            ..mk("chord", "abc", Priority::Normal, false, true)
+        };
+        let j2 = q.enqueue(&j2).await.unwrap();
         assert_eq!(
             q.claim(&j2.job_id, "chord", HostRole::Primary, 4).await.unwrap(),
             ClaimOutcome::ModuleBusy
@@ -2830,7 +3343,12 @@ mod tests {
         q.finalize(&a.job_id, JobState::Done, &tok).await.unwrap();
         q.release(&a.job_id, "chord", HostRole::Primary, &tok).await.unwrap();
         let after = q.peek(10).await.unwrap();
-        let rerun = after.iter().find(|j| j.module == "chord" && j.git_ref == "abc").unwrap();
+        // Disambiguate from the still-queued mode=test `j2` (same module/ref,
+        // different mode/lock-sharing but a distinct dedupe entry) via `mode`.
+        let rerun = after
+            .iter()
+            .find(|j| j.module == "chord" && j.git_ref == "abc" && j.mode == "build")
+            .unwrap();
         assert_ne!(rerun.job_id, a.job_id, "re-run is a fresh job");
         // Rust-built and Lua-derived dedupe keys must AGREE on the collision-free
         // encoding: a fresh enqueue of the same pair coalesces onto the Lua-written
@@ -2884,10 +3402,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redis_concurrent_claim_serializes_same_module() {
-        // B4: two schedulers race to claim TWO DIFFERENT refs of the SAME module,
-        // against the real CLAIM_LUA — exactly one wins, the other is ModuleBusy
-        // (per-module serialization holds under real concurrency).
+    async fn redis_concurrent_claim_serializes_same_module_ref() {
+        // B4 / PCON-04: two schedulers race to claim the SAME (module, ref)
+        // (distinguished only by mode, so each gets its own job id), against the
+        // real CLAIM_LUA — exactly one wins, the other is ModuleBusy (the
+        // (module, ref) lock serializes under real concurrency).
         let Some(server) = EphemeralRedis::start() else {
             eprintln!("SKIP redis_concurrent_claim: redis-server not installed");
             return;
@@ -2896,18 +3415,19 @@ mod tests {
             RedisBackend::build(&server.url(), None, 0, 1, Duration::from_millis(500)).unwrap();
         let _: () = raw(&backend, "FLUSHALL", &[]).await;
         let q = Arc::new(RedisQueue::new(backend.clone()));
-        let mk = |r: &str| JobRequest {
+        let mk = |mode: &str| JobRequest {
             module: "chord".into(),
-            git_ref: r.into(),
+            git_ref: "r1".into(),
             priority: Priority::Normal,
             heavy: false,
             ready: true,
             bin: None,
             force: false,
-            mode: "build".to_string(),
+            mode: mode.to_string(),
+            resolved_sha: None,
         };
-        let j1 = q.enqueue(&mk("r1")).await.unwrap();
-        let j2 = q.enqueue(&mk("r2")).await.unwrap();
+        let j1 = q.enqueue(&mk("build")).await.unwrap();
+        let j2 = q.enqueue(&mk("test")).await.unwrap();
         // Race both claims concurrently.
         let (qa, qb) = (q.clone(), q.clone());
         let (ia, ib) = (j1.job_id.clone(), j2.job_id.clone());
@@ -2919,8 +3439,44 @@ mod tests {
             .filter(|o| matches!(o, ClaimOutcome::Claimed { .. }))
             .count();
         let busy = [&ra, &rb].iter().filter(|o| matches!(o, ClaimOutcome::ModuleBusy)).count();
-        assert_eq!(claimed, 1, "exactly one racer claims the module: {ra:?} / {rb:?}");
+        assert_eq!(claimed, 1, "exactly one racer claims the (module, ref) lock: {ra:?} / {rb:?}");
         assert_eq!(busy, 1, "the other is serialized out (ModuleBusy): {ra:?} / {rb:?}");
+    }
+
+    #[tokio::test]
+    async fn redis_different_ref_same_module_claims_concurrently_pcon04() {
+        // PCON-04, against the real CLAIM_LUA: two DIFFERENT refs (in practice,
+        // two different resolved SHAs — PCON-01..03 isolate their stage/target
+        // dirs) of the SAME module both claim successfully — the (module, ref)
+        // lock no longer force-serializes them.
+        let Some(server) = EphemeralRedis::start() else {
+            eprintln!("SKIP redis_different_ref_same_module: redis-server not installed");
+            return;
+        };
+        let backend =
+            RedisBackend::build(&server.url(), None, 0, 1, Duration::from_millis(500)).unwrap();
+        let _: () = raw(&backend, "FLUSHALL", &[]).await;
+        let q = RedisQueue::new(backend.clone());
+        let mk = |r: &str| JobRequest {
+            module: "chord".into(),
+            git_ref: r.into(),
+            priority: Priority::Normal,
+            heavy: false,
+            ready: true,
+            bin: None,
+            force: false,
+            mode: "build".to_string(),
+            resolved_sha: None,
+        };
+        let j1 = q.enqueue(&mk("sha-aaaa")).await.unwrap();
+        let j2 = q.enqueue(&mk("sha-bbbb")).await.unwrap();
+        let r1 = q.claim(&j1.job_id, "chord", HostRole::Primary, 4).await.unwrap();
+        assert!(matches!(r1, ClaimOutcome::Claimed { .. }), "{r1:?}");
+        let r2 = q.claim(&j2.job_id, "chord", HostRole::Primary, 4).await.unwrap();
+        assert!(
+            matches!(r2, ClaimOutcome::Claimed { .. }),
+            "different-ref job of the same module must not be ModuleBusy: {r2:?}"
+        );
     }
 
     #[test]
@@ -2962,7 +3518,7 @@ mod tests {
             seq_key(),
             dedupe_key("chord", "abc", "build"),
             job_key("id"),
-            module_lock_key("chord"),
+            module_lock_key("chord", "abc"),
             host_set_key(HostRole::Heavy),
         ] {
             assert!(k.starts_with("queue:"), "{k} must be under the Queue namespace");

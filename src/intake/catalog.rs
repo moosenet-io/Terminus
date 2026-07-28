@@ -73,11 +73,83 @@ pub const TEST_TYPE_AGENT: &str = "agent";
 /// MINT-DIFF-01: the diffusion suite's test-family tag (use-case quality +
 /// performance, distinct from `coder`/`assistant`/`serving`/`agent`).
 pub const TEST_TYPE_DIFFUSION: &str = "diffusion";
+/// SUITE-EMB (S125 TERM #508): the embedding-retrieval suite's test-family tag
+/// (IR quality — precision/recall/MRR/nDCG — plus dimensionality, throughput, and
+/// a public-vs-domain delta). Results land in `assistant_dimension_score` under
+/// `task_category = "embedding_retrieval"`; see
+/// [`crate::intake::newcats::embedding_retrieval`].
+pub const TEST_TYPE_EMBEDDING_RETRIEVAL: &str = "embedding_retrieval";
+/// S125 SUITE-TOOL: the tool-routing suite's test-family tag (correct-tool@1,
+/// parameter validity, decoy rejection, multi-step — distinct from the legacy
+/// `agent` tool-use family, which stays a scalar accuracy on its own axis).
+pub const TEST_TYPE_TOOL_ROUTING: &str = "tool_routing";
+/// SUITE-VQA: the vision-QA suite's test-family tag (image → short answer;
+/// accuracy / caption similarity / hallucination / latency / VRAM).
+pub const TEST_TYPE_VISION_QA: &str = "vision_qa";
+/// The vision-QA leaf `task_category` — the `image_parsing` module's own tag,
+/// which the suite writes its `assistant_dimension_score` rows under.
+pub const VISION_QA_CATEGORY: &str = "image_parsing";
+/// The `dimension` the vision-QA suite writes (image_parsing::DIMENSION). A
+/// vision_qa cell is `run` when a row for this dimension exists for the model
+/// (read via `read_assistant_cells`, which does not filter `task_category`).
+const VISION_QA_DIMENSION: &str = "vision_description";
+/// SUITE-RRK: the reranking suite's test-family tag (nDCG uplift + latency,
+/// distinct from the other families).
+pub const TEST_TYPE_RERANKING: &str = "reranking";
+/// SUITE-IMG (S125): the image-generation suite's test-family tag. Distinct from
+/// `TEST_TYPE_DIFFUSION` — image generation (text→image, sd-turbo behind Chord's
+/// `/v1/images/generations`) and the diffusion-language probe are separate suites
+/// with separate `task_category`s (`newcats::image_generation::TASK_CATEGORY ==
+/// "image_generation"` vs `newcats::diffusion::TASK_CATEGORY == "diffusion"`).
+pub const TEST_TYPE_IMAGE_GENERATION: &str = "image_generation";
 
 /// The single serving/context-profile leaf category.
 pub const SERVING_CATEGORY: &str = "context_profile";
 /// The single agent tool-use leaf category.
 pub const AGENT_CATEGORY: &str = "tool_use";
+/// The single embedding-retrieval leaf category (matches the `newcats` module's
+/// `TASK_CATEGORY`).
+pub const EMBEDDING_RETRIEVAL_CATEGORY: &str = "embedding_retrieval";
+/// The single tool-routing leaf category (all four routing metrics roll up under
+/// the one `"tool_routing"` dimension written by the suite).
+pub const TOOL_ROUTING_CATEGORY: &str = "tool_routing";
+/// SUITE-RRK: the single reranking leaf category. MUST equal
+/// `newcats::reranking::DIMENSION` — the reranking suite writes its
+/// `assistant_dimension_score` rows under that dimension, and the catalog cell
+/// is derived by matching it (duplicated as a string here, matching how
+/// `ASSISTANT_DIMENSIONS` duplicates the `assistant/dim*.rs` `DIMENSION` consts).
+pub const RERANKING_CATEGORY: &str = "rerank_relevance";
+/// SUITE-IMG: the image-generation leaf category — the `dimension` the suite
+/// writes (`newcats::image_generation::DIMENSION == "text_to_image"`).
+pub const IMAGE_GENERATION_CATEGORY: &str = "text_to_image";
+/// SUITE-IMG: the `task_category` the suite writes its rows under
+/// (`newcats::image_generation::TASK_CATEGORY`) — the filter for
+/// [`storage::read_task_category_cells`] (distinct from the leaf dimension above).
+pub const IMAGE_GENERATION_TASK_CATEGORY: &str = "image_generation";
+/// SUITE-DOC (S125): the document_parsing suite's test-family tag (field accuracy
+/// + CER/WER + table F1 via Chord `/v1/documents/parse`).
+pub const TEST_TYPE_DOCUMENT_PARSING: &str = "document_parsing";
+/// SUITE-DOC: the single document_parsing leaf category (matches
+/// [`crate::intake::newcats::document_parsing::TASK_CATEGORY`]); also the
+/// `task_category` filter for [`storage::read_task_category_cells`].
+pub const DOCUMENT_PARSING_CATEGORY: &str = "document_parsing";
+/// SUITE-STT (S125): the voice_transcription suite's test-family tag (WER/CER +
+/// latency + RTF via Chord's `/v1/audio/transcriptions`).
+pub const TEST_TYPE_VOICE_TRANSCRIPTION: &str = "voice_transcription";
+/// SUITE-STT: the voice_transcription leaf category — the `dimension` the suite
+/// writes (`newcats::voice_transcription::DIMENSION == "asr_transcription"`).
+pub const VOICE_TRANSCRIPTION_CATEGORY: &str = "asr_transcription";
+/// SUITE-STT: the `task_category` the suite writes its rows under
+/// (`newcats::voice_transcription::TASK_CATEGORY`) — the `read_task_category_cells`
+/// filter (distinct from the leaf dimension above).
+pub const VOICE_TRANSCRIPTION_TASK_CATEGORY: &str = "voice_transcription";
+/// SUITE-TTS (S125): the text-to-speech suite's test-family tag (intelligibility
+/// via loopback ASR + synthesis performance).
+pub const TEST_TYPE_TTS: &str = "tts";
+/// SUITE-TTS: the text-to-speech leaf category / `task_category`
+/// (`newcats::tts::TASK_CATEGORY`), used both as the display category and the
+/// [`storage::read_task_category_cells`] filter.
+pub const TTS_CATEGORY: &str = "tts";
 
 /// A cell's coverage status. `not_run` is FIRST-CLASS — representing gaps is the
 /// catalog's whole job.
@@ -182,6 +254,17 @@ pub struct CatalogInputs {
     pub serving: Vec<ServingRow>,
     /// Agent tool-use rollups.
     pub agent: Vec<AgentRollup>,
+    /// SUITE-IMG (S125): image_generation rollups — one `AssistantCell` per model
+    /// with a `task_category = "image_generation"` dimension-score row, read via
+    /// [`storage::read_task_category_cells`] (a proper per-task_category filtered
+    /// reader, unlike `read_assistant_cells` which ignores task_category).
+    pub image_generation: Vec<AssistantCell>,
+    /// SUITE-DOC (S125): document_parsing rollups (`task_category = "document_parsing"`).
+    pub document_parsing: Vec<AssistantCell>,
+    /// SUITE-STT (S125): voice_transcription rollups (`task_category = "voice_transcription"`).
+    pub voice_transcription: Vec<AssistantCell>,
+    /// SUITE-TTS (S125): text-to-speech rollups (`task_category = "tts"`).
+    pub tts: Vec<AssistantCell>,
     /// The coder epoch stamped on `run` coder cells (`current_epoch()` live).
     pub coder_epoch: String,
 }
@@ -341,6 +424,18 @@ pub fn build_catalog(inputs: &CatalogInputs) -> Vec<ModelCatalog> {
     }
     for a in &inputs.agent {
         universe.insert(a.model_name.clone());
+    }
+    for d in &inputs.image_generation {
+        universe.insert(d.model_name.clone());
+    }
+    for d in &inputs.document_parsing {
+        universe.insert(d.model_name.clone());
+    }
+    for d in &inputs.voice_transcription {
+        universe.insert(d.model_name.clone());
+    }
+    for d in &inputs.tts {
+        universe.insert(d.model_name.clone());
     }
 
     let mut out = Vec::with_capacity(universe.len());
@@ -524,6 +619,210 @@ pub fn build_catalog(inputs: &CatalogInputs) -> Vec<ModelCatalog> {
         };
         cells.push(agent_cell);
 
+        // ---- embedding_retrieval cell (SUITE-EMB) ----------------------------
+        // The suite writes its results to `assistant_dimension_score` under
+        // `task_category = "embedding_retrieval"`; no dedicated stored-aggregate
+        // reader is threaded into `CatalogInputs` yet, so — like every other
+        // uncovered family — this is emitted as a FIRST-CLASS `not_run` coverage
+        // cell so the embedding-retrieval axis shows up (as an explicit gap) for
+        // every model until a reader promotes it to `Run`. Adding that reader is a
+        // follow-up, mirroring how `diffusion` introduced its `TEST_TYPE_*` before
+        // a catalog reader existed.
+        cells.push(not_run_cell(
+            &model,
+            TEST_TYPE_EMBEDDING_RETRIEVAL,
+            EMBEDDING_RETRIEVAL_CATEGORY,
+        ));
+        // ---- tool-routing cell (S125 SUITE-TOOL) -----------------------------
+        // Reads the same assistant-dimension rollups (`read_assistant_cells`
+        // groups by dimension across every task_category), keyed on the suite's
+        // own `"tool_routing"` dimension — so it never collides with the
+        // hardcoded ASSISTANT_DIMENSIONS list above.
+        let tool_routing_row = inputs
+            .assistant
+            .iter()
+            .find(|a| a.model_name == model && a.dimension == TOOL_ROUTING_CATEGORY);
+        let tool_routing_cell = match tool_routing_row {
+            Some(a) if a.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_TOOL_ROUTING.to_string(),
+                task_category: TOOL_ROUTING_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                pass_rate: None,
+                n_samples: Some(a.n_samples),
+                score_stddev: a.score_stddev,
+                low_confidence: Some(a.n_samples <= 1),
+                last_run_at: a.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_TOOL_ROUTING, TOOL_ROUTING_CATEGORY),
+        };
+        cells.push(tool_routing_cell);
+
+        // ---- vision_qa cell (SUITE-VQA image-QA suite) -----------------------
+        // The vision_qa suite writes `assistant_dimension_score` rows under the
+        // `vision_description` dimension (task_category "image_parsing"), read
+        // into `inputs.assistant` — which does not filter task_category. A
+        // vision_qa cell is `run` when such a row exists for this model, else
+        // not_run (the explicit coverage gap, same as agent/serving).
+        let vision_row = inputs
+            .assistant
+            .iter()
+            .find(|a| a.model_name == model && a.dimension == VISION_QA_DIMENSION);
+        let vision_cell = match vision_row {
+            Some(a) if a.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_VISION_QA.to_string(),
+                task_category: VISION_QA_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                pass_rate: None,
+                n_samples: Some(a.n_samples),
+                score_stddev: a.score_stddev,
+                low_confidence: Some(a.n_samples <= 1),
+                last_run_at: a.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_VISION_QA, VISION_QA_CATEGORY),
+        };
+        cells.push(vision_cell);
+
+        // ---- reranking cell (SUITE-RRK) --------------------------------------
+        // The reranking suite writes its rows into `assistant_dimension_score`
+        // under `dimension = RERANKING_CATEGORY` (see `newcats::reranking`), and
+        // `read_assistant_cells` groups EVERY dimension (no task_category filter),
+        // so a reranking rollup arrives in `inputs.assistant` keyed by that
+        // dimension — no separate input source is needed. `Run` when rows exist,
+        // `not_run` otherwise. The fixed assistant loop above never emits this
+        // cell because RERANKING_CATEGORY is not in `ASSISTANT_DIMENSIONS`, so
+        // there is no double-count.
+        let rerank_row = inputs
+            .assistant
+            .iter()
+            .find(|a| a.model_name == model && a.dimension == RERANKING_CATEGORY);
+        let rerank_cell = match rerank_row {
+            Some(a) if a.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_RERANKING.to_string(),
+                task_category: RERANKING_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                pass_rate: None,
+                n_samples: Some(a.n_samples),
+                score_stddev: a.score_stddev,
+                low_confidence: Some(a.n_samples <= 1),
+                last_run_at: a.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_RERANKING, RERANKING_CATEGORY),
+        };
+        cells.push(rerank_cell);
+
+        // ---- image-generation cell (SUITE-IMG) -------------------------------
+        // The suite writes `assistant_dimension_score` rows under
+        // `task_category = "image_generation"` (dimension `text_to_image`). Read
+        // via the per-task_category filtered reader `read_task_category_cells`
+        // (threaded into `inputs.image_generation`), so the cell flips to `Run`
+        // only for a genuine image_generation row — never a cross-suite dimension
+        // collision. `Run` when measured, else the explicit `not_run` gap.
+        let imagegen_row = inputs
+            .image_generation
+            .iter()
+            .find(|a| a.model_name == model);
+        let imagegen_cell = match imagegen_row {
+            Some(a) if a.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_IMAGE_GENERATION.to_string(),
+                task_category: IMAGE_GENERATION_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                // Image generation is a success/hardware probe, not a pass-rate;
+                // only sample count + recency are meaningful (like the serving cell).
+                pass_rate: None,
+                n_samples: Some(a.n_samples),
+                score_stddev: a.score_stddev,
+                low_confidence: Some(a.n_samples <= 1),
+                last_run_at: a.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_IMAGE_GENERATION, IMAGE_GENERATION_CATEGORY),
+        };
+        cells.push(imagegen_cell);
+
+        // ---- document_parsing cell (SUITE-DOC) -------------------------------
+        // The suite writes rows under `task_category = "document_parsing"` (read
+        // via `read_task_category_cells` into `inputs.document_parsing`). `Run`
+        // when a measured row exists, else the explicit `not_run` gap.
+        let doc_row = inputs
+            .document_parsing
+            .iter()
+            .find(|d| d.model_name == model);
+        let doc_cell = match doc_row {
+            Some(d) if d.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_DOCUMENT_PARSING.to_string(),
+                task_category: DOCUMENT_PARSING_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                pass_rate: None,
+                n_samples: Some(d.n_samples),
+                score_stddev: d.score_stddev,
+                low_confidence: Some(d.n_samples <= 1),
+                last_run_at: d.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_DOCUMENT_PARSING, DOCUMENT_PARSING_CATEGORY),
+        };
+        cells.push(doc_cell);
+
+        // ---- voice_transcription cell (SUITE-STT) ----------------------------
+        // The suite writes rows under `task_category = "voice_transcription"`
+        // (read via `read_task_category_cells` into `inputs.voice_transcription`).
+        let stt_row = inputs
+            .voice_transcription
+            .iter()
+            .find(|d| d.model_name == model);
+        let stt_cell = match stt_row {
+            Some(d) if d.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_VOICE_TRANSCRIPTION.to_string(),
+                task_category: VOICE_TRANSCRIPTION_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                pass_rate: None,
+                n_samples: Some(d.n_samples),
+                score_stddev: d.score_stddev,
+                low_confidence: Some(d.n_samples <= 1),
+                last_run_at: d.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_VOICE_TRANSCRIPTION, VOICE_TRANSCRIPTION_CATEGORY),
+        };
+        cells.push(stt_cell);
+
+        // ---- tts cell (SUITE-TTS) --------------------------------------------
+        // The suite writes rows under `task_category = "tts"` (read via
+        // `read_task_category_cells` into `inputs.tts`).
+        let tts_row = inputs.tts.iter().find(|d| d.model_name == model);
+        let tts_cell = match tts_row {
+            Some(d) if d.n_samples > 0 => CatalogCell {
+                model_name: model.clone(),
+                quant: None,
+                test_type: TEST_TYPE_TTS.to_string(),
+                task_category: TTS_CATEGORY.to_string(),
+                status: CoverageStatus::Run,
+                pass_rate: None,
+                n_samples: Some(d.n_samples),
+                score_stddev: d.score_stddev,
+                low_confidence: Some(d.n_samples <= 1),
+                last_run_at: d.last_run_at,
+                harness_version: None,
+            },
+            _ => not_run_cell(&model, TEST_TYPE_TTS, TTS_CATEGORY),
+        };
+        cells.push(tts_cell);
+
         // ---- serving facts (fleet card) --------------------------------------
         let serving = ServingFacts {
             max_context_safe: serving_row.and_then(|s| s.max_context_safe),
@@ -609,6 +908,17 @@ pub async fn refresh_fleet_catalog(pool: &PgPool) -> Result<usize, ToolError> {
     let assistant = storage::read_assistant_cells(pool).await?;
     let serving = storage::read_serving_rows(pool).await?;
     let agent = storage::read_agent_rollups(pool).await?;
+    // SUITE-IMG/DOC/STT/TTS (S125): per-task_category filtered rollups — each read
+    // via `read_task_category_cells` on the row's own `task_category`, so a cell
+    // flips to `Run` only for a genuine row of that suite (never a cross-suite
+    // dimension-name collision the unfiltered assistant reader could allow).
+    let image_generation =
+        storage::read_task_category_cells(pool, IMAGE_GENERATION_TASK_CATEGORY).await?;
+    let document_parsing =
+        storage::read_task_category_cells(pool, DOCUMENT_PARSING_CATEGORY).await?;
+    let voice_transcription =
+        storage::read_task_category_cells(pool, VOICE_TRANSCRIPTION_TASK_CATEGORY).await?;
+    let tts = storage::read_task_category_cells(pool, TTS_CATEGORY).await?;
 
     // Fleet list: nominations UNION the models that appear in any result table.
     // Best-effort — an unreadable nominations file still yields a catalog built
@@ -624,6 +934,10 @@ pub async fn refresh_fleet_catalog(pool: &PgPool) -> Result<usize, ToolError> {
         assistant,
         serving,
         agent,
+        image_generation,
+        document_parsing,
+        voice_transcription,
+        tts,
         coder_epoch: epoch,
     };
     let catalog = build_catalog(&inputs);
@@ -787,6 +1101,49 @@ pub fn filter_cards(
         });
     }
     (out, note)
+}
+
+/// Map an intake SUITE name (the fleet driver's vocabulary — `context`, `code`,
+/// `agent`, `stt`, `tts`, …) to the catalog `test_type` its results land under,
+/// or `None` for an unknown suite. PURE — the single source of truth the sweep
+/// uses to check whether a suite's coverage cell is already settled.
+pub fn suite_test_type(suite: &str) -> Option<&'static str> {
+    Some(match suite {
+        "context" => TEST_TYPE_SERVING,
+        "code" => TEST_TYPE_CODER,
+        "agent" => TEST_TYPE_AGENT,
+        "diffusion" => TEST_TYPE_DIFFUSION,
+        "embedding_retrieval" => TEST_TYPE_EMBEDDING_RETRIEVAL,
+        "tool_routing" => TEST_TYPE_TOOL_ROUTING,
+        "vision_qa" => TEST_TYPE_VISION_QA,
+        "reranking" => TEST_TYPE_RERANKING,
+        "image_generation" => TEST_TYPE_IMAGE_GENERATION,
+        "document_parsing" => TEST_TYPE_DOCUMENT_PARSING,
+        "stt" => TEST_TYPE_VOICE_TRANSCRIPTION,
+        "tts" => TEST_TYPE_TTS,
+        _ => return None,
+    })
+}
+
+/// DR-01 (S125): of a model's `candidate_suites`, which still need running in a
+/// CONVERGENT sweep — given the model's persisted coverage `cells`. A suite is
+/// PENDING when the model has NO settled (`run`/`non_viable`) cell for that
+/// suite's `test_type` yet: every matching cell is `not_run`/`stale`, or no cell
+/// exists at all. Settled suites are dropped so a resumed/partial sweep targets
+/// the gaps instead of re-profiling everything. An UNKNOWN suite (no `test_type`
+/// mapping) is kept — fail-open, never silently drop coverage. PURE (no DB, no
+/// clock, no env), so the convergence logic is fully unit-testable.
+pub fn pending_suites(candidate_suites: &[String], cells: &[StoredCatalogCell]) -> Vec<String> {
+    candidate_suites
+        .iter()
+        .filter(|suite| match suite_test_type(suite) {
+            Some(tt) => !cells
+                .iter()
+                .any(|c| c.test_type == tt && (c.status == "run" || c.status == "non_viable")),
+            None => true,
+        })
+        .cloned()
+        .collect()
 }
 
 /// One cell as an output JSON object.
@@ -1201,14 +1558,79 @@ mod tests {
             m.cells.iter().all(|c| c.status == CoverageStatus::NotRun),
             "every cell must be not_run"
         );
-        // Coder (3) + assistant (7) + serving (1) + agent (1) = 12 cells.
-        assert_eq!(m.cells.len(), 12);
-        assert_eq!(m.not_run_count, 12);
+        // Coder (3) + assistant (7) + serving (1) + agent (1) +
+        // embedding_retrieval (1, SUITE-EMB) + tool_routing (1, SUITE-TOOL) + vision_qa (1, SUITE-VQA) + reranking (1, SUITE-RRK)
+        // + image_generation (1, SUITE-IMG) + document_parsing (1, SUITE-DOC) + voice_transcription (1, SUITE-STT) + tts (1, SUITE-TTS) = 20 cells.
+        assert_eq!(m.cells.len(), 20);
+        assert_eq!(m.not_run_count, 20);
         // multi_file gap is explicitly present, not omitted.
         assert_eq!(
             cell(&cat, "ghost", "coder", "multi_file").status,
             CoverageStatus::NotRun
         );
+    }
+
+    /// CB-01: the coverage matrix must carry a cell for EVERY one of the 8 new
+    /// S125 modalities (regardless of whether the suite is a batch-1 assistant
+    /// reader or a batch-2 `read_task_category_cells` reader), so a model with no
+    /// rows shows an explicit `not_run` gap per modality — never a silently
+    /// omitted row. Note the `stt` modality's emitted `test_type` is
+    /// `voice_transcription` (there is no separate `TEST_TYPE_STT`).
+    #[test]
+    fn catalog_covers_all_s125_modalities() {
+        let mut inp = base_inputs();
+        inp.fleet = vec![FleetModel {
+            model_name: "blank".into(),
+            in_current_fleet: true,
+            vram_footprint_gb: None,
+        }];
+        let cat = build_catalog(&inp);
+        let m = cat.iter().find(|m| m.model_name == "blank").unwrap();
+
+        // (test_type, task_category) for each of the 8 S125 modalities.
+        let s125: [(&str, &str); 8] = [
+            (TEST_TYPE_EMBEDDING_RETRIEVAL, EMBEDDING_RETRIEVAL_CATEGORY),
+            (TEST_TYPE_RERANKING, RERANKING_CATEGORY),
+            (TEST_TYPE_VISION_QA, VISION_QA_CATEGORY),
+            (TEST_TYPE_TOOL_ROUTING, TOOL_ROUTING_CATEGORY),
+            (TEST_TYPE_DOCUMENT_PARSING, DOCUMENT_PARSING_CATEGORY),
+            (TEST_TYPE_IMAGE_GENERATION, IMAGE_GENERATION_CATEGORY),
+            (TEST_TYPE_VOICE_TRANSCRIPTION, VOICE_TRANSCRIPTION_CATEGORY), // stt
+            (TEST_TYPE_TTS, TTS_CATEGORY),
+        ];
+        for (tt, tc) in s125 {
+            let matches: Vec<&CatalogCell> =
+                m.cells.iter().filter(|c| c.test_type == tt).collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "expected exactly one coverage cell for modality {tt}, found {}",
+                matches.len()
+            );
+            let c = matches[0];
+            assert_eq!(c.task_category, tc, "wrong task_category for {tt}");
+            assert_eq!(
+                c.status,
+                CoverageStatus::NotRun,
+                "modality {tt} must account as not_run for a model with no rows"
+            );
+        }
+
+        // The pre-existing modalities remain present alongside the S125 eight.
+        for tt in [
+            TEST_TYPE_CODER,
+            TEST_TYPE_ASSISTANT,
+            TEST_TYPE_SERVING,
+            TEST_TYPE_AGENT,
+        ] {
+            assert!(
+                m.cells.iter().any(|c| c.test_type == tt),
+                "pre-existing modality {tt} missing from coverage matrix"
+            );
+        }
+
+        // Every cell is a not_run gap, and not_run_count agrees with the total.
+        assert_eq!(m.not_run_count, m.cells.len());
     }
 
     /// A `non_viable_vram` model → `non_viable` coder cells (read off the failure
@@ -1389,6 +1811,50 @@ mod tests {
             refreshed_at: chrono::Utc::now(),
             cells,
         }
+    }
+
+    // DR-01: suite → test_type mapping covers every fleet suite; unknown → None.
+    #[test]
+    fn suite_test_type_mapping() {
+        assert_eq!(suite_test_type("context"), Some(TEST_TYPE_SERVING));
+        assert_eq!(suite_test_type("code"), Some(TEST_TYPE_CODER));
+        assert_eq!(suite_test_type("agent"), Some(TEST_TYPE_AGENT));
+        assert_eq!(suite_test_type("stt"), Some(TEST_TYPE_VOICE_TRANSCRIPTION));
+        assert_eq!(suite_test_type("tts"), Some(TEST_TYPE_TTS));
+        assert_eq!(suite_test_type("vision_qa"), Some(TEST_TYPE_VISION_QA));
+        assert_eq!(suite_test_type("image_generation"), Some(TEST_TYPE_IMAGE_GENERATION));
+        assert_eq!(suite_test_type("nonsense"), None);
+    }
+
+    // DR-01: a CONVERGENT sweep keeps only suites whose cell is not_run/stale (or
+    // absent); a settled (`run`/`non_viable`) cell drops its suite; an unknown
+    // suite is kept (fail-open).
+    #[test]
+    fn pending_suites_targets_gaps_only() {
+        let cells = vec![
+            scell("m", TEST_TYPE_SERVING, "context_profile", "run"), // context settled
+            scell("m", TEST_TYPE_TTS, "tts", "not_run"),             // tts pending
+            scell("m", TEST_TYPE_VISION_QA, "image_parsing", "stale"), // vqa pending (stale)
+            scell("m", TEST_TYPE_RERANKING, "rerank_relevance", "non_viable"), // settled
+        ];
+        let candidates: Vec<String> = ["context", "tts", "vision_qa", "reranking", "stt", "mystery"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let pending = pending_suites(&candidates, &cells);
+        // context (run) + reranking (non_viable) dropped; tts+vqa (gaps), stt (no
+        // cell at all) and mystery (unknown → fail-open) kept.
+        assert_eq!(pending, vec!["tts", "vision_qa", "stt", "mystery"]);
+    }
+
+    #[test]
+    fn pending_suites_empty_when_all_settled() {
+        let cells = vec![
+            scell("m", TEST_TYPE_SERVING, "context_profile", "run"),
+            scell("m", TEST_TYPE_CODER, "blitz", "run"),
+        ];
+        let candidates: Vec<String> = ["context", "code"].iter().map(|s| s.to_string()).collect();
+        assert!(pending_suites(&candidates, &cells).is_empty());
     }
 
     /// A two-model fixture: `alpha` has a run + a not_run coder cell; `beta` has

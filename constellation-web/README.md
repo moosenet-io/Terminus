@@ -19,12 +19,20 @@ same-origin `/api/{harmony,chord,lumina,muse,terminus}/*` calls, cookie-based
 
 It has two implementations of the same `AggregationClient` interface:
 
-- **`mockAdapter`** — canned, in-memory data. Default. Lets the whole app build, run, and be
-  reviewed with zero backend present.
 - **`httpAdapter`** — real fetch against `/api/...`, the same origin the SPA is served from.
+  **Default in any browser** (the SPA is served same-origin by the real terminus binary in
+  production, so the backend is right there).
+- **`mockAdapter`** — canned, in-memory data. Explicit opt-in only; lets the app build, run, and
+  be reviewed with zero backend present.
 
-Selected via the `VITE_AGG_MODE` env var (`mock` | `http`), default `mock`. Swapping to a
-real backend is a build-time env change, not a code change.
+S127 TGUI2 — the adapter default is **http**, and selection is runtime-selectable (see
+`resolveMode()` in `src/lib/aggregationClient.ts`). Precedence: build-time `VITE_AGG_MODE`
+(`http`|`mock`) › server-injected `window.__AGG_MODE__` › runtime mock opt-in (`?mock` URL param
+or `localStorage['constellation.aggMode']='mock'`) › **http** in any browser › `mock` only when
+there is no `window` (unit tests/SSR). This inverts the old build-time-only default (which was
+`mock`, so a build that forgot `VITE_AGG_MODE=http` shipped the entire app as fixtures). A
+mock-only bundle can no longer ship silently; `npm run build:verify` asserts the emitted bundle
+can reach the http adapter (`scripts/assert-http-bundle.mjs`).
 
 **Endpoints/shapes CONST-02 (the real Terminus-side aggregation layer) needs to serve** —
 this is the contract the httpAdapter already assumes:
@@ -35,8 +43,8 @@ this is the contract the httpAdapter already assumes:
 | POST | `/api/auth/login` (body `{username,password}`) | same as above |
 | POST | `/api/auth/logout` | 200/204 |
 | GET | `/api/health` | `{ system: 'harmony'\|'chord'\|'lumina'\|'muse'\|'terminus'; available: boolean; detail?: string }[]` |
-| GET | `/api/terminus/config` | `{ modules: { name: string; enabled: boolean; version?: string }[]; workerCount: number }` |
-| GET | `/api/terminus/activity?limit=N` | `{ entries: { ts: string; method: string; path: string; principal: string \| null; system: string }[] }` — tail of the CONST-02 mutating-request audit log; **never body content**. `limit` asks for fewer entries, never more than the server's own `CONSTELLATION_ACTIVITY_TAIL_LIMIT` cap (default 200). A missing/empty audit log yields `{entries: []}`, `200 OK` — never an error. |
+| GET | `/api/terminus/config` | `{ modules: { name: string; enabled: boolean; version?: string; toolCount?: number; tools?: string[] }[]; workerCount: number }` (`toolCount`/`tools` are CONST-28, additive — a pre-CONST-28 backend response is still valid, just without them) |
+| GET | `/api/terminus/activity?limit=N` | `{ entries: { ts: string; method: string; path: string; principal: string \| null; system: string }[] }` — tail of the CONST-02 mutating-request audit log; **never body content**. `limit` asks for fewer entries, never more than the server's own `CONSTELLATION_ACTIVITY_TAIL_LIMIT` cap (default 200). A missing/empty audit log yields `{entries: []}`, `200 OK` — never an error. CONST-28's client additionally degrades to `{available:false}` on 404/501/error (see Terminus module panels below). |
 | any | `/api/{system}/{path}` | generic passthrough used by `client.request<T>()` for panel-specific reads that don't have a typed method yet |
 
 **CONST-21 — the Models/MINT read API** (`src/constellation/models_api.rs`, spec
@@ -65,6 +73,18 @@ CONST-19 adds the fourth namespace, `/api/muse/*path` — identical single-door/
 degradation semantics to the other three, with one difference: `/api/muse/art/*` (poster/art
 images) passes through as raw bytes with the upstream's own content-type rather than JSON —
 fetch those by URL (e.g. an `<img src>`), not through `client.request<T>()`.
+
+**LGUI-05 — Lumina proxy authentication.** `/api/lumina/*path` is the one namespace that
+authenticates itself to its backend server-side: `proxy_lumina`
+(`src/constellation/proxy.rs`) attaches `Authorization: Bearer <CONSTELLATION_LUMINA_TOKEN>`
+(unset ⇒ unauthenticated passthrough, unchanged from before this item) and `X-Lumina-User:
+<verified session principal>` on every outbound call. The browser never holds, sets, or reads
+either header — `enforceHeaders` (above) strips a caller-supplied `Authorization`/
+`X-Lumina-User` client-side as a defense-in-depth door, and the Rust proxy independently never
+reads any inbound header but `content-type` to build its own outbound ones. A `401` from
+Lumina (misconfigured/rejected token) degrades to the same `{available:false,
+detail:"lumina auth failed"}` shape every other backend failure uses, never a raw `401`
+forwarded to a browser session that has no way to react to it.
 
 #### The `prefs` seam (CONST-16)
 
@@ -259,6 +279,50 @@ door — it's structurally incapable of storing a credential shape). Vault-refer
 (provider API keys, etc., landing in CONST-08+) must be surfaced as a vault key *name* with a
 set/rotate affordance, never a round-tripped value.
 
+## Muse module (CONST-19 backend, CONST-20 UI)
+
+`muse` is the fourth namespaced proxy arm (`/api/muse/*path` in `src/constellation/proxy.rs`,
+CONST-19) with three panels (CONST-20, `src/panels/muse/`) against it:
+
+- **`muse.dashboard`** — a Library Overview MetricCards row (library size, active channels,
+  pending items, last ingest) plus On Deck (poster rail), Premieres (sorted, past-dated
+  entries dimmed not hidden), and Gaps summary.
+- **`muse.taste`** — a taste-cluster scatter (first 4 clusters keep a categorical slot, the
+  rest fold into one "Other" series — the §4.2 all-pairs cap), a watch-history stacked area,
+  and a group-dynamics table. All read-only.
+- **`muse.channels`** — channels list, per-channel lineup, and a guide grid rendered as a
+  `DataTable` timeline (deliberately **not** an EPG widget, per spec §5.4). Compose/maintenance
+  actions are operator-gated and confirmed.
+
+All data comes from `src/hooks/useMuse.ts`, which wraps every Muse read in its own
+`useMuseSection` call — this is the mechanism behind the module's **per-endpoint degradation**
+requirement: a single unwired/erroring route (the MUSEX-WIRE reality — most Muse features
+exist unwired in production) collapses only its own `ChartCard` to `ChartEmpty("not yet
+wired")`, never the whole panel. Degradation is keyed on two equivalent signals: the
+httpAdapter throwing `HTTP 404`/`HTTP 501`, or the mockAdapter resolving `null` for a pathname
+with no `MOCK_GET` entry (aggregationClient.ts's own "not mocked" sentinel). Manually verified
+by deleting a `MOCK_GET` key and confirming only that section degrades (see `useMuse.ts`'s and
+`DashboardPanel.tsx`'s top comments for how).
+
+Role gating comes from **merged CONST-27**: Muse's compose/maintenance controls are wrapped in
+main's canonical `components/RoleGate.tsx` (a viewer session sees them disabled with an
+"operator role required" tooltip; the real session role flows via `AuthRoleContext`'s
+`useAuthRole()`), and enforcement is always server-side regardless (spec §3.4 —
+`enforce_viewer_role_gate` 403s a viewer's mutating request). This build's earlier pre-merge
+role seam (a local `hooks/useAuthRole.ts` + its own RoleGate variant) was DELETED when the
+branch reconciled onto merged main. One local stand-in remains, clearly marked in its file
+header for its real item to replace without touching call sites:
+
+- **`components/ConfirmDialog.tsx`** — no shared modal/dialog kit on main yet (CONST-25's is
+  unmerged). Minimal, brand-token, `role="dialog"` + Esc-to-cancel stand-in for Muse's
+  compose/maintenance confirmations.
+
+Two mock/route additions beyond the original §5.4 endpoint list (both plain GET/POST passthrough
+under the existing `proxy_muse` arm, no `proxy.rs` change needed, both degrade the same way as
+every spec'd route): `GET /stats` (the dashboard's MetricCards row has no dedicated endpoint in
+the original list) and `POST /api/channels/{id}/{compose,maintenance}` (the channel mutation
+routes spec §5.4 names but doesn't give an exact path for).
+
 ## Roles (CONST-27)
 
 There are exactly two session tiers, both minted onto the same signed JWT from CONST-03 (no
@@ -441,17 +505,51 @@ backend — type one of these as (or within) your message:
 | `trigger:long` | a 4200+ char assistant reply |
 | anything else | a short canned reply exercising **bold**, `` `inline code` ``, a link, and a fenced code block |
 
+## Terminus module panels (CONST-28)
+
+The `terminus` module's own self-observability surface, built on the CONST-04 `Config` panel's
+pattern, in `src/panels/terminus/`:
+
+- **`FleetPanel.tsx`** ("Fleet") — a health board with one card per fleet system
+  (harmony/chord/lumina/terminus). Each card polls `client.health.list()` on its own 5s
+  interval and accumulates into a **client-held ring buffer of the last 120 polls per system**
+  (`fleetRingBuffer.ts` — pure, framework-free, unit-tested in `fleetRingBuffer.test.ts` via
+  `npm run test`: capacity cap, transition/flap detection, uptime ratio). Each card renders an
+  uptime `Sparkline` (`src/viz/Sparkline.tsx`, the viz kit's minimal chrome-free line chart) plus
+  the mesh/broker summary (module/worker counts) from `/api/terminus/config`. Edge cases: an
+  empty broker-routes table reads as "0 (in-process)", not an error; a failing health poll
+  leaves every system's ring buffer at its last-known content (see the pure function's own
+  "leaves a system untouched" test) rather than clearing it.
+- **`ToolsPanel.tsx`** ("Tools") — the full tool catalog, grouped by module prefix, from the
+  CONST-28-extended `/api/terminus/config` (`modules[].tools`/`toolCount`). Searchable (text +
+  per-module filter chips) and paged (`DataTable`, 25 rows/page) — the mock fixture pads `plane`
+  out to 34 tools specifically to exercise paging. A `TODO(CONST-25 seam)` comment marks where
+  the command-palette entity-source registration wires in once that item lands (CONST-25 isn't
+  on this branch's base yet — deliberately not imported ahead of time so this typechecks/builds
+  clean against `origin/main`).
+- **`ActivityPanel.tsx`** ("Activity") — a paged, filterable (system/method/principal) view
+  against the §8 contract `GET /api/terminus/activity?limit=` → `{entries:[{ts,method,path,
+  principal,system}]}`. That Rust endpoint is CONST-26's, landing in parallel with this item —
+  this panel only *consumes* `client.terminus.activity()` (`aggregationClient.ts`), which
+  already degrades to `{available:false}` on a 404/501/any failure; the panel then renders an
+  explanatory "not live yet" empty state instead of an error.
+
+All three are registered under the existing `terminus` module in `registerPanels.ts` alongside
+the pre-existing `Config` panel (`terminus.fleet` / `terminus.tools` / `terminus.activity`).
+
 ## Dev / build
 
 ```sh
 npm install
 npm run dev        # vite dev server, :5174, proxies /api and /ws to :3100 by default
 npm run typecheck  # tsc --noEmit
+npm run test       # vitest run — currently: fleetRingBuffer.test.ts (CONST-28)
 npm run build       # tsc --noEmit && vite build -> dist/
 ```
 
-Set `VITE_AGG_MODE=http` (e.g. in `.env.local`) to point the app at a real backend instead
-of the mock adapter.
+The app talks to the real backend (http adapter) by default in any browser. To force offline
+fixtures during dev, opt into mock explicitly: `VITE_AGG_MODE=mock npm run dev`, or append
+`?mock` to the URL, or set `localStorage['constellation.aggMode']='mock'`.
 
 ## Embedded build (CONST-15)
 
@@ -460,13 +558,14 @@ of the mock adapter.
 `include_dir!("$CARGO_MANIFEST_DIR/constellation-web/dist")`). This is deliberate: the fleet's build-on-dest pipeline
 (`constellation-updater`, moosenet-spec v3.23) runs a **cargo-only** build on the deploy
 host with no npm/node toolchain — the committed dist is what makes that possible. The
-embedded UI is always served same-origin by the binary in production, so it is always
-built with `VITE_AGG_MODE=http` (never the mock adapter).
+embedded UI is served same-origin by the binary in production, so it talks to the real backend
+(the http adapter is the default — S127 TGUI2; no `VITE_AGG_MODE` flag is required, and a
+mock-only bundle can no longer ship silently).
 
 **Whenever the UI changes, rebuild and recommit `dist/`:**
 
 ```sh
-VITE_AGG_MODE=http npm run build
+npm run build:verify   # tsc + vite build, then asserts the bundle can reach the http adapter
 git add -f constellation-web/dist
 ```
 

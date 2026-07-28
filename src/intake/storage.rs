@@ -1597,6 +1597,153 @@ pub async fn read_assistant_cells(pool: &PgPool) -> Result<Vec<AssistantCell>, T
     }
 }
 
+/// SUITE-DOC (S125): per-model rollup of the dimension scores for ONE
+/// `task_category` (e.g. `"document_parsing"`): sample count, mean dispersion,
+/// last-run — the same shape as [`read_assistant_cells`] but scoped to a single
+/// task_category and grouped by model only (a newcats suite has one dimension
+/// but several metrics/cases per model, so the coverage signal is per-model, not
+/// per-dimension). `dimension` carries the task_category label for the caller's
+/// convenience. Tolerates the table being absent → empty vec.
+pub async fn read_task_category_cells(
+    pool: &PgPool,
+    task_category: &str,
+) -> Result<Vec<AssistantCell>, ToolError> {
+    let sql = "SELECT model_id, count(*)::bigint, avg(std_dev), max(created_at) \
+         FROM assistant_dimension_score WHERE task_category = $1 GROUP BY model_id";
+    type Row = (
+        String,
+        i64,
+        Option<f64>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    );
+    match sqlx::query_as::<_, Row>(sql)
+        .bind(task_category)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(|(model_name, n, sd, last)| AssistantCell {
+                model_name,
+                dimension: task_category.to_string(),
+                n_samples: n,
+                score_stddev: sd,
+                last_run_at: last,
+            })
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read {task_category} task-category cells: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// CGUI-07 (TERM #530): one raw `assistant_dimension_score` row for a single
+/// new-MINT-category `task_category` (embedding_retrieval / reranking /
+/// image_parsing / document_parsing / image_generation / voice_transcription /
+/// tts / tool_routing), joined to its run for `harness_version`. This is the
+/// generic per-category read behind `/api/terminus/mint/category/{cat}/*` and
+/// the widened `/api/terminus/mint/runs?suite={cat}` — the handler shapes these
+/// rows in-memory (summary/dimensions/matrix/box/failures), exactly as
+/// `mint_box`/`list_models` already do fleet-scale in-memory aggregation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskCategoryScoreRow {
+    pub run_id: Uuid,
+    pub model_id: String,
+    pub backend_tag: String,
+    pub dimension: String,
+    pub metric: String,
+    pub value: f64,
+    pub std_dev: Option<f64>,
+    pub judge: String,
+    pub low_confidence: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub harness_version: Option<String>,
+}
+
+/// Read every `assistant_dimension_score` row for `task_category`, newest
+/// first, optionally scoped to one `epoch` (`assistant_profile_run.
+/// harness_version`). `task_category` and `epoch` are BOUND parameters ($1/$2),
+/// never spliced. `value`/`std_dev` are cast to `::double precision` so a
+/// NUMERIC-typed column can never panic sqlx's `f64` decode (the S125
+/// `read_agent_rollups` precedent). Fail-open: an absent
+/// `assistant_dimension_score`/`assistant_profile_run` table (un-migrated DB)
+/// or absent column degrades to an empty vec — never a hard error.
+pub async fn read_task_category_scores(
+    pool: &PgPool,
+    task_category: &str,
+    epoch: Option<&str>,
+) -> Result<Vec<TaskCategoryScoreRow>, ToolError> {
+    let mut sql = String::from(
+        "SELECT s.run_id, s.model_id, s.backend_tag, s.dimension, s.metric, \
+         s.value::double precision, s.std_dev::double precision, s.judge, \
+         s.low_confidence, s.created_at, r.harness_version \
+         FROM assistant_dimension_score s \
+         LEFT JOIN assistant_profile_run r ON r.id = s.run_id \
+         WHERE s.task_category = $1",
+    );
+    if epoch.is_some() {
+        sql.push_str(" AND r.harness_version = $2");
+    }
+    sql.push_str(" ORDER BY s.created_at DESC");
+
+    type Row = (
+        Uuid,
+        String,
+        String,
+        String,
+        String,
+        f64,
+        Option<f64>,
+        String,
+        bool,
+        chrono::DateTime<chrono::Utc>,
+        Option<String>,
+    );
+    let mut query = sqlx::query_as::<_, Row>(&sql).bind(task_category);
+    if let Some(e) = epoch {
+        query = query.bind(e.to_string());
+    }
+    match query.fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(
+                |(run_id, model_id, backend_tag, dimension, metric, value, std_dev, judge, low_confidence, created_at, harness_version)| {
+                    TaskCategoryScoreRow {
+                        run_id,
+                        model_id,
+                        backend_tag,
+                        dimension,
+                        metric,
+                        value,
+                        std_dev,
+                        judge,
+                        low_confidence,
+                        created_at,
+                        harness_version,
+                    }
+                },
+            )
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read {task_category} scores: {msg}"
+                )))
+            }
+        }
+    }
+}
+
 /// Latest serving/operational profile per model (the fleet card's serving
 /// facts). Tolerates the operational-profile table being absent → empty vec.
 pub async fn read_serving_rows(pool: &PgPool) -> Result<Vec<ServingRow>, ToolError> {
@@ -1639,13 +1786,24 @@ pub async fn read_serving_rows(pool: &PgPool) -> Result<Vec<ServingRow>, ToolErr
     }
 }
 
+/// The agent tool-use rollup query. The tool-accuracy column is
+/// `avg(CASE WHEN ap.correct_tool_selected THEN 1.0 ELSE 0.0 END)` — `AVG` over
+/// the numeric literals `1.0`/`0.0` returns Postgres `NUMERIC`, which does NOT
+/// decode into a Rust `Option<f64>` (`FLOAT8`) and crashed
+/// `refresh_fleet_catalog` at runtime with "mismatched types; Rust type
+/// Option<f64> (as SQL type FLOAT8) is not compatible with SQL type NUMERIC".
+/// The trailing `::double precision` cast pins the column to `FLOAT8` so it
+/// decodes cleanly (S125 FIX1). `count(*)::bigint` is likewise pinned to `INT8`
+/// for the `i64` decode.
+const SELECT_AGENT_ROLLUPS_SQL: &str = "SELECT mp.model_name, count(*)::bigint, \
+                avg(CASE WHEN ap.correct_tool_selected THEN 1.0 ELSE 0.0 END)::double precision \
+         FROM model_profiles mp JOIN agent_profile_runs ap ON ap.profile_id = mp.id \
+         GROUP BY mp.model_name";
+
 /// Per-model agent tool-use rollup: sample count and correct-tool-selection
 /// accuracy. Tolerates the `agent_profile_runs` table being absent → empty vec.
 pub async fn read_agent_rollups(pool: &PgPool) -> Result<Vec<AgentRollup>, ToolError> {
-    let sql = "SELECT mp.model_name, count(*)::bigint, \
-                avg(CASE WHEN ap.correct_tool_selected THEN 1.0 ELSE 0.0 END) \
-         FROM model_profiles mp JOIN agent_profile_runs ap ON ap.profile_id = mp.id \
-         GROUP BY mp.model_name";
+    let sql = SELECT_AGENT_ROLLUPS_SQL;
     type Row = (String, i64, Option<f64>);
     match sqlx::query_as::<_, Row>(sql).fetch_all(pool).await {
         Ok(rows) => Ok(rows
@@ -3340,6 +3498,29 @@ mod tests {
     // process env vars — `cargo test` runs tests in the same process on
     // multiple threads by default.
     use serial_test::serial;
+
+    /// S125 FIX1 regression: `read_agent_rollups` decodes its tool-accuracy
+    /// column into `Option<f64>` (`FLOAT8`). `AVG(CASE ... THEN 1.0 ELSE 0.0
+    /// END)` returns Postgres `NUMERIC` (the arms are numeric literals), which
+    /// does NOT decode into `f64` and crashed `refresh_fleet_catalog` at
+    /// runtime. Since this crate has no live-Postgres test harness (see the
+    /// sibling SQL-constant tests), assert at the string level that the query
+    /// pins the aggregate to `double precision` (→ `FLOAT8`) so the `Row`
+    /// tuple's column types match. The count column stays pinned to `::bigint`
+    /// for the `i64` decode.
+    #[test]
+    fn agent_rollups_sql_casts_accuracy_to_float8() {
+        // The tool-accuracy AVG must be cast to double precision so the numeric
+        // result decodes as Option<f64> rather than crashing on NUMERIC≠FLOAT8.
+        assert!(
+            SELECT_AGENT_ROLLUPS_SQL.contains(
+                "avg(CASE WHEN ap.correct_tool_selected THEN 1.0 ELSE 0.0 END)::double precision"
+            ),
+            "agent-rollups AVG must be ::double precision, got: {SELECT_AGENT_ROLLUPS_SQL}"
+        );
+        // Count stays ::bigint for the i64 decode.
+        assert!(SELECT_AGENT_ROLLUPS_SQL.contains("count(*)::bigint"));
+    }
 
     #[tokio::test]
     #[serial]

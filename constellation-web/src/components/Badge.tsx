@@ -13,41 +13,56 @@ const TONE_CLASS: Record<BadgeTone, string> = {
   neutral: 'h-badge-neutral',
 };
 
+// DS dot color = the tone's foreground ink (Badge.jsx: `background: t.fg`).
 const TONE_DOT: Record<BadgeTone, string> = {
-  violet: 'var(--violet-400)',
-  blue: 'var(--flux-blue)',
-  green: 'var(--flux-green)',
+  violet: 'var(--violet-300)',
+  blue: 'var(--flux-blue-soft)',
+  green: 'var(--flux-green-soft)',
   amber: 'var(--flux-amber)',
-  rose: 'var(--flux-rose)',
-  neutral: 'var(--text-400)',
+  rose: 'var(--flux-rose-soft)',
+  neutral: 'var(--text-300)',
 };
 
 interface BadgeProps {
   tone?: BadgeTone;
   children: React.ReactNode;
-  /** Small glowing dot before the label — use only when the tone IS the semantic (§2.4). */
+  /** DS contract prop (§8 Badge): leading 6px glowing dot in the tone's ink. */
+  dot?: boolean;
+  /** @deprecated use `dot` — retained so existing callers don't break. */
   glowDot?: boolean;
+  /**
+   * S127 TGUI2 M6 — override the leading dot's color independently of the chip body. Lets a
+   * NEUTRAL outline chip carry a tiny semantic leading dot (read/write/admin scannability)
+   * while the chip body stays neutral — the "one colored token per row" rule. Pass a CSS var.
+   */
+  dotColor?: string;
   /** JetBrains Mono rendering for cost/tier badges. */
   mono?: boolean;
   className?: string;
   style?: React.CSSProperties;
 }
 
-export function Badge({ tone = 'neutral', children, glowDot = false, mono = false, className, style }: BadgeProps) {
+export function Badge({ tone = 'neutral', children, dot, glowDot = false, dotColor, mono = false, className, style }: BadgeProps) {
+  // Render the leading dot whenever an explicit `dotColor` is supplied — the M6 neutral-chip
+  // pattern is a neutral body + a semantic dot, and forgetting `dot` at a call site must not
+  // silently drop that dot (which would strip the only kind/status signal from the chip).
+  const showDot = (dot ?? glowDot) || dotColor != null;
+  const dotInk = dotColor ?? TONE_DOT[tone];
   return (
     <span
       className={`h-badge ${TONE_CLASS[tone]}${mono ? ' h-badge-mono' : ''}${className ? ` ${className}` : ''}`}
       style={style}
     >
-      {glowDot && (
+      {showDot && (
         <span
           aria-hidden
           style={{
             width: 6,
             height: 6,
             borderRadius: '50%',
-            background: TONE_DOT[tone],
-            boxShadow: `0 0 6px ${TONE_DOT[tone]}`,
+            background: dotInk,
+            // S127 M6: no glow halo on the neutral-chip semantic dot (data-dense rows stay crisp,
+            // per M3 "no ambient glow"); the solid 6px dot alone carries the scannability cue.
             flexShrink: 0,
           }}
         />

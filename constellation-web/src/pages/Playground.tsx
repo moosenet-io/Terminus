@@ -49,15 +49,15 @@ export function Playground() {
 
   return (
     <div style={{ padding: 16, height: '100%', display: 'flex', flexDirection: 'column', gap: 12, overflowY: 'auto' }}>
-      <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--h-teal)', margin: 0 }}>Prompt Playground</h2>
+      <h2 style={{ fontSize: 16, fontWeight: 600, color: 'var(--accent)', margin: 0 }}>Prompt Playground</h2>
 
       {/* Settings bar */}
       <div className="h-card">
         <div className="h-card-body" style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center' }}>
           <div>
-            <div style={{ fontSize: 10, color: 'var(--h-text-muted)', marginBottom: 3 }}>Model</div>
+            <div style={{ fontSize: 10, color: 'var(--text-300)', marginBottom: 3 }}>Model</div>
             <select value={model} onChange={e => setModel(e.target.value)}
-              style={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', borderRadius: 4, color: 'var(--h-text)', padding: '4px 8px', fontSize: 12, outline: 'none' }}>
+              style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text-100)', padding: '4px 8px', fontSize: 12, outline: 'none' }}>
               {MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
             </select>
           </div>
@@ -66,17 +66,17 @@ export function Playground() {
             { label: 'Top-p', value: topP, min: 0, max: 1, step: 0.05, setter: setTopP },
           ].map(({ label, value, min, max, step, setter }) => (
             <div key={label}>
-              <div style={{ fontSize: 10, color: 'var(--h-text-muted)', marginBottom: 3 }}>{label}: {value.toFixed(2)}</div>
+              <div style={{ fontSize: 10, color: 'var(--text-300)', marginBottom: 3 }}>{label}: {value.toFixed(2)}</div>
               <input type="range" min={min} max={max} step={step} value={value}
                 onChange={e => setter(parseFloat(e.target.value))}
                 style={{ width: 100 }} />
             </div>
           ))}
           <div>
-            <div style={{ fontSize: 10, color: 'var(--h-text-muted)', marginBottom: 3 }}>Max tokens</div>
+            <div style={{ fontSize: 10, color: 'var(--text-300)', marginBottom: 3 }}>Max tokens</div>
             <input type="number" value={maxTokens} min={10} max={4000}
               onChange={e => setMaxTokens(parseInt(e.target.value) || 500)}
-              style={{ width: 70, background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', borderRadius: 4, color: 'var(--h-text)', padding: '4px 6px', fontSize: 12, outline: 'none' }} />
+              style={{ width: 70, background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text-100)', padding: '4px 6px', fontSize: 12, outline: 'none' }} />
           </div>
         </div>
       </div>
@@ -97,8 +97,8 @@ export function Playground() {
               placeholder="Enter your prompt… (Cmd+Enter to run)"
               style={{
                 flex: 1, width: '100%', resize: 'none', border: 'none', outline: 'none',
-                background: 'transparent', color: 'var(--h-text)', fontSize: 12,
-                fontFamily: 'var(--h-font-mono)', lineHeight: 1.5,
+                background: 'transparent', color: 'var(--text-100)', fontSize: 12,
+                fontFamily: 'var(--font-mono)', lineHeight: 1.5,
               }} />
           </div>
         </div>
@@ -107,21 +107,21 @@ export function Playground() {
           <div className="h-card-header" style={{ cursor: 'default' }}>
             <span style={{ fontWeight: 600, fontSize: 13 }}>Response</span>
             {result && (
-              <span style={{ fontSize: 11, color: 'var(--h-text-muted)' }}>
+              <span style={{ fontSize: 11, color: 'var(--text-300)' }}>
                 {result.tokens_in}→{result.tokens_out} tokens · {result.latency_ms}ms · ${result.cost.toFixed(4)}
               </span>
             )}
           </div>
           <div className="h-card-body" style={{ flex: 1, overflowY: 'auto' }}>
-            {loading && <div style={{ color: 'var(--h-text-muted)', fontSize: 12 }}>Thinking…</div>}
-            {error && <div style={{ color: 'var(--h-red)', fontSize: 12 }}>{error}</div>}
+            {loading && <div style={{ color: 'var(--text-300)', fontSize: 12 }}>Thinking…</div>}
+            {error && <div style={{ color: 'var(--flux-rose)', fontSize: 12 }}>{error}</div>}
             {result && (
-              <pre style={{ fontSize: 12, color: 'var(--h-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0 }}>
+              <pre style={{ fontSize: 12, color: 'var(--text-100)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0 }}>
                 {result.response}
               </pre>
             )}
             {!loading && !error && !result && (
-              <div style={{ color: 'var(--h-text-muted)', fontSize: 12 }}>Response will appear here.</div>
+              <div style={{ color: 'var(--text-300)', fontSize: 12 }}>Response will appear here.</div>
             )}
           </div>
         </div>

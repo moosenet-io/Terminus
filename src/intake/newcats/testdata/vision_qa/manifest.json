@@ -1,0 +1,12 @@
+[
+  {
+    "image_file": "img_001.png",
+    "question": "What color is the circle? Answer with a single color word.",
+    "answer": "red"
+  },
+  {
+    "image_file": "img_006.png",
+    "question": "How many red squares are in the image? Answer with a single number.",
+    "answer": "2"
+  }
+]
