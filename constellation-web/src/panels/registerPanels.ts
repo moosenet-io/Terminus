@@ -34,6 +34,7 @@ import { registerPanel, registerModule } from '../lib/moduleRegistry';
 import { registerCommand } from '../lib/commandRegistry';
 import { getCurrentPath, requestHealthRefresh } from '../lib/shellBridge';
 import { TerminusPanel } from './terminus/TerminusPanel';
+import { ChatPanel } from './lumina/ChatPanel';
 import { FleetPanel } from './terminus/FleetPanel';
 import { ToolsPanel } from './terminus/ToolsPanel';
 import { ActivityPanel } from './terminus/ActivityPanel';
@@ -375,4 +376,44 @@ registerPanel({
   icon: '✦',
   available: true,
   component: LuminaOverviewPanel,
+});
+
+// LGUI-07: Conversations panel (LUMINA-GUI-SPEC.md §3.2/§9, route `/lumina/chat`, min role
+// operator per §2's panel table — enforced inside ChatPanel itself via useAuthRole, same
+// convention as RoleGate; PanelDescriptor has no per-panel role field). Works end-to-end on
+// the mock adapter today; the real `/api/lumina/v1/chat/completions` proxy route is LGUI-05's
+// job (also added by LGUI-05 — keep one on merge, if that lands a lumina.chat registration too).
+registerPanel({
+  id: 'lumina.chat',
+  system: 'lumina',
+  title: 'Conversations',
+  path: '/lumina/chat',
+  icon: '💬',
+  available: true,
+  component: ChatPanel,
+});
+
+// ── Palette commands (CONST-25) ────────────────────────────────────────────────
+// A couple of sensible starter actions, registered the same way panels are — one line each,
+// no shell change needed. Every other panel adds its own `registerCommand` calls the same way.
+
+registerCommand({
+  id: 'shell.refresh-health',
+  title: 'Refresh health',
+  subtitle: 'Re-poll /api/health for every module now',
+  icon: '⟳',
+  run: () => requestHealthRefresh(),
+});
+
+registerCommand({
+  id: 'shell.copy-current-path',
+  title: 'Copy current path',
+  subtitle: 'Copies the current route to the clipboard',
+  icon: '⧉',
+  run: () => {
+    navigator.clipboard?.writeText(getCurrentPath()).catch(() => {
+      // Clipboard permission denied/unavailable — the command just silently no-ops, same
+      // convention as the rest of the shell's non-critical UI actions.
+    });
+  },
 });

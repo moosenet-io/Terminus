@@ -447,6 +447,64 @@ after its bounded reconnect budget was exhausted -- same polling fallback applie
 is required for this item; a future item MAY use the code to distinguish "no backend
 configured" from "backend flapped" in the UI if that becomes useful.
 
+## Lumina Conversations panel (LGUI-07)
+
+`lumina.chat` (`/lumina/chat`, `src/panels/lumina/ChatPanel.tsx` +
+`ChatBubble.tsx` + `src/hooks/useLuminaChat.ts`) is a **single-conversation, v1** chat surface
+per `docs/constellation/LUMINA-GUI-SPEC.md` §3.2 — there is no history-list API yet, so this
+panel only ever holds the in-memory thread for the current tab session; refreshing the page
+starts a new one.
+
+- **Wire call**: the pre-existing, non-streaming lumina endpoint (spec §0.2), reached as
+  `POST /api/lumina/v1/chat/completions` through the Terminus proxy (server-side bearer
+  injection is LGUI-05's job — this panel already calls the right path/shape and works fully
+  against the mock adapter today). Request body is the OpenAI-shaped `{messages:[{role,content}]}`;
+  success response `{choices:[{message:{role,content}}]}`; errors reuse the constellation-wide
+  `{error:{message,type}}` envelope.
+- **No fake streaming.** The composer disables and shows a `StatusPill state="idle" label="thinking"`
+  for the one round trip; there is no token-by-token animation anywhere in this code path.
+- **`/deep` / `/quick` chips** are REAL router overrides (spec §0.1.4) — toggling one just
+  prefixes the outgoing message with `/deep ` or `/quick `, exactly like typing it yourself;
+  there is no client-side routing logic.
+- **Error mapping** (`useLuminaChat`'s `ChatErrorKind`): `rate_limit_error` → inline amber
+  "Daily turn budget reached"; `upstream_error` (or any thrown transport failure) → "Chord
+  unreachable"; anything else → inline error text + a retry button that resends the last
+  attempted message.
+- **Session-idle divider**: a "session resumes · 30 min idle" divider renders between two
+  consecutive messages whose client-side timestamps are more than `SESSION_IDLE_MS` (30 min)
+  apart — cosmetic only, never gates the request.
+- **Role gating**: `ChatPanel` reads `useAuthRole()` directly (same convention `RoleGate` uses)
+  and renders a read-only placeholder card for a `'viewer'` session instead of the composer —
+  the panel is registered `available: true` for everyone the module rail shows, per spec §2's
+  "min role operator" being a UI-courtesy gate here, not a registry field (`PanelDescriptor` has
+  no per-panel role).
+- **Injection-safe rendering (XSS proof)**: `ChatBubble.tsx` never uses
+  `dangerouslySetInnerHTML`. Message content is parsed by `src/lib/chatMarkdown.ts` — a tiny,
+  dependency-free parser (bold/inline-code/fenced-code/http(s)-only links; no dependency was
+  added, per spec) that only ever produces a plain-data token list, which `ChatBubble` renders
+  entirely as React text content. A literal `<script>...</script>` in a reply (see the mock's
+  `trigger:xss` fixture below) can only ever reach the DOM as the visible, inert characters
+  `<script>...</script>` — there is no code path that turns untrusted content into markup.
+  `src/lib/chatMarkdown.test.ts` is the dependency-free self-check for this (same convention as
+  `commandMatch.test.ts` — no JS test runner is wired up in this repo yet; run directly via
+  `npx tsx src/lib/chatMarkdown.test.ts`), including two assertions specifically proving the
+  `<script>` tag round-trips as inert text tokens only.
+- **Long replies** (4000+ chars) render in a bubble with its own `overflow-y: auto` and a fixed
+  max height, so the transcript panel itself never grows unbounded.
+
+**Mock fixtures** (`mockLuminaChatReply` in `src/lib/aggregationClient.ts`) key off substrings
+in the composer text (case-insensitive) so every one of the above is reviewable with zero
+backend — type one of these as (or within) your message:
+
+| Trigger substring | What comes back |
+|---|---|
+| `trigger:ratelimit` | `{error:{type:'rate_limit_error', ...}}` |
+| `trigger:upstream` | `{error:{type:'upstream_error', ...}}` |
+| `trigger:other` | `{error:{type:'internal_error', ...}}` (the generic inline+retry path) |
+| `trigger:xss` | assistant reply containing a literal `<script>alert(1)</script>` |
+| `trigger:long` | a 4200+ char assistant reply |
+| anything else | a short canned reply exercising **bold**, `` `inline code` ``, a link, and a fenced code block |
+
 ## Terminus module panels (CONST-28)
 
 The `terminus` module's own self-observability surface, built on the CONST-04 `Config` panel's

@@ -619,8 +619,76 @@ function mockGetFor(system: SystemId, pathname: string): unknown {
   return null;
 }
 
+// ── Mock data for the Lumina Conversations panel (LGUI-07; spec §3.2/§7) ────
+// The real endpoint is lumina's pre-existing, NON-streaming `POST /v1/chat/completions`
+// (spec §0.2), reached here as `lumina /v1/chat/completions`. Response shapes mirror the
+// OpenAI-style success envelope and the constellation-wide `{error:{message,type}}` shape
+// (spec §7). Body content drives which canned fixture comes back, so the panel's error-type
+// mapping, XSS-inertness, and long-reply scroll behavior are all reviewable on mocks alone —
+// type a trigger phrase (case-insensitive substring match) into the composer:
+//   "trigger:ratelimit" -> rate_limit_error envelope ("Daily turn budget reached")
+//   "trigger:upstream"  -> upstream_error envelope ("Chord unreachable")
+//   "trigger:other"     -> an error.type the panel doesn't special-case (generic inline+retry)
+//   "trigger:xss"       -> assistant reply containing a literal <script> tag (XSS-inert proof,
+//                          see ChatBubble.tsx's render-path doc comment + chatMarkdown.test.ts)
+//   "trigger:long"      -> a 4000+ char reply (scrollable-bubble proof)
+//   anything else       -> a short canned reply exercising **bold**/`code`/a link/a fenced block
+function mockLuminaChatReply(body: string | undefined): unknown {
+  let lastUserContent = '';
+  try {
+    const parsed = body ? JSON.parse(body) as { messages?: Array<{ role: string; content: string }> } : undefined;
+    const messages = parsed?.messages ?? [];
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i].role === 'user') { lastUserContent = messages[i].content; break; }
+    }
+  } catch {
+    // Malformed body in mock mode — fall through to the default reply rather than throwing.
+  }
+  const lower = lastUserContent.toLowerCase();
+
+  if (lower.includes('trigger:ratelimit')) {
+    return { error: { message: 'Daily turn budget reached for this user.', type: 'rate_limit_error' } };
+  }
+  if (lower.includes('trigger:upstream')) {
+    return { error: { message: 'Chord proxy unreachable.', type: 'upstream_error' } };
+  }
+  if (lower.includes('trigger:other')) {
+    return { error: { message: 'An unexpected error occurred.', type: 'internal_error' } };
+  }
+  if (lower.includes('trigger:xss')) {
+    return {
+      choices: [{
+        message: {
+          role: 'assistant',
+          content: 'Here is something odd: <script>alert(1)</script> — it should render as inert text, never execute.',
+        },
+      }],
+    };
+  }
+  if (lower.includes('trigger:long')) {
+    const paragraph = 'This is a long mock reply used to prove the chat bubble scrolls instead of overflowing the panel. ';
+    const content = paragraph.repeat(Math.ceil(4200 / paragraph.length));
+    return { choices: [{ message: { role: 'assistant', content } }] };
+  }
+  const routed = lower.startsWith('/deep ') ? ' (routed: deep)' : lower.startsWith('/quick ') ? ' (routed: quick)' : '';
+  return {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content:
+          `(mock adapter — no live Chord backend) Got it${routed}. Here's a bit of **bold**, ` +
+          'some `inline code`, a [link](https://example.com), and a fenced block:\n\n' +
+          '```\nfn hello() {\n    println!("hi from mock Lumina");\n}\n```',
+      },
+    }],
+  };
+}
+
 /** POST/PUT-style mock acks — every write in the mock world just succeeds with a canned shape. */
-function mockWriteFor(system: SystemId, pathname: string): unknown {
+function mockWriteFor(system: SystemId, pathname: string, body?: string): unknown {
+  if (system === 'lumina' && pathname === '/v1/chat/completions') {
+    return mockLuminaChatReply(body);
+  }
   if (system === 'harmony' && pathname === '/engine/stop') {
     return { state: 'stopped', pid: null, active_count: 0, uptime_secs: 0, stop_reason: 'mock', executor_active: false };
   }
@@ -666,8 +734,12 @@ function mockRequest<T>(system: SystemId, path: string, init?: RequestInit): Pro
   const pathname = path.split('?')[0];
   const value = method === 'GET'
     ? mockGetFor(system, pathname)
-    : mockWriteFor(system, pathname);
-  return delay(value as T);
+    : mockWriteFor(system, pathname, typeof init?.body === 'string' ? init.body : undefined);
+  // LGUI-07: the chat round trip gets a deliberately longer canned delay than the default
+  // 120ms — enough for the composer's "thinking" StatusPill to be visibly reviewable, still
+  // fast enough not to be annoying. Every other mock write keeps the default.
+  const ms = system === 'lumina' && pathname === '/v1/chat/completions' ? 650 : undefined;
+  return delay(value as T, ms);
 }
 
 /** Mock WS: reports "connected" immediately, never emits events (mock has no live daemon). */
