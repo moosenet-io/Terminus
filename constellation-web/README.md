@@ -519,6 +519,71 @@ Grid lines are **solid 1px hairlines** (`--chart-grid`/`--chart-axis`) — the d
 `strokeDasharray:'3 3'` pattern from harmony-web is retired everywhere (audit §1.4). Every
 chart ships a table-view twin (`TableViewToggle`) — this is both the WCAG relief channel for
 sub-3:1 fills and a hard rule (§4.4).
+## Model Library module (`models`, CONST-21 API + CGUI-09 roster/detail + CONST-22 compare, spec §6)
+
+A `terminus`-backed module (its `ModuleDescriptor.healthSystem` is `'terminus'` — there's no
+separate `/api/health` entry for it, same convention as the `terminus` module itself), 100%
+wired to the real Terminus models API (`GET /api/terminus/models*`, `GET /api/terminus/mint/
+dimensions`, CONST-21 + CGUI-07) via the CGUI-08 data client (`getAggregationClient().models.*`
+/ `.mint.*`) and its checked response types in `src/types/mint.ts` (mirrors `models_api.rs`'s
+`json!({…})` shapes 1:1). There is exactly one registered panel each for the roster, detail, and
+compare surfaces — see below for how the module's two build lineages (CGUI-09's roster/detail,
+CONST-22's compare) were reconciled into that single set.
+
+- **`models.roster`** (`/models/roster`, `src/panels/models/RosterPanel.tsx`) — the module's
+  primary surface: header `MetricCard` row (models / serving now / in current fleet), a
+  `Toolbar` (search, All/Fleet/Brochure scope segments, serving-only toggle, table/card view
+  toggle + result count), server-side `limit`/`offset` pagination over the full roster, and a
+  dense sortable `SortableTable` (default view) or a rich card grid — both driven by
+  `client.models.list()`. Clicking a model name/card swaps the panel to `ModelDetailView` inline
+  (a master-detail swap within the same route, not a separate `/models/:name` route — there is
+  no `models.detail` panel registration; `ModelDetailView` is rendered directly by `RosterPanel`
+  when a row is selected). Review fix: a leading checkbox per row (table view) / per card (card
+  view) selects up to 4 models for comparison; a "Compare (N)" button appears in the toolbar
+  once ≥1 is selected (enabled at ≥2) and navigates to `models.compare` with the selected names
+  as `?m=` params — Compare was originally reachable only by hand-constructing the URL.
+- **`ModelDetailView`** (`src/panels/models/ModelDetailView.tsx`, no route of its own) —
+  per-model detail via `client.models.model(name)`: a per-category pass-rate radar
+  (`src/viz/RadarChart.tsx`, lazy-loaded so the roster never pays for the `@nivo/radar` chunk),
+  Identity/Brochure/Serving/Operational fact cards, and a full per-category metrics table. Fails
+  open throughout — a 404/network error degrades to an inline "unavailable" notice, never a
+  thrown/blank panel.
+- **`models.compare`** (`/models/compare?m=a&m=b…`, `src/panels/models/ComparePanel.tsx`, 2–4
+  models) — URL state ONLY, no `client.prefs` entry. A capability the roster/detail surface
+  doesn't have at all, added as a pure addition rather than replacing anything: a side-by-side
+  `DataTable` (best value per row outline-ringed, never color-alone), a MINT dimension radar
+  overlay (≤4 series via `SlotAssigner`, `src/viz/CompareRadarChart.tsx` — a new lazy nivo
+  wrapper distinct from `RadarChart`/`RadarChartKit`/`MintRadarChart`, since none of those three
+  fit a generic up-to-4-model overlay driven by the caller's own per-model colors), and a Pareto
+  scatter (VRAM vs. best pass-rate) with the compared models emphasized and the rest of the
+  fleet rendered in `--chart-deemphasis`. `low_confidence`/`n<=1` MINT scores always render the
+  ⚠ affordance + a variance tooltip (`src/lib/mintCaveat.ts`) — never silently hidden, INCLUDING
+  a null-`norm` (no-data) score (review fix: the table cell's early-return for a null score
+  used to skip the caveat check entirely). The radar can't honestly plot a missing per-vertex
+  value (it renders as 0, matching a real low score) — a caveat line beneath the chart names
+  every low-confidence/no-data `(model, dimension)` point actually plotted, disclosing rather
+  than hiding the substitution. VRAM/best-pass-rate fallback for the COMPARED models themselves
+  comes from a small targeted `models.list({q:name})` lookup per compared name (review fix: the
+  original single `limit:500/offset:0` "rest of fleet" fetch could silently miss a compared
+  model past the first page on a roster larger than 500 — that broad fetch now backfills only
+  non-compared models for the Pareto background). Compare
+  was originally built against a bespoke mock data layer (`hooks/useModels.ts` +
+  `types/models.ts`) that never wired to the real backend; it has since been ported onto the
+  same real data client the roster/detail use (`getAggregationClient().models.*` /
+  `.mint.*`, typed via `types/mint.ts`) — the bespoke hook/types files are retired. One field the
+  panel originally read doesn't exist on the real `ModelDetailResponse` (`catalog.card` has no
+  `best_pass_rate`); Compare's "Best pass-rate" row sources that value from the roster's
+  `ModelListEntry.best_pass_rate` instead of fabricating the field.
+
+Two small additive changes landed alongside this module (both backward-compatible, every
+existing caller unaffected): `DataTable` gained an optional `onRowClick` prop, and
+`PanelDescriptor` gained an optional `hideInRail` flag — set on `models.compare` since it's only
+reachable via a Compare action + its own URL-state selection, never a bare rail link, and
+`ModuleRail` filters it out of the nav list.
+
+`src/viz/recharts.ts`'s barrel also carries `ScatterChart`/`Scatter`/`ZAxis` (for the Pareto
+chart) — same "panels never import recharts directly" rule as every other chart in this app.
+
 ## Real-time relay (`/ws`, CONST-18)
 
 `GET /ws` (`src/constellation/ws.rs` on the Terminus side, not in this package) is a

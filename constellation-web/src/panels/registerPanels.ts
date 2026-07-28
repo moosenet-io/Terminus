@@ -62,6 +62,7 @@ import { Inference } from '../pages/Inference';
 import { Providers } from '../pages/Providers';
 import { Playground } from '../pages/Playground';
 import { Analytics } from '../pages/Analytics';
+import { ComparePanel } from './models/ComparePanel';
 
 // ── Modules (order per LUMINA-GUI-SPEC §2: Overview · Harmony · Chord · Muse · Lumina ·
 // Models · MINT · Terminus — Overview has no descriptor, it's the always-available default
@@ -293,6 +294,24 @@ registerPanel({
   icon: '◆',
   available: true,
   component: ModelsRosterPanel,
+});
+
+// CONST-22 (reconciled): Compare — side-by-side comparison of 2-4 models (DataTable + MINT
+// radar overlay + VRAM/pass-rate Pareto scatter), URL-state only (`?m=a&m=b…`, no
+// `client.prefs` entry). Ported off CGUI-09/models.roster's real data client
+// (`getAggregationClient().models.*`, `types/mint.ts`) rather than the bespoke
+// `hooks/useModels.ts` + `types/models.ts` it was originally built against — see
+// ComparePanel.tsx's header comment for the field-mapping notes. `hideInRail` because it's
+// reached via a Compare action + its own URL-state selection, never a bare rail link.
+registerPanel({
+  id: 'models.compare',
+  system: 'models',
+  title: 'Compare',
+  path: '/models/compare',
+  icon: '⇄',
+  available: true,
+  component: ComparePanel,
+  hideInRail: true,
 });
 
 // ── MINT (CGUI-10, TERM #533) ────────────────────────────────────────────────

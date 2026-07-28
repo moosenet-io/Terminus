@@ -105,6 +105,13 @@ export interface PanelDescriptor {
    */
   available: boolean;
   component: ComponentType;
+  /** CONST-22: true for a panel reachable only via a parameterized/URL-state route rather than
+   *  a plain nav destination (e.g. `models.compare` at `/models/compare?m=a&m=b…`, reached via
+   *  a Compare action + its own URL-state selection, never a bare rail link). Model DETAIL is
+   *  NOT a separate registered panel/route — it's an inline master-detail swap inside
+   *  `RosterPanel.tsx` (`ModelDetailView`), so it needs no `hideInRail` entry of its own.
+   *  Default false/absent — every other panel keeps rendering in the rail exactly as before. */
+  hideInRail?: boolean;
 }
 
 const registry = new Map<string, PanelDescriptor>();

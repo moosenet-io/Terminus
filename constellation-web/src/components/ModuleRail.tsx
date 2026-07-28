@@ -19,7 +19,9 @@ interface ModuleRailProps {
 
 export function ModuleRail({ module, variant, drawerOpen, onCloseDrawer }: ModuleRailProps) {
   const iconOnly = variant === 'icon';
-  const panels = getPanelsByModule(module.id);
+  // CONST-22: a URL-state/parameterized panel (e.g. models.compare) opts out of the rail via
+  // `hideInRail` — see moduleRegistry.ts.
+  const panels = getPanelsByModule(module.id).filter(p => !p.hideInRail);
 
   const content: ReactNode = (
     <>

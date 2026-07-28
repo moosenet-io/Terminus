@@ -867,6 +867,9 @@ function mockGetFor(system: SystemId, pathname: string, fullPath: string): unkno
   if (system === 'lumina' && pathname === '/engram/search') {
     return mockEngramSearch(fullPath);
   }
+  // Model Library + MINT reads (CGUI-08/09/10) go through the dedicated `client.models.*` /
+  // `client.mint.*` mock methods below (their own canned data, typed against `types/mint.ts`),
+  // not this generic system+pathname router — so there is no `/models`/`/mint/*` branch here.
   return null;
 }
 
@@ -1019,7 +1022,8 @@ function mockWriteFor(system: SystemId, pathname: string, body?: string): unknow
 
 function mockRequest<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
   const method = (init?.method ?? 'GET').toUpperCase();
-  const pathname = path.split('?')[0];
+  const qIdx = path.indexOf('?');
+  const pathname = qIdx === -1 ? path : path.slice(0, qIdx);
   const value = method === 'GET'
     ? mockGetFor(system, pathname, path)
     : mockWriteFor(system, pathname, typeof init?.body === 'string' ? init.body : undefined);
@@ -1585,6 +1589,14 @@ const mockAdapter: AggregationClient = {
 //            (binary passthrough -- see crate::constellation::proxy's module doc; this generic
 //            request<T>() path is JSON-typed, art responses should be fetched by <img src> URL,
 //            not through this method)
+//   terminus (CONST-21/CGUI-07/CGUI-08; the Model Library + MINT modules build against these --
+//            see src/types/mint.ts for the exact shapes, typed 1:1 against models_api.rs):
+//            served via the dedicated `client.models.*` / `client.mint.*` methods below, not
+//            this generic request<T>() path -- GET /models?scope=&q=&category=&status=&serving=
+//            &limit=&offset=, GET /models/{name} (URL-encoded full registry key),
+//            GET /mint/dimensions?models=&epoch= (comma-separated model ids), plus the rest of
+//            the mint/* surface (summary/matrix/runs/box/language-stats/failures/context-
+//            profiles/activity/category/*).
 //            CONST-20 additions (not in the original §5.4 route list -- see aggregationClient's
 //            MOCK_MUSE_STATS/compose/maintenance comments for why): GET /stats (dashboard
 //            MetricCards row), POST /api/channels/{id}/compose, POST /api/channels/{id}/
