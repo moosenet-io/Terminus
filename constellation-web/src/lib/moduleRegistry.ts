@@ -105,11 +105,12 @@ export interface PanelDescriptor {
    */
   available: boolean;
   component: ComponentType;
-  /** CONST-22: true for panels reachable only via a dynamic/parameterized route (e.g.
-   *  `models.detail` at `/models/:name`, `models.compare` at `/models/compare`) — they still
-   *  need a registry entry so `App.tsx`'s `<Routes>` picks them up, but `ModuleRail` must NOT
-   *  render them as a plain nav link (there is no bare `:name` to link to). Default false/
-   *  absent — every other panel keeps rendering in the rail exactly as before. */
+  /** CONST-22: true for a panel reachable only via a parameterized/URL-state route rather than
+   *  a plain nav destination (e.g. `models.compare` at `/models/compare?m=a&m=b…`, reached via
+   *  a Compare action + its own URL-state selection, never a bare rail link). Model DETAIL is
+   *  NOT a separate registered panel/route — it's an inline master-detail swap inside
+   *  `RosterPanel.tsx` (`ModelDetailView`), so it needs no `hideInRail` entry of its own.
+   *  Default false/absent — every other panel keeps rendering in the rail exactly as before. */
   hideInRail?: boolean;
 }
 
