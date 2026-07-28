@@ -1628,6 +1628,32 @@ fn cargo_build_argv(
 /// instead of stopping at the first (needed for the structured pass/fail +
 /// failing-test summary the gate returns).
 ///
+/// The bare name of a TOML table header, if `line` is one (TERM #544).
+///
+/// Handles the shapes a hand-written `Cargo.toml` actually uses:
+/// `[lib]`, `[lib] # comment`, and `[ lib ]`. Returns `None` for anything
+/// else, including array-of-table headers (`[[bin]]`), which this caller does
+/// not care about.
+///
+/// Stripping at the first `#` is safe for the three bare names this is used
+/// for — none of them can appear as a quoted key containing a `#` — and the
+/// caller pairs it with a raw substring check anyway, so a miss here can only
+/// ever fall back to the safe answer.
+fn toml_table_header(line: &str) -> Option<&str> {
+    let line = line.trim();
+    let line = line.split('#').next().unwrap_or("").trim();
+    // Reject `[[array-of-table]]` — not a plain table header.
+    if line.starts_with("[[") {
+        return None;
+    }
+    let inner = line.strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner)
+    }
+}
+
 /// Does the staged crate have a library target? (TERM #544)
 ///
 /// Used to decide whether `cargo test` may be given `--lib`. Deliberately
@@ -1652,15 +1678,33 @@ fn crate_has_lib_target(source_dir: &std::path::Path) -> bool {
         return true;
     };
 
+    // Detection is biased toward `true` on purpose, and asymmetrically so.
+    // Failing to notice `[package]` costs nothing (we return true anyway), but
+    // failing to notice `[lib]` or `[workspace]` would DROP `--lib` from a
+    // crate that has a library — the exact coverage narrowing this function
+    // exists to avoid. A review caught the first version doing precisely that
+    // on `[lib] # explicit target`, since it compared whole trimmed lines and
+    // TOML permits a comment after a table header (and whitespace inside the
+    // brackets: `[ lib ]` is equally valid).
+    //
+    // So each header is matched two ways and either is enough: a parsed header
+    // (comment-stripped, brackets removed, inner name trimmed) OR a raw
+    // substring hit. The raw pass means even a `[lib]` mentioned only in a
+    // comment keeps `--lib` — over-detection is harmless here, under-detection
+    // is not.
     let mut has_package = false;
-    let mut has_workspace = false;
-    let mut has_lib_section = false;
+    // Seeded from the raw text so a header this scanner fails to parse still
+    // counts; the loop below can only ever add to these, never clear them.
+    let mut has_workspace = text.contains("[workspace]");
+    let mut has_lib_section = text.contains("[lib]");
     for line in text.lines() {
-        match line.trim() {
-            "[package]" => has_package = true,
-            "[workspace]" => has_workspace = true,
-            "[lib]" => has_lib_section = true,
-            _ => {}
+        if let Some(name) = toml_table_header(line) {
+            match name {
+                "package" => has_package = true,
+                "workspace" => has_workspace = true,
+                "lib" => has_lib_section = true,
+                _ => {}
+            }
         }
     }
 
@@ -5137,6 +5181,58 @@ mod tests {
     fn probe_says_lib_for_an_explicit_lib_section() {
         let d = ProbeDir::new("libsec", "[package]\nname = \"t\"\n\n[lib]\npath = \"src/other.rs\"\n");
         assert!(crate_has_lib_target(d.path()));
+    }
+
+    #[test]
+    fn probe_sees_a_lib_header_with_a_trailing_comment_or_inner_spaces() {
+        // The review finding. TOML allows a comment after a table header and
+        // whitespace inside the brackets; the first version compared whole
+        // trimmed lines, so `[lib] # ...` was missed and a crate with an
+        // explicit library target (custom path, no src/lib.rs) silently lost
+        // --lib — the precise coverage narrowing this function exists to stop.
+        for manifest in [
+            "[package]\nname = \"x\"\n\n[lib] # explicit library target\npath = \"src/custom.rs\"\n",
+            "[package]\nname = \"x\"\n\n[ lib ]\npath = \"src/custom.rs\"\n",
+            "[package]\nname = \"x\"\n\n  [lib]\t# tabbed\npath = \"src/custom.rs\"\n",
+        ] {
+            let d = ProbeDir::new("libcomment", manifest);
+            assert!(
+                crate_has_lib_target(d.path()),
+                "must detect the lib target in: {manifest:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_sees_a_workspace_header_with_a_trailing_comment() {
+        let d = ProbeDir::new("wscomment", "[workspace] # virtual\nmembers = [\"a\"]\n");
+        assert!(crate_has_lib_target(d.path()));
+    }
+
+    #[test]
+    fn probe_still_says_no_lib_for_a_genuinely_bin_only_manifest() {
+        // The hardening must not swing so far that nothing is ever detected as
+        // binary-only — that would leave the original bug in place.
+        let d = ProbeDir::new(
+            "binonly2",
+            "[package] # the app\nname = \"muse\"\n\n[[bin]] # not a lib\nname = \"muse\"\n",
+        );
+        assert!(!crate_has_lib_target(d.path()));
+    }
+
+    #[test]
+    fn toml_table_header_parses_the_shapes_that_matter() {
+        assert_eq!(toml_table_header("[lib]"), Some("lib"));
+        assert_eq!(toml_table_header("  [lib]  "), Some("lib"));
+        assert_eq!(toml_table_header("[lib] # comment"), Some("lib"));
+        assert_eq!(toml_table_header("[ lib ]"), Some("lib"));
+        assert_eq!(toml_table_header("[package]"), Some("package"));
+        // array-of-table is not a plain header
+        assert_eq!(toml_table_header("[[bin]]"), None);
+        // not a header at all
+        assert_eq!(toml_table_header("name = \"x\""), None);
+        assert_eq!(toml_table_header("# [lib] in a comment"), None);
+        assert_eq!(toml_table_header(""), None);
     }
 
     #[test]
