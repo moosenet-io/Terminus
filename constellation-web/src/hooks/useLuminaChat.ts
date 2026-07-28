@@ -22,6 +22,11 @@ function classifyHttpErrorMessage(message: string): ChatErrorKind {
   const status = statusMatch ? Number(statusMatch[1]) : null;
   if (status === 429) return 'rate_limit';
   if (status === 502 || status === 503 || status === 504) return 'upstream';
+  // A recognized HTTP status that isn't the rate-limit/upstream pair (400/409/…) is a real
+  // "anything else" per spec §3.2 — the generic inline+retry path, not "Chord unreachable".
+  // Only the absence of an "HTTP NNN" prefix at all (a thrown network/TypeError with no status)
+  // is genuinely unreachable-transport, which is the sole case that reads as upstream.
+  if (status !== null) return 'other';
   return 'upstream';
 }
 
@@ -96,10 +101,16 @@ export function useLuminaChat() {
   // instead of a closure captured before a same-tick setMessages() call has flushed.
   const messagesRef = useRef<ChatMessage[]>([]);
   useEffect(() => { messagesRef.current = messages; }, [messages]);
+  // The `thinking` STATE only reflects reality after React commits a render — two retry()
+  // clicks fired before that commit both read `thinking === false` and would both proceed
+  // concurrently. This ref is set/checked synchronously in the same tick, so the second call
+  // is rejected immediately regardless of render timing.
+  const inFlightRef = useRef(false);
 
   const sendRaw = useCallback(async (content: string, replaceMessageId?: string) => {
     const trimmed = content.trim();
-    if (!trimmed || thinking) return;
+    if (!trimmed || inFlightRef.current) return;
+    inFlightRef.current = true;
 
     const userMsg: ChatMessage = { id: nextId(), role: 'user', content: trimmed, ts: Date.now() };
     const base = replaceMessageId
@@ -149,9 +160,10 @@ export function useLuminaChat() {
       const message = e instanceof Error ? e.message : 'Chord unreachable';
       setError({ kind: classifyHttpErrorMessage(message), message });
     } finally {
+      inFlightRef.current = false;
       setThinking(false);
     }
-  }, [thinking]);
+  }, []);
 
   const send = useCallback((rawText: string, override: RouterOverride) => {
     const content = override ? `/${override} ${rawText}` : rawText;
