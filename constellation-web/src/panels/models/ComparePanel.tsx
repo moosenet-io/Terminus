@@ -177,7 +177,13 @@ export function ComparePanel() {
     let cancelled = false;
     Promise.all(names.map(async n => {
       try {
-        const res = await getAggregationClient().models.list({ scope: 'all', q: n, limit: 10 });
+        // Review fix cycle-2 (codex): `limit: 10` risked missing the exact match if the
+        // backend's `q` ranking put it past the first page for a name that's a common
+        // substring of many others. The API clamps `limit` to 500 (its hard max, per
+        // `ModelsListQuery`'s own doc) — using that ceiling here (still ONE call per compared
+        // model, at most MAX_COMPARE=4 total) makes finding the exact `model_name` match
+        // effectively certain without needing real pagination logic for a lookup this narrow.
+        const res = await getAggregationClient().models.list({ scope: 'all', q: n, limit: 500 });
         return res.models.find(m => m.model_name === n) ?? null;
       } catch {
         return null;
@@ -309,10 +315,20 @@ export function ComparePanel() {
   const radarCaveats = (mint?.dimensions ?? []).flatMap(dim =>
     names
       .map(n => ({ n, score: mintScoreFor(n, dim) }))
-      .filter(({ score }) => score && isLowConfidenceScore(score))
+      // Review fix cycle-2 (codex): a model the backend OMITS ENTIRELY for this dimension
+      // (`mintScoreFor` returns `undefined` — no MintDimensionScore record at all, not merely
+      // one with `low_confidence:true`) still gets plotted as `0` on the radar above and was
+      // previously excluded from this disclosure list by the `score &&` guard, since there's
+      // no score to run `isLowConfidenceScore` against. Treat "no record" as equally worth
+      // disclosing as "record present but low-confidence" — both plot as a possibly-misleading
+      // 0.
+      .filter(({ score }) => !score || isLowConfidenceScore(score))
       .map(({ n, score }) => ({
         label: `${n} · ${dim}`,
-        tooltip: score ? mintCaveatTooltip(score) : '',
+        tooltip: score ? mintCaveatTooltip(score) : 'no MINT data for this dimension',
+        // A score record with a real (non-null) norm plots its ACTUAL value — only flagged for
+        // low sample size/confidence, not substituted. Absent-entirely or null-norm both fall
+        // back to 0 on the chart above.
         zeroPlotted: score?.norm == null,
       })),
   );
