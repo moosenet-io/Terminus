@@ -15,6 +15,16 @@
 // Charts come exclusively from the viz kit (src/viz) — nivo radar/heatmap load lazily via the
 // reserved `viz` chunk (React.lazy), the box plot is a bespoke SVG. Every chart has a table twin
 // (§4.4). Deep-space/violet tokens only.
+//
+// CGUI-10/CONST-23/24 reconciliation: two chart-type ports from the independently-built
+// CONST-23/24 MINT branch, both rewired to the real `client.mint.*` methods above (never the
+// bespoke mock/hook layer CONST-23/24 built against):
+//   - BoxPlotChart's n<5 groups now render as a jittered-dot strip instead of a misleading
+//     5-number-summary box (see BoxPlotChart.tsx's header comment).
+//   - A sixth, context-only view (ContextDegradationSection.tsx) — throughput/recall over
+//     context-token tiers, with OOM markers and a max_context_safe hairline — shown only for
+//     the 'context' legacy category, where the generic radar/heatmap/box/ranking/failures set
+//     doesn't cover "how does this model degrade as context grows."
 import { Suspense, lazy, useMemo, useState } from 'react';
 import { PanelRoot } from '../../components/PanelRoot';
 import { CardTitle } from '../../components/Card';
@@ -46,6 +56,7 @@ import {
   type RadarVM, type HeatmapVM, type RankRow, type FailuresVM,
 } from './transforms';
 import type { MintRunRow } from '../../types/mint';
+import { ContextDegradationSection } from './ContextDegradationSection';
 
 // CGUI-10: the MINT multi-series radar (MintRadarChart), distinct from CGUI-09's single-series
 // Models radar (viz/RadarChart.tsx). Both lazy-load into the reserved `viz` nivo chunk.
@@ -622,6 +633,7 @@ export function CategoryReportPanel() {
         <RankingSection cat={cat} epoch={selectedEpoch} />
         <DistributionSection cat={cat} epoch={selectedEpoch} />
         <FailuresSection cat={cat} epoch={selectedEpoch} />
+        {cat.kind === 'legacy' && cat.legacySuite === 'context' && <ContextDegradationSection />}
         <RunsSection cat={cat} epoch={selectedEpoch} />
       </div>
     </PanelRoot>

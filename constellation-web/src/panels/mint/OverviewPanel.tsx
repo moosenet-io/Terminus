@@ -6,6 +6,11 @@
 // The coverage roll-up fans out one `mint.categorySummary` read per new task-category (fail-open
 // per category — an un-profiled category simply shows 0 models, never an error), and reads the
 // legacy suite run counts from `mint.summary`. Tokens only; charts from the viz kit.
+//
+// CGUI-10/CONST-23/24 reconciliation: ports CONST-24's C9 trade-off parallel-coordinates chart
+// type (see TradeoffsSection.tsx) into this panel, rewired to the real `languageStats()` +
+// `contextProfiles()` client methods — CONST-24's own version read a mock-only `/mint/tradeoffs`
+// endpoint that has no real backend counterpart. See TradeoffsSection.tsx's header comment.
 import { useEffect, useMemo, useState } from 'react';
 import { PanelRoot } from '../../components/PanelRoot';
 import { CardTitle } from '../../components/Card';
@@ -25,6 +30,7 @@ import { getAggregationClient } from '../../lib/aggregationClient';
 import { useMintSection } from '../../hooks/useMint';
 import { MINT_CATEGORY_META, metricLabel, formatMetricValue } from './categoryMeta';
 import { rankingFromCategory, metricsOfCategory } from './transforms';
+import { TradeoffsSection } from './TradeoffsSection';
 import type { MintActivityResponse } from '../../types/mint';
 
 interface CoverageRow {
@@ -223,6 +229,7 @@ export function OverviewPanel() {
         <ActivitySection />
         <CoverageSection />
       </div>
+      <TradeoffsSection />
     </PanelRoot>
   );
 }

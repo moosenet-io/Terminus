@@ -547,65 +547,53 @@ Grid lines are **solid 1px hairlines** (`--chart-grid`/`--chart-axis`) — the d
 chart ships a table-view twin (`TableViewToggle`) — this is both the WCAG relief channel for
 sub-3:1 fills and a hard rule (§4.4).
 
-## MINT module (`src/panels/mint/`, CONST-23 phase 1 + CONST-24 phase 2)
+## MINT module (`src/panels/mint/`, CGUI-10 base + CONST-23/24 chart-type reconciliation)
 
-`/mint` (`mint.overview`) is ONE sectioned page (Overview, Coverage, Capability, Coder,
-Context), not one panel/route per section, per spec §7.1 -- `MintPage.tsx` owns a sticky
-in-page section nav (anchor links + `scrollMarginTop`) and the single global filter row
-(`MintFilterBar.tsx`: epoch, task_category, backend_tag, model multi-select capped at 4) that
-scopes every section below it. `mint` registers as a `ModuleId` gated on the `terminus` health
-entry (`registerPanels.ts`) -- it has no independent proxy namespace; like `models`, its data
-is server-side aggregation inside Terminus itself (`GET /api/terminus/mint/*`, §8), not a
-proxied fleet system.
+MINT is TWO registered panels, both terminus-backed (`mint` registers as a `ModuleId` gated on
+the `terminus` health entry, `registerPanels.ts` -- it has no independent proxy namespace; like
+`models`, its data is server-side aggregation inside Terminus itself, `GET /api/terminus/mint/*`)
+and both driven ENTIRELY by the real, live `client.mint.*` data client (`aggregationClient.ts`,
+CGUI-08):
+- **`mint.overview`** (`/mint/overview`, `OverviewPanel.tsx`) -- fleet-wide headline metrics,
+  profiling activity over time, a category coverage roll-up, and (see below) fleet-wide
+  trade-off analysis.
+- **`mint.categories`** (`/mint/categories`, `CategoryReportPanel.tsx`) -- the per-category
+  deep-dive: a grouped category picker over all 12 MINT categories (8 task-categories, 3 legacy
+  suites, the persona radar), each rendering capability radar / coverage heatmap / distribution
+  box / ranking / failure-class bars / recent runs, plus (see below) a context-degradation view
+  for the `context` legacy category.
 
-**Deep links** (`mintFilters.ts`): filters round-trip through the query string --
-`parseMintFilters`/`mintFiltersToParams` -- via `useSearchParams` + `replace:true` (filter
-tweaks don't spam browser history). Reload/share a `/mint?epoch=S118&model=qwen3-coder:30b`
-URL and the exact view restores.
+This pair superseded an independently-built, two-phase MINT UI (`CONST-23-mint-phase1` /
+`CONST-24-mint-phase2`, a single sectioned `/mint` page with its own filter bar and a bespoke
+mock-only data layer, built before CGUI-10's real backend/client landed on `main`). The two were
+reconciled by keeping CGUI-10's two-panel structure as the base (already live, already wired to
+the real backend) and porting only the CONST-23/24 chart TYPES that panel pair genuinely lacked,
+rewired to the real client:
+- **Low-n distribution honesty** (`BoxPlotChart.tsx`): a group with `n < 5` no longer renders a
+  5-number-summary box (statistically misleading from that few samples) -- it renders the
+  individual observed values (summary points + outliers) as jittered dots instead.
+- **Trade-off parallel coordinates** (`TradeoffsSection.tsx`, folded into `mint.overview`;
+  `viz/ParallelCoordinatesChart.tsx` + `viz/nivo-parallel-coordinates.d.ts`) -- a 6-dimension
+  per-model comparison (mean score, pass^3, throughput, p95 latency, VRAM, max safe context),
+  assembled CLIENT-SIDE from the real `languageStats()` and `contextProfiles()` methods (there is
+  no dedicated `/mint/tradeoffs` backend endpoint -- CONST-24's original version read one, but it
+  was a mock-only fixture with no real contract behind it).
+- **Context degradation** (`ContextDegradationSection.tsx`, folded into `mint.categories`,
+  rendered only for the `context` legacy category) -- throughput/recall over context-token
+  tiers, OOM markers, and a `max_context_safe` hairline, wired to the real `contextProfiles()`
+  method. Sibling charts, never a dual-axis chart.
 
-**CONST-23 built C0/C1/C2/C4/C7/C8** (stat tiles, capability radar, coverage heatmap, Pareto
-scatter, context degradation, sweep activity). **CONST-24 lands the remaining four** -- C3
-(`BoxPlotChart.tsx`, latency box plots), C5 (`SwarmPlotChart.tsx`, score beeswarm), C6
-(`FailureBarsChart.tsx`, failure-class bars), C9 (`ParallelCoordinatesChart.tsx`, trade-off
-parallel coordinates) -- plus the Coder section's language control (§7.1's one documented
-exception to the global filter row) and the cross-chart drill-downs §7 calls for:
-- Coverage's heatmap (C2) cell click adds that row's model to the global model filter and
-  scrolls to Coder -- since C3/C5 already read the same global filter, this re-scopes both
-  without `CoverageSection.tsx` importing anything from the Coder section.
-- Failure-class bars (C6) segment click filters the beeswarm (C5) to that failure class (a
-  section-local `failureClassFilter`, shown as a removable chip next to the language control).
-- Score beeswarm (C5) dot click switches C5 into table view and highlights the matching run
-  row (`DataTable`'s new optional `highlightRowKey` prop, CONST-24 addition; scrolls it into
-  view). C5 lane-header click adds that lane's model to the global model filter (routes to C6).
-
-`TradeoffsSection.tsx` (C9) is a separate file from `CapabilitySection.tsx` (C1) but renders
-inside the SAME `<section id="capability">` -- §7.3's "Capability = C1+C9" composition holds
-without a monolithic file.
-
-Each of the now nine section endpoints (`useMint.ts`) degrades independently -- one dead
-endpoint collapses only its own `ChartCard` to the degraded state, never the whole page.
-
-**Backend not merged yet:** CONST-21 (`models_api.rs`) owns the real `/api/terminus/mint/*`
-endpoints and hasn't landed -- this item (like CONST-23 before it) builds entirely against
-`aggregationClient.ts` mock fixtures shaped exactly per §8, covering the required variants
-(full fleet, sparse/missing dimensions, not_run-only coverage, single-model selection, n<5
-groups, >400-run decimation, an all-`none`-failure epoch, and a <2-complete-model trade-off
-set). Deviations from §8 worth flagging for CONST-21 (CONST-23's two, plus CONST-24's three):
-- `GET /mint/pareto?models=&epoch=` is NOT in §8's endpoint table -- C4 needs per-model
-  `{latency, score, vram}` that doesn't fit any other listed shape, so the mock adds this as
-  an additive contract-to-confirm rather than overloading `/mint/runs` or `/models`.
-- The model multi-select's option list (`MINT_MODEL_CATALOG`) is hardcoded from the mock
-  fixture's own model set, since `/api/terminus/models` (CONST-21/22) isn't built yet either --
-  swap it for a real model list once CONST-22 lands.
-- `GET /mint/box` additionally returns an optional `raw_values: number[]` per group when
-  `n < 5` -- §8's quartile-only shape has no per-point data for the beeswarm-strip fallback
-  §7.2 requires for low-n groups; CONST-21 should populate it from the same raw run rows the
-  quartiles are computed from.
-- `GET /mint/tradeoffs?models=` (C9) is likewise NOT in §8's table -- same additive pattern as
-  `/mint/pareto`, since C9's 6-dim per-model shape (normalized + raw ranges) doesn't fit
-  `/mint/language-stats`, `/mint/context-profiles`, or `/models` cleanly on its own.
-- The Coder section's language catalog (`MINT_LANGUAGES`) is hardcoded from the mock run
-  fixture, same deviation/precedent as `MINT_MODEL_CATALOG` above.
+What was reviewed and NOT ported, because CGUI-10's existing pair already covers the same ground
+live: the CONST-23/24 filter bar (`MintFilterBar.tsx`/`mintFilters.ts` -- its model/category
+facets were backed by a mock fixture, and its language filter was explicitly a documented
+stopgap "swap for a real facet list once CONST-21 lands"; CGUI-10 instead uses a per-panel
+category picker + epoch selector against the real client), its own Overview/Coverage sections
+(redundant with `OverviewPanel.tsx`'s headline metrics + coverage roll-up), its Capability
+radar (redundant with the persona radar already in `CategoryReportPanel.tsx`), and its
+failure-class bar chart / score-beeswarm Coder section (redundant with `CategoryReportPanel.tsx`'s
+existing Failures + Distribution sections for the `code` category). `MintPage.tsx` and every
+CONST-23/24 section file were deleted once their useful chart types were folded in or explicitly
+rejected, so the module carries no dead duplicate UI.
 
 ## Real-time relay (`/ws`, CONST-18)
 
