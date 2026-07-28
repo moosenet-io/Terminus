@@ -1,5 +1,0 @@
-<<<<<<<< HEAD:constellation-web/dist/assets/RadarChartImpl-3a5YTvd3.js
-import{j as o,a5 as i}from"./viz-CxDJ30Dv.js";import{g as s,C as m}from"./index-CdGq_gZs.js";import"./vendor-BaHbZ5Ko.js";function l({axes:e}){const r=s(),a=e.map(t=>({category:t.category,score:t.score}));return o.jsx(i,{data:a,keys:["score"],indexBy:"category",maxValue:1,margin:{top:40,right:60,bottom:40,left:60},gridShape:"circular",gridLabelOffset:16,dotSize:8,dotBorderWidth:2,colors:[m[0]],fillOpacity:.2,borderWidth:2,theme:r.nivo,isInteractive:!0,animate:!1})}export{l as default};
-========
-import{j as o,a4 as i}from"./viz-xhAUhQui.js";import{g as s,C as m}from"./index-C3R-SIKk.js";import"./vendor-DF587Cjf.js";function l({axes:e}){const r=s(),a=e.map(t=>({category:t.category,score:t.score}));return o.jsx(i,{data:a,keys:["score"],indexBy:"category",maxValue:1,margin:{top:40,right:60,bottom:40,left:60},gridShape:"circular",gridLabelOffset:16,dotSize:8,dotBorderWidth:2,colors:[m[0]],fillOpacity:.2,borderWidth:2,theme:r.nivo,isInteractive:!0,animate:!1})}export{l as default};
->>>>>>>> origin/main:constellation-web/dist/assets/RadarChartImpl-PC9bTZwN.js
