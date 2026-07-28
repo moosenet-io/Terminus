@@ -15,6 +15,7 @@
 // page (a note under the table makes that explicit). Fail-open: an empty roster renders a clean
 // empty state; the panel never throws.
 import { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Card, CardTitle } from '../../components/Card';
 import { PanelRoot } from '../../components/PanelRoot';
 import { Badge } from '../../components/Badge';
@@ -45,13 +46,38 @@ const VIEWS = [
 /** Roster page size — the backend clamps `limit` to [1, 500]; 50 matches its default. */
 const PAGE_SIZE = 50;
 
+/** Review fix (codex): `models.compare` (CONST-22 reconciliation) existed with no way to reach
+ *  it from the roster except hand-constructing the URL. Must match ComparePanel.tsx's own
+ *  `MAX_COMPARE` cap (kept as a literal here rather than importing across panel boundaries). */
+const MAX_COMPARE = 4;
+
 export function RosterPanel() {
+  const navigate = useNavigate();
   const [models, setModels] = useState<ModelListEntry[] | null>(null);
   const [total, setTotal] = useState(0);
   const [refreshedAt, setRefreshedAt] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   const [selected, setSelected] = useState<ModelListEntry | null>(null);
   const [view, setView] = useState<ViewMode>('table');
+  const [compareSet, setCompareSet] = useState<Set<string>>(new Set());
+
+  const toggleCompare = (name: string) => {
+    setCompareSet(prev => {
+      const next = new Set(prev);
+      if (next.has(name)) {
+        next.delete(name);
+      } else if (next.size < MAX_COMPARE) {
+        next.add(name);
+      }
+      return next;
+    });
+  };
+
+  const goCompare = () => {
+    const params = new URLSearchParams();
+    for (const n of compareSet) params.append('m', n);
+    navigate(`/models/compare?${params.toString()}`);
+  };
 
   const [scope, setScope] = useState<Scope>('all');
   const [servingOnly, setServingOnly] = useState(false);
@@ -106,6 +132,20 @@ export function RosterPanel() {
 
   const columns: SortableColumn<ModelListEntry>[] = useMemo(() => [
     {
+      key: 'compare', header: '', width: '2.5rem',
+      render: m => (
+        <input
+          type="checkbox"
+          checked={compareSet.has(m.model_name)}
+          disabled={!compareSet.has(m.model_name) && compareSet.size >= MAX_COMPARE}
+          onChange={() => toggleCompare(m.model_name)}
+          onClick={e => e.stopPropagation()}
+          aria-label={`Select ${m.model_name} for comparison`}
+          title={`Select for comparison (max ${MAX_COMPARE})`}
+        />
+      ),
+    },
+    {
       key: 'name', header: 'Model', sortable: true, sortValue: m => m.model_name, width: '28%',
       render: m => (
         <button
@@ -144,7 +184,7 @@ export function RosterPanel() {
       key: 'tier', header: 'Tier', align: 'right', sortable: true, sortValue: m => deriveCostTier(m).label,
       render: m => <Badge tone="neutral" mono>{deriveCostTier(m).label}</Badge>,
     },
-  ], []);
+  ], [compareSet]);
 
   // Detail view — master/detail swap inside the same panel/route.
   if (selected) {
@@ -171,6 +211,22 @@ export function RosterPanel() {
       <Toolbar
         right={
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--space-3)' }}>
+            {compareSet.size > 0 && (
+              <button
+                type="button"
+                onClick={goCompare}
+                disabled={compareSet.size < 2}
+                title={compareSet.size < 2 ? 'Select at least 2 models to compare' : `Compare ${compareSet.size} models`}
+                style={{
+                  background: 'var(--accent-bright)', color: 'var(--space-900)', border: 'none',
+                  borderRadius: 'var(--radius-md)', padding: '5px 12px', fontSize: 'var(--fs-sm)',
+                  fontWeight: 600, cursor: compareSet.size < 2 ? 'not-allowed' : 'pointer',
+                  opacity: compareSet.size < 2 ? 0.5 : 1,
+                }}
+              >
+                Compare ({compareSet.size})
+              </button>
+            )}
             <ResultCount count={total} noun="model" />
             <SegmentedControl options={VIEWS} value={view} onChange={setView} ariaLabel="Roster view" />
           </div>
@@ -244,7 +300,18 @@ export function RosterPanel() {
             return (
               <Card key={m.model_name} variant="interactive" glow={m.serving_now} onClick={() => setSelected(m)}>
                 <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 'var(--space-2)', marginBottom: 'var(--space-2)' }}>
-                  <span style={{ fontWeight: 600, color: 'var(--text-primary)', wordBreak: 'break-all' }}>{m.model_name}</span>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                    <input
+                      type="checkbox"
+                      checked={compareSet.has(m.model_name)}
+                      disabled={!compareSet.has(m.model_name) && compareSet.size >= MAX_COMPARE}
+                      onChange={() => toggleCompare(m.model_name)}
+                      onClick={e => e.stopPropagation()}
+                      aria-label={`Select ${m.model_name} for comparison`}
+                      title={`Select for comparison (max ${MAX_COMPARE})`}
+                    />
+                    <span style={{ fontWeight: 600, color: 'var(--text-primary)', wordBreak: 'break-all' }}>{m.model_name}</span>
+                  </span>
                   <Badge tone="neutral" mono>{tier.label}</Badge>
                 </div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 'var(--space-2)', marginBottom: 'var(--space-3)' }}>

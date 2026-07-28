@@ -908,6 +908,9 @@ function mockGetFor(system: SystemId, pathname: string, fullPath: string): unkno
   if (system === 'lumina' && pathname === '/engram/search') {
     return mockEngramSearch(fullPath);
   }
+  // Model Library + MINT reads (CGUI-08/09/10) go through the dedicated `client.models.*` /
+  // `client.mint.*` mock methods below (their own canned data, typed against `types/mint.ts`),
+  // not this generic system+pathname router — so there is no `/models`/`/mint/*` branch here.
   return null;
 }
 
@@ -1060,8 +1063,8 @@ function mockWriteFor(system: SystemId, pathname: string, body?: string): unknow
 
 function mockRequest<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
   const method = (init?.method ?? 'GET').toUpperCase();
-  const [pathname, search] = path.split('?');
-  const query = new URLSearchParams(search ?? '');
+  const qIdx = path.indexOf('?');
+  const pathname = qIdx === -1 ? path : path.slice(0, qIdx);
   const value = method === 'GET'
     ? mockGetFor(system, pathname, path)
     : mockWriteFor(system, pathname, typeof init?.body === 'string' ? init.body : undefined);
@@ -1627,15 +1630,19 @@ const mockAdapter: AggregationClient = {
 //            (binary passthrough -- see crate::constellation::proxy's module doc; this generic
 //            request<T>() path is JSON-typed, art responses should be fetched by <img src> URL,
 //            not through this method)
-//   terminus/mint (CONST-21 backend, merged to main; CGUI-08/10 build the Overview + Category
-//            Reports panels against the REAL typed `client.mint.*` methods below -- summary(),
-//            dimensions(), matrix(), runs(), box(), languageStats(), failures(),
-//            contextProfiles(), activity(), categorySummary/-Dimensions/-Matrix/-Box/-Failures()
-//            -- not the generic pathname passthrough this doc block otherwise describes.
-//            CONST-23/24 originally mocked MINT through this generic dispatch (`GET /mint/*`,
-//            including two additive not-in-spec mocks `/mint/pareto` and `/mint/tradeoffs`);
-//            that generic path was retired during the CGUI-10/CONST-23/24 merge reconciliation
-//            since the typed client fully supersedes it.
+//   terminus (CONST-21/CGUI-07/CGUI-08; the Model Library + MINT modules build against these --
+//            see src/types/mint.ts for the exact shapes, typed 1:1 against models_api.rs):
+//            served via the dedicated `client.models.*` / `client.mint.*` methods below, not
+//            this generic request<T>() path -- GET /models?scope=&q=&category=&status=&serving=
+//            &limit=&offset=, GET /models/{name} (URL-encoded full registry key),
+//            GET /mint/dimensions?models=&epoch= (comma-separated model ids), plus the rest of
+//            the mint/* surface (summary/matrix/runs/box/language-stats/failures/context-
+//            profiles/activity/category/*). CGUI-08/10 build the Overview + Category Reports
+//            panels against these REAL typed methods. CONST-23/24 originally mocked MINT
+//            through the generic pathname dispatch (`GET /mint/*`, including two additive
+//            not-in-spec mocks `/mint/pareto` and `/mint/tradeoffs`); that generic path was
+//            retired during the CGUI-10/CONST-23/24 merge reconciliation since the typed client
+//            fully supersedes it.
 //            CONST-20 additions (not in the original §5.4 route list -- see aggregationClient's
 //            MOCK_MUSE_STATS/compose/maintenance comments for why): GET /stats (dashboard
 //            MetricCards row), POST /api/channels/{id}/compose, POST /api/channels/{id}/
