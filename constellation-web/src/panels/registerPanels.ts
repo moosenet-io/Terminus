@@ -333,7 +333,6 @@ registerPanel({
 });
 
 // CONST-28: Terminus module self — fleet health board, tool catalog, activity feed.
-
 registerPanel({
   id: 'terminus.fleet',
   system: 'terminus',
@@ -365,15 +364,20 @@ registerPanel({
 });
 
 // ── Lumina ───────────────────────────────────────────────────────────────────
-// CGUI-06 (TERM #529): Lumina was a registered module with ZERO panels (an empty tab). This
-// lands its first real panel — an operational overview of the lumina-core agent — so the
-// module is no longer empty. Anticipates the full LGUI-06..12 surface
-// (chat/memory/persona/routing/tools/access/setup), which will register alongside it.
+// LGUI-06: the module's actual landing panel (§2 of LUMINA-GUI-SPEC.md — `lumina.overview`,
+// route `/lumina`, min role viewer). Registered first so it's the module's first panel (the
+// one `ModuleRail`/`ModuleCard`'s "Open" link points at, per moduleRegistry's registration-
+// order convention — see getPanelsByModule). The CONST-04 stub (`lumina.config`,
+// `available: false`) was removed by LGUI-05; LGUI-06 registers the first real panel here.
+// SWAPPED IN over the simpler CGUI-06 placeholder (TERM #529, mock-fallback data, no
+// first-run/degraded-state handling) per operator decision: LGUI-06 is spec-accurate (real
+// useLumina §7 hook, registry-gated first-run redirect, honest whole-panel degrade) — same bar
+// as the LGUI-07/08 panels already merged alongside it.
 registerPanel({
   id: 'lumina.overview',
   system: 'lumina',
   title: 'Overview',
-  path: '/lumina/overview',
+  path: '/lumina',
   icon: '✦',
   available: true,
   component: LuminaOverviewPanel,

@@ -16,10 +16,10 @@
 export {
   LineChart,
   Line,
-  BarChart,
-  Bar,
   AreaChart,
   Area,
+  BarChart,
+  Bar,
   ScatterChart,
   Scatter,
   ZAxis,

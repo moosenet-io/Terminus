@@ -575,6 +575,71 @@ const MOCK_MUSE_GROUP_DYNAMICS = {
   ],
 };
 
+// ── Mock data for the Lumina module (LGUI-01/02 backend, LGUI-06 builds its Overview
+// panel against these shapes -- verified §7 response sketches, LUMINA-GUI-SPEC.md) ──────────
+
+const MOCK_LUMINA_STATUS = {
+  version: '0.4.2',
+  uptime_secs: 3 * 24 * 3600 + 6 * 3600 + 12 * 60,
+  state: 'online',
+  display_name: 'Lumina',
+  onboarding_complete: true,
+  dynamic_prompt: true,
+  chord_configured: true,
+  channels: [
+    { name: 'matrix', state: 'connected', configured: true },
+    { name: 'imap', state: 'connected', configured: true },
+    { name: 'caldav', state: 'configured-off', configured: false },
+    { name: 'sms', state: 'misconfigured', configured: true },
+  ],
+};
+
+// NOTE: `/engram/stats` is ONE real backend endpoint consumed by TWO panels (Overview's metric
+// row + memory-growth chart via `LuminaEngramStats`; Memory's stats strip via
+// `LuminaMemoryStats`) — both types are structurally compatible supersets of the same §7 core
+// fields (total/by_type/by_sensitivity/db_bytes/embedded_pct/store_ok), so there is exactly ONE
+// mock object below (merged at LGUI-06/CGUI-06 reconciliation) rather than two diverging stat
+// computations for the same route. `growth_30d` (Overview) and `security_violation_key`
+// (Memory, absent here since `store_ok:true`) are each optional on their respective consumer's
+// type and simply unused by the other.
+const GROWTH_30D = Array.from({ length: 30 }, (_, i) => ({
+  date: new Date(Date.now() - (29 - i) * 86_400_000).toISOString().slice(0, 10),
+  total: 1200 + Math.round(i * 21.4 + (i % 5) * 6),
+}));
+
+const MOCK_LUMINA_ANALYTICS_SUMMARY = {
+  top_tools: [
+    { name: 'searxng_search', count: 214 },
+    { name: 'engram_search', count: 176 },
+    { name: 'gitea_create_issue', count: 58 },
+    { name: 'calendar_list', count: 41 },
+    { name: 'weather', count: 22 },
+  ],
+  failure_rate: 0.021,
+  escalation_rate: 0.183,
+  avg_duration_ms: 842,
+  daily: Array.from({ length: 14 }, (_, i) => {
+    const turns = 30 + ((i * 7) % 20);
+    const deep = Math.round(turns * (0.15 + (i % 4) * 0.05));
+    return {
+      date: new Date(Date.now() - (13 - i) * 86_400_000).toISOString().slice(0, 10),
+      turns,
+      deep,
+      tool_calls: turns * 2 + (i % 3),
+    };
+  }),
+};
+
+const MOCK_LUMINA_ANALYTICS_EVENTS = {
+  events: [
+    { ts: new Date(Date.now() - 8 * 60_000).toISOString(), level: 'ok', text: 'tool searxng_search 412ms' },
+    { ts: new Date(Date.now() - 6 * 60_000).toISOString(), level: 'ok', text: 'chat turn completed model=deep 1834ms' },
+    { ts: new Date(Date.now() - 5 * 60_000).toISOString(), level: 'warn', text: 'escalation fast→deep threshold=0.72' },
+    { ts: new Date(Date.now() - 3 * 60_000).toISOString(), level: 'ok', text: 'tool engram_search 88ms results=6' },
+    { ts: new Date(Date.now() - 60_000).toISOString(), level: 'error', text: 'tool calendar_list upstream_error timeout' },
+  ],
+};
+
 // ── Mock data for the Lumina Memory (engram) browser panel (LGUI-08, §3.3) ──────────────────
 // Seeded for variety per the item's requirements: all 4 `MemoryType`s, several `sensitivity`
 // categories (incl. the always-private Health/Finance/Personal set), a superseded chain
@@ -701,11 +766,24 @@ const MOCK_GET: Record<string, unknown> = {
   'muse /api/graph/watch-history': MOCK_MUSE_WATCH_HISTORY,
   'muse /api/graph/group-dynamics': MOCK_MUSE_GROUP_DYNAMICS,
   'muse /guide': MOCK_MUSE_GUIDE,
+  'lumina /status': MOCK_LUMINA_STATUS,
   // LGUI-08 (§3.3/§7): the stats route has no query-dependent shape, so it's a plain lookup;
   // `/engram/search` DOES depend on the query string and is handled in `mockGetFor` below
   // (same pattern as `lumina /analytics`'s `view` param elsewhere in this file's history).
-  'lumina /engram/stats': MOCK_LUMINA_MEMORY_STATS,
+  // Merged with LGUI-06's `growth_30d` series (Overview's memory-growth chart) — see the note
+  // above `GROWTH_30D` for why this is one object, not two divergent stats mocks.
+  'lumina /engram/stats': { ...MOCK_LUMINA_MEMORY_STATS, growth_30d: GROWTH_30D },
 };
+
+/** `GET /api/lumina/analytics?view=summary|events&days=` (§7) — `view` picks the response
+ *  shape, so (unlike every other mock lookup) this needs the query string, not just the
+ *  pathname. `view=summary` (or omitted) returns the daily/top-tools/rate shape;
+ *  `view=events` returns the last-N log-line events (§3.1's activity feed). */
+function mockLuminaAnalytics(fullPath: string): unknown {
+  const query = fullPath.split('?')[1] ?? '';
+  const view = new URLSearchParams(query).get('view') ?? 'summary';
+  return view === 'events' ? MOCK_LUMINA_ANALYTICS_EVENTS : MOCK_LUMINA_ANALYTICS_SUMMARY;
+}
 
 function mockGetFor(system: SystemId, pathname: string, fullPath: string): unknown {
   const key = `${system} ${pathname}`;
@@ -716,6 +794,9 @@ function mockGetFor(system: SystemId, pathname: string, fullPath: string): unkno
   if (system === 'muse' && pathname.startsWith('/api/channels/') && pathname.endsWith('/lineup')) {
     const channelId = pathname.split('/')[3];
     return MOCK_MUSE_LINEUP[channelId] ?? { channel_id: channelId, lineup: [] };
+  }
+  if (system === 'lumina' && pathname === '/analytics') {
+    return mockLuminaAnalytics(fullPath);
   }
   if (system === 'lumina' && pathname === '/engram/search') {
     return mockEngramSearch(fullPath);
@@ -1408,6 +1489,11 @@ const mockAdapter: AggregationClient = {
 //            plain passthrough paths under the existing `proxy_muse` arm -- no proxy.rs change
 //            needed, they degrade exactly like every other unwired muse route (404/501 ->
 //            ChartEmpty "not yet wired") until the real muse backend implements them.
+//   lumina (LGUI-01/02 backend; LGUI-06 builds the Overview panel against these -- see
+//            src/types/lumina.ts for the exact shapes, mirroring LUMINA-GUI-SPEC.md §7):
+//            GET /status, GET /engram/stats, GET /analytics?view=summary|events&days=
+//            (view picks the response shape -- see mockLuminaAnalytics above, the mock's
+//            documentation of that contract)
 
 function baseUrl(): string {
   // Same-origin only — never a hardcoded host/port. This is the one place in the app

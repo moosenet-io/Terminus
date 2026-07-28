@@ -258,6 +258,61 @@ no palette code changes.
 runner wired up yet (no vitest/jest in `package.json`), so it isn't invoked by any script today;
 wire it into `npm test` the moment one is added.
 
+## Lumina module (`lumina.*`, LGUI-05/06)
+
+The `lumina` module (id `lumina`, `healthSystem: 'lumina'`) is the assistant's home in the
+portal (LUMINA-GUI-SPEC.md §1/§2). Its first panel, `lumina.overview` (route `/lumina`, min
+role viewer — `src/panels/lumina/OverviewPanel.tsx`), is the assistant dashboard:
+
+- **Identity Card** (`src/panels/lumina/IdentityCard.tsx`) — StatusPill from `status.state`,
+  uptime + version, one Badge per channel (green=connected, neutral=configured-off,
+  amber=misconfigured), `glow`s when online.
+- **Tile row** — memories (engram total + 24h delta when derivable), turns today, deep-turn
+  share, active users, reminders. Tiles degrade to an em dash rather than fabricating a number
+  when a section hasn't loaded or the source can't derive it.
+- **Charts** (viz kit only, per CONST-GUI-SPEC.md §4) — memory growth (30-day area, single
+  series), routing mix (14-day stacked bars, fast vs deep), top tools (7-day horizontal bar).
+  Each chart is backed by its OWN windowed request/slice (review fix) — routing mix and top
+  tools are two SEPARATE `useLumina` sections (`analyticsRouting` at `days=14`, `analyticsTools`
+  at `days=7`), not one over-fetched request rendered into two differently-labeled charts,
+  because the backend's `top_tools` ranking is itself scoped by the `days` param it's asked
+  for. Memory growth's `growth_30d` is defensively `.slice(-30)`'d client-side.
+- **Activity feed** — last 20 events in the log-line voice (`[ok] tool searxng_search 412ms`).
+- **First-run**: when `GET /api/lumina/status` reports `onboarding_complete: false`, the intent
+  is `/lumina/setup` (LGUI-12's wizard route). Review fix: the panel checks the registry
+  dynamically (`isPanelAvailable('lumina.setup')`, `src/lib/moduleRegistry.ts`) before
+  redirecting — while LGUI-12 is unmerged that check is false, so instead of an unconditional
+  `Navigate` (which just bounces off App.tsx's wildcard Route back to `/overview`, making the
+  "NEW · needs setup" card permanently unreachable), the panel renders that hero card here on
+  `/lumina` with its "Begin setup" action disabled and annotated "setup wizard lands with
+  LGUI-12". The moment LGUI-12 registers `lumina.setup`, the redirect self-activates with zero
+  code change on either side.
+- **Degraded/empty states**: a whole-panel degraded card when `/api/health`'s `lumina` entry
+  reports `available: false`; per-section `ChartEmpty` (e.g. "No memories yet — they'll appear
+  as you talk") when a store has no data yet. `status.display_name` and `engram.growth_30d` are
+  OPTIONAL additive extensions not in the §7 sketch (`src/types/lumina.ts`) — `undefined`
+  (field absent) and empty-but-present are distinct states with distinct copy: the identity
+  card falls back to "Lumina" + version/uptime with no name, and the memory-growth chart shows
+  "backend does not expose a memory-inserts series yet" (field absent) vs "No memories yet"
+  (field present, store just has no history). Each of the five backing reads (status, engram
+  stats, analytics-routing, analytics-tools, analytics events) is its own independent
+  `useLumina` section state, so a slow/failing one degrades on its own without blanking the
+  rest of the panel.
+
+Data comes from `src/hooks/useLumina.ts`, which polls the §7 endpoints
+(`/api/lumina/status`, `/api/lumina/engram/stats`,
+`/api/lumina/analytics?view=summary&days=14`, `/api/lumina/analytics?view=summary&days=7`,
+`/api/lumina/analytics?view=events&days=7`) through `client.request('lumina', ...)` — see
+`src/types/lumina.ts` for the exact response shapes (REQUIRED surface is §7 exactly, plus the
+two documented OPTIONAL additive fields above) and `lib/aggregationClient.ts`'s mock data for
+the canned fixtures those hooks build against with no backend present.
+
+**Seam note**: the shared Overview card canvas (`panels/overview/ModuleCard.tsx`) has a
+4-state `CardState` union (`online`/`idle`/`error`/`disabled`) with no per-module state-
+injection seam yet — adding a 5th "needs setup" canvas state is a canvas refactor out of
+LGUI-06's scope. The "NEW · needs setup" badge + "Begin setup" button instead render on the
+Lumina module's own `/lumina` route today; wire it through `ModuleCard` once that seam exists.
+
 ## Adding a panel
 
 1. Create `src/panels/<module>/<Name>Panel.tsx`. Read data via
