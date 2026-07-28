@@ -1628,6 +1628,51 @@ fn cargo_build_argv(
 /// instead of stopping at the first (needed for the structured pass/fail +
 /// failing-test summary the gate returns).
 ///
+/// Does the staged crate have a library target? (TERM #544)
+///
+/// Used to decide whether `cargo test` may be given `--lib`. Deliberately
+/// **conservative: it returns `true` unless it can positively prove there is no
+/// lib target**, so an unreadable/unexpected manifest keeps the pre-existing
+/// `--lib --bins` behaviour rather than silently narrowing what the gate runs
+/// for the modules that work today.
+///
+/// It answers `false` only for the unambiguous case: a single-package manifest
+/// with no `[workspace]` members, no explicit `[lib]` section, and no
+/// `src/lib.rs` beside it. That is precisely the binary-only shape (Muse) that
+/// `--lib` aborts on.
+///
+/// A deliberately simple line scan rather than a TOML parse or a
+/// `cargo metadata` subprocess: this runs on the hot path of every test gate,
+/// the three facts it needs are all top-level section headers, and being wrong
+/// in the safe direction costs nothing.
+fn crate_has_lib_target(source_dir: &std::path::Path) -> bool {
+    let manifest = source_dir.join("Cargo.toml");
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        // Can't read it — assume a lib exists (pre-TERM-#544 behaviour).
+        return true;
+    };
+
+    let mut has_package = false;
+    let mut has_workspace = false;
+    let mut has_lib_section = false;
+    for line in text.lines() {
+        match line.trim() {
+            "[package]" => has_package = true,
+            "[workspace]" => has_workspace = true,
+            "[lib]" => has_lib_section = true,
+            _ => {}
+        }
+    }
+
+    // A workspace (virtual or otherwise) may have members that carry libs;
+    // don't try to reason about them here, keep the old behaviour.
+    if has_workspace || has_lib_section || !has_package {
+        return true;
+    }
+
+    source_dir.join("src").join("lib.rs").exists()
+}
+
 /// BLD-GATE-06 (TERM #419): defaults to `--lib --bins` (hermetic unit tests)
 /// rather than the whole workspace/crate — integration tests under `tests/`
 /// commonly need live services (gitea/plane/redis/network) that don't exist
@@ -1638,13 +1683,24 @@ fn cargo_build_argv(
 /// pass) — any other value (including unset) keeps the `--lib --bins`
 /// default.
 ///
+/// TERM #544: `--lib` is emitted only when the crate actually HAS a library
+/// target (`has_lib_target`, determined by [`crate_has_lib_target`]). Passing
+/// it to a binary-only crate is a hard cargo error that aborts before any test
+/// runs, which made such modules permanently ungateable.
+///
 /// Also caps the RUN-thread count (distinct from the `-j` BUILD-thread cap
 /// above) via a trailing `-- --test-threads=<N>`: at the host's full core
 /// count (~32) some suites hit test-concurrency flakiness (httpmock /
 /// GPU-exclusive-resource races) that doesn't reproduce at a lower thread
 /// count. `N` comes from env `BUILD_GATE_TEST_THREADS`, defaulting to `8`
 /// when unset, empty, non-numeric, or `0`.
-fn cargo_test_argv(profile: &str, triple: &str, jobs: u32, manifest_path: &str) -> Vec<String> {
+fn cargo_test_argv(
+    profile: &str,
+    triple: &str,
+    jobs: u32,
+    manifest_path: &str,
+    has_lib_target: bool,
+) -> Vec<String> {
     let (profile_flags, _subdir) = profile_flags_and_subdir(profile);
     let mut argv = vec![
         "cargo".to_string(),
@@ -1665,7 +1721,19 @@ fn cargo_test_argv(profile: &str, triple: &str, jobs: u32, manifest_path: &str) 
     if full_workspace {
         argv.push("--workspace".to_string());
     } else {
-        argv.push("--lib".to_string());
+        // `--lib` is a HARD ERROR for a crate with no library target:
+        //   error: no library targets found in package `muse`
+        // cargo exits before running anything, so the gate reports
+        // process_exit_success:false with 0 passed / 0 failed and no summary —
+        // indistinguishable at a glance from a build failure. That is exactly
+        // what made every binary-only module permanently ungateable (TERM #544,
+        // found while gating Muse, which has no src/lib.rs).
+        //
+        // `--bins` is always safe: every module the compiler builds has at
+        // least one binary by definition (that is what it deploys).
+        if has_lib_target {
+            argv.push("--lib".to_string());
+        }
         argv.push("--bins".to_string());
     }
 
@@ -3270,7 +3338,13 @@ impl CompilerBuild {
             .await?;
 
             let cargo_argv = if is_test_mode {
-                cargo_test_argv(&profile, &triple, resolved.caps.jobs, &manifest_str)
+                cargo_test_argv(
+                    &profile,
+                    &triple,
+                    resolved.caps.jobs,
+                    &manifest_str,
+                    crate_has_lib_target(&local_source_dir),
+                )
             } else {
                 cargo_build_argv(&profile, &triple, resolved.caps.jobs, &bin, &manifest_str)
             };
@@ -3656,7 +3730,16 @@ impl CompilerBuild {
             }
 
             let cargo_argv = if is_test_mode {
-                cargo_test_argv(&profile, &triple, resolved.caps.jobs, &remote_manifest)
+                cargo_test_argv(
+                    &profile,
+                    &triple,
+                    resolved.caps.jobs,
+                    &remote_manifest,
+                    // Probe the LOCAL staged tree: the remote build is a
+                    // relay of this exact source, so the local copy is
+                    // authoritative and needs no extra remote round-trip.
+                    crate_has_lib_target(&local_source_dir),
+                )
             } else {
                 cargo_build_argv(&profile, &triple, resolved.caps.jobs, &bin, &remote_manifest)
             };
@@ -4972,6 +5055,103 @@ mod tests {
 
     // ── BLD-COMPTEST: cargo_test_argv (mirrors the cargo_build_argv tests above) ──
 
+    // ── TERM #544: --lib is a hard error on a binary-only crate ──
+
+    #[test]
+    fn cargo_test_argv_omits_lib_for_a_binary_only_crate() {
+        // The regression this fixes. `cargo test --lib` against a crate with no
+        // library target exits immediately with "no library targets found in
+        // package <x>" — 0 passed, 0 failed, no summary — so the gate could
+        // never pass for such a module.
+        let _env = ScopedEnv::new().unset("BUILD_GATE_TESTS");
+        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", false);
+        assert!(
+            !argv.iter().any(|a| a == "--lib"),
+            "must not pass --lib when there is no lib target: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--bins"),
+            "--bins is always safe and must remain: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_test_argv_keeps_lib_when_the_crate_has_one() {
+        let _env = ScopedEnv::new().unset("BUILD_GATE_TESTS");
+        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true);
+        assert!(argv.iter().any(|a| a == "--lib"), "argv: {argv:?}");
+        assert!(argv.iter().any(|a| a == "--bins"), "argv: {argv:?}");
+    }
+
+    #[test]
+    fn workspace_opt_in_ignores_the_lib_target_flag_entirely() {
+        // BUILD_GATE_TESTS=workspace replaces --lib/--bins wholesale, so the
+        // has_lib_target answer must not leak into that path either way.
+        let _env = ScopedEnv::new().set("BUILD_GATE_TESTS", "workspace");
+        for has_lib in [true, false] {
+            let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", has_lib);
+            assert!(argv.iter().any(|a| a == "--workspace"), "argv: {argv:?}");
+            assert!(!argv.iter().any(|a| a == "--lib"), "argv: {argv:?}");
+            assert!(!argv.iter().any(|a| a == "--bins"), "argv: {argv:?}");
+        }
+    }
+
+    /// A throwaway crate dir for the [`crate_has_lib_target`] probe tests.
+    struct ProbeDir(std::path::PathBuf);
+    impl ProbeDir {
+        fn new(tag: &str, manifest: &str) -> Self {
+            let mut p = std::env::temp_dir();
+            p.push(format!("term544-{}-{}", tag, std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(p.join("src")).expect("mkdir");
+            std::fs::write(p.join("Cargo.toml"), manifest).expect("write manifest");
+            Self(p)
+        }
+        fn with_lib_rs(self) -> Self {
+            std::fs::write(self.0.join("src").join("lib.rs"), "// lib").expect("write lib.rs");
+            self
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for ProbeDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn probe_says_no_lib_for_a_bin_only_package() {
+        let d = ProbeDir::new("binonly", "[package]\nname = \"muse\"\n\n[[bin]]\nname = \"muse\"\n");
+        assert!(!crate_has_lib_target(d.path()));
+    }
+
+    #[test]
+    fn probe_says_lib_when_src_lib_rs_exists() {
+        let d = ProbeDir::new("librs", "[package]\nname = \"t\"\n").with_lib_rs();
+        assert!(crate_has_lib_target(d.path()));
+    }
+
+    #[test]
+    fn probe_says_lib_for_an_explicit_lib_section() {
+        let d = ProbeDir::new("libsec", "[package]\nname = \"t\"\n\n[lib]\npath = \"src/other.rs\"\n");
+        assert!(crate_has_lib_target(d.path()));
+    }
+
+    #[test]
+    fn probe_is_conservative_for_a_workspace_and_for_an_unreadable_manifest() {
+        // A workspace may have members carrying libs — keep the old behaviour
+        // rather than reasoning about members here.
+        let ws = ProbeDir::new("ws", "[workspace]\nmembers = [\"a\"]\n");
+        assert!(crate_has_lib_target(ws.path()));
+
+        // And an absent/unreadable manifest must never NARROW the gate.
+        let missing = std::env::temp_dir().join("term544-definitely-absent");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(crate_has_lib_target(&missing));
+    }
+
     #[test]
     fn cargo_test_argv_release_musl() {
         let argv = cargo_test_argv(
@@ -4979,6 +5159,7 @@ mod tests {
             "x86_64-unknown-linux-musl",
             4,
             "/src/chord/Cargo.toml",
+            true,
         );
         let j = argv.join(" ");
         assert!(j.starts_with("cargo test --locked --release"));
@@ -4993,7 +5174,7 @@ mod tests {
 
     #[test]
     fn cargo_test_argv_debug_has_no_release_flag() {
-        let argv = cargo_test_argv("debug", "t", 8, "/s/Cargo.toml");
+        let argv = cargo_test_argv("debug", "t", 8, "/s/Cargo.toml", true);
         assert!(!argv.iter().any(|a| a == "--release"));
         assert!(argv.windows(2).any(|w| w[0] == "-j" && w[1] == "8"));
         assert!(argv
@@ -5003,7 +5184,7 @@ mod tests {
 
     #[test]
     fn cargo_test_argv_named_profile() {
-        let argv = cargo_test_argv("release-dist", "t", 2, "/s/Cargo.toml");
+        let argv = cargo_test_argv("release-dist", "t", 2, "/s/Cargo.toml", true);
         assert!(argv
             .windows(2)
             .any(|w| w[0] == "--profile" && w[1] == "release-dist"));
@@ -5016,7 +5197,7 @@ mod tests {
         let _env = ScopedEnv::new()
             .unset("BUILD_GATE_TESTS")
             .unset("BUILD_GATE_TEST_THREADS");
-        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true);
         assert!(argv.iter().any(|a| a == "--lib"), "argv: {argv:?}");
         assert!(argv.iter().any(|a| a == "--bins"), "argv: {argv:?}");
         assert!(
@@ -5035,7 +5216,7 @@ mod tests {
     #[test]
     fn cargo_test_argv_build_gate_tests_workspace_opts_in() {
         let _env = ScopedEnv::new().set("BUILD_GATE_TESTS", "workspace");
-        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true);
         assert!(argv.iter().any(|a| a == "--workspace"), "argv: {argv:?}");
         assert!(
             !argv.iter().any(|a| a == "--lib"),
@@ -5050,7 +5231,7 @@ mod tests {
     #[test]
     fn cargo_test_argv_test_threads_env_override() {
         let _env = ScopedEnv::new().set("BUILD_GATE_TEST_THREADS", "4");
-        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true);
         assert!(
             argv.iter().any(|a| a == "--test-threads=4"),
             "argv: {argv:?}"
@@ -5062,13 +5243,13 @@ mod tests {
     fn cargo_test_argv_test_threads_zero_or_garbage_falls_back_to_default() {
         let argv_zero = {
             let _env = ScopedEnv::new().set("BUILD_GATE_TEST_THREADS", "0");
-            cargo_test_argv("release", "t", 4, "/s/Cargo.toml")
+            cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true)
         };
         assert!(argv_zero.iter().any(|a| a == "--test-threads=8"));
 
         let argv_garbage = {
             let _env = ScopedEnv::new().set("BUILD_GATE_TEST_THREADS", "not-a-number");
-            cargo_test_argv("release", "t", 4, "/s/Cargo.toml")
+            cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true)
         };
         assert!(argv_garbage.iter().any(|a| a == "--test-threads=8"));
     }
@@ -5153,7 +5334,7 @@ mod tests {
         // The load-bearing distinction between mode=test and mode=build: the
         // subcommand itself differs, everything else (locked/profile/target/-j/
         // manifest-path) stays parallel.
-        let test_argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        let test_argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true);
         let build_argv = cargo_build_argv("release", "t", 4, "m", "/s/Cargo.toml");
         assert_eq!(test_argv[0], "cargo");
         assert_eq!(test_argv[1], "test");
@@ -5252,7 +5433,7 @@ mod tests {
         let lockgen_scope =
             crate::compiler::scope::render_scope_argv(&lockgen_unit, &caps, &setenv, &lockgen_argv);
 
-        let test_argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        let test_argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml", true);
         let test_scope = crate::compiler::scope::render_scope_argv(&unit, &caps, &setenv, &test_argv);
 
         // Both are systemd-run scopes on DISTINCT unit names (never collide).
