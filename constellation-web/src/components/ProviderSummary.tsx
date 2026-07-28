@@ -30,9 +30,9 @@ export function ProviderSummary() {
     .reduce((sum, p) => sum + (p.cost?.used_usd ?? 0), 0);
 
   const statusDot = (status: string) => {
-    if (status === 'healthy') return 'var(--h-green)';
-    if (status === 'unknown') return 'var(--h-yellow)';
-    return 'var(--h-red)';
+    if (status === 'healthy') return 'var(--flux-green)';
+    if (status === 'unknown') return 'var(--flux-amber)';
+    return 'var(--flux-rose)';
   };
 
   const badgeParts: string[] = [];
@@ -65,9 +65,9 @@ export function ProviderSummary() {
               backgroundColor: statusDot(p.status),
               flexShrink: 0,
             }} />
-            <span style={{ flex: 1, fontSize: 13, color: 'var(--h-text)' }}>{p.display_name ?? p.name}</span>
+            <span style={{ flex: 1, fontSize: 13, color: 'var(--text-100)' }}>{p.display_name ?? p.name}</span>
             {(p.active_tasks ?? 0) > 0 && (
-              <span style={{ fontSize: 11, color: 'var(--h-text-muted)' }}>
+              <span style={{ fontSize: 11, color: 'var(--text-300)' }}>
                 {p.active_tasks} active
               </span>
             )}
@@ -76,10 +76,10 @@ export function ProviderSummary() {
       </div>
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
-        <span style={{ fontSize: 12, color: 'var(--h-text-muted)' }}>
+        <span style={{ fontSize: 12, color: 'var(--text-300)' }}>
           Cost today: ${costToday.toFixed(2)}
         </span>
-        <span style={{ fontSize: 12, color: 'var(--h-accent)' }}>→ Manage</span>
+        <span style={{ fontSize: 12, color: 'var(--accent)' }}>→ Manage</span>
       </div>
     </div>
   );

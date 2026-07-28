@@ -3452,6 +3452,25 @@ mod tests {
     use httpmock::prelude::*;
     use serial_test::serial;
 
+    /// Remove every ambient `PLANE_PAT_<NAME>` var from this process's
+    /// environment, whatever its name. `scan_named_identities` (used by
+    /// `PlaneClient::from_env`) picks up ANY var matching the prefix, so a
+    /// test asserting "no named identities configured" is only hermetic if
+    /// it clears the whole prefix — not just the handful of names other
+    /// tests in this module happen to use. Reproduced locally: exporting an
+    /// arbitrary `PLANE_PAT_AXON` before running
+    /// `test_from_env_backward_compat_only_default_key_acts_as_default`
+    /// alone broke it, matching how this test failed in the compiler
+    /// test-gate (whose environment carries real `PLANE_PAT_*` secrets).
+    fn clear_all_plane_pat_vars() {
+        let leaked: Vec<String> = std::env::vars()
+            .filter_map(|(k, _)| k.starts_with(PLANE_IDENTITY_PREFIX).then_some(k))
+            .collect();
+        for k in leaked {
+            std::env::remove_var(k);
+        }
+    }
+
     /// Build a PlaneClient pointing at the given mock server URL. Uses a
     /// zero-interval rate limiter so functional tests aren't slowed down by
     /// pacing — dedicated rate-limiting tests build their own `RateLimiter`
@@ -5089,9 +5108,11 @@ mod tests {
         std::env::set_var("PLANE_WORKSPACE", "testws");
         std::env::set_var("PLANE_API_KEY", "only-default-token");
         std::env::remove_var("PLANE_IDENTITY_NAME");
-        std::env::remove_var("PLANE_PAT_LUMINA");
-        std::env::remove_var("PLANE_PAT_CLAUDE");
-        std::env::remove_var("PLANE_PAT_SEER");
+        // Clear every ambient PLANE_PAT_<NAME>, not just the three this
+        // module happens to use elsewhere — an unrelated one (e.g. a real
+        // secret materialized in the test-gate's environment) would still
+        // make `identity_names()` non-empty and fail this assertion.
+        clear_all_plane_pat_vars();
 
         let client = Arc::new(PlaneClient::from_env());
         assert_eq!(client.identity_name(), None, "no named default without PLANE_IDENTITY_NAME");

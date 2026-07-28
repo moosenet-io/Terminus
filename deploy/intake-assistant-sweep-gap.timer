@@ -1,0 +1,27 @@
+[Unit]
+# TERM-c590e045 — off-peak driver for the GAP-ONLY assistant profiling sweep.
+# Fills the ~69-model coverage gap (models with a BUILDER profile but no
+# ASSISTANT profile, incl. gpt-oss:20b/120b) a few models per night, bounded, so
+# the fleet's assistant coverage advances without ever re-measuring the whole
+# GPU-heavy fleet. This timer only SCHEDULES; the paired .service does the
+# idle-gate + sweep. See intake-assistant-sweep-gap-idle-gate.sh.
+#
+# DESIGN ARTIFACT — version-controlled for review/audit. The orchestrator
+# installs + enables this as an OPS action; it is NOT auto-installed by any
+# build step and must NOT be enabled from a dev box.
+Description=Nightly off-peak gap-only assistant profiling sweep (TERM-c590e045)
+
+[Timer]
+# 02:17 local — deep off-peak, and a deliberately NON-:00 minute so this never
+# lands on the same tick as the many *:00 / *:00/30 timers on the host
+# (e.g. terminus-mirror-runner's :00/30 slot). RandomizedDelaySec spreads the
+# actual start across a ~23-minute window so even a fleet of hosts sharing this
+# unit don't all POST /admin/idle to their Chord at the same instant.
+OnCalendar=*-*-* 02:17:00
+RandomizedDelaySec=1380
+# Catch up a missed window (host asleep/off at 02:17) on the next boot, so a
+# powered-down night doesn't silently skip a whole day of gap coverage.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

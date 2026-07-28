@@ -1,187 +1,149 @@
-// CONST-24: the viz kit's @nivo/boxplot wrapper — no panel may import @nivo/boxplot directly
-// (§4.1/§9). §7.2 C3 encoding: horizontal boxes per model, single hue `--series-1` (models are
-// nominal here, row label carries identity — not a categorical series comparison), thin boxes,
-// 2px ink median, 1px whiskers, outlier dots >=8px with surface rings; log-scale x toggle
-// default ON; n<5 groups render as a beeswarm strip instead of a box (rendered by this same
-// component, not ScatterChart/SwarmPlotChart, since it needs to share the box chart's x-scale).
+// CGUI-10 (TERM #533): bespoke box-and-whisker distribution chart, hand-drawn in SVG.
 //
-// EXACT-QUANTILE TRICK: our data contract (§8 `/mint/box`) gives SERVER-COMPUTED quartiles
-// {min,q1,median,q3,max}, not raw per-run values — but @nivo/boxplot only knows how to derive
-// quartiles itself from a raw `data: RawDatum[]` array (it has no "I already know the
-// quantiles" mode). Feeding it a synthetic 5-element array [min,q1,median,q3,max] per group
-// reproduces our exact server quartiles: for n=5 raw values, d3's quantile interpolation at
-// fractions [0, .25, .5, .75, 1] lands on EXACT array indices (0, 1, 2, 3, 4) with zero
-// interpolation error. This is deliberate, not a hack-of-convenience — it's the only way to
-// honor server-side quartiles through nivo's box-plot statistics engine without recomputing
-// quantiles ourselves (which would silently diverge from whatever quantile method the backend
-// uses). Real outliers (and the true `n`) are carried in our OWN data (`MintBoxGroup`) and
-// rendered by a custom SVG layer positioned via the same `xScale`/`yScale` nivo exposes to
-// custom layers — nivo's synthetic n=5/box is never shown to the user directly (all tooltips
-// and the table view read from the real `MintBoxGroup`).
-import { useMemo } from 'react';
-import { ResponsiveBoxPlot } from '@nivo/boxplot';
-import type { BoxPlotCustomLayerProps, BoxPlotDatum } from '@nivo/boxplot';
-import { getVizTheme } from './theme';
+// Why not @nivo/boxplot: nivo's boxplot recomputes quantiles from RAW sample points, but the
+// MINT box endpoints (`mint.box` / `mint.category/*/box`) return a PRE-COMPUTED 5-number
+// summary (min/q1/median/q3/max) plus explicit outliers. Synthesizing fake raw samples to feed
+// nivo would misrepresent the data; a direct summary renderer is both honest and fully
+// brand-controllable. Horizontal layout: one row per model, shared value axis, median tick,
+// IQR box, whiskers to min/max, outlier dots. Colors are stable categorical slots (color
+// follows the model, not its rank, §4.2). Tokens only; SVG coords are unitless numbers.
+import { useLayoutEffect, useRef, useState } from 'react';
 import { CATEGORICAL_HEX, CHART_CHROME } from './palette';
-import { ChartTooltip } from './ChartTooltip';
-import type { ChartTooltipRow } from './ChartTooltip';
-import type { MintBoxGroup } from '../lib/aggregationClient';
+import type { BoxVM, BoxGroupVM } from '../panels/mint/transforms';
 
-export interface BoxPlotChartProps {
-  groups: MintBoxGroup[];
+interface BoxPlotChartProps {
+  vm: BoxVM;
+  /** Formats an axis / tooltip value in the metric's native units. */
+  formatValue: (v: number) => string;
   height: number;
-  /** §7.2: log-scale x toggle, default ON. */
-  logScale: boolean;
-  onOutlierClick?: (outlier: MintBoxGroup['outliers'][number], model: string) => void;
 }
 
-const SINGLE_HUE = CATEGORICAL_HEX[0]; // --series-1, per §7.2 ("single hue")
-const LOW_N_THRESHOLD = 5;
+/** Tracks the rendered width of a wrapper so the SVG can lay out to real pixels (a viewBox
+ *  scale would distort text). Falls back to 600 before the first measure. */
+function useElementWidth() {
+  const ref = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(600);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const ro = new ResizeObserver(entries => {
+      const w = entries[0]?.contentRect.width;
+      if (w && w > 0) setWidth(w);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return { ref, width } as const;
+}
 
-/** Synthetic 5-point dataset that makes nivo's own quantile computation reproduce our exact
- *  server quartiles (see file header). `group` doubles as the row label (§7.2: model identity). */
-function toBoxPlotData(groups: MintBoxGroup[]): BoxPlotDatum[] {
-  const out: BoxPlotDatum[] = [];
+const ROW_H = 34;
+const LABEL_W = 132;
+const PAD_R = 20;
+const AXIS_H = 22;
+const BOX_H = 16;
+
+export function BoxPlotChart({ vm, formatValue, height }: BoxPlotChartProps) {
+  const { ref, width } = useElementWidth();
+  const groups = vm.groups;
+
+  const domain = computeDomain(groups);
+  const plotLeft = LABEL_W;
+  const plotRight = Math.max(width - PAD_R, plotLeft + 40);
+  const plotW = plotRight - plotLeft;
+  const scale = (v: number) => {
+    if (domain.max === domain.min) return plotLeft + plotW / 2;
+    return plotLeft + ((v - domain.min) / (domain.max - domain.min)) * plotW;
+  };
+
+  const chartH = groups.length * ROW_H + AXIS_H;
+  const ticks = axisTicks(domain.min, domain.max, 4);
+
+  return (
+    <div ref={ref} style={{ width: '100%', height, overflowY: 'auto' }}>
+      <svg width={width} height={Math.max(chartH, height - 4)} role="img" aria-label="Distribution box plot">
+        {/* axis gridlines + tick labels */}
+        {ticks.map(t => {
+          const x = scale(t);
+          return (
+            <g key={`t-${t}`}>
+              <line x1={x} y1={AXIS_H} x2={x} y2={chartH} stroke="var(--chart-grid)" strokeWidth={1} />
+              <text x={x} y={14} textAnchor="middle" fontSize={11} fill="var(--text-muted)" fontFamily="var(--font-mono)">
+                {formatValue(t)}
+              </text>
+            </g>
+          );
+        })}
+
+        {groups.map((g, i) => {
+          const cy = AXIS_H + i * ROW_H + ROW_H / 2;
+          const color = i < CATEGORICAL_HEX.length ? CATEGORICAL_HEX[i] : CHART_CHROME.deemphasis;
+          return (
+            <g key={g.model}>
+              {/* model label */}
+              <text x={LABEL_W - 10} y={cy + 4} textAnchor="end" fontSize={11} fill="var(--text-body)" fontFamily="var(--font-mono)">
+                {truncate(g.model, 16)}
+              </text>
+              {/* whisker */}
+              <line x1={scale(g.min)} y1={cy} x2={scale(g.max)} y2={cy} stroke={color} strokeWidth={1.5} opacity={0.7} />
+              <line x1={scale(g.min)} y1={cy - 5} x2={scale(g.min)} y2={cy + 5} stroke={color} strokeWidth={1.5} opacity={0.7} />
+              <line x1={scale(g.max)} y1={cy - 5} x2={scale(g.max)} y2={cy + 5} stroke={color} strokeWidth={1.5} opacity={0.7} />
+              {/* IQR box */}
+              <rect
+                x={scale(g.q1)}
+                y={cy - BOX_H / 2}
+                width={Math.max(scale(g.q3) - scale(g.q1), 1)}
+                height={BOX_H}
+                rx={2}
+                fill={color}
+                fillOpacity={0.22}
+                stroke={color}
+                strokeWidth={1.5}
+              />
+              {/* median */}
+              <line x1={scale(g.median)} y1={cy - BOX_H / 2} x2={scale(g.median)} y2={cy + BOX_H / 2} stroke={color} strokeWidth={2} />
+              {/* outliers */}
+              {g.outliers.map((o, oi) => (
+                <circle key={oi} cx={scale(o)} cy={cy} r={3} fill="var(--flux-rose)" fillOpacity={0.85}>
+                  <title>{`outlier ${formatValue(o)}`}</title>
+                </circle>
+              ))}
+              {g.lowN && (
+                <text x={scale(g.max) + 8} y={cy + 4} fontSize={11} fill="var(--flux-amber)" fontFamily="var(--font-mono)">
+                  {`n=${g.n}`}
+                </text>
+              )}
+              <title>{`${g.model} · median ${formatValue(g.median)} · IQR ${formatValue(g.q1)}–${formatValue(g.q3)} · n=${g.n}`}</title>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+function computeDomain(groups: BoxGroupVM[]): { min: number; max: number } {
+  if (groups.length === 0) return { min: 0, max: 1 };
+  let min = Infinity;
+  let max = -Infinity;
   for (const g of groups) {
-    if (g.n < LOW_N_THRESHOLD) continue; // rendered as a beeswarm strip instead, see below
-    for (const v of [g.min, g.q1, g.median, g.q3, g.max]) {
-      out.push({ group: g.model, value: Math.max(v, 0.001) }); // log-scale needs value > 0
-    }
+    min = Math.min(min, g.min, ...g.outliers);
+    max = Math.max(max, g.max, ...g.outliers);
   }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return { min: 0, max: 1 };
+  if (min === max) return { min: min - 1, max: max + 1 };
+  const pad = (max - min) * 0.05;
+  return { min: min - pad, max: max + pad };
+}
+
+/** ~`count` evenly spaced round-ish tick values across [min,max]. */
+export function axisTicks(min: number, max: number, count: number): number[] {
+  if (min === max) return [min];
+  const step = (max - min) / count;
+  const out: number[] = [];
+  for (let i = 0; i <= count; i++) out.push(Math.round((min + step * i) * 1000) / 1000);
   return out;
 }
 
-/** Custom layer: draws >=8px outlier dots with a surface ring at each outlier's real value,
- *  aligned to nivo's own xScale/yScale for the box rows (so outliers land exactly on their
- *  model's row and true value, log-scale-aware). */
-function OutlierLayer(groups: MintBoxGroup[], onOutlierClick?: BoxPlotChartProps['onOutlierClick']) {
-  return function Layer({ xScale, yScale, boxPlots }: BoxPlotCustomLayerProps<BoxPlotDatum>) {
-    return (
-      <g>
-        {groups.filter(g => g.n >= LOW_N_THRESHOLD).flatMap(g => {
-          const box = boxPlots.find(b => b.group === g.model);
-          if (!box) return [];
-          // Row center for this group, in pixels — horizontal layout puts groups on the y-axis.
-          const rowY = box.y;
-          return g.outliers.map(o => {
-            const x = xScale(Math.max(o.value, 0.001));
-            return (
-              <g key={o.run_id} transform={`translate(${x},${rowY})`} style={{ cursor: onOutlierClick ? 'pointer' : 'default' }} onClick={() => onOutlierClick?.(o, g.model)}>
-                <circle r={5} fill="var(--bg-panel)" stroke={SINGLE_HUE} strokeWidth={2} />
-              </g>
-            );
-          });
-        })}
-      </g>
-    );
-  };
-}
-
-/** n<5 fallback (§7.2): a simple jittered-dot strip per low-n model, sharing the parent's log/
- *  linear x-scale so it visually lines up with the box-plot rows above it. Deliberately NOT the
- *  full SwarmPlotChart (C5) — this is a single-row-per-model strip of raw sample values, not a
- *  per-run judge-score distribution; a lighter, purpose-built renderer keeps it honest. */
-function LowNStrip({ groups, logScale, width }: { groups: MintBoxGroup[]; logScale: boolean; width: number }) {
-  const theme = getVizTheme();
-  const allValues = groups.flatMap(g => g.raw_values ?? []);
-  if (allValues.length === 0 || groups.length === 0) return null;
-  const min = Math.max(0.001, Math.min(...allValues));
-  const max = Math.max(...allValues, min * 1.001);
-
-  const scaleX = (v: number): number => {
-    const value = Math.max(v, 0.001);
-    if (logScale) {
-      const t = (Math.log(value) - Math.log(min)) / (Math.log(max) - Math.log(min) || 1);
-      return t * (width - 40) + 20;
-    }
-    const t = (value - min) / (max - min || 1);
-    return t * (width - 40) + 20;
-  };
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 4 }}>
-      {groups.map(g => (
-        <div key={g.model} style={{ position: 'relative', height: 22, display: 'flex', alignItems: 'center' }} title={`${g.model}: n=${g.n} (< 5 — beeswarm strip, not a box)`}>
-          <span style={{ position: 'absolute', left: 0, fontSize: 10, fontFamily: theme.fontMono, color: theme.textMuted }}>
-            {g.model} <span style={{ color: 'var(--status-warning)' }}>⚠ n={g.n}</span>
-          </span>
-          <svg width={width} height={22} style={{ overflow: 'visible' }}>
-            {(g.raw_values ?? []).map((v, i) => (
-              <circle key={i} cx={scaleX(v)} cy={11} r={5} fill={SINGLE_HUE} fillOpacity={0.85} stroke="var(--bg-panel)" strokeWidth={1.5}>
-                <title>{`${g.model}: ${v}`}</title>
-              </circle>
-            ))}
-          </svg>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-export function BoxPlotChart({ groups, height, logScale, onOutlierClick }: BoxPlotChartProps) {
-  const theme = getVizTheme();
-  // @nivo/boxplot's theme type adds a `translation` bag (i18n strings) on top of the shared
-  // PartialTheme every other nivo chart in this kit accepts as-is — supply an empty one rather
-  // than loosen the shared `VizTheme.nivo` type just for this one consumer.
-  const boxplotTheme = { ...theme.nivo, translation: {} };
-  const highNGroups = useMemo(() => groups.filter(g => g.n >= LOW_N_THRESHOLD), [groups]);
-  const lowNGroups = useMemo(() => groups.filter(g => g.n < LOW_N_THRESHOLD), [groups]);
-  const data = useMemo(() => toBoxPlotData(groups), [groups]);
-  const groupOrder = useMemo(() => highNGroups.map(g => g.model), [highNGroups]);
-  const outlierLayer = useMemo(() => OutlierLayer(groups, onOutlierClick), [groups, onOutlierClick]);
-
-  const boxHeight = lowNGroups.length > 0 ? Math.max(120, height - lowNGroups.length * 26 - 16) : height;
-
-  return (
-    <div style={{ height }}>
-      {highNGroups.length > 0 && (
-        <div style={{ height: boxHeight }}>
-          <ResponsiveBoxPlot
-            data={data}
-            groupBy="group"
-            groups={groupOrder}
-            value="value"
-            layout="horizontal"
-            margin={{ top: 10, right: 30, bottom: 40, left: 140 }}
-            padding={0.55} /* thin ~12px boxes relative to the row band */
-            valueScale={logScale ? { type: 'log', base: 10 } : { type: 'linear' }}
-            colors={SINGLE_HUE}
-            borderWidth={1}
-            borderColor={SINGLE_HUE}
-            medianWidth={2}
-            medianColor="var(--text-100)"
-            whiskerWidth={1}
-            whiskerColor={SINGLE_HUE}
-            whiskerEndSize={0.4}
-            axisBottom={{ legend: logScale ? 'total_time_ms (log)' : 'total_time_ms', legendPosition: 'middle', legendOffset: 34 }}
-            theme={boxplotTheme}
-            animate={false}
-            layers={['grid', 'axes', 'boxPlots', outlierLayer, 'markers']}
-            tooltip={({ formatted, label }) => {
-              const g = groups.find(x => x.model === label);
-              const rows: ChartTooltipRow[] = g
-                ? [
-                    { key: 'min', label: 'min', value: String(g.min) },
-                    { key: 'q1', label: 'q1', value: String(g.q1) },
-                    { key: 'median', label: 'median', value: String(g.median) },
-                    { key: 'q3', label: 'q3', value: String(g.q3) },
-                    { key: 'max', label: 'max', value: String(g.max) },
-                    { key: 'n', label: 'n', value: String(g.n) },
-                  ]
-                : [{ key: 'v', label: 'value', value: String(formatted.quantiles) }];
-              return <ChartTooltip title={String(label)} rows={rows} />;
-            }}
-          />
-        </div>
-      )}
-      {lowNGroups.length > 0 && (
-        <LowNStrip groups={lowNGroups} logScale={logScale} width={520} />
-      )}
-      {groups.length === 0 && (
-        <div style={{ height, display: 'flex', alignItems: 'center', justifyContent: 'center', color: CHART_CHROME.deemphasis }}>
-          no groups
-        </div>
-      )}
-    </div>
-  );
+function truncate(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }

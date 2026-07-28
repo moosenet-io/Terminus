@@ -1,133 +1,123 @@
-// CONST-23: the viz kit's @nivo/radar wrapper — no panel may import @nivo/radar directly
-// (§4.1/§9). Brand theme via getVizTheme(); series colors are caller-supplied (SlotAssigner
-// output) rather than nivo's own ordinal scale, so color stays stable across filtering (§4.2).
+// LGUI-09: the viz kit's radar chart-form wrapper (§4.2's "all-pairs" family — radar/boxplot/
+// heatmap/parallel-coordinates/swarmplot/scatterplot). CONST-17 shipped only the nivo
+// foundation for these, deferring the actual wrapper components to "the routes that use them"
+// (README, "The viz kit" section) — this item is the first Recharts-based radar consumer
+// (§3.4/§8's trait radar), and no radar wrapper existed on `main` yet at build time, so this
+// adds one per the kit's own conventions: panels never touch `recharts`/`@nivo/*` directly,
+// only `src/viz/*`.
 //
-// §7.2 C1 encoding: 2px lines, ~10% fills, vertices >=8px with a surface ring, fleet median
-// wears --chart-deemphasis (not a categorical slot — it's the one non-nominal series here).
-// Missing dimensions (a model profiled on fewer than `dimensions.length` axes) render at 0 with
-// a hollow vertex + a caveat (surfaced via `hollowKeys` below).
+// Scope: ONE primary series + ONE de-emphasis reference series (§8: "trait radar = slot 1 vs
+// de-emphasis overlay") — not a general N-series radar. A future item building a genuinely
+// multi-series radar (e.g. MINT's 8-dimension capability radar, CONST-22/23) should extend
+// this file's props rather than duplicating it, but should keep the all-pairs 4-axis cap
+// (`ALL_PAIRS_CEILING`, `src/viz/palette.ts`) in mind if it grows past 4 axes.
 //
-// Vertex tooltip (§7.2: "value, raw, ±std_dev, n, ⚠"): nivo's radar tooltip primitive is a
-// per-AXIS slice tooltip (all series' values at one dimension) rather than a true per-point
-// hover — that IS the vertex-tooltip granularity this chart needs (a "vertex" here is one
-// series' point on one axis; hovering the axis surfaces every series' vertex at once, which is
-// strictly more informative, not less).
-import { ResponsiveRadar } from '@nivo/radar';
-import type { PointData } from '@nivo/radar';
-import { getVizTheme } from './theme';
-import { ChartTooltip } from './ChartTooltip';
-import type { ChartTooltipRow } from './ChartTooltip';
+// RECONCILIATION NOTE (LGUI-06/CONST-22/23/24 reconciliation): this file also independently
+// grew a SECOND, differently-named radar (`RadarChart`, CGUI-09/TERM #532) for the Models
+// module's per-model detail view — a lazy-loaded `@nivo/radar` wrapper, code-split so the
+// shell/roster never pay for the chunk. `RadarChartKit` (this item, Recharts, single+
+// de-emphasis series, used by PersonaPanel) and `RadarChart` (nivo, N-axis, lazy, used by
+// ModelDetailView) are DIFFERENT components with DIFFERENT exported names and DIFFERENT
+// consumers — there is no actual naming collision, so both coexist in this one viz-kit file
+// rather than one replacing the other.
+import {
+  RechartsRadarChart,
+  PolarGrid,
+  PolarAngleAxis,
+  PolarRadiusAxis,
+  Radar,
+  Tooltip,
+  ResponsiveContainer,
+} from './recharts';
+import { CATEGORICAL_HEX, CHART_CHROME } from './palette';
+import { rechartsTickStyle, rechartsTooltipStyle } from './theme';
+import { Suspense, lazy } from 'react';
+import { ChartSkeleton } from './ChartSkeleton';
+import type { RadarAxis } from '../panels/models/modelsData';
 
-export interface RadarSeries {
-  id: string;
-  label: string;
-  color: string;
-  /** true for the fleet-median reference series (deemphasis chrome, not a categorical slot). */
-  isReference?: boolean;
+export interface RadarAxisPoint {
+  /** Axis label, e.g. a trait name ("flair"). Rendered verbatim as the angle-axis tick — the
+   *  chart never trusts this for anything except display (textContent-only per the kit's
+   *  tooltip-label rule, ChartTooltip.tsx's doc). */
+  axis: string;
+  /** Primary series value, 0..1 (already clamped by the caller — this component does not
+   *  re-clamp, so an out-of-domain value is a caller bug, not a chart concern). */
+  value: number;
+  /** De-emphasis reference value for the same axis (e.g. a fleet default) — 0..1. Omit the
+   *  whole reference series (pass `deemphasisLabel={undefined}`, see below) if there is no
+   *  meaningful reference to overlay; a per-axis `undefined` is NOT supported (all-or-nothing,
+   *  keeps the two series' vertex counts equal, which Recharts' radar requires anyway). */
+  deemphasis?: number;
 }
 
-export interface RadarDatum {
-  dimension: string;
-  /** One key per series id -> normalized 0..1 value (0 when synthesized for a missing axis). */
-  [seriesId: string]: number | string;
-}
-
-export interface RadarVertexMeta {
-  raw: number;
-  std_dev: number;
-  n: number;
-  low_confidence: boolean;
-  /** True when this axis was never profiled for this model (value is a synthesized 0). */
-  missing?: boolean;
-}
-
-interface RadarChartProps {
-  data: RadarDatum[];
-  series: RadarSeries[];
+interface RadarChartKitProps {
+  data: RadarAxisPoint[];
+  /** Domain max for the radius axis — e.g. 1 for a 0..1 trait scale. Domain min is always 0. */
+  max: number;
   height: number;
-  /** Per-vertex metadata for the tooltip, keyed `${dimension}::${seriesId}`. */
-  meta: Map<string, RadarVertexMeta>;
-  onAxisClick?: (dimension: string) => void;
+  primaryLabel: string;
+  /** Renders the de-emphasis series + its own tooltip row when set; omit entirely to render
+   *  only the primary series (e.g. no fleet-default reference available yet). */
+  deemphasisLabel?: string;
 }
 
-/** §7.2: a model with fewer than the full 8 dimensions renders the missing axes with a
- *  HOLLOW vertex (surface-fill ring, series-colored stroke only) instead of a filled dot. */
-function HollowAwareDot(meta: Map<string, RadarVertexMeta>) {
-  return function Dot({ datum, size, color }: { datum: PointData; size: number; color: string; borderWidth: number; borderColor: string }) {
-    const isMissing = meta.get(`${datum.index}::${datum.key}`)?.missing === true;
-    const r = Math.max(4, size / 2);
-    // §7.2: vertices >=8px with a surface ring (filled) — missing axes render hollow
-    // (surface fill, series-colored stroke only) instead.
-    return (
-      <circle
-        r={r}
-        fill={isMissing ? 'var(--bg-panel)' : color}
-        stroke={isMissing ? color : 'var(--bg-panel)'}
-        strokeWidth={2}
-      />
-    );
-  };
-}
-
-export function RadarChart({ data, series, height, meta, onAxisClick }: RadarChartProps) {
-  const theme = getVizTheme();
-  // nivo's radar `colors` config is keyed by { key, index } (key === our series id).
-  const colorFor = (d: { key: string }) => series.find(s => s.id === d.key)?.color ?? 'var(--chart-deemphasis)';
-  const hasMissing = [...meta.values()].some(m => m.missing);
-  const dotSymbol = HollowAwareDot(meta);
-
+/** One series (§4.2's violet-400 slot 1) + an optional de-emphasis reference series
+ *  (`--chart-deemphasis`/`CHART_CHROME.deemphasis`) — the exact pairing §8 specs for the
+ *  trait radar. Vertex tooltips come from Recharts' own `Tooltip` (shared kit chrome via
+ *  `rechartsTooltipStyle()`), not a custom hover layer. Callers own the `ChartCard` wrapper
+ *  (loading/empty/degraded/table-twin) — this component is chart body only, matching every
+ *  other form in this barrel (Line/Area/Scatter, etc. also render bare inside `ChartCard`).
+ */
+export function RadarChartKit({ data, max, height, primaryLabel, deemphasisLabel }: RadarChartKitProps) {
+  const tick = rechartsTickStyle();
   return (
-    <div style={{ height }}>
-      <ResponsiveRadar
-        data={data}
-        keys={series.map(s => s.id)}
-        indexBy="dimension"
-        maxValue={1}
-        margin={{ top: 46, right: 70, bottom: 34, left: 70 }}
-        gridLevels={4}
-        gridShape="circular"
-        gridLabelOffset={16}
-        dotSize={9}
-        dotBorderWidth={2}
-        dotBorderColor={{ from: 'color' }}
-        dotSymbol={dotSymbol}
-        enableDotLabel={false}
-        colors={colorFor}
-        fillOpacity={0.1}
-        borderWidth={2}
-        borderColor={{ from: 'color' }}
-        blendMode="normal"
-        theme={theme.nivo}
-        motionConfig="gentle"
-        onClick={(datum: unknown) => {
-          const idx = (datum as { index?: string }).index;
-          if (idx && onAxisClick) onAxisClick(idx);
-        }}
-        sliceTooltip={({ index, data: sliceData }) => {
-          const rows: ChartTooltipRow[] = sliceData.map(d => {
-            const s = series.find(x => x.id === d.id);
-            const m = meta.get(`${index}::${d.id}`);
-            const parts = [d.formattedValue];
-            if (m) {
-              parts.push(`raw ${m.raw.toFixed(2)}`, `±${m.std_dev.toFixed(2)}`, `n=${m.n}`);
-              if (m.low_confidence) parts.push('⚠ low n');
-              if (m.missing) parts.push('⚠ not profiled');
-            }
-            return {
-              key: d.id,
-              label: s?.label ?? d.id,
-              value: parts.join(' · '),
-              color: d.color,
-            };
-          });
-          return <ChartTooltip title={String(index)} rows={rows} />;
-        }}
-      />
-      {hasMissing && (
-        <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-faint)', marginTop: -8, textAlign: 'center' }}>
-          ⚠ hollow vertex = dimension not yet profiled for that model (rendered at 0)
-        </div>
-      )}
-    </div>
+    <ResponsiveContainer width="100%" height={height}>
+      <RechartsRadarChart data={data} outerRadius="70%">
+        <PolarGrid stroke={CHART_CHROME.grid} />
+        <PolarAngleAxis dataKey="axis" tick={tick} />
+        <PolarRadiusAxis angle={90} domain={[0, max]} tick={tick} axisLine={false} />
+        {deemphasisLabel && (
+          <Radar
+            name={deemphasisLabel}
+            dataKey="deemphasis"
+            stroke={CHART_CHROME.deemphasis}
+            fill={CHART_CHROME.deemphasis}
+            fillOpacity={0.12}
+            strokeDasharray="4 3"
+            isAnimationActive={false}
+          />
+        )}
+        <Radar
+          name={primaryLabel}
+          dataKey="value"
+          stroke={CATEGORICAL_HEX[0]}
+          fill={CATEGORICAL_HEX[0]}
+          fillOpacity={0.28}
+          isAnimationActive={false}
+        />
+        <Tooltip contentStyle={rechartsTooltipStyle()} />
+      </RechartsRadarChart>
+    </ResponsiveContainer>
+  );
+}
+
+// CGUI-09 (TERM #532): lazy boundary for the nivo radar. `RadarChartImpl` (and through it
+// `@nivo/radar` + `@nivo/core`) is code-split into the reserved `viz` chunk and only fetched
+// when a per-model detail actually renders a radar — the shell/roster never pay for it.
+// A ChartSkeleton fills the frame while the chunk loads, so the fixed-height ChartCard body
+// never collapses.
+const RadarChartImpl = lazy(() => import('./RadarChartImpl'));
+
+export interface RadarChartProps {
+  axes: RadarAxis[];
+  /** matches the enclosing ChartCard body height so the skeleton is the same size. */
+  height: number;
+}
+
+export function RadarChart({ axes, height }: RadarChartProps) {
+  return (
+    <Suspense fallback={<ChartSkeleton height={height} />}>
+      <RadarChartImpl axes={axes} />
+    </Suspense>
   );
 }

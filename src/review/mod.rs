@@ -42,7 +42,18 @@ pub(crate) mod capacity;
 // table a second time -- one source of truth for "which providers go
 // through the daemon vs. OpenRouter", not two.
 pub(crate) mod dispatch;
+// REVX-03..07,14: the dynamic per-provider review effort policy. `pub(crate)`
+// (not private) since `mod.rs::execute()` (this module) computes it once per
+// run and the review_daemon binary's tests reference `ALLOWED_CODEX_MODELS`
+// for its own closed-allowlist invariant -- one source of truth for the
+// tier/native-mapping tables, not two.
+pub(crate) mod effort_policy;
 pub(crate) mod free_pool;
+// REVX-09/10/11: the paid, pooled OpenRouter provider (curated model set,
+// round-robin + 429 cooldown, and the runtime ON/OFF toggle). `pub(crate)`
+// like `free_pool` -- `dispatch.rs`'s `dispatch_paid_pool` and the
+// `review_paid_pool_toggle` tool (this module, further down) both need it.
+pub(crate) mod paid_pool;
 // `pub(crate)` (was module-private): CXEG-02's `cortex_scope`
 // (`crate::cortex::scope`) reuses `derive_changed_files` directly so it and
 // `review_run`'s KGREV-01 grounding agree on which files a `diff`/
@@ -80,6 +91,12 @@ use crate::tool::{RustTool, ToolOutput};
 
 pub use aggregate::{aggregate, Finding, ProviderResult};
 pub use dispatch::ReviewConfig;
+// REVX-13: `claude-fable-5` is a REVIEW/capstone-only provider -- this
+// codebase's review tool never scaffolds, so the enforceable guard here is
+// this documented, greppable assertion helper (any future Terminus surface
+// that DOES dispatch implementer work can assert against it); the
+// authoritative enforcement is the build-pipeline/skill rule (REVX-15).
+pub use effort_policy::is_review_only_provider;
 pub use prompt::{build_docs_prompt, build_prompt, parse_findings, parse_verdict, Role, Structure};
 // CXEG-10: the calibration harness needs to name the CXEG-07 lens's result
 // types to read back what it would have flagged. Re-exported rather than
@@ -87,8 +104,14 @@ pub use prompt::{build_docs_prompt, build_prompt, parse_findings, parse_verdict,
 // above.
 pub use consistency::{ConsistencyFinding, ConsistencyRun};
 
-const ALLOWED_PROVIDERS: &[&str] =
-    &["opus", "codex", "agy", "nemotron", "qwen_coder", "free", "claude-fable-5", "gpt56", "diffusion"];
+// REVX-09: `paid` -- the pooled, curated PAID OpenRouter provider (Kimi K2/
+// K2-thinking, DeepSeek V3.2, GLM-5/4.6, Gemini 2.5 Pro) -- added to the
+// allowlist alongside the sub/free lenses; gated behind the REVX-11 runtime
+// toggle (default OFF) and the existing paid-model credit floor, not the
+// routine default gate.
+const ALLOWED_PROVIDERS: &[&str] = &[
+    "opus", "codex", "agy", "nemotron", "qwen_coder", "free", "claude-fable-5", "gpt56", "diffusion", "paid",
+];
 /// Routine review panel cap (per one `review_run` call).
 const MAX_PROVIDERS: usize = 5;
 /// The Epic capstone runs the widest possible panel once per build, so it may
@@ -795,11 +818,20 @@ fn is_intensive_substitute(provider: &str, now: std::time::SystemTime) -> bool {
 /// `consistency::maybe_run` (the Tier-C lens's dedicated pinned-provider
 /// dispatch) both call this rather than each re-deriving which transport a
 /// provider name maps to.
+///
+/// `effort_tier` (REVX-10): the effort-policy tier for the OpenRouter-routed
+/// arms (`paid`, and the existing `gpt56`/`nemotron`/`qwen_coder` fixed-model
+/// arm) -- threaded into [`dispatch::reasoning_for`] so those dispatches
+/// carry a policy-driven `reasoning` object. `None` (every pre-REVX-10 call
+/// site, and the policy-disabled path) omits `reasoning` entirely,
+/// reproducing the prior request body byte-for-byte. Daemon providers ignore
+/// this -- their effort is already carried by `daemon_opts.reasoning_effort`.
 async fn dispatch_provider_raw(
     cfg: &ReviewConfig,
     provider: &str,
     prompt_text: &str,
     daemon_opts: &dispatch::DaemonOpts,
+    effort_tier: Option<effort_policy::EffortTier>,
 ) -> Result<String, String> {
     if dispatch::is_daemon_provider(provider) {
         cfg.dispatch_daemon(provider, prompt_text, daemon_opts).await
@@ -814,12 +846,18 @@ async fn dispatch_provider_raw(
         // ahead of the `openrouter_model_for` check rather than being folded
         // into that table.
         cfg.dispatch_diffusion(prompt_text).await
+    } else if provider == "paid" {
+        // REVX-09/10/11: the pooled, curated PAID OpenRouter provider --
+        // round-robin + 429 failover + the runtime toggle + the credit floor,
+        // all internal to `dispatch_paid_pool`.
+        cfg.dispatch_paid_pool(prompt_text, effort_tier).await
     } else if let Some(model) = dispatch::openrouter_model_for(provider) {
         // Credit guard: refuse a PAID model (e.g. gpt56 = gpt-5.6-luna) when the
         // OpenRouter balance is below the floor, so a paid lens can never bottom
         // out the account. Free models pass through untouched.
         cfg.guard_paid_model(model).await?;
-        cfg.dispatch_openrouter(model, prompt_text).await
+        let reasoning = effort_tier.map(|t| dispatch::reasoning_for(model, t));
+        cfg.dispatch_openrouter(model, prompt_text, reasoning).await
     } else {
         // Unreachable given parse_input's validation for the correctness
         // panel, but fail safe rather than panic if it ever were -- and a
@@ -835,8 +873,9 @@ async fn run_one_provider(
     provider: String,
     prompt_text: String,
     daemon_opts: dispatch::DaemonOpts,
+    effort_tier: Option<effort_policy::EffortTier>,
 ) -> ProviderResult {
-    let raw = dispatch_provider_raw(&cfg, &provider, &prompt_text, &daemon_opts).await;
+    let raw = dispatch_provider_raw(&cfg, &provider, &prompt_text, &daemon_opts, effort_tier).await;
 
     match raw {
         Ok(text) => {
@@ -950,6 +989,26 @@ than failing the whole call."
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let (structure, mut providers, criteria, mut context) = parse_input(&args)?;
 
+        // REVX-11: a disabled `paid` seat is dropped from the EFFECTIVE panel
+        // entirely -- never dispatched (no network call), and never counted
+        // against `panel_unanimous`/`complete` completeness -- unless it was
+        // the ONLY requested provider, in which case that's a clear "no
+        // enabled providers" result rather than a silently empty panel.
+        if providers.iter().any(|p| p == "paid") && !paid_pool::is_enabled() {
+            if providers.iter().all(|p| p == "paid") {
+                return Ok(json!({
+                    "structure": args["structure"],
+                    "providers": [],
+                    "aggregate_verdict": "UNKNOWN",
+                    "complete": false,
+                    "reason": "paid pool is disabled and was the only requested provider -- \
+                               no enabled providers",
+                })
+                .to_string());
+            }
+            providers.retain(|p| p != "paid");
+        }
+
         // KGREV-02: a project with an in-flight incremental KG rebuild (from
         // a just-approved prior review) short-circuits here -- a re-review
         // must never reference a mid-rebuild graph. Dispatches no providers.
@@ -1056,6 +1115,43 @@ than failing the whole call."
             })
             .collect();
 
+        // REVX-03..07,14: compute the dynamic effort policy ONCE per run
+        // (base tier from diff signals + the prior-pass adaptive lever), then
+        // derive a PER-PROVIDER decision inside the dispatch loop below.
+        // `REVIEW_EFFORT_POLICY_ENABLED=0` (the master switch, REVX-06)
+        // short-circuits this to a no-op -- `run_tier`/`risk_class` are never
+        // consulted below and every dispatch keeps today's static behavior
+        // (routine/epic presets, REVCAP-01's fixed `"high"` intensive floor)
+        // byte-for-byte.
+        let effort_cfg = effort_policy::EffortPolicyConfig::from_env();
+        let effort_signals = effort_policy::DiffSignals::from_context(&context, &effort_cfg);
+        let (effort_run_tier, effort_hand_off, mut effort_reasons) = if effort_cfg.enabled {
+            let (base, base_reasons) = effort_policy::base_tier(&effort_signals, &effort_cfg);
+            let history = effort_policy::load_pass_history(&context).await;
+            let (tier, hist_reasons, hand_off) =
+                effort_policy::apply_pass_history(base, &history, &effort_cfg);
+            let mut reasons = base_reasons;
+            reasons.extend(hist_reasons);
+            (tier, hand_off, reasons)
+        } else {
+            (effort_policy::EffortTier::Medium, false, Vec::new())
+        };
+        if effort_policy::content_risk_hint(&context) {
+            effort_reasons.push("content: diff text contains secret-shaped literal(s)".to_string());
+        }
+        let token_budget_set =
+            context.get("token_budget").and_then(Value::as_f64).map(|b| b > 0.0).unwrap_or(false);
+        let caller_effort_override =
+            context.get("effort").and_then(Value::as_str).map(|s| s.to_string());
+        // Per-provider decisions, collected for the run output's `effort`
+        // block (REVX-14) regardless of whether the provider is daemon-backed
+        // (only daemon providers actually get `reasoning_effort`/`model`
+        // applied to their dispatch opts below; OpenRouter-routed providers'
+        // decisions are informational here -- REVX-10 wires their native
+        // `reasoning` object, out of this item's scope).
+        let mut effort_decisions: Vec<(String, effort_policy::EffortDecision)> =
+            Vec::with_capacity(providers.len());
+
         let mut set = tokio::task::JoinSet::new();
         // Tracks each spawned task's tokio::task::Id back to its (index,
         // provider name), so a task panic (JoinError) can still be attributed
@@ -1094,18 +1190,81 @@ than failing the whole call."
             // down (the common case, and every pre-PART-B call site) is
             // completely unaffected: `is_intensive_substitute` is `false` for
             // every provider, so this is a no-op there.
-            let opts = if role == Role::Reviewer && is_intensive_substitute(provider, now) {
+            let is_substitute = role == Role::Reviewer && is_intensive_substitute(provider, now);
+            let intensive_floor = if is_substitute { Some(effort_policy::EffortTier::High) } else { None };
+
+            // REVX-14: the per-provider effort decision -- computed for EVERY
+            // provider (so the run's `effort` block always names a reason for
+            // every seat), but only DAEMON providers (opus/codex/agy/fable)
+            // get it actually applied to their dispatch opts below.
+            let decision = if effort_cfg.enabled || is_substitute {
+                effort_policy::decide(
+                    provider,
+                    effort_run_tier,
+                    effort_signals.risk_class,
+                    token_budget_set,
+                    caller_effort_override.as_deref(),
+                    intensive_floor,
+                    &effort_cfg,
+                )
+            } else {
+                // REVIEW_EFFORT_POLICY_ENABLED=0: DYNAMIC tier/model
+                // SELECTION is off (this decision is a fixed, informational
+                // Medium/None placeholder, never applied to dispatch opts
+                // below). This is NOT the same as reverting REVX-08's codex
+                // model bump: `model: None` here means the daemon's own
+                // `build_command_with_model` falls back to its fixed
+                // `review_daemon/provider.rs::CODEX_MODEL` constant, which IS
+                // the REVX-08-upgraded default (`"gpt-5.6-sol"`) at a fixed
+                // default reasoning effort -- disabling the policy disables
+                // DYNAMIC per-provider tier/model selection, it does not roll
+                // codex back to gpt-5.5. (Contrast with the ENABLED path,
+                // where `codex_model_for_tier` selects sol/terra/luna
+                // dynamically and IS overridable per tier via
+                // `REVIEW_CODEX_MODEL_SOL`/`_TERRA`/`_LUNA`.)
+                effort_policy::EffortDecision {
+                    tier: effort_policy::EffortTier::Medium,
+                    reason: "effort policy disabled (REVIEW_EFFORT_POLICY_ENABLED=0): dynamic selection off, \
+                             codex still runs its fixed GPT-5.6 default effort/model (REVX-08)"
+                        .to_string(),
+                    native: None,
+                    model: None,
+                }
+            };
+
+            let opts = if is_substitute {
                 role = Role::IntensiveReviewer;
-                dispatch::DaemonOpts::intensive()
+                // REVCAP-01 PART B preserved exactly: `decision.tier` is
+                // already floored at `max(policy, High)` by `intensive_floor`
+                // above, so `decision.native` is never below the daemon's own
+                // pre-policy `INTENSIVE_REASONING_EFFORT` -- this generalizes
+                // (never regresses) the old fixed-`"high"` intensive() preset.
+                dispatch::DaemonOpts::intensive_with(decision.native.clone(), decision.model.clone())
+            } else if effort_cfg.enabled && dispatch::is_daemon_provider(provider) {
+                // REVX-16: a daemon provider running at a raised effort tier also
+                // gets a wall-clock backstop scaled to that tier, so a deep
+                // High/Xhigh pass isn't killed at the routine baseline mid-think.
+                daemon_opts
+                    .clone()
+                    .with_effort(decision.native.clone(), decision.model.clone())
+                    .with_backstop_for_tier(decision.tier)
             } else {
                 daemon_opts.clone()
             };
+            // REVX-10: the OpenRouter-tier arms (`paid`/`gpt56`/`nemotron`/
+            // `qwen_coder`) get the SAME decision tier threaded through as a
+            // `reasoning` object -- `None` when the policy is disabled, so
+            // those dispatches stay byte-for-byte unchanged in that case.
+            let effort_tier_for_openrouter = if effort_cfg.enabled { Some(decision.tier) } else { None };
+            effort_decisions.push((provider.clone(), decision));
+
             let prompt_text = build_prompt(role, &criteria, &context);
             let cfg = cfg.clone();
             let provider = provider.clone();
             let provider_for_map = provider.clone();
             let handle = set.spawn(async move {
-                let result = run_one_provider(cfg, provider, prompt_text, opts).await;
+                let result =
+                    run_one_provider(cfg, provider, prompt_text, opts, effort_tier_for_openrouter).await;
                 (idx, result)
             });
             id_to_slot.insert(handle.id(), (idx, provider_for_map));
@@ -1140,6 +1299,18 @@ than failing the whole call."
         let results: Vec<ProviderResult> = indexed.into_iter().map(|(_, r)| r).collect();
 
         let (aggregate_verdict, complete) = aggregate(structure, &results);
+
+        // REVX-04: record this pass's outcome (material-findings count +
+        // whether the verdict was REQUEST_CHANGES) for the NEXT re-review of
+        // the SAME MR/branch's prior-pass adaptive lever. Best-effort -- a
+        // Redis-absent/unreachable condition is a silent no-op (the lever
+        // just reads as "pass 1" again next time); never affects this call's
+        // own verdict. Skipped entirely when the policy is disabled, so a
+        // disabled policy also writes no state.
+        if effort_cfg.enabled {
+            let material_findings = dedup_across_providers(&results).len();
+            effort_policy::record_pass_outcome(&context, &aggregate_verdict, material_findings).await;
+        }
 
         // CXEG-07: Tier-C consistency/elegance lens. Runs strictly AFTER the
         // line above -- `aggregate_verdict`/`complete` are already fixed and
@@ -1220,6 +1391,30 @@ than failing the whole call."
         // `aggregate_verdict`/`complete` above.
         let escalation = finalize_escalation(escalation_decision, &results);
 
+        // REVX-14: the per-provider effort record -- WHY each pass ran at its
+        // tier, so a human reviewing the run's JSON output can see the
+        // policy's reasoning without cross-referencing logs. `enabled: false`
+        // means every decision below is the disabled-policy placeholder
+        // (static behavior; see the dispatch loop above).
+        let effort_block = json!({
+            "enabled": effort_cfg.enabled,
+            "run_tier": effort_run_tier,
+            "hand_off": effort_hand_off,
+            "reasons": effort_reasons,
+            "providers": effort_decisions
+                .iter()
+                .map(|(provider, d)| {
+                    json!({
+                        "provider": provider,
+                        "tier": d.tier,
+                        "native": d.native,
+                        "model": d.model,
+                        "reason": d.reason,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        });
+
         Ok(json!({
             "structure": args["structure"],
             "providers": results,
@@ -1229,6 +1424,7 @@ than failing the whole call."
             "scribe_docs": scribe_docs,
             "findings_recorded": findings_recorded,
             "escalation": escalation,
+            "effort": effort_block,
             "capacity_substitutions": capacity_substitutions,
             "consistency": {
                 "status": consistency_run.status,
@@ -1319,7 +1515,7 @@ impl ReviewProviderStatus {
     /// `record_dispatch_outcome` hook a real review uses.
     async fn probe_one(cfg: &ReviewConfig, provider: &str) {
         let daemon_opts = dispatch::DaemonOpts::routine();
-        let raw = dispatch_provider_raw(cfg, provider, "ping", &daemon_opts).await;
+        let raw = dispatch_provider_raw(cfg, provider, "ping", &daemon_opts, None).await;
         record_dispatch_outcome(provider, &raw.map(|_| ()));
     }
 }
@@ -1399,6 +1595,66 @@ impl RustTool for ReviewProviderStatus {
     }
 }
 
+/// REVX-11 — `review_paid_pool_toggle`: flip the `paid` provider's runtime
+/// enabled/disabled flag ([`paid_pool::is_enabled`]/[`paid_pool::set_enabled`])
+/// WITHOUT a redeploy. Paid spend is operator-gated (default OFF), so this is
+/// the sanctioned agent-invocable door to turn it on/off on operator
+/// instruction, and to read the current state (omit `enabled` for a
+/// status-only read).
+struct ReviewPaidPoolToggle;
+
+#[async_trait::async_trait]
+impl RustTool for ReviewPaidPoolToggle {
+    fn name(&self) -> &str {
+        "review_paid_pool_toggle"
+    }
+
+    fn description(&self) -> &str {
+        "Enable/disable the `paid` review provider (a pooled, curated set of paid \
+         OpenRouter capstone models -- Kimi K2/K2-thinking, DeepSeek V3.2, GLM-5/4.6, \
+         Gemini 2.5 Pro) at RUNTIME, no redeploy. Defaults OFF (paid spend is \
+         operator-gated). Pass 'enabled: true|false' to flip it, or omit 'enabled' \
+         to just read the current state. The flag survives across review_run calls \
+         for the life of the process; it resets to the REVIEW_PAID_POOL_ENABLED env \
+         default on a process restart."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "description": "If present, sets the paid pool's runtime enabled state. \
+                                     Omit to just read the current state without changing it."
+                }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        if let Some(enabled) = args.get("enabled").and_then(Value::as_bool) {
+            paid_pool::set_enabled(enabled);
+        }
+        let enabled = paid_pool::is_enabled();
+        let structured = json!({
+            "enabled": enabled,
+            "models": paid_pool::configured_models(),
+        });
+        let text = format!(
+            "paid review pool is now {} ({} configured model(s))",
+            if enabled { "ENABLED" } else { "DISABLED" },
+            paid_pool::configured_models().len(),
+        );
+        Ok(ToolOutput::with_structured(text, structured))
+    }
+}
+
 pub fn register(registry: &mut ToolRegistry) {
     registry
         .register(Box::new(ReviewRun::new()))
@@ -1409,6 +1665,9 @@ pub fn register(registry: &mut ToolRegistry) {
     registry
         .register(Box::new(ReviewProviderStatus))
         .expect("review_provider_status must register cleanly");
+    registry
+        .register(Box::new(ReviewPaidPoolToggle))
+        .expect("review_paid_pool_toggle must register cleanly");
 }
 
 #[cfg(test)]
@@ -1669,6 +1928,71 @@ mod tests {
         for p in parsed["providers"].as_array().unwrap() {
             assert!(p["error"].is_string(), "expected a degrade reason, got {p}");
         }
+    }
+
+    // ── REVX-09/11: `paid` provider allowlist + runtime-toggle wiring ──────
+
+    #[test]
+    fn paid_is_in_the_allowed_providers_list() {
+        assert!(ALLOWED_PROVIDERS.contains(&"paid"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn disabled_paid_seat_is_dropped_from_the_panel_not_dispatched() {
+        paid_pool::set_enabled(false);
+        std::env::remove_var("REVIEW_DAEMON_TOKEN");
+        let args = json!({
+            "structure": "panel_majority",
+            "providers": ["opus", "paid"],
+            "criteria": "must compile",
+            "context": {"diff": "+ fn x() {}"}
+        });
+        let out = tool().execute(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let providers = parsed["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 1, "disabled paid seat must be dropped, not dispatched: {parsed}");
+        assert_eq!(providers[0]["provider"], "opus");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn disabled_paid_as_the_only_provider_returns_a_clear_no_enabled_providers_result() {
+        paid_pool::set_enabled(false);
+        let args = json!({
+            "structure": "single",
+            "providers": ["paid"],
+            "criteria": "must compile",
+            "context": {}
+        });
+        let out = tool().execute(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["providers"].as_array().unwrap().len(), 0, "{parsed}");
+        assert_eq!(parsed["complete"], false, "{parsed}");
+        assert!(
+            parsed["reason"].as_str().unwrap_or("").contains("no enabled providers"),
+            "{parsed}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn review_paid_pool_toggle_flips_state_and_reports_it() {
+        let toggle = ReviewPaidPoolToggle;
+        let on = toggle.execute_structured(json!({"enabled": true})).await.unwrap();
+        assert_eq!(on.structured.as_ref().unwrap()["enabled"], true);
+        assert!(paid_pool::is_enabled());
+
+        let off = toggle.execute_structured(json!({"enabled": false})).await.unwrap();
+        assert_eq!(off.structured.as_ref().unwrap()["enabled"], false);
+        assert!(!paid_pool::is_enabled());
+
+        // A status-only read (no `enabled` key) must not change the state.
+        paid_pool::set_enabled(true);
+        let status = toggle.execute_structured(json!({})).await.unwrap();
+        assert_eq!(status.structured.as_ref().unwrap()["enabled"], true);
+        assert!(paid_pool::is_enabled(), "status-only read must not flip the flag");
+        paid_pool::set_enabled(false);
     }
 
     // ── KGREV-02: rebuild-on-pass hook + per-project re-review lock ────────
@@ -2362,6 +2686,35 @@ mod tests {
         // CORTEX_RISK_SCORE_THRESHOLD/CORTEX_RISK_BAND_ELEVATED_CUT env
         // overrides (execute() calls `CortexConfig::from_env()` internally,
         // not the test's own `escalation_cfg`).
+        //
+        // Hermeticity (test-gate flake fix): this test needs BOTH the base
+        // panel provider (`opus`) and the escalated provider (`codex`) to be
+        // dispatchable (not capacity-paused) yet have the `codex` dispatch
+        // itself fail as "unavailable". Two ambient conditions previously
+        // broke that on the gate host and nowhere else:
+        //   1. `capacity::registry()` is a process-global singleton shared
+        //      with every other test in this binary (see the REVCAP-A
+        //      section below, which documents the same hazard). If an
+        //      earlier test left `opus`/`codex`/`agy` marked down/rate
+        //      limited (e.g. it panicked before its own cleanup ran), the
+        //      REVCAP-01 frontier-capacity gate can pause dispatch entirely
+        //      before either provider is even attempted, so `providers` come
+        //      back with fewer than 2 entries -- unrelated to the thing this
+        //      test actually exercises. Force all three FRONTIER providers
+        //      back to a known-good `mark_success` state up front, exactly
+        //      like the REVCAP-A tests do.
+        //   2. `remove_var("REVIEW_DAEMON_TOKEN")` only guarantees "no token"
+        //      if the ambient process env didn't already have a real one --
+        //      on the compiler-gate host, which also runs the review daemon,
+        //      it can. Don't rely on the token being absent: point
+        //      `REVIEW_DAEMON_URL` at a closed local port so the daemon
+        //      dispatch fails at the transport layer regardless of whether a
+        //      token happens to be configured, making "codex unavailable"
+        //      true unconditionally rather than incidentally.
+        capacity::registry().update("opus", |s| s.mark_success());
+        capacity::registry().update("codex", |s| s.mark_success());
+        capacity::registry().update("agy", |s| s.mark_success());
+
         let store_dir = std::env::temp_dir().join(format!("review-cxeg08-degraded-{}", std::process::id()));
         std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
         seed_tiny_graph("TERM", "src/a.rs");
@@ -2370,6 +2723,10 @@ mod tests {
         std::env::set_var("CORTEX_ESCALATION_ADD_PROVIDER", "codex");
         std::env::remove_var("REVIEW_DAEMON_TOKEN");
         std::env::remove_var("OPENROUTER_API_KEY");
+        // Guaranteed-unreachable: nothing listens on loopback port 1, so this
+        // fails fast (connection refused) rather than depending on ambient
+        // token state, and rather than risking a slow real-network timeout.
+        std::env::set_var("REVIEW_DAEMON_URL", "http://127.0.0.1:1");
 
         let args = json!({
             "structure": "panel_majority",
@@ -2384,7 +2741,7 @@ mod tests {
         assert_eq!(parsed["escalation"]["added_provider"], "codex", "{parsed}");
         assert_eq!(
             parsed["escalation"]["escalation_degraded"], true,
-            "codex has no REVIEW_DAEMON_TOKEN configured -- must degrade, not deadlock: {parsed}"
+            "codex must degrade (no token / unreachable daemon), not deadlock: {parsed}"
         );
         // No deadlock: the call still completed and returned both providers.
         assert_eq!(parsed["providers"].as_array().unwrap().len(), 2, "{parsed}");
@@ -2394,6 +2751,12 @@ mod tests {
         std::env::remove_var("CORTEX_RISK_SCORE_THRESHOLD");
         std::env::remove_var("CORTEX_RISK_BAND_ELEVATED_CUT");
         std::env::remove_var("CORTEX_ESCALATION_ADD_PROVIDER");
+        std::env::remove_var("REVIEW_DAEMON_URL");
+        // Leave the frontier providers in a known-good state for whichever
+        // test runs next (same discipline as the REVCAP-A section).
+        capacity::registry().update("opus", |s| s.mark_success());
+        capacity::registry().update("codex", |s| s.mark_success());
+        capacity::registry().update("agy", |s| s.mark_success());
     }
 
     // ── REVCAP-01 PART A: capacity gate + review_provider_status wiring ────

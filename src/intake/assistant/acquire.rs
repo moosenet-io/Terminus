@@ -35,8 +35,12 @@ use super::{BackendTag, ModelId};
 
 /// Host VRAM ceiling (GB) used for the fit check. Read from `INTAKE_VRAM_CEILING_GB`
 /// via [`vram_ceiling_gb`]; the constant is only the documented default for the
-/// current host class (~96GB in this environment), not an infra literal pinned into logic.
-const DEFAULT_VRAM_CEILING_GB: f64 = 96.0;
+/// current host class, not an infra literal pinned into logic. ~120GB reflects
+/// this host's GTT (Graphics Translation Table — system RAM mapped as
+/// GPU-accessible memory) SERVING envelope, not just dedicated VRAM. NB: this is
+/// the SERVING ceiling only; the ingestion (safetensors → GGUF conversion) path
+/// is still bound by ~31GB system RAM (GTT does not help CPU-side conversion).
+const DEFAULT_VRAM_CEILING_GB: f64 = 120.0;
 
 /// Host VRAM ceiling in GB for the fit check (from `INTAKE_VRAM_CEILING_GB`,
 /// default [`DEFAULT_VRAM_CEILING_GB`]).
@@ -151,8 +155,9 @@ impl Nominations {
 
     /// Load from the reliable NAS staging path ([`config::intake_nominations_path`]).
     pub fn load() -> Result<Nominations, String> {
-        let path = config::intake_nominations_path()
-            .ok_or_else(|| "INTAKE_STAGING_DIR not set — cannot locate nominations.json".to_string())?;
+        let path = config::intake_nominations_path().ok_or_else(|| {
+            "INTAKE_STAGING_DIR not set — cannot locate nominations.json".to_string()
+        })?;
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read nominations at {path}: {e}"))?;
         Self::from_json(&raw)
@@ -174,7 +179,11 @@ impl Nomination {
     /// distinguishes the two so the runner can surface it instead of quietly
     /// never measuring the model.
     pub fn yarn_config(&self) -> Option<&YarnConfig> {
-        if self.yarn_capable { self.yarn.as_ref() } else { None }
+        if self.yarn_capable {
+            self.yarn.as_ref()
+        } else {
+            None
+        }
     }
 
     /// True ⇒ `yarn_capable` is set but `yarn` is missing — an authoring
@@ -328,7 +337,11 @@ impl ShellAcquirer {
         // `<root>/<id>.gguf`. A missing root is a clean skip, not a crash.
         match model_load_root() {
             Some(root) => {
-                let path = format!("{}/{}.gguf", root.trim_end_matches('/'), sanitize_id(&nom.id));
+                let path = format!(
+                    "{}/{}.gguf",
+                    root.trim_end_matches('/'),
+                    sanitize_id(&nom.id)
+                );
                 if std::path::Path::new(&path).exists() {
                     AcquisitionOutcome::Ready {
                         local_path: Some(path),
@@ -344,7 +357,6 @@ impl ShellAcquirer {
             },
         }
     }
-
 }
 
 /// Make a model id filesystem-safe for a staged path (`:` and `/` → `_`).
@@ -389,17 +401,32 @@ mod tests {
     #[test]
     fn model_id_is_byte_identical_passthrough() {
         // S83 join correctness: no normalization of the nominated id.
-        let n = nom("Qwen3.6:32B", 32.0, Gfx1151Class::Experimental, AcquisitionPath::OllamaPull);
+        let n = nom(
+            "Qwen3.6:32B",
+            32.0,
+            Gfx1151Class::Experimental,
+            AcquisitionPath::OllamaPull,
+        );
         assert_eq!(n.model_id().as_str(), "Qwen3.6:32B");
     }
 
     #[test]
     fn command_a_plus_exceeds_vram_clean_skip() {
-        // 218B → ~131GB footprint > 96GB ceiling → flagged for skip-with-reason.
+        // 218B → ~131GB footprint > 120GB ceiling → flagged for skip-with-reason.
         std::env::remove_var("INTAKE_VRAM_CEILING_GB");
-        let big = nom("command-a-plus:218b", 218.0, Gfx1151Class::Experimental, AcquisitionPath::HfFetch);
+        let big = nom(
+            "command-a-plus:218b",
+            218.0,
+            Gfx1151Class::Experimental,
+            AcquisitionPath::HfFetch,
+        );
         assert!(big.exceeds_vram());
-        let fits = nom("command-r:35b", 35.0, Gfx1151Class::Confirmed, AcquisitionPath::OllamaPull);
+        let fits = nom(
+            "command-r:35b",
+            35.0,
+            Gfx1151Class::Confirmed,
+            AcquisitionPath::OllamaPull,
+        );
         assert!(!fits.exceeds_vram());
     }
 
@@ -407,7 +434,12 @@ mod tests {
     fn shell_acquirer_skips_over_vram_without_touching_network() {
         // Even the live acquirer must skip an over-VRAM model BEFORE any shell-out.
         std::env::remove_var("INTAKE_VRAM_CEILING_GB");
-        let big = nom("command-a-plus:218b", 218.0, Gfx1151Class::Experimental, AcquisitionPath::HfFetch);
+        let big = nom(
+            "command-a-plus:218b",
+            218.0,
+            Gfx1151Class::Experimental,
+            AcquisitionPath::HfFetch,
+        );
         let outcome = futures_block_on(ShellAcquirer.acquire(&big));
         assert!(!outcome.is_ready());
         assert!(outcome.skip_reason().unwrap().contains("VRAM"));
@@ -426,12 +458,22 @@ mod tests {
         std::env::remove_var("CHORD_CONTROL_URL");
         std::env::remove_var("INTAKE_VRAM_CEILING_GB");
 
-        let ollama_nom = nom("qwen3-coder:30b", 30.0, Gfx1151Class::Confirmed, AcquisitionPath::OllamaPull);
+        let ollama_nom = nom(
+            "qwen3-coder:30b",
+            30.0,
+            Gfx1151Class::Confirmed,
+            AcquisitionPath::OllamaPull,
+        );
         let outcome = futures_block_on(ShellAcquirer.acquire(&ollama_nom));
         assert!(!outcome.is_ready());
         assert!(outcome.skip_reason().unwrap().contains("CHORD_CONTROL_URL"));
 
-        let mut hf_nom = nom("cohere/command-a-plus:104b", 104.0, Gfx1151Class::Experimental, AcquisitionPath::HfFetch);
+        let mut hf_nom = nom(
+            "cohere/command-a-plus:104b",
+            104.0,
+            Gfx1151Class::Experimental,
+            AcquisitionPath::HfFetch,
+        );
         hf_nom.hf_repo = Some("cohere/command-a-plus".to_string());
         let outcome = futures_block_on(ShellAcquirer.acquire(&hf_nom));
         assert!(!outcome.is_ready());
@@ -440,14 +482,27 @@ mod tests {
 
     #[test]
     fn backend_strategy_defaults_to_both_passes() {
-        let n = nom("m:8b", 8.0, Gfx1151Class::Confirmed, AcquisitionPath::OllamaPull);
+        let n = nom(
+            "m:8b",
+            8.0,
+            Gfx1151Class::Confirmed,
+            AcquisitionPath::OllamaPull,
+        );
         let s = n.backend_strategy();
-        assert_eq!(s, vec![(BackendTag::Gpu, "llama-gpu"), (BackendTag::Cpu, "ollama")]);
+        assert_eq!(
+            s,
+            vec![(BackendTag::Gpu, "llama-gpu"), (BackendTag::Cpu, "ollama")]
+        );
     }
 
     #[test]
     fn backend_strategy_honors_explicit_tags() {
-        let mut n = nom("m:8b", 8.0, Gfx1151Class::Confirmed, AcquisitionPath::OllamaPull);
+        let mut n = nom(
+            "m:8b",
+            8.0,
+            Gfx1151Class::Confirmed,
+            AcquisitionPath::OllamaPull,
+        );
         n.backends = vec!["cpu".into()];
         assert_eq!(n.backend_strategy(), vec![(BackendTag::Cpu, "ollama")]);
         n.backends = vec!["llama-gpu".into(), "ollama".into()];

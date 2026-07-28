@@ -49,12 +49,12 @@
 //! lint). See `docs/house-style.md#known-limitations`.
 //!
 //! ## Sanctioned files are exempt from RULE 1 ONLY
-//! `src/config.rs` / `src/<secret-manager>/mod.rs` / `src/secrets_bootstrap.rs` are
+//! `src/config.rs` / `src/<secret-manager>/mod.rs` / `src/secrets_bootstrap.rs` are // pii-test-fixture: public product name, sanctioned secrets-manager module path (see infra_service_path_exempt rationale)
 //! the sanctioned secret-materialization layer, so a raw secret read there is
 //! not a Rule-1 violation. This exemption is applied at the point a
 //! `RawSecretEnvVar` finding would be recorded — every file is still parsed
 //! and visited, so Rules 2 (empty description) and 4 (`panic!` in `execute`)
-//! apply to them too (`src/<secret-manager>/mod.rs` has real `RustTool` impls).
+//! apply to them too (`src/<secret-manager>/mod.rs` has real `RustTool` impls). // pii-test-fixture: public product name, sanctioned secrets-manager module path
 //!
 //! ## Waivers
 //! A `// house-style-allow: <reason>` line comment, on the same line as the
@@ -182,7 +182,7 @@ pub fn check_tree(repo_root: &Path) -> Vec<Violation> {
         let rel = rel_path(repo_root, &path);
         // NOTE: sanctioned files are NOT skipped here — every file is parsed
         // and visited so Rules 2 (empty description) and 4 (panic in execute)
-        // apply everywhere, including `src/<secret-manager>/mod.rs` (which has real
+        // apply everywhere, including `src/<secret-manager>/mod.rs` (which has real  // pii-test-fixture: public product name, sanctioned secrets-manager module path (see infra_service_path_exempt rationale)
         // `RustTool` impls). The sanctioned exemption is Rule-1-only and is
         // applied at the point a `RawSecretEnvVar` would be recorded.
         let source = match fs::read_to_string(&path) {
@@ -482,7 +482,7 @@ struct Checker<'s> {
     fn_stack: Vec<String>,
     /// True while visiting the body of an `impl RustTool for X` block.
     in_rust_tool_impl: bool,
-    /// True for `src/config.rs` / `src/<secret-manager>/mod.rs` /
+    /// True for `src/config.rs` / `src/<secret-manager>/mod.rs` / // pii-test-fixture: public product name, sanctioned secrets-manager module path
     /// `src/secrets_bootstrap.rs` — the sanctioned secret-materialization
     /// layer. Suppresses RULE 1 (raw secret env read) ONLY; Rules 2/4 still
     /// apply to these files.
@@ -1082,10 +1082,10 @@ mod tests {
                 }
             }
         "#;
-        // Sanctioned (e.g. src/<secret-manager>/mod.rs): the raw secret read (Rule 1)
+        // Sanctioned (e.g. src/<secret-manager>/mod.rs): the raw secret read (Rule 1) // pii-test-fixture: fixture path string, not a real leak
         // is exempt, but the empty description (Rule 2) and panic! (Rule 4)
         // are STILL flagged.
-        let mut sanctioned = rules(&check_source_as("src/<secret-manager>/mod.rs", src));
+        let mut sanctioned = rules(&check_source_as("src/<secret-manager>/mod.rs", src)); // pii-test-fixture: fixture path string, not a real leak
         sanctioned.sort_by_key(|r| r.id());
         assert_eq!(sanctioned, vec![Rule::EmptyToolDescription, Rule::PanicInExecute]);
 
@@ -1109,7 +1109,7 @@ mod tests {
                 }
             }
         "#;
-        for rel in ["src/config.rs", "src/<secret-manager>/mod.rs", "src/secrets_bootstrap.rs"] {
+        for rel in ["src/config.rs", "src/<secret-manager>/mod.rs", "src/secrets_bootstrap.rs"] { // pii-test-fixture: fixture path strings, not a real leak
             assert!(
                 check_source_as(rel, src).is_empty(),
                 "{rel} should be Rule-1 exempt"

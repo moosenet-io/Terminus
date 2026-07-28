@@ -2,6 +2,7 @@
 // CONST-17: restyled to the Terminus brand (§2.3) — gradient fill, violet hairline/glow,
 // new `glow`/`accent` emphasis props. API kept: same 4 variants, same StatusColor union.
 import { useState } from 'react';
+import { onEnterOrSpace } from '../lib/a11y';
 
 type CardVariant = 'metric' | 'content' | 'interactive' | 'expandable';
 
@@ -30,8 +31,35 @@ interface CardProps {
   /** §2.3: persistent brand-emphasis glow. Reserve for live/primary elements (§2.4) —
    *  never ambient decoration. */
   glow?: boolean;
-  /** §2.3: violet-gradient border-mask + strong hairline — emphasis without full glow. */
+  /** §2.3 / §8: violet-gradient border-mask + strong hairline — emphasis without full glow. */
   accent?: boolean;
+  /** DS contract prop (§8 Card): override the variant's default padding (e.g. 'var(--space-5)'). */
+  padding?: string;
+}
+
+// DS Card `accent` treatment (§8): a masked gradient-hairline border overlay — the luminous
+// "processing center" edge. DS uses inset:-1px; our Card container is overflow:hidden for its
+// variants, so we inset:0 to sit precisely on the border's inner edge without being clipped.
+function AccentHairline() {
+  return (
+    <span
+      aria-hidden
+      style={{
+        position: 'absolute',
+        inset: 0,
+        borderRadius: 'inherit',
+        // DS-exact 1px hairline (§8 Card accent mask) — intentional raw px, NOT tokenized
+        // (this is the border-mask thickness; tokenizing breaks DS pixel-parity). lint warns expected.
+        padding: '1px',
+        background: 'linear-gradient(180deg, rgba(168, 85, 247, 0.5), rgba(124, 58, 237, 0.04))',
+        // mask only depends on alpha; `black` keyword avoids a raw-hex literal (was #000).
+        WebkitMask: 'linear-gradient(black 0 0) content-box, linear-gradient(black 0 0)',
+        WebkitMaskComposite: 'xor',
+        maskComposite: 'exclude',
+        pointerEvents: 'none',
+      }}
+    />
+  );
 }
 
 const baseCard: React.CSSProperties = {
@@ -58,20 +86,27 @@ export function Card({
   defaultExpanded = false,
   glow = false,
   accent = false,
+  padding,
 }: CardProps) {
   const [expanded, setExpanded] = useState(defaultExpanded);
   const emphasisStyle: React.CSSProperties = {
-    ...(accent ? { borderColor: 'var(--border-strong)', boxShadow: 'var(--shadow-md), var(--glow-violet-soft), var(--inset-hi)' } : {}),
+    ...(accent ? { position: 'relative', borderColor: 'var(--line-accent)', boxShadow: 'var(--shadow-md), var(--glow-violet-soft), var(--inset-hi)' } : {}),
     ...(glow ? { boxShadow: 'var(--shadow-md), var(--glow-violet), var(--inset-hi)' } : {}),
   };
+  const accentOverlay = accent ? <AccentHairline /> : null;
 
   if (variant === 'expandable') {
     return (
       <div className={className} style={{ ...baseCard, ...emphasisStyle, ...style }}>
+        {accentOverlay}
         <div
           className="h-card-header"
+          role="button"
+          tabIndex={0}
+          aria-expanded={header != null ? expanded : undefined}
           onClick={() => { setExpanded(e => !e); onClick?.(); }}
-          style={{ transition: `background var(--dur-fast) var(--ease-out)` }}
+          onKeyDown={onEnterOrSpace(() => { setExpanded(e => !e); onClick?.(); })}
+          style={{ transition: `background var(--dur-fast) var(--ease-out)`, ...(padding ? { padding } : {}) }}
         >
           <div style={{ flex: 1 }}>{header ?? children}</div>
           {/* Chevron only when there is a distinct header (i.e. a separate body to reveal).
@@ -91,7 +126,7 @@ export function Card({
             collapse/expand transition via data-expanded so children never fail to render. */}
         {header != null && (
           <div className="h-expandable-body" data-expanded={expanded}
-            style={{ borderTop: '1px solid var(--border)', padding: 'var(--space-3) var(--space-4)' }}>
+            style={{ borderTop: '1px solid var(--border)', padding: padding ?? 'var(--space-3) var(--space-4)' }}>
             {children}
           </div>
         )}
@@ -104,8 +139,13 @@ export function Card({
       <div
         className={`h-card-interactive${className ? ` ${className}` : ''}`}
         onClick={onClick}
-        style={{ padding: paddingMap.interactive, ...emphasisStyle, ...style }}
+        // A clickable card is a custom control: make it keyboard-reachable + Enter/Space
+        // operable when it actually carries an onClick (CGUI-13). Purely presentational
+        // interactive cards (no handler) stay non-focusable.
+        {...(onClick ? { role: 'button', tabIndex: 0, onKeyDown: onEnterOrSpace(onClick) } : {})}
+        style={{ padding: padding ?? paddingMap.interactive, ...emphasisStyle, ...style }}
       >
+        {accentOverlay}
         {children}
       </div>
     );
@@ -115,8 +155,10 @@ export function Card({
     <div
       className={`h-card${className ? ` ${className}` : ''}`}
       onClick={onClick}
-      style={{ padding: paddingMap[variant], ...emphasisStyle, ...style }}
+      {...(onClick ? { role: 'button', tabIndex: 0, onKeyDown: onEnterOrSpace(onClick) } : {})}
+      style={{ padding: padding ?? paddingMap[variant], ...emphasisStyle, ...style }}
     >
+      {accentOverlay}
       {children}
     </div>
   );

@@ -507,7 +507,7 @@ mod tests {
     /// Force `EmbedClient::from_env()` to fail fast and deterministically,
     /// regardless of the test host: `EMBEDDINGS_URL` otherwise defaults to
     /// `crate::config::chord_personal_federation_url()` (`:8099`), which is a
-    /// REAL, reachable Chord embeddings proxy on the <host> build host this
+    /// REAL, reachable Chord embeddings proxy on the <host> build host this  // pii-test-fixture: doc comment inside #[cfg(test)] fixture helper, no real service reached
     /// suite runs on (per project infra docs) — a unit test must never
     /// silently round-trip to a live production service. Every test below
     /// that reaches [`select_exemplars`]/[`compute_profile`]/the cache calls

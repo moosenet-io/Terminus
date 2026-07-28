@@ -6,21 +6,26 @@
    degradation, table skins) are kept from CONST-04; only values change. */
 
 :root {
-  /* ── Surfaces — "deep space" (page → chip, darkest to lightest) ─────────────── */
-  --space-900: #0D0B1A;
-  --space-800: #110E22;
-  --space-700: #161130;
-  --space-600: #1A1333;
-  --space-500: #221A40;
-  --space-400: #2C2350;
+  /* ── Surfaces — neutral deep-dark (page → chip, darkest to lightest) ─────────────
+     S127 TGUI2 POL-1 / M1: desaturated ~65% off the old violet-tinted "deep space"
+     surfaces toward Linear/Grafana neutral-dark. Only a whisper of violet remains — the
+     brand now lives in the ACCENT + node dots, not the ambient surface hue. Prior violet
+     values kept in the trailing comment for provenance. */
+  --space-900: #0A0A0D; /* was #0D0B1A */
+  --space-800: #0F0F14; /* was #110E22 */
+  --space-700: #141419; /* was #161130 */
+  --space-600: #18181F; /* was #1A1333 */
+  --space-500: #1C1C24; /* was #221A40 */
+  --space-400: #26262F; /* was #2C2350 — proportional neutral step */
   --bg-page: var(--space-900);
   --bg-panel: var(--space-700);
   --bg-elevated: var(--space-600);
   --bg-hover: var(--space-500);
   --surface-card: var(--space-700);
   --surface-chip: var(--space-400);
-  --grad-space: linear-gradient(135deg, #0D0B1A 0%, #1A1333 100%);
-  --grad-card: linear-gradient(180deg, var(--space-700), var(--space-800));
+  --grad-space: linear-gradient(135deg, #0A0A0D 0%, #18181F 100%); /* was 135deg #0D0B1A→#1A1333 */
+  /* Keep the IDEA of a vertical card gradient for depth, drop the purple (M1). */
+  --grad-card: linear-gradient(180deg, #16161C, #111116); /* was space-700→space-800 (violet) */
 
   /* ── Brand accent — violet ramp ───────────────────────────────────────────── */
   --violet-700: #5B21B6;
@@ -32,6 +37,7 @@
   --accent: var(--violet-500);
   --accent-bright: var(--violet-400);
   --accent-on: #FFFFFF;
+  --accent-soft: rgba(124, 58, 237, 0.14); /* violet-tint fill for active/selected surfaces */
   --grad-accent: linear-gradient(135deg, #7C3AED 0%, rgba(124, 58, 237, 0.6) 100%);
 
   /* ── Functional ("flux") hues — SEMANTIC, never decorative (§2.4) ───────────── */
@@ -41,6 +47,7 @@
   --flux-green-soft: #34D399;
   --flux-amber: #F59E0B;
   --flux-rose: #F43F5E;
+  --flux-rose-soft: #FB7185;
   --node-source: var(--flux-blue);
   --node-core: var(--violet-500);
   --node-endpoint: var(--flux-green);
@@ -55,6 +62,12 @@
   --status-error: var(--flux-rose);
   --status-info: var(--flux-blue);
 
+  /* M5: progress is NOT status — a completion bar renders as a single desaturated-violet
+     fill on a neutral track, never the red→amber→green status ramp (which read as "warning"
+     on trivial in-progress work). Genuine status still uses the semantic hues above. */
+  --progress-fill: rgba(124, 58, 237, 0.55);
+  --progress-track: rgba(255, 255, 255, 0.06);
+
   /* ── Ink ─────────────────────────────────────────────────────────────────── */
   --text-100: #F4F2FB;
   --text-200: #C7C3D6;
@@ -67,10 +80,14 @@
   --text-muted: var(--text-300);
   --text-faint: var(--text-500);
 
-  /* ── Lines — violet-alpha hairlines ──────────────────────────────────────── */
-  --line-soft: rgba(168, 85, 247, 0.14);
-  --line-default: rgba(168, 85, 247, 0.22);
-  --line-strong: rgba(168, 85, 247, 0.40);
+  /* ── Lines — neutral white-alpha hairlines (M2) ──────────────────────────────
+     S127 TGUI2 POL-1 / M2: structural hairlines are neutral white-alpha; violet is
+     reserved ONLY for the active/accent edge (--line-accent), applied to selected nav,
+     focused inputs, primary buttons and accent cards. Prior violet hairlines in comments. */
+  --line-soft: rgba(255, 255, 255, 0.06);   /* was rgba(168,85,247,0.14) */
+  --line-default: rgba(255, 255, 255, 0.09); /* was rgba(168,85,247,0.22) */
+  --line-strong: rgba(255, 255, 255, 0.14);  /* was rgba(168,85,247,0.40) */
+  --line-accent: rgba(168, 85, 247, 0.40);   /* violet — active/accent/focus edge ONLY */
   --border: var(--line-default);
   --border-strong: var(--line-strong);
   --border-width: 1px;
@@ -119,13 +136,19 @@
   --radius-pill: 999px;
   --maxw-prose: 68ch;
   --maxw-content: 1120px;
+  /* S127 TGUI2 POL-03: the canvas content cap. Main content is centered and capped at this
+     width so short pages read as a composed column rather than top-left-anchored in a huge
+     canvas with a yawning void to the right/below (the "tech-demo" tell). Additive token. */
+  --content-max: 1280px;
 
   /* ── Elevation + glow (glow = brand emphasis, reserved: see §2.4) ───────────── */
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
   --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.55);
-  --glow-violet: 0 0 24px rgba(124, 58, 237, 0.45);
-  --glow-violet-soft: 0 0 12px rgba(168, 85, 247, 0.30);
+  /* M3: glow is an INTERACTION signal only (hover/active/primary/focus), never ambient.
+     Cut ~35% so elevation reads crisp (Linear) rather than neon. */
+  --glow-violet: 0 0 16px rgba(124, 58, 237, 0.28);      /* was 0 0 24px .45 */
+  --glow-violet-soft: 0 0 8px rgba(168, 85, 247, 0.20);  /* was 0 0 12px .30 */
   --glow-blue: 0 0 18px rgba(59, 130, 246, 0.45);
   --glow-green: 0 0 18px rgba(16, 185, 129, 0.45);
   --glow-amber: 0 0 18px rgba(245, 158, 11, 0.45);
@@ -188,7 +211,10 @@
   --bg-surface-overlay: var(--surface-chip);
   --border-subtle: var(--line-soft);
   --border-default: var(--line-default);
-  --border-emphasis: var(--line-strong);
+  /* M2: "emphasis" means active/selected (violet accent edge), not merely a stronger
+     structural hairline — repointed off --line-strong (now neutral) to --line-accent so
+     selected nav tabs / emphasized edges keep the single brand accent. */
+  --border-emphasis: var(--line-accent);
   --text-primary: var(--text-100);
   --text-secondary: var(--text-200);
   --text-tertiary: var(--text-300);
@@ -211,25 +237,10 @@
   --transition-fast: var(--dur-fast) var(--ease-out);
   --transition-default: var(--dur-base) var(--ease-out);
 
-  /* `--h-*` aliases (already legacy before CONST-17; re-pointed onto the brand values) */
-  --h-bg: var(--bg-base);
-  --h-bg-card: var(--bg-surface);
-  --h-bg-hover: var(--bg-surface-raised);
-  --h-bg-active: var(--accent-primary-subtle);
-  --h-border: var(--border-default);
-  --h-teal: var(--accent-primary);
-  --h-teal-dim: rgba(168, 85, 247, 0.6);
-  --h-green: var(--status-success);
-  --h-amber: var(--status-warning);
-  --h-red: var(--status-error);
-  --h-red-dim: color-mix(in srgb, var(--status-error) 70%, white);
-  --h-blue: var(--status-info);
-  --h-text: var(--text-primary);
-  --h-text-dim: var(--text-secondary);
-  --h-text-muted: var(--text-tertiary);
-  --h-sidebar-w: 200px;
-  --h-radius: var(--radius-lg);
-  --h-font-mono: var(--font-mono);
+  /* CGUI-01: the teal-era `--h-*` alias shim was REMOVED here. Every `var(--h-*)` call-site
+     in components/pages was migrated onto the canonical brand tokens above
+     (--h-teal→--accent, --h-text-muted→--text-300, --h-border→--border, etc.).
+     Do not reintroduce `--h-*` aliases — reference the canonical names directly. */
 }
 
 * {
@@ -257,11 +268,85 @@ body {
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
+/* CGUI-02 (TERM #525): panel-scroll custom scrollbar used by <PanelRoot>.
+   The scroll container itself carries `height:100%; min-height:0; overflow-y:auto`
+   (min-height:0 on the flex child is the load-bearing bit); this class only styles
+   its scrollbar per the guide-spec §5 `.hf-scroll` treatment (width 8px, violet
+   thumb radius 8px, transparent track). */
+.hf-scroll { scrollbar-width: thin; scrollbar-color: rgba(168, 85, 247, 0.25) transparent; }
+.hf-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.hf-scroll::-webkit-scrollbar-track { background: transparent; }
+.hf-scroll::-webkit-scrollbar-thumb { background: rgba(168, 85, 247, 0.25); border-radius: 8px; }
+.hf-scroll::-webkit-scrollbar-thumb:hover { background: rgba(168, 85, 247, 0.40); }
+
 /* Global focus ring (§2.6 accessibility) */
 :focus-visible {
   outline: var(--focus-ring);
   outline-offset: 2px;
 }
+
+/* ── CGUI-13 (TERM #536): authoritative prefers-reduced-motion kill-switch ─────────
+   The SINGLE app-wide source of truth for reduced motion (the earlier interactions.css
+   duplicate was folded into this so there is exactly one rule). Per the brand guide's
+   hard rule, every looping/continuous decorative animation is disabled outright —
+   starfield/backdrop twinkle, data-flow pulses, StatusPill ping, NodeBadge core-pulse,
+   h-pulse dots, shimmer skeletons, Forest fog/spin/rise/grow, activity streams. One-shot
+   transitions collapse to ~0 so state changes stay instant rather than janky.
+   NOTE: SVG SMIL (<animate>/<animateMotion>) is NOT a CSS animation and cannot be reached
+   by this rule — those loops are withheld in render code via the useReducedMotion hook
+   (Forest sap/halo, ModuleDetail flow-pulse connector, TaskTree node halos).
+   NOTE (review): disabling functional animation here is INTENTIONAL and guide-mandated — it
+   applies only when the user has explicitly opted into reduced motion, and the 1ms transition
+   still fires `transitionend`, so JS transition callbacks are not broken. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition-duration: 1ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ── CGUI-12: deep-space backdrop (guide §0) ─────────────────────────────────────
+   The fixed frame the whole shell lives in front of — a single element pinned behind
+   every screen (z-index:0), so "the frame never moves; only the canvas scrolls". Two
+   stacked layers per the guide:
+     A. two nebula radials (violet top-left, blue top-right) over a vertical gradient that
+        ends green-tinted (#0F1A18) toward the bottom — the forest ground.
+     B. a six-dot starfield (::after), opacity ~.75, gently twinkling.
+   The raw rgba/hex/px below are intentional guide-§0 visual literals (this is CSS, not TSX,
+   so the adherence lint — which only scans .ts/.tsx — does not flag them; they are kept
+   verbatim from the brand guide rather than tokenised so the backdrop matches pixel-for-pixel).
+   Reduced motion: the ::after twinkle is an animation, so the global
+   prefers-reduced-motion rule (interactions.css) already stills it. */
+.const-backdrop {
+  position: fixed;
+  inset: 0;
+  /* z-index:-1 (not 0): the backdrop is a POSITIONED element, so at z-index:0 it would paint
+     AFTER — i.e. on top of — its non-positioned in-flow siblings (the rail + canvas row),
+     obscuring /overview. A negative z-index parks it behind the shell's in-flow content while
+     staying inside the shell's stacking context (the shell column is position:relative;z-index:1,
+     the GlobalBar z-index:2, and the content row position:relative;z-index:1 — all above this). */
+  z-index: -1;
+  pointer-events: none;
+  /* S127 TGUI2 POL-1 / M4 — CALM the data-page backdrop. This is the fixed frame behind ALL
+     six data pages, so it must read as near-flat neutral-dark, not "deep space dust".
+     - nebula radials dropped to Stripe-corner subtlety (violet .16→.05, blue .10→.03)
+     - the green forest-ground tint is removed; the vertical gradient is now neutral-dark only
+     - the twinkling starfield (::after) is REMOVED entirely from data pages (see below)
+     Full starfield + forest gradient survive ONLY on the Forest Build hero (its own <svg> grove)
+     and the login surface (its own paint) — neither depends on this element. */
+  background:
+    radial-gradient(70% 55% at 14% 2%, rgba(124, 58, 237, 0.05), transparent 60%),
+    radial-gradient(60% 55% at 88% 8%, rgba(59, 130, 246, 0.03), transparent 62%),
+    linear-gradient(180deg, #0A0A0D 0%, #0D0D12 55%, #0A0A0D 100%);
+}
+/* M4: the six-dot twinkling starfield that used to live on `.const-backdrop::after` is
+   intentionally removed — on data pages it read as sensor-noise dust floating through the
+   content (design-direction Tell #3). The starfield identity anchor is retained via the
+   `.h-starfield` component treatment, used only on Forest/login surfaces. */
 
 /* Card — brand: gradient fill, violet hairline, glow on hover (§2.3) */
 .h-card {
@@ -286,16 +371,32 @@ body {
   transition: background var(--dur-base) var(--ease-out), border-color var(--dur-base) var(--ease-out),
               box-shadow var(--dur-base) var(--ease-out), transform var(--dur-base) var(--ease-out);
 }
+/* DS Card interactive hover (§8): lift -2px, violet border, glow-violet + shadow-lg
+   (gradient fill retained — DS does not swap the surface on hover). */
 .h-card-interactive:hover {
-  background: var(--bg-hover);
-  border-color: var(--accent-bright);
-  box-shadow: var(--glow-violet), var(--inset-hi);
+  border-color: var(--violet-400);
+  box-shadow: var(--glow-violet), var(--shadow-lg);
   transform: translateY(-2px);
 }
 
-/* Accent card variant — violet-gradient border-mask + strong line (§2.3 Card row) */
+/* CGUI-03: Overview module-card state modifiers. The card body reuses `.h-card-interactive`
+   for the §3.2 region-7 hover behaviour (lift -2px + violet border + glow-violet,shadow-lg);
+   these single-class modifiers layer the resting-state treatment on top. Placed AFTER
+   `.h-card-interactive` so the resting border wins over the class default, while the higher-
+   specificity `.h-card-interactive:hover` still overrides on hover. */
+.const-modcard--error { border-color: var(--flux-rose); }
+.const-modcard--disabled {
+  opacity: 0.5;
+  pointer-events: none; /* inert — no hover lift, no action clicks */
+}
+/* CGUI-03 review FIX A: the enable toggle must stay live so a card toggled OFF can be
+   toggled back ON. A child re-declaring pointer-events:auto overrides the inert ancestor. */
+.const-modcard--disabled .const-modcard__toggle { pointer-events: auto; }
+
+/* Accent card variant — the ONE place a resting card keeps the violet edge (active/live
+   elements only, §2.4). M2: uses --line-accent (violet), not the now-neutral --border-strong. */
 .h-card-accent {
-  border-color: var(--border-strong);
+  border-color: var(--line-accent);
   box-shadow: var(--shadow-md), var(--glow-violet-soft), var(--inset-hi);
 }
 
@@ -350,17 +451,19 @@ body {
 /* lumina-ping — StatusPill's expanding ring (§2.3/§2.6); brand-normative name kept
    distinct from h-pulse so the two sanctioned motion patterns don't collide. */
 @keyframes lumina-ping {
-  0%   { transform: scale(0.8); opacity: 0.7; }
-  100% { transform: scale(2.2); opacity: 0; }
+  0%        { transform: scale(0.8); opacity: 0.5; }
+  80%, 100% { transform: scale(2.2); opacity: 0; }
 }
 .lumina-ping {
   animation: lumina-ping 1.8s var(--ease-out) infinite;
 }
 
-/* lumina-corepulse — the active NodeBadge core pulse (§2.3) */
+/* lumina-corepulse — the active NodeBadge core-dot breathe (§2.3). CGUI-01: matches the
+   DS keyframe exactly (scale + opacity on the dot, not box-shadow); applied inline on the
+   NodeBadge dot at 3.2s var(--ease-in-out). */
 @keyframes lumina-corepulse {
-  0%, 100% { box-shadow: var(--glow-violet-soft); }
-  50%      { box-shadow: var(--glow-violet); }
+  0%, 100% { transform: scale(1);   opacity: 1; }
+  50%      { transform: scale(1.5); opacity: 0.55; }
 }
 .lumina-corepulse { animation: lumina-corepulse var(--dur-flow) var(--ease-in-out) infinite; }
 
@@ -396,61 +499,69 @@ body {
 .h-flex-1 { flex: 1; }
 .h-truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* Button — brand: gradient primary + glow, tonal secondary, ghost, danger (§2.3) */
+/* Button — brand: gradient primary + glow, tonal secondary, ghost, danger.
+   CGUI-01: reconciled EXACTLY to DS Button (_ds_bundle Button.jsx §8) — sizes carry
+   DS padding/radius/gap/font-size, weight semibold, primary adds shadow-sm, secondary
+   carries inset-hi + gradient hover, ghost text-200, danger 180deg .18/.06 / #FFD7DE. */
 .h-btn {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
-  padding: var(--space-1) var(--space-4);
-  border: none;
+  justify-content: center;
+  font-family: var(--font-sans);
+  border: var(--border-width) solid transparent;
   border-radius: var(--radius-md);
-  font-size: var(--fs-sm);
-  font-weight: var(--fw-medium);
+  font-weight: var(--fw-semibold);
+  line-height: 1;
   cursor: pointer;
   transition: opacity var(--dur-fast) var(--ease-out), box-shadow var(--dur-base) var(--ease-out),
+              background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out),
               transform var(--dur-fast) var(--ease-out), filter var(--dur-fast) var(--ease-out);
 }
-.h-btn:disabled { opacity: 0.45; cursor: default; }
+.h-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .h-btn:not(:disabled):active { transform: translateY(1px) scale(0.99); }
 
 .h-btn-primary,
 .h-btn-teal {
   background: var(--grad-accent);
   color: var(--accent-on);
-  box-shadow: var(--glow-violet-soft);
+  box-shadow: var(--glow-violet-soft), var(--shadow-sm);
 }
 .h-btn-primary:not(:disabled):hover,
 .h-btn-teal:not(:disabled):hover {
-  box-shadow: var(--glow-violet);
+  box-shadow: var(--glow-violet), var(--shadow-md);
   filter: brightness(1.08);
 }
 
 .h-btn-secondary {
   background: linear-gradient(180deg, var(--space-600), var(--space-700));
-  color: var(--text-primary);
+  color: var(--text-100);
   border: var(--border-width) solid var(--border-strong);
+  box-shadow: var(--inset-hi);
 }
-.h-btn-secondary:not(:disabled):hover { border-color: var(--accent-bright); }
+.h-btn-secondary:not(:disabled):hover {
+  border-color: var(--violet-400);
+  background: linear-gradient(180deg, var(--space-500), var(--space-600));
+}
 
 .h-btn-ghost {
   background: transparent;
-  color: var(--text-primary);
+  color: var(--text-200);
 }
-.h-btn-ghost:not(:disabled):hover { background: var(--bg-hover); }
+.h-btn-ghost:not(:disabled):hover { background: var(--bg-hover); color: var(--text-100); }
 
 .h-btn-danger,
 .h-btn-red {
-  background: linear-gradient(135deg, rgba(244, 63, 94, 0.28), rgba(244, 63, 94, 0.12));
-  color: #FFDDE3;
+  background: linear-gradient(180deg, rgba(244, 63, 94, 0.18), rgba(244, 63, 94, 0.06));
+  color: #FFD7DE;
   border: var(--border-width) solid rgba(244, 63, 94, 0.45);
 }
 
-.h-btn-green { background: var(--status-success); color: #0a0a0a; }
+.h-btn-green { background: var(--flux-green); color: var(--space-900); }
 
-/* Sizes: sm 6x12 / md 9x18 / lg 13x24 (§2.3) */
-.h-btn-sm { padding: 6px 12px; border-radius: var(--radius-sm); font-size: var(--fs-xs); }
-.h-btn-md { padding: 9px 18px; border-radius: var(--radius-md); font-size: var(--fs-sm); }
-.h-btn-lg { padding: 13px 24px; border-radius: var(--radius-md); font-size: var(--fs-body); }
+/* Sizes: DS sm 6x12 / md 9x18 / lg 13x24, gap 6/8/10, font-size fs-sm/fs-body/fs-body-lg */
+.h-btn-sm { padding: 6px 12px; border-radius: var(--radius-sm); font-size: var(--fs-sm); gap: 6px; }
+.h-btn-md { padding: 9px 18px; border-radius: var(--radius-md); font-size: var(--fs-body); gap: 8px; }
+.h-btn-lg { padding: 13px 24px; border-radius: var(--radius-md); font-size: var(--fs-body-lg); gap: 10px; }
 
 /* Table */
 .h-table { width: 100%; border-collapse: collapse; }
@@ -466,6 +577,79 @@ body {
 .h-table tr:last-child td { border-bottom: none; }
 .h-table tr:hover td { background: var(--bg-hover); }
 
+/* S127 TGUI2 POL-06/08 — dense professional data table (Cloudflare/Linear density).
+   Sortable header buttons, tighter rows, sticky header, expandable detail rows, pagination. */
+.h-dtable { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+.h-dtable thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--bg-panel);
+  color: var(--text-400);
+  font-family: var(--font-mono); font-size: var(--fs-mono-sm); font-weight: var(--fw-medium);
+  text-transform: uppercase; letter-spacing: var(--ls-label);
+  text-align: left; padding: 6px 10px;
+  border-bottom: var(--border-width) solid var(--border);
+  white-space: nowrap;
+}
+.h-dtable tbody td { padding: 5px 10px; border-bottom: var(--border-width) solid var(--line-soft); vertical-align: middle; }
+.h-dtable tbody tr:last-child td { border-bottom: none; }
+.h-dtable tbody tr.h-dtable-row:hover td { background: var(--bg-hover); }
+.h-dtable-num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right; }
+/* sortable header trigger */
+.h-dtable-sortbtn {
+  all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;
+  font: inherit; letter-spacing: inherit; text-transform: inherit; color: inherit; width: 100%;
+}
+.h-dtable-sortbtn:hover { color: var(--text-200); }
+.h-dtable-sortbtn:focus-visible { outline: var(--border-width) solid var(--accent); outline-offset: 2px; }
+.h-dtable-caret { font-size: 9px; line-height: 1; opacity: 0.5; }
+.h-dtable-caret[data-active="true"] { opacity: 1; color: var(--text-200); }
+/* expandable */
+.h-dtable-row-expandable td { cursor: pointer; }
+.h-dtable-chevron { display: inline-block; color: var(--text-tertiary); font-size: var(--fs-xs); transition: transform var(--dur-fast) var(--ease-out); }
+.h-dtable-chevron[data-open="true"] { transform: rotate(90deg); }
+.h-dtable-detail-td { padding: 0 !important; background: var(--space-800); }
+.h-dtable-detail-inner { padding: var(--space-3); border-bottom: var(--border-width) solid var(--border); }
+/* pagination footer */
+.h-dtable-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space-3);
+  padding-top: var(--space-2); flex-wrap: wrap;
+}
+.h-dtable-count { font-family: var(--font-mono); font-size: var(--fs-mono-sm); color: var(--text-400); }
+.h-pagebtn {
+  font-family: var(--font-mono); font-size: var(--fs-mono-sm);
+  background: var(--space-700); color: var(--text-secondary);
+  border: var(--border-width) solid var(--border); border-radius: var(--radius-sm);
+  padding: 3px 10px; cursor: pointer;
+}
+.h-pagebtn:hover:not(:disabled) { border-color: var(--line-accent); color: var(--text-primary); }
+.h-pagebtn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* S127 TGUI2 POL-07 — contextual toolbar (Linear pattern): neutral search + filters. */
+.h-toolbar { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+.h-toolbar-spacer { flex: 1 1 auto; }
+.h-input, .h-select {
+  background: var(--space-700); color: var(--text-primary);
+  border: var(--border-width) solid var(--border); border-radius: var(--radius-md);
+  padding: 5px 10px; font-size: var(--fs-sm);
+}
+.h-input::placeholder { color: var(--text-500); }
+.h-input:focus-visible, .h-select:focus-visible { outline: none; border-color: var(--line-accent); }
+.h-select { font-family: var(--font-mono); font-size: var(--fs-mono-sm); cursor: pointer; }
+/* neutral segmented control — subtle active state, never a rainbow at rest */
+.h-seg { display: inline-flex; gap: 2px; background: var(--space-800); border-radius: var(--radius-sm); padding: 2px; }
+.h-seg-btn {
+  font-family: var(--font-mono); font-size: var(--fs-mono-sm);
+  text-transform: uppercase; letter-spacing: var(--ls-label);
+  padding: 3px 10px; border-radius: var(--radius-xs); border: none; cursor: pointer;
+  background: transparent; color: var(--text-muted);
+}
+.h-seg-btn[data-active="true"] { background: var(--space-600); color: var(--text-primary); box-shadow: inset 0 0 0 1px var(--line-accent); }
+.h-seg-btn:hover:not([data-active="true"]) { color: var(--text-secondary); }
+
+/* S127 TGUI2 POL-08 — sequential color-ramp legend for the coverage heatmap. */
+.h-ramp-legend { display: flex; align-items: center; gap: var(--space-2); font-family: var(--font-mono); font-size: var(--fs-mono-sm); color: var(--text-400); }
+.h-ramp-bar { height: 8px; width: 120px; border-radius: var(--radius-pill); border: var(--border-width) solid var(--border); }
+
 /* Progress bar */
 .h-progress { height: 4px; border-radius: var(--radius-sm); background: var(--bg-surface-raised); overflow: hidden; }
 .h-progress-fill { height: 100%; border-radius: var(--radius-sm); transition: width 0.3s var(--ease-out); }
@@ -473,26 +657,31 @@ body {
 .h-progress-amber .h-progress-fill { background: var(--status-warning); }
 .h-progress-red .h-progress-fill { background: var(--status-error); }
 
-/* Badge/pill — brand tones at ~14% bg-tint + ~32% border (§2.3) */
+/* Badge/pill — CGUI-01: reconciled EXACTLY to DS Badge (_ds_bundle Badge.jsx §8):
+   fg/bg(.14)/border tones, radius-pill, padding 3px 10px, gap 6px, line-height 1.3,
+   non-mono fs-xs semibold ls .01em; mono fs-mono-sm medium ls .04em. */
 .h-badge {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: var(--space-1) var(--space-2);
+  gap: 6px;
+  padding: 3px 10px;
   border-radius: var(--radius-pill);
+  font-family: var(--font-sans);
   font-size: var(--fs-xs);
   font-weight: var(--fw-semibold);
-  letter-spacing: 0.04em;
+  letter-spacing: 0.01em;
+  line-height: 1.3;
+  white-space: nowrap;
   border: var(--border-width) solid transparent;
 }
-.h-badge-violet { background: rgba(124, 58, 237, 0.14); border-color: rgba(124, 58, 237, 0.32); color: var(--violet-300); }
+.h-badge-violet { background: rgba(168, 85, 247, 0.14); border-color: rgba(168, 85, 247, 0.32); color: var(--violet-300); }
 .h-badge-green, .h-badge-blue-green { background: rgba(16, 185, 129, 0.14); border-color: rgba(16, 185, 129, 0.32); color: var(--flux-green-soft); }
-.h-badge-amber { background: rgba(245, 158, 11, 0.14); border-color: rgba(245, 158, 11, 0.32); color: var(--flux-amber); }
-.h-badge-red, .h-badge-rose { background: rgba(244, 63, 94, 0.14); border-color: rgba(244, 63, 94, 0.32); color: var(--flux-rose); }
+.h-badge-amber { background: rgba(245, 158, 11, 0.14); border-color: rgba(245, 158, 11, 0.34); color: var(--flux-amber); }
+.h-badge-red, .h-badge-rose { background: rgba(244, 63, 94, 0.14); border-color: rgba(244, 63, 94, 0.34); color: var(--flux-rose-soft); }
 .h-badge-blue { background: rgba(59, 130, 246, 0.14); border-color: rgba(59, 130, 246, 0.32); color: var(--flux-blue-soft); }
-.h-badge-teal { background: var(--accent-primary-subtle); color: var(--accent-primary); }
-.h-badge-dim, .h-badge-neutral { background: var(--bg-surface-raised); border-color: var(--border); color: var(--text-secondary); }
-.h-badge-mono { font-family: var(--font-mono); letter-spacing: var(--ls-mono); }
+.h-badge-teal { background: var(--accent-soft); color: var(--accent); }
+.h-badge-dim, .h-badge-neutral { background: rgba(255, 255, 255, 0.05); border-color: var(--border); color: var(--text-300); }
+.h-badge-mono { font-family: var(--font-mono); font-size: var(--fs-mono-sm); font-weight: var(--fw-medium); letter-spacing: 0.04em; }
 
 /* Loading skeleton */
 @keyframes h-shimmer {

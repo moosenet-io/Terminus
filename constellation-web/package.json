@@ -5,9 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && vite build && node scripts/assert-http-bundle.mjs",
+    "build:verify": "npm run build",
+    "assert-http-bundle": "node scripts/assert-http-bundle.mjs",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint:adherence": "node scripts/adherence-lint.mjs"
   },
   "dependencies": {
     "@nivo/core": "0.99.0",
@@ -27,6 +31,7 @@
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
     "typescript": "^5.4.5",
-    "vite": "^5.3.1"
+    "vite": "^5.3.1",
+    "vitest": "^2.1.9"
   }
 }
