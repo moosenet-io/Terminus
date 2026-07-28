@@ -1678,16 +1678,13 @@ fn classify_target_kind(kind: Option<&Vec<Value>>) -> TargetLibVerdict {
 /// `manifest_path` is the manifest the gate will pass to `cargo test`.
 ///
 /// **Selection has to mirror `cargo test`'s, not just read every package.**
-/// `cargo metadata` reports every workspace member, but `cargo test
-/// --manifest-path X` with no `-p`/`--workspace` selects only the workspace's
-/// *default members*. A review caught the naive any-package version here: a
-/// library in an unselected sibling member would answer `true`, `--lib` would
-/// be passed, and cargo would then fail on the binary-only package it actually
-/// selected — reintroducing the very bug this function exists to prevent. So
-/// selection follows cargo's precedence: the package this manifest *defines*
-/// wins, and `workspace_default_members` applies only when the manifest
-/// defines none (a virtual workspace root), falling back last to "all
-/// packages".
+/// `cargo metadata` reports every workspace member, but `cargo test` with no
+/// `-p`/`--workspace` selects only some of them — so counting a library in an
+/// unselected sibling would keep `--lib` and then fail on the binary-only
+/// package cargo actually selected, reintroducing the very bug this function
+/// exists to prevent. `workspace_default_members` is cargo's own computed
+/// answer for the given manifest and is used directly; see the inline comment
+/// for the experiment that established this.
 ///
 /// Anything unparseable or unrecognised answers `true` — the safe direction,
 /// since a wrong `false` silently drops library tests.
@@ -1699,49 +1696,62 @@ fn metadata_reports_lib_target(metadata_json: &str, manifest_path: &std::path::P
         return true;
     };
 
-    // Mirror cargo's own package selection, in cargo's own precedence order.
+    // Mirror cargo's own package selection by simply believing cargo.
     //
-    // Round 4 caught this the wrong way round. `--manifest-path` pointing at a
-    // package manifest selects THAT package — `workspace_default_members` is
-    // only what cargo falls back to when the manifest defines no package of
-    // its own, i.e. a *virtual* workspace root. Preferring default-members
-    // unconditionally got both directions wrong: it could drop `--lib` for a
-    // selected member that has a library, and keep `--lib` for a selected
-    // binary-only member whose sibling has one.
-    let selected: Vec<&Value> = {
-        // 1. The package this exact manifest defines, if any.
-        let by_manifest: Vec<&Value> = packages
-            .iter()
-            .filter(|p| {
-                p.get("manifest_path")
-                    .and_then(Value::as_str)
-                    .is_some_and(|mp| std::path::Path::new(mp) == manifest_path)
-            })
-            .collect();
-        if !by_manifest.is_empty() {
-            by_manifest
-        } else {
-            // 2. Virtual workspace root: cargo selects the default members.
-            v.get("workspace_default_members")
-                .and_then(Value::as_array)
-                .map(|ids| {
-                    let want: std::collections::HashSet<&str> =
-                        ids.iter().filter_map(Value::as_str).collect();
-                    packages
-                        .iter()
-                        .filter(|p| {
-                            p.get("id")
-                                .and_then(Value::as_str)
-                                .is_some_and(|id| want.contains(id))
-                        })
-                        .collect::<Vec<_>>()
+    // This went back and forth across two review rounds, so it was settled
+    // EMPIRICALLY rather than by reasoning about the docs. Constructing a
+    // workspace whose non-virtual root package has a lib, with
+    // `default-members = ["member-a"]` where member-a is binary-only:
+    //
+    //   $ cargo test --lib                      # at the root
+    //   error: no library targets found in package `member-a`
+    //
+    // so cargo selected the DEFAULT MEMBER, not the root package that owns the
+    // manifest — a manifest-match-first rule gets this wrong. And pointing at
+    // a non-default member that does have a lib:
+    //
+    //   $ cargo test --lib --manifest-path member-b/Cargo.toml   # succeeds
+    //   $ cargo metadata --manifest-path member-b/Cargo.toml
+    //     workspace_default_members: ["member-b"]
+    //
+    // The key observation: cargo RECOMPUTES `workspace_default_members`
+    // relative to the manifest it was given. It is therefore already the
+    // authoritative answer for the selection that the matching `cargo test
+    // --manifest-path <same>` will make, in every case — root or member,
+    // virtual or not, explicit default-members or not. Nothing needs to be
+    // re-derived on top of it.
+    let selected: Vec<&Value> = v
+        .get("workspace_default_members")
+        .and_then(Value::as_array)
+        .map(|ids| {
+            let want: std::collections::HashSet<&str> =
+                ids.iter().filter_map(Value::as_str).collect();
+            packages
+                .iter()
+                .filter(|p| {
+                    p.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| want.contains(id))
                 })
-                .filter(|v: &Vec<&Value>| !v.is_empty())
-                // 3. Nothing matched (older cargo, unexpected shape): consider
-                //    everything, which errs toward keeping `--lib`.
-                .unwrap_or_else(|| packages.iter().collect())
-        }
-    };
+                .collect::<Vec<_>>()
+        })
+        .filter(|v: &Vec<&Value>| !v.is_empty())
+        .or_else(|| {
+            // Older cargo (< 1.71) omits the field: fall back to the package
+            // this manifest defines.
+            let hit: Vec<&Value> = packages
+                .iter()
+                .filter(|p| {
+                    p.get("manifest_path")
+                        .and_then(Value::as_str)
+                        .is_some_and(|mp| std::path::Path::new(mp) == manifest_path)
+                })
+                .collect();
+            (!hit.is_empty()).then_some(hit)
+        })
+        // Last resort: everything cargo returned, which errs toward keeping
+        // `--lib`.
+        .unwrap_or_else(|| packages.iter().collect());
 
     selected.iter().any(|p| match p.get("targets").and_then(Value::as_array) {
         // A package with no `targets` is a shape cargo should never emit, so
@@ -5273,35 +5283,41 @@ mod tests {
     }
 
     #[test]
-    fn metadata_probe_selects_the_member_the_manifest_points_at_not_the_default_members() {
-        // Round-4 finding, both directions. --manifest-path at a member selects
-        // THAT member; workspace_default_members is only cargo's fallback when
-        // the manifest defines no package of its own.
-        let core_manifest = std::path::Path::new("/s/core/Cargo.toml");
+    fn metadata_probe_follows_workspace_default_members_even_for_a_root_package() {
+        // Measured against real cargo, not inferred. A non-virtual root whose
+        // OWN package has a lib, with default-members pointing at a binary-only
+        // member: `cargo test --lib` at that root fails with "no library
+        // targets found in package `member-a`". So the default member is what
+        // cargo selects, and a manifest-match-first rule would wrongly keep
+        // --lib here.
         let json = format!(
-            r#"{{"packages":[{},{}],"workspace_default_members":["app"],"version":1}}"#,
-            pkg("app", r#"{"name":"app","kind":["bin"]}"#),
-            pkg("core", r#"{"name":"core","kind":["lib"]}"#),
-        );
-        // Selecting the library member must KEEP --lib even though the default
-        // member is binary-only.
-        assert!(
-            metadata_reports_lib_target(&json, core_manifest),
-            "selecting a member with a lib must keep --lib"
-        );
-
-        // And selecting the binary-only member must DROP --lib even though a
-        // default member elsewhere has a library.
-        let json2 = format!(
-            r#"{{"packages":[{},{}],"workspace_default_members":["core"],"version":1}}"#,
-            pkg("app", r#"{"name":"app","kind":["bin"]}"#),
-            pkg("core", r#"{"name":"core","kind":["lib"]}"#),
+            r#"{{"packages":[{},{}],"workspace_default_members":["member-a"],"version":1}}"#,
+            r#"{"id":"member-a","name":"member-a","manifest_path":"/s/member-a/Cargo.toml","targets":[{"name":"member-a","kind":["bin"]}]}"#,
+            r#"{"id":"rootpkg","name":"rootpkg","manifest_path":"/s/Cargo.toml","targets":[{"name":"rootpkg","kind":["lib"]}]}"#,
         );
         assert!(
-            !metadata_reports_lib_target(&json2, std::path::Path::new("/s/app/Cargo.toml")),
-            "selecting a binary-only member must drop --lib"
+            !metadata_reports_lib_target(&json, std::path::Path::new("/s/Cargo.toml")),
+            "cargo selects the default member, so --lib must be dropped even \
+             though the root package itself has a lib"
         );
     }
+
+    #[test]
+    fn metadata_probe_trusts_the_recomputed_default_members_for_a_member_manifest() {
+        // The other measured half: pointing at a non-default member that HAS a
+        // lib, cargo recomputes workspace_default_members to that member and
+        // `cargo test --lib --manifest-path member-b/Cargo.toml` succeeds.
+        let json = format!(
+            r#"{{"packages":[{},{}],"workspace_default_members":["member-b"],"version":1}}"#,
+            r#"{"id":"member-a","name":"member-a","manifest_path":"/s/member-a/Cargo.toml","targets":[{"name":"member-a","kind":["bin"]}]}"#,
+            r#"{"id":"member-b","name":"member-b","manifest_path":"/s/member-b/Cargo.toml","targets":[{"name":"member-b","kind":["lib"]}]}"#,
+        );
+        assert!(
+            metadata_reports_lib_target(&json, std::path::Path::new("/s/member-b/Cargo.toml")),
+            "the selected member has a lib, so --lib must be kept"
+        );
+    }
+
 
     #[test]
     fn metadata_probe_uses_default_members_only_for_a_virtual_workspace_root() {
