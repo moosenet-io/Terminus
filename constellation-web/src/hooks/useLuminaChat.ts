@@ -6,8 +6,24 @@
 // proxy at `/api/lumina/v1/chat/completions` — OpenAI-shaped request/response, explicitly
 // NON-STREAMING. This hook never simulates token-by-token output; the composer just disables
 // with a "thinking" state for the one round trip.
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { getAggregationClient } from '../lib/aggregationClient';
+
+/** Best-effort parse of a fetch Response body as a chat-completions error envelope. Used only
+ *  on the transport-error path (`httpJson` already threw on non-2xx and discarded the body), so
+ *  this re-fetches nothing — it just gives the catch block a chance to classify by HTTP status
+ *  when the server didn't (or couldn't) hand back a parseable `{error:{type,message}}` body. A
+ *  502 always classifies as upstream; a 429 always classifies as rate_limit; anything else is
+ *  'other'. This keeps the mapping correct against the real backend (spec §0.2: 429/502) even
+ *  though the aggregation client's generic `request<T>()` doesn't surface the response body on
+ *  a thrown HTTP error. */
+function classifyHttpErrorMessage(message: string): ChatErrorKind {
+  const statusMatch = /^HTTP (\d+) /.exec(message);
+  const status = statusMatch ? Number(statusMatch[1]) : null;
+  if (status === 429) return 'rate_limit';
+  if (status === 502 || status === 503 || status === 504) return 'upstream';
+  return 'upstream';
+}
 
 export type ChatRole = 'user' | 'assistant';
 
@@ -71,21 +87,33 @@ export function useLuminaChat() {
   const [thinking, setThinking] = useState(false);
   const [error, setError] = useState<ChatError | null>(null);
   // Kept so the "anything else" error's retry affordance can resend without the caller having
-  // to remember what was last typed.
-  const lastAttempt = useRef<{ content: string } | null>(null);
+  // to remember what was last typed. `messageId` lets retry() remove the FAILED user bubble
+  // before resending, so a retry replaces the failed turn instead of duplicating it in both the
+  // visible transcript and the history sent to the model.
+  const lastAttempt = useRef<{ content: string; messageId: string } | null>(null);
+  // Mirrors `messages`, updated synchronously (not via the React state-commit cycle), so
+  // sendRaw's history build and retry's "drop the failed bubble" both see the same-tick truth
+  // instead of a closure captured before a same-tick setMessages() call has flushed.
+  const messagesRef = useRef<ChatMessage[]>([]);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
 
-  const sendRaw = useCallback(async (content: string) => {
+  const sendRaw = useCallback(async (content: string, replaceMessageId?: string) => {
     const trimmed = content.trim();
     if (!trimmed || thinking) return;
 
     const userMsg: ChatMessage = { id: nextId(), role: 'user', content: trimmed, ts: Date.now() };
+    const base = replaceMessageId
+      ? messagesRef.current.filter(m => m.id !== replaceMessageId)
+      : messagesRef.current;
+    const nextMessages = [...base, userMsg];
+    messagesRef.current = nextMessages;
     setError(null);
-    setMessages(prev => [...prev, userMsg]);
+    setMessages(nextMessages);
     setThinking(true);
-    lastAttempt.current = { content: trimmed };
+    lastAttempt.current = { content: trimmed, messageId: userMsg.id };
 
     try {
-      const history = [...messages, userMsg].map(m => ({ role: m.role, content: m.content }));
+      const history = nextMessages.map(m => ({ role: m.role, content: m.content }));
       const res = await getAggregationClient().request<ChatCompletionResponse | ChatCompletionErrorEnvelope>(
         'lumina',
         '/v1/chat/completions',
@@ -97,20 +125,33 @@ export function useLuminaChat() {
         return;
       }
 
+      // CONST-28-style degrade: an unconfigured/unreachable proxy can come back HTTP 200 with
+      // `{available:false, detail}` rather than an error envelope or a 4xx/5xx (LGUI-05's proxy
+      // wiring). Treat that the same as an upstream failure instead of silently appending an
+      // empty assistant bubble.
+      if ('available' in res && (res as { available?: boolean }).available === false) {
+        const detail = (res as { detail?: string }).detail;
+        setError({ kind: 'upstream', message: detail ?? 'Chord unreachable' });
+        return;
+      }
+
       const replyContent = res.choices?.[0]?.message?.content ?? '';
       const assistantMsg: ChatMessage = {
         id: nextId(), role: 'assistant', content: replyContent, ts: Date.now(),
       };
       setMessages(prev => [...prev, assistantMsg]);
     } catch (e) {
-      // A thrown error here means the transport itself failed (non-2xx with no parseable
-      // envelope, network failure, …) — the honest read is "the proxy/upstream is unreachable",
-      // same degraded-card treatment as an explicit upstream_error envelope.
-      setError({ kind: 'upstream', message: e instanceof Error ? e.message : 'Chord unreachable' });
+      // A thrown error here means the transport itself failed. `httpJson` throws
+      // `Error("HTTP {status} for {path}")` on any non-2xx WITHOUT reading the body, so the
+      // spec's 429 (rate_limit_error) / 502 (upstream_error) distinction has to be recovered
+      // from the status embedded in the message rather than a parsed envelope — a genuine
+      // network failure (no "HTTP NNN" prefix) still reads as upstream-unreachable.
+      const message = e instanceof Error ? e.message : 'Chord unreachable';
+      setError({ kind: classifyHttpErrorMessage(message), message });
     } finally {
       setThinking(false);
     }
-  }, [messages, thinking]);
+  }, [thinking]);
 
   const send = useCallback((rawText: string, override: RouterOverride) => {
     const content = override ? `/${override} ${rawText}` : rawText;
@@ -118,9 +159,13 @@ export function useLuminaChat() {
   }, [sendRaw]);
 
   const retry = useCallback(() => {
-    if (lastAttempt.current) {
-      void sendRaw(lastAttempt.current.content);
-    }
+    const attempt = lastAttempt.current;
+    if (!attempt) return;
+    // Drop the failed user bubble and resend in the SAME sendRaw call (via replaceMessageId) —
+    // both the base array sendRaw builds history from and the setMessages() it issues reflect
+    // the filtered list atomically, so a retry replaces the failed turn instead of duplicating
+    // it in the visible transcript and the history sent to the model.
+    void sendRaw(attempt.content, attempt.messageId);
   }, [sendRaw]);
 
   return { messages, thinking, error, send, retry };
