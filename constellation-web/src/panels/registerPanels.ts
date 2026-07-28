@@ -38,6 +38,7 @@ import { ChatPanel } from './lumina/ChatPanel';
 import { FleetPanel } from './terminus/FleetPanel';
 import { ToolsPanel } from './terminus/ToolsPanel';
 import { ActivityPanel } from './terminus/ActivityPanel';
+import { PersonaPanel } from './lumina/PersonaPanel';
 import { MemoryPanel } from './lumina/MemoryPanel';
 import { EngineDiagramPanel } from './status/EngineDiagramPanel';
 import { DashboardPanel } from './harmony/DashboardPanel';
@@ -409,6 +410,17 @@ registerPanel({
   icon: '\u{1F9E0}',
   available: true,
   component: MemoryPanel,
+});
+
+// LGUI-09 (§2/§3.4): Persona & Behavior — traits, digest, active context, prompt layers.
+registerPanel({
+  id: 'lumina.persona',
+  system: 'lumina',
+  title: 'Persona',
+  path: '/lumina/persona',
+  icon: '🎭',
+  available: true,
+  component: PersonaPanel,
 });
 
 // ── Palette commands (CONST-25) ────────────────────────────────────────────────

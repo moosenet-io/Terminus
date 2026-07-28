@@ -15,6 +15,18 @@
 // unconfigured build degrades to real-backend-with-empty-states, never silent fake data.
 // This is deliberately the *only* seam CONST-02 (the real Terminus-side aggregation layer)
 // needs to fill in — the httpAdapter below defines exactly the endpoints/shapes it must serve.
+//
+// LGUI-09: persona mock data/types live in `../types/lumina` (shared Lumina domain-type file
+// sibling build items also land their own §7 types in) and are used only via the generic
+// `request<T>('lumina', path)` escape hatch below — no new typed `AggregationClient` method
+// needed for this item, same convention as the Muse module's read routes.
+import { PERSONA_DEFAULT_BOUNDS, LUMINA_PROMPT_LAYER_ORDER } from '../types/lumina';
+import type {
+  LuminaPersonaResponse,
+  LuminaPersonaTraitsWriteBody,
+  LuminaPersonaContextWriteBody,
+  LuminaTraitVector,
+} from '../types/lumina';
 
 // LGUI-08 (§3.3): the Memory browser panel's search-param application lives in
 // `panels/lumina/memorySearch.ts` (pure, unit-tested) rather than inline here — this file just
@@ -575,6 +587,54 @@ const MOCK_MUSE_GROUP_DYNAMICS = {
   ],
 };
 
+// ── Mock data for the Lumina Persona & Behavior panel (LGUI-09, §7/§0.1.1) ───────────────
+// `MOCK_LUMINA_PERSONA` is intentionally `let` (not `const`) — unlike most mock fixtures, the
+// panel's PUT /persona/traits and /persona/context mutations update it in place below, so a
+// refetch after a save shows the just-saved values (proves the diff-preview save round-trips,
+// not just posts-and-forgets).
+
+function clampTrait(v: number): number {
+  return Math.min(PERSONA_DEFAULT_BOUNDS.max, Math.max(PERSONA_DEFAULT_BOUNDS.min, v));
+}
+
+function effectiveTraits(base: LuminaTraitVector, modifier: LuminaTraitVector): LuminaTraitVector {
+  return {
+    flair: clampTrait(base.flair + modifier.flair),
+    spontaneity: clampTrait(base.spontaneity + modifier.spontaneity),
+    humor: clampTrait(base.humor + modifier.humor),
+    focus: clampTrait(base.focus + modifier.focus),
+  };
+}
+
+// Bytes are rough/plausible, largest for the layers most likely to carry live content
+// (personality/knowledge/context); `memory` disabled to exercise the Layer Inspector's
+// enabled/disabled rendering (§3.4) without needing a special-cased mock.
+const MOCK_LUMINA_PERSONA_LAYER_BYTES: Record<string, number> = {
+  identity: 412, rules: 1180, capabilities: 860, style: 240, personality: 96,
+  opinions: 512, knowledge: 2048, context: 640, memory: 0, proactive: 128, now: 48,
+};
+
+let MOCK_LUMINA_PERSONA: LuminaPersonaResponse = (() => {
+  const base: LuminaTraitVector = { flair: 0.70, spontaneity: 0.55, humor: 0.65, focus: 0.75 };
+  const modifier: LuminaTraitVector = { flair: 0.05, spontaneity: -0.10, humor: 0.00, focus: 0.02 };
+  return {
+    traits: { base, modifier, effective: effectiveTraits(base, modifier) },
+    bounds: { ...PERSONA_DEFAULT_BOUNDS },
+    knowledge_digest:
+      'Prefers concise, direct answers. Works primarily in Rust and TypeScript. Runs a small '
+      + 'self-hosted fleet (moosenet) across several hosts; cares about local-inference-first '
+      + 'design and avoiding hardcoded secrets.',
+    active_context:
+      'Currently heads-down on the Lumina GUI build (LGUI series) — persona/behavior panel, '
+      + 'onboarding wizard, and the rest of the module surface.',
+    layers: LUMINA_PROMPT_LAYER_ORDER.map(name => ({
+      name,
+      bytes: MOCK_LUMINA_PERSONA_LAYER_BYTES[name] ?? 0,
+      enabled: name !== 'memory',
+    })),
+  };
+})();
+
 // ── Mock data for the Lumina module (LGUI-01/02 backend, LGUI-06 builds its Overview
 // panel against these shapes -- verified §7 response sketches, LUMINA-GUI-SPEC.md) ──────────
 
@@ -766,7 +826,13 @@ const MOCK_GET: Record<string, unknown> = {
   'muse /api/graph/watch-history': MOCK_MUSE_WATCH_HISTORY,
   'muse /api/graph/group-dynamics': MOCK_MUSE_GROUP_DYNAMICS,
   'muse /guide': MOCK_MUSE_GUIDE,
+  // `/status` is ONE real endpoint; LGUI-09's PersonaPanel only reads a narrow slice
+  // (`LuminaPersonaStatusFlags` -- onboarding_complete/dynamic_prompt) of the SAME response
+  // LGUI-06's Overview panel reads in full (`LuminaStatus`). `MOCK_LUMINA_STATUS` is a superset
+  // containing both fields, so it serves both consumers -- no separate narrow mock needed
+  // (LGUI-06/LGUI-09 reconciliation; the persona-only `MOCK_LUMINA_PERSONA_STATUS` was dropped).
   'lumina /status': MOCK_LUMINA_STATUS,
+  'lumina /persona': MOCK_LUMINA_PERSONA,
   // LGUI-08 (§3.3/§7): the stats route has no query-dependent shape, so it's a plain lookup;
   // `/engram/search` DOES depend on the query string and is handled in `mockGetFor` below
   // (same pattern as `lumina /analytics`'s `view` param elsewhere in this file's history).
@@ -869,10 +935,47 @@ function mockLuminaChatReply(body: string | undefined): unknown {
   };
 }
 
-/** POST/PUT-style mock acks — every write in the mock world just succeeds with a canned shape. */
+/** POST/PUT-style mock acks — every write in the mock world just succeeds with a canned shape.
+ *  `body` is the RAW JSON string (the http adapter always sends `JSON.stringify(...)`, so the
+ *  mock adapter must match that shape) — any handler that needs the parsed content (persona
+ *  traits/context saves, the chat reply trigger-phrase matching) parses it itself, best-effort,
+ *  same "malformed body falls through to a default" convention `mockLuminaChatReply` already
+ *  established. LGUI-09 review fix: the original persona-write handlers cast `body` directly to
+ *  the typed request shape without parsing it — since `body` is always a string here, that read
+ *  `req.base`/`req.modifier` off a `string`, silently falling back to the existing fixture on
+ *  every save (never actually applying an edit). Fixed by parsing first, same as chat's handler. */
 function mockWriteFor(system: SystemId, pathname: string, body?: string): unknown {
   if (system === 'lumina' && pathname === '/v1/chat/completions') {
     return mockLuminaChatReply(body);
+  }
+  // LGUI-09 (§7): PUT /persona/traits — applies whichever of base/modifier the diff-preview
+  // save sent, re-clamps, mutates the in-memory fixture so a refetch shows the saved values.
+  if (system === 'lumina' && pathname === '/persona/traits') {
+    let req: LuminaPersonaTraitsWriteBody = {};
+    try {
+      req = body ? JSON.parse(body) as LuminaPersonaTraitsWriteBody : {};
+    } catch {
+      // Malformed body in mock mode — fall through to the existing fixture values.
+    }
+    const base = req.base ?? MOCK_LUMINA_PERSONA.traits.base;
+    const modifier = req.modifier ?? MOCK_LUMINA_PERSONA.traits.modifier;
+    const effective = effectiveTraits(base, modifier);
+    MOCK_LUMINA_PERSONA = {
+      ...MOCK_LUMINA_PERSONA,
+      traits: { base, modifier, effective },
+    };
+    return { base, modifier, effective };
+  }
+  // LGUI-09 (§7): PUT /persona/context — active-context write.
+  if (system === 'lumina' && pathname === '/persona/context') {
+    let req: LuminaPersonaContextWriteBody = { active_context: '' };
+    try {
+      req = body ? JSON.parse(body) as LuminaPersonaContextWriteBody : { active_context: '' };
+    } catch {
+      // Malformed body in mock mode — fall through to an empty context write.
+    }
+    MOCK_LUMINA_PERSONA = { ...MOCK_LUMINA_PERSONA, active_context: req.active_context ?? '' };
+    return { active_context: MOCK_LUMINA_PERSONA.active_context };
   }
   if (system === 'harmony' && pathname === '/engine/stop') {
     return { state: 'stopped', pid: null, active_count: 0, uptime_secs: 0, stop_reason: 'mock', executor_active: false };

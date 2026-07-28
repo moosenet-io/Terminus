@@ -13,6 +13,13 @@
 // §4.4 floor (hover/tooltip/table-twin/keyboard), so it stays on Recharts like every other
 // chart in this barrel today. Still governed by the same 4-series all-pairs cap (§4.2)
 // regardless of library.
+//
+// LGUI-09 addition: RadarChart/PolarGrid/PolarAngleAxis/PolarRadiusAxis/Radar — the trait
+// radar (§3.4/§8, "4-axis radar thumbnail ... mirrors the sliders"). No radar wrapper existed
+// in this barrel yet as of this build (CONST-22, which was expected to add the general
+// all-pairs radar/boxplot/heatmap forms, is unmerged) — same Recharts-not-nivo call as the
+// scatter addition above, for the same reason (this chart doesn't need nivo's lazy `viz`
+// chunk to satisfy the §4.4 floor). See `RadarChart.tsx` for the kit wrapper built on these.
 export {
   LineChart,
   Line,
@@ -23,6 +30,11 @@ export {
   ScatterChart,
   Scatter,
   ZAxis,
+  RadarChart as RechartsRadarChart,
+  PolarGrid,
+  PolarAngleAxis,
+  PolarRadiusAxis,
+  Radar,
   XAxis,
   YAxis,
   CartesianGrid,
