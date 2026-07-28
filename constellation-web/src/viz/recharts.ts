@@ -37,12 +37,9 @@ export {
   Radar,
   XAxis,
   YAxis,
-  ZAxis,
   CartesianGrid,
   Tooltip,
   Legend,
   ResponsiveContainer,
   Cell,
-  ScatterChart,
-  Scatter,
 } from 'recharts';
