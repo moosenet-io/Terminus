@@ -103,6 +103,29 @@ fn enc_path(v: &str) -> String {
     v.split('/').map(enc).collect::<Vec<_>>().join("/")
 }
 
+/// PCON-11: normalize a Gitea `compare` basehead to THREE-dot semantics so the
+/// review/gate diff is `merge-base(base, head)..head` — the branch's OWN changes
+/// only. A two-dot `base..head` shows EVERY file the base gained since the branch
+/// point once `main` advances, polluting `derive_changed_files` (KGREV-01
+/// grounding + Cortex scope) with unrelated files. This rewrites a caller-
+/// supplied two-dot range to three-dot; an explicit three-dot range is left
+/// unchanged, and a value with no `..` range separator (a single ref) is
+/// returned verbatim. Refs that merely contain dots (e.g. `v1.2..v1.3`) are
+/// handled by splitting on the FIRST `..` separator.
+pub(crate) fn normalize_compare_three_dot(basehead: &str) -> String {
+    if basehead.contains("...") {
+        return basehead.to_string();
+    }
+    if let Some(idx) = basehead.find("..") {
+        let base = &basehead[..idx];
+        let head = &basehead[idx + 2..];
+        if !base.is_empty() && !head.is_empty() {
+            return format!("{base}...{head}");
+        }
+    }
+    basehead.to_string()
+}
+
 /// True if `v`, interpreted as a URL path, contains a `.`/`..` traversal segment
 /// in either raw OR percent-encoded form. Splits on both `/` and `\` because
 /// WHATWG URL normalisation for http(s) schemes treats a backslash as a segment
@@ -580,7 +603,12 @@ impl GiteaForge {
                 get(format!("/repos/{owner}/{}/commits?sha={sha}&limit={limit}&page={page}", repo()?)).await
             }
             CommitsGet => get(format!("/repos/{owner}/{}/git/commits/{}", repo()?, enc(s("sha")?))).await,
-            CommitsCompareDiff => get(format!("/repos/{owner}/{}/compare/{}", repo()?, enc_path(s("basehead")?))).await,
+            CommitsCompareDiff => {
+                // PCON-11: force three-dot (merge-base) compare so an advanced
+                // base never surfaces unrelated files in the review/gate diff.
+                let basehead = normalize_compare_three_dot(s("basehead")?);
+                get(format!("/repos/{owner}/{}/compare/{}", repo()?, enc_path(&basehead))).await
+            }
             CommitsStatus => get(format!("/repos/{owner}/{}/commits/{}/status", repo()?, enc(s("sha")?))).await,
 
             // ── Pull / merge requests ───────────────────────────────────────────
@@ -1230,6 +1258,27 @@ mod tests {
         assert!(!has_traversal_segment("v1.2.3"));
         assert!(!has_traversal_segment("heads/main"));
         assert!(!has_traversal_segment("base...head"));
+    }
+
+    #[test]
+    fn compare_basehead_is_normalized_to_three_dot() {
+        // PCON-11: a two-dot range becomes three-dot (merge-base diff).
+        assert_eq!(normalize_compare_three_dot("main..feat/x"), "main...feat/x");
+        assert_eq!(
+            normalize_compare_three_dot("abc123..def456"),
+            "abc123...def456"
+        );
+        // An explicit three-dot range is left unchanged.
+        assert_eq!(normalize_compare_three_dot("main...feat/x"), "main...feat/x");
+        // A single ref (no range separator) is returned verbatim.
+        assert_eq!(normalize_compare_three_dot("main"), "main");
+        // Dotted ref names split on the FIRST `..` separator, not on a version dot.
+        assert_eq!(normalize_compare_three_dot("v1.2..v1.3"), "v1.2...v1.3");
+        // A degenerate range with an empty side is left as-is (not our case to fix).
+        assert_eq!(normalize_compare_three_dot("..head"), "..head");
+        assert_eq!(normalize_compare_three_dot("base.."), "base..");
+        // Still passes the traversal guard after normalization.
+        assert!(!has_traversal_segment(&normalize_compare_three_dot("main..feat/x")));
     }
 
     #[tokio::test]

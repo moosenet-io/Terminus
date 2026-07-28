@@ -30,7 +30,7 @@
 //! [`crate::approval::gate`] itself at the top of `execute_structured`
 //! (after the statement-class + destructive-shape checks, before any DB
 //! connection is attempted) — matching the `pg_admin`/`openhands`/
-//! `<secret-manager>` precedent: the tool owns its own gate call as the real
+//! `<secret-manager>` precedent: the tool owns its own gate call as the real // pii-test-fixture: public product name, sanctioned secrets-manager module (see infra_service_path_exempt rationale)
 //! enforcement point; `GUARDED_BARE_NAMES` is a second, gateway-level
 //! classification used for federated dispatch, not the only place the
 //! approval requirement is enforced.

@@ -250,7 +250,13 @@ function domIdFor(key: string): string {
                       fontStyle: row.degraded ? 'italic' : 'normal',
                     }}
                   >
-                    {row.icon && <span aria-hidden>{row.icon}</span>}
+                    {/* POL-13 (§9, no-emoji): a neutral node-dot marker replaces the per-row
+                        emoji glyph — the DS's own icon language, consistent across nav/action/
+                        entity rows. */}
+                    <span
+                      aria-hidden
+                      style={{ width: 6, height: 6, borderRadius: '50%', flexShrink: 0, alignSelf: 'center', background: row.key === activeKey ? 'var(--accent-primary)' : 'var(--text-500)' }}
+                    />
                     <span style={{ flex: 1 }}>{row.label}</span>
                     {row.sublabel && <span style={{ color: 'var(--text-tertiary)', fontSize: 'var(--text-xs)' }}>{row.sublabel}</span>}
                   </div>

@@ -380,6 +380,60 @@ impl HfHubClient {
         Ok(results)
     }
 
+    /// Fetch one repo's model-info metadata from HF Hub's PUBLIC per-model
+    /// endpoint (`GET {base_url}/api/models/{repo}?blobs=true`), returning the
+    /// raw JSON object for the Ask-4 measure step to parse
+    /// (`crate::intake::discovery::measure`). This is METADATA ONLY — it reads
+    /// the model card's `safetensors.total` param count and `siblings[]` file
+    /// sizes; it NEVER downloads model weights (that remains DISC-08's separate,
+    /// authenticated concern). Same PUBLIC trust boundary as `list_models`: no
+    /// bearer token, no `HF_TOKEN`, required or read here — the model-info
+    /// endpoint is anonymous-readable for public repos, so this measure path,
+    /// like the listing path, deliberately holds no credential (see this
+    /// module's "Public listing vs. DISC-08's authenticated fetch" doc). The
+    /// `?blobs=true` variant asks HF to include per-file byte `size`s in
+    /// `siblings[]`, which the measure step sums for a rough VRAM footprint.
+    ///
+    /// Reuses the shared throttle + per-request timeout. Typed failures mirror
+    /// `list_models`: any non-2xx is [`HfListError::Failed`] (a 404 for a
+    /// gated/removed repo is just a `Failed { status: 404, .. }` the caller
+    /// treats as "unmeasurable, skip"), transport failure is
+    /// [`HfListError::Unreachable`].
+    pub async fn get_model_info(&self, repo: &str) -> Result<serde_json::Value, HfListError> {
+        self.throttle().await;
+        let url = format!(
+            "{}/api/models/{}?blobs=true",
+            self.base_url,
+            // Percent-encode each path segment but keep the '/' between org and
+            // model, matching how HF's own model-info URLs are shaped.
+            repo.split('/').map(urlencode).collect::<Vec<_>>().join("/"),
+        );
+        let resp = match self.client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(HfListError::Unreachable {
+                    detail: format!("request to HF Hub model-info failed: {e}"),
+                })
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(HfListError::Failed {
+                status: status.as_u16(),
+                detail: if body_text.is_empty() {
+                    format!("HTTP {status}")
+                } else {
+                    body_text.chars().take(300).collect()
+                },
+            });
+        }
+        resp.json::<serde_json::Value>().await.map_err(|e| HfListError::Failed {
+            status: status.as_u16(),
+            detail: format!("could not parse HF Hub model-info as JSON: {e}"),
+        })
+    }
+
     fn first_page_url(&self, mapping: &HfCategoryMapping) -> String {
         let mut url = format!(
             "{}/api/models?pipeline_tag={}&sort=trendingScore&direction=-1&limit={}",

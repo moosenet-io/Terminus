@@ -4,11 +4,15 @@
 // elsewhere in the app (that's an acceptance-criterion grep check, keep it true).
 //
 // Two implementations of the same typed interface:
-//   - mockAdapter: canned in-memory data, no network. Default — lets the app build/run/typecheck
-//     with no backend present.
 //   - httpAdapter: real same-origin fetch against `/api/{system}/...`, cookie-based session auth.
+//   - mockAdapter: canned in-memory data, no network — for explicit offline/dev use only.
 //
-// Selection is via `import.meta.env.VITE_AGG_MODE` ('mock' | 'http'), default 'mock'.
+// S127 TGUI2 (Part B) — adapter selection, http-default + runtime-selectable (see resolveMode
+// at the bottom of this file). The old build-time-only switch defaulted to `mock`, so a
+// production build that forgot `VITE_AGG_MODE=http` shipped the ENTIRE app as fixtures (the
+// "4-5 items / smoke-and-mirrors" defect). The default is now INVERTED: any build served to a
+// browser talks to the real backend (http); `mock` must be explicitly opted into. So an
+// unconfigured build degrades to real-backend-with-empty-states, never silent fake data.
 // This is deliberately the *only* seam CONST-02 (the real Terminus-side aggregation layer)
 // needs to fill in — the httpAdapter below defines exactly the endpoints/shapes it must serve.
 
@@ -17,6 +21,31 @@
 // wires it into the mock `/engram/search` route below.
 import { applyMemorySearchParams } from '../panels/lumina/memorySearch';
 import type { Memory, LuminaMemoryStats, MemoryType, SensitivityCategory } from '../types/luminaMemory';
+// CGUI-08 (TERM #531): the Models/MINT data-client method group consumes the CONST-21 +
+// CGUI-07 read API (`crate::constellation::models_api`). Response shapes live in
+// `../types/mint` (typed 1:1 against each handler's `json!({…})`).
+import type {
+  MintCategory,
+  MintCategoryAlias,
+  ModelsListQuery,
+  ModelsListResponse,
+  ModelDetailResponse,
+  MintSummaryResponse,
+  MintDimensionsResponse,
+  MintMatrixResponse,
+  MintRunsQuery,
+  MintRunsResponse,
+  MintBoxResponse,
+  MintLanguageStatsResponse,
+  MintFailuresResponse,
+  MintContextProfilesResponse,
+  MintActivityResponse,
+  MintCategorySummaryResponse,
+  MintCategoryDimensionsResponse,
+  MintCategoryMatrixResponse,
+  MintCategoryBoxResponse,
+  MintCategoryFailuresResponse,
+} from '../types/mint';
 
 // ── Shared types ────────────────────────────────────────────────────────────
 
@@ -169,6 +198,12 @@ export interface AggregationClient {
      *  Overview feed/bell + ActivityPanel each render their own empty/degraded state. */
     activity(limit?: number): Promise<TerminusActivityResponse>;
   };
+  /** CGUI-08: the fleet Models read surface (`/api/terminus/models*`, CONST-21).
+   *  Consumed by CGUI-09 (Models module). */
+  models: ModelsClient;
+  /** CGUI-08: the MINT profiling read surface (`/api/terminus/mint/*`, CONST-21 +
+   *  the CGUI-07 per-category endpoints). Consumed by CGUI-10 (MINT module). */
+  mint: MintClient;
   /**
    * Generic escape hatch for panel-specific reads that don't yet have a typed method above.
    * Still routed through this client so the "single path to the backend" rule holds even as
@@ -188,6 +223,57 @@ export interface AggregationClient {
   prefs: PrefsClient;
 }
 
+// ── Models / MINT data-client seam (CGUI-08, TERM #531) ──────────────────────
+// The typed method group over `crate::constellation::models_api` (CONST-21 + CGUI-07). Every
+// method is a read (GET) — none mutate, so none flow through `withMutationResultEvent`. Both
+// adapters implement this identically-shaped contract: the httpAdapter fetches same-origin
+// `/api/terminus/...`, the mockAdapter returns canned fixtures so CGUI-09/10 can build offline
+// (VITE_AGG_MODE default is mock). Category methods accept the 8 canonical categories or the
+// two friendly aliases (`vision_qa`, `stt`); an unknown category is a 400 from the backend.
+
+/** Any category value the backend's `newcat_task_category` resolver accepts. */
+export type MintCategoryKey = MintCategory | MintCategoryAlias;
+
+export interface ModelsClient {
+  /** `GET /api/terminus/models` — the unified fleet ⋈ brochure ⋈ serving ⋈ advisor list. */
+  list(query?: ModelsListQuery): Promise<ModelsListResponse>;
+  /** `GET /api/terminus/models/:name` — one model's full identity/brochure/serving/
+   *  operational/catalog detail. `name` is URL-encoded (an HF repo id's `/` → `%2F`).
+   *  Throws on a `404` (name unknown in every source), matching the backend contract. */
+  model(name: string): Promise<ModelDetailResponse>;
+}
+
+/** Optional filters for `mint.box()` / `mint.languageStats()` etc. — mirrors the backend
+ *  query structs; every field optional. */
+export interface MintBoxQuery {
+  /** `total_time_ms` (default) | `code_quality_score` — validated server-side (400 otherwise). */
+  metric?: 'total_time_ms' | 'code_quality_score';
+  model?: string;
+  task_category?: string;
+  language?: string;
+  failure_class?: string;
+  epoch?: string;
+}
+
+export interface MintClient {
+  // Legacy (CONST-21) MINT views ---------------------------------------------
+  summary(epoch?: string): Promise<MintSummaryResponse>;
+  dimensions(params?: { models?: string[]; epoch?: string }): Promise<MintDimensionsResponse>;
+  matrix(epoch?: string): Promise<MintMatrixResponse>;
+  runs(query?: MintRunsQuery): Promise<MintRunsResponse>;
+  box(query?: MintBoxQuery): Promise<MintBoxResponse>;
+  languageStats(params?: { language?: string; epoch?: string }): Promise<MintLanguageStatsResponse>;
+  failures(params?: { epoch?: string; task_category?: string }): Promise<MintFailuresResponse>;
+  contextProfiles(models?: string[]): Promise<MintContextProfilesResponse>;
+  activity(range?: '30d' | '90d' | 'all'): Promise<MintActivityResponse>;
+  // CGUI-07 per-category views (the 8 new MINT task-categories) ---------------
+  categorySummary(category: MintCategoryKey, epoch?: string): Promise<MintCategorySummaryResponse>;
+  categoryDimensions(category: MintCategoryKey, epoch?: string): Promise<MintCategoryDimensionsResponse>;
+  categoryMatrix(category: MintCategoryKey, epoch?: string): Promise<MintCategoryMatrixResponse>;
+  categoryBox(category: MintCategoryKey, metric?: string, epoch?: string): Promise<MintCategoryBoxResponse>;
+  categoryFailures(category: MintCategoryKey, epoch?: string): Promise<MintCategoryFailuresResponse>;
+}
+
 export interface WsHandlers {
   onEvent: (event: unknown) => void;
   onOpen?: () => void;
@@ -205,8 +291,10 @@ export interface WsConnection {
 // only the two allowlisted, non-secret keys below may ever be read or written. Any other key
 // (including via a loosely-typed caller) throws rather than silently writing an unreviewed key.
 
-/** The only two keys the prefs seam will ever store — both non-secret UI state. */
-export type PrefsKey = 'layout' | 'density';
+/** The keys the prefs seam will store — all non-secret UI state. `core` (S127) is the operator's
+ *  last-selected Overview core tab (Lumina/Chord/Terminus/Harmony/Muse), persisted so the shell
+ *  reopens on the same core. */
+export type PrefsKey = 'layout' | 'density' | 'core';
 
 export interface PrefsClient {
   /** Returns the stored value for an allowlisted key, or `null` if unset/unparsable. */
@@ -220,7 +308,7 @@ export interface PrefsClient {
 // Defined here (ahead of both adapters) since each adapter's object literal references
 // `prefsClient` directly.
 
-const PREFS_ALLOWLIST: readonly PrefsKey[] = ['layout', 'density'];
+const PREFS_ALLOWLIST: readonly PrefsKey[] = ['layout', 'density', 'core'];
 const PREFS_STORAGE_PREFIX = 'constellation.prefs.';
 
 function assertAllowedPrefsKey(key: string): asserts key is PrefsKey {
@@ -635,8 +723,76 @@ function mockGetFor(system: SystemId, pathname: string, fullPath: string): unkno
   return null;
 }
 
+// ── Mock data for the Lumina Conversations panel (LGUI-07; spec §3.2/§7) ────
+// The real endpoint is lumina's pre-existing, NON-streaming `POST /v1/chat/completions`
+// (spec §0.2), reached here as `lumina /v1/chat/completions`. Response shapes mirror the
+// OpenAI-style success envelope and the constellation-wide `{error:{message,type}}` shape
+// (spec §7). Body content drives which canned fixture comes back, so the panel's error-type
+// mapping, XSS-inertness, and long-reply scroll behavior are all reviewable on mocks alone —
+// type a trigger phrase (case-insensitive substring match) into the composer:
+//   "trigger:ratelimit" -> rate_limit_error envelope ("Daily turn budget reached")
+//   "trigger:upstream"  -> upstream_error envelope ("Chord unreachable")
+//   "trigger:other"     -> an error.type the panel doesn't special-case (generic inline+retry)
+//   "trigger:xss"       -> assistant reply containing a literal <script> tag (XSS-inert proof,
+//                          see ChatBubble.tsx's render-path doc comment + chatMarkdown.test.ts)
+//   "trigger:long"      -> a 4000+ char reply (scrollable-bubble proof)
+//   anything else       -> a short canned reply exercising **bold**/`code`/a link/a fenced block
+function mockLuminaChatReply(body: string | undefined): unknown {
+  let lastUserContent = '';
+  try {
+    const parsed = body ? JSON.parse(body) as { messages?: Array<{ role: string; content: string }> } : undefined;
+    const messages = parsed?.messages ?? [];
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i].role === 'user') { lastUserContent = messages[i].content; break; }
+    }
+  } catch {
+    // Malformed body in mock mode — fall through to the default reply rather than throwing.
+  }
+  const lower = lastUserContent.toLowerCase();
+
+  if (lower.includes('trigger:ratelimit')) {
+    return { error: { message: 'Daily turn budget reached for this user.', type: 'rate_limit_error' } };
+  }
+  if (lower.includes('trigger:upstream')) {
+    return { error: { message: 'Chord proxy unreachable.', type: 'upstream_error' } };
+  }
+  if (lower.includes('trigger:other')) {
+    return { error: { message: 'An unexpected error occurred.', type: 'internal_error' } };
+  }
+  if (lower.includes('trigger:xss')) {
+    return {
+      choices: [{
+        message: {
+          role: 'assistant',
+          content: 'Here is something odd: <script>alert(1)</script> — it should render as inert text, never execute.',
+        },
+      }],
+    };
+  }
+  if (lower.includes('trigger:long')) {
+    const paragraph = 'This is a long mock reply used to prove the chat bubble scrolls instead of overflowing the panel. ';
+    const content = paragraph.repeat(Math.ceil(4200 / paragraph.length));
+    return { choices: [{ message: { role: 'assistant', content } }] };
+  }
+  const routed = lower.startsWith('/deep ') ? ' (routed: deep)' : lower.startsWith('/quick ') ? ' (routed: quick)' : '';
+  return {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content:
+          `(mock adapter — no live Chord backend) Got it${routed}. Here's a bit of **bold**, ` +
+          'some `inline code`, a [link](https://example.com), and a fenced block:\n\n' +
+          '```\nfn hello() {\n    println!("hi from mock Lumina");\n}\n```',
+      },
+    }],
+  };
+}
+
 /** POST/PUT-style mock acks — every write in the mock world just succeeds with a canned shape. */
-function mockWriteFor(system: SystemId, pathname: string): unknown {
+function mockWriteFor(system: SystemId, pathname: string, body?: string): unknown {
+  if (system === 'lumina' && pathname === '/v1/chat/completions') {
+    return mockLuminaChatReply(body);
+  }
   if (system === 'harmony' && pathname === '/engine/stop') {
     return { state: 'stopped', pid: null, active_count: 0, uptime_secs: 0, stop_reason: 'mock', executor_active: false };
   }
@@ -682,8 +838,12 @@ function mockRequest<T>(system: SystemId, path: string, init?: RequestInit): Pro
   const pathname = path.split('?')[0];
   const value = method === 'GET'
     ? mockGetFor(system, pathname, path)
-    : mockWriteFor(system, pathname);
-  return delay(value as T);
+    : mockWriteFor(system, pathname, typeof init?.body === 'string' ? init.body : undefined);
+  // LGUI-07: the chat round trip gets a deliberately longer canned delay than the default
+  // 120ms — enough for the composer's "thinking" StatusPill to be visibly reviewable, still
+  // fast enough not to be annoying. Every other mock write keeps the default.
+  const ms = system === 'lumina' && pathname === '/v1/chat/completions' ? 650 : undefined;
+  return delay(value as T, ms);
 }
 
 /** Mock WS: reports "connected" immediately, never emits events (mock has no live daemon). */
@@ -694,6 +854,401 @@ function mockWsConnect(handlers: WsHandlers): WsConnection {
     close() { clearTimeout(id); handlers.onClose?.(); },
   };
 }
+
+// ── Mock data for the Models/MINT surface (CGUI-08, TERM #531) ───────────────
+// Canned fixtures so the Models (CGUI-09) and MINT (CGUI-10) modules can be built,
+// typechecked, and demoed with zero backend. Shapes are 1:1 with `models_api.rs` — the same
+// contract the httpAdapter's real fetches consume. Values are plausible, not real.
+
+/** Fixed base epoch for every CGUI-08 mock timestamp — deterministic, evaluated once at
+ *  module load (never `Date.now()` at request time), so repeated calls and snapshot tests
+ *  see byte-identical payloads. 2026-07-21T12:00:00Z. */
+const MOCK_NOW_MS = Date.UTC(2026, 6, 21, 12, 0, 0);
+
+/** The 8 assistant-suite radar axes (mirrors `ASSISTANT_DIMENSIONS` in models_api.rs). */
+const MOCK_ASSISTANT_DIMENSIONS = [
+  'conversation_depth', 'tool_chaining', 'memory_integration', 'personality_latent',
+  'personality_prompted', 'embeddings', 'yarn_context_depth', 'fleet_membership',
+] as const;
+
+/** The metrics each new MINT category reports (plausible per-suite metric names). */
+const MOCK_MINT_CATEGORY_METRICS: Record<MintCategory, string[]> = {
+  embedding_retrieval: ['ndcg_at_10', 'mrr', 'recall_at_10'],
+  reranking: ['ndcg_at_10', 'map'],
+  image_parsing: ['accuracy', 'description_quality'],
+  document_parsing: ['cer', 'layout_f1'],
+  image_generation: ['clip_score', 'aesthetic_score'],
+  voice_transcription: ['wer', 'cer'],
+  tts: ['mos', 'wer'],
+  tool_routing: ['accuracy', 'f1'],
+};
+
+/** Two plausible models per category, so every mock view has ≥2 rows to render. */
+const MOCK_MINT_CATEGORY_MODELS: Record<MintCategory, string[]> = {
+  embedding_retrieval: ['bge-m3', 'nomic-embed-text-v1.5'],
+  reranking: ['bge-reranker-v2-m3', 'jina-reranker-v2'],
+  image_parsing: ['qwen2.5-vl:7b', 'llava:13b'],
+  document_parsing: ['got-ocr2', 'docling-layout'],
+  image_generation: ['sdxl-turbo', 'flux.1-schnell'],
+  voice_transcription: ['whisper-large-v3', 'parakeet-tdt'],
+  tts: ['kokoro-82m', 'xtts-v2'],
+  tool_routing: ['qwen2.5:7b', 'hermes-3-llama-3.1-8b'],
+};
+
+/** A plausible baseline for a metric (higher-is-better ~0.6–0.95; error rates ~0.05–0.25;
+ *  MOS ~3.5–4.5; clip/aesthetic on their own scales). Deterministic — no RNG in fixtures. */
+function mockMetricBase(metric: string): number {
+  switch (metric) {
+    case 'wer': case 'cer': return 0.11;
+    case 'mos': return 4.1;
+    case 'clip_score': return 0.31;
+    case 'aesthetic_score': return 6.2;
+    default: return 0.82; // ndcg/mrr/recall/map/accuracy/f1/layout_f1/description_quality
+  }
+}
+
+/** Deterministic per-(model-index, metric-index) jitter around the metric baseline. */
+function mockMetricValue(metric: string, modelIdx: number, metricIdx: number): number {
+  const base = mockMetricBase(metric);
+  const delta = base * (0.04 * modelIdx + 0.02 * metricIdx);
+  const raw = metric === 'wer' || metric === 'cer' ? base + delta : base - delta;
+  return Math.round(raw * 1000) / 1000;
+}
+
+function mockCategoryLastRun(modelIdx: number, metricIdx: number): string {
+  return new Date(MOCK_NOW_MS - (modelIdx * 3600_000 + metricIdx * 600_000)).toISOString();
+}
+
+/** The legacy MINT suites (their own dedicated readers), accepted by `mint.runs` alongside the
+ *  8 new categories — mirrors the backend allowlist in `mint_runs`. */
+const MOCK_LEGACY_SUITES = new Set<string>(['code', 'context', 'agent']);
+
+/** Resolve a category key (canonical or alias) to its canonical form, mirroring the backend's
+ *  `newcat_task_category`. Returns null for an unknown key — the mock adapter treats that like
+ *  the backend's `400`. */
+function mockResolveCategory(key: string): MintCategory | null {
+  if (key in MOCK_MINT_CATEGORY_METRICS) return key as MintCategory;
+  if (key === 'vision_qa') return 'image_parsing';
+  if (key === 'stt' || key === 'asr' || key === 'asr_transcription') return 'voice_transcription';
+  return null;
+}
+
+function mockCategoryOr400(key: string): MintCategory {
+  const cat = mockResolveCategory(key);
+  if (!cat) {
+    throw new Error(
+      `HTTP 400 — unrecognized category '${key}' (expected one of: ${Object.keys(MOCK_MINT_CATEGORY_METRICS).join(', ')})`,
+    );
+  }
+  return cat;
+}
+
+function mockCategorySummary(cat: MintCategory): MintCategorySummaryResponse {
+  const metrics = MOCK_MINT_CATEGORY_METRICS[cat];
+  return {
+    models: MOCK_MINT_CATEGORY_MODELS[cat].map((model_id, mi) => ({
+      model_id,
+      metrics: metrics.map((metric, i) => ({
+        dimension: cat,
+        metric,
+        value: mockMetricValue(metric, mi, i),
+        std_dev: Math.round((0.02 + 0.01 * i) * 1000) / 1000,
+        low_confidence: mi === 1 && i === 0,
+        backend_tag: 'gpu',
+        last_run_at: mockCategoryLastRun(mi, i),
+      })),
+    })),
+  };
+}
+
+function mockCategoryDimensions(cat: MintCategory): MintCategoryDimensionsResponse {
+  return {
+    dimensions: MOCK_MINT_CATEGORY_METRICS[cat].map(metric => ({ dimension: cat, metric })),
+  };
+}
+
+function mockCategoryMatrix(cat: MintCategory): MintCategoryMatrixResponse {
+  const metrics = MOCK_MINT_CATEGORY_METRICS[cat];
+  const models = MOCK_MINT_CATEGORY_MODELS[cat];
+  const cells = models.flatMap((model, mi) =>
+    metrics.map((metric, i) => ({
+      model,
+      metric,
+      dimension: cat,
+      mean: mockMetricValue(metric, mi, i),
+      n: 5 - i,
+      low_confidence: mi === 1 && i === 0,
+      last_run_at: mockCategoryLastRun(mi, i),
+    })),
+  );
+  return { models, columns: metrics, cells };
+}
+
+function mockCategoryBox(cat: MintCategory, metric?: string): MintCategoryBoxResponse {
+  const chosen = metric ?? MOCK_MINT_CATEGORY_METRICS[cat][0];
+  if (!MOCK_MINT_CATEGORY_METRICS[cat].includes(chosen)) {
+    // fail-open to empty groups, exactly like `shape_newcat_box`
+    return { metric: chosen, groups: [] };
+  }
+  const groups = MOCK_MINT_CATEGORY_MODELS[cat].map((model, mi) => {
+    const mid = mockMetricValue(chosen, mi, 0);
+    const spread = Math.max(Math.abs(mid) * 0.08, 0.01);
+    return {
+      model,
+      min: Math.round((mid - 2 * spread) * 1000) / 1000,
+      q1: Math.round((mid - spread) * 1000) / 1000,
+      median: mid,
+      q3: Math.round((mid + spread) * 1000) / 1000,
+      max: Math.round((mid + 2 * spread) * 1000) / 1000,
+      n: 8 - mi,
+      low_n: 8 - mi < 5,
+      outliers: mi === 0
+        ? [{ run_id: `${cat}-${model}-out`, value: Math.round((mid + 4 * spread) * 1000) / 1000, low_confidence: false }]
+        : [],
+    };
+  });
+  return { metric: chosen, groups };
+}
+
+function mockCategoryFailures(cat: MintCategory): MintCategoryFailuresResponse {
+  return {
+    classes: ['low_confidence', 'ok'],
+    models: MOCK_MINT_CATEGORY_MODELS[cat].map((model, mi) => {
+      const total = 10 - mi * 2;
+      const low = mi; // model 0 all-ok, later models a couple low-conf
+      return { model, counts: { low_confidence: low, ok: total - low }, total_runs: total };
+    }),
+  };
+}
+
+const MOCK_MODELS_LIST: ModelsListResponse = {
+  total: 3,
+  refreshed_at: new Date(MOCK_NOW_MS - 30 * 60000).toISOString(),
+  models: [
+    {
+      model_name: 'qwen2.5-coder:32b', family: 'qwen2.5-coder', params_b: 32, quant: 'Q4_K_M',
+      category: 'code', brochure_status: 'in_fleet', in_current_fleet: true, discovery_score: 0.91,
+      vram_gb: 21.5, size_b: 32, serving_now: true,
+      coverage: { coder: true, assistant: true, serving: true, agent: false },
+      best_pass_rate: 0.78, last_run_at: new Date(MOCK_NOW_MS - 2 * 3600_000).toISOString(),
+    },
+    {
+      model_name: 'bge-m3', family: 'bge', params_b: 0.57, quant: null,
+      category: 'embedding_retrieval', brochure_status: 'in_fleet', in_current_fleet: true,
+      discovery_score: 0.84, vram_gb: 2.1, size_b: 0.57, serving_now: false,
+      coverage: { coder: false, assistant: true, serving: true, agent: false },
+      best_pass_rate: null, last_run_at: new Date(MOCK_NOW_MS - 26 * 3600_000).toISOString(),
+    },
+    {
+      model_name: 'flux.1-schnell', family: 'flux', params_b: 12, quant: 'fp8',
+      category: 'image_generation', brochure_status: 'candidate', in_current_fleet: false,
+      discovery_score: 0.66, vram_gb: 16.0, size_b: 12, serving_now: false,
+      coverage: { coder: false, assistant: false, serving: false, agent: false },
+      best_pass_rate: null, last_run_at: null,
+    },
+  ],
+};
+
+function mockModelDetail(name: string): ModelDetailResponse {
+  const entry = MOCK_MODELS_LIST.models.find(m => m.model_name === name);
+  if (!entry) {
+    // Mirror the backend's real 404 for a name absent from every source.
+    throw new Error(`HTTP 404 for /api/terminus/models/${encodeURIComponent(name)}`);
+  }
+  return {
+    identity: {
+      family: entry.family ?? name, params_b: entry.params_b, active_b: entry.params_b,
+      architecture: 'transformer',
+      quants: entry.quant ? { [entry.quant]: { vram_gb: entry.vram_gb, quality_penalty: 0.02 } } : {},
+      quality: 'good', best_for: ['general'], avoid_for: [],
+      ollama_name: entry.model_name, notes: 'mock adapter — canned identity',
+    },
+    brochure: {
+      hf_repo: `mock/${entry.model_name}`, category: entry.category ?? 'unknown',
+      status: entry.brochure_status ?? 'candidate', gfx1151_class: 'green',
+      size_b: entry.size_b, vram_footprint_gb: entry.vram_gb, discovery_source: 'mock',
+      discovery_score: entry.discovery_score,
+      discovered_at: new Date(MOCK_NOW_MS - 10 * 86400_000).toISOString(),
+      last_seen_at: new Date(MOCK_NOW_MS - 86400_000).toISOString(),
+      fetched_at: new Date(MOCK_NOW_MS - 86400_000).toISOString(),
+      marked_for_fleet_at: entry.in_current_fleet ? new Date(MOCK_NOW_MS - 5 * 86400_000).toISOString() : null,
+      evicted_at: null, rationale: 'mock candidate',
+    },
+    serving: entry.serving_now
+      ? [{
+          backend_tag: 'gpu', best_runtime: 'llama.cpp', tok_s: 63.4, vram_or_ram_peak_gb: entry.vram_gb,
+          cold_load_s: 4.2, keep_warm: true, fallback_runtime: 'vulkan', exclusion_reason: null,
+          recheck_trigger: null, provenance: 'mock', updated_at: new Date(MOCK_NOW_MS).toISOString(),
+        }]
+      : [],
+    operational: entry.coverage.coder
+      ? {
+          max_context_safe: 32768, max_context_absolute: 65536, quality_degradation_point: 40000,
+          throughput_at_2k: 60, throughput_at_8k: 52, throughput_at_16k: 44, throughput_at_32k: 33,
+          throughput_at_64k: 20, recommended_timeout_chat_sec: 60, recommended_timeout_build_sec: 300,
+          recommended_timeout_deep_sec: 900, overall_tier: 'A',
+        }
+      : null,
+    catalog: {
+      card: {
+        model_name: entry.model_name, quant: entry.quant, in_current_fleet: entry.in_current_fleet,
+        serving: null, not_run_count: 1, stale_count: 0, refreshed_at: MOCK_MODELS_LIST.refreshed_at,
+      },
+      cells: [{
+        test_type: 'coder', task_category: 'code_generation', quant: entry.quant, status: 'run',
+        pass_rate: entry.best_pass_rate, n_samples: 40, score_stddev: 0.05,
+        low_confidence: false, last_run_at: entry.last_run_at, harness_version: 'coder-v2',
+      }],
+    },
+  };
+}
+
+const MOCK_MINT_SUMMARY: MintSummaryResponse = {
+  models_profiled: 12,
+  runs: { code: 5721, context: 340, agent: 128, total: 6189 },
+  fleet_best_model: { model: 'qwen2.5-coder:32b', pass_hat_3: 0.81 },
+  gpu_hours: 214.6,
+  epoch: 'coder-v2',
+  became_current_at: new Date(MOCK_NOW_MS - 20 * 86400_000).toISOString(),
+};
+
+const MOCK_MINT_DIMENSIONS: MintDimensionsResponse = {
+  dimensions: [...MOCK_ASSISTANT_DIMENSIONS],
+  models: ['qwen2.5-coder:32b', 'llama3.3:70b'].map((model_id, mi) => ({
+    model_id,
+    scores: MOCK_ASSISTANT_DIMENSIONS.map((dimension, i) => ({
+      dimension,
+      norm: Math.round((0.4 + 0.06 * i - 0.05 * mi) * 1000) / 1000,
+      raw: Math.round((0.5 + 0.04 * i) * 1000) / 1000,
+      metric: 'value',
+      std_dev: 0.03,
+      n: 6,
+      low_confidence: i === 7,
+    })),
+  })),
+  fleet_median: MOCK_ASSISTANT_DIMENSIONS.map((dimension, i) => ({
+    dimension,
+    norm: Math.round((0.45 + 0.04 * i) * 1000) / 1000,
+  })),
+};
+
+const MOCK_MINT_MATRIX: MintMatrixResponse = {
+  models: ['qwen2.5-coder:32b', 'bge-m3'],
+  columns: [
+    { test_type: 'coder', task_category: 'code_generation' },
+    { test_type: 'assistant', task_category: 'embedding_retrieval' },
+  ],
+  cells: [
+    {
+      model: 'qwen2.5-coder:32b', col: { test_type: 'coder', task_category: 'code_generation' },
+      status: 'run', pass_rate: 0.78, n_samples: 40, score_stddev: 0.05, low_confidence: false,
+      last_run_at: new Date(MOCK_NOW_MS - 2 * 3600_000).toISOString(), harness_version: 'coder-v2',
+    },
+    {
+      model: 'bge-m3', col: { test_type: 'assistant', task_category: 'embedding_retrieval' },
+      status: 'run', pass_rate: 0.82, n_samples: 30, score_stddev: 0.03, low_confidence: false,
+      last_run_at: new Date(MOCK_NOW_MS - 26 * 3600_000).toISOString(), harness_version: 'a1',
+    },
+    {
+      model: 'bge-m3', col: { test_type: 'coder', task_category: 'code_generation' },
+      status: 'not_run', pass_rate: null, n_samples: null, score_stddev: null,
+      low_confidence: false, last_run_at: null, harness_version: null,
+    },
+  ],
+};
+
+const MOCK_MINT_RUNS: MintRunsResponse = {
+  total: 2,
+  runs: [
+    {
+      run_id: 'run-code-1', model: 'qwen2.5-coder:32b', metric: 'code_quality_score', value: 0.79,
+      dimension: 'code_generation', backend_tag: 'gpu', judge: 'harness', low_confidence: false,
+      created_at: new Date(MOCK_NOW_MS - 2 * 3600_000).toISOString(), harness_version: 'coder-v2',
+    },
+    {
+      run_id: 'run-code-2', model: 'qwen2.5-coder:32b', metric: 'total_time_ms', value: 4200,
+      dimension: 'code_generation', backend_tag: 'gpu', judge: 'harness', low_confidence: false,
+      created_at: new Date(MOCK_NOW_MS - 3 * 3600_000).toISOString(), harness_version: 'coder-v2',
+    },
+  ],
+};
+
+const MOCK_MINT_BOX: MintBoxResponse = {
+  groups: [
+    {
+      model: 'qwen2.5-coder:32b', min: 3200, q1: 3800, median: 4200, q3: 4700, max: 5400,
+      n: 40, low_n: false,
+      outliers: [{ run_id: 'run-code-slow', value: 9800, case_id: 'case-77', failure_class: 'timeout' }],
+    },
+    {
+      model: 'llama3.3:70b', min: 5100, q1: 6000, median: 6800, q3: 7600, max: 8800,
+      n: 3, low_n: true, outliers: [],
+    },
+  ],
+};
+
+const MOCK_MINT_LANGUAGE_STATS: MintLanguageStatsResponse = {
+  rows: [
+    {
+      model: 'qwen2.5-coder:32b', language: 'python', n_scored: 120, mean_score: 0.81,
+      stddev_score: 0.09, retry_lift: 0.06, mean_throughput: 58.2, mean_latency_ms: 1800,
+      p95_latency_ms: 3400, total_gpu_seconds: 640.5, quality_per_gpu_second: 0.0013,
+      pass_hat_3: 0.83, vram_gb: 21.5, point_size_px: 22.4,
+    },
+    {
+      model: 'bge-m3', language: 'rust', n_scored: 40, mean_score: 0.72, stddev_score: 0.11,
+      retry_lift: 0.03, mean_throughput: 44.0, mean_latency_ms: 2100, p95_latency_ms: 3900,
+      total_gpu_seconds: 120.0, quality_per_gpu_second: 0.006, pass_hat_3: 0.70, vram_gb: 2.1,
+      point_size_px: 8.0,
+    },
+  ],
+};
+
+const MOCK_MINT_FAILURES: MintFailuresResponse = {
+  classes: ['timeout', 'wrong_output', 'compile_error', 'refusal', 'oom', 'other'],
+  models: [
+    {
+      model: 'qwen2.5-coder:32b',
+      counts: { timeout: 3, wrong_output: 8, compile_error: 5, refusal: 1, oom: 0, other: 2 },
+      total_runs: 40,
+    },
+    {
+      model: 'llama3.3:70b',
+      counts: { timeout: 6, wrong_output: 4, compile_error: 2, refusal: 0, oom: 3, other: 1 },
+      total_runs: 32,
+    },
+  ],
+};
+
+const MOCK_MINT_CONTEXT_PROFILES: MintContextProfilesResponse = {
+  models: ['qwen2.5-coder:32b', 'llama3.3:70b'].map((model, mi) => ({
+    model,
+    max_context_safe: 32768 - mi * 8192,
+    tiers: [2000, 8000, 16000, 32000, 64000].map((context_tokens, i) => ({
+      context_tokens,
+      throughput_tok_per_sec: Math.round((60 - i * 8 - mi * 5) * 10) / 10,
+      ttft_ms: 200 + i * 150 + mi * 100,
+      recall_score: Math.round((0.98 - i * 0.06) * 1000) / 1000,
+      memory_usage_mb: 12000 + i * 4000 + mi * 6000,
+      oom: i === 4 && mi === 1,
+    })),
+  })),
+};
+
+const MOCK_MINT_ACTIVITY: MintActivityResponse = {
+  days: Array.from({ length: 14 }, (_, i) => {
+    const d = new Date(MOCK_NOW_MS - (13 - i) * 86400_000);
+    return {
+      date: d.toISOString().slice(0, 10),
+      code: 20 + (i % 5) * 6,
+      context: 2 + (i % 3),
+      agent: i % 4,
+    };
+  }),
+  epochs: [
+    { epoch: 'coder-v2', became_current_at: new Date(MOCK_NOW_MS - 20 * 86400_000).toISOString(), note: 'v2 harness cutover' },
+  ],
+};
 
 const mockAdapter: AggregationClient = {
   auth: {
@@ -721,6 +1276,90 @@ const mockAdapter: AggregationClient = {
     async activity(limit?: number) {
       const entries = limit != null ? MOCK_ACTIVITY_ENTRIES.slice(-limit) : MOCK_ACTIVITY_ENTRIES;
       return delay({ entries, available: true });
+    },
+  },
+  models: {
+    async list(query?: ModelsListQuery) {
+      // A minimal offline filter so the mock behaves like the endpoint for the common
+      // scope/q/serving filters the Models module will drive.
+      let models = MOCK_MODELS_LIST.models;
+      if (query?.scope === 'fleet') models = models.filter(m => m.in_current_fleet);
+      else if (query?.scope === 'brochure') models = models.filter(m => m.brochure_status != null);
+      if (query?.q) {
+        const q = query.q.toLowerCase();
+        models = models.filter(m =>
+          m.model_name.toLowerCase().includes(q) || (m.family ?? '').toLowerCase().includes(q));
+      }
+      if (query?.category) models = models.filter(m => m.category === query.category);
+      if (query?.status) models = models.filter(m => m.brochure_status === query.status);
+      if (query?.serving != null) models = models.filter(m => m.serving_now === query.serving);
+      // S127 (DATA-04): mirror the backend's paginate() — `total` is the FULL filtered count
+      // (the true roster scale), `models` is only the requested page. offset/limit default to
+      // 0 / 50 and the server clamps limit to [1, 500].
+      const total = models.length;
+      const offset = Math.max(0, query?.offset ?? 0);
+      const limit = Math.min(500, Math.max(1, query?.limit ?? 50));
+      const page = models.slice(offset, offset + limit);
+      return delay({ total, refreshed_at: MOCK_MODELS_LIST.refreshed_at, models: page });
+    },
+    async model(name: string) {
+      return delay(mockModelDetail(name));
+    },
+  },
+  mint: {
+    async summary() { return delay(MOCK_MINT_SUMMARY); },
+    async dimensions() { return delay(MOCK_MINT_DIMENSIONS); },
+    async matrix() { return delay(MOCK_MINT_MATRIX); },
+    async runs(query?: MintRunsQuery) {
+      // Validate the suite exactly like the backend's widened allowlist (models_api.rs
+      // `mint_runs`): legacy `code|context|agent`, any of the 8 new categories, or a category
+      // alias succeeds; a truly-unknown suite is a 400-equivalent throw (parity with the mock's
+      // categorySummary guard) — never a silent fall-through to the canned legacy page.
+      const suite = query?.suite ?? 'code';
+      const cat = mockResolveCategory(suite);
+      if (!cat && !MOCK_LEGACY_SUITES.has(suite)) {
+        throw new Error(
+          `HTTP 400 — unrecognized suite '${suite}' (expected one of: code, context, agent, ` +
+          `${Object.keys(MOCK_MINT_CATEGORY_METRICS).join(', ')} (category aliases: vision_qa, stt))`,
+        );
+      }
+      // A new-category suite reads the category's rows via the summary fixture, shaped as runs;
+      // legacy code/context/agent return the canned run page.
+      if (cat) {
+        const summary = mockCategorySummary(cat);
+        const runs: MintRunsResponse['runs'] = summary.models.flatMap(m =>
+          m.metrics
+            .filter(mt => !query?.metric || mt.metric === query.metric)
+            .filter(() => !query?.model || m.model_id === query.model)
+            .map(mt => ({
+              run_id: `${cat}-${m.model_id}-${mt.metric}`, model: m.model_id, backend_tag: mt.backend_tag,
+              dimension: mt.dimension, metric: mt.metric, value: mt.value, std_dev: mt.std_dev,
+              judge: 'harness', low_confidence: mt.low_confidence, created_at: mt.last_run_at,
+              harness_version: 'a1',
+            })));
+        return delay({ total: runs.length, runs });
+      }
+      return delay(MOCK_MINT_RUNS);
+    },
+    async box() { return delay(MOCK_MINT_BOX); },
+    async languageStats() { return delay(MOCK_MINT_LANGUAGE_STATS); },
+    async failures() { return delay(MOCK_MINT_FAILURES); },
+    async contextProfiles() { return delay(MOCK_MINT_CONTEXT_PROFILES); },
+    async activity() { return delay(MOCK_MINT_ACTIVITY); },
+    async categorySummary(category: MintCategoryKey) {
+      return delay(mockCategorySummary(mockCategoryOr400(category)));
+    },
+    async categoryDimensions(category: MintCategoryKey) {
+      return delay(mockCategoryDimensions(mockCategoryOr400(category)));
+    },
+    async categoryMatrix(category: MintCategoryKey) {
+      return delay(mockCategoryMatrix(mockCategoryOr400(category)));
+    },
+    async categoryBox(category: MintCategoryKey, metric?: string) {
+      return delay(mockCategoryBox(mockCategoryOr400(category), metric));
+    },
+    async categoryFailures(category: MintCategoryKey) {
+      return delay(mockCategoryFailures(mockCategoryOr400(category)));
     },
   },
   async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
@@ -778,6 +1417,15 @@ function baseUrl(): string {
 
 // The single-auth invariant, enforced structurally: Content-Type is always JSON and
 // authoritative; no caller-supplied auth-bearing header is ever forwarded to the backend.
+//
+// LGUI-05: `x-lumina-user` joins this strip list -- it's not itself a credential, but it's an
+// identity-spoofing vector for Lumina's admin-gated routes (spec §7 C-1), and the browser has
+// no business setting it either way: `crate::constellation::proxy::proxy_lumina` derives it
+// server-side from the VERIFIED session cookie, never from a request header. This is a
+// defense-in-depth door only -- the Rust proxy independently never reads ANY inbound header
+// but `content-type` to build its own outbound `Authorization`/`X-Lumina-User` (see that
+// module's doc), so a caller-supplied value here couldn't reach Lumina even if this stripped
+// nothing at all.
 function enforceHeaders(callerHeaders?: HeadersInit): Record<string, string> {
   const out: Record<string, string> = {};
   if (callerHeaders) {
@@ -788,7 +1436,7 @@ function enforceHeaders(callerHeaders?: HeadersInit): Record<string, string> {
         : Object.entries(callerHeaders);
     for (const [k, v] of entries) {
       const lk = k.toLowerCase();
-      if (lk === 'authorization' || lk === 'cookie' || lk === 'content-type') continue;
+      if (lk === 'authorization' || lk === 'cookie' || lk === 'content-type' || lk === 'x-lumina-user') continue;
       out[k] = v as string;
     }
   }
@@ -812,6 +1460,18 @@ async function httpJson<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (res.status === 204) return undefined as unknown as T;
   return (await res.json()) as T;
+}
+
+/** Build a `?a=1&b=2` query string from a params object, dropping `undefined`/`null`/`''`
+ *  values and encoding the rest. Returns `''` when nothing to add. Used by the CGUI-08
+ *  Models/MINT reads (their only same-origin query-carrying GETs). */
+function buildQuery(params: Record<string, string | number | boolean | undefined | null>): string {
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null || v === '') continue;
+    parts.push(`${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`);
+  }
+  return parts.length ? `?${parts.join('&')}` : '';
 }
 
 const httpAdapter: AggregationClient = {
@@ -855,6 +1515,82 @@ const httpAdapter: AggregationClient = {
       } catch (e) {
         return { entries: [], available: false, detail: e instanceof Error ? e.message : 'unavailable' };
       }
+    },
+  },
+  models: {
+    async list(query?: ModelsListQuery) {
+      const q = buildQuery({
+        scope: query?.scope, q: query?.q, category: query?.category, status: query?.status,
+        serving: query?.serving, limit: query?.limit, offset: query?.offset,
+      });
+      return httpJson<ModelsListResponse>(`/api/terminus/models${q}`);
+    },
+    async model(name: string) {
+      // Encode the whole name as ONE path segment — an HF repo id's `/` becomes `%2F`, which
+      // the backend's `Path<String>` extractor decodes back within this single segment.
+      return httpJson<ModelDetailResponse>(`/api/terminus/models/${encodeURIComponent(name)}`);
+    },
+  },
+  mint: {
+    async summary(epoch?: string) {
+      return httpJson<MintSummaryResponse>(`/api/terminus/mint/summary${buildQuery({ epoch })}`);
+    },
+    async dimensions(params?: { models?: string[]; epoch?: string }) {
+      const q = buildQuery({ models: params?.models?.join(','), epoch: params?.epoch });
+      return httpJson<MintDimensionsResponse>(`/api/terminus/mint/dimensions${q}`);
+    },
+    async matrix(epoch?: string) {
+      return httpJson<MintMatrixResponse>(`/api/terminus/mint/matrix${buildQuery({ epoch })}`);
+    },
+    async runs(query?: MintRunsQuery) {
+      const q = buildQuery({
+        suite: query?.suite, model: query?.model, task_category: query?.task_category,
+        language: query?.language, failure_class: query?.failure_class, metric: query?.metric,
+        epoch: query?.epoch, limit: query?.limit, offset: query?.offset,
+      });
+      return httpJson<MintRunsResponse>(`/api/terminus/mint/runs${q}`);
+    },
+    async box(query?: MintBoxQuery) {
+      const q = buildQuery({
+        metric: query?.metric, model: query?.model, task_category: query?.task_category,
+        language: query?.language, failure_class: query?.failure_class, epoch: query?.epoch,
+      });
+      return httpJson<MintBoxResponse>(`/api/terminus/mint/box${q}`);
+    },
+    async languageStats(params?: { language?: string; epoch?: string }) {
+      const q = buildQuery({ language: params?.language, epoch: params?.epoch });
+      return httpJson<MintLanguageStatsResponse>(`/api/terminus/mint/language-stats${q}`);
+    },
+    async failures(params?: { epoch?: string; task_category?: string }) {
+      const q = buildQuery({ epoch: params?.epoch, task_category: params?.task_category });
+      return httpJson<MintFailuresResponse>(`/api/terminus/mint/failures${q}`);
+    },
+    async contextProfiles(models?: string[]) {
+      const q = buildQuery({ models: models?.join(',') });
+      return httpJson<MintContextProfilesResponse>(`/api/terminus/mint/context-profiles${q}`);
+    },
+    async activity(range?: '30d' | '90d' | 'all') {
+      return httpJson<MintActivityResponse>(`/api/terminus/mint/activity${buildQuery({ range })}`);
+    },
+    async categorySummary(category: MintCategoryKey, epoch?: string) {
+      return httpJson<MintCategorySummaryResponse>(
+        `/api/terminus/mint/category/${encodeURIComponent(category)}/summary${buildQuery({ epoch })}`);
+    },
+    async categoryDimensions(category: MintCategoryKey, epoch?: string) {
+      return httpJson<MintCategoryDimensionsResponse>(
+        `/api/terminus/mint/category/${encodeURIComponent(category)}/dimensions${buildQuery({ epoch })}`);
+    },
+    async categoryMatrix(category: MintCategoryKey, epoch?: string) {
+      return httpJson<MintCategoryMatrixResponse>(
+        `/api/terminus/mint/category/${encodeURIComponent(category)}/matrix${buildQuery({ epoch })}`);
+    },
+    async categoryBox(category: MintCategoryKey, metric?: string, epoch?: string) {
+      return httpJson<MintCategoryBoxResponse>(
+        `/api/terminus/mint/category/${encodeURIComponent(category)}/box${buildQuery({ metric, epoch })}`);
+    },
+    async categoryFailures(category: MintCategoryKey, epoch?: string) {
+      return httpJson<MintCategoryFailuresResponse>(
+        `/api/terminus/mint/category/${encodeURIComponent(category)}/failures${buildQuery({ epoch })}`);
     },
   },
   async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
@@ -906,11 +1642,41 @@ const httpAdapter: AggregationClient = {
 };
 
 // ── Selection ─────────────────────────────────────────────────────────────
-
-function resolveMode(): 'mock' | 'http' {
-  const raw = (import.meta as unknown as { env?: Record<string, string | undefined> }).env
+//
+// S127 TGUI2 (Part B / DATA-01+02): http-DEFAULT + runtime-selectable. Precedence, highest first:
+//   1. Build-time `import.meta.env.VITE_AGG_MODE` === 'http' | 'mock' — an explicit build wins.
+//   2. Runtime `window.__AGG_MODE__` === 'http' | 'mock' — the server MAY inject this into
+//      index.html to force a mode on a single embedded bundle without a rebuild.
+//   3. Runtime opt-IN to mock only: `?mock` in the URL, or `localStorage['constellation.aggMode']
+//      === 'mock'` — for offline/dev against a bundle that would otherwise go to the real backend.
+//   4. Any other browser context → 'http' (the SPA is served same-origin by the real terminus
+//      binary in production, so the real backend is right there — INVERTED from the old default).
+//   5. No `window` at all (unit tests / SSR) → 'mock', so tests stay offline + deterministic.
+// A mock bundle can therefore never ship silently: mock is only ever reached by an explicit
+// build flag, an explicit server injection, or an explicit per-session opt-in.
+export function resolveMode(): 'mock' | 'http' {
+  const buildMode = (import.meta as unknown as { env?: Record<string, string | undefined> }).env
     ?.VITE_AGG_MODE;
-  return raw === 'http' ? 'http' : 'mock';
+  if (buildMode === 'http') return 'http';
+  if (buildMode === 'mock') return 'mock';
+
+  // Non-browser (vitest node env, SSR): offline mock, deterministic.
+  if (typeof window === 'undefined') return 'mock';
+
+  const injected = (window as unknown as { __AGG_MODE__?: string }).__AGG_MODE__;
+  if (injected === 'http') return 'http';
+  if (injected === 'mock') return 'mock';
+
+  try {
+    if (new URLSearchParams(window.location.search).has('mock')) return 'mock';
+    if (window.localStorage.getItem('constellation.aggMode') === 'mock') return 'mock';
+  } catch {
+    // URL/storage unavailable (private mode etc.) — fall through to the real-backend default.
+  }
+
+  // Served same-origin by the real backend → talk to it. Unreachable panels fail-open to a
+  // clean empty/loading state (each adapter method degrades), never to fake data.
+  return 'http';
 }
 
 let cached: AggregationClient | null = null;
@@ -919,6 +1685,12 @@ let cached: AggregationClient | null = null;
 export function getAggregationClient(): AggregationClient {
   if (!cached) {
     cached = resolveMode() === 'http' ? httpAdapter : mockAdapter;
+    if (typeof console !== 'undefined' && resolveMode() === 'mock' && typeof window !== 'undefined') {
+      // Visible-in-devtools signal that this session is on fixtures, so a mock bundle is never
+      // mistaken for real data (the S127 "smoke-and-mirrors" trap). Harmless in production
+      // (production defaults to http, so this never fires there).
+      console.warn('[constellation] aggregation adapter = MOCK (fixtures) — not live backend data.');
+    }
   }
   return cached;
 }

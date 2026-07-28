@@ -108,7 +108,11 @@ function ProjectRow({ project: p, expanded, onToggle }: { project: Project; expa
 
           {/* Enrichment progress row — per behavior contract §1.2: enrichment readiness feeds into execution */}
           <div className="h-flex h-gap-md" style={{ alignItems: 'center', marginTop: 4 }}>
-            <span style={{ fontSize: 10, color: 'var(--text-tertiary)', width: 60, flexShrink: 0 }}>⚡ Enrich</span>
+            {/* POL-13 (§9, no-emoji): drop the ⚡ glyph; a neutral dot marks the row. */}
+            <span style={{ fontSize: 10, color: 'var(--text-tertiary)', width: 60, flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <span aria-hidden style={{ width: 5, height: 5, borderRadius: '50%', background: 'var(--node-core)', flexShrink: 0 }} />
+              Enrich
+            </span>
             <div className="h-progress" style={{ flex: 1, height: 3 }}>
               <div className="h-progress-fill" style={{
                 width: `${ePct}%`,

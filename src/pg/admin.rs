@@ -44,7 +44,7 @@
 //! `crate::approval::GUARDED_BARE_NAMES`, with a test that enumerates the
 //! registered `pg_*` names so no guard entry ever dangles. `pg_admin` also
 //! calls [`crate::approval::gate`] itself at the top of `execute_structured`
-//! (matching the `openhands`/`<secret-manager>` precedent: the tool owns its own
+//! (matching the `openhands`/`<secret-manager>` precedent: the tool owns its own // pii-test-fixture: public product name, sanctioned secrets-manager module (see infra_service_path_exempt rationale)
 //! gate call; `GUARDED_BARE_NAMES` is a second, gateway-level check used for
 //! federated/mesh dispatch, not the only enforcement point) — both layers
 //! are in place.

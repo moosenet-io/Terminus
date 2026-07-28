@@ -51,3 +51,32 @@ pub mod runner;
 pub mod sweep;
 pub mod tools;
 pub mod workdir;
+
+/// Process-wide monotonic counter, combined below with pid+nanos, to guarantee a
+/// unique temp-path suffix for every mirror scratch dir (bare repos, work-dirs,
+/// gate scan roots, askpass scripts, …) allocated anywhere in this module tree.
+///
+/// `pid + nanos` alone is unique in the overwhelming common case, but it has two
+/// real failure modes under the compiler test-gate: (a) two allocations *in the
+/// same process* landing in the same clock tick when the host's timer resolution
+/// is coarser than expected, and (b) two *separate* gate build processes that
+/// happen to share both a PID (containers/sandboxes often reuse low PIDs) and a
+/// nearby wall-clock tick when they share a bind-mounted `/tmp`. The atomic
+/// counter makes same-process collisions structurally impossible (every call in
+/// a process gets a distinct sequence number), and folding it into the suffix
+/// makes accidental cross-process reuse require BOTH a PID collision AND a
+/// nanosecond-clock collision AND a sequence-number collision — vanishingly
+/// unlikely rather than merely unlikely.
+static UNIQUE_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Build a filesystem-safe, process- and call-unique suffix `<pid>-<nanos>-<seq>`.
+/// Callers prefix this with a stable tag identifying the call site, e.g.
+/// `std::env::temp_dir().join(format!("ghmr04-bare-{}", unique_temp_suffix()))`.
+pub(crate) fn unique_temp_suffix() -> String {
+    let seq = UNIQUE_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}-{}", std::process::id(), nanos, seq)
+}

@@ -161,14 +161,8 @@ impl ResidualCleaner for CommandCleaner {
                 "context": v.context,
             })).collect::<Vec<_>>(),
         });
-        let residuals_file = std::env::temp_dir().join(format!(
-            "ghmr05-residuals-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let residuals_file = std::env::temp_dir()
+            .join(format!("ghmr05-residuals-{}.json", super::unique_temp_suffix()));
         std::fs::write(&residuals_file, payload.to_string()).map_err(|e| {
             ToolError::Execution(format!("failed writing residuals file for cleaning command: {e}"))
         })?;
@@ -585,14 +579,7 @@ mod tests {
     use super::super::workdir::{approved_tag, run_git, MirrorWorkDir};
 
     fn unique(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "ghmr05-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+        std::env::temp_dir().join(format!("ghmr05-{tag}-{}", super::super::unique_temp_suffix()))
     }
 
     fn write_file(dir: &Path, rel: &str, content: &str) {

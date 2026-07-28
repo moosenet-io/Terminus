@@ -22,7 +22,9 @@ use serde_json::{json, Value};
 
 use crate::error::ToolError;
 use crate::intake::discovery::hf_client::{HfCategory, HfHubClient, HfModelSummary};
-use crate::intake::discovery::schema::{CandidateStatus, DiscoveryCandidate, FleetCategory};
+use crate::intake::discovery::schema::{
+    CandidateStatus, DiscoveryCandidate, FleetCategory, Modality,
+};
 use crate::intake::discovery::upsert::upsert_candidate;
 use crate::intake::storage as intake_storage;
 use crate::registry::ToolRegistry;
@@ -59,7 +61,11 @@ fn discovery_score(m: &HfModelSummary) -> f64 {
 }
 
 /// Build the `Discovered`-status candidate for one listed HF model.
-fn candidate_from(summary: &HfModelSummary, cat: HfCategory, now: chrono::DateTime<chrono::Utc>) -> DiscoveryCandidate {
+fn candidate_from(
+    summary: &HfModelSummary,
+    cat: HfCategory,
+    now: chrono::DateTime<chrono::Utc>,
+) -> DiscoveryCandidate {
     DiscoveryCandidate {
         // `model_name` is the brochure PRIMARY KEY, so it must be globally
         // unique. Use the FULL HF repo id ("Qwen/Qwen3-8B"), never the leaf
@@ -71,6 +77,11 @@ fn candidate_from(summary: &HfModelSummary, cat: HfCategory, now: chrono::DateTi
         hf_repo: summary.hf_repo.clone(),
         category: fleet_category(cat),
         status: CandidateStatus::Discovered,
+        // CB-02: classify the finer profiling modality from the HF listing's
+        // pipeline_tag + tags, so a later fleet sweep can auto-route this
+        // candidate to the right suite (Modality::suite). `None` when the
+        // listing carried no signal the classifier recognized.
+        modality: Modality::classify(summary.pipeline_tag.as_deref(), &summary.tags),
         // Fit is unknown from a listing (no parameter count); the fetch/measure
         // step sets 'confirmed'/'experimental'. 'unknown' is the brochure's
         // documented sentinel for exactly this.
@@ -92,6 +103,17 @@ fn candidate_from(summary: &HfModelSummary, cat: HfCategory, now: chrono::DateTi
             summary.likes,
             summary.trending_score
         )),
+        // Ask-4 practical metadata (S127): a bare listing carries none of it
+        // reliably — the MEASURE/ENRICH step fills these from the model-info blob
+        // and upsert COALESCE-protects them, so leaving them None here never
+        // erases an enriched value on a re-observation.
+        published_at: None,
+        updated_at: None,
+        license: None,
+        arch: None,
+        is_instruct: None,
+        gated: None,
+        quant_dtype: None,
     }
 }
 
@@ -151,17 +173,17 @@ fn parse_categories(args: &Value) -> Result<Vec<HfCategory>, ToolError> {
     let Some(v) = args.get("categories") else {
         return Ok(HfCategory::all().to_vec());
     };
-    let arr = v
-        .as_array()
-        .ok_or_else(|| ToolError::InvalidArgument("'categories' must be an array of strings".into()))?;
+    let arr = v.as_array().ok_or_else(|| {
+        ToolError::InvalidArgument("'categories' must be an array of strings".into())
+    })?;
     if arr.is_empty() {
         return Ok(HfCategory::all().to_vec());
     }
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
-        let s = item
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArgument("each 'categories' entry must be a string".into()))?;
+        let s = item.as_str().ok_or_else(|| {
+            ToolError::InvalidArgument("each 'categories' entry must be a string".into())
+        })?;
         let cat = HfCategory::all()
             .into_iter()
             .find(|c| c.as_str() == s)
@@ -178,7 +200,10 @@ pub struct ModelDiscoveryRefresh;
 impl ModelDiscoveryRefresh {
     async fn run(&self, args: Value) -> Result<Value, ToolError> {
         let categories = parse_categories(&args)?;
-        let dry_run = args.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+        let dry_run = args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let client = HfHubClient::new();
         let now = chrono::Utc::now();
         let pool = if dry_run {
@@ -249,7 +274,10 @@ impl RustTool for ModelDiscoveryRefresh {
     async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let v = self.run(args).await?;
         let text = serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string());
-        Ok(ToolOutput { text, structured: Some(v) })
+        Ok(ToolOutput {
+            text,
+            structured: Some(v),
+        })
     }
 }
 
@@ -279,7 +307,12 @@ mod tests {
         // Every HF category has a fleet category with the SAME string form —
         // the mapping is total and name-preserving (a divergence would fail here).
         for c in HfCategory::all() {
-            assert_eq!(fleet_category(c).as_str(), c.as_str(), "category '{}' must map by name", c.as_str());
+            assert_eq!(
+                fleet_category(c).as_str(),
+                c.as_str(),
+                "category '{}' must map by name",
+                c.as_str()
+            );
         }
     }
 
@@ -290,13 +323,25 @@ mod tests {
         let more_likes = summary("org/m", 1000, 5000, 5.0);
         let more_trend = summary("org/m", 1000, 10, 50.0);
         let b = discovery_score(&base);
-        assert!(discovery_score(&more_dl) > b, "more downloads must score higher");
-        assert!(discovery_score(&more_likes) > b, "more likes must score higher");
-        assert!(discovery_score(&more_trend) > b, "higher trending must score higher");
+        assert!(
+            discovery_score(&more_dl) > b,
+            "more downloads must score higher"
+        );
+        assert!(
+            discovery_score(&more_likes) > b,
+            "more likes must score higher"
+        );
+        assert!(
+            discovery_score(&more_trend) > b,
+            "higher trending must score higher"
+        );
         // Bounded even for absurd inputs.
         let huge = summary("org/m", u64::MAX, u64::MAX, 1e9);
         let s = discovery_score(&huge);
-        assert!((0.0..=100.0).contains(&s), "score must clamp to [0,100], got {s}");
+        assert!(
+            (0.0..=100.0).contains(&s),
+            "score must clamp to [0,100], got {s}"
+        );
         // A zero-signal model still yields a finite, non-negative score.
         let zero = summary("org/m", 0, 0, 0.0);
         assert!((0.0..=100.0).contains(&discovery_score(&zero)));
@@ -307,35 +352,105 @@ mod tests {
         // Two orgs, same leaf → DISTINCT model_name (the PK), so upsert can't
         // clobber one with the other. Using the leaf would collide.
         let now = chrono::Utc::now();
-        let a = candidate_from(&summary("Qwen/Qwen3-8B", 1, 1, 1.0), HfCategory::Assistant, now);
-        let b = candidate_from(&summary("unsloth/Qwen3-8B", 1, 1, 1.0), HfCategory::Assistant, now);
+        let a = candidate_from(
+            &summary("Qwen/Qwen3-8B", 1, 1, 1.0),
+            HfCategory::Assistant,
+            now,
+        );
+        let b = candidate_from(
+            &summary("unsloth/Qwen3-8B", 1, 1, 1.0),
+            HfCategory::Assistant,
+            now,
+        );
         assert_eq!(a.model_name, "Qwen/Qwen3-8B");
         assert_eq!(b.model_name, "unsloth/Qwen3-8B");
-        assert_ne!(a.model_name, b.model_name, "same-leaf models from different orgs must NOT share a PK");
+        assert_ne!(
+            a.model_name, b.model_name,
+            "same-leaf models from different orgs must NOT share a PK"
+        );
     }
 
     #[test]
     fn candidate_from_sets_discovered_status_and_unknown_fit() {
         let now = chrono::Utc::now();
-        let c = candidate_from(&summary("Org/Cool-Coder-7B", 5000, 40, 12.0), HfCategory::Coder, now);
+        let c = candidate_from(
+            &summary("Org/Cool-Coder-7B", 5000, 40, 12.0),
+            HfCategory::Coder,
+            now,
+        );
         assert_eq!(c.model_name, "Org/Cool-Coder-7B");
         assert_eq!(c.hf_repo, "Org/Cool-Coder-7B");
         assert!(matches!(c.category, FleetCategory::Coder));
-        assert!(matches!(c.status, CandidateStatus::Discovered), "new candidate starts Discovered");
+        assert!(
+            matches!(c.status, CandidateStatus::Discovered),
+            "new candidate starts Discovered"
+        );
         assert_eq!(c.gfx1151_class, "unknown", "fit unknown from a listing");
-        assert!(c.size_b.is_none() && c.vram_footprint_gb.is_none(), "size unknown from a listing");
+        assert!(
+            c.size_b.is_none() && c.vram_footprint_gb.is_none(),
+            "size unknown from a listing"
+        );
         assert!(c.discovery_score.unwrap() > 0.0);
         assert_eq!(c.discovery_source, "huggingface_hub");
+    }
+
+    fn summary_tagged(repo: &str, pipeline_tag: Option<&str>, tags: &[&str]) -> HfModelSummary {
+        HfModelSummary {
+            hf_repo: repo.to_string(),
+            pipeline_tag: pipeline_tag.map(|s| s.to_string()),
+            downloads: 10,
+            likes: 1,
+            trending_score: 1.0,
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn candidate_from_classifies_modality_from_the_listing() {
+        let now = chrono::Utc::now();
+        // A text-generation LLM (the default summary) → text_generation modality.
+        let text = candidate_from(&summary("org/chat", 1, 1, 1.0), HfCategory::Assistant, now);
+        assert_eq!(text.modality, Some(Modality::TextGeneration));
+
+        // A vision-language model listed under `visual` → vlm (NOT lumped with image_gen).
+        let vlm = candidate_from(
+            &summary_tagged("org/vlm", Some("image-text-to-text"), &[]),
+            HfCategory::Visual,
+            now,
+        );
+        assert_eq!(vlm.modality, Some(Modality::Vlm));
+
+        // An embedding model → embedding modality (suite embedding_retrieval).
+        let emb = candidate_from(
+            &summary_tagged("org/emb", Some("feature-extraction"), &[]),
+            HfCategory::Embedding,
+            now,
+        );
+        assert_eq!(emb.modality, Some(Modality::Embedding));
+
+        // An ASR/STT model under `voice` → stt (voice no longer means "any voice").
+        let stt = candidate_from(
+            &summary_tagged("org/asr", Some("automatic-speech-recognition"), &[]),
+            HfCategory::Voice,
+            now,
+        );
+        assert_eq!(stt.modality, Some(Modality::Stt));
     }
 
     #[test]
     fn parse_categories_defaults_to_all_and_rejects_unknown() {
         assert_eq!(parse_categories(&json!({})).unwrap().len(), 8);
-        assert_eq!(parse_categories(&json!({"categories": []})).unwrap().len(), 8);
+        assert_eq!(
+            parse_categories(&json!({"categories": []})).unwrap().len(),
+            8
+        );
         let one = parse_categories(&json!({"categories": ["coder"]})).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].as_str(), "coder");
         assert!(parse_categories(&json!({"categories": ["nonsense"]})).is_err());
-        assert!(parse_categories(&json!({"categories": "coder"})).is_err(), "must be an array");
+        assert!(
+            parse_categories(&json!({"categories": "coder"})).is_err(),
+            "must be an array"
+        );
     }
 }
