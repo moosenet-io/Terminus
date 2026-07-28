@@ -15,7 +15,7 @@ export function buildMemorySearchQuery(params: MemorySearchParams): string {
   if (params.user) usp.set('user', params.user);
   if (params.limit != null) usp.set('limit', String(params.limit));
   const qs = usp.toString();
-  return qs ? `/search?${qs}` : '/search';
+  return qs ? `/engram/search?${qs}` : '/engram/search';
 }
 
 /** Applies `MemorySearchParams` to an in-memory fixture array — this is the ONE place that

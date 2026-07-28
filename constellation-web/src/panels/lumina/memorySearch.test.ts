@@ -27,17 +27,17 @@ function memory(overrides: Partial<Memory> & { id: string }): Memory {
 
 describe('buildMemorySearchQuery', () => {
   it('omits empty/undefined fields entirely', () => {
-    expect(buildMemorySearchQuery({})).toBe('/search');
-    expect(buildMemorySearchQuery({ q: '  ' })).toBe('/search');
+    expect(buildMemorySearchQuery({})).toBe('/engram/search');
+    expect(buildMemorySearchQuery({ q: '  ' })).toBe('/engram/search');
   });
 
   it('includes only the params actually set', () => {
     const qs = buildMemorySearchQuery({ q: 'weather', type: 'Preference', limit: 25 });
-    expect(qs).toBe('/search?q=weather&type=Preference&limit=25');
+    expect(qs).toBe('/engram/search?q=weather&type=Preference&limit=25');
   });
 
   it('trims whitespace from q', () => {
-    expect(buildMemorySearchQuery({ q: '  hello  ' })).toBe('/search?q=hello');
+    expect(buildMemorySearchQuery({ q: '  hello  ' })).toBe('/engram/search?q=hello');
   });
 });
 

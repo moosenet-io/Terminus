@@ -136,7 +136,10 @@ function TypeMiniBars({ byType }: { byType: Record<string, number> }) {
 
 export function MemoryPanel() {
   const role = useAuthRole();
-  const { stats, results, filters, setFilters, refetchAll } = useLuminaMemory();
+  // Rules-of-hooks: useLuminaMemory must always be called, but `enabled: false` for a viewer
+  // session means it never issues the stats/search fetch at all — a viewer only ever sees the
+  // ViewerPlaceholder below, and now never even requests the underlying memory content.
+  const { stats, results, filters, setFilters, refetchAll } = useLuminaMemory(role !== 'viewer');
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
   const byId = useMemo(() => {
@@ -146,6 +149,23 @@ export function MemoryPanel() {
   }, [results.data]);
 
   const selected = selectedId ? byId.get(selectedId) ?? null : null;
+  // `selectedId` may point at a superseding record outside the current filtered/paginated
+  // result set (§3.3's "row → drawer ... superseded_by link navigating the chain" doesn't
+  // promise the chain stays within one filter view). `pendingId` distinguishes that in-flight
+  // case (still resolving after a widen+refetch) from "drawer closed" for MemoryDrawer.
+  const pendingId = selectedId && !selected ? selectedId : null;
+
+  const handleNavigate = (id: string) => {
+    setSelectedId(id);
+    // The search API has no fetch-by-id (§7 only exposes search+stats), so the best available
+    // recovery when the target isn't in `byId` is to widen the view as much as the contract
+    // allows — clear all filters and take the largest result window — and let the refetch run;
+    // `supersededChain` isn't a network primitive, it's the local-cycle-detection guard, not a
+    // fetch mechanism, so widening + refetch is the correct fix here rather than calling it.
+    if (!byId.has(id)) {
+      setFilters({ ...DEFAULT_MEMORY_FILTERS, limit: 100 });
+    }
+  };
 
   if (role === 'viewer') {
     return (
@@ -270,7 +290,8 @@ export function MemoryPanel() {
         memory={selected}
         lookup={id => byId.get(id) ?? null}
         onClose={() => setSelectedId(null)}
-        onNavigate={id => setSelectedId(id)}
+        onNavigate={handleNavigate}
+        pendingId={pendingId}
       />
     </div>
   );

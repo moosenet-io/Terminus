@@ -17,6 +17,10 @@ interface MemoryDrawerProps {
   onClose: () => void;
   /** Navigates the drawer to a different record (superseded_by link). */
   onNavigate: (id: string) => void;
+  /** Set while the panel is mid-navigate to a record not (yet) present in `lookup` — the search
+   *  API has no fetch-by-id, so navigating clears filters and refetches; this renders a "still
+   *  looking" state instead of silently closing the drawer while that refetch is in flight. */
+  pendingId: string | null;
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
@@ -33,18 +37,64 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-export function MemoryDrawer({ memory, lookup, onClose, onNavigate }: MemoryDrawerProps) {
+export function MemoryDrawer({ memory, lookup, onClose, onNavigate, pendingId }: MemoryDrawerProps) {
   const panelRef = useRef<HTMLDivElement>(null);
+  const showPending = !memory && pendingId !== null;
 
   useEffect(() => {
-    if (!memory) return;
+    if (!memory && !showPending) return;
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
     window.addEventListener('keydown', onKey);
     panelRef.current?.focus();
     return () => window.removeEventListener('keydown', onKey);
-  }, [memory, onClose]);
+  }, [memory, showPending, onClose]);
 
-  if (!memory) return null;
+  if (!memory && !showPending) return null;
+
+  if (!memory) {
+    // Navigated to a superseded_by id outside the current (now-widened) result set. Stay open
+    // with an honest "still resolving / not found" state instead of silently closing — closing
+    // reads as a bug (per review finding), not as "there is no such record."
+    return (
+      <div
+        role="presentation"
+        onClick={onClose}
+        style={{ position: 'fixed', inset: 0, background: 'rgba(13,11,26,0.55)', zIndex: 1000, display: 'flex', justifyContent: 'flex-end' }}
+      >
+        <div
+          ref={panelRef}
+          role="dialog"
+          aria-modal="true"
+          tabIndex={-1}
+          onClick={e => e.stopPropagation()}
+          style={{
+            width: 'min(480px, 92vw)', height: '100%', padding: 'var(--space-5)',
+            background: 'var(--grad-card)', borderLeft: '1px solid var(--border-strong)',
+            boxShadow: 'var(--shadow-lg), var(--inset-hi)',
+          }}
+        >
+          <div style={{ fontSize: 'var(--fs-h4)', fontWeight: 'var(--fw-semibold)', color: 'var(--text-100)', marginBottom: 'var(--space-3)' }}>
+            Looking for record…
+          </div>
+          <p style={{ color: 'var(--text-tertiary)', fontSize: 'var(--fs-sm)' }}>
+            Filters were cleared and the search re-run to look for <code style={{ fontFamily: 'var(--font-mono)' }}>{pendingId}</code>.
+            If it still doesn't appear, the record may be outside the result limit or no longer exists.
+          </p>
+          <button
+            type="button"
+            onClick={onClose}
+            style={{
+              marginTop: 'var(--space-3)', background: 'transparent', border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-md)', color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)',
+              fontSize: 'var(--fs-mono-sm)', padding: '5px 12px', cursor: 'pointer',
+            }}
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   const superseding = memory.superseded_by ? lookup(memory.superseded_by) : null;
 

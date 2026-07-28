@@ -66,7 +66,12 @@ export interface UseLuminaMemoryResult {
  *  client-side. The mock adapter's own server-side simulation lives in
  *  `aggregationClient.ts`'s `mockEngramSearch` (which itself calls the same
  *  `applyMemorySearchParams` helper this file's sibling `memorySearch.ts` exports). */
-export function useLuminaMemory(): UseLuminaMemoryResult {
+/** `enabled` (default true) gates ALL fetching, including the stats poll — pass `false` for a
+ *  viewer-role session so a session that only ever SEES the read-only access placeholder never
+ *  issues a request for potentially Health/Finance/Personal-sensitivity memory content in the
+ *  first place (defense in depth: the panel already renders the placeholder instead of the
+ *  table, but the fetch must not fire regardless of what's rendered). */
+export function useLuminaMemory(enabled: boolean = true): UseLuminaMemoryResult {
   const [filters, setFilters] = useState<MemoryFilters>(DEFAULT_MEMORY_FILTERS);
   const [stats, setStats] = useState<SectionState<LuminaMemoryStats>>(() => initialSection());
   const [results, setResults] = useState<SectionState<Memory[]>>(() => initialSection());
@@ -95,15 +100,16 @@ export function useLuminaMemory(): UseLuminaMemoryResult {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filters]);
 
-  useEffect(() => { fetchStats(false); }, [fetchStats]);
+  useEffect(() => { if (enabled) fetchStats(false); }, [enabled, fetchStats]);
   useEffect(() => {
+    if (!enabled) return;
     const id = setInterval(() => fetchStats(true), STATS_POLL_MS);
     return () => clearInterval(id);
-  }, [fetchStats]);
+  }, [enabled, fetchStats]);
 
   // Every filter change re-runs the (server-side) search — no client-side re-filtering of a
   // cached dump, per §3.3.
-  useEffect(() => { fetchResults(false); }, [fetchResults]);
+  useEffect(() => { if (enabled) fetchResults(false); }, [enabled, fetchResults]);
 
   const refetchAll = useCallback(() => {
     fetchStats(false);
