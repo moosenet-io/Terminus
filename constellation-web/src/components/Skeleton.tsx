@@ -31,3 +31,16 @@ export function SkeletonList({ rows = 3 }: { rows?: number }) {
     </div>
   );
 }
+
+/** S127 TGUI2 POL-10 (§3.6): equal-height skeleton ROWS for a table/list loading state — a
+ *  panel that is fetching renders these instead of a blank area or a lone spinner (every full
+ *  bar reads as "a row is coming"). Reduced motion stills the shimmer via the global rule. */
+export function SkeletonRows({ rows = 5, height = 18 }: { rows?: number; height?: number }) {
+  return (
+    <div role="status" aria-label="Loading" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
+      {Array.from({ length: rows }).map((_, i) => (
+        <Skeleton key={i} variant="bar" height={height} width="100%" />
+      ))}
+    </div>
+  );
+}

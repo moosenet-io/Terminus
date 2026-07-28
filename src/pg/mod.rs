@@ -19,7 +19,7 @@
 //! ## Registration
 //! `pg` registers on the CORE tool registry ONLY (`crate::registry::register_all`,
 //! alongside `crate::intake::register`) — Chord-served, never the
-//! `terminus_personal`/<host> personal registry, matching how
+//! `terminus_personal` federated/personal registry, matching how
 //! `model_fleet_catalog` and the rest of the build-pipeline-facing core
 //! surface are scoped (S9 posture).
 //!

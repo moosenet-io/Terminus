@@ -1,0 +1,27 @@
+[
+  {
+    "label": "greeting",
+    "text": "Hello, how can I help you today?",
+    "acoustic_ref": null
+  },
+  {
+    "label": "digits",
+    "text": "Your appointment is scheduled for March third at four fifteen in the afternoon.",
+    "acoustic_ref": null
+  },
+  {
+    "label": "pangram",
+    "text": "The quick brown fox jumps over the lazy dog.",
+    "acoustic_ref": null
+  },
+  {
+    "label": "instruction",
+    "text": "Please turn off the kitchen lights and lock the front door.",
+    "acoustic_ref": null
+  },
+  {
+    "label": "prose",
+    "text": "The northern lights shimmered green and violet across the winter sky.",
+    "acoustic_ref": null
+  }
+]

@@ -256,6 +256,102 @@ pub fn only_stale_from_env() -> bool {
     parse_only_stale(std::env::var("MINT_ONLY_STALE").ok().as_deref())
 }
 
+/// Parse the assistant-sweep gap-only run-mode flag from a raw env value
+/// (`INTAKE_ASSISTANT_GAP_ONLY`). Truthy = `1`/`true`/`yes`/`on`
+/// (case-insensitive); anything else (including unset) is `false` so the FULL
+/// assistant sweep stays the default. Pure over its input. Reuses the exact
+/// truthiness rule as [`parse_only_stale`] for one consistent flag grammar.
+pub fn parse_gap_only(raw: Option<&str>) -> bool {
+    parse_only_stale(raw)
+}
+
+/// Whether the assistant sweep should run in gap-only candidate-selection mode
+/// (`INTAKE_ASSISTANT_GAP_ONLY`, default `false` → full nomination set). When
+/// on, the candidate set is narrowed to models with a builder profile but no
+/// assistant profile (see `runner::select_gap_models`).
+pub fn gap_only_from_env() -> bool {
+    parse_gap_only(std::env::var("INTAKE_ASSISTANT_GAP_ONLY").ok().as_deref())
+}
+
+/// Parse the gap-only per-run model cap from a raw env value
+/// (`INTAKE_ASSISTANT_GAP_MAX`). Clamped to at least `1` (a cap of `0`/negative
+/// would profile nothing, defeating the point); a missing/unparseable value
+/// falls back to the default of `10` so an overnight gap run is bounded. Pure
+/// over its input.
+pub fn parse_gap_max(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|n| *n >= 1)
+        .map(|n| n as usize)
+        .unwrap_or(10)
+}
+
+/// The gap-only per-run model cap from the environment
+/// (`INTAKE_ASSISTANT_GAP_MAX`, default `10`).
+pub fn gap_max_from_env() -> usize {
+    parse_gap_max(std::env::var("INTAKE_ASSISTANT_GAP_MAX").ok().as_deref())
+}
+
+/// Whether the assistant sweep should ALSO fold high-signal brochure-discovered
+/// models into its nomination set (Ask-4 Phase 1 — `INTAKE_ASSISTANT_DISCOVERY_SELECT`,
+/// default `false`). When on, `run_mode` reads the brochure, ranks it via
+/// `discovery::select::select_discovery_candidates`, and merges the synthesized
+/// nominations into the curated set (see `discovery::select`). When off (the
+/// default) the nomination set is byte-for-byte the curated `nominations.json`,
+/// so every existing sweep mode (full / gap-only / only-stale) is unchanged.
+/// Reuses [`parse_only_stale`]'s truthiness grammar. Pure over its input.
+pub fn parse_discovery_select(raw: Option<&str>) -> bool {
+    parse_only_stale(raw)
+}
+
+/// Whether brochure discovery-select is enabled
+/// (`INTAKE_ASSISTANT_DISCOVERY_SELECT`, default `false`).
+pub fn discovery_select_from_env() -> bool {
+    parse_discovery_select(std::env::var("INTAKE_ASSISTANT_DISCOVERY_SELECT").ok().as_deref())
+}
+
+/// Whether the assistant sweep should run the Ask-4 Phase 2b HF→cold-storage
+/// INGEST pre-step (`INTAKE_ASSISTANT_DISCOVERY_INGEST`, default `false`). When
+/// on, `run_mode` reads + ranks the brochure, then for each selected candidate
+/// not yet in cold storage calls Chord's `/api/models/ingest` endpoint and
+/// advances the brochure status on success (see `discovery::ingest`). INDEPENDENT
+/// of `INTAKE_ASSISTANT_DISCOVERY_SELECT`: this flag off (the default) means no
+/// ingest call is ever made, so — with both flags off — the sweep is byte-for-
+/// byte unchanged. Reuses [`parse_only_stale`]'s truthiness grammar. Pure over
+/// its input.
+pub fn parse_discovery_ingest(raw: Option<&str>) -> bool {
+    parse_only_stale(raw)
+}
+
+/// Whether brochure Phase-2b ingest is enabled
+/// (`INTAKE_ASSISTANT_DISCOVERY_INGEST`, default `false`).
+pub fn discovery_ingest_from_env() -> bool {
+    parse_discovery_ingest(std::env::var("INTAKE_ASSISTANT_DISCOVERY_INGEST").ok().as_deref())
+}
+
+/// Whether the assistant sweep should run the Ask-4 discovery pre-step in
+/// DRY-RUN / SHADOW mode (`INTAKE_ASSISTANT_DISCOVERY_DRY_RUN`, default
+/// `false`). This is the audit-window mode: on a normal schedule it reads the
+/// brochure (READ-ONLY), ranks it exactly as the live pre-step would, and emits
+/// a structured `[ask4-shadow]` JSON report of what it WOULD select/pull/test —
+/// then takes ZERO live action (no Chord `/api/models/ingest` call, no
+/// nomination augmentation, no `transition_status` DB write, no proxy touch).
+///
+/// PRECEDENCE (fail-safe toward no-action): when this is on, the shadow pass
+/// WINS over both `INTAKE_ASSISTANT_DISCOVERY_SELECT` and
+/// `INTAKE_ASSISTANT_DISCOVERY_INGEST` — it runs REGARDLESS of them (the action
+/// flags stay OFF during the audit) and no live pre-step runs even if an action
+/// flag is somehow also set. See `discovery::ingest::plan_discovery_step`.
+/// Reuses [`parse_only_stale`]'s truthiness grammar. Pure over its input.
+pub fn parse_discovery_dry_run(raw: Option<&str>) -> bool {
+    parse_only_stale(raw)
+}
+
+/// Whether brochure discovery DRY-RUN / shadow mode is enabled
+/// (`INTAKE_ASSISTANT_DISCOVERY_DRY_RUN`, default `false`).
+pub fn discovery_dry_run_from_env() -> bool {
+    parse_discovery_dry_run(std::env::var("INTAKE_ASSISTANT_DISCOVERY_DRY_RUN").ok().as_deref())
+}
+
 // ---------------------------------------------------------------------------
 // Unified MINT harness (MINT2-04)
 // ---------------------------------------------------------------------------
@@ -465,28 +561,74 @@ fn parse_suites(args: &Value, model_name: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// Infer the default suite list for a model from its name (the operator's
-/// "correct tests for intended purposes"):
-///   - "coder"                  → [context, code]
-///   - "gpt-oss"                → [context, agent]
-///   - "qwen3:8b" / "harness"   → [context, code, agent]
+/// "correct tests for intended purposes"). S125 makes this EXHAUSTIVE: a general
+/// text/vision model runs every suite APPLICABLE to it, not just one or two:
+///   - general text LLM         → [context, code, agent, tool_routing]
+///     (coder / gpt-oss / qwen3 / harness / any other chat/code model)
+///   - vision (VLM)             → [vision_qa, context, agent, tool_routing]
 ///   - "diffusiongemma"/"dgem"  → [diffusion]  (MINT-DIFF-01: a non-Ollama
 ///                                daemon model — the Ollama-based suites
 ///                                can't load it, so its default is the
 ///                                diffusion suite, not `context`/`code`)
+///   - "nomic-embed"/"bge"/…    → [embedding_retrieval]  (SUITE-EMB: an
+///                                embedding model can't run the chat-shaped
+///                                suites; see [`is_embedding_model`])
+///   - "rerank"                 → [reranking]  (SUITE-RRK: a cross-encoder
+///                                reranker profiled via Chord's /v1/rerank,
+///                                not an Ollama generative suite)
 ///   - default                  → [context]
 /// Pure.
 pub fn default_suites_for(model_name: &str) -> Vec<String> {
     let n = model_name.to_lowercase();
     let v = if n.contains("diffusiongemma") || n.contains("dgem") {
         vec!["diffusion"]
-    } else if n.contains("coder") {
-        vec!["context", "code"]
-    } else if n.contains("gpt-oss") {
-        vec!["context", "agent"]
-    } else if n.contains("qwen3:8b") || n.contains("harness") {
-        vec!["context", "code", "agent"]
+    } else if n.contains("sd-turbo")
+        || n.contains("stable-diffusion")
+        || n.contains("sdxl")
+        || n.contains("flux")
+    {
+        // SUITE-IMG: text-to-image models default to the image-generation suite
+        // (the Ollama-based context/code/agent suites don't apply to them).
+        vec!["image_generation"]
+    } else if n.contains("docling") || n.contains("docparse") || n.contains("ocr") {
+        // SUITE-DOC: a document-parse model (docling/OCR) is served through
+        // Chord's /v1/documents/parse, not an Ollama chat serve — its default
+        // is the document_parsing suite, not context/code.
+        vec!["document_parsing"]
+    } else if is_stt_model(&n) {
+        // SUITE-STT: a whisper/ASR model is served behind Chord's
+        // `/v1/audio/transcriptions` route — the Ollama-based suites can't load
+        // it, so its default is the `stt` suite (mirrors the diffusion default).
+        vec!["stt"]
+    } else if is_tts_model(&n) {
+        // S125 SUITE-TTS: a piper/TTS model is served behind Chord's synthesis
+        // route (intelligibility scored via an STT loopback) — the Ollama-based
+        // suites can't load it, so its default is the `tts` suite (mirrors stt).
+        vec!["tts"]
+    } else if is_embedding_model(&n) {
+        // SUITE-EMB (TERM #508): an embedding model can't run the chat-shaped
+        // context/code/agent suites — its default is the IR-retrieval suite.
+        vec!["embedding_retrieval"]
+    } else if is_vision_model(&n) {
+        // SUITE-VQA (S125 exhaustive): a VLM is ALSO a chat model — profile both
+        // its vision path AND the applicable text-based suites, not just
+        // vision_qa. (No `code`: a VLM is not assumed to be a coder, matching the
+        // operator's exhaustive-but-applicable routing.)
+        vec!["vision_qa", "context", "agent", "tool_routing"]
+    } else if n.contains("rerank") {
+        // SUITE-RRK: a reranker (e.g. bge-reranker-v2-m3) is a cross-encoder, not
+        // a generative model — the Ollama-based suites don't apply; its default
+        // is the reranking suite via Chord's /v1/rerank.
+        vec!["reranking"]
     } else {
-        vec!["context"]
+        // S125 exhaustive routing: every GENERAL text LLM (a coder, gpt-oss, a
+        // qwen3/harness chat model, or any other chat/code model) now runs EVERY
+        // text-based suite that applies to it — context, code, agent, AND
+        // tool_routing — so MINT is exhaustive rather than covering just one or
+        // two buckets per model. The specialized single-purpose backends above
+        // (diffusion/image/doc/stt/tts/embedding/vision/rerank) keep returning
+        // only their own suite.
+        vec!["context", "code", "agent", "tool_routing"]
     };
     v.into_iter().map(String::from).collect()
 }
@@ -497,6 +639,71 @@ pub fn is_non_ollama_daemon(model_name: &str) -> bool {
     let n = model_name.to_lowercase();
     n.contains("diffusiongemma") || n.contains("dgem")
 }
+
+/// SUITE-STT: whether a model is a speech-to-text (ASR) model reached through
+/// Chord's OpenAI-compatible `/v1/audio/transcriptions` route rather than the
+/// Ollama load path. Name-heuristic (whisper / `stt` / asr / transcrib), same
+/// style as [`is_non_ollama_daemon`]. STT always wins over TTS: any name
+/// carrying one of these signals is classified stt, and [`is_tts_model`] is
+/// guarded to return false for it, so the two predicates are provably disjoint.
+/// Pure. Expects an already-lowercased name.
+pub fn is_stt_model(model_name_lower: &str) -> bool {
+    model_name_lower.contains("whisper")
+        || model_name_lower.contains("stt")
+        || model_name_lower.contains("asr")
+        || model_name_lower.contains("transcrib")
+}
+
+/// S125 SUITE-TTS: whether a model is a text-to-speech (TTS) model reached through
+/// Chord's OpenAI-compatible synthesis route rather than the Ollama load path.
+/// Name-heuristic (piper / vits / a `tts` tag), same style as [`is_stt_model`].
+/// Provably disjoint from [`is_stt_model`]: STT wins, so this returns false for
+/// any name carrying a speech-to-text signal even when it also carries a TTS
+/// marker (e.g. `coqui-stt`, `my-stt-tts`). A bare `coqui` is deliberately NOT a
+/// TTS signal — coqui ships both STT and TTS models, so only a `tts`-bearing
+/// coqui name (`coqui-tts`) routes here. Pure. Expects an already-lowercased name.
+pub fn is_tts_model(model_name_lower: &str) -> bool {
+    // STT always wins -> the predicates are disjoint by construction.
+    if is_stt_model(model_name_lower) {
+        return false;
+    }
+    // Require a TTS-specific signal (bare `coqui` is ambiguous, so excluded).
+    model_name_lower.contains("piper")
+        || model_name_lower.contains("vits")
+        || model_name_lower.contains("tts")
+}
+
+/// Whether a model is a text-embedding model (SUITE-EMB): matched by the common
+/// embedding-model name markers in this fleet's registry (nomic-embed, bge,
+/// mxbai-embed, gte, e5, embeddinggemma, or a bare `-embed`/`embedding` tag).
+/// Pure. Deliberately conservative substring matching — a chat model won't carry
+/// these markers, and a false negative just falls back to the `context` default.
+pub fn is_embedding_model(model_name: &str) -> bool {
+    let n = model_name.to_lowercase();
+    n.contains("embed")
+        || n.contains("nomic")
+        || n.contains("bge-")
+        || n.contains("mxbai")
+        || n.contains("gte-")
+        || n.starts_with("gte")
+        || n.contains("e5-")
+}
+
+/// SUITE-VQA: whether a model name looks like a vision-capable (VLM) model that
+/// the image-QA suite should profile. Matches the common local VLM families.
+/// Pure. `model_name` is expected already-lowercased by the caller path, but is
+/// lowercased again defensively.
+pub fn is_vision_model(model_name: &str) -> bool {
+    let n = model_name.to_lowercase();
+    n.contains("llava")
+        || n.contains("bakllava")
+        || n.contains("minicpm-v")
+        || n.contains("vision")
+        || n.contains("-vl")
+        || n.contains(":vl")
+        || n.contains("moondream")
+}
+
 
 /// Pick code-suite languages by model purpose: coder models get the full P0/P1
 /// set; everyone else gets a lighter, fast set. Empty vec = "all languages in
@@ -568,8 +775,8 @@ impl RustTool for ModelIntake {
                 "model_name": { "type": "string", "description": "Ollama model name, e.g. 'gpt-oss:20b'" },
                 "suites": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion"] },
-                    "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other three suites don't apply to it."
+                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion", "tool_routing", "vision_qa", "reranking", "image_generation", "document_parsing", "stt", "tts"] },
+                    "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other suites don't apply to it. 'tool_routing' profiles function-calling over Chord's OpenAI-compatible /v1/chat/completions (correct-tool@1, parameter validity, decoy rejection, multi-step) — a first-class generalization of the 'agent' suite's tool-selection path. 'vision_qa' profiles a vision/VLM model on image-QA via Chord's chat/vision route (accuracy, caption similarity, hallucination, latency, VRAM)."
                 },
                 "tiers": {
                     "type": "array",
@@ -658,6 +865,31 @@ impl RustTool for ModelIntake {
             return Ok(out);
         }
 
+        // SUITE-STT: an STT model is served behind Chord's OpenAI-compatible
+        // `/v1/audio/transcriptions` route — the Ollama-based load path can't
+        // load it. When the 'stt' suite is requested, run it via its own corpus
+        // harness and return before the Ollama-load section below (mirrors the
+        // diffusion daemon guard). Any Ollama-based suites requested alongside it
+        // are not applicable and are noted, never silently dropped.
+        if suites.iter().any(|s| s == "stt") {
+            let res = runner::run_stt_suite(model_name).await?;
+            out.push_str("=== STT suite ===\n");
+            out.push_str(&format!(
+                "clips run: {}\navg WER (digit-normalized): {:.3}\navg real-time factor: {:.2}\n",
+                res.clips_run, res.avg_wer, res.avg_rtf,
+            ));
+            for line in &res.per_clip {
+                out.push_str(&format!("  {line}\n"));
+            }
+            if suites.iter().any(|s| s != "stt") {
+                out.push_str(
+                    "Note: Ollama-based suites (context/code/agent) are not applicable to an \
+                     STT model served behind Chord's transcription route and were skipped.\n",
+                );
+            }
+            return Ok(out);
+        }
+
         // P5: optional backend override — force this run onto a specific backend
         // (e.g. `ollama` for the CPU-sizing pass, `llama-gpu` for the GPU pass)
         // regardless of the model's tag. A drop guard clears it on every exit.
@@ -713,8 +945,8 @@ impl RustTool for ModelIntake {
             ));
         }
 
-        // Ensure a parent profile row for code/agent-only runs.
-        let needs_profile = suites.iter().any(|s| s == "code" || s == "agent");
+        // Ensure a parent profile row for code/agent/tool_routing-only runs.
+        let needs_profile = suites.iter().any(|s| s == "code" || s == "agent" || s == "tool_routing");
         if needs_profile && profile_id.is_none() {
             profile_id = Some(runner::create_profile_row(model_name).await?);
         }
@@ -816,6 +1048,132 @@ impl RustTool for ModelIntake {
                 a.personality_quality.map(|v| format!("{v:.1}/5")).unwrap_or_else(|| "n/a".into()),
             ));
             out.push_str(&format!("recommended_role: {}\n\n", a.recommended_role));
+        }
+
+        // SUITE-EMB (TERM #508): IR-retrieval profiling for embedding models.
+        // Self-contained (creates its own profile row, loads its own corpora),
+        // so it runs independently of the context/code/agent profile_id above.
+        if suites.iter().any(|s| s == "embedding_retrieval") {
+            let res = runner::run_embedding_retrieval_suite(model_name).await?;
+            out.push_str("=== Embedding-retrieval suite (SUITE-EMB) ===\n");
+            if res.skipped {
+                out.push_str(&format!("skipped: {}\n\n", res.summary));
+            } else {
+                out.push_str(&format!("{}\n\n", res.summary));
+            }
+        }
+        if suites.iter().any(|s| s == "tool_routing") {
+            let pid = profile_id.expect("profile_id set");
+            let limit = args.get("scenario_limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let res = runner::run_tool_routing_suite(model_name, pid, limit).await?;
+            out.push_str("=== Tool-routing suite ===\n");
+            out.push_str(&format!(
+                "scenarios run: {} ({} rows, {} errored/skipped)\n",
+                res.scenarios_run, res.rows_written, res.errored
+            ));
+            let pct = |v: Option<f64>| v.map(|x| format!("{:.0}%", x * 100.0)).unwrap_or_else(|| "n/a".into());
+            out.push_str(&format!(
+                "correct_tool@1: {} | parameter_validity: {} | decoy_rejection: {} | multi_step: {}\n\n",
+                pct(res.correct_tool_at_1),
+                pct(res.parameter_validity),
+                pct(res.decoy_rejection),
+                pct(res.multi_step_success),
+            ));
+        }
+
+        // SUITE-VQA: the vision-QA suite loads its own image corpus and profiles
+        // via Chord's chat/vision route, creating its own profile row (like the
+        // diffusion suite) — it does not share the context/code/agent profile_id.
+        if suites.iter().any(|s| s == "vision_qa") {
+            let res = runner::run_vision_qa_suite(model_name).await?;
+            out.push_str("=== Vision-QA suite ===\n");
+            out.push_str(&format!(
+                "items run: {}\naccuracy: {:.2}\nhallucination_rate: {:.2}\navg_latency_ms: {:.0}\n",
+                res.items_run, res.accuracy, res.hallucination_rate, res.avg_latency_ms,
+            ));
+            for line in &res.per_item {
+                out.push_str(&format!("  {line}\n"));
+            }
+            out.push('\n');
+        }
+
+        // SUITE-RRK: reranking self-manages its profile row (provider "openai",
+        // Chord's /v1/rerank) and needs no shared `profile_id` — a reranker never
+        // runs the Ollama-based context/code/agent suites.
+        if suites.iter().any(|s| s == "reranking") {
+            let res = runner::run_reranking_suite(model_name).await?;
+            out.push_str("=== Reranking suite ===\n");
+            out.push_str(&format!(
+                "queries run: {}\navg nDCG uplift: {:+.3}\navg reranked nDCG: {:.3}\navg latency_ms: {:.0}\n",
+                res.queries_run, res.avg_ndcg_uplift, res.avg_reranked_ndcg, res.avg_latency_ms,
+            ));
+            for line in &res.per_query {
+                out.push_str(&format!("  {line}\n"));
+            }
+            out.push('\n');
+        }
+
+        // SUITE-IMG: image-generation suite (its own profile row + `openai`
+        // backend via Chord's `/v1/images/generations`, sd-turbo behind it).
+        // Self-contained — does not use the Ollama `profile_id` above.
+        if suites.iter().any(|s| s == "image_generation") {
+            let res = runner::run_image_generation_suite(model_name).await?;
+            out.push_str("=== Image-generation suite ===\n");
+            out.push_str(&format!(
+                "prompts run: {}\nsuccessful: {}/{}\navg time_to_image_ms: {:.0}\n",
+                res.prompts_run, res.success_count, res.prompts_run, res.avg_time_to_image_ms,
+            ));
+            for line in &res.per_prompt {
+                out.push_str(&format!("  {line}\n"));
+            }
+            out.push('\n');
+        }
+
+        // SUITE-DOC: document_parsing runs through Chord `/v1/documents/parse`
+        // (docling), owns its own profile row, and reads its corpus from
+        // INTAKE_CORPUS_DIR — so it dispatches directly, independent of the
+        // Ollama-based context/code/agent suites above. A NotConfigured corpus
+        // is reported inline, not fatal to the rest of the run.
+        if suites.iter().any(|s| s == "document_parsing") {
+            out.push_str("=== Document-parsing suite ===\n");
+            match runner::run_document_parsing_suite(model_name).await {
+                Ok(res) => {
+                    out.push_str(&format!(
+                        "cases run: {}\navg field_accuracy: {:.2}\navg latency_ms: {:.0}\n",
+                        res.cases_run, res.avg_field_accuracy, res.avg_latency_ms,
+                    ));
+                    for line in &res.per_case {
+                        out.push_str(&format!("  {line}\n"));
+                    }
+                    out.push('\n');
+                }
+                Err(e) => out.push_str(&format!("skipped: {e}\n\n")),
+            }
+        }
+
+        // S125 SUITE-TTS: text-to-speech runs through Chord's synthesis route with
+        // an STT loopback for intelligibility, owns its own `openai`-provider
+        // profile row, and is independent of the Ollama-based suites above — so it
+        // dispatches directly here (like document_parsing). This wires the tts
+        // suite into the single-model `model_intake` tool consistently with the
+        // fleet path's `tts` branch (previously it was fleet-only).
+        if suites.iter().any(|s| s == "tts") {
+            out.push_str("=== Text-to-speech suite ===\n");
+            match runner::run_tts_suite(model_name).await {
+                Ok(res) => {
+                    out.push_str(&format!(
+                        "cases run: {}\navg loopback WER: {:.2}\navg real-time factor: {}\n",
+                        res.cases_run,
+                        res.avg_loopback_wer,
+                        res.avg_rtf.map(|r| format!("{r:.2}")).unwrap_or_else(|| "n/a".into()),
+                    ));
+                    for line in &res.per_case {
+                        out.push_str(&format!("  {line}\n"));
+                    }
+                    out.push('\n');
+                }
+                Err(e) => out.push_str(&format!("skipped: {e}\n\n")),
+            }
         }
 
         out.push_str("Note: coherence_score stored as NULL (LLM-judge deferred).\n");
@@ -1043,7 +1401,12 @@ async fn run_fleet_sweep(args: &Value, job_id: Option<&str>) -> Result<String, T
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| ToolError::Http(e.to_string()))?;
-        models = runner::list_chat_models(&client).await;
+        // S125 (exhaustive all-categories fleet): seed from ALL profilable models —
+        // chat models PLUS the registry's specialized (embedding / vision / rerank /
+        // stt / tts / doc-parse / image-gen / diffusion) models — not just chat, so
+        // every category's suite actually runs in an auto sweep. `default_suites_for`
+        // still routes each model to its own suite(s); cold ones warm-fail and skip.
+        models = runner::list_all_profilable_models(&client).await;
     }
     if models.is_empty() {
         return Err(ToolError::NotConfigured("no models to profile (catalog empty)".into()));
@@ -1052,7 +1415,27 @@ async fn run_fleet_sweep(args: &Value, job_id: Option<&str>) -> Result<String, T
     // Per-model suite override map.
     let overrides = args.get("model_suites").cloned().unwrap_or(Value::Null);
 
-    let resolve_suites = move |m: &str| -> Vec<String> {
+    // DR-01: CONVERGENT sweep. When `only_pending` is set, read the persisted
+    // fleet catalog ONCE and, per model, keep only the suites whose coverage cell
+    // is still `not_run`/`stale` (via `catalog::pending_suites`) — settled cells
+    // are skipped so a resumed/partial sweep converges instead of re-profiling
+    // everything. Best-effort: an un-migrated host / DB hiccup falls back to
+    // running all resolved suites (map is `None`), never failing the sweep.
+    let only_pending = args.get("only_pending").and_then(|v| v.as_bool()).unwrap_or(false);
+    let pending_cells: Option<std::collections::HashMap<String, Vec<catalog::StoredCatalogCell>>> =
+        if only_pending {
+            match storage::get_pool().await {
+                Ok(pool) => storage::read_fleet_catalog(&pool)
+                    .await
+                    .ok()
+                    .map(|cards| cards.into_iter().map(|c| (c.model_name.clone(), c.cells)).collect()),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+    let base_resolve = move |m: &str| -> Vec<String> {
         if let Some(arr) = overrides.get(m).and_then(|v| v.as_array()) {
             let v: Vec<String> = arr
                 .iter()
@@ -1064,6 +1447,21 @@ async fn run_fleet_sweep(args: &Value, job_id: Option<&str>) -> Result<String, T
             }
         }
         default_suites_for(m)
+    };
+
+    let resolve_suites = move |m: &str| -> Vec<String> {
+        let suites = base_resolve(m);
+        match &pending_cells {
+            // Targeted (convergent) sweep: prune settled cells. A model absent from
+            // the catalog has no settled cells, so all its suites stay pending.
+            Some(map) => {
+                let empty: Vec<catalog::StoredCatalogCell> = Vec::new();
+                let cells = map.get(m).unwrap_or(&empty);
+                catalog::pending_suites(&suites, cells)
+            }
+            // Full sweep (default): run every resolved suite, unchanged behavior.
+            None => suites,
+        }
     };
 
     let results = runner::run_fleet_suites(
@@ -1165,7 +1563,9 @@ impl RustTool for ModelIntakeFleet {
                 "model_suites": { "type": "object",
                     "description": "Explicit per-model suite override: {model: [suites]}. Overrides purpose inference for that model." },
                 "async": { "type": "boolean",
-                    "description": "Run the sweep as a non-blocking background job (default false = blocking, current behavior). When true, returns a job_id immediately — poll with model_intake_job_status." }
+                    "description": "Run the sweep as a non-blocking background job (default false = blocking, current behavior). When true, returns a job_id immediately — poll with model_intake_job_status." },
+                "only_pending": { "type": "boolean",
+                    "description": "DR-01 convergent sweep: run only the models×suites whose fleet-catalog cell is still not_run/stale (skip settled run/non_viable cells) so a resumed/partial sweep converges. Default false = profile every resolved suite." }
             }
         })
     }
@@ -1320,11 +1720,13 @@ mod tests {
 
     #[test]
     fn parse_suites_default_inferred_by_purpose() {
-        // No suites → per-model purpose routing.
-        assert_eq!(parse_suites(&json!({}), "qwen3-coder:30b"), vec!["context", "code"]);
-        assert_eq!(parse_suites(&json!({}), "gpt-oss:20b"), vec!["context", "agent"]);
-        assert_eq!(parse_suites(&json!({}), "qwen3:8b"), vec!["context", "code", "agent"]);
-        assert_eq!(parse_suites(&json!({}), "mystery:7b"), vec!["context"]);
+        // No suites → per-model purpose routing. S125 exhaustive: every general
+        // text model runs all four text suites.
+        let all_text = vec!["context", "code", "agent", "tool_routing"];
+        assert_eq!(parse_suites(&json!({}), "qwen3-coder:30b"), all_text);
+        assert_eq!(parse_suites(&json!({}), "gpt-oss:20b"), all_text);
+        assert_eq!(parse_suites(&json!({}), "qwen3:8b"), all_text);
+        assert_eq!(parse_suites(&json!({}), "mystery:7b"), all_text);
     }
 
     #[test]
@@ -1345,17 +1747,112 @@ mod tests {
     #[test]
     fn parse_suites_empty_array_falls_back_to_purpose() {
         let s = parse_suites(&json!({"suites": []}), "gpt-oss:20b");
-        assert_eq!(s, vec!["context", "agent"]);
+        // S125 exhaustive: a general text model falls back to all four text suites.
+        assert_eq!(s, vec!["context", "code", "agent", "tool_routing"]);
     }
 
     #[test]
     fn default_suites_for_routing() {
-        assert_eq!(default_suites_for("qwen3-coder:30b"), vec!["context", "code"]);
-        assert_eq!(default_suites_for("gpt-oss:20b"), vec!["context", "agent"]);
-        assert_eq!(default_suites_for("harness-1"), vec!["context", "code", "agent"]);
+        // S125 exhaustive: every GENERAL text LLM now runs ALL four text suites,
+        // not just one or two — coder / gpt-oss / qwen3 / harness / any chat model.
+        let all_text = vec!["context", "code", "agent", "tool_routing"];
+        assert_eq!(default_suites_for("qwen3-coder:30b"), all_text);
+        assert_eq!(default_suites_for("gpt-oss:20b"), all_text);
+        assert_eq!(default_suites_for("harness-1"), all_text);
+        assert_eq!(default_suites_for("qwen3:8b"), all_text);
+        assert_eq!(default_suites_for("llama3:8b"), all_text);
+        // S125 exhaustive: a VLM profiles its vision path AND the text suites
+        // (context/agent/tool_routing — no `code`, a VLM is not assumed a coder).
+        assert_eq!(
+            default_suites_for("llava:13b"),
+            vec!["vision_qa", "context", "agent", "tool_routing"]
+        );
+        // Specialized single-purpose backends still route to only their suite.
         assert_eq!(default_suites_for("diffusiongemma-26b-a4b"), vec!["diffusion"]);
         assert_eq!(default_suites_for("dgem-secondary"), vec!["diffusion"]);
-        assert_eq!(default_suites_for("llama3:8b"), vec!["context"]);
+        assert_eq!(default_suites_for("jina-reranker-v2-base"), vec!["reranking"]);
+        // SUITE-EMB: embedding models route to the embedding_retrieval suite.
+        assert_eq!(default_suites_for("nomic-embed-text:latest"), vec!["embedding_retrieval"]);
+        assert_eq!(default_suites_for("bge-large-en"), vec!["embedding_retrieval"]);
+        assert_eq!(default_suites_for("mxbai-embed-large"), vec!["embedding_retrieval"]);
+        // SUITE-IMG: text-to-image models route to the image-generation suite.
+        assert_eq!(default_suites_for("sd-turbo"), vec!["image_generation"]);
+        assert_eq!(default_suites_for("stable-diffusion-3.5"), vec!["image_generation"]);
+        // SUITE-DOC: document-parse models route to the document_parsing suite.
+        assert_eq!(default_suites_for("docling-v2"), vec!["document_parsing"]);
+        assert_eq!(default_suites_for("granite-docling-258m"), vec!["document_parsing"]);
+        // SUITE-STT: whisper / ASR models route to the stt suite.
+        assert_eq!(default_suites_for("faster-whisper:small"), vec!["stt"]);
+        assert_eq!(default_suites_for("whisper-large-v3"), vec!["stt"]);
+        // S125 SUITE-TTS: piper / TTS models route to the tts suite.
+        assert_eq!(default_suites_for("piper-en_US-lessac-medium"), vec!["tts"]);
+        assert_eq!(default_suites_for("coqui-xtts-v2"), vec!["tts"]);
+        assert_eq!(default_suites_for("my-tts-voice"), vec!["tts"]);
+    }
+
+    #[test]
+    fn is_stt_model_matches_whisper_family() {
+        assert!(is_stt_model("faster-whisper:small"));
+        assert!(is_stt_model("whisper-large-v3"));
+        assert!(is_stt_model("my-stt-model"));
+        assert!(!is_stt_model("qwen3:8b"));
+        assert!(!is_stt_model("diffusiongemma-26b-a4b"));
+    }
+
+    #[test]
+    fn is_tts_model_matches_tts_family_and_is_disjoint_from_stt() {
+        // Genuine TTS names (piper / vits / a `tts` tag) route tts-only.
+        assert!(is_tts_model("piper-en_US-lessac-medium"));
+        assert!(is_tts_model("coqui-xtts-v2")); // `xtts` carries the `tts` tag
+        assert!(is_tts_model("coqui-tts"));
+        assert!(is_tts_model("some-vits-model"));
+        assert!(is_tts_model("my-tts-voice"));
+        assert!(!is_stt_model("piper-en_US-lessac-medium"));
+        assert!(!is_stt_model("coqui-tts"));
+
+        // STT wins on any speech-to-text signal, even alongside a tts marker.
+        // `coqui-stt` and `my-stt-tts` satisfy the raw tts substrings but must
+        // classify stt-only.
+        assert!(is_stt_model("coqui-stt"));
+        assert!(!is_tts_model("coqui-stt"));
+        assert!(is_stt_model("my-stt-tts"));
+        assert!(!is_tts_model("my-stt-tts"));
+        assert!(is_stt_model("whisper"));
+        assert!(!is_tts_model("whisper"));
+        assert!(!is_tts_model("faster-whisper:small"));
+        assert!(!is_tts_model("my-stt-model"));
+
+        // A bare `coqui` (no tts/stt marker) is ambiguous and routes to NEITHER
+        // predicate — coqui ships both families, so a bare tag is not a signal.
+        assert!(!is_tts_model("coqui"));
+        assert!(!is_stt_model("coqui"));
+
+        // Non-audio models trip neither predicate.
+        assert!(!is_tts_model("qwen3:8b"));
+        assert!(!is_stt_model("qwen3:8b"));
+
+        // Exhaustive disjointness: NO name may satisfy both predicates at once.
+        for name in [
+            "piper-en_US-lessac-medium",
+            "coqui-xtts-v2",
+            "coqui-tts",
+            "coqui-stt",
+            "my-stt-tts",
+            "some-vits-model",
+            "my-tts-voice",
+            "whisper",
+            "faster-whisper:small",
+            "my-stt-model",
+            "coqui",
+            "qwen3:8b",
+            "asr-conformer",
+            "transcribe-net",
+        ] {
+            assert!(
+                !(is_stt_model(name) && is_tts_model(name)),
+                "name {name:?} satisfied BOTH is_stt_model and is_tts_model"
+            );
+        }
     }
 
     #[test]
@@ -1562,6 +2059,28 @@ mod tests {
         assert!(parse_only_stale(Some("true")));
         assert!(parse_only_stale(Some("YES")));
         assert!(parse_only_stale(Some(" On ")));
+    }
+
+    #[test]
+    fn parse_gap_only_is_false_unless_explicitly_truthy() {
+        assert!(!parse_gap_only(None), "unset → full sweep (default)");
+        assert!(!parse_gap_only(Some("")));
+        assert!(!parse_gap_only(Some("0")));
+        assert!(!parse_gap_only(Some("off")));
+        assert!(parse_gap_only(Some("1")));
+        assert!(parse_gap_only(Some("true")));
+        assert!(parse_gap_only(Some(" On ")));
+    }
+
+    #[test]
+    fn parse_gap_max_defaults_to_ten_and_clamps() {
+        assert_eq!(parse_gap_max(None), 10, "unset → default 10");
+        assert_eq!(parse_gap_max(Some("")), 10);
+        assert_eq!(parse_gap_max(Some("garbage")), 10);
+        assert_eq!(parse_gap_max(Some("0")), 10, "0 is not a useful cap → default");
+        assert_eq!(parse_gap_max(Some("-4")), 10, "negative → default");
+        assert_eq!(parse_gap_max(Some(" 3 ")), 3);
+        assert_eq!(parse_gap_max(Some("25")), 25);
     }
 
     #[test]

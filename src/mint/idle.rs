@@ -623,6 +623,29 @@ impl IdleController {
         }
     }
 
+    /// S125 IDLE-WATCHDOG: extend the auto-reactivate deadline to at least `new_deadline`
+    /// (never shorten). Used when a fresh compiler lease enters while MINT is ALREADY idle
+    /// from an earlier lease, so a longer build window is honored instead of the first
+    /// lease's (possibly shorter) deadline. No-op unless fully `Idle`.
+    pub fn bump_watchdog(&self, new_deadline: u64) {
+        let mut guard = self.inner.write().expect("mint idle lock poisoned");
+        let changed = if let IdleState::Idle(m) = &mut *guard {
+            if new_deadline > m.watchdog_deadline {
+                m.watchdog_deadline = new_deadline;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // Persist the extended deadline so a restart mid-build reloads the LONGER window,
+        // not the first lease's stale (shorter) one, and cannot reactivate MINT early.
+        if changed {
+            self.persist_locked(&guard);
+        }
+    }
+
     /// Try to admit ONE new MINT run. The in-flight increment happens under the SAME
     /// write lock that flips the phase, so once a concurrent
     /// [`begin_enter`](Self::begin_enter) has installed `EnteringIdle`, this can never
@@ -1152,7 +1175,17 @@ impl Drop for ReleasingLatchGuard {
 /// freed RAM, record the resume manifest. Delegates to [`enter_idle_on`] against the
 /// process-global controller with the real GPU-lock release.
 pub async fn enter_idle(reason: &str) -> (EnterOutcome, Option<IdleReport>) {
-    enter_idle_on(mint_idle(), reason, release_mint_gpu_lock).await
+    enter_idle_on(mint_idle(), reason, release_mint_gpu_lock, None).await
+}
+
+/// Like [`enter_idle`] but pins the auto-reactivate watchdog window (seconds). The
+/// compiler idle lease (S125 IDLE-WATCHDOG) passes its own max-lease so the MINT
+/// fail-safe never reactivates MINT mid-build for a build longer than the 3600s default.
+pub async fn enter_idle_with_watchdog(
+    reason: &str,
+    watchdog_secs: u64,
+) -> (EnterOutcome, Option<IdleReport>) {
+    enter_idle_on(mint_idle(), reason, release_mint_gpu_lock, Some(watchdog_secs)).await
 }
 
 /// The generic enter-idle orchestration, parameterised over the controller and the
@@ -1182,17 +1215,29 @@ pub async fn enter_idle_on<F>(
     ctl: Arc<IdleController>,
     reason: &str,
     release_fn: F,
+    watchdog_secs: Option<u64>,
 ) -> (EnterOutcome, Option<IdleReport>)
 where
     F: FnOnce() -> GpuReleaseResult + Send + 'static,
 {
+    // S125 IDLE-WATCHDOG: the caller may override the auto-reactivate window. The
+    // compiler lease passes its own (longer) max-lease so the fail-safe watchdog never
+    // fires BEFORE the lease's own cap during a legitimately long build; `None` uses the
+    // env default (`MINT_IDLE_WATCHDOG_SECS`, 3600s).
+    let watchdog_secs = watchdog_secs.unwrap_or_else(watchdog_secs_from_env);
     // Atomically CLAIM the transition FIRST (fixes the TOCTOU: two concurrent enters
     // can no longer both observe "active" and both run release). Only the `Begin`
     // winner proceeds; everyone else returns a no-op with no side effects. The RAII
     // `transition` guard makes the pre-release phase cancellation-safe.
     let transition = match ctl.try_begin_enter() {
         Ok(t) => t,
-        Err(BeginEnter::AlreadyIdle(m)) => return (EnterOutcome::AlreadyIdle(m), None),
+        Err(BeginEnter::AlreadyIdle(m)) => {
+            // Already idle from an earlier lease: honor a longer watchdog window from this
+            // (overlapping) lease so the fail-safe never fires before the longest lease's
+            // cap. Never shortens an existing deadline.
+            ctl.bump_watchdog(now_epoch().saturating_add(watchdog_secs));
+            return (EnterOutcome::AlreadyIdle(m), None);
+        }
         Err(_) => return (EnterOutcome::InTransition, None),
     };
     // Phase is now `EnteringIdle`: `try_admit` rejects all new runs, so the drain below
@@ -1302,7 +1347,7 @@ where
     let manifest = ResumeManifest {
         reason: reason.to_string(),
         entered_at: now,
-        watchdog_deadline: now.saturating_add(watchdog_secs_from_env()),
+        watchdog_deadline: now.saturating_add(watchdog_secs),
         released_holders: report.holders_released.clone(),
         mem_available_before_gb: report.mem_available_before_gb.unwrap_or(0.0),
     };
@@ -2112,7 +2157,7 @@ mod tests {
 
         let ctl_task = ctl.clone();
         let enter =
-            tokio::spawn(async move { enter_idle_on(ctl_task, "test", slow_release).await });
+            tokio::spawn(async move { enter_idle_on(ctl_task, "test", slow_release, None).await });
 
         // Wait until the blocking release has actually started.
         while !started.load(Ordering::SeqCst) {
@@ -2178,7 +2223,7 @@ mod tests {
 
         let ctl_task = ctl.clone();
         let enter =
-            tokio::spawn(async move { enter_idle_on(ctl_task, "test", slow_release).await });
+            tokio::spawn(async move { enter_idle_on(ctl_task, "test", slow_release, None).await });
 
         while !started.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -2239,7 +2284,7 @@ mod tests {
 
         let ctl_task = ctl.clone();
         let enter =
-            tokio::spawn(async move { enter_idle_on(ctl_task, "test", panicking_release).await });
+            tokio::spawn(async move { enter_idle_on(ctl_task, "test", panicking_release, None).await });
 
         // Wait until the blocking release has started (latch set, blocked on recv).
         while !started.load(Ordering::SeqCst) {
@@ -2300,7 +2345,7 @@ mod tests {
         };
 
         // Await to completion (NOT cancelled): the JoinError path must decline to commit.
-        let (outcome, report) = enter_idle_on(ctl.clone(), "test", failing_release).await;
+        let (outcome, report) = enter_idle_on(ctl.clone(), "test", failing_release, None).await;
 
         assert!(
             matches!(outcome, EnterOutcome::InTransition),
@@ -2546,5 +2591,109 @@ mod tests {
         assert!(try_admit_gpu_on(&ctl, "bld-05-compiler", &mints)
             .expect("compiler never gated")
             .is_none());
+    }
+
+    // ── S125 Phase-5 idle-switch FEATURE VERIFICATION (IDLE-01) ───────────────
+    //
+    // Deterministic, offline (NO real GPU, NO real clock — a compiler-build signal and
+    // cycle counts are injected) proof that a "running" MINT sweep YIELDS the shared GPU
+    // to a compiler build within a bounded number of poll cycles, does NOT contend (the
+    // compiler holder is never gated), and RESUMES cleanly once the build clears — with
+    // no double-acquire. Drives the SAME admission gate MINT's real entry points call
+    // (`try_admit_gpu_on`, via `ExclusiveGuard`/`LiveGpuLock`). The client-yield half
+    // (IDLE-02) and the combined harness (IDLE-03) live in `crate::intake::gpu_authority`.
+
+    /// Bound (poll cycles) within which a yield/resume must be observed. The gate refuses
+    /// a NEW unit the instant the build signal is asserted (real bound = 1 cycle); N gives
+    /// headroom and documents the "within a bounded number of poll cycles" contract.
+    const IDLE01_BOUND_CYCLES: usize = 5;
+
+    #[test]
+    fn idle01_mint_yields_to_compiler_within_bound_and_resumes() {
+        let mints = mint_labels();
+        let holder = "intake_coder_sweep";
+        let ctl = IdleController::new();
+
+        // Compiler build active for cycles [2, 7); MINT should be running before and after.
+        const BUILD_START: usize = 2;
+        const BUILD_CLEAR: usize = 7;
+        let build_active = |c: usize| (BUILD_START..BUILD_CLEAR).contains(&c);
+
+        // Per cycle: true = MINT yielded the GPU (refused, no work); false = MINT ran.
+        let mut yielded: Vec<bool> = Vec::new();
+        let mut max_inflight = 0usize;
+
+        for cycle in 0..14usize {
+            // The compiler's own control actions drive the controller: it idles MINT when
+            // its build starts and MINT lazily reactivates once the build is gone.
+            if build_active(cycle) && ctl.phase() == Phase::Active {
+                ctl.enter(manifest("compiler", cycle as u64, cycle as u64 + 3600));
+            } else if !build_active(cycle) && ctl.is_idle() {
+                ctl.exit();
+            }
+
+            // INVARIANT: the compiler (non-MINT holder) is NEVER gated — it must be able to
+            // take the GPU it idled MINT for, or the build would deadlock.
+            assert!(
+                try_admit_gpu_on(&ctl, "bld-05-compiler", &mints)
+                    .expect("compiler never gated")
+                    .is_none(),
+                "cycle {cycle}: the compiler must never contend / be gated"
+            );
+
+            // The MINT sweep tries to take the GPU for this unit of work.
+            match try_admit_gpu_on(&ctl, holder, &mints) {
+                Ok(Some(guard)) => {
+                    assert_eq!(ctl.inflight_count(), 1, "cycle {cycle}: single admitted unit");
+                    max_inflight = max_inflight.max(ctl.inflight_count());
+                    drop(guard); // unit finishes, releases between units of work
+                    assert_eq!(ctl.inflight_count(), 0, "cycle {cycle}: released cleanly");
+                    yielded.push(false);
+                }
+                Ok(None) => unreachable!("a MINT holder always yields a counted guard when admitted"),
+                Err(_) => yielded.push(true), // refused: MINT yielded to the build
+            }
+        }
+
+        // YIELD: within N cycles of the build starting, MINT must be yielding, and it keeps
+        // yielding for the whole build window (no contention, no refused work counted).
+        let first_yield = yielded
+            .iter()
+            .enumerate()
+            .skip(BUILD_START)
+            .find(|(_, y)| **y)
+            .map(|(c, _)| c)
+            .expect("MINT must yield to a compiler build");
+        assert!(
+            first_yield - BUILD_START < IDLE01_BOUND_CYCLES,
+            "MINT yielded {} cycles after the build started (bound {IDLE01_BOUND_CYCLES})",
+            first_yield - BUILD_START
+        );
+        for cycle in BUILD_START..BUILD_CLEAR {
+            assert!(yielded[cycle], "cycle {cycle}: MINT must not contend during the build");
+        }
+
+        // RESUME: within N cycles of the build clearing, MINT is running again, and keeps
+        // running (no wedge, no spurious yields).
+        let first_resume = yielded
+            .iter()
+            .enumerate()
+            .skip(BUILD_CLEAR)
+            .find(|(_, y)| !**y)
+            .map(|(c, _)| c)
+            .expect("MINT must resume once the build clears");
+        assert!(
+            first_resume - BUILD_CLEAR < IDLE01_BOUND_CYCLES,
+            "MINT resumed {} cycles after the build cleared (bound {IDLE01_BOUND_CYCLES})",
+            first_resume - BUILD_CLEAR
+        );
+        for (cycle, y) in yielded.iter().enumerate().skip(BUILD_CLEAR) {
+            assert!(!y, "cycle {cycle}: MINT must run freely once the build clears");
+        }
+
+        // No double-acquire anywhere, and MINT ends Active — no deadlock/wedge.
+        assert!(max_inflight <= 1, "MINT must never double-acquire the GPU");
+        assert_eq!(ctl.phase(), Phase::Active, "harness ends Active — no wedge");
+        assert_eq!(ctl.inflight_count(), 0, "no leaked in-flight units");
     }
 }

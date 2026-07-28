@@ -1,0 +1,75 @@
+[Unit]
+# TERM-c590e045 — oneshot that runs the idle-gated, gap-only assistant sweep.
+# Driven by intake-assistant-sweep-gap.timer (02:17 off-peak). All the real
+# safety logic (fleet-idle gate, Chord drain/restore, max-lease timeout) lives
+# in the wrapper script so it is auditable and testable outside systemd; this
+# unit just invokes it on the GPU host.
+#
+# DESIGN ARTIFACT — version-controlled for review/audit. The orchestrator
+# installs + enables this as an OPS action; it is NOT auto-installed by any
+# build step. Install on the GPU host that runs Chord + the MINT sweeps
+# (<host>-class), the SAME host whose runtime env already carries
+# CHORD_CONTROL_URL and TERMINUS_PRIMARY_CHORD_JWT_SECRET.
+Description=Idle-gated gap-only assistant profiling sweep (TERM-c590e045)
+After=network-online.target
+Wants=network-online.target
+# Best-effort ordering: don't fight a heavy build's own idle lease. Replace with
+# the actual Chord unit name on the host if a hard ordering is wanted.
+# After=<chord-unit>.service
+
+[Service]
+Type=oneshot
+
+# The wrapper does: fleet-idle probe -> (if idle) POST /admin/idle -> run the
+# gap-only sweep under `timeout` -> ALWAYS POST /admin/activate (trap). If the
+# fleet is busy it logs and exits 0 (retry next window) — it NEVER forces a drain.
+ExecStart=<path-to-terminus-checkout>/deploy/intake-assistant-sweep-gap-idle-gate.sh
+
+# --- Chord control channel (required; provisioned into this host's env, S1) ---
+# Base URL of Chord's control API (the :8090 control port). No literal committed.
+#   e.g. Environment=CHORD_CONTROL_URL=http://<loopback-host>:<control-port>
+Environment=CHORD_CONTROL_URL=<chord-control-url>
+# The gap-only sweep binary (deployed artifact). Task-specified default path:
+Environment=INTAKE_ASSISTANT_SWEEP_BIN=/opt/intake/intake_assistant_sweep
+
+# --- Gap-only knobs (Part 1 code reads these) ---
+Environment=INTAKE_ASSISTANT_GAP_ONLY=1
+Environment=INTAKE_ASSISTANT_GAP_MAX=10
+
+# --- Idle-gate tuning (wrapper reads these; safe defaults baked in the script) ---
+# Minimum fleet idle (seconds, from GET /admin/activity's `idle_secs`) before the
+# sweep may start. 1800 = 30 min quiet.
+Environment=SWEEP_IDLE_THRESHOLD_SECS=1800
+# Hard max-lease around the sweep: the wrapper runs it under
+# `timeout --signal=TERM --kill-after=SWEEP_KILL_AFTER_SECS SWEEP_MAX_LEASE_SECS`.
+# Kept comfortably BELOW Chord's server-side idle watchdog (CHORD_IDLE_WATCHDOG_SECS,
+# default 3600s) so the wrapper's own /admin/activate restore always wins first.
+Environment=SWEEP_MAX_LEASE_SECS=3000
+# SIGTERM→SIGKILL grace: gives the wrapper control back to run its restore if the
+# sweep ignores TERM.
+Environment=SWEEP_KILL_AFTER_SECS=60
+
+# REQUIRED secret (referenced BY NAME only): the env var named
+# TERMINUS_PRIMARY_CHORD_JWT_SECRET must be present in this host's runtime
+# environment, materialized from <secret-manager> at deploy time (NEVER written as a
+# literal here, and NOT set via an Environment= line in this unit). Its value is
+# the same one Chord validates as CHORD_JWT_SECRET; the wrapper reads it to mint
+# the short-lived HS256 service JWT Chord's `auth_check` requires on /admin/idle
+# and /admin/activate. Provision it the same way chord.service already receives
+# its own secrets (EnvironmentFile from the <secret-manager>-materialized env), not inline.
+
+# systemd ceiling — the MIDDLE of the three ordered bounds:
+#   SWEEP_MAX_LEASE_SECS + SWEEP_KILL_AFTER_SECS + restore-margin  (3000+60+~180)
+#     <  TimeoutStartSec (3300)
+#       <  Chord's CHORD_IDLE_WATCHDOG_SECS (default 3600, the SIGKILL-safe backstop)
+# So: the wrapper's own restore wins in the normal/hung case; if systemd SIGKILLs a
+# wedged wrapper (EXIT trap does NOT run on SIGKILL), Chord's server-side watchdog
+# still auto-reactivates at its deadline — Chord is never left drained.
+# NOTE: this needs `sudo systemctl kill -s SIGKILL` behavior only as a last resort;
+# the wrapper's --kill-after already bounds the sweep well under this ceiling.
+TimeoutStartSec=3300
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

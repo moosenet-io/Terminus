@@ -17,7 +17,9 @@ use std::time::Instant;
 use serde_json::{json, Value};
 
 use crate::error::ToolError;
+use crate::review::effort_policy::EffortTier;
 use crate::review::free_pool;
+use crate::review::paid_pool;
 
 /// nemotron's fixed, verified-live OpenRouter model tag. Upgraded from the
 /// nano-tier `nvidia/nemotron-nano-9b-v2:free` (real but not frontier-class)
@@ -115,15 +117,30 @@ impl ReviewConfig {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let openrouter_key = std::env::var("OPENROUTER_API_KEY")
+        // Operator directive (S121): the review daemon's OpenRouter spend (paid
+        // pool + gpt56 + any paid model) is isolated on the DEDICATED
+        // OPENROUTER_API_KEY_CHORDHARMONY key so review-provider cost is cleanly
+        // trackable; fall back to the shared OPENROUTER_API_KEY when it's absent.
+        let openrouter_key = std::env::var("OPENROUTER_API_KEY_CHORDHARMONY")
             .ok()
+            .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         Self { daemon_url, daemon_token, openrouter_key }
     }
 
+    /// HTTP client for the direct OpenRouter arms (`free`/`paid`/`gpt56`/
+    /// `nemotron`/`qwen_coder`). REVX-16: a high-reasoning paid model
+    /// (kimi-k2-thinking, deepseek-v3.2 with `reasoning`) can legitimately take
+    /// several minutes; the old fixed 150s ceiling cut it off. Generous 5-min
+    /// default, operator-tunable via `REVIEW_OPENROUTER_TIMEOUT_SECS`.
     fn client() -> Result<reqwest::Client, ToolError> {
-        Self::client_with_timeout(150)
+        let secs = std::env::var("REVIEW_OPENROUTER_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(300);
+        Self::client_with_timeout(secs)
     }
 
     /// A client with a caller-chosen request timeout. The Epic capstone's explore
@@ -175,6 +192,13 @@ impl ReviewConfig {
         // dispatch is an intensive-substitute review (see `DaemonOpts::intensive`).
         if let Some(effort) = &opts.reasoning_effort {
             req_body["reasoning_effort"] = json!(effort);
+        }
+        // REVX-07/08: an explicit provider-native model override (currently
+        // only meaningful for `codex`'s dynamic GPT-5.6 tier selection --
+        // sol/terra/luna). `None` on every pre-REVX-07 call site, so a
+        // dispatch that never sets `model` is byte-for-byte unchanged.
+        if let Some(model) = &opts.model {
+            req_body["model"] = json!(model);
         }
         let resp = client
             .post(&url)
@@ -265,19 +289,34 @@ impl ReviewConfig {
     }
 
     /// Dispatch directly to OpenRouter's chat-completions endpoint.
-    pub async fn dispatch_openrouter(&self, model: &str, prompt: &str) -> Result<String, String> {
+    ///
+    /// REVX-10: `reasoning`, when `Some`, is injected as the top-level
+    /// `reasoning` object (see [`reasoning_for`] for how a caller picks the
+    /// right shape per model family). `None` reproduces the pre-REVX-10
+    /// request body byte-for-byte -- every pre-existing call site
+    /// (`free_pool`) keeps passing `None` and is unaffected.
+    pub async fn dispatch_openrouter(
+        &self,
+        model: &str,
+        prompt: &str,
+        reasoning: Option<Value>,
+    ) -> Result<String, String> {
         let Some(key) = &self.openrouter_key else {
             return Err("unavailable: OPENROUTER_API_KEY not configured".to_string());
         };
         let client = Self::client().map_err(|e| format!("unavailable: {e}"))?;
+        let mut body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": false,
+        });
+        if let Some(r) = reasoning {
+            body["reasoning"] = r;
+        }
         let resp = client
             .post(openrouter_chat_url())
             .bearer_auth(key)
-            .json(&json!({
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": false,
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|e| format!("unavailable: openrouter unreachable: {e}"))?;
@@ -394,11 +433,61 @@ impl ReviewConfig {
                     "unavailable: all free-tier models are rate-limited (cooling down)".to_string(),
                 );
             };
-            match self.dispatch_openrouter(&model, prompt).await {
+            match self.dispatch_openrouter(&model, prompt, None).await {
                 Ok(text) => return Ok(text),
                 Err(e) => {
                     // Only a rate-limit earns a cooldown; other per-model errors
                     // just rotate (the cursor already advanced) without penalty.
+                    if is_openrouter_rate_limited(&e) {
+                        pool.lock().await.mark_rate_limited(&model, Instant::now());
+                    }
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// REVX-09/10/11: dispatch the `paid` provider -- round-robin the
+    /// curated, config-listed PAID OpenRouter model pool ([`paid_pool`]),
+    /// with per-model 429-cooldown failover exactly like [`Self::dispatch_free_pool`].
+    /// Differs from the free pool in three ways: (1) gated behind the REVX-11
+    /// runtime toggle ([`paid_pool::is_enabled`]) -- disabled is checked
+    /// FIRST, before even looking at the key, so a disabled pool never makes
+    /// a network call; (2) every pooled model is PAID, so the existing
+    /// [`Self::guard_paid_model`] credit floor is checked once up front
+    /// (the balance doesn't vary by which pooled model is picked next); (3)
+    /// `tier`, when `Some`, is threaded into [`reasoning_for`] so each
+    /// dispatch carries the REVX-10 `reasoning` object driven by the
+    /// effort-policy tier.
+    pub async fn dispatch_paid_pool(&self, prompt: &str, tier: Option<EffortTier>) -> Result<String, String> {
+        if !paid_pool::is_enabled() {
+            return Err("unavailable: paid pool disabled".to_string());
+        }
+        if self.openrouter_key.is_none() {
+            return Err("unavailable: OPENROUTER_API_KEY not configured".to_string());
+        }
+        let models = paid_pool::configured_models();
+        if models.is_empty() {
+            return Err("unavailable: paid pool has no configured models".to_string());
+        }
+        // Every pooled model is paid (never a `:free` slug) -- the credit
+        // floor doesn't vary by which one gets picked, so check it once
+        // rather than per-attempt.
+        self.guard_paid_model(&models[0]).await?;
+
+        let pool = paid_pool::global_pool();
+        let attempts = models.len();
+        let mut last_err = "unavailable: paid pool produced no usable model".to_string();
+        for _ in 0..attempts {
+            let model = pool.lock().await.next_available(&models, Instant::now());
+            let Some(model) = model else {
+                return Err("unavailable: all paid pool models cooling down".to_string());
+            };
+            let reasoning = tier.map(|t| reasoning_for(&model, t));
+            match self.dispatch_openrouter(&model, prompt, reasoning).await {
+                Ok(text) => return Ok(text),
+                Err(e) => {
                     if is_openrouter_rate_limited(&e) {
                         pool.lock().await.mark_rate_limited(&model, Instant::now());
                     }
@@ -449,6 +538,26 @@ impl ReviewConfig {
             .await
             .map_err(|e| format!("malformed models response: {e}"))?;
         Ok(free_pool::curate(&body))
+    }
+}
+
+/// REVX-10: pick the OpenRouter `reasoning` object shape for `model` at
+/// `tier`. Gemini/Anthropic/Claude-family model ids (identified by a
+/// case-insensitive substring match on the id) take Anthropic/Gemini-style
+/// `{"max_tokens": N}` (>= 1024, per [`crate::review::effort_policy::tier_to_max_tokens`]);
+/// everything else (OpenAI/Kimi/DeepSeek/GLM/Qwen-family) takes OpenAI-style
+/// `{"effort": "<level>"}` (per
+/// [`crate::review::effort_policy::tier_to_openrouter_effort`]). A model that
+/// ignores the `reasoning` field entirely is harmless -- OpenRouter drops
+/// unknown params (per the spec's edge cases).
+pub fn reasoning_for(model: &str, tier: EffortTier) -> Value {
+    let lower = model.to_ascii_lowercase();
+    let is_max_tokens_style =
+        lower.contains("gemini") || lower.contains("anthropic") || lower.contains("claude");
+    if is_max_tokens_style {
+        json!({"max_tokens": crate::review::effort_policy::tier_to_max_tokens(tier)})
+    } else {
+        json!({"effort": crate::review::effort_policy::tier_to_openrouter_effort(tier)})
     }
 }
 
@@ -536,18 +645,104 @@ pub struct DaemonOpts {
     /// makes opus enter an agentic tool-loop and never emit a `VERDICT:` line
     /// (proven live), so [`Self::intensive`] deliberately keeps `explore: false`.
     pub reasoning_effort: Option<String>,
+    /// REVX-07/08: an explicit provider-native model override -- currently
+    /// only meaningful for `codex` (its dynamic GPT-5.6 sol/terra/luna tier
+    /// selection; see `effort_policy::codex_model_for_tier`). `None` on
+    /// every pre-REVX-07 preset ([`Self::routine`], [`Self::epic`],
+    /// [`Self::intensive`]) -- omitted from the wire body entirely, so those
+    /// dispatches stay byte-for-byte unchanged; the daemon then falls back
+    /// to its own fixed default. Ignored by every provider that has no
+    /// model-override knob (opus/agy/fable).
+    pub model: Option<String>,
+}
+
+/// REVX-16: the routine-review wall-clock backstop, in seconds.
+///
+/// High-reasoning review agents (codex on GPT-5.6, opus, agy) at a raised
+/// effort tier legitimately *think* for several minutes on a large diff before
+/// they emit a `VERDICT:` line. The old hard-coded 120s backstop killed them
+/// mid-think and surfaced as a spurious `UNKNOWN` ("timed out after 120s
+/// (wall-clock backstop)"), poisoning the panel aggregate to REQUEST_CHANGES
+/// with zero real findings. This raises the routine default to a generous 5
+/// minutes and makes it operator-tunable, capped at the daemon's own
+/// [`crate::bin`]-side `MAX_TIMEOUT_SECS` (1800). The daemon's progress/stall
+/// detector -- not this ceiling -- remains the primary bound for a genuinely
+/// wedged provider.
+const DEFAULT_ROUTINE_TIMEOUT_SECS: u64 = 300;
+/// Mirrors `review_daemon::config::MAX_TIMEOUT_SECS` (the daemon rejects a
+/// larger `timeout_secs`); duplicated as a plain const to avoid a bin-crate dep.
+const DAEMON_MAX_TIMEOUT_SECS: u64 = 1800;
+/// Floor for the Medium-anchor base. Set no lower than the OLD hard-coded 120s
+/// (raising the backstop was the whole point of REVX-16, so a *lower* value is
+/// never wanted) AND high enough that the tier multipliers below never collapse
+/// two tiers into each other: at base 120 the tiers are 72/96/120/192/240 --
+/// still strictly monotonic. A base under this floor is clamped UP to it.
+const MIN_ROUTINE_TIMEOUT_SECS: u64 = 120;
+/// Upper clamp for the Medium-anchor base: half the daemon max, so the largest
+/// tier multiplier (Xhigh = base * 2) reaches EXACTLY `DAEMON_MAX_TIMEOUT_SECS`
+/// and never has to be clamped down. That is what keeps the tiers STRICTLY
+/// monotonic at the top of the range too (codex review): without this cap, a
+/// large base would push both High (1.6x) and Xhigh (2x) past the daemon max
+/// and collapse them onto it. An operator wanting a longer whole-review budget
+/// than 15 min should use Epic/explore mode, not this routine knob.
+const MAX_ROUTINE_TIMEOUT_SECS: u64 = DAEMON_MAX_TIMEOUT_SECS / 2;
+/// The HTTP client ceiling is always the wall-clock backstop plus this margin
+/// (the socket must outlive the daemon's own kill so we read its error body).
+const CLIENT_TIMEOUT_MARGIN_SECS: u64 = 30;
+
+/// The operator-tunable routine backstop (`REVIEW_ROUTINE_TIMEOUT_SECS`),
+/// defaulting to [`DEFAULT_ROUTINE_TIMEOUT_SECS`] and clamped to
+/// `[MIN_ROUTINE_TIMEOUT_SECS, MAX_ROUTINE_TIMEOUT_SECS]`. Both clamps keep the
+/// per-tier multipliers STRICTLY monotonic for every valid base: the lower
+/// bound stops a tiny value collapsing Minimal/Low/Medium, the upper bound stops
+/// a huge value collapsing High/Xhigh onto the daemon max.
+fn routine_timeout_secs() -> u64 {
+    std::env::var("REVIEW_ROUTINE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_ROUTINE_TIMEOUT_SECS)
+        .clamp(MIN_ROUTINE_TIMEOUT_SECS, MAX_ROUTINE_TIMEOUT_SECS)
+}
+
+/// REVX-16: the wall-clock backstop for a given effort tier. The routine base
+/// ([`routine_timeout_secs`]) is the *Medium anchor*; every tier scales off it,
+/// so raising the env knob lifts them all proportionally. A deep High/Xhigh pass
+/// gets real minutes to converge (1.6x/2x) while a Minimal/Low breadth pass gets
+/// a tighter budget (0.6x/0.8x, token/time thrift). Floored at 60s (a socket
+/// must have *some* time) and clamped to the daemon max. At the 300s default:
+/// Minimal 180, Low 240, Medium 300, High 480, Xhigh 600.
+fn tier_backstop_secs(tier: EffortTier) -> u64 {
+    // `base` is clamped to >= MIN_ROUTINE_TIMEOUT_SECS (120), so the integer
+    // multipliers below stay strictly monotonic (72 < 96 < 120 < 192 < 240 at
+    // the floor) -- no tier can collapse into another.
+    let base = routine_timeout_secs();
+    let secs = match tier {
+        EffortTier::Minimal => base * 3 / 5, // 0.6x
+        EffortTier::Low => base * 4 / 5,     // 0.8x
+        EffortTier::Medium => base,
+        EffortTier::High => base * 8 / 5,    // 1.6x
+        EffortTier::Xhigh => base * 2,       // 2.0x
+    };
+    secs.min(DAEMON_MAX_TIMEOUT_SECS)
 }
 
 impl DaemonOpts {
-    /// Routine per-item/per-sprint review: unchanged pre-capstone behavior.
+    /// Routine per-item/per-sprint review. The wall-clock backstop is now the
+    /// operator-tunable [`routine_timeout_secs`] (generous 5-min default, was a
+    /// hard-coded 120s) so a high-reasoning provider isn't killed mid-think; the
+    /// client ceiling trails it by [`CLIENT_TIMEOUT_MARGIN_SECS`]. Explore/stall/
+    /// effort shape is otherwise unchanged.
     pub fn routine() -> Self {
+        let timeout_secs = routine_timeout_secs();
         Self {
-            timeout_secs: 120,
-            client_timeout_secs: 150,
+            timeout_secs,
+            client_timeout_secs: timeout_secs + CLIENT_TIMEOUT_MARGIN_SECS,
             explore: false,
             stall_secs: None,
             repo_path: None,
             reasoning_effort: None,
+            model: None,
         }
     }
 
@@ -560,6 +755,7 @@ impl DaemonOpts {
             stall_secs: Some(180),
             repo_path,
             reasoning_effort: None,
+            model: None,
         }
     }
 
@@ -582,7 +778,55 @@ impl DaemonOpts {
             stall_secs: Some(240),
             repo_path: None,
             reasoning_effort: Some(INTENSIVE_REASONING_EFFORT.to_string()),
+            model: None,
         }
+    }
+
+    /// REVX-14: generalizes [`Self::intensive`] -- an intensive-substitute
+    /// dispatch whose effort is the EFFORT-POLICY tier (already floored at
+    /// `max(policy, High)` by `effort_policy::decide`'s `intensive_floor`
+    /// argument) rather than the fixed [`INTENSIVE_REASONING_EFFORT`]
+    /// constant, plus an optional provider-native model override (codex's
+    /// dynamic GPT-5.6 tier). Keeps the same timeout/stall shape as
+    /// [`Self::intensive`] -- only the effort/model strings are
+    /// policy-driven now.
+    pub fn intensive_with(native_effort: Option<String>, model: Option<String>) -> Self {
+        Self {
+            timeout_secs: 900,
+            client_timeout_secs: 950,
+            explore: false,
+            stall_secs: Some(240),
+            repo_path: None,
+            reasoning_effort: native_effort,
+            model,
+        }
+    }
+
+    /// REVX-14: apply a policy-computed native effort string + optional
+    /// model override onto an existing preset (`routine()`/`epic()`), without
+    /// otherwise touching its timeout/explore/stall shape. `native_effort:
+    /// None` clears any effort override (policy disabled or the provider has
+    /// no native reasoning control) -- reproduces the preset byte-for-byte.
+    pub fn with_effort(mut self, native_effort: Option<String>, model: Option<String>) -> Self {
+        self.reasoning_effort = native_effort;
+        self.model = model;
+        self
+    }
+
+    /// REVX-16: widen the wall-clock backstop to match a raised effort `tier`,
+    /// so a deep High/Xhigh routine review gets the minutes it needs instead of
+    /// being killed at the routine baseline. Only ever GROWS the budget
+    /// (`max` with the current value -- never shrinks `epic`/`intensive`'s
+    /// already-long budgets if ever composed onto them) and keeps the client
+    /// ceiling trailing by [`CLIENT_TIMEOUT_MARGIN_SECS`]. A no-op when the
+    /// tier's backstop is not larger than what the preset already carries.
+    pub fn with_backstop_for_tier(mut self, tier: EffortTier) -> Self {
+        let floor = tier_backstop_secs(tier);
+        if floor > self.timeout_secs {
+            self.timeout_secs = floor;
+            self.client_timeout_secs = floor + CLIENT_TIMEOUT_MARGIN_SECS;
+        }
+        self
     }
 }
 
@@ -645,7 +889,7 @@ mod tests {
             daemon_token: None,
             openrouter_key: None,
         };
-        let err = cfg.dispatch_openrouter(NEMOTRON_MODEL, "x").await.unwrap_err();
+        let err = cfg.dispatch_openrouter(NEMOTRON_MODEL, "x", None).await.unwrap_err();
         assert!(err.contains("OPENROUTER_API_KEY"));
     }
 
@@ -824,9 +1068,15 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn epic_daemon_opts_enable_explore_and_stall() {
+        std::env::remove_var("REVIEW_ROUTINE_TIMEOUT_SECS");
         let routine = DaemonOpts::routine();
-        assert!(!routine.explore && routine.stall_secs.is_none() && routine.timeout_secs == 120);
+        // REVX-16: the routine backstop is now a generous 5-min default (was a
+        // hard-coded 120s that killed high-reasoning reviewers mid-think).
+        assert!(!routine.explore && routine.stall_secs.is_none());
+        assert_eq!(routine.timeout_secs, DEFAULT_ROUTINE_TIMEOUT_SECS);
+        assert_eq!(routine.client_timeout_secs, DEFAULT_ROUTINE_TIMEOUT_SECS + CLIENT_TIMEOUT_MARGIN_SECS);
         let epic = DaemonOpts::epic(Some("/repo".into()));
         assert!(epic.explore);
         assert!(epic.stall_secs.is_some());
@@ -836,11 +1086,83 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn revx16_tier_backstop_scales_and_respects_env_floor() {
+        std::env::remove_var("REVIEW_ROUTINE_TIMEOUT_SECS");
+        // Higher tiers get strictly more wall-clock; Medium == routine baseline.
+        assert_eq!(tier_backstop_secs(EffortTier::Medium), DEFAULT_ROUTINE_TIMEOUT_SECS);
+        assert!(tier_backstop_secs(EffortTier::High) > tier_backstop_secs(EffortTier::Medium));
+        assert!(tier_backstop_secs(EffortTier::Xhigh) > tier_backstop_secs(EffortTier::High));
+        // The Minimal/Low breadth tail keeps a tighter budget than Medium.
+        assert!(tier_backstop_secs(EffortTier::Low) < tier_backstop_secs(EffortTier::Medium));
+        // Default-base concrete values.
+        assert_eq!(tier_backstop_secs(EffortTier::Minimal), 180);
+        assert_eq!(tier_backstop_secs(EffortTier::Low), 240);
+        assert_eq!(tier_backstop_secs(EffortTier::High), 480);
+        assert_eq!(tier_backstop_secs(EffortTier::Xhigh), 600);
+        // The env knob is the Medium anchor; all tiers scale off it.
+        std::env::set_var("REVIEW_ROUTINE_TIMEOUT_SECS", "500");
+        assert_eq!(tier_backstop_secs(EffortTier::Medium), 500);
+        assert_eq!(tier_backstop_secs(EffortTier::Xhigh), 1000);
+        assert_eq!(tier_backstop_secs(EffortTier::Minimal), 300);
+        // A huge base clamps to MAX_ROUTINE_TIMEOUT_SECS (900); Xhigh (2x) then
+        // reaches EXACTLY the daemon max without collapsing High onto it (codex
+        // review: strict monotonicity must hold at the top of the range too).
+        std::env::set_var("REVIEW_ROUTINE_TIMEOUT_SECS", "999999");
+        assert_eq!(tier_backstop_secs(EffortTier::Medium), MAX_ROUTINE_TIMEOUT_SECS);
+        assert_eq!(tier_backstop_secs(EffortTier::Xhigh), DAEMON_MAX_TIMEOUT_SECS);
+        assert!(
+            tier_backstop_secs(EffortTier::High) < tier_backstop_secs(EffortTier::Xhigh),
+            "High must stay strictly below Xhigh even at the max base"
+        );
+        // codex+free review finding: a TINY base must NOT collapse tiers to a
+        // floor -- the base is clamped up to MIN_ROUTINE_TIMEOUT_SECS so every
+        // tier stays STRICTLY monotonic even at the smallest valid base.
+        std::env::set_var("REVIEW_ROUTINE_TIMEOUT_SECS", "1");
+        let (mn, lo, md, hi, xh) = (
+            tier_backstop_secs(EffortTier::Minimal),
+            tier_backstop_secs(EffortTier::Low),
+            tier_backstop_secs(EffortTier::Medium),
+            tier_backstop_secs(EffortTier::High),
+            tier_backstop_secs(EffortTier::Xhigh),
+        );
+        assert!(mn < lo && lo < md && md < hi && hi < xh, "tiers must stay strictly monotonic at the floor: {mn} {lo} {md} {hi} {xh}");
+        assert_eq!(md, MIN_ROUTINE_TIMEOUT_SECS, "base floored to the minimum");
+        std::env::remove_var("REVIEW_ROUTINE_TIMEOUT_SECS");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn revx16_with_backstop_for_tier_only_grows_and_trails_client() {
+        std::env::remove_var("REVIEW_ROUTINE_TIMEOUT_SECS");
+        let base = DaemonOpts::routine();
+        let hi = base.clone().with_backstop_for_tier(EffortTier::High);
+        assert!(hi.timeout_secs > base.timeout_secs);
+        assert_eq!(hi.client_timeout_secs, hi.timeout_secs + CLIENT_TIMEOUT_MARGIN_SECS);
+        // Never SHRINKS an already-longer preset (e.g. intensive's 900s).
+        let intensive = DaemonOpts::intensive();
+        let unchanged = intensive.clone().with_backstop_for_tier(EffortTier::Medium);
+        assert_eq!(unchanged.timeout_secs, intensive.timeout_secs);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn revx16_routine_env_override() {
+        std::env::set_var("REVIEW_ROUTINE_TIMEOUT_SECS", "420");
+        let r = DaemonOpts::routine();
+        assert_eq!(r.timeout_secs, 420);
+        assert_eq!(r.client_timeout_secs, 420 + CLIENT_TIMEOUT_MARGIN_SECS);
+        std::env::remove_var("REVIEW_ROUTINE_TIMEOUT_SECS");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn intensive_daemon_opts_raise_effort_and_timeout_but_stay_out_of_explore_mode() {
+        std::env::remove_var("REVIEW_ROUTINE_TIMEOUT_SECS");
         let routine = DaemonOpts::routine();
         let intensive = DaemonOpts::intensive();
-        // The proven failure point: routine's 120s backstop is too short for a
-        // genuinely deep review of a large diff -- intensive must exceed it.
+        // Intensive still exceeds the (now generous) routine backstop for a
+        // genuinely deep review of a large diff.
         assert!(intensive.timeout_secs > routine.timeout_secs);
         assert!(intensive.client_timeout_secs > intensive.timeout_secs);
         assert_eq!(intensive.reasoning_effort.as_deref(), Some(INTENSIVE_REASONING_EFFORT));
@@ -922,6 +1244,7 @@ mod tests {
         p.set_models(models, Instant::now());
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     #[serial_test::serial]
     async fn free_pool_dispatch_rotates_past_a_429_to_the_next_model() {
@@ -972,5 +1295,186 @@ mod tests {
         }
         let err = keyed_cfg().dispatch_free_pool("x").await.unwrap_err();
         assert!(err.contains("rate-limited (cooling down)"), "got: {err}");
+    }
+
+    // ── REVX-10: reasoning_for ────────────────────────────────────────────
+
+    #[test]
+    fn reasoning_for_gemini_and_anthropic_style_uses_max_tokens() {
+        let r = reasoning_for("google/gemini-2.5-pro", EffortTier::High);
+        assert_eq!(r["max_tokens"].as_u64(), Some(16384));
+        assert!(r.get("effort").is_none());
+
+        let r2 = reasoning_for("anthropic/claude-opus-4-8", EffortTier::Minimal);
+        assert!(r2["max_tokens"].as_u64().unwrap() >= 1024);
+    }
+
+    #[test]
+    fn reasoning_for_openai_kimi_deepseek_glm_style_uses_effort() {
+        let r = reasoning_for("moonshotai/kimi-k2-thinking", EffortTier::Medium);
+        assert_eq!(r["effort"].as_str(), Some("medium"));
+        assert!(r.get("max_tokens").is_none());
+
+        assert_eq!(reasoning_for("deepseek/deepseek-v3.2", EffortTier::High)["effort"].as_str(), Some("high"));
+        assert_eq!(reasoning_for("z-ai/glm-5", EffortTier::Low)["effort"].as_str(), Some("low"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn dispatch_openrouter_no_tier_omits_reasoning_field() {
+        let server = MockServer::start();
+        fn body_excludes_reasoning(req: &httpmock::prelude::HttpMockRequest) -> bool {
+            let body = req.body.as_deref().unwrap_or(&[]);
+            let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            v.get("reasoning").is_none()
+        }
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/chat/completions").matches(body_excludes_reasoning);
+            then.status(200)
+                .json_body(json!({"choices": [{"message": {"content": "ok\nVERDICT: APPROVE"}}]}));
+        });
+        std::env::set_var("OPENROUTER_CHAT_URL", format!("{}/api/v1/chat/completions", server.base_url()));
+        let cfg = keyed_cfg();
+        cfg.dispatch_openrouter(NEMOTRON_MODEL, "x", None).await.unwrap();
+        mock.assert();
+        std::env::remove_var("OPENROUTER_CHAT_URL");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn dispatch_openrouter_with_tier_includes_reasoning_object() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/chat/completions")
+                .json_body_partial(r#"{"reasoning": {"effort": "high"}}"#);
+            then.status(200)
+                .json_body(json!({"choices": [{"message": {"content": "ok\nVERDICT: APPROVE"}}]}));
+        });
+        std::env::set_var("OPENROUTER_CHAT_URL", format!("{}/api/v1/chat/completions", server.base_url()));
+        let cfg = keyed_cfg();
+        let reasoning = reasoning_for("moonshotai/kimi-k2-thinking", EffortTier::High);
+        cfg.dispatch_openrouter("moonshotai/kimi-k2-thinking", "x", Some(reasoning)).await.unwrap();
+        mock.assert();
+        std::env::remove_var("OPENROUTER_CHAT_URL");
+    }
+
+    // ── REVX-09/11: paid pool dispatch ──────────────────────────────────
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn paid_pool_dispatch_disabled_by_default_never_calls_network() {
+        paid_pool::set_enabled(false);
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: Some("test-key".to_string()),
+        };
+        let err = cfg.dispatch_paid_pool("x", None).await.unwrap_err();
+        assert!(err.contains("paid pool disabled"), "got: {err}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn paid_pool_dispatch_degrades_when_no_key_even_if_enabled() {
+        paid_pool::set_enabled(true);
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: None,
+        };
+        let err = cfg.dispatch_paid_pool("x", None).await.unwrap_err();
+        assert!(err.contains("OPENROUTER_API_KEY"), "got: {err}");
+        paid_pool::set_enabled(false);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn paid_pool_dispatch_below_credit_floor_refuses_without_dispatch() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/credits");
+            then.status(200).json_body(json!({"data": {"total_credits": 1.0, "total_usage": 0.99}}));
+        });
+        std::env::set_var("OPENROUTER_CREDITS_URL", format!("{}/api/v1/credits", server.base_url()));
+        paid_pool::set_enabled(true);
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: Some("test-key".to_string()),
+        };
+        let err = cfg.dispatch_paid_pool("x", None).await.unwrap_err();
+        assert!(err.contains("credits low"), "got: {err}");
+        paid_pool::set_enabled(false);
+        std::env::remove_var("OPENROUTER_CREDITS_URL");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn paid_pool_dispatch_rotates_past_a_429_to_the_next_model() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/credits");
+            then.status(200).json_body(json!({"data": {"total_credits": 100.0, "total_usage": 0.0}}));
+        });
+        server.mock(|when, then| {
+            when.method(POST).body_contains("model-a");
+            then.status(429).json_body(json!({"error": {"message": "Too Many Requests"}}));
+        });
+        server.mock(|when, then| {
+            when.method(POST).body_contains("model-b");
+            then.status(200)
+                .json_body(json!({"choices": [{"message": {"content": "looks fine\nVERDICT: APPROVE"}}]}));
+        });
+        std::env::set_var("OPENROUTER_CREDITS_URL", format!("{}/api/v1/credits", server.base_url()));
+        std::env::set_var("OPENROUTER_CHAT_URL", format!("{}/api/v1/chat/completions", server.base_url()));
+        std::env::set_var("REVIEW_PAID_POOL_MODELS", "openai/model-a,openai/model-b");
+        paid_pool::set_enabled(true);
+        {
+            let mut p = paid_pool::global_pool().lock().await;
+            *p = paid_pool::PaidPool::default();
+        }
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: Some("test-key".to_string()),
+        };
+        let out = cfg.dispatch_paid_pool("review", None).await.unwrap();
+        assert!(out.contains("VERDICT: APPROVE"), "should have failed over to model-b: {out}");
+        paid_pool::set_enabled(false);
+        std::env::remove_var("OPENROUTER_CREDITS_URL");
+        std::env::remove_var("OPENROUTER_CHAT_URL");
+        std::env::remove_var("REVIEW_PAID_POOL_MODELS");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn paid_pool_dispatch_all_cooling_returns_distinct_error() {
+        std::env::set_var("REVIEW_PAID_POOL_MODELS", "openai/model-c");
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/credits");
+            then.status(200).json_body(json!({"data": {"total_credits": 100.0, "total_usage": 0.0}}));
+        });
+        std::env::set_var("OPENROUTER_CREDITS_URL", format!("{}/api/v1/credits", server.base_url()));
+        paid_pool::set_enabled(true);
+        {
+            let mut p = paid_pool::global_pool().lock().await;
+            *p = paid_pool::PaidPool::default();
+            p.mark_rate_limited("openai/model-c", Instant::now());
+        }
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: Some("test-key".to_string()),
+        };
+        let err = cfg.dispatch_paid_pool("x", None).await.unwrap_err();
+        assert!(err.contains("cooling down"), "got: {err}");
+        paid_pool::set_enabled(false);
+        std::env::remove_var("OPENROUTER_CREDITS_URL");
+        std::env::remove_var("REVIEW_PAID_POOL_MODELS");
     }
 }

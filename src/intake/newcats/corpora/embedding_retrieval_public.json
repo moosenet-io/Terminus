@@ -1,0 +1,26 @@
+{
+  "name": "embedding_retrieval_public",
+  "description": "A compact MTEB/BEIR-style public IR baseline for the embedding_retrieval suite (SUITE-EMB). Domain-neutral encyclopedic/technical query -> relevant-doc pairs used to measure a candidate embedding model's BASELINE retrieval capability. Contains no private data of any kind; all text is generic prose. The public-vs-domain delta against this baseline is the calibration signal.",
+  "k": 3,
+  "docs": [
+    {"id": "p1", "text": "Photosynthesis is the process by which green plants convert light energy into chemical energy stored as sugars, releasing oxygen as a byproduct."},
+    {"id": "p2", "text": "Chlorophyll is the pigment in plant cells that absorbs light most strongly in the blue and red bands and reflects green light."},
+    {"id": "p3", "text": "The water cycle describes the continuous movement of water through evaporation, condensation, precipitation, and collection across the planet."},
+    {"id": "p4", "text": "A relational database stores data in tables of rows and columns and answers queries written in a structured query language."},
+    {"id": "p5", "text": "An index is a data structure that speeds up row lookups in a database at the cost of extra storage and slower writes."},
+    {"id": "p6", "text": "A hash table maps keys to values using a hash function and offers average constant-time insertion and lookup."},
+    {"id": "p7", "text": "A compiler translates source written in a high-level programming language into machine code that a processor can execute directly."},
+    {"id": "p8", "text": "An interpreter executes program instructions one at a time without first producing a separate machine-code file."},
+    {"id": "p9", "text": "A neural network learns by adjusting connection weights to reduce the error between its predictions and labeled training examples."},
+    {"id": "p10", "text": "Gradient descent is an optimization method that iteratively moves parameters in the direction that most reduces a loss function."}
+  ],
+  "queries": [
+    {"id": "pq1", "text": "How do plants turn sunlight into energy?", "relevant": ["p1", "p2"]},
+    {"id": "pq2", "text": "Why do leaves look green?", "relevant": ["p2"]},
+    {"id": "pq3", "text": "How does water move around the planet?", "relevant": ["p3"]},
+    {"id": "pq4", "text": "How is structured data stored and queried?", "relevant": ["p4", "p5"]},
+    {"id": "pq5", "text": "How can lookups in a table be made faster?", "relevant": ["p5", "p6"]},
+    {"id": "pq6", "text": "What is the difference between compiling and interpreting code?", "relevant": ["p7", "p8"]},
+    {"id": "pq7", "text": "How does a model learn from labeled examples?", "relevant": ["p9", "p10"]}
+  ]
+}

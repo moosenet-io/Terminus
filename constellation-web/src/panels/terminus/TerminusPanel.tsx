@@ -3,6 +3,7 @@
 // Do NOT extend this into the full Terminus config UI here — that's CONST-05..12.
 import { useEffect, useState } from 'react';
 import { Card, CardTitle } from '../../components/Card';
+import { PanelRoot } from '../../components/PanelRoot';
 import { MetricCard } from '../../components/MetricCard';
 import { Skeleton, SkeletonList } from '../../components/Skeleton';
 import { getAggregationClient } from '../../lib/aggregationClient';
@@ -25,7 +26,7 @@ export function TerminusPanel() {
   }, []);
 
   return (
-    <div style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+    <PanelRoot style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
       <CardTitle subtitle="Registered infra modules on the Terminus tool hub">Terminus — Config</CardTitle>
 
       {error && (
@@ -78,6 +79,6 @@ export function TerminusPanel() {
           </Card>
         </>
       )}
-    </div>
+    </PanelRoot>
   );
 }
