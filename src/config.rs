@@ -97,6 +97,29 @@ pub fn judge_timeout_secs() -> u64 {
         .unwrap_or(120)
 }
 
+/// Wall-clock ceiling (seconds) for an on-demand backend to become healthy
+/// after launch, from `CHORD_ENSURE_UP_TIMEOUT_SECS`. Default 90.
+///
+/// The effective value is HARD-CLAMPED to at most [`ENSURE_UP_TIMEOUT_HARD_CAP`]
+/// (110s) — strictly below lumina's 120s `/v1/chat/completions` egress timeout —
+/// regardless of the env value. Without the clamp, setting the env to 120/180
+/// would let a slow-but-not-crashed backend equal or outlast the client,
+/// defeating the point (the caller falls back to the default Ollama backend on
+/// the returned Err, but only if it returns before the client gives up). A
+/// crashed backend unit is detected and fails fast well before this ceiling
+/// (see `intake::lifecycle::ensure_up`).
+pub fn ensure_up_timeout_secs() -> u64 {
+    let configured = env_nonempty("CHORD_ENSURE_UP_TIMEOUT_SECS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(90);
+    configured.min(ENSURE_UP_TIMEOUT_HARD_CAP)
+}
+
+/// Hard upper bound (seconds) on [`ensure_up_timeout_secs`] — strictly below
+/// lumina's 120s client egress timeout so the backend wait can never outlast
+/// the caller no matter what the env is set to.
+pub const ENSURE_UP_TIMEOUT_HARD_CAP: u64 = 110;
+
 /// Postgres URL for the intake/assistant-profile tables. Prefers
 /// `INTAKE_DATABASE_URL`, falls back to the shared `DATABASE_URL`.
 /// Returns `None` (caller raises `NotConfigured`) when neither is set.
@@ -885,6 +908,21 @@ pub fn hf_discovery_rate_limit_per_min() -> u32 {
         .unwrap_or(30)
 }
 
+/// Maximum number of brochure candidates the DISC measure pass
+/// (`model_discovery_measure`, Ask-4) will fetch HF model-info metadata for in a
+/// single run. From `INTAKE_DISCOVERY_MEASURE_MAX`, default 50 — bounds outbound
+/// HF calls per run so a one-shot backfill of a large (~850-row) brochure spaces
+/// its metadata fetches across several runs rather than hammering HF's API in one
+/// burst (the same courtesy-throttle rationale as `hf_discovery_rate_limit_per_min`;
+/// see memory `feedback_plane_ratelimit`/`mint_brochure_curator_fixed` on spacing
+/// calls out). A non-positive or unparseable override falls back to the default.
+pub fn intake_discovery_measure_max() -> usize {
+    env_nonempty("INTAKE_DISCOVERY_MEASURE_MAX")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(50)
+}
+
 // ── KGEMB-02: KG semantic-embeddings client config ────────────────────────
 // `crate::scribe::graph::vec_embed::EmbedClient` turns a node "card" (short
 // text) into a vector against a configurable endpoint. URL/model/timeout are
@@ -1190,7 +1228,7 @@ pub fn validate_worker_transport_entry(
 // it proxies to, and every filesystem path it needs, is resolved here —
 // NEVER a literal in `crate::constellation::*` — matching this file's own
 // convention for every other tool in this crate. Following this crate's
-// established secret/config convention (see the `crate::<secret-manager>` and
+// established secret/config convention (see the `crate::<secret-manager>` and // pii-test-fixture: public product name, sanctioned secrets-manager module (same rationale as infra_service_path_exempt's src/<secret-manager>/ + docs/ exemption)
 // `crate::review::dispatch` module docs: there is no separate
 // `SecretManager`/`vault::manager()` API in terminus-rs — a plain env read
 // of a runtime-materialized value, via [`env_nonempty`], IS the vault read
@@ -1318,7 +1356,7 @@ pub fn constellation_operator_secret() -> Option<String> {
 /// Viewer shared secret (CONST-27, §3.4) compared (constant-time) against the
 /// submitted login password AFTER the operator secret has already been
 /// checked and didn't match. From `CONSTELLATION_VIEWER_SECRET`
-/// (operator-provisioned in <secret-manager> — never hardcoded). `None` when unset
+/// (operator-provisioned in <secret-manager> — never hardcoded). `None` when unset // pii-test-fixture: public product name, sanctioned secrets manager (see infra_service_path_exempt rationale)
 /// — callers MUST fail-closed (every viewer-tier login attempt rejected,
 /// same posture as an unset `CONSTELLATION_OPERATOR_SECRET`): an operator who
 /// hasn't provisioned this secret simply hasn't enabled the viewer tier yet,
@@ -1328,6 +1366,26 @@ pub fn constellation_operator_secret() -> Option<String> {
 /// value.
 pub fn constellation_viewer_secret() -> Option<String> {
     env_nonempty("CONSTELLATION_VIEWER_SECRET")
+}
+
+/// LGUI-05 (LUMINA-GUI-SPEC.md §6 decision D2): the bearer credential
+/// `crate::constellation::proxy::proxy_lumina` attaches as
+/// `Authorization: Bearer <token>` on every proxied `/api/lumina/*path`
+/// request to the Lumina backend, so the browser never holds -- and can
+/// never supply -- a Lumina credential; the operator's Constellation session
+/// cookie only ever authenticates the *browser* to Terminus, this token is
+/// what separately authenticates *Terminus to Lumina* server-side. From
+/// `CONSTELLATION_LUMINA_TOKEN` (<secret-manager>-provisioned; same value as // pii-test-fixture: public product name, sanctioned secrets manager (see infra_service_path_exempt rationale)
+/// Lumina's own `LUMINA_HTTP_TOKEN` -- two consumers, one secret, per the
+/// spec's Pre-flight section). `None` when unset -- `proxy_lumina` forwards
+/// unauthenticated in that case, exactly as it did before this item (a
+/// token-less dev Lumina instance keeps working), never a hard failure.
+/// Same "no separate secret-store API in this crate" rationale as
+/// [`constellation_operator_secret`] above; the only caller is
+/// `crate::constellation::proxy::proxy_lumina`, which never logs the
+/// returned value.
+pub fn constellation_lumina_token() -> Option<String> {
+    env_nonempty("CONSTELLATION_LUMINA_TOKEN")
 }
 
 /// Constellation session token TTL, in seconds. Independent of
@@ -1443,6 +1501,51 @@ pub fn gitea_merge_queue_min_delay_secs() -> u64 {
     env_nonempty("GITEA_MERGE_QUEUE_MIN_DELAY_SECS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(8)
+}
+
+// ── PCON-06: in-slot rebase + re-gate (Bors / GitHub-merge-queue model) ──────
+
+/// PCON-06: whether the merge queue, on a stale-base (`NotMergeable`) condition,
+/// REBASES current `main` into the PR branch and fires a FRESH compiler
+/// test-gate on the rebased head INSIDE the critical section — merging only on
+/// a green re-gate — instead of bouncing "rebase current base and retry" to the
+/// caller (the pre-PCON-06 behavior). From `BUILD_MERGE_REGATE_ENABLED`
+/// (`"true"`/`"1"` ⇒ on, anything else ⇒ off); defaults to **on**, so where the
+/// compiler build door is reachable every merge is tested in its exact landing
+/// state and `main` stays always-green.
+///
+/// Turning it **off** (or the compiler door being unreachable at re-gate time)
+/// falls back to exactly today's `NotMergeable`-bounce — a fail-safe, never a
+/// blind merge and never an indefinitely-held slot. This is the operator kill
+/// switch for the re-gate behavior specifically; the queue's serialization,
+/// spacing, and stale-base guard are unaffected by it.
+pub fn build_merge_regate_enabled() -> bool {
+    env_nonempty("BUILD_MERGE_REGATE_ENABLED")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(true)
+}
+
+// ── PCON-07: speculative merge batching (GitHub-merge-queue model) ──────────
+
+/// PCON-07: the maximum number of same-base PRs the merge queue will stack into
+/// ONE speculative rebased batch, gate ONCE, and merge together on green (the
+/// GitHub-merge-queue "speculative batches" throughput optimization layered on
+/// top of PCON-06's serialized rebase-and-re-gate). From `BUILD_MERGE_BATCH_MAX`.
+///
+/// **Defaults to `1`, and `1` is the safe baseline: NO batching at all — every
+/// merge takes exactly the PCON-06 single-PR rebase-and-re-gate path,
+/// byte-for-byte.** Batching only engages at a value `> 1`, and only for a
+/// caller that explicitly supplies a `batch_prs` set (see `gitea_merge_pr`);
+/// with the default `1`, or a single-PR call, the batch layer is never entered.
+///
+/// A value of `0` or an unparyseable value is clamped up to `1` (never zero —
+/// a batch must always contain at least the front PR), so the accessor can
+/// never disable merging entirely or return a degenerate cap.
+pub fn build_merge_batch_max() -> usize {
+    env_nonempty("BUILD_MERGE_BATCH_MAX")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1)
 }
 
 #[cfg(test)]
@@ -2226,6 +2329,16 @@ mod tests {
 
     #[test]
     #[serial]
+    fn constellation_lumina_token_unset_is_none() {
+        std::env::remove_var("CONSTELLATION_LUMINA_TOKEN");
+        assert_eq!(constellation_lumina_token(), None);
+        std::env::set_var("CONSTELLATION_LUMINA_TOKEN", "lumina-secret"); // pii-test-fixture
+        assert_eq!(constellation_lumina_token(), Some("lumina-secret".to_string()));
+        std::env::remove_var("CONSTELLATION_LUMINA_TOKEN");
+    }
+
+    #[test]
+    #[serial]
     fn constellation_session_ttl_seconds_default_and_override() {
         std::env::remove_var("CONSTELLATION_SESSION_TTL_SECONDS");
         assert_eq!(constellation_session_ttl_seconds(), 3_600);
@@ -2283,5 +2396,36 @@ mod tests {
         assert_eq!(gitea_merge_queue_wait_ttl_secs(), 500);
         std::env::remove_var("GITEA_MERGE_QUEUE_MAX_WAIT_SECS");
         std::env::remove_var("GITEA_MERGE_QUEUE_WAIT_TTL_SECS");
+    }
+
+    // ── PCON-07: speculative merge batching cap ─────────────────────────────
+
+    #[test]
+    #[serial]
+    fn build_merge_batch_max_defaults_to_one_no_batching() {
+        // The safe baseline: unset ⇒ 1 ⇒ PCON-06 single-PR behavior, never any
+        // batching engaged.
+        std::env::remove_var("BUILD_MERGE_BATCH_MAX");
+        assert_eq!(build_merge_batch_max(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn build_merge_batch_max_honors_a_value_above_one() {
+        std::env::set_var("BUILD_MERGE_BATCH_MAX", "4");
+        assert_eq!(build_merge_batch_max(), 4);
+        std::env::remove_var("BUILD_MERGE_BATCH_MAX");
+    }
+
+    #[test]
+    #[serial]
+    fn build_merge_batch_max_clamps_zero_and_garbage_up_to_one() {
+        // A batch must always contain at least the front PR — 0 (or an
+        // unparseable value) can never disable merging; it clamps to 1.
+        std::env::set_var("BUILD_MERGE_BATCH_MAX", "0");
+        assert_eq!(build_merge_batch_max(), 1);
+        std::env::set_var("BUILD_MERGE_BATCH_MAX", "not-a-number");
+        assert_eq!(build_merge_batch_max(), 1);
+        std::env::remove_var("BUILD_MERGE_BATCH_MAX");
     }
 }

@@ -333,6 +333,21 @@ pub fn is_transport_error(msg: &str) -> bool {
         || l.contains("eof")
 }
 
+/// FIX2 (S125): whether a stored tier error string denotes a genuine TIMEOUT —
+/// the per-tier/request deadline elapsed (`RequestFailureClass::Timeout`). This
+/// is the real "context too big to serve in time" CAPACITY signal, and is
+/// DELIBERATELY narrower than [`is_transport_error`]: a transient connect/body/
+/// parse blip must NOT count, because it does not prove a larger context is
+/// infeasible (halting escalation on it would wrongly cap the model at that
+/// tier). The runner uses this alongside `oom` to decide a tier is the model's
+/// feasible-context ceiling and STOP escalating. Matches the two timeout markers
+/// `describe_request_error` emits: the `Timeout` label ("timed out") and the
+/// `is_timeout=true` predicate dump. Pure.
+pub fn is_timeout_error(msg: &str) -> bool {
+    let l = msg.to_lowercase();
+    l.contains("timed out") || l.contains("is_timeout=true")
+}
+
 /// Coarse classification of an inference error, unifying the two ad hoc
 /// predicates ([`is_oom_like`], [`is_transport_error`]) into one public
 /// vocabulary (Phase 2 item 4). Named `ErrorClass` — not `RetryReason` or
@@ -481,6 +496,34 @@ pub async fn run_tier(
     let filler = build_filler(target_tokens);
     let prompt = plant_facts(&filler);
     let actual_tokens = estimate_tokens(&prompt);
+
+    // BT-02: backend-agnostic context tier. Ollama keeps its native `/api/generate` path
+    // below (rich `prompt_eval_duration`/`eval_*` → TTFT + throughput). ANY other backend
+    // kind (openai/llama-server/daemon) routes through the backend-resolved
+    // `infer_with_metrics` dispatch — otherwise the context suite would POST an ollama
+    // route at a non-ollama URL and fail. This is what makes the context suite profile
+    // lemonade/vLLM/OpenRouter/Chord, not just ollama.
+    let backend = crate::intake::infer::resolve_backend(model_name);
+    if backend.kind != "ollama" {
+        let m = crate::intake::infer::infer_with_metrics(client, model_name, &prompt, timeout).await;
+        let mut result = TierResult {
+            context_tokens: actual_tokens,
+            throughput_tok_per_sec: m.throughput_tok_per_sec,
+            ttft_ms: m.ttft_ms,
+            total_time_ms: m.total_time_ms,
+            recall_score: None,
+            coherence_score: None,
+            memory_usage_mb: None,
+            oom: m.oom,
+            error: m.error.clone(),
+            response: String::new(),
+        };
+        if result.error.is_none() {
+            result.recall_score = Some(score_recall(&m.response));
+            result.response = m.response;
+        }
+        return result;
+    }
 
     let base = ollama_base();
     let body = serde_json::json!({
@@ -943,10 +986,19 @@ mod tests {
         assert!((sum - 1.0).abs() < 0.001, "sum={sum}");
         // Rust dominates (target ~60%, accept 45-75% given real file sizes).
         assert!(rs > 0.45 && rs < 0.75, "rust proportion {rs}");
-        // Markdown is the second biggest class.
+        // Markdown is a substantial prose class.
         assert!(md > 0.10, "md proportion {md}");
-        // toml + json are the small classes.
-        assert!(toml < md && json < md, "toml={toml} json={json} md={md}");
+        // json (a single compact probe file) is always the smallest class.
+        // NOTE: toml is NOT asserted smaller than md here — `F_TOML_TERMINUS`
+        // embeds this crate's own (workspace) Cargo.toml via `include_str!`,
+        // whose size drifts with dependency count and has grown past
+        // markdown's share; that drift is incidental churn, not a corpus
+        // regression, so pinning toml < md would make this test flaky on
+        // every dependency bump.
+        assert!(json < md && json < toml, "toml={toml} json={json} md={md}");
+        // The machine-generated formats (toml + json) stay a minority
+        // relative to the rust+markdown prose corpus.
+        assert!(toml + json < 0.45, "toml+json proportion too large: toml={toml} json={json}");
     }
 
     #[test]
@@ -1036,6 +1088,27 @@ mod tests {
         assert!(!is_transport_error("model 'foo' not found"));
         assert!(!is_transport_error("invalid prompt"));
         assert!(!is_transport_error("out of memory"));
+    }
+
+    /// FIX2 (S125): `is_timeout_error` is NARROWER than `is_transport_error` — it
+    /// matches ONLY a genuine timeout (the two markers `describe_request_error`
+    /// emits), never a transient connect/body/parse error. This is what lets the
+    /// runner treat a timeout (a real capacity ceiling) differently from a
+    /// one-off network blip.
+    #[test]
+    fn is_timeout_error_matches_only_timeouts() {
+        // Genuine timeouts (the two describe_request_error markers).
+        assert!(is_timeout_error(
+            "run_tier: inference request failed (timed out); is_timeout=true is_connect=false"
+        ));
+        assert!(is_timeout_error("operation timed out"));
+        // NOT timeouts — transient connect/body/parse failures.
+        assert!(!is_timeout_error(
+            "run_tier: inference request failed (connection refused); is_timeout=false is_connect=true"
+        ));
+        assert!(!is_timeout_error("response parse error: expected value"));
+        assert!(!is_timeout_error("unexpected EOF"));
+        assert!(!is_timeout_error("out of memory"));
     }
 
     #[test]

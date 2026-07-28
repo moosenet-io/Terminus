@@ -968,6 +968,28 @@ pub async fn reconcile(pool: &PgPool) -> Result<Vec<ReconciliationGap>, ToolErro
         .collect())
 }
 
+/// The distinct set of model ids that have a builder profile but NO assistant
+/// profile — the gap-targeting candidate source for the assistant sweep's
+/// `INTAKE_ASSISTANT_GAP_ONLY` mode. Reads straight from `model_dual_profile`,
+/// so it reflects the exact same join logic as [`reconcile`] and the
+/// operator-facing dual view (a model counts as "needs an assistant profile" if
+/// ANY of its (backend, mem_config) rows are builder-only). The DB pool is the
+/// caller's — this makes no connection of its own (no literal DSN; S1/S7).
+pub async fn gap_only_model_ids(
+    pool: &PgPool,
+) -> Result<std::collections::BTreeSet<String>, ToolError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT model_id FROM model_dual_profile \
+         WHERE has_builder_profile AND NOT has_assistant_profile \
+         ORDER BY model_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ToolError::Database(format!("gap-only candidate query: {e}")))?;
+
+    Ok(rows.into_iter().map(|(model_id,)| model_id).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

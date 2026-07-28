@@ -14,7 +14,7 @@
 //! terminus-rs has no separate `SecretManager::get()` / `vault::manager()` API
 //! of its own (see `crate::pki` module docs for the full rationale, and
 //! `crate::plane`'s `PLANE_PAT_<NAME>` scan for the exact precedent this
-//! mirrors): the runtime secret store (<secret-manager> / the operator's vault) is
+//! mirrors): the runtime secret store (<secret-manager> / the operator's vault) is // pii-test-fixture: public product name, sanctioned secrets manager (see infra_service_path_exempt rationale)
 //! materialized into THIS process's environment at startup — either by
 //! `crate::secrets_bootstrap` for the crate's fixed allowlisted keys, or by
 //! the operator's deployment tooling for a per-identity family like this one

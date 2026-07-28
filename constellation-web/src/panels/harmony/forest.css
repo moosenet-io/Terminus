@@ -1,0 +1,20 @@
+/* CGUI-11 (TERM #534): Harmony Forest Build — screen-scoped keyframes + custom scrollbar.
+ * These are the exact motion primitives from the design handoff (§2.5): a leaf pops in, a bough
+ * grows, a finished tree drifts to the horizon, the distant fog drifts, and annotation callouts
+ * rise. Kept in one file (imported by HarmonyForestPanel.tsx) rather than globals.css so the
+ * `tg-*` / `.hf-scroll` names stay clearly owned by this screen.
+ *
+ * Reduced motion: the app's interactions.css already collapses every CSS animation/transition to
+ * ~1ms under `prefers-reduced-motion: reduce`, which stills these loops. The panel additionally
+ * withholds the SVG <animateMotion>/<animate> SMIL sap+halo pulses in reduced-motion (SMIL is not
+ * governed by the CSS media rule) — see useReducedMotion in HarmonyForestPanel.tsx. */
+
+@keyframes tg-twinkle { 0%, 100% { opacity: 0.2; } 50% { opacity: 0.9; } }
+@keyframes tg-leafpop { 0% { transform: scale(0); opacity: 0; } 60% { transform: scale(1.25); opacity: 1; } 100% { transform: scale(1); } }
+@keyframes tg-grow { 0% { transform: scale(0) translateY(14px); opacity: 0; } 100% { transform: scale(1) translateY(0); opacity: 1; } }
+@keyframes tg-fog { 0%, 100% { transform: translateX(-2%); } 50% { transform: translateX(2%); } }
+@keyframes tg-rise { 0% { opacity: 0; transform: translateY(8px); } 100% { opacity: 1; transform: translateY(0); } }
+
+.hf-scroll::-webkit-scrollbar { width: 8px; }
+.hf-scroll::-webkit-scrollbar-thumb { background: rgba(168, 85, 247, 0.25); border-radius: 8px; }
+.hf-scroll::-webkit-scrollbar-track { background: transparent; }

@@ -71,7 +71,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::constellation::mask::mask_response;
 use crate::intake::catalog::{self, CatalogQuery, StoredCatalogCard};
 use crate::intake::discovery::schema::{DiscoveryCandidate, FleetCategory};
-use crate::intake::{discovery, storage, EpochSelector};
+use crate::intake::{discovery, newcats, storage, EpochSelector};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -139,6 +139,259 @@ fn top_n_classes<'a>(class_totals: &BTreeMap<&'a str, i64>, n: usize) -> BTreeSe
     let mut ranked: Vec<(&str, i64)> = class_totals.iter().map(|(c, n)| (*c, *n)).collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     ranked.into_iter().take(n).map(|(c, _)| c).collect()
+}
+
+// ---------------------------------------------------------------------------
+// CGUI-07 (TERM #530): the 8 NEW MINT task-categories
+// ---------------------------------------------------------------------------
+
+/// The 8 new MINT task-categories, each keyed by the canonical
+/// `assistant_dimension_score.task_category` string its suite actually writes —
+/// the `newcats::*::TASK_CATEGORY` consts, NOT the catalog leaf-DIMENSION
+/// consts (which DIFFER for reranking `"rerank_relevance"` / vision
+/// `"vision_description"` / stt `"asr_transcription"`; using those as the
+/// filter would read ZERO rows). Order is display order.
+const NEWCAT_TASK_CATEGORIES: [&str; 8] = [
+    newcats::embedding_retrieval::TASK_CATEGORY, // "embedding_retrieval"
+    newcats::reranking::TASK_CATEGORY,           // "reranking"
+    newcats::image_parsing::TASK_CATEGORY,       // "image_parsing"  (vision_qa)
+    newcats::document_parsing::TASK_CATEGORY,    // "document_parsing"
+    newcats::image_generation::TASK_CATEGORY,    // "image_generation"
+    newcats::voice_transcription::TASK_CATEGORY, // "voice_transcription"  (stt)
+    newcats::tts::TASK_CATEGORY,                 // "tts"
+    newcats::tool_routing::TASK_CATEGORY,        // "tool_routing"
+];
+
+/// Resolve a suite/category key from the client to its canonical
+/// `assistant_dimension_score.task_category`, or `None` if it is not one of the
+/// 8 new MINT categories. Accepts the canonical value directly AND the friendly
+/// aliases the spec/frontend use for the two categories whose display name
+/// differs from their stored `task_category` (`vision_qa`→`image_parsing`,
+/// `stt`/`asr`→`voice_transcription`).
+fn newcat_task_category(suite: &str) -> Option<&'static str> {
+    if let Some(tc) = NEWCAT_TASK_CATEGORIES.iter().copied().find(|tc| *tc == suite) {
+        return Some(tc);
+    }
+    match suite {
+        "vision_qa" => Some(newcats::image_parsing::TASK_CATEGORY),
+        "stt" | "asr" | "asr_transcription" => Some(newcats::voice_transcription::TASK_CATEGORY),
+        _ => None,
+    }
+}
+
+/// The full human-readable list of accepted `suite` values for a `/mint/runs`
+/// (or category-endpoint) 400 — legacy suites plus every new MINT category.
+fn valid_suites_hint() -> String {
+    let mut all = vec!["code", "context", "agent"];
+    all.extend(NEWCAT_TASK_CATEGORIES.iter().copied());
+    format!("{} (category aliases: vision_qa, stt)", all.join(", "))
+}
+
+/// One `TaskCategoryScoreRow` as the run/table JSON row shape (shared by the
+/// widened `/mint/runs?suite={cat}` page and any future category run view).
+fn newcat_row_json(r: &storage::TaskCategoryScoreRow) -> Value {
+    json!({
+        "run_id": r.run_id,
+        "model": r.model_id,
+        "backend_tag": r.backend_tag,
+        "dimension": r.dimension,
+        "metric": r.metric,
+        "value": r.value,
+        "std_dev": r.std_dev,
+        "judge": r.judge,
+        "low_confidence": r.low_confidence,
+        "created_at": r.created_at,
+        "harness_version": r.harness_version,
+    })
+}
+
+/// The epoch filter to pass to [`storage::read_task_category_scores`] for the
+/// new MINT categories: only an EXPLICIT single-epoch selector
+/// (`EpochSelector::Only`) constrains `assistant_profile_run.harness_version`.
+/// `Current`/`All`/absent apply NO filter — deliberately, because
+/// `EpochSelector::Current` resolves to the *coder* epoch ([`current_epoch`]),
+/// which is unrelated to the assistant/newcats harness lineage; applying it
+/// would silently zero out every newcats row (fail-CLOSED). Absent-epoch
+/// therefore reads ALL of a category's rows (fail-OPEN), which is the correct
+/// default here.
+fn newcat_epoch_filter(epoch: Option<&str>) -> Option<String> {
+    match epoch_selector_from_query(epoch) {
+        EpochSelector::Only(e) => Some(e),
+        _ => None,
+    }
+}
+
+// -- pure in-memory shapers (unit-tested without a DB) ----------------------
+
+/// C0-style per-model summary: each model's LATEST value per metric. Rows are
+/// grouped by `(model, metric)` keeping only the most-recent `created_at`
+/// (sorted here defensively rather than trusting the reader's `ORDER BY`).
+fn shape_newcat_summary(rows: &[storage::TaskCategoryScoreRow]) -> Value {
+    let mut idx: Vec<usize> = (0..rows.len()).collect();
+    idx.sort_by(|&a, &b| rows[b].created_at.cmp(&rows[a].created_at));
+    let mut seen: BTreeSet<(&str, &str)> = BTreeSet::new();
+    let mut by_model: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    for &i in &idx {
+        let r = &rows[i];
+        if seen.insert((r.model_id.as_str(), r.metric.as_str())) {
+            by_model.entry(r.model_id.as_str()).or_default().push(json!({
+                "dimension": r.dimension,
+                "metric": r.metric,
+                "value": r.value,
+                "std_dev": r.std_dev,
+                "low_confidence": r.low_confidence,
+                "backend_tag": r.backend_tag,
+                "last_run_at": r.created_at,
+            }));
+        }
+    }
+    let models: Vec<Value> = by_model
+        .into_iter()
+        .map(|(model, mut metrics)| {
+            metrics.sort_by(|a, b| a["metric"].as_str().cmp(&b["metric"].as_str()));
+            json!({"model_id": model, "metrics": metrics})
+        })
+        .collect();
+    json!({"models": models})
+}
+
+/// The distinct `(dimension, metric)` pairs present for a category — the axis
+/// list a radar/table client needs to know which columns exist.
+fn shape_newcat_dimensions(rows: &[storage::TaskCategoryScoreRow]) -> Value {
+    let pairs: BTreeSet<(&str, &str)> = rows
+        .iter()
+        .map(|r| (r.dimension.as_str(), r.metric.as_str()))
+        .collect();
+    let dims: Vec<Value> = pairs
+        .into_iter()
+        .map(|(dimension, metric)| json!({"dimension": dimension, "metric": metric}))
+        .collect();
+    json!({"dimensions": dims})
+}
+
+/// model × metric coverage matrix, mirroring `mint_matrix`'s
+/// `{models, columns, cells}` shape (here a column is a `metric`). Each cell
+/// carries the mean value, sample count, last run, and whether ANY contributing
+/// row was low-confidence.
+fn shape_newcat_matrix(rows: &[storage::TaskCategoryScoreRow]) -> Value {
+    struct Agg {
+        sum: f64,
+        n: i64,
+        last: chrono::DateTime<chrono::Utc>,
+        low: bool,
+        dimension: String,
+    }
+    let mut cells: BTreeMap<(&str, &str), Agg> = BTreeMap::new();
+    let mut models: BTreeSet<&str> = BTreeSet::new();
+    let mut columns: BTreeSet<&str> = BTreeSet::new();
+    for r in rows {
+        models.insert(r.model_id.as_str());
+        columns.insert(r.metric.as_str());
+        let e = cells.entry((r.model_id.as_str(), r.metric.as_str())).or_insert(Agg {
+            sum: 0.0,
+            n: 0,
+            last: r.created_at,
+            low: false,
+            dimension: r.dimension.clone(),
+        });
+        e.sum += r.value;
+        e.n += 1;
+        e.low |= r.low_confidence;
+        if r.created_at > e.last {
+            e.last = r.created_at;
+        }
+    }
+    let cells_json: Vec<Value> = cells
+        .into_iter()
+        .map(|((model, metric), a)| {
+            json!({
+                "model": model,
+                "metric": metric,
+                "dimension": a.dimension,
+                "mean": if a.n > 0 { a.sum / a.n as f64 } else { 0.0 },
+                "n": a.n,
+                "low_confidence": a.low,
+                "last_run_at": a.last,
+            })
+        })
+        .collect();
+    json!({
+        "models": models,
+        "columns": columns.into_iter().collect::<Vec<_>>(),
+        "cells": cells_json,
+    })
+}
+
+/// Per-model box/distribution for one metric (mirrors `mint_box`'s `groups`
+/// shape, reusing [`quartiles`]). `metric` defaults to the lexicographically
+/// first metric present when absent; the chosen metric is echoed back so the
+/// client knows what it got. A metric that matches no rows yields empty groups
+/// (fail-open, never an error).
+fn shape_newcat_box(rows: &[storage::TaskCategoryScoreRow], metric: Option<&str>) -> Value {
+    let chosen: Option<String> = metric.map(str::to_string).or_else(|| {
+        rows.iter().map(|r| r.metric.clone()).min()
+    });
+    let Some(metric) = chosen else {
+        return json!({"metric": Value::Null, "groups": []});
+    };
+
+    let mut by_model: BTreeMap<&str, Vec<&storage::TaskCategoryScoreRow>> = BTreeMap::new();
+    for r in rows.iter().filter(|r| r.metric == metric) {
+        by_model.entry(r.model_id.as_str()).or_default().push(r);
+    }
+    let groups: Vec<Value> = by_model
+        .into_iter()
+        .map(|(model, model_rows)| {
+            let values: Vec<f64> = model_rows.iter().map(|r| r.value).collect();
+            let n = values.len();
+            let (min, q1, median, q3, max, outlier_idx) = quartiles(&values);
+            let outliers: Vec<Value> = outlier_idx
+                .into_iter()
+                .filter_map(|i| model_rows.get(i))
+                .map(|r| json!({
+                    "run_id": r.run_id,
+                    "value": r.value,
+                    "low_confidence": r.low_confidence,
+                }))
+                .collect();
+            json!({
+                "model": model,
+                "min": min, "q1": q1, "median": median, "q3": q3, "max": max,
+                "n": n,
+                "low_n": n < 5,
+                "outliers": outliers,
+            })
+        })
+        .collect();
+    json!({"metric": metric, "groups": groups})
+}
+
+/// Per-model failure view for a category. `assistant_dimension_score` has NO
+/// `failure_class` column (unlike `code_profile_runs`), so the only honest
+/// failure signal available here is `low_confidence`; this reports, per model,
+/// the low-confidence vs OK split — mirroring `mint_failures`'
+/// `{classes, models}` shape so the same failure-bar client renders it.
+fn shape_newcat_failures(rows: &[storage::TaskCategoryScoreRow]) -> Value {
+    let mut low: BTreeMap<&str, i64> = BTreeMap::new();
+    let mut total: BTreeMap<&str, i64> = BTreeMap::new();
+    for r in rows {
+        *total.entry(r.model_id.as_str()).or_insert(0) += 1;
+        if r.low_confidence {
+            *low.entry(r.model_id.as_str()).or_insert(0) += 1;
+        }
+    }
+    let models: Vec<Value> = total
+        .into_iter()
+        .map(|(model, t)| {
+            let l = low.get(model).copied().unwrap_or(0);
+            json!({
+                "model": model,
+                "counts": {"low_confidence": l, "ok": t - l},
+                "total_runs": t,
+            })
+        })
+        .collect();
+    json!({"classes": ["low_confidence", "ok"], "models": models})
 }
 
 /// Connect the shared intake pool, degrading to `None` on ANY failure
@@ -797,6 +1050,9 @@ pub struct RunsQuery {
     task_category: Option<String>,
     language: Option<String>,
     failure_class: Option<String>,
+    /// New-MINT-category runs only (`assistant_dimension_score.metric`): an
+    /// optional exact-metric filter for a `suite={category}` page.
+    metric: Option<String>,
     epoch: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
@@ -823,11 +1079,19 @@ pub async fn mint_runs(Query(q): Query<RunsQuery>) -> Response {
 
     // Validate the suite enum BEFORE the DB check so an unrecognized suite is a
     // 400 even when no DB is configured (otherwise it would silently degrade to
-    // an empty 200 — see mint_runs_rejects_unknown_suite_with_400).
-    if !matches!(suite, "code" | "context" | "agent") {
+    // an empty 200 — see mint_runs_rejects_unknown_suite_with_400). The
+    // allowlist is WIDENED (CGUI-07) to the 8 new MINT categories: legacy
+    // `code|context|agent` keep their dedicated readers; any recognized new
+    // category reads `assistant_dimension_score` by `task_category`. Anything
+    // else is a 400 naming every accepted value.
+    let newcat = newcat_task_category(suite);
+    if !matches!(suite, "code" | "context" | "agent") && newcat.is_none() {
         return json_status(
             StatusCode::BAD_REQUEST,
-            json!({"error": format!("unrecognized suite '{suite}' (expected one of: code, context, agent)")}),
+            json!({"error": format!(
+                "unrecognized suite '{suite}' (expected one of: {})",
+                valid_suites_hint()
+            )}),
         );
     }
 
@@ -880,11 +1144,120 @@ pub async fn mint_runs(Query(q): Query<RunsQuery>) -> Response {
                 .unwrap_or((Vec::new(), 0));
             json_ok(json!({"total": total, "runs": rows}))
         }
-        other => json_status(
-            StatusCode::BAD_REQUEST,
-            json!({"error": format!("unrecognized suite '{other}' (expected one of: code, context, agent)")}),
-        ),
+        // A new MINT category (validated above ⇒ `newcat` is `Some`): read the
+        // category's `assistant_dimension_score` rows, filter by `model`/
+        // `metric` in-memory, and paginate. Fail-open: no rows ⇒ empty 200.
+        _ => {
+            let task_category = newcat.expect("newcat suite validated above is Some");
+            let epoch = newcat_epoch_filter(q.epoch.as_deref());
+            let all = storage::read_task_category_scores(&pool, task_category, epoch.as_deref())
+                .await
+                .unwrap_or_default();
+            let filtered: Vec<&storage::TaskCategoryScoreRow> = all
+                .iter()
+                .filter(|r| q.model.as_deref().map_or(true, |m| r.model_id == m))
+                .filter(|r| q.metric.as_deref().map_or(true, |m| r.metric == m))
+                .collect();
+            let total = filtered.len() as i64;
+            let page: Vec<Value> = filtered
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .map(newcat_row_json)
+                .collect();
+            json_ok(json!({"total": total, "runs": page}))
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// CGUI-07 (TERM #530): GET /api/terminus/mint/category/{category}/{view}
+//   view ∈ {summary, dimensions, matrix, box, failures}
+// (runs for a new category go through the widened `/mint/runs?suite={category}`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CategoryViewQuery {
+    epoch: Option<String>,
+    metric: Option<String>,
+}
+
+/// Resolve the `{category}` path segment to its canonical `task_category`, read
+/// every row for it once (fail-open to empty on no DB / un-migrated table), and
+/// hand the rows to `shape`. An unrecognized category is the ONE 400 these
+/// endpoints raise — every other outcome (no DB, empty category) is an empty
+/// `200`, matching the module's degradation contract.
+async fn category_view(
+    category: &str,
+    epoch: Option<&str>,
+    shape: impl FnOnce(&[storage::TaskCategoryScoreRow]) -> Value,
+) -> Response {
+    let Some(task_category) = newcat_task_category(category) else {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({"error": format!(
+                "unrecognized category '{category}' (expected one of: {})",
+                NEWCAT_TASK_CATEGORIES.join(", ")
+            )}),
+        );
+    };
+    let Some(pool) = pool_or_none().await else {
+        return json_ok(shape(&[]));
+    };
+    let rows = storage::read_task_category_scores(&pool, task_category, newcat_epoch_filter(epoch).as_deref())
+        .await
+        .unwrap_or_default();
+    json_ok(shape(&rows))
+}
+
+/// `GET /api/terminus/mint/category/{category}/summary?epoch=` — per-model
+/// latest metrics for one new MINT category.
+pub async fn mint_category_summary(
+    Path(category): Path<String>,
+    Query(q): Query<CategoryViewQuery>,
+) -> Response {
+    category_view(&category, q.epoch.as_deref(), shape_newcat_summary).await
+}
+
+/// `GET /api/terminus/mint/category/{category}/dimensions?epoch=` — the
+/// distinct (dimension, metric) axes present for the category.
+pub async fn mint_category_dimensions(
+    Path(category): Path<String>,
+    Query(q): Query<CategoryViewQuery>,
+) -> Response {
+    category_view(&category, q.epoch.as_deref(), shape_newcat_dimensions).await
+}
+
+/// `GET /api/terminus/mint/category/{category}/matrix?epoch=` — the model×metric
+/// coverage matrix for the category.
+pub async fn mint_category_matrix(
+    Path(category): Path<String>,
+    Query(q): Query<CategoryViewQuery>,
+) -> Response {
+    category_view(&category, q.epoch.as_deref(), shape_newcat_matrix).await
+}
+
+/// `GET /api/terminus/mint/category/{category}/box?metric=&epoch=` — per-model
+/// quartiles for one of the category's metrics.
+pub async fn mint_category_box(
+    Path(category): Path<String>,
+    Query(q): Query<CategoryViewQuery>,
+) -> Response {
+    let metric = q.metric.clone();
+    category_view(&category, q.epoch.as_deref(), move |rows| {
+        shape_newcat_box(rows, metric.as_deref())
+    })
+    .await
+}
+
+/// `GET /api/terminus/mint/category/{category}/failures?epoch=` — per-model
+/// low-confidence split (the only failure signal `assistant_dimension_score`
+/// carries) for the category.
+pub async fn mint_category_failures(
+    Path(category): Path<String>,
+    Query(q): Query<CategoryViewQuery>,
+) -> Response {
+    category_view(&category, q.epoch.as_deref(), shape_newcat_failures).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,6 +1621,205 @@ mod tests {
             .route("/api/terminus/mint/failures", get(mint_failures))
             .route("/api/terminus/mint/context-profiles", get(mint_context_profiles))
             .route("/api/terminus/mint/activity", get(mint_activity))
+            .route("/api/terminus/mint/category/:category/summary", get(mint_category_summary))
+            .route("/api/terminus/mint/category/:category/dimensions", get(mint_category_dimensions))
+            .route("/api/terminus/mint/category/:category/matrix", get(mint_category_matrix))
+            .route("/api/terminus/mint/category/:category/box", get(mint_category_box))
+            .route("/api/terminus/mint/category/:category/failures", get(mint_category_failures))
+    }
+
+    // ---- CGUI-07 (TERM #530): new-MINT-category read helpers ----
+
+    /// A synthetic `TaskCategoryScoreRow` for the pure-shaper unit tests below.
+    fn score_row(
+        model: &str,
+        metric: &str,
+        value: f64,
+        low_confidence: bool,
+        secs: i64,
+    ) -> storage::TaskCategoryScoreRow {
+        storage::TaskCategoryScoreRow {
+            run_id: uuid::Uuid::new_v4(),
+            model_id: model.to_string(),
+            backend_tag: "gpu".to_string(),
+            dimension: "embedding_retrieval".to_string(),
+            metric: metric.to_string(),
+            value,
+            std_dev: None,
+            judge: "harness".to_string(),
+            low_confidence,
+            created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap(),
+            harness_version: Some("a1".to_string()),
+        }
+    }
+
+    #[test]
+    fn newcat_task_category_resolves_canonical_and_aliases() {
+        // canonical task_category values (what the suite actually writes)
+        assert_eq!(newcat_task_category("embedding_retrieval"), Some("embedding_retrieval"));
+        assert_eq!(newcat_task_category("reranking"), Some("reranking"));
+        assert_eq!(newcat_task_category("image_parsing"), Some("image_parsing"));
+        assert_eq!(newcat_task_category("voice_transcription"), Some("voice_transcription"));
+        assert_eq!(newcat_task_category("tts"), Some("tts"));
+        assert_eq!(newcat_task_category("tool_routing"), Some("tool_routing"));
+        // friendly aliases the frontend/spec use
+        assert_eq!(newcat_task_category("vision_qa"), Some("image_parsing"));
+        assert_eq!(newcat_task_category("stt"), Some("voice_transcription"));
+        assert_eq!(newcat_task_category("asr_transcription"), Some("voice_transcription"));
+        // NOT a new category (legacy suites and junk)
+        assert_eq!(newcat_task_category("code"), None);
+        assert_eq!(newcat_task_category("bogus"), None);
+        // Guard against the classic bug: reranking/vision/stt must key off the
+        // stored task_category, NOT the leaf DIMENSION const.
+        assert_ne!(newcat_task_category("reranking"), Some("rerank_relevance"));
+    }
+
+    #[test]
+    fn newcat_epoch_filter_only_constrains_on_an_explicit_single_epoch() {
+        // Current/absent/all must NOT filter (fail-open: Current resolves to the
+        // coder epoch, which would zero out every newcats row).
+        assert_eq!(newcat_epoch_filter(None), None);
+        assert_eq!(newcat_epoch_filter(Some("all")), None);
+        assert_eq!(newcat_epoch_filter(Some("a1")), Some("a1".to_string()));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mint_runs_accepts_a_new_category_suite_and_degrades_to_empty() {
+        clear_db_env();
+        let (status, body) =
+            get_json(test_router(), "/api/terminus/mint/runs?suite=embedding_retrieval").await;
+        assert_eq!(status, StatusCode::OK, "widened allowlist must accept a new category");
+        assert_eq!(body["total"], 0);
+        assert_eq!(body["runs"], json!([]));
+        // an alias resolves too
+        let (status, _b) = get_json(test_router(), "/api/terminus/mint/runs?suite=vision_qa").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mint_runs_still_rejects_a_truly_unknown_suite() {
+        clear_db_env();
+        let (status, body) = get_json(test_router(), "/api/terminus/mint/runs?suite=definitely_not_a_suite").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // the 400 now enumerates the new categories, not just code/context/agent
+        assert!(body["error"].as_str().unwrap_or_default().contains("embedding_retrieval"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn category_endpoints_reject_unknown_category_with_400() {
+        clear_db_env();
+        for view in ["summary", "dimensions", "matrix", "box", "failures"] {
+            let (status, _b) =
+                get_json(test_router(), &format!("/api/terminus/mint/category/nope/{view}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "unknown category must 400 for {view}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn category_endpoints_degrade_to_empty_without_a_db() {
+        clear_db_env();
+        let cases = [
+            ("summary", "models"),
+            ("dimensions", "dimensions"),
+            ("matrix", "cells"),
+            ("box", "groups"),
+            ("failures", "models"),
+        ];
+        for (view, key) in cases {
+            let (status, body) = get_json(
+                test_router(),
+                &format!("/api/terminus/mint/category/embedding_retrieval/{view}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{view} degrades to 200");
+            assert_eq!(body[key], json!([]), "{view}.{key} is empty");
+        }
+    }
+
+    #[test]
+    fn shape_newcat_summary_keeps_only_the_latest_value_per_metric() {
+        // two runs of the same (model, metric); the newer (larger secs) wins.
+        let rows = vec![
+            score_row("m1", "ndcg", 0.70, false, 100),
+            score_row("m1", "ndcg", 0.90, false, 200), // latest
+            score_row("m1", "mrr", 0.50, false, 150),
+        ];
+        let v = shape_newcat_summary(&rows);
+        let models = v["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1);
+        let metrics = models[0]["metrics"].as_array().unwrap();
+        // ndcg + mrr, sorted by metric name
+        assert_eq!(metrics.len(), 2);
+        let ndcg = metrics.iter().find(|m| m["metric"] == "ndcg").unwrap();
+        assert_eq!(ndcg["value"], 0.90, "latest run's value wins");
+    }
+
+    #[test]
+    fn shape_newcat_dimensions_lists_distinct_pairs() {
+        let rows = vec![
+            score_row("m1", "ndcg", 0.7, false, 1),
+            score_row("m2", "ndcg", 0.8, false, 2),
+            score_row("m1", "mrr", 0.5, false, 3),
+        ];
+        let v = shape_newcat_dimensions(&rows);
+        let dims = v["dimensions"].as_array().unwrap();
+        assert_eq!(dims.len(), 2, "two distinct (dimension, metric) pairs");
+    }
+
+    #[test]
+    fn shape_newcat_matrix_means_and_flags_low_confidence() {
+        let rows = vec![
+            score_row("m1", "ndcg", 0.6, false, 1),
+            score_row("m1", "ndcg", 0.8, true, 2), // same cell, low-conf
+        ];
+        let v = shape_newcat_matrix(&rows);
+        let cells = v["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0]["n"], 2);
+        assert_eq!(cells[0]["mean"], 0.7);
+        assert_eq!(cells[0]["low_confidence"], true, "any low-conf row taints the cell");
+    }
+
+    #[test]
+    fn shape_newcat_box_defaults_to_first_metric_and_computes_groups() {
+        let mut rows = vec![
+            score_row("m1", "latency_ms", 10.0, false, 1),
+            score_row("m1", "latency_ms", 20.0, false, 2),
+            score_row("m1", "ndcg", 0.9, false, 3),
+        ];
+        rows.push(score_row("m2", "latency_ms", 30.0, false, 4));
+        // no metric given ⇒ lexicographically-first metric ("latency_ms") chosen
+        let v = shape_newcat_box(&rows, None);
+        assert_eq!(v["metric"], "latency_ms");
+        let groups = v["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "one group per model that has the metric");
+        // an explicit metric is honored
+        let v = shape_newcat_box(&rows, Some("ndcg"));
+        assert_eq!(v["metric"], "ndcg");
+        assert_eq!(v["groups"].as_array().unwrap().len(), 1);
+        // a metric matching nothing fails open to empty groups (not an error)
+        let v = shape_newcat_box(&rows, Some("does_not_exist"));
+        assert_eq!(v["groups"], json!([]));
+    }
+
+    #[test]
+    fn shape_newcat_failures_splits_low_confidence_vs_ok() {
+        let rows = vec![
+            score_row("m1", "ndcg", 0.7, false, 1),
+            score_row("m1", "ndcg", 0.2, true, 2),
+            score_row("m2", "ndcg", 0.9, false, 3),
+        ];
+        let v = shape_newcat_failures(&rows);
+        assert_eq!(v["classes"], json!(["low_confidence", "ok"]));
+        let models = v["models"].as_array().unwrap();
+        let m1 = models.iter().find(|m| m["model"] == "m1").unwrap();
+        assert_eq!(m1["counts"]["low_confidence"], 1);
+        assert_eq!(m1["counts"]["ok"], 1);
+        assert_eq!(m1["total_runs"], 2);
     }
 
     async fn get_json(router: Router, path: &str) -> (StatusCode, Value) {

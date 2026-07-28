@@ -379,6 +379,69 @@ fn profile_for(
     })
 }
 
+/// Map a seed cell DIRECTLY to its baseline [`ServingProfile`] row, WITHOUT any
+/// measurement (no [`Launcher`], no [`VramGate`], no [`Verdict`], no GPU).
+///
+/// The seed cell already carries the STATIC verdict for its `(model × backend)`
+/// cell (`best_runtime`, `exclusion_reason`/`recheck_trigger`, `tok_s` etc.,
+/// `keep_warm`); this applies the same field mapping [`profile_for`] applies to a
+/// live [`Verdict`], but sourced from the cell's declared baseline instead of a
+/// fresh measurement. It is the seed-load path behind the `serving_profile_seed`
+/// Terminus tool, which populates the empty `serving_profile` table from the
+/// embedded baseline so Chord's arch-aware routing activates without a GPU sweep.
+///
+/// `env_json` is built via the SAME [`CellRequest::env_json`] path the measurement
+/// runner records (mmap re-derivation + standard-prompt id), so a seeded row is
+/// byte-compatible in shape with a later measured row — a real measurement sweep
+/// can UPSERT (UPDATE) the same `(model_id, backend_tag)` row in place; the seed
+/// is the INITIAL baseline, never a permanent winner.
+///
+/// Returns `Err(reason)` for a cell whose enum/tag strings don't parse or whose
+/// enum pairing is self-contradictory. The caller SKIPS such a cell and records
+/// the reason — a malformed cell never aborts the whole seed.
+pub fn seed_profile_for(cell: &SeedCell) -> Result<ServingProfile, String> {
+    let backend = ServingBackend::parse(&cell.backend_tag)
+        .ok_or_else(|| format!("unknown backend_tag '{}'", cell.backend_tag))?;
+    let best_runtime = Runtime::parse(&cell.best_runtime)
+        .ok_or_else(|| format!("unknown best_runtime '{}'", cell.best_runtime))?;
+    let exclusion_reason = ExclusionReason::parse(&cell.exclusion_reason)
+        .ok_or_else(|| format!("unknown exclusion_reason '{}'", cell.exclusion_reason))?;
+    let recheck_trigger = RecheckTrigger::parse(&cell.recheck_trigger)
+        .ok_or_else(|| format!("unknown recheck_trigger '{}'", cell.recheck_trigger))?;
+    let fallback_runtime = match cell.fallback_runtime.as_deref() {
+        None => None,
+        Some(s) => {
+            Some(Runtime::parse(s).ok_or_else(|| format!("unknown fallback_runtime '{s}'"))?)
+        }
+    };
+
+    // Reuse the runner's exact env construction so the seeded env_json matches the
+    // shape a measured row would carry. `load_bound_s` is irrelevant here — no
+    // launch happens; it is only carried on the request struct.
+    let req = build_request(cell, 0.0).map_err(|e| format!("build request: {e}"))?;
+    let env_json = req.env_json();
+
+    let profile = ServingProfile {
+        model_id: ModelId::from(cell.model_id.as_str()),
+        backend_tag: backend,
+        best_runtime,
+        env_json,
+        tok_s: cell.tok_s,
+        vram_or_ram_peak_gb: cell.vram_or_ram_peak_gb,
+        cold_load_s: cell.cold_load_s,
+        keep_warm: cell.keep_warm,
+        fallback_runtime,
+        exclusion_reason,
+        recheck_trigger,
+        provenance: cell.provenance.clone(),
+    };
+
+    // Validate the enum pairing up front so a self-contradictory seed cell is a
+    // clean SKIP for the caller rather than a DB CHECK failure mid-batch.
+    profile.validate().map_err(|e| e.to_string())?;
+    Ok(profile)
+}
+
 /// Compare a run verdict against the seed cell and emit a drift entry if they
 /// disagree on the exclusion reason (the routing-relevant axis).
 fn drift_for(cell: &SeedCell, verdict: &Verdict) -> Option<DriftEntry> {
@@ -940,6 +1003,86 @@ mod tests {
                 cell.model_id, cell.backend_tag, cell.cold_load_s, thresh, cell.keep_warm, recomputed
             );
         }
+    }
+
+    #[test]
+    fn seed_profile_for_preserves_verdict_fields() {
+        // gpt-oss:20b carries the routing-critical arch exclusions this seed exists
+        // to activate: EXCLUDED on llama-gpu (permanent-unknown-arch), NONE on
+        // ollama-gpu. Assert the mapping preserves exclusion_reason, backend_tag,
+        // and best_runtime verbatim for both.
+        let cells = load_seed().unwrap();
+
+        let llama = cells
+            .iter()
+            .find(|c| c.model_id == "gpt-oss:20b" && c.backend_tag == "llama-gpu")
+            .expect("gpt-oss:20b llama-gpu seed cell present");
+        let p = seed_profile_for(llama).expect("maps");
+        assert_eq!(p.model_id.as_str(), "gpt-oss:20b");
+        assert_eq!(p.backend_tag, ServingBackend::LlamaGpu);
+        assert_eq!(p.best_runtime, Runtime::LlamaCpp);
+        assert_eq!(p.exclusion_reason, ExclusionReason::PermanentUnknownArch);
+        assert_eq!(p.recheck_trigger, RecheckTrigger::None);
+        // Exclusion row → no measured numbers carried.
+        assert!(p.tok_s.is_none());
+
+        let ollama = cells
+            .iter()
+            .find(|c| c.model_id == "gpt-oss:20b" && c.backend_tag == "ollama-gpu")
+            .expect("gpt-oss:20b ollama-gpu seed cell present");
+        let p = seed_profile_for(ollama).expect("maps");
+        assert_eq!(p.backend_tag, ServingBackend::OllamaGpu);
+        assert_eq!(p.best_runtime, Runtime::Ollama);
+        assert_eq!(p.exclusion_reason, ExclusionReason::None);
+        // Working row → measured tok/s preserved from the seed baseline.
+        assert_eq!(p.tok_s, Some(49.0));
+    }
+
+    #[test]
+    fn seed_profile_for_maps_every_seed_cell_and_keys_are_unique() {
+        // The whole embedded baseline maps without a skip, and the mapping is
+        // idempotent by KEY: no two rows share (model_id, backend_tag), so the
+        // UPSERT on that unique key never duplicates when seeded twice.
+        let cells = load_seed().unwrap();
+        let mut keys = BTreeSet::new();
+        for cell in &cells {
+            let p = seed_profile_for(cell).unwrap_or_else(|e| {
+                panic!(
+                    "seed cell {} {} unmapped: {e}",
+                    cell.model_id, cell.backend_tag
+                )
+            });
+            assert!(
+                keys.insert((
+                    p.model_id.as_str().to_string(),
+                    p.backend_tag.as_str().to_string()
+                )),
+                "duplicate (model_id, backend_tag) key in seed: {} {}",
+                cell.model_id,
+                cell.backend_tag
+            );
+        }
+        assert_eq!(keys.len(), cells.len(), "every seed cell is a distinct key");
+
+        // Idempotency (logic): mapping the same seed twice yields identical row
+        // content — an UPSERT of the second pass overwrites with the same values.
+        let first: Vec<_> = cells.iter().map(|c| seed_profile_for(c).unwrap()).collect();
+        let second: Vec<_> = cells.iter().map(|c| seed_profile_for(c).unwrap()).collect();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn seed_profile_for_skips_malformed_cell_not_fatal() {
+        // A cell with an unknown backend_tag maps to Err (the caller skips it and
+        // records the reason) — it never panics or aborts the batch.
+        let mut bad = load_seed().unwrap()[0].clone();
+        bad.backend_tag = "quantum-gpu".to_string();
+        let err = seed_profile_for(&bad).expect_err("unmappable backend must Err");
+        assert!(
+            err.contains("backend_tag"),
+            "reason names the bad field: {err}"
+        );
+        assert!(err.contains("quantum-gpu"));
     }
 
     /// Helper: the verdict a CLEAN reproduction of a seed cell would produce

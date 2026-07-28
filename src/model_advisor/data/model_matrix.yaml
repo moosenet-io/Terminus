@@ -225,3 +225,119 @@ mistral-small3:
   best_for: [multilingual, tool_use, function_calling, enterprise_tasks]
   avoid_for: [frontier_reasoning]
   ollama_name: mistral-small3
+
+# ── Modality / multimodal backends (CB-03, S125) ──────────────────────────────
+# The offline twin of the Chord runtime selector: one concrete model per non-chat
+# modality, tagged with the shared Chord capability taxonomy in `best_for`
+# (chat/reasoning/code/embed/rerank/vlm/ocr/doc/image_gen/tts/stt/tool_router/
+# diffusion). These are the real backends stood up on the <host> fleet this sprint.
+# Quant keys mirror the existing shape; for backends whose native precision is not
+# GGUF (whisper/piper/docling/sd-turbo) the keys are nominal precision tiers, not
+# llama.cpp quants. These serve on-demand (lazy-start / idle-reap) so their VRAM is
+# not permanently resident alongside the chat fleet.
+
+llava:7b:
+  family: llava
+  params_b: 7
+  active_b: 7
+  architecture: dense
+  quants:
+    Q4_K_M: {vram_gb: 5, quality_penalty: 0}
+    Q8_0:   {vram_gb: 8, quality_penalty: 0}
+    F16:    {vram_gb: 15, quality_penalty: 0}
+  quality: 7
+  speed: fast
+  best_for: [vlm, vision, image_understanding, captioning, multimodal_chat]
+  avoid_for: [ocr_dense_text, frontier_reasoning]
+  ollama_name: llava:7b
+  notes: "Default VLM. Vision route is /v1/chat/completions with an image content part."
+
+bge-reranker-v2-m3:
+  family: bge
+  params_b: 0.6
+  active_b: 0.6
+  architecture: dense
+  quants:
+    Q4_K_M: {vram_gb: 0.8, quality_penalty: 0}
+    Q8_0:   {vram_gb: 1, quality_penalty: 0}
+    F16:    {vram_gb: 1.2, quality_penalty: 0}
+  quality: 8
+  speed: very_fast
+  best_for: [rerank, cross_encoder, retrieval_reranking, rag]
+  avoid_for: [chat, generation, embed]
+  ollama_name: bge-reranker-v2-m3
+  notes: "Default reranker. Cross-encoder scoring via Chord /v1/rerank."
+
+faster-whisper-small:
+  family: whisper
+  params_b: 0.24
+  active_b: 0.24
+  architecture: encoder_decoder
+  quants:
+    INT8: {vram_gb: 0.5, quality_penalty: 1}
+    F16:  {vram_gb: 1, quality_penalty: 0}
+  quality: 7
+  speed: fast
+  best_for: [stt, asr, transcription, voice_transcription]
+  avoid_for: [chat, generation, tts]
+  ollama_name: faster-whisper-small
+  notes: "Default STT (speech-to-text). Audio route is /v1/audio/transcriptions."
+
+piper-lessac-medium:
+  family: piper
+  params_b: 0.02
+  active_b: 0.02
+  architecture: vits
+  quants:
+    F16: {vram_gb: 0.5, quality_penalty: 0}
+  quality: 7
+  speed: very_fast
+  best_for: [tts, speech_synthesis, voice]
+  avoid_for: [chat, generation, stt]
+  ollama_name: piper-lessac-medium
+  notes: "Default TTS voice en_US-lessac-medium. Audio route is /v1/audio/speech. CPU-viable."
+
+docling:
+  family: docling
+  params_b: 0.5
+  active_b: 0.5
+  architecture: pipeline
+  quants:
+    F16: {vram_gb: 1, quality_penalty: 0}
+  quality: 8
+  speed: medium
+  best_for: [doc, ocr, document_parsing, layout_extraction, pdf]
+  avoid_for: [chat, generation, image_gen]
+  ollama_name: docling
+  notes: "Default document-parsing / OCR pipeline. Route is /v1/documents/parse. Largely CPU."
+
+sd-turbo:
+  family: stable_diffusion
+  params_b: 0.9
+  active_b: 0.9
+  architecture: diffusion
+  quants:
+    F16: {vram_gb: 4, quality_penalty: 0}
+    Q8_0: {vram_gb: 3, quality_penalty: 1}
+  quality: 6
+  speed: fast
+  best_for: [image_gen, diffusion, text_to_image]
+  avoid_for: [chat, generation, vlm]
+  ollama_name: sd-turbo
+  notes: "Default text-to-image (single/few-step). Route is /v1/images/generations."
+
+qwen3-embedding:0.6b:
+  family: qwen
+  params_b: 0.6
+  active_b: 0.6
+  architecture: dense
+  quants:
+    Q4_K_M: {vram_gb: 0.6, quality_penalty: 0}
+    Q8_0:   {vram_gb: 1, quality_penalty: 0}
+    F16:    {vram_gb: 1.4, quality_penalty: 0}
+  quality: 7
+  speed: very_fast
+  best_for: [embed, embeddings, retrieval, semantic_search]
+  avoid_for: [chat, generation, rerank]
+  ollama_name: qwen3-embedding:0.6b
+  notes: "Default text-embedding backend @1024 dims. Route is /v1/embeddings."

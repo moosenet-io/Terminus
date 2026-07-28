@@ -22,7 +22,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::error::ToolError;
-use crate::intake::discovery::schema::{CandidateStatus, DiscoveryCandidate, FleetCategory};
+use crate::intake::discovery::schema::{
+    CandidateStatus, DiscoveryCandidate, FleetCategory, Modality,
+};
 use crate::intake::discovery::storage;
 use crate::intake::storage as intake_storage;
 use crate::registry::ToolRegistry;
@@ -36,6 +38,11 @@ use crate::tool::{RustTool, ToolOutput};
 pub struct BrochureQuery {
     pub category: Option<FleetCategory>,
     pub status: Option<CandidateStatus>,
+    /// CB-02: restrict to candidates classified into this profiling modality —
+    /// the axis a fleet sweep filters on to auto-target a suite (see
+    /// [`Modality::suite`]). A candidate with a `NULL`/unclassified modality
+    /// never matches a modality filter.
+    pub modality: Option<Modality>,
     pub min_discovery_score: Option<f64>,
     /// `acquire.rs::Gfx1151Class` value as plain text (`confirmed` |
     /// `experimental` | `unknown`) — see `schema.rs`'s note on why
@@ -85,6 +92,7 @@ pub fn filter_candidates(
         .into_iter()
         .filter(|c| q.category.map_or(true, |cat| c.category == cat))
         .filter(|c| q.status.map_or(true, |st| c.status == st))
+        .filter(|c| q.modality.map_or(true, |m| c.modality == Some(m)))
         .filter(|c| {
             q.gfx1151_class
                 .as_deref()
@@ -107,6 +115,11 @@ fn candidate_json(c: &DiscoveryCandidate) -> Value {
         "hf_repo": c.hf_repo,
         "category": c.category.as_str(),
         "status": c.status.as_str(),
+        // CB-02: the classified profiling modality (null = unclassified) and
+        // the MINT suite a fleet sweep would auto-route it to (null when the
+        // modality has no specialized suite, i.e. plain text_generation).
+        "modality": c.modality.map(|m| m.as_str()),
+        "suite": c.modality.and_then(|m| m.suite()),
         "gfx1151_class": c.gfx1151_class,
         "size_b": c.size_b,
         "vram_footprint_gb": c.vram_footprint_gb,
@@ -195,6 +208,9 @@ fn parse_brochure_args(args: &Value) -> Result<(BrochureQuery, String), ToolErro
     let status = opt_str("status")
         .map(|s| CandidateStatus::from_str(&s))
         .transpose()?;
+    let modality = opt_str("modality")
+        .map(|s| Modality::from_str(&s))
+        .transpose()?;
 
     let format = opt_str("format").unwrap_or_else(|| "json".to_string());
     if format != "json" && format != "markdown" {
@@ -206,15 +222,14 @@ fn parse_brochure_args(args: &Value) -> Result<(BrochureQuery, String), ToolErro
     let min_discovery_score = match args.get("min_discovery_score") {
         None | Some(Value::Null) => None,
         Some(v) => Some(v.as_f64().ok_or_else(|| {
-            ToolError::InvalidArgument(format!(
-                "'min_discovery_score' must be a number, got {v}"
-            ))
+            ToolError::InvalidArgument(format!("'min_discovery_score' must be a number, got {v}"))
         })?),
     };
 
     let query = BrochureQuery {
         category,
         status,
+        modality,
         min_discovery_score,
         gfx1151_class: opt_str("gfx1151_class"),
         model: opt_str("model"),
@@ -262,7 +277,10 @@ impl RustTool for ModelDiscoveryBrochure {
          'model_fleet_catalog' to see test coverage/scores for a model already in the fleet. \
          All filters optional: 'category' (tool_router|writer_slm|assistant|coder|embedding| \
          visual|voice), 'status' (discovered|fetching|cold_stored|marked_for_fleet|swept| \
-         evicted|rejected), 'min_discovery_score' (numeric threshold), 'gfx1151_class' \
+         evicted|rejected), 'modality' (embedding|rerank|vlm|tool_routing|document_parsing| \
+         image_gen|stt|tts|text_generation — the finer profiling axis; each candidate also \
+         carries the MINT 'suite' its modality auto-routes to), 'min_discovery_score' \
+         (numeric threshold), 'gfx1151_class' \
          (confirmed|experimental|unknown), 'model' (exact model_name match — unknown value \
          returns empty with a note, never an error). 'format' is 'json' (default, structured) \
          or 'markdown' (a compact table: model | category | status | gfx1151_class | vram_gb | \
@@ -283,6 +301,11 @@ impl RustTool for ModelDiscoveryBrochure {
                     "type": "string",
                     "enum": ["discovered", "fetching", "cold_stored", "marked_for_fleet", "swept", "evicted", "rejected"],
                     "description": "Restrict to candidates with this lifecycle status."
+                },
+                "modality": {
+                    "type": "string",
+                    "enum": ["embedding", "rerank", "vlm", "tool_routing", "document_parsing", "image_gen", "stt", "tts", "text_generation"],
+                    "description": "Restrict to candidates classified into this profiling modality (CB-02). Each candidate's JSON also carries the MINT 'suite' this modality auto-routes to. Candidates with an unclassified (null) modality never match."
                 },
                 "min_discovery_score": {
                     "type": "number",
@@ -345,6 +368,7 @@ mod tests {
             hf_repo: format!("org/{model_name}"),
             category,
             status,
+            modality: None,
             gfx1151_class: gfx1151_class.to_string(),
             size_b: Some(7.0),
             vram_footprint_gb: Some(4.2),
@@ -357,6 +381,13 @@ mod tests {
             evicted_at: None,
             retained_profile: None,
             rationale: None,
+            published_at: None,
+            updated_at: None,
+            license: None,
+            arch: None,
+            is_instruct: None,
+            gated: None,
+            quant_dtype: None,
         }
     }
 
@@ -422,6 +453,43 @@ mod tests {
     }
 
     #[test]
+    fn modality_filter_returns_only_that_modality_and_ignores_unclassified() {
+        let mut cs = fixture();
+        cs[0].modality = Some(Modality::Vlm); // alpha
+        cs[1].modality = Some(Modality::Embedding); // beta
+                                                    // gamma keeps modality = None (unclassified) — must never match.
+        let q = BrochureQuery {
+            modality: Some(Modality::Vlm),
+            ..Default::default()
+        };
+        let (out, note) = filter_candidates(&cs, &q);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].model_name, "alpha");
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn candidate_json_carries_modality_and_its_suite() {
+        let mut c = candidate(
+            "vlm-model",
+            FleetCategory::Visual,
+            CandidateStatus::Discovered,
+            "confirmed",
+            Some(0.5),
+        );
+        c.modality = Some(Modality::Vlm);
+        let v = candidate_json(&c);
+        assert_eq!(v["modality"], "vlm");
+        assert_eq!(v["suite"], "vision_qa");
+
+        // An unclassified candidate serializes both as null, never an error.
+        c.modality = None;
+        let v = candidate_json(&c);
+        assert!(v["modality"].is_null());
+        assert!(v["suite"].is_null());
+    }
+
+    #[test]
     fn combined_category_and_status_filters_are_anded() {
         let q = BrochureQuery {
             category: Some(FleetCategory::Coder),
@@ -472,7 +540,9 @@ mod tests {
     #[test]
     fn evicted_candidate_appears_by_default_unfiltered() {
         let (out, _note) = filter_candidates(&fixture(), &BrochureQuery::default());
-        assert!(out.iter().any(|c| c.model_name == "gamma" && c.status == CandidateStatus::Evicted));
+        assert!(out
+            .iter()
+            .any(|c| c.model_name == "gamma" && c.status == CandidateStatus::Evicted));
     }
 
     #[test]
@@ -518,6 +588,7 @@ mod tests {
         let (q, format) = parse_brochure_args(&json!({
             "category": "coder",
             "status": "discovered",
+            "modality": "vlm",
             "min_discovery_score": 0.5,
             "gfx1151_class": "confirmed",
             "model": "alpha",
@@ -527,6 +598,7 @@ mod tests {
         assert_eq!(format, "markdown");
         assert_eq!(q.category, Some(FleetCategory::Coder));
         assert_eq!(q.status, Some(CandidateStatus::Discovered));
+        assert_eq!(q.modality, Some(Modality::Vlm));
         assert_eq!(q.min_discovery_score, Some(0.5));
         assert_eq!(q.gfx1151_class.as_deref(), Some("confirmed"));
         assert_eq!(q.model.as_deref(), Some("alpha"));
@@ -541,6 +613,12 @@ mod tests {
     #[test]
     fn parse_args_rejects_invalid_status_with_invalid_argument() {
         let err = parse_brochure_args(&json!({"status": "not_a_status"})).unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn parse_args_rejects_invalid_modality_with_invalid_argument() {
+        let err = parse_brochure_args(&json!({"modality": "not_a_modality"})).unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 

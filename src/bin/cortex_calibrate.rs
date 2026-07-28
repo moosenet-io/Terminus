@@ -521,21 +521,36 @@ mod tests {
 
     #[test]
     fn no_direct_http_client() {
-        // Structural check that this file never imports/uses reqwest (or any
-        // other HTTP client) directly -- every network call must go through
-        // the forge dispatch path (`ForgeProvider::dispatch`), never a raw
-        // client built in this binary (S9). Scans this file's OWN source so
-        // the assertion survives future edits without relying on a reviewer
-        // remembering to check by hand.
+        // Structural check that this file's PRODUCTION code never
+        // imports/uses reqwest (or any other HTTP client) directly -- every
+        // network call must go through the forge dispatch path
+        // (`ForgeProvider::dispatch`), never a raw client built in this
+        // binary (S9). Scans this file's OWN source so the assertion
+        // survives future edits without relying on a reviewer remembering to
+        // check by hand.
         let src = include_str!("cortex_calibrate.rs");
-        // Skip this doc-comment/test's own mentions of "reqwest" by only
-        // scanning code outside of `///`/`//!` doc comments and this test's
-        // own string literal — simplest robust approach: check for the
-        // actual import/usage tokens rather than the bare substring "reqwest",
-        // which only ever appears in this file inside comments/doc text.
-        assert!(!src.contains("use reqwest"), "must not import reqwest directly");
-        assert!(!src.contains("reqwest::Client"), "must not construct a reqwest client directly");
-        assert!(!src.contains("hyper::Client"), "must not construct a hyper client directly");
+        // Scan only the code ABOVE this `#[cfg(test)] mod tests` block: the
+        // whole point is to check production code, and `include_str!` pulls
+        // in this test module's own source too. Previously the scan covered
+        // the FULL file, and the needle string "use reqwest" appeared
+        // literally in this very assert!()'s message on the next line, so
+        // `src.contains("use reqwest")` was unconditionally true -- a
+        // self-referential quine bug that made this test permanently red
+        // regardless of the production code. Slicing to production-only
+        // fixes that without weakening the check: everything this guard
+        // (S9's "no raw client in this binary") cares about lives above the
+        // test module, and the needles below are built from parts so they
+        // never appear contiguously in this file's own source either.
+        let test_mod_start = src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("expected this file to have a #[cfg(test)] mod tests block");
+        let production = &src[..test_mod_start];
+        let use_reqwest = format!("{}{}", "use ", "reqwest");
+        let reqwest_client = format!("{}::{}", "reqwest", "Client");
+        let hyper_client = format!("{}::{}", "hyper", "Client");
+        assert!(!production.contains(&use_reqwest), "must not import reqwest directly");
+        assert!(!production.contains(&reqwest_client), "must not construct a reqwest client directly");
+        assert!(!production.contains(&hyper_client), "must not construct a hyper client directly");
     }
 
     // ── revert/hotfix detection re-export sanity (calibrate module owns the

@@ -1,15 +1,25 @@
 // LGUI-09: the viz kit's radar chart-form wrapper (§4.2's "all-pairs" family — radar/boxplot/
 // heatmap/parallel-coordinates/swarmplot/scatterplot). CONST-17 shipped only the nivo
 // foundation for these, deferring the actual wrapper components to "the routes that use them"
-// (README, "The viz kit" section) — this item is the first radar consumer (§3.4/§8's trait
-// radar), and no radar wrapper existed on `main` yet at build time, so this adds one per the
-// kit's own conventions: panels never touch `recharts`/`@nivo/*` directly, only `src/viz/*`.
+// (README, "The viz kit" section) — this item is the first Recharts-based radar consumer
+// (§3.4/§8's trait radar), and no radar wrapper existed on `main` yet at build time, so this
+// adds one per the kit's own conventions: panels never touch `recharts`/`@nivo/*` directly,
+// only `src/viz/*`.
 //
 // Scope: ONE primary series + ONE de-emphasis reference series (§8: "trait radar = slot 1 vs
 // de-emphasis overlay") — not a general N-series radar. A future item building a genuinely
 // multi-series radar (e.g. MINT's 8-dimension capability radar, CONST-22/23) should extend
 // this file's props rather than duplicating it, but should keep the all-pairs 4-axis cap
 // (`ALL_PAIRS_CEILING`, `src/viz/palette.ts`) in mind if it grows past 4 axes.
+//
+// RECONCILIATION NOTE (LGUI-06/CONST-22/23/24 reconciliation): this file also independently
+// grew a SECOND, differently-named radar (`RadarChart`, CGUI-09/TERM #532) for the Models
+// module's per-model detail view — a lazy-loaded `@nivo/radar` wrapper, code-split so the
+// shell/roster never pay for the chunk. `RadarChartKit` (this item, Recharts, single+
+// de-emphasis series, used by PersonaPanel) and `RadarChart` (nivo, N-axis, lazy, used by
+// ModelDetailView) are DIFFERENT components with DIFFERENT exported names and DIFFERENT
+// consumers — there is no actual naming collision, so both coexist in this one viz-kit file
+// rather than one replacing the other.
 import {
   RechartsRadarChart,
   PolarGrid,
@@ -21,6 +31,9 @@ import {
 } from './recharts';
 import { CATEGORICAL_HEX, CHART_CHROME } from './palette';
 import { rechartsTickStyle, rechartsTooltipStyle } from './theme';
+import { Suspense, lazy } from 'react';
+import { ChartSkeleton } from './ChartSkeleton';
+import type { RadarAxis } from '../panels/models/modelsData';
 
 export interface RadarAxisPoint {
   /** Axis label, e.g. a trait name ("flair"). Rendered verbatim as the angle-axis tick — the
@@ -85,5 +98,26 @@ export function RadarChartKit({ data, max, height, primaryLabel, deemphasisLabel
         <Tooltip contentStyle={rechartsTooltipStyle()} />
       </RechartsRadarChart>
     </ResponsiveContainer>
+  );
+}
+
+// CGUI-09 (TERM #532): lazy boundary for the nivo radar. `RadarChartImpl` (and through it
+// `@nivo/radar` + `@nivo/core`) is code-split into the reserved `viz` chunk and only fetched
+// when a per-model detail actually renders a radar — the shell/roster never pay for it.
+// A ChartSkeleton fills the frame while the chunk loads, so the fixed-height ChartCard body
+// never collapses.
+const RadarChartImpl = lazy(() => import('./RadarChartImpl'));
+
+export interface RadarChartProps {
+  axes: RadarAxis[];
+  /** matches the enclosing ChartCard body height so the skeleton is the same size. */
+  height: number;
+}
+
+export function RadarChart({ axes, height }: RadarChartProps) {
+  return (
+    <Suspense fallback={<ChartSkeleton height={height} />}>
+      <RadarChartImpl axes={axes} />
+    </Suspense>
   );
 }

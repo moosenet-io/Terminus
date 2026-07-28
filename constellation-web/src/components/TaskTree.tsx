@@ -2,6 +2,7 @@
 // Replaces the old absolute-positioned grid layout.
 import { useMemo, useRef, useEffect, useState } from 'react';
 import type { TreeStage } from '../types/tree';
+import { useReducedMotion } from '../hooks/useReducedMotion';
 
 // ─── Types (re-exported — Dashboard.tsx imports TaskItem + TaskStatus) ────────
 
@@ -78,6 +79,9 @@ function completionRatio(children: TaskItem[]): number {
 function FruitNode({ item, x, y }: { item: TaskItem; x: number; y: number }) {
   const prevStatus = useRef<TaskStatus>(item.status);
   const [popScale, setPopScale] = useState(1);
+  // SMIL <animate> loops (the active/held halo pulses below) are not reachable by the CSS
+  // reduced-motion rule — withhold them in render when reduced motion is requested (CGUI-13).
+  const reduced = useReducedMotion();
 
   useEffect(() => {
     if (prevStatus.current === item.status) return;
@@ -122,24 +126,30 @@ function FruitNode({ item, x, y }: { item: TaskItem; x: number; y: number }) {
     <g transform={`translate(${x},${y}) scale(${popScale})`} style={{ cursor: 'default' }}>
       <title>{tooltip}</title>
 
-      {/* Pulse halo for active nodes */}
+      {/* Pulse halo for active nodes — SMIL loop withheld under reduced motion (static halo kept). */}
       {isActive && (
         <circle r={r + 5} fill={C.active} fillOpacity={0.3}>
-          <animate attributeName="r"
-            values={`${r + 4};${r + 10};${r + 4}`}
-            dur="2s" repeatCount="indefinite" />
-          <animate attributeName="fill-opacity"
-            values="0.28;0;0.28"
-            dur="2s" repeatCount="indefinite" />
+          {!reduced && (
+            <>
+              <animate attributeName="r"
+                values={`${r + 4};${r + 10};${r + 4}`}
+                dur="2s" repeatCount="indefinite" />
+              <animate attributeName="fill-opacity"
+                values="0.28;0;0.28"
+                dur="2s" repeatCount="indefinite" />
+            </>
+          )}
         </circle>
       )}
 
-      {/* Amber halo for held nodes */}
+      {/* Amber halo for held nodes — SMIL loop withheld under reduced motion. */}
       {isHeld && !isActive && (
         <circle r={r + 4} fill={C.held} fillOpacity={0.2}>
-          <animate attributeName="fill-opacity"
-            values="0.2;0.05;0.2"
-            dur="2.5s" repeatCount="indefinite" />
+          {!reduced && (
+            <animate attributeName="fill-opacity"
+              values="0.2;0.05;0.2"
+              dur="2.5s" repeatCount="indefinite" />
+          )}
         </circle>
       )}
 

@@ -352,8 +352,38 @@ pub fn local_cache_dir(dataset_root: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     const DATASET: &str = "/data/build";
+
+    /// RAII guard that removes `SCCACHE_BIN` for the duration of a test and
+    /// restores whatever value (if any) was ambient beforehand on drop.
+    /// `SccacheEnv::binary()` (used unconditionally by `from_secret*`, even
+    /// when the caller passes an explicit `secret_url`) reads this var, so
+    /// any test asserting `RUSTC_WRAPPER == "sccache"` is silently
+    /// environment-dependent otherwise. This is not hypothetical: the
+    /// compiler test-gate itself runs `cargo test` with `SCCACHE_BIN` set
+    /// (so its OWN build is sccache-wrapped), which broke exactly these
+    /// assertions on clean `main` — reproduced locally by exporting
+    /// `SCCACHE_BIN=/opt/some/sccache-path` before `cargo test`.
+    struct ScopedNoSccacheBin(Option<String>);
+
+    impl ScopedNoSccacheBin {
+        fn new() -> Self {
+            let prior = std::env::var(SCCACHE_BIN_ENV).ok();
+            std::env::remove_var(SCCACHE_BIN_ENV);
+            Self(prior)
+        }
+    }
+
+    impl Drop for ScopedNoSccacheBin {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var(SCCACHE_BIN_ENV, v),
+                None => std::env::remove_var(SCCACHE_BIN_ENV),
+            }
+        }
+    }
 
     #[test]
     fn parses_full_authd_url() {
@@ -390,9 +420,13 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn split_env_preferred_over_bare_url() {
         // The whole point of BLD-05's sccache wiring: we emit the SPLIT env, not
         // a single SCCACHE_REDIS var (which fell back to local disk in testing).
+        // #[serial] + the guard below isolate SCCACHE_BIN, which
+        // `SccacheEnv::binary()` reads ambiently — see `ScopedNoSccacheBin`.
+        let _no_bin = ScopedNoSccacheBin::new();
         let env = from_secret(Some("redis://default:pw@h:6379/1"), DATASET);
         assert_eq!(env.mode, SccacheMode::Redis);
         assert_eq!(
@@ -420,7 +454,11 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn fails_open_to_local_dir_when_unconfigured() {
+        // #[serial] + the guard below isolate SCCACHE_BIN, which
+        // `SccacheEnv::binary()` reads ambiently — see `ScopedNoSccacheBin`.
+        let _no_bin = ScopedNoSccacheBin::new();
         let env = from_secret(None, DATASET);
         assert_eq!(env.mode, SccacheMode::LocalDir);
         assert_eq!(

@@ -30,8 +30,8 @@ export function BuildControls({ engineState, isEnriching = false, focusedProject
   };
 
   const buildState = isBuilding ? engineState : 'IDLE';
-  const buildColor = isBuilding ? 'var(--h-green)' : 'var(--h-text-dim)';
-  const enrichColor = isEnriching ? 'var(--h-amber)' : 'var(--h-text-dim)';
+  const buildColor = isBuilding ? 'var(--flux-green)' : 'var(--text-200)';
+  const enrichColor = isEnriching ? 'var(--flux-amber)' : 'var(--text-200)';
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '8px 0' }}>
@@ -42,8 +42,8 @@ export function BuildControls({ engineState, isEnriching = false, focusedProject
           onChange={e => setSelectedProject(e.target.value)}
           disabled={busy}
           style={{
-            background: 'var(--h-bg-card)', border: '1px solid var(--h-border)',
-            borderRadius: 5, color: 'var(--h-text)', padding: '5px 10px', fontSize: 13, outline: 'none',
+            background: 'var(--bg-panel)', border: '1px solid var(--border)',
+            borderRadius: 5, color: 'var(--text-100)', padding: '5px 10px', fontSize: 13, outline: 'none',
           }}
         >
           {projects.map(p => <option key={p} value={p}>{p}</option>)}
