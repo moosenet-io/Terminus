@@ -164,6 +164,33 @@ export function ComparePanel() {
     return () => { cancelled = true; };
   }, []);
 
+  // Review fix (codex): the broad limit:500/offset:0 fetch above is a best-effort "rest of
+  // fleet" Pareto background — a roster larger than 500 can leave a COMPARED model (whose
+  // best_pass_rate/vram_gb fallback only exist on the roster row, never on ModelDetailResponse)
+  // silently missing from `rosterByName`, degrading Best-pass-rate/VRAM-fallback to `—` for a
+  // model that's actually correctly identified in the URL. Since there are at most
+  // MAX_COMPARE (4) compared models, a small targeted `q`-filtered lookup per name is cheap and
+  // guarantees correctness regardless of total fleet size — independent of the broad fetch.
+  const [comparedRoster, setComparedRoster] = useState<Record<string, ModelListEntry>>({});
+  useEffect(() => {
+    if (names.length === 0) { setComparedRoster({}); return; }
+    let cancelled = false;
+    Promise.all(names.map(async n => {
+      try {
+        const res = await getAggregationClient().models.list({ scope: 'all', q: n, limit: 10 });
+        return res.models.find(m => m.model_name === n) ?? null;
+      } catch {
+        return null;
+      }
+    })).then(found => {
+      if (cancelled) return;
+      const out: Record<string, ModelListEntry> = {};
+      for (const entry of found) if (entry) out[entry.model_name] = entry;
+      setComparedRoster(out);
+    });
+    return () => { cancelled = true; };
+  }, [names]);
+
   if (names.length < 2) {
     return (
       <div style={{ padding: 'var(--space-6)', textAlign: 'center', color: 'var(--text-muted)' }}>
@@ -177,7 +204,11 @@ export function ComparePanel() {
     return <div style={{ padding: 'var(--space-5)' }}><SkeletonList rows={6} /></div>;
   }
 
+  // Compared models' own roster row is authoritative from the targeted `comparedRoster` lookup
+  // (guaranteed correct regardless of fleet size); the broad `fleetList` fetch only backfills
+  // OTHER (non-compared) models for the Pareto background scatter.
   const rosterByName = new Map((fleetList ?? []).map(m => [m.model_name, m]));
+  for (const [name, entry] of Object.entries(comparedRoster)) rosterByName.set(name, entry);
   const colorFor = (name: string) => slotAssigner.colorFor(name);
   const staticRows = buildStaticRows();
 
@@ -208,7 +239,20 @@ export function ComparePanel() {
         const d = details[n];
         if (row.__dim) {
           const score = mintScoreFor(n, row.__dim);
-          if (!score || score.norm == null) return <span style={{ color: 'var(--text-faint)' }}>—</span>;
+          // Review fix (codex): a null `norm` (no data / n=0) is ALSO `low_confidence` per the
+          // real MintDimensionScore contract — the dash must still carry the mandated ⚠
+          // caveat tooltip, not silently omit it the way a bare "no score object at all" does.
+          if (!score) return <span style={{ color: 'var(--text-faint)' }}>—</span>;
+          if (score.norm == null) {
+            return (
+              <span style={{ color: 'var(--text-faint)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                —
+                {isLowConfidenceScore(score) && (
+                  <span title={mintCaveatTooltip(score)} style={{ color: 'var(--status-warning)' }}>⚠</span>
+                )}
+              </span>
+            );
+          }
           const values = names
             .map(m => mintScoreFor(m, row.__dim as string)?.norm)
             .filter((v): v is number => v != null);
@@ -257,6 +301,22 @@ export function ComparePanel() {
     return row;
   }) ?? null;
 
+  // Review fix (codex): a null `norm` plotted as `0` above visually reads as "measured zero,"
+  // not "no data" — recharts' Radar has no honest way to render a per-vertex gap, so rather
+  // than risk a misleading chart, disclose exactly which (model, dimension) points are actually
+  // missing/low-confidence beneath it — same underlying `isLowConfidenceScore` the table cells
+  // use, so the two surfaces never disagree about what counts as low-confidence.
+  const radarCaveats = (mint?.dimensions ?? []).flatMap(dim =>
+    names
+      .map(n => ({ n, score: mintScoreFor(n, dim) }))
+      .filter(({ score }) => score && isLowConfidenceScore(score))
+      .map(({ n, score }) => ({
+        label: `${n} · ${dim}`,
+        tooltip: score ? mintCaveatTooltip(score) : '',
+        zeroPlotted: score?.norm == null,
+      })),
+  );
+
   const paretoBackground = (fleetList ?? [])
     .filter(m => !names.includes(m.model_name) && m.vram_gb != null && m.best_pass_rate != null)
     .map(m => ({ x: m.vram_gb as number, y: (m.best_pass_rate as number) * 100, name: m.model_name }));
@@ -294,11 +354,25 @@ export function ComparePanel() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: 'var(--space-4)' }}>
         <ChartCard title="MINT profile overlay" subtitle="normalized dimension scores" height={280} empty={!radarData}>
           {radarData && (
-            <CompareRadarChart
-              data={radarData}
-              series={names.slice(0, MAX_COMPARE).map(n => ({ id: n, color: colorFor(n) }))}
-              height={280}
-            />
+            <>
+              <CompareRadarChart
+                data={radarData}
+                series={names.slice(0, MAX_COMPARE).map(n => ({ id: n, color: colorFor(n) }))}
+                height={280}
+              />
+              {radarCaveats.length > 0 && (
+                <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--status-warning)', marginTop: 'var(--space-2)' }}>
+                  ⚠ low-confidence dims (
+                  {radarCaveats.map((c, i) => (
+                    <span key={c.label} title={c.tooltip}>
+                      {i > 0 ? ', ' : ''}
+                      {c.label}{c.zeroPlotted ? ' (no data — plotted as 0)' : ''}
+                    </span>
+                  ))}
+                  )
+                </div>
+              )}
+            </>
           )}
         </ChartCard>
 

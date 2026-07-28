@@ -538,7 +538,10 @@ CONST-22's compare) were reconciled into that single set.
   `client.models.list()`. Clicking a model name/card swaps the panel to `ModelDetailView` inline
   (a master-detail swap within the same route, not a separate `/models/:name` route — there is
   no `models.detail` panel registration; `ModelDetailView` is rendered directly by `RosterPanel`
-  when a row is selected).
+  when a row is selected). Review fix: a leading checkbox per row (table view) / per card (card
+  view) selects up to 4 models for comparison; a "Compare (N)" button appears in the toolbar
+  once ≥1 is selected (enabled at ≥2) and navigates to `models.compare` with the selected names
+  as `?m=` params — Compare was originally reachable only by hand-constructing the URL.
 - **`ModelDetailView`** (`src/panels/models/ModelDetailView.tsx`, no route of its own) —
   per-model detail via `client.models.model(name)`: a per-category pass-rate radar
   (`src/viz/RadarChart.tsx`, lazy-loaded so the roster never pays for the `@nivo/radar` chunk),
@@ -554,7 +557,16 @@ CONST-22's compare) were reconciled into that single set.
   fit a generic up-to-4-model overlay driven by the caller's own per-model colors), and a Pareto
   scatter (VRAM vs. best pass-rate) with the compared models emphasized and the rest of the
   fleet rendered in `--chart-deemphasis`. `low_confidence`/`n<=1` MINT scores always render the
-  ⚠ affordance + a variance tooltip (`src/lib/mintCaveat.ts`) — never silently hidden. Compare
+  ⚠ affordance + a variance tooltip (`src/lib/mintCaveat.ts`) — never silently hidden, INCLUDING
+  a null-`norm` (no-data) score (review fix: the table cell's early-return for a null score
+  used to skip the caveat check entirely). The radar can't honestly plot a missing per-vertex
+  value (it renders as 0, matching a real low score) — a caveat line beneath the chart names
+  every low-confidence/no-data `(model, dimension)` point actually plotted, disclosing rather
+  than hiding the substitution. VRAM/best-pass-rate fallback for the COMPARED models themselves
+  comes from a small targeted `models.list({q:name})` lookup per compared name (review fix: the
+  original single `limit:500/offset:0` "rest of fleet" fetch could silently miss a compared
+  model past the first page on a roster larger than 500 — that broad fetch now backfills only
+  non-compared models for the Pareto background). Compare
   was originally built against a bespoke mock data layer (`hooks/useModels.ts` +
   `types/models.ts`) that never wired to the real backend; it has since been ported onto the
   same real data client the roster/detail use (`getAggregationClient().models.*` /
