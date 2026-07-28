@@ -537,13 +537,59 @@ pattern, in `src/panels/terminus/`:
 All three are registered under the existing `terminus` module in `registerPanels.ts` alongside
 the pre-existing `Config` panel (`terminus.fleet` / `terminus.tools` / `terminus.activity`).
 
+## Lumina Memory browser (LGUI-08)
+
+`lumina.memory` (route `/lumina/memory`, spec §3.3 "Engram browser") — the operator-facing
+browser over the assistant's engram store. **v1 is read-only end to end: no delete/edit
+affordance exists anywhere in `src/panels/lumina/{MemoryPanel,MemoryDrawer}.tsx`.**
+
+- **Own type/data seam, deliberately not sharing LGUI-06/07's files** — `src/types/
+  luminaMemory.ts`, `src/hooks/useLuminaMemory.ts`, `src/panels/lumina/memorySearch.ts` are new
+  files rather than extensions of the unmerged sibling branches' `types/lumina.ts` /
+  `useLumina.ts` (filename-collision avoidance per this item's brief); reconciling the two
+  `EngramStats`-shaped types happens at merge time, not here.
+- **Filter row** (query, `memory_type`, `sensitivity`, `visibility`, admin-only user scope,
+  limit) is **server-side only** — `useLuminaMemory` always re-issues `GET /api/lumina/engram/
+  search?...` on a filter change; it never fetches an unfiltered dump and slices it client-side.
+  The mock adapter's own simulation of that server-side filtering (`mockEngramSearch` in
+  `aggregationClient.ts`) reuses the exact same `applyMemorySearchParams` helper
+  `memorySearch.ts` exports — one filtering implementation, exercised by both the mock route and
+  `memorySearch.test.ts`.
+- **Badges** (§5): `MemoryTypeBadge` — fixed tone map violet=Principle, blue=Semantic,
+  green=Preference, neutral=Episodic (`MEMORY_TYPE_TONE`, `memorySearch.ts`), with a
+  `MemoryTypeLegend` in the panel header so the mapping is always visible, never memorized.
+  `SensitivityBadge` — `Health`/`Finance`/`Personal` (`isAlwaysPrivate`,
+  `types/luminaMemory.ts`) ALWAYS render a 🔒 lock glyph, independent of the record's actual
+  `visibility` value.
+- **Results `DataTable`** → row click opens `MemoryDrawer` with the full `Memory` record
+  (embedding is never present in the type at all — not even as an optional field — so
+  rendering one is a type error, not a runtime slip), provenance (conversation/turn/source),
+  and a `superseded_by` link that re-points the drawer at the replacing record
+  (`supersededChain` in `memorySearch.ts` is cycle-safe for malformed/mock data).
+- **Stats strip**: total, by-type mini bars, DB size (`formatBytes`), embedding coverage %, and
+  store health. A `store_ok: false` (or a `SecurityViolation` on open) renders an error card
+  naming only the offending key's **ENV NAME** (e.g. `ENGRAM_DB_KEY`) — S7 secrets discipline,
+  never a value, never a GUI write path.
+- **Mock fixtures** (`aggregationClient.ts`): 18 seeded `Memory` records covering all 4 types,
+  6 of the 7 sensitivity categories (incl. the always-private set), a superseded chain
+  (`mem-006 → mem-002`), and one deliberately huge-content record (`mem-014`) to exercise
+  `clampPreview`'s 2-line/240-char preview clamp independent of CSS `line-clamp` alone.
+- **`DataTable` gained one additive, opt-in prop** (`onRowClick?: (row: T) => void`,
+  `src/components/DataTable.tsx`) to support the row → Drawer interaction — every existing
+  caller that doesn't pass it renders exactly as before.
+- Empty store → onboarding pointer copy (links to `/lumina/setup` in prose, no route change).
+- Gating follows the `ChatPanel.tsx`/`RoleGate` convention: `PanelDescriptor` has no `minRole`
+  field, so `MemoryPanel` itself checks `useAuthRole()` and renders a read-only placeholder for
+  a viewer session — cosmetic only, same as everywhere else in this app; the server enforces
+  the real 403.
+
 ## Dev / build
 
 ```sh
 npm install
 npm run dev        # vite dev server, :5174, proxies /api and /ws to :3100 by default
 npm run typecheck  # tsc --noEmit
-npm run test       # vitest run — currently: fleetRingBuffer.test.ts (CONST-28)
+npm run test       # vitest run — fleetRingBuffer.test.ts (CONST-28), memorySearch.test.ts (LGUI-08)
 npm run build       # tsc --noEmit && vite build -> dist/
 ```
 
