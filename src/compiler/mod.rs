@@ -1628,48 +1628,124 @@ fn cargo_build_argv(
 /// instead of stopping at the first (needed for the structured pass/fail +
 /// failing-test summary the gate returns).
 ///
-/// Does the resolved package set contain a library target? (TERM #544)
+/// Known non-library cargo target kinds. Anything outside this set *and* the
+/// library set is a shape we do not recognise — see [`TargetLibVerdict`].
+const NON_LIB_KINDS: [&str; 5] = ["bin", "test", "bench", "example", "custom-build"];
+/// Library-ish cargo target kinds — the ones `cargo test --lib` selects.
+const LIB_KINDS: [&str; 6] = ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
+
+/// What a single target's `kind` array tells us.
+#[derive(Debug, PartialEq, Eq)]
+enum TargetLibVerdict {
+    /// Well-formed and library-ish.
+    Lib,
+    /// Well-formed and definitely not a library.
+    NotLib,
+    /// A shape we cannot interpret — empty, non-string, or an unknown kind
+    /// (a future cargo target type could be library-like). Treated as `Lib`
+    /// by the caller, because a wrong "no lib" silently drops library tests.
+    Unknown,
+}
+
+fn classify_target_kind(kind: Option<&Vec<Value>>) -> TargetLibVerdict {
+    let Some(kinds) = kind else {
+        return TargetLibVerdict::Unknown;
+    };
+    if kinds.is_empty() {
+        return TargetLibVerdict::Unknown;
+    }
+    let mut saw_lib = false;
+    for k in kinds {
+        match k.as_str() {
+            Some(k) if LIB_KINDS.contains(&k) => saw_lib = true,
+            Some(k) if NON_LIB_KINDS.contains(&k) => {}
+            // A non-string entry, or a kind neither list knows about.
+            _ => return TargetLibVerdict::Unknown,
+        }
+    }
+    if saw_lib {
+        TargetLibVerdict::Lib
+    } else {
+        TargetLibVerdict::NotLib
+    }
+}
+
+/// Does the package set that `cargo test` will actually SELECT contain a
+/// library target? (TERM #544)
 ///
 /// Pure half of the probe, split out so it is testable without a subprocess.
-/// `metadata_json` is the output of `cargo metadata --no-deps`.
+/// `metadata_json` is the output of `cargo metadata --no-deps`;
+/// `manifest_path` is the manifest the gate will pass to `cargo test`.
 ///
-/// Returns `true` if ANY package exposes a library-ish target. That is the
-/// right predicate for the flag it guards: `cargo test --lib` at a workspace
-/// root succeeds as long as at least one selected package has a lib, and
-/// errors only when none does.
+/// **Selection has to mirror `cargo test`'s, not just read every package.**
+/// `cargo metadata` reports every workspace member, but `cargo test
+/// --manifest-path X` with no `-p`/`--workspace` selects only the workspace's
+/// *default members*. A review caught the naive any-package version here: a
+/// library in an unselected sibling member would answer `true`, `--lib` would
+/// be passed, and cargo would then fail on the binary-only package it actually
+/// selected — reintroducing the very bug this function exists to prevent. So
+/// selection is taken from `workspace_default_members` when cargo reports it
+/// (cargo ≥ 1.71; the fleet pins 1.97), falling back to the package whose
+/// `manifest_path` matches, and only then to "all packages".
 ///
-/// A malformed or unparseable payload answers `true` — the safe direction,
+/// Anything unparseable or unrecognised answers `true` — the safe direction,
 /// since a wrong `false` silently drops library tests.
-fn metadata_reports_lib_target(metadata_json: &str) -> bool {
-    // `lib` is the common case; the rest are the other library crate-types
-    // cargo can emit, all of which `--lib` legitimately selects.
-    const LIB_KINDS: [&str; 6] = ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
-
+fn metadata_reports_lib_target(metadata_json: &str, manifest_path: &std::path::Path) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(metadata_json) else {
         return true;
     };
     let Some(packages) = v.get("packages").and_then(Value::as_array) else {
         return true;
     };
-    // Note the `None => true` arms: a package with no `targets`, or a target
-    // with no `kind`, is a shape cargo should never emit — so it means we are
-    // reading something we do not understand, and the safe answer to "does a
-    // lib exist?" is yes. (A caught-by-its-own-test detail: an earlier version
-    // used `is_some_and`, which collapses those to `false` and would have
-    // dropped `--lib` on a payload it merely failed to recognise.)
-    //
-    // An EMPTY `targets: []` is different and correctly yields `false` — that
-    // is a well-formed statement that the package has no targets at all.
-    packages.iter().any(|p| match p.get("targets").and_then(Value::as_array) {
+
+    // Mirror cargo's own package selection.
+    let selected: Vec<&Value> = {
+        let by_default_members = v
+            .get("workspace_default_members")
+            .and_then(Value::as_array)
+            .filter(|ids| !ids.is_empty())
+            .map(|ids| {
+                let want: std::collections::HashSet<&str> =
+                    ids.iter().filter_map(Value::as_str).collect();
+                packages
+                    .iter()
+                    .filter(|p| {
+                        p.get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| want.contains(id))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v: &Vec<&Value>| !v.is_empty());
+
+        by_default_members
+            .or_else(|| {
+                // Older cargo: fall back to the package this manifest defines.
+                let hit: Vec<&Value> = packages
+                    .iter()
+                    .filter(|p| {
+                        p.get("manifest_path")
+                            .and_then(Value::as_str)
+                            .is_some_and(|mp| std::path::Path::new(mp) == manifest_path)
+                    })
+                    .collect();
+                (!hit.is_empty()).then_some(hit)
+            })
+            // Last resort: everything cargo returned.
+            .unwrap_or_else(|| packages.iter().collect())
+    };
+
+    selected.iter().any(|p| match p.get("targets").and_then(Value::as_array) {
+        // A package with no `targets` is a shape cargo should never emit, so
+        // we are reading something we do not understand: answer safely.
         None => true,
+        // An EMPTY `targets: []` is different — a well-formed statement that
+        // there are no targets, so it correctly contributes `false`. Without
+        // that distinction nothing would ever be detected as binary-only and
+        // the original bug would quietly return.
         Some(targets) => targets
             .iter()
-            .any(|t| match t.get("kind").and_then(Value::as_array) {
-                None => true,
-                Some(kinds) => kinds
-                    .iter()
-                    .any(|k| k.as_str().is_some_and(|k| LIB_KINDS.contains(&k))),
-            }),
+            .any(|t| classify_target_kind(t.get("kind").and_then(Value::as_array)) != TargetLibVerdict::NotLib),
     })
 }
 
@@ -1708,7 +1784,18 @@ fn crate_has_lib_target(source_dir: &std::path::Path) -> bool {
 
     match out {
         Ok(o) if o.status.success() => {
-            metadata_reports_lib_target(&String::from_utf8_lossy(&o.stdout))
+            // Not `from_utf8_lossy`: replacement chars could turn unreadable
+            // output into something that parses to a confident wrong answer.
+            match std::str::from_utf8(&o.stdout) {
+                Ok(text) => metadata_reports_lib_target(text, &manifest),
+                Err(_) => {
+                    tracing::warn!(
+                        "compiler: `cargo metadata` emitted non-UTF8 output while probing \
+                         for a lib target; assuming one exists (keeps --lib)"
+                    );
+                    true
+                }
+            }
         }
         Ok(o) => {
             tracing::warn!(
@@ -5115,86 +5202,132 @@ mod tests {
 
     /// Minimal `cargo metadata --no-deps` payloads. Only the fields the probe
     /// reads are present — that is the whole contract with cargo here.
-    fn metadata_with(targets: &str) -> String {
-        format!(r#"{{"packages":[{{"name":"m","targets":[{targets}]}}],"version":1}}"#)
+    fn md(packages: &str) -> String {
+        format!(r#"{{"packages":[{packages}],"version":1}}"#)
+    }
+    fn pkg(id: &str, targets: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","name":"{id}","manifest_path":"/s/{id}/Cargo.toml","targets":[{targets}]}}"#
+        )
+    }
+    fn probe(json: &str) -> bool {
+        metadata_reports_lib_target(json, std::path::Path::new("/s/Cargo.toml"))
     }
 
     #[test]
     fn metadata_probe_says_no_lib_for_a_bin_only_package() {
-        let json = metadata_with(r#"{"name":"muse","kind":["bin"]}"#);
-        assert!(!metadata_reports_lib_target(&json));
+        assert!(!probe(&md(&pkg("muse", r#"{"name":"muse","kind":["bin"]}"#))));
     }
 
     #[test]
     fn metadata_probe_sees_every_library_crate_type() {
-        // These are the shapes a lexical manifest scan kept getting wrong —
-        // a custom-path lib, a quoted ["lib"] key, autolib=false — all of which
-        // cargo resolves for us, so the probe only has to read the answer.
         for kind in ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"] {
-            let json = metadata_with(&format!(r#"{{"name":"m","kind":["{kind}"]}}"#));
-            assert!(
-                metadata_reports_lib_target(&json),
-                "kind {kind} must count as a library target"
-            );
+            let json = md(&pkg("m", &format!(r#"{{"name":"m","kind":["{kind}"]}}"#)));
+            assert!(probe(&json), "kind {kind} must count as a library target");
         }
     }
 
     #[test]
     fn metadata_probe_sees_a_lib_alongside_bins_and_tests() {
-        let json = metadata_with(
+        let json = md(&pkg(
+            "m",
             r#"{"name":"m","kind":["bin"]},{"name":"m","kind":["lib"]},{"name":"it","kind":["test"]}"#,
-        );
-        assert!(metadata_reports_lib_target(&json));
+        ));
+        assert!(probe(&json));
     }
 
     #[test]
-    fn metadata_probe_sees_a_lib_in_any_workspace_member() {
-        // `cargo test --lib` at a workspace root succeeds when at least one
-        // selected package has a lib, so "any package" is the right predicate.
-        let json = r#"{"packages":[
-            {"name":"app","targets":[{"name":"app","kind":["bin"]}]},
-            {"name":"core","targets":[{"name":"core","kind":["lib"]}]}
-        ],"version":1}"#;
-        assert!(metadata_reports_lib_target(json));
+    fn metadata_probe_ignores_a_lib_in_an_unselected_workspace_member() {
+        // The round-3 finding. `cargo metadata` lists every member, but
+        // `cargo test` with no -p/--workspace selects only the default
+        // members. Counting an unselected sibling's lib would pass --lib and
+        // then fail on the binary-only package actually selected — the exact
+        // bug this function exists to prevent.
+        let json = format!(
+            r#"{{"packages":[{},{}],"workspace_default_members":["app"],"version":1}}"#,
+            pkg("app", r#"{"name":"app","kind":["bin"]}"#),
+            pkg("core", r#"{"name":"core","kind":["lib"]}"#),
+        );
+        assert!(
+            !probe(&json),
+            "a lib in an UNSELECTED member must not keep --lib"
+        );
+    }
+
+    #[test]
+    fn metadata_probe_sees_a_lib_in_a_selected_workspace_member() {
+        let json = format!(
+            r#"{{"packages":[{},{}],"workspace_default_members":["core"],"version":1}}"#,
+            pkg("app", r#"{"name":"app","kind":["bin"]}"#),
+            pkg("core", r#"{"name":"core","kind":["lib"]}"#),
+        );
+        assert!(probe(&json));
+    }
+
+    #[test]
+    fn metadata_probe_falls_back_to_the_matching_manifest_when_defaults_are_absent() {
+        // Older cargo emits no workspace_default_members; select by manifest.
+        let json = format!(
+            r#"{{"packages":[{},{}],"version":1}}"#,
+            r#"{"id":"app","name":"app","manifest_path":"/s/Cargo.toml","targets":[{"name":"app","kind":["bin"]}]}"#,
+            pkg("core", r#"{"name":"core","kind":["lib"]}"#),
+        );
+        assert!(!probe(&json), "must select the package at the probed manifest");
     }
 
     #[test]
     fn metadata_probe_says_no_lib_for_a_well_formed_empty_target_list() {
-        // Distinct from the malformed cases above: an empty `targets` array is
-        // a well-formed statement that there are no targets, so it must NOT be
-        // treated as uncertain — otherwise nothing would ever be detected as
-        // binary-only and the original bug would return.
-        assert!(!metadata_reports_lib_target(
-            r#"{"packages":[{"name":"m","targets":[]}],"version":1}"#
-        ));
+        // Distinct from the malformed cases: an empty `targets` array is a
+        // well-formed statement that there are no targets. Treating it as
+        // uncertain would mean nothing is ever detected as binary-only, which
+        // would quietly restore the original bug.
+        assert!(!probe(&md(&pkg("m", ""))));
     }
 
     #[test]
-    fn metadata_probe_says_no_lib_when_no_workspace_member_has_one() {
-        let json = r#"{"packages":[
-            {"name":"app","targets":[{"name":"app","kind":["bin"]}]},
-            {"name":"tool","targets":[{"name":"tool","kind":["bin"]}]}
-        ],"version":1}"#;
-        assert!(!metadata_reports_lib_target(json));
+    fn metadata_probe_fails_safe_on_any_kind_shape_it_cannot_interpret() {
+        // Round-3 finding: an empty/non-string/unknown kind is NOT a
+        // well-formed "no library" answer, and a future cargo target kind
+        // could be library-like. All must keep --lib.
+        for target in [
+            r#"{"name":"t","kind":[]}"#,
+            r#"{"name":"t","kind":["unknown-future-kind"]}"#,
+            r#"{"name":"t","kind":[null]}"#,
+            r#"{"name":"t","kind":["bin",123]}"#,
+            r#"{"name":"t"}"#,
+        ] {
+            assert!(
+                probe(&md(&pkg("m", target))),
+                "must fail safe (true) for target: {target}"
+            );
+        }
     }
 
     #[test]
     fn metadata_probe_fails_safe_on_anything_it_cannot_read() {
-        // A wrong `false` silently drops library tests, so every uncertain
-        // input must answer `true`.
         for json in [
             "not json at all",
             "",
-            r#"{"version":1}"#,                                  // no packages key
+            r#"{"version":1}"#,
             r#"{"packages":"unexpected shape"}"#,
-            r#"{"packages":[{"name":"m"}]}"#,                    // package with no targets
-            r#"{"packages":[{"name":"m","targets":[{"name":"t"}]}]}"#, // target with no kind
+            r#"{"packages":[{"name":"m"}]}"#,
         ] {
-            assert!(
-                metadata_reports_lib_target(json),
-                "must fail safe (true) for: {json:?}"
-            );
+            assert!(probe(json), "must fail safe (true) for: {json:?}");
         }
+    }
+
+    #[test]
+    fn classify_target_kind_is_exhaustive_about_what_it_knows() {
+        use TargetLibVerdict::*;
+        let arr = |v: serde_json::Value| v.as_array().cloned().unwrap();
+        assert_eq!(classify_target_kind(Some(&arr(json!(["lib"])))), Lib);
+        assert_eq!(classify_target_kind(Some(&arr(json!(["bin"])))), NotLib);
+        assert_eq!(classify_target_kind(Some(&arr(json!(["bin", "test"])))), NotLib);
+        assert_eq!(classify_target_kind(Some(&arr(json!(["bin", "lib"])))), Lib);
+        assert_eq!(classify_target_kind(Some(&arr(json!([])))), Unknown);
+        assert_eq!(classify_target_kind(Some(&arr(json!(["mystery"])))), Unknown);
+        assert_eq!(classify_target_kind(Some(&arr(json!([7])))), Unknown);
+        assert_eq!(classify_target_kind(None), Unknown);
     }
 
     #[test]
