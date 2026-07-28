@@ -1753,14 +1753,25 @@ fn metadata_reports_lib_target(metadata_json: &str, manifest_path: &std::path::P
         // `--lib`.
         .unwrap_or_else(|| packages.iter().collect());
 
+    // Empty selection = we did not recognise the metadata (cargo always
+    // reports at least one package for a buildable tree, and default-members
+    // that match nothing is a shape we do not understand). Fail safe rather
+    // than letting `.any()` on an empty set answer a confident "no lib".
+    if selected.is_empty() {
+        return true;
+    }
+
     selected.iter().any(|p| match p.get("targets").and_then(Value::as_array) {
         // A package with no `targets` is a shape cargo should never emit, so
         // we are reading something we do not understand: answer safely.
         None => true,
-        // An EMPTY `targets: []` is different — a well-formed statement that
-        // there are no targets, so it correctly contributes `false`. Without
-        // that distinction nothing would ever be detected as binary-only and
-        // the original bug would quietly return.
+        // An EMPTY `targets: []` is likewise not a well-formed "no library"
+        // answer — real cargo always reports at least one target for a
+        // package — so it fails safe too. This does NOT weaken detection: a
+        // genuinely binary-only package reports `targets:[{kind:["bin"]}]`,
+        // which is non-empty and classifies NotLib, so `--lib` is still
+        // correctly dropped for the case this whole function exists to fix.
+        Some(targets) if targets.is_empty() => true,
         Some(targets) => targets
             .iter()
             .any(|t| classify_target_kind(t.get("kind").and_then(Value::as_array)) != TargetLibVerdict::NotLib),
@@ -5343,12 +5354,26 @@ mod tests {
     }
 
     #[test]
-    fn metadata_probe_says_no_lib_for_a_well_formed_empty_target_list() {
-        // Distinct from the malformed cases: an empty `targets` array is a
-        // well-formed statement that there are no targets. Treating it as
-        // uncertain would mean nothing is ever detected as binary-only, which
-        // would quietly restore the original bug.
-        assert!(!probe(&md(&pkg("m", ""))));
+    fn metadata_probe_fails_safe_on_an_empty_target_list_and_empty_selection() {
+        // Neither is a well-formed "no library" answer: real cargo always
+        // reports at least one package, and at least one target per package.
+        assert!(probe(&md(&pkg("m", ""))), "empty targets must fail safe");
+        assert!(probe(r#"{"packages":[],"version":1}"#), "empty packages must fail safe");
+        assert!(
+            probe(&format!(
+                r#"{{"packages":[{}],"workspace_default_members":["nonexistent"],"version":1}}"#,
+                pkg("m", r#"{"name":"m","kind":["bin"]}"#)
+            )),
+            "default-members matching no package must fail safe"
+        );
+    }
+
+    #[test]
+    fn failing_safe_on_empty_shapes_does_not_weaken_real_detection() {
+        // The guard against over-correcting: a genuinely binary-only package
+        // still reports a non-empty bin target, so --lib is still dropped for
+        // the case this function exists to fix.
+        assert!(!probe(&md(&pkg("muse", r#"{"name":"muse","kind":["bin"]}"#))));
     }
 
     #[test]
