@@ -216,6 +216,16 @@ pub struct DiscoverySelectConfig {
     /// Whether a candidate with NO license (unknown/absent) is allowed. Default
     /// `true` (lenient). Env: `INTAKE_ASSISTANT_DISCOVERY_ALLOW_UNKNOWN_LICENSE`.
     pub allow_unknown_license: bool,
+    /// Whether to REQUIRE a confirmed pre-built GGUF (S127b). Default `true` —
+    /// serveability is a HARD requirement for the live loop: the fleet serves
+    /// GGUF via ollama/llama.cpp and the ingest path (`ollama pull hf.co/<repo>`)
+    /// only accepts GGUF repos, so a non-GGUF model is neither ingestable nor
+    /// serveable. When `true`, a candidate is dropped unless `has_gguf ==
+    /// Some(true)` (an unmeasured `None` is fail-closed OUT — its serveability is
+    /// unknown, so it is not selected). The escape hatch (`false`, which disables
+    /// the filter entirely) exists for a future safetensors→GGUF conversion
+    /// ingest path. Env: `INTAKE_DISCOVERY_REQUIRE_GGUF`.
+    pub require_gguf: bool,
     /// Recency half-life (days) for the recency component. Default
     /// [`DEFAULT_RECENCY_HALFLIFE_DAYS`]. Env:
     /// `INTAKE_DISCOVERY_RANK_RECENCY_HALFLIFE_DAYS`.
@@ -246,6 +256,9 @@ impl Default for DiscoverySelectConfig {
             allow_noninstruct: false,
             license_deny: default_license_deny(),
             allow_unknown_license: true,
+            // Serveability is a hard requirement for the live loop (GGUF-only
+            // ingest); default ON, fail-closed on an unmeasured None.
+            require_gguf: true,
             recency_halflife_days: DEFAULT_RECENCY_HALFLIFE_DAYS,
             weights: RankWeights::default(),
         }
@@ -299,6 +312,7 @@ impl DiscoverySelectConfig {
         cfg.allow_unknown_license = parse_allow_unknown_license(
             env_opt("INTAKE_ASSISTANT_DISCOVERY_ALLOW_UNKNOWN_LICENSE").as_deref(),
         );
+        cfg.require_gguf = parse_require_gguf(env_opt("INTAKE_DISCOVERY_REQUIRE_GGUF").as_deref());
         if let Some(deny) =
             parse_license_deny(env_opt("INTAKE_ASSISTANT_DISCOVERY_LICENSE_DENY").as_deref())
         {
@@ -379,6 +393,17 @@ pub fn parse_halflife_days(raw: Option<&str>) -> f64 {
 /// (lenient): only an explicit falsey value (`0`/`false`/`no`/`off`) turns it
 /// off. Pure.
 pub fn parse_allow_unknown_license(raw: Option<&str>) -> bool {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("0") | Some("false") | Some("no") | Some("off") => false,
+        _ => true,
+    }
+}
+
+/// Parse the require-GGUF flag (`INTAKE_DISCOVERY_REQUIRE_GGUF`, S127b). DEFAULTS
+/// TRUE (serveability is a hard requirement — the fleet only ingests/serves
+/// GGUF): only an explicit falsey value (`0`/`false`/`no`/`off`) turns it off
+/// (opening the future safetensors-conversion escape hatch). Pure.
+pub fn parse_require_gguf(raw: Option<&str>) -> bool {
     match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         Some("0") | Some("false") | Some("no") | Some("off") => false,
         _ => true,
@@ -552,6 +577,24 @@ pub fn instruct_allowed(is_instruct: Option<bool>, allow_noninstruct: bool) -> b
     !matches!(is_instruct, Some(false))
 }
 
+/// Whether a candidate clears the GGUF-serveability hard filter (S127b). This is
+/// a PRACTICAL/SERVEABILITY criterion, NOT a quality one: the fleet serves GGUF
+/// via ollama/llama.cpp and the ingest path (`ollama pull hf.co/<repo>`) only
+/// accepts GGUF repos, so a non-GGUF model is neither ingestable nor serveable.
+///
+/// When `require_gguf` is `false` (the future safetensors-conversion escape
+/// hatch) every candidate passes. When `true` (the default), ONLY a confirmed
+/// GGUF passes: `Some(true)` is kept; `Some(false)` (safetensors-only) is
+/// dropped; and `None` (unmeasured — serveability unknown) is dropped
+/// FAIL-CLOSED — a model whose serveability can't be confirmed is never selected
+/// into the live loop. Pure.
+pub fn gguf_allowed(has_gguf: Option<bool>, require_gguf: bool) -> bool {
+    if !require_gguf {
+        return true;
+    }
+    has_gguf == Some(true)
+}
+
 /// PURELY rank the brochure into an ORDERED, capped shortlist of assistant-
 /// relevant candidates. Deterministic; no I/O. Mirrors
 /// `assistant::runner::select_gap_models`'s data-in/data-out contract.
@@ -575,7 +618,12 @@ pub fn instruct_allowed(is_instruct: Option<bool>, allow_noninstruct: bool) -> b
 ///      `cfg.allow_noninstruct` (an unknown/`None` is kept — heuristic-lenient);
 ///   8. license (S127): drop a clearly-blocked license (`cfg.license_deny`); an
 ///      absent license is kept iff `cfg.allow_unknown_license`;
-///   9. public (S127): `gated != Some(true)` (a gated repo can't be auto-ingested).
+///   9. public (S127): `gated != Some(true)` (a gated repo can't be auto-ingested);
+///  10. GGUF serveability (S127b): when `cfg.require_gguf` (default true), drop
+///      any candidate without a confirmed GGUF (`has_gguf != Some(true)`) — a
+///      PRACTICAL/serveability filter (the fleet serves GGUF via ollama/llama.cpp
+///      and `ollama pull hf.co/<repo>` only accepts GGUF repos). An unmeasured
+///      `None` is fail-closed OUT (serveability unknown → not selected).
 ///
 /// Ranking (S127): by the blended practical [`fit_score`] DESC — hardware fit,
 /// assistant suitability, and recency dominate; popularity is only `w_pop`
@@ -618,6 +666,9 @@ pub fn select_discovery_candidates(
             )
         })
         .filter(|c| c.gated != Some(true))
+        // GGUF serveability (S127b): require a confirmed pre-built GGUF (default
+        // on); fail-closed on an unmeasured None.
+        .filter(|c| gguf_allowed(c.has_gguf, cfg.require_gguf))
         .collect();
 
     // Rank by blended fit_score DESC; tiebreak popularity DESC then name ASC.
@@ -823,6 +874,10 @@ mod tests {
             is_instruct: Some(true),
             gated: Some(false),
             quant_dtype: None,
+            // Serveable by default (has a GGUF) so the EXISTING filter/rank tests
+            // aren't tripped by the S127b require-GGUF hard filter (default on);
+            // the GGUF-filter tests below set this explicitly.
+            has_gguf: Some(true),
         }
     }
 
@@ -1689,7 +1744,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hard_filter_requires_gguf_by_default_dropping_safetensors_and_unmeasured() {
+        // GGUF present → kept; safetensors-only (Some(false)) → dropped; unmeasured
+        // (None) → dropped FAIL-CLOSED. Default require_gguf = true.
+        let mut gguf = practical("gguf_ok", 8.0, 50.0, "confirmed", Some(true), 1);
+        gguf.has_gguf = Some(true);
+        let mut safetensors = practical("safetensors_only", 8.0, 99.0, "confirmed", Some(true), 1);
+        safetensors.has_gguf = Some(false);
+        let mut unmeasured = practical("unmeasured", 8.0, 99.0, "confirmed", Some(true), 1);
+        unmeasured.has_gguf = None;
+        let out = select_discovery_candidates(
+            vec![gguf, safetensors, unmeasured],
+            &DiscoverySelectConfig::default(),
+            test_now(),
+        );
+        let ids: Vec<&str> = out.iter().map(|c| c.model_name.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["gguf_ok"],
+            "only a confirmed-GGUF candidate survives; safetensors-only + unmeasured are dropped"
+        );
+    }
+
+    #[test]
+    fn require_gguf_false_disables_the_filter_entirely() {
+        // The escape hatch: with require_gguf off, safetensors-only AND unmeasured
+        // candidates are selectable again (future safetensors→GGUF conversion path).
+        let mut safetensors = practical("safetensors_only", 8.0, 50.0, "confirmed", Some(true), 1);
+        safetensors.has_gguf = Some(false);
+        let mut unmeasured = practical("unmeasured", 8.0, 10.0, "confirmed", Some(true), 1);
+        unmeasured.has_gguf = None;
+        let mut cfg = DiscoverySelectConfig::default();
+        cfg.require_gguf = false;
+        cfg.top_n = 10;
+        let out = select_discovery_candidates(vec![safetensors, unmeasured], &cfg, test_now());
+        let mut ids: Vec<&str> = out.iter().map(|c| c.model_name.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["safetensors_only", "unmeasured"],
+            "require_gguf=false lets non-GGUF candidates through"
+        );
+    }
+
+    #[test]
+    fn require_gguf_does_not_reorder_among_gguf_candidates() {
+        // The GGUF filter is purely additive: among candidates that all HAVE a
+        // GGUF, the fit_score ordering is exactly what it would be without it.
+        let a = practical("popular_old", 8.0, 100.0, "confirmed", Some(true), 400);
+        let b = practical("recent_fit", 8.0, 20.0, "confirmed", Some(true), 10);
+        // (cand()/practical() default has_gguf = Some(true).)
+        let mut cfg = DiscoverySelectConfig::default();
+        cfg.top_n = 10;
+        let out = select_discovery_candidates(vec![a, b], &cfg, test_now());
+        let ids: Vec<&str> = out.iter().map(|c| c.model_name.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["recent_fit", "popular_old"],
+            "GGUF filter is additive — ordering among GGUF candidates is unchanged"
+        );
+    }
+
     // ---- pure filter helpers ----
+
+    #[test]
+    fn gguf_allowed_helper() {
+        // require on (default): only a confirmed GGUF passes; None fail-closed.
+        assert!(gguf_allowed(Some(true), true));
+        assert!(!gguf_allowed(Some(false), true));
+        assert!(!gguf_allowed(None, true));
+        // require off: everything passes (escape hatch).
+        assert!(gguf_allowed(Some(true), false));
+        assert!(gguf_allowed(Some(false), false));
+        assert!(gguf_allowed(None, false));
+    }
 
     #[test]
     fn license_allowed_helper() {
@@ -1761,6 +1890,21 @@ mod tests {
         assert!(!parse_allow_unknown_license(Some("false")));
         assert!(!parse_allow_unknown_license(Some("0")));
         assert!(!parse_allow_unknown_license(Some("off")));
+    }
+
+    #[test]
+    fn parse_require_gguf_defaults_true_and_only_explicit_falsey_disables() {
+        // Default ON (serveability is a hard requirement).
+        assert!(parse_require_gguf(None));
+        assert!(parse_require_gguf(Some("1")));
+        assert!(parse_require_gguf(Some("true")));
+        assert!(parse_require_gguf(Some("anything")));
+        // Only an explicit falsey value opens the escape hatch.
+        assert!(!parse_require_gguf(Some("false")));
+        assert!(!parse_require_gguf(Some("0")));
+        assert!(!parse_require_gguf(Some("no")));
+        assert!(!parse_require_gguf(Some("off")));
+        assert!(!parse_require_gguf(Some("  OFF  ")));
     }
 
     #[test]

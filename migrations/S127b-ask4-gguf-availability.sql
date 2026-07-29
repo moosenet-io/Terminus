@@ -1,0 +1,33 @@
+-- S127b Ask-4 (TERM): GGUF-availability flag on the discovery "brochure"
+-- (`model_discovery_candidate`, DISC-01, see `S114-disc01-brochure.sql`;
+-- practical metadata added in `S127-ask4-practical-metadata.sql`).
+--
+-- WHY: the now-LIVE Ask-4 pull->test->promote loop selected top-ranked models
+-- that then FAILED live ingest, because the fleet serves GGUF via ollama /
+-- llama.cpp and the ingest path (`ollama pull hf.co/<repo>`) ONLY accepts GGUF
+-- repos. A safetensors-only repo (e.g. Yi-34B-Chat, Yi-1.5-9B-Chat,
+-- Llama3.1-8B-Chinese-Chat) is neither ingestable nor serveable, so ranking it
+-- highly wastes a scarce sweep slot; the repos that SUCCEEDED are GGUF
+-- (TheBloke/...-GGUF, Astrea-...-GGUF). This column records whether a repo has a
+-- pre-built GGUF so the selector can hard-filter to serveable candidates.
+--
+--   has_gguf   TRUE  = at least one `*.gguf` file in the HF `siblings[]` list;
+--              FALSE = siblings known but none is a `.gguf` (safetensors-only);
+--              NULL  = not yet measured / HF blob carried no siblings signal.
+--
+-- Derived from the SAME model-info blob the MEASURE/ENRICH step already fetches
+-- (public `/api/models/{repo}`, NO token, NO weight download — the siblings list
+-- includes filenames). Fail-soft per the doc above; NULL is never erased by a
+-- later NULL re-observation (COALESCE in `upsert.rs`), and an already-measured
+-- row with `has_gguf IS NULL` is re-selected by `needs_enrichment` so a
+-- re-measure pass backfills it (same pattern as the `arch` backfill).
+--
+-- Applied OUT-OF-BAND by an operator, NOT by the harness (matching the DISC-01 /
+-- CB-02 / S127 convention — `src/intake/storage.rs` only INSERTs/SELECTs, never
+-- issues DDL). Additive, idempotent, non-destructive: `ADD COLUMN IF NOT EXISTS`,
+-- so re-applying is a safe no-op, and existing rows simply carry NULL until the
+-- next MEASURE pass enriches them. Depends only on `model_discovery_candidate`
+-- existing (the DISC-01 migration); touches no other table.
+
+ALTER TABLE model_discovery_candidate
+    ADD COLUMN IF NOT EXISTS has_gguf BOOLEAN;

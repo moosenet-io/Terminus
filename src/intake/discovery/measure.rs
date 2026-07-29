@@ -274,6 +274,13 @@ pub struct EnrichedMetadata {
     pub gated: Option<bool>,
     /// Dominant key of `safetensors.parameters` (e.g. `"BF16"`).
     pub quant_dtype: Option<String>,
+    /// Whether the repo ships a pre-built GGUF (any `*.gguf` in `siblings[]`,
+    /// case-insensitive) — a PRACTICAL SERVEABILITY signal (the fleet serves
+    /// GGUF via ollama/llama.cpp; `ollama pull hf.co/<repo>` only accepts GGUF
+    /// repos). `Some(true)` = a GGUF exists; `Some(false)` = siblings known but
+    /// none is GGUF (safetensors-only → not ingestable); `None` = no siblings
+    /// signal at all (fail-soft — serveability unknown).
+    pub has_gguf: Option<bool>,
 }
 
 /// PURE enrichment: derive [`EnrichedMetadata`] from one repo's HF model-info
@@ -289,7 +296,33 @@ pub fn enrich_from_model_info(info: &Value, repo_id: &str) -> EnrichedMetadata {
         is_instruct: Some(is_instruct_from_info(info, repo_id)),
         gated: gated_from_info(info),
         quant_dtype: quant_dtype_from_info(info),
+        has_gguf: has_gguf_from_info(info),
     }
+}
+
+/// Whether the repo ships a pre-built GGUF weight file, from the model-info
+/// `siblings[]` list. A PRACTICAL SERVEABILITY signal: the fleet serves GGUF via
+/// ollama/llama.cpp and the ingest path (`ollama pull hf.co/<repo>`) only accepts
+/// GGUF repos, so a safetensors-only repo is neither ingestable nor serveable.
+///
+/// Rule (fail-soft): `Some(true)` when any sibling `rfilename` ends in `.gguf`
+/// (case-insensitive); `Some(false)` when the siblings list is present and
+/// non-empty but carries no `.gguf`; `None` when there is no siblings signal at
+/// all (missing / non-array / empty array) — serveability then unknown, which the
+/// selector treats fail-closed. Siblings without a string `rfilename` are simply
+/// not counted. PURE — no IO.
+fn has_gguf_from_info(info: &Value) -> Option<bool> {
+    let siblings = info.get("siblings").and_then(Value::as_array)?;
+    if siblings.is_empty() {
+        return None;
+    }
+    let any_gguf = siblings.iter().any(|s| {
+        s.get("rfilename")
+            .and_then(Value::as_str)
+            .map(|name| name.to_ascii_lowercase().ends_with(".gguf"))
+            .unwrap_or(false)
+    });
+    Some(any_gguf)
 }
 
 /// Parse an HF RFC3339/ISO-8601 timestamp value (`createdAt`/`lastModified`)
@@ -566,18 +599,24 @@ fn effective_cap(max_arg: Option<&Value>, ceiling: usize) -> Result<usize, ToolE
 
 /// Whether a candidate still NEEDS an enrich/measure pass: it has never been
 /// through the S127 enrich path (`arch IS NULL` — `arch` is the new-metadata
-/// marker) OR it was never sized (`size_b IS NULL`). PURE.
+/// marker) OR it was never sized (`size_b IS NULL`) OR its GGUF serveability was
+/// never measured (`has_gguf IS NULL`, S127b). PURE.
 ///
 /// The `arch IS NULL` half is what lets a one-time backfill re-enrich the ~two-
 /// thirds of the brochure that were size-measured BEFORE the practical-ranking
 /// fields existed: those rows have a `size_b` but no `arch`/derived
 /// `gfx1151_class`/`license`/recency/`gated`/`is_instruct`, so the blended
-/// `fit_score` would otherwise run on empty hardware data for them. Once a row
-/// has been enriched (its `arch` is set), it stops re-selecting and the backlog
-/// stabilizes — a genuinely arch-less repo (HF exposed no arch) simply stays
-/// selected and is retried, exactly like a never-resolved size.
+/// `fit_score` would otherwise run on empty hardware data for them. The
+/// `has_gguf IS NULL` half does the same for the S127b serveability flag: rows
+/// enriched before it existed carry `has_gguf = NULL`, so a re-measure pass
+/// backfills it (same pattern as the arch backfill) — a candidate whose
+/// serveability is unknown is fail-closed OUT of selection until it is measured.
+/// Once a row has been fully enriched (arch, size, AND has_gguf all set), it
+/// stops re-selecting and the backlog stabilizes — a genuinely arch-less /
+/// siblings-less repo (HF exposed neither) simply stays selected and is retried,
+/// exactly like a never-resolved size.
 pub fn needs_enrichment(c: &DiscoveryCandidate) -> bool {
-    c.arch.is_none() || c.size_b.is_none()
+    c.arch.is_none() || c.size_b.is_none() || c.has_gguf.is_none()
 }
 
 /// PURE selection: the candidates that still need an enrich/measure pass (see
@@ -615,7 +654,8 @@ pub struct MeasureOutcome {
 /// that still [`needs_enrichment`] (`arch IS NULL OR size_b IS NULL`), fetch each
 /// repo's HF model-info metadata, derive `size_b` (+ optional `vram_footprint_gb`)
 /// AND the S127 practical metadata (`arch`/`gfx1151_class`/`license`/recency/
-/// `gated`/`is_instruct`), and write it all back via [`upsert_candidate`].
+/// `gated`/`is_instruct`/`has_gguf`), and write it all back via
+/// [`upsert_candidate`].
 ///
 /// - Idempotent: a FULLY-enriched row (`arch` set AND `size_b` set) is never
 ///   re-fetched, so the backlog stabilizes. A row already sized but not yet
@@ -698,6 +738,7 @@ pub async fn measure_brochure(
                         updated.is_instruct = enriched.is_instruct.or(updated.is_instruct);
                         updated.gated = enriched.gated.or(updated.gated);
                         updated.quant_dtype = enriched.quant_dtype.clone().or(updated.quant_dtype);
+                        updated.has_gguf = enriched.has_gguf.or(updated.has_gguf);
                         match upsert_candidate(p, &updated).await {
                             Ok(()) => {
                                 if has_size {
@@ -880,14 +921,16 @@ mod tests {
             is_instruct: None,
             gated: None,
             quant_dtype: None,
+            has_gguf: None,
         }
     }
 
-    /// A FULLY-enriched candidate: both `size_b` and `arch` set, so
+    /// A FULLY-enriched candidate: `size_b`, `arch`, AND `has_gguf` all set, so
     /// [`needs_enrichment`] is false and it is never reselected.
     fn enriched(repo: &str, size_b: f64, arch: &str) -> DiscoveryCandidate {
         let mut c = candidate(repo, Some(size_b));
         c.arch = Some(arch.to_string());
+        c.has_gguf = Some(true);
         c
     }
 
@@ -1253,6 +1296,96 @@ mod tests {
         assert_eq!(e2.arch, None);
         assert_eq!(e2.license, None);
         assert_eq!(e2.quant_dtype, None);
+    }
+
+    // ---- has_gguf detection (S127b): serveability from the siblings list ----
+
+    #[test]
+    fn has_gguf_true_when_a_gguf_sibling_is_present() {
+        let info = json!({
+            "siblings": [
+                { "rfilename": "config.json" },
+                { "rfilename": "model.Q4_K_M.gguf" }
+            ]
+        });
+        assert_eq!(
+            enrich_from_model_info(&info, "TheBloke/Foo-GGUF").has_gguf,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn has_gguf_false_when_only_safetensors_and_no_gguf() {
+        // A safetensors-only repo (the live-ingest FAILURE case: Yi-34B-Chat &c.)
+        // → serveability KNOWN-false, must be droppable.
+        let info = json!({
+            "siblings": [
+                { "rfilename": "model-00001-of-00002.safetensors" },
+                { "rfilename": "model-00002-of-00002.safetensors" },
+                { "rfilename": "tokenizer.json" }
+            ]
+        });
+        assert_eq!(
+            enrich_from_model_info(&info, "01-ai/Yi-34B-Chat").has_gguf,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn has_gguf_none_when_no_siblings_signal() {
+        // Missing key, non-array, and empty array all → None (unknown).
+        assert_eq!(
+            enrich_from_model_info(&json!({}), "org/no-siblings").has_gguf,
+            None
+        );
+        assert_eq!(
+            enrich_from_model_info(&json!({ "siblings": 5 }), "org/weird").has_gguf,
+            None
+        );
+        assert_eq!(
+            enrich_from_model_info(&json!({ "siblings": [] }), "org/empty").has_gguf,
+            None
+        );
+    }
+
+    #[test]
+    fn has_gguf_detection_is_case_insensitive() {
+        // Upper/mixed-case `.GGUF` still counts.
+        let info = json!({ "siblings": [ { "rfilename": "MODEL.GGUF" } ] });
+        assert_eq!(
+            enrich_from_model_info(&info, "org/upper").has_gguf,
+            Some(true)
+        );
+        let mixed = json!({ "siblings": [ { "rfilename": "weights-f16.GgUf" } ] });
+        assert_eq!(
+            enrich_from_model_info(&mixed, "org/mixed").has_gguf,
+            Some(true)
+        );
+        // A sibling missing a string rfilename is simply not counted (no panic).
+        let missing_name =
+            json!({ "siblings": [ { "size": 10 }, { "rfilename": "x.safetensors" } ] });
+        assert_eq!(
+            enrich_from_model_info(&missing_name, "org/m").has_gguf,
+            Some(false)
+        );
+    }
+
+    // ---- needs_enrichment re-selects on a NULL has_gguf (backfill) ----
+
+    #[test]
+    fn needs_enrichment_reselects_a_row_with_has_gguf_null() {
+        // A row measured before S127b: size + arch set, but has_gguf NULL — it
+        // MUST be reselected so a re-measure pass backfills serveability.
+        let mut c = candidate("org/pre-s127b", Some(8.0));
+        c.arch = Some("LlamaForCausalLM".to_string());
+        c.has_gguf = None;
+        assert!(
+            needs_enrichment(&c),
+            "a has_gguf-NULL row must be reselected for backfill"
+        );
+        // Once has_gguf is set too, it stops re-selecting.
+        c.has_gguf = Some(true);
+        assert!(!needs_enrichment(&c));
     }
 
     // ---- effective_cap: `max` may only lower, never raise, the ceiling ----

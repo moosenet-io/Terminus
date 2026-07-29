@@ -114,6 +114,9 @@ fn candidate_from(
         is_instruct: None,
         gated: None,
         quant_dtype: None,
+        // S127b: a bare listing carries no siblings blob; the MEASURE/ENRICH step
+        // derives has_gguf and upsert COALESCE-protects it (None never erases it).
+        has_gguf: None,
     }
 }
 
