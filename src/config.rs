@@ -1388,6 +1388,27 @@ pub fn constellation_lumina_token() -> Option<String> {
     env_nonempty("CONSTELLATION_LUMINA_TOKEN")
 }
 
+/// Bearer token the constellation proxy presents to **Muse** on its
+/// auth-gated routes (`CONSTELLATION_MUSE_TOKEN`), the Muse counterpart of
+/// [`constellation_lumina_token`].
+///
+/// Point-of-use read, like the Lumina one, so an operator can rotate the token
+/// without a restart. `None` ⇒ no `Authorization` header at all
+/// (unauthenticated passthrough), which keeps a token-less dev Muse working —
+/// the same fail-soft posture as the Lumina arm rather than a hard failure.
+///
+/// The value is Muse's own `MUSE_API_TOKEN`, materialized from <secret-manager> into
+/// this process's environment; never a literal in config or source (S7).
+///
+/// Why this exists (TERM #549): the constellation GUI's Muse panels read
+/// per-account routes that live on Muse's *protected* router — `/premiere` and
+/// the `/api/graph/*` set. Without a bearer, every one of them answered 401,
+/// each panel degraded to "not yet wired", and the Muse section rendered empty
+/// no matter how much data Muse actually held.
+pub fn constellation_muse_token() -> Option<String> {
+    env_nonempty("CONSTELLATION_MUSE_TOKEN")
+}
+
 /// Constellation session token TTL, in seconds. Independent of
 /// `TERMINUS_ENROLLMENT_JWT_TTL_SECONDS` (a different credential with a
 /// different lifecycle: an operator's browser session vs. a paired

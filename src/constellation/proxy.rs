@@ -55,6 +55,17 @@
 //! [`crate::constellation::audit::record_mutating_request`] before the
 //! backend call is attempted.
 //!
+//! ## TERM #549: Muse bearer injection
+//!
+//! [`proxy_muse`] authenticates to Muse with `Authorization: Bearer
+//! <CONSTELLATION_MUSE_TOKEN>` (point-of-use read via
+//! [`config::constellation_muse_token`]; absent ⇒ no header, so a token-less
+//! dev Muse still works). Without it every read against Muse's *protected*
+//! router — `/premiere`, `/api/graph/*` — answered 401, each constellation
+//! Muse panel degraded to "not yet wired", and the section rendered empty
+//! regardless of how much data Muse held. The `art/` arm is excluded: Muse
+//! serves artwork unauthenticated by design.
+//!
 //! ## LGUI-05: Lumina bearer injection (spec §6, decision D2)
 //! [`proxy_lumina`] is the one namespaced arm that authenticates itself to
 //! its backend. It attaches two headers the shared [`proxy`] helper doesn't
@@ -324,6 +335,25 @@ fn lumina_upstream_headers(token: Option<String>, principal: Option<&str>) -> Ve
     headers
 }
 
+/// The `extra_upstream_headers` [`proxy_muse`] passes to [`proxy`] — the Muse
+/// counterpart of [`lumina_upstream_headers`], pulled out as a pure function
+/// for the same reason (directly unit-testable, no axum round-trip).
+///
+/// `token` is the point-of-use `CONSTELLATION_MUSE_TOKEN` read; `None` ⇒ no
+/// `Authorization` header at all, so a token-less dev Muse keeps working.
+///
+/// Deliberately narrower than the Lumina builder: Muse has no `X-*-User`
+/// convention, so the verified principal is NOT forwarded as a header here.
+/// Muse scopes per-account reads from its own token identity, and inventing a
+/// user header it does not read would be dead weight that looks load-bearing.
+fn muse_upstream_headers(token: Option<String>) -> Vec<(&'static str, String)> {
+    let mut headers = Vec::new();
+    if let Some(token) = token {
+        headers.push(("authorization", format!("Bearer {token}")));
+    }
+    headers
+}
+
 /// LGUI-05 (spec §6, D2): the one namespaced arm that authenticates itself
 /// to its backend — see the module doc's "LGUI-05: Lumina bearer injection"
 /// section for the full design and why the two headers built here can never
@@ -376,6 +406,17 @@ pub async fn proxy_muse(
     if path.starts_with("art/") {
         return proxy_muse_art(&path, query.as_deref(), method, &headers, body, principal.as_deref()).await;
     }
+    // TERM #549: authenticate to Muse. Its protected router (`/premiere`, the
+    // `/api/graph/*` set) answered 401 for every GUI read before this, which
+    // surfaced as permanently "not yet wired" Muse panels. Same point-of-use
+    // read + fail-soft-when-absent posture as the Lumina arm above.
+    //
+    // NOTE the `art/` early return above deliberately does NOT get the bearer:
+    // Muse serves `/art/{kind}/{id}` unauthenticated by design (MUSE-27), and
+    // that arm is raw binary passthrough, so a token there would be sent for
+    // nothing.
+    let extra_headers = muse_upstream_headers(config::constellation_muse_token());
+
     proxy(
         "muse",
         config::constellation_muse_url(),
@@ -385,8 +426,8 @@ pub async fn proxy_muse(
         &headers,
         body,
         principal.as_deref(),
-        &[],
-        None,
+        &extra_headers,
+        Some("muse auth failed"),
     )
     .await
 }
@@ -763,6 +804,32 @@ mod tests {
         assert_eq!(parsed["principal"], "test-operator");
 
         std::env::remove_var("CONSTELLATION_AUDIT_LOG_PATH");
+    }
+
+    // ── TERM #549: Muse bearer injection ───────────────────────────────────
+
+    #[test]
+    fn muse_upstream_headers_attaches_the_bearer_when_a_token_is_configured() {
+        let headers = muse_upstream_headers(Some("muse-token".to_string()));
+        assert_eq!(headers, vec![("authorization", "Bearer muse-token".to_string())]);
+    }
+
+    #[test]
+    fn muse_upstream_headers_are_empty_without_a_token() {
+        // Fail-soft, matching the Lumina arm: no token means unauthenticated
+        // passthrough (a token-less dev Muse keeps working), never a synthesised
+        // or empty Authorization header — an `Authorization: Bearer ` with no
+        // value would be worse than none, since Muse would reject it outright.
+        assert!(muse_upstream_headers(None).is_empty());
+    }
+
+    #[test]
+    fn muse_upstream_headers_never_forward_a_user_header() {
+        // Unlike Lumina, Muse has no X-*-User convention. Asserting the ABSENCE
+        // keeps a future edit from bolting on a header Muse does not read.
+        let headers = muse_upstream_headers(Some("t".to_string()));
+        assert!(headers.iter().all(|(k, _)| *k != "x-lumina-user" && *k != "x-muse-user"));
+        assert_eq!(headers.len(), 1);
     }
 
     // ── LGUI-05: Lumina bearer injection (spec §6, D2) ──────────────────────
