@@ -200,6 +200,39 @@ export function useMuseLibrary(limit = 120): MuseSection<MuseLibrary> {
   return useMuseSection<MuseLibrary>(`/api/library?limit=${encodeURIComponent(String(limit))}`);
 }
 
+/** One row of the management table (guide screen 03). `GET /api/library/table` returns a BARE
+ *  ARRAY, not an envelope — field names copied from a live capture:
+ *    [{"cutoff_met":null,"file_count":2,"kind":"movie","media_item_id":2,
+ *      "media_metadata_id":2,"monitored":true,"on_disk":true,
+ *      "poster_url":"/art/media_metadata/2","quality_profile_id":null,
+ *      "quality_profile_name":null,"size_bytes":16893019180,
+ *      "title":"10 Things I Hate About You","year":1999}] */
+export interface MuseLibraryTableRow {
+  media_item_id: number;
+  media_metadata_id: number;
+  title: string;
+  year: number | null;
+  kind: string;
+  monitored: boolean;
+  on_disk: boolean;
+  file_count: number;
+  size_bytes: number | null;
+  quality_profile_id: number | null;
+  quality_profile_name: string | null;
+  /** `null` when no quality profile / cutoff is configured — which is the norm on this
+   *  deployment. A null must NOT be read as "meets cutoff"; see `LibraryTablePanel`. */
+  cutoff_met: boolean | null;
+}
+
+/** `enabled = false` passes a null path, which `useMuseSection` treats as idle (no request) — so
+ *  the grid view does not pay for the table's separate fetch until the toggle asks for it. React
+ *  hooks cannot be called conditionally, so this flag is how laziness is expressed. */
+export function useMuseLibraryTable(limit = 500, enabled = true): MuseSection<MuseLibraryTableRow[]> {
+  return useMuseSection<MuseLibraryTableRow[]>(
+    enabled ? `/api/library/table?limit=${encodeURIComponent(String(limit))}` : null,
+  );
+}
+
 // ── Taste (muse.taste) ───────────────────────────────────────────────────────
 
 export interface MuseTastePoint {

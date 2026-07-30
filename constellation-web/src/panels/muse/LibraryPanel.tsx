@@ -28,7 +28,8 @@
 // client-side. The real fix is a server-side thumbnail variant, tracked as MUSE #100.
 import { useMemo, useState } from 'react';
 import { ChartCard } from '../../viz/ChartCard';
-import { useMuseLibrary, museArtUrl, type MuseLibraryItem } from '../../hooks/useMuse';
+import { useMuseLibrary, useMuseLibraryTable, museArtUrl, type MuseLibraryItem } from '../../hooks/useMuse';
+import { LibraryTableView } from './LibraryTableView';
 
 /** How many titles to request. Bounded because this is a browse surface, not an export; the
  *  header reports the untruncated total from `counts.owned` alongside it so a capped page can
@@ -36,8 +37,21 @@ import { useMuseLibrary, museArtUrl, type MuseLibraryItem } from '../../hooks/us
 const PAGE_LIMIT = 240;
 /** `ChartCard` takes an explicit body height in px; the poster wall scrolls inside it. */
 const PANEL_BODY_HEIGHT = 720;
+/** The table view is denser than the grid, so it can afford more rows per fetch. */
+const TABLE_LIMIT = 500;
 
-type KindFilter = 'all' | 'movie' | 'show';
+/** The guide's filter chips are Movies · Series · Wanted · Unwatched. Three of the four are here.
+ *  **`Unwatched` is deliberately ABSENT**, not forgotten: `/api/library` projects no watched state,
+ *  so the chip would have nothing to filter on. The data exists (84 media_items have a finished
+ *  play_session; watch_stats has 146 rows) but is not exposed by this endpoint — tracked as
+ *  MUSE #101. Shipping a chip that silently filters nothing is worse than shipping three that work.
+ *
+ *  The guide's `sort: taste` control is absent for the same reason (no per-title fit score in this
+ *  projection — same issue), and the tile's `★` rating is absent because `media_metadata.ratings`
+ *  and `popularity` are 0-populated across all 1886 rows, so it would render blank for every title
+ *  (MUSE #102). */
+type Filter = 'all' | 'movie' | 'show' | 'wanted';
+type View = 'grid' | 'table';
 
 /** The guide's availability badge vocabulary (pattern library: "A title's state across the
  *  acquire → own → upgrade lifecycle"). Driven by the API's `availability` field. An
@@ -127,18 +141,42 @@ function PosterTile({ item }: { item: MuseLibraryItem }) {
 export function LibraryPanel() {
   const { data, loading, degraded } = useMuseLibrary(PAGE_LIMIT);
   const [query, setQuery] = useState('');
-  const [kind, setKind] = useState<KindFilter>('all');
+  const [filter, setFilter] = useState<Filter>('all');
+  const [view, setView] = useState<View>('grid');
+  // The table is a SEPARATE endpoint with its own projection, fetched only when the toggle selects
+  // it — `useMuseLibraryTable(_, enabled=false)` passes a null path and `useMuseSection` then makes
+  // no request at all, so the grid view never pays for it.
+  const table = useMuseLibraryTable(TABLE_LIMIT, view === 'table');
 
   const owned = data?.owned ?? [];
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
     return owned.filter(i => {
-      if (kind !== 'all' && i.kind !== kind) return false;
+      if (filter === 'movie' || filter === 'show') {
+        if (i.kind !== filter) return false;
+      } else if (filter === 'wanted') {
+        // "Wanted" == not on disk. Derived from `availability`, the field that actually carries it.
+        if (i.availability === 'on_disk') return false;
+      }
       if (q && !i.title.toLowerCase().includes(q)) return false;
       return true;
     });
-  }, [owned, query, kind]);
+  }, [owned, query, filter]);
+
+  const tableRows = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const rows = table.data ?? [];
+    return rows.filter(r => {
+      if (filter === 'movie' || filter === 'show') {
+        if (r.kind !== filter) return false;
+      } else if (filter === 'wanted') {
+        if (r.on_disk) return false;
+      }
+      if (q && !r.title.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [table.data, query, filter]);
 
   // A successful call that returned no titles is an EMPTY library, which is a different thing
   // from a degraded endpoint — `ChartCard` renders them differently on purpose.
@@ -189,11 +227,11 @@ export function LibraryPanel() {
               borderRadius: 'var(--radius-xs, 3px)',
             }}
           />
-          {(['all', 'movie', 'show'] as KindFilter[]).map(k => (
+          {(['all', 'movie', 'show', 'wanted'] as Filter[]).map(k => (
             <button
               key={k}
-              onClick={() => setKind(k)}
-              aria-pressed={kind === k}
+              onClick={() => setFilter(k)}
+              aria-pressed={filter === k}
               style={{
                 padding: '3px 10px',
                 fontSize: 'var(--fs-2xs, 10px)',
@@ -201,20 +239,61 @@ export function LibraryPanel() {
                 textTransform: 'uppercase',
                 letterSpacing: '0.04em',
                 cursor: 'pointer',
-                color: kind === k ? 'var(--text-000, #fff)' : 'var(--text-300)',
-                background: kind === k ? 'var(--accent-dim, rgba(139,92,246,0.18))' : 'transparent',
-                border: `1px solid ${kind === k ? 'var(--accent, #8b5cf6)' : 'var(--border)'}`,
+                color: filter === k ? 'var(--text-000, #fff)' : 'var(--text-300)',
+                background: filter === k ? 'var(--accent-dim, rgba(139,92,246,0.18))' : 'transparent',
+                border: `1px solid ${filter === k ? 'var(--accent, #8b5cf6)' : 'var(--border)'}`,
                 borderRadius: 'var(--radius-xs, 3px)',
               }}
             >
-              {k === 'all' ? 'All' : k === 'movie' ? 'Movies' : 'Series'}
+              {k === 'all' ? 'All' : k === 'movie' ? 'Movies' : k === 'show' ? 'Series' : 'Wanted'}
             </button>
           ))}
+
+          {/* The guide's Grid⇄Table toggle. Both views are REAL — the table is guide screen 03
+              backed by its own public endpoint — so this is never a dead control. */}
+          <span style={{ display: 'inline-flex', marginLeft: 'auto' }}>
+            {(['grid', 'table'] as View[]).map(v => (
+              <button
+                key={v}
+                onClick={() => setView(v)}
+                aria-pressed={view === v}
+                style={{
+                  padding: '3px 10px',
+                  fontSize: 'var(--fs-2xs, 10px)',
+                  fontFamily: 'var(--font-mono)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.04em',
+                  cursor: 'pointer',
+                  color: view === v ? 'var(--text-000, #fff)' : 'var(--text-300)',
+                  background: view === v ? 'var(--accent-dim, rgba(139,92,246,0.18))' : 'transparent',
+                  border: `1px solid ${view === v ? 'var(--accent, #8b5cf6)' : 'var(--border)'}`,
+                  borderRadius: 'var(--radius-xs, 3px)',
+                }}
+              >
+                {v}
+              </button>
+            ))}
+          </span>
         </div>
 
         {/* THE scroll container. `minHeight: 0` is what lets it actually shrink inside the flex
-            parent instead of pushing the page body into being the scroller. */}
-        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}>
+            parent instead of pushing the page body into being the scroller. `role`+`tabIndex` make
+            it keyboard-reachable — a scrollable region that cannot take focus is pointer-only. */}
+        {view === 'table' ? (
+          table.degraded ? (
+            <div style={{ padding: 'var(--space-3)', fontSize: 'var(--fs-xs)', color: 'var(--text-300)' }}>
+              Table view unavailable: {table.degraded.detail}
+            </div>
+          ) : (
+            <LibraryTableView rows={tableRows} />
+          )
+        ) : (
+        <div
+          role="region"
+          aria-label="Library poster grid"
+          tabIndex={0}
+          style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}
+        >
           {visible.length === 0 && owned.length > 0 ? (
             <div style={{ padding: 'var(--space-3)', fontSize: 'var(--fs-xs)', color: 'var(--text-300)' }}>
               No titles match this filter.
@@ -234,6 +313,7 @@ export function LibraryPanel() {
             </div>
           )}
         </div>
+        )}
       </div>
     </ChartCard>
   );
