@@ -26,9 +26,9 @@
 // visit briefly shows empty tiles that fill in. That is a slow image, NOT a broken one (the art
 // endpoint returns 200 with a valid JPEG — verified directly), and NOT something the panel can fix
 // client-side. The real fix is a server-side thumbnail variant, tracked as MUSE #100.
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { ChartCard } from '../../viz/ChartCard';
-import { useMuseLibrary, useMuseLibraryTable, museArtUrl, type MuseLibraryItem } from '../../hooks/useMuse';
+import { useMuseLibrary, useMuseLibraryTable, museArtUrlAt, type MuseLibraryItem } from '../../hooks/useMuse';
 import { LibraryTableView } from './LibraryTableView';
 
 /** How many titles to request. Bounded because this is a browse surface, not an export; the
@@ -50,8 +50,43 @@ const TABLE_LIMIT = 500;
  *  projection — same issue), and the tile's `★` rating is absent because `media_metadata.ratings`
  *  and `popularity` are 0-populated across all 1886 rows, so it would render blank for every title
  *  (MUSE #102). */
-type Filter = 'all' | 'movie' | 'show' | 'wanted';
+/** Kind and availability are INDEPENDENT axes, not one mutually-exclusive chip
+ *  row — "movies I don't have yet" is a real question the old single-row filter
+ *  could not express. */
+type KindFilter = 'all' | 'movie' | 'show';
+type AvailFilter = 'all' | 'on_disk' | 'wanted';
 type View = 'grid' | 'table';
+
+/** Sorts over data that ACTUALLY EXISTS in the payload. The guide also asks for a
+ *  taste sort; there is no per-title fit score in this projection, so it is absent
+ *  rather than faked (MUSE #101) — same rule that kept the star rating out. */
+type SortKey = 'title_asc' | 'title_desc' | 'year_desc' | 'year_asc';
+
+const SORTS: { key: SortKey; label: string }[] = [
+  { key: 'title_asc', label: 'A→Z' },
+  { key: 'title_desc', label: 'Z→A' },
+  { key: 'year_desc', label: 'Newest' },
+  { key: 'year_asc', label: 'Oldest' },
+];
+
+const ALPHABET = ['#', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')];
+
+/** The alphabet bucket a title sorts into. Leading articles are stripped so
+ *  "The Martian" lands under M, which is where someone looking for it will press
+ *  — matching how Plex/Jellyfin index a library. Anything not starting with a
+ *  letter buckets under '#'. */
+export function alphaKey(title: string): string {
+  const stripped = title.trim().replace(/^(the|a|an)\s+/i, '');
+  const first = stripped.charAt(0).toUpperCase();
+  return first >= 'A' && first <= 'Z' ? first : '#';
+}
+
+/** Sort title: the same article-stripped, case-folded form the alphabet index
+ *  uses, so the A→Z order and the letter rail agree. If they disagreed, pressing
+ *  M would scroll to a position where M does not start. */
+function sortTitle(title: string): string {
+  return title.trim().replace(/^(the|a|an)\s+/i, '').toLowerCase();
+}
 
 /** The guide's availability badge vocabulary (pattern library: "A title's state across the
  *  acquire → own → upgrade lifecycle"). Driven by the API's `availability` field. An
@@ -90,7 +125,10 @@ function PosterTile({ item }: { item: MuseLibraryItem }) {
         }}
       >
         <img
-          src={museArtUrl('media_metadata', String(item.media_metadata_id))}
+          // MGUI-15: a 160px RENDITION, not the master (MUSE #100). The master is
+          // ~1.9 MB for a ~112px tile, which is what made the first poster wall
+          // fill in slowly.
+          src={museArtUrlAt('media_metadata', String(item.media_metadata_id), 160)}
           alt=""
           aria-hidden
           loading="lazy"
@@ -141,64 +179,167 @@ function PosterTile({ item }: { item: MuseLibraryItem }) {
 export function LibraryPanel() {
   const { data, loading, degraded } = useMuseLibrary(PAGE_LIMIT);
   const [query, setQuery] = useState('');
-  const [filter, setFilter] = useState<Filter>('all');
+  const [kind, setKind] = useState<KindFilter>('all');
+  const [avail, setAvail] = useState<AvailFilter>('all');
+  const [sort, setSort] = useState<SortKey>('title_asc');
   const [view, setView] = useState<View>('grid');
-  // The table is a SEPARATE endpoint with its own projection, fetched only when the toggle selects
-  // it — `useMuseLibraryTable(_, enabled=false)` passes a null path and `useMuseSection` then makes
-  // no request at all, so the grid view never pays for it.
   const table = useMuseLibraryTable(TABLE_LIMIT, view === 'table');
+
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const searchRef = useRef<HTMLInputElement | null>(null);
+  // One ref per rendered letter bucket, so a jump scrolls to a real element
+  // rather than an estimated offset (tile heights vary with title wrapping).
+  const letterAnchors = useRef<Record<string, HTMLDivElement | null>>({});
 
   const owned = data?.owned ?? [];
 
-  const visible = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return owned.filter(i => {
-      if (filter === 'movie' || filter === 'show') {
-        if (i.kind !== filter) return false;
-      } else if (filter === 'wanted') {
-        // "Wanted" == not on disk. Derived from `availability`, the field that actually carries it.
-        if (i.availability === 'on_disk') return false;
+  const matches = useCallback(
+    (item: { kind: string; title: string; availability?: string; on_disk?: boolean }) => {
+      if (kind !== 'all' && item.kind !== kind) return false;
+      if (avail !== 'all') {
+        // The grid rows carry `availability`; the table rows carry `on_disk`.
+        // Normalise rather than duplicating the filter for each shape.
+        const onDisk =
+          item.availability !== undefined ? item.availability === 'on_disk' : item.on_disk === true;
+        if (avail === 'on_disk' && !onDisk) return false;
+        if (avail === 'wanted' && onDisk) return false;
       }
-      if (q && !i.title.toLowerCase().includes(q)) return false;
+      const q = query.trim().toLowerCase();
+      if (q && !item.title.toLowerCase().includes(q)) return false;
       return true;
-    });
-  }, [owned, query, filter]);
+    },
+    [kind, avail, query],
+  );
 
-  const tableRows = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    const rows = table.data ?? [];
-    return rows.filter(r => {
-      if (filter === 'movie' || filter === 'show') {
-        if (r.kind !== filter) return false;
-      } else if (filter === 'wanted') {
-        if (r.on_disk) return false;
+  const compare = useCallback(
+    (a: { title: string; year: number | null }, b: { title: string; year: number | null }) => {
+      switch (sort) {
+        case 'title_desc':
+          return sortTitle(b.title).localeCompare(sortTitle(a.title));
+        case 'year_desc':
+        case 'year_asc': {
+          // A title with no year sorts LAST in both directions rather than
+          // pretending to be year 0 (which would bury real 2026 titles under
+          // unknowns, or float unknowns to the top).
+          const ay = a.year;
+          const by = b.year;
+          if (ay === null && by === null) return sortTitle(a.title).localeCompare(sortTitle(b.title));
+          if (ay === null) return 1;
+          if (by === null) return -1;
+          if (ay !== by) return sort === 'year_desc' ? by - ay : ay - by;
+          return sortTitle(a.title).localeCompare(sortTitle(b.title));
+        }
+        case 'title_asc':
+        default:
+          return sortTitle(a.title).localeCompare(sortTitle(b.title));
       }
-      if (q && !r.title.toLowerCase().includes(q)) return false;
-      return true;
-    });
-  }, [table.data, query, filter]);
+    },
+    [sort],
+  );
+
+  const visible = useMemo(
+    () => owned.filter(matches).slice().sort(compare),
+    [owned, matches, compare],
+  );
+
+  const tableRows = useMemo(
+    () => (table.data ?? []).filter(matches).slice().sort(compare),
+    [table.data, matches, compare],
+  );
+
+  /** Which letters actually have a title in the CURRENT result set. A letter with
+   *  nothing behind it is rendered inert rather than as a button that does
+   *  nothing when pressed. */
+  const presentLetters = useMemo(() => {
+    const set = new Set<string>();
+    for (const i of visible) set.add(alphaKey(i.title));
+    return set;
+  }, [visible]);
+
+  /** The alphabet rail only makes sense while the list is in title order — under
+   *  a year sort, "jump to M" has no position to jump to. */
+  const alphaActive = sort === 'title_asc' || sort === 'title_desc';
+
+  const jumpTo = useCallback((letter: string) => {
+    const el = letterAnchors.current[letter];
+    const scroller = scrollerRef.current;
+    if (!el || !scroller) return;
+    // Scroll by the measured DELTA between the two boxes.
+    //
+    // The previous form was `scrollTop = el.offsetTop - scroller.offsetTop`.
+    // That happened to produce the same result here, but it is not sound:
+    // `offsetTop` is measured from the nearest POSITIONED ancestor, which is not
+    // guaranteed to be this scroller, so the two values need not share a
+    // coordinate space and subtracting them is only accidentally correct.
+    // `getBoundingClientRect` puts both in viewport space, where the difference
+    // IS the distance to scroll — correct by construction rather than by luck.
+    //
+    // (I first reported this as a landing bug on the strength of a faulty probe
+    // that looked for the first visible CAPTION; a caption sits below its poster,
+    // so a previous row whose poster had scrolled off still matched. Measuring
+    // the anchor tile directly shows the landing was, and is, exact — offset 0
+    // for every letter tried.)
+    //
+    // Still the CONTAINER's scrollTop, never `scrollIntoView` — that walks up to
+    // the nearest scrollable ancestor and can drag the whole shell.
+    const delta = el.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+    scroller.scrollTop += delta;
+  }, []);
+
+  const filtersActive = kind !== 'all' || avail !== 'all' || query.trim() !== '';
+  const clearFilters = useCallback(() => {
+    setKind('all');
+    setAvail('all');
+    setQuery('');
+  }, []);
+
+  // NO global key binding here, deliberately.
+  //
+  // The first version bound `/` to focus this panel's search — but the SHELL
+  // already owns `/` for its global tool search (App.tsx), so the two handlers
+  // competed and the panel lost: verification showed `/` never focused this
+  // input at all. Stealing a shell-wide shortcut for one panel would be wrong
+  // even if it had won, because it would break the same key everywhere else in
+  // the app.
+  //
+  // Esc-to-clear is bound on the INPUT itself (below) rather than on `window`,
+  // so it is scoped to the field the user is actually typing in and cannot
+  // interfere with anything outside this panel.
 
   // A successful call that returned no titles is an EMPTY library, which is a different thing
   // from a degraded endpoint — `ChartCard` renders them differently on purpose.
   const empty = !loading && !degraded && owned.length === 0;
 
+  const chip = (active: boolean): React.CSSProperties => ({
+    padding: '3px 10px',
+    fontSize: 'var(--fs-2xs, 10px)',
+    fontFamily: 'var(--font-mono)',
+    textTransform: 'uppercase',
+    letterSpacing: '0.04em',
+    cursor: 'pointer',
+    color: active ? 'var(--text-000, #fff)' : 'var(--text-300)',
+    background: active ? 'var(--accent-dim, rgba(139,92,246,0.18))' : 'transparent',
+    border: `1px solid ${active ? 'var(--accent, #8b5cf6)' : 'var(--border)'}`,
+    borderRadius: 'var(--radius-xs, 3px)',
+  });
+
+  const shown = view === 'table' ? tableRows.length : visible.length;
   const total = data?.counts.owned ?? 0;
-  // Say plainly when the page is capped. The alternative — showing 240 of 1892 with a bare
-  // "240" — reads as "that's everything", which is the quiet-wrong-number failure.
-  const countLabel = total > owned.length
-    ? `${owned.length} of ${total} titles`
-    : `${owned.length} titles`;
+  // Per-VIEW loaded count. The grid and the table are separate endpoints with
+  // separate page sizes (240 vs 500), so a single `loaded` produced a
+  // self-contradictory subtitle in table view — "500 of 240 loaded" (codex).
+  const loaded = view === 'table' ? (table.data?.length ?? 0) : owned.length;
+  // The search placeholder must agree with whichever view is on screen.
+  const searchScopeCount = loaded;
 
   return (
     <ChartCard
       title="Library"
       subtitle={
         data
-          ? `${countLabel} · ${data.counts.on_disk} on disk${data.counts.wanted ? ` · ${data.counts.wanted} wanted` : ''}`
+          ? `${shown}${filtersActive ? ' matching' : ''} of ${loaded} loaded · ${total} in library · ${data.counts.on_disk} on disk`
           : 'Poster wall'
       }
-      // A tall fixed body: `ChartCard` needs an explicit px height, and the wall scrolls
-      // INSIDE it (see the scroll container below) rather than growing the page.
       height={PANEL_BODY_HEIGHT}
       loading={loading}
       degraded={degraded}
@@ -207,16 +348,26 @@ export function LibraryPanel() {
       emptyHint="Run a library scan in Muse to populate the poster wall"
     >
       <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)', height: '100%', minHeight: 0 }}>
-        {/* Filter row. Search is CLIENT-SIDE over the fetched page — it deliberately does not
-            claim to search the whole library; server-side search is a follow-up. */}
-        <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'center', flexWrap: 'wrap' }}>
+        {/* Row 1 — search + view toggle. Search is CLIENT-SIDE over the loaded
+            page and its placeholder says so rather than implying full-library
+            search. */}
+        <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }}>
           <input
+            ref={searchRef}
             value={query}
             onChange={e => setQuery(e.target.value)}
-            placeholder={`Search these ${owned.length} titles…`}
+            onKeyDown={e => {
+              // Scoped to this field — see the note above on why there is no
+              // window-level binding.
+              if (e.key === 'Escape') {
+                e.stopPropagation();
+                setQuery('');
+              }
+            }}
+            placeholder={`Search these ${searchScopeCount} titles…   (Esc clears)`}
             aria-label="Search loaded titles"
             style={{
-              flex: '1 1 220px',
+              flex: '1 1 240px',
               minWidth: 0,
               padding: '4px 8px',
               fontSize: 'var(--fs-xs)',
@@ -227,58 +378,66 @@ export function LibraryPanel() {
               borderRadius: 'var(--radius-xs, 3px)',
             }}
           />
-          {(['all', 'movie', 'show', 'wanted'] as Filter[]).map(k => (
-            <button
-              key={k}
-              onClick={() => setFilter(k)}
-              aria-pressed={filter === k}
-              style={{
-                padding: '3px 10px',
-                fontSize: 'var(--fs-2xs, 10px)',
-                fontFamily: 'var(--font-mono)',
-                textTransform: 'uppercase',
-                letterSpacing: '0.04em',
-                cursor: 'pointer',
-                color: filter === k ? 'var(--text-000, #fff)' : 'var(--text-300)',
-                background: filter === k ? 'var(--accent-dim, rgba(139,92,246,0.18))' : 'transparent',
-                border: `1px solid ${filter === k ? 'var(--accent, #8b5cf6)' : 'var(--border)'}`,
-                borderRadius: 'var(--radius-xs, 3px)',
-              }}
-            >
-              {k === 'all' ? 'All' : k === 'movie' ? 'Movies' : k === 'show' ? 'Series' : 'Wanted'}
+          {filtersActive && (
+            <button onClick={clearFilters} style={chip(false)} title="Clear search and filters">
+              clear
             </button>
-          ))}
-
-          {/* The guide's Grid⇄Table toggle. Both views are REAL — the table is guide screen 03
-              backed by its own public endpoint — so this is never a dead control. */}
-          <span style={{ display: 'inline-flex', marginLeft: 'auto' }}>
+          )}
+          <span style={{ display: 'inline-flex', gap: 2 }}>
             {(['grid', 'table'] as View[]).map(v => (
-              <button
-                key={v}
-                onClick={() => setView(v)}
-                aria-pressed={view === v}
-                style={{
-                  padding: '3px 10px',
-                  fontSize: 'var(--fs-2xs, 10px)',
-                  fontFamily: 'var(--font-mono)',
-                  textTransform: 'uppercase',
-                  letterSpacing: '0.04em',
-                  cursor: 'pointer',
-                  color: view === v ? 'var(--text-000, #fff)' : 'var(--text-300)',
-                  background: view === v ? 'var(--accent-dim, rgba(139,92,246,0.18))' : 'transparent',
-                  border: `1px solid ${view === v ? 'var(--accent, #8b5cf6)' : 'var(--border)'}`,
-                  borderRadius: 'var(--radius-xs, 3px)',
-                }}
-              >
+              <button key={v} onClick={() => setView(v)} aria-pressed={view === v} style={chip(view === v)}>
                 {v}
               </button>
             ))}
           </span>
         </div>
 
-        {/* THE scroll container. `minHeight: 0` is what lets it actually shrink inside the flex
-            parent instead of pushing the page body into being the scroller. `role`+`tabIndex` make
-            it keyboard-reachable — a scrollable region that cannot take focus is pointer-only. */}
+        {/* Row 2 — the two INDEPENDENT filter axes plus sort. Kept as separate
+            groups so "movies I don't own yet" is expressible; a single chip row
+            could not say that. */}
+        <div style={{ display: 'flex', gap: 'var(--space-3)', alignItems: 'center', flexWrap: 'wrap' }}>
+          {/* Each axis is a labelled group. Without this a screen reader meets
+              several ambiguous buttons — two of them effectively "everything" —
+              with no way to tell which axis they belong to (codex). */}
+          <span role="group" aria-label="Filter by kind" style={{ display: 'inline-flex', gap: 2, alignItems: 'center' }}>
+            <span aria-hidden style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', marginRight: 4 }}>kind</span>
+            {(['all', 'movie', 'show'] as KindFilter[]).map(k => (
+              <button
+                key={k}
+                onClick={() => setKind(k)}
+                aria-pressed={kind === k}
+                aria-label={k === 'all' ? 'All kinds' : k === 'movie' ? 'Movies' : 'Series'}
+                style={chip(kind === k)}
+              >
+                {k === 'all' ? 'All' : k === 'movie' ? 'Movies' : 'Series'}
+              </button>
+            ))}
+          </span>
+          <span role="group" aria-label="Filter by availability" style={{ display: 'inline-flex', gap: 2, alignItems: 'center' }}>
+            <span aria-hidden style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', marginRight: 4 }}>have</span>
+            {(['all', 'on_disk', 'wanted'] as AvailFilter[]).map(a => (
+              <button
+                key={a}
+                onClick={() => setAvail(a)}
+                aria-pressed={avail === a}
+                aria-label={a === 'all' ? 'Any availability' : a === 'on_disk' ? 'On disk' : 'Wanted'}
+                style={chip(avail === a)}
+              >
+                {a === 'all' ? 'Any' : a === 'on_disk' ? 'On disk' : 'Wanted'}
+              </button>
+            ))}
+          </span>
+          <span role="group" aria-label="Sort order" style={{ display: 'inline-flex', gap: 2, alignItems: 'center' }}>
+            <span aria-hidden style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', marginRight: 4 }}>sort</span>
+            {SORTS.map(sd => (
+              <button key={sd.key} onClick={() => setSort(sd.key)} aria-pressed={sort === sd.key} style={chip(sort === sd.key)}>
+                {sd.label}
+              </button>
+            ))}
+          </span>
+        </div>
+
+        {/* Body: the grid (with its alphabet rail) or the table. */}
         {view === 'table' ? (
           table.degraded ? (
             <div style={{ padding: 'var(--space-3)', fontSize: 'var(--fs-xs)', color: 'var(--text-300)' }}>
@@ -288,31 +447,97 @@ export function LibraryPanel() {
             <LibraryTableView rows={tableRows} />
           )
         ) : (
-        <div
-          role="region"
-          aria-label="Library poster grid"
-          tabIndex={0}
-          style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}
-        >
-          {visible.length === 0 && owned.length > 0 ? (
-            <div style={{ padding: 'var(--space-3)', fontSize: 'var(--fs-xs)', color: 'var(--text-300)' }}>
-              No titles match this filter.
-            </div>
-          ) : (
+          <div style={{ display: 'flex', gap: 'var(--space-2)', flex: 1, minHeight: 0 }}>
             <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fill, minmax(112px, 1fr))',
-                gap: 'var(--space-3)',
-                paddingRight: 'var(--space-1)',
-              }}
+              ref={scrollerRef}
+              role="region"
+              aria-label="Library poster grid"
+              tabIndex={0}
+              style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}
             >
-              {visible.map(item => (
-                <PosterTile key={item.media_item_id} item={item} />
-              ))}
+              {visible.length === 0 && owned.length > 0 ? (
+                <div style={{ padding: 'var(--space-3)', fontSize: 'var(--fs-xs)', color: 'var(--text-300)' }}>
+                  No titles match this filter.
+                </div>
+              ) : (
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fill, minmax(112px, 1fr))',
+                    gap: 'var(--space-3)',
+                    paddingRight: 'var(--space-1)',
+                  }}
+                >
+                  {visible.map((item, idx) => {
+                    // Anchor the FIRST tile of each letter bucket so a jump
+                    // targets a real element rather than an estimated offset —
+                    // tile heights vary with title wrapping.
+                    const key = alphaKey(item.title);
+                    const isFirstOfLetter = idx === 0 || alphaKey(visible[idx - 1].title) !== key;
+                    return (
+                      <div
+                        key={item.media_item_id}
+                        ref={
+                          isFirstOfLetter
+                            ? el => {
+                                letterAnchors.current[key] = el;
+                              }
+                            : undefined
+                        }
+                        style={{ minWidth: 0 }}
+                      >
+                        <PosterTile item={item} />
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
-          )}
-        </div>
+
+            {/* The A–Z jump rail. Only meaningful in title order, so under a year
+                sort it is hidden rather than shown as a row of inert letters. */}
+            {alphaActive && (
+              <div
+                role="navigation"
+                aria-label="Jump to letter"
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 0,
+                  overflow: 'hidden',
+                  flex: '0 0 auto',
+                  paddingLeft: 2,
+                }}
+              >
+                {ALPHABET.map(letter => {
+                  const has = presentLetters.has(letter);
+                  return (
+                    <button
+                      key={letter}
+                      onClick={() => has && jumpTo(letter)}
+                      disabled={!has}
+                      aria-disabled={!has}
+                      title={has ? `Jump to ${letter}` : `No titles under ${letter}`}
+                      style={{
+                        // A letter with nothing behind it is visibly inert, not a
+                        // button that silently does nothing when pressed.
+                        cursor: has ? 'pointer' : 'default',
+                        color: has ? 'var(--text-200)' : 'var(--text-500, rgba(255,255,255,0.18))',
+                        background: 'transparent',
+                        border: 'none',
+                        padding: '0 3px',
+                        lineHeight: 1.15,
+                        fontSize: 'var(--fs-2xs, 10px)',
+                        fontFamily: 'var(--font-mono)',
+                      }}
+                    >
+                      {letter}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         )}
       </div>
     </ChartCard>
