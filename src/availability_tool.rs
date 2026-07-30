@@ -64,6 +64,20 @@ impl RustTool for ToolAvailability {
         let pol = policy();
         // Report over the full compiled-in registry so a parked tool still SHOWS UP
         // here even though tools/list hides it from agents.
+        //
+        // KNOWN LIMITATION, stated honestly (round-3 review): availability is an
+        // OVERLAY keyed by tool name, not a field on `ToolInfo`, and this enumerates a
+        // freshly-built compiled-in registry. So this view covers compiled-in tools
+        // only — it does NOT list broker/worker routes or mesh-federated upstream
+        // tools, even though the ENFORCEMENT paths do cover them (`tools/list`
+        // filtering and the `tools/call` gate both run over the merged catalog, and
+        // `entry_for` matches namespaced names). Net effect: a federated tool CAN be
+        // parked and the parking WILL be enforced, it just will not appear in this
+        // listing.
+        //
+        // Threading availability into `ToolInfo` and reading the live merged catalog
+        // would close the gap; that is a larger refactor of the registry contract than
+        // this item, and is filed rather than smuggled in here.
         let mut registry = ToolRegistry::new();
         crate::registry::register_all(&mut registry);
 

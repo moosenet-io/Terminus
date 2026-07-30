@@ -34,6 +34,12 @@ use serde::Deserialize;
 /// `{"crucible_": {"state": "off", "reason": "retired 2026-07-30"}, ...}`
 pub const AVAILABILITY_ENV: &str = "TERMINUS_TOOL_AVAILABILITY_JSON";
 
+/// Reason reported for every tool when the configured map failed to parse. Stated
+/// plainly so an operator reading the admin view sees WHY everything is parked
+/// rather than concluding the fleet died.
+const MALFORMED_REASON: &str =
+    "the tool-availability map failed to parse — every tool is parked until it is fixed";
+
 /// Whether a tool may be offered to, and invoked by, an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Availability {
@@ -178,6 +184,14 @@ impl AvailabilityPolicy {
     /// family-wide `"crucible_" => off` can still be overridden by a specific
     /// `"crucible_status" => available`.
     pub fn state_of(&self, tool_name: &str) -> (Availability, Option<&str>) {
+        // A MALFORMED policy resolves to Off for EVERY tool, consistently.
+        // Round-3 review caught a real inconsistency here: `agent_usable` denied the
+        // call while `state_of` still reported `Available`, so `denial_message` could
+        // emit the nonsense "`weather` is currently available and cannot be called."
+        // Deny and report must agree.
+        if self.malformed {
+            return (Availability::Off, Some(MALFORMED_REASON));
+        }
         self.entry_for(tool_name)
             .map(|e| (e.state, e.reason.as_deref()))
             .unwrap_or((Availability::Available, None))
@@ -185,6 +199,9 @@ impl AvailabilityPolicy {
 
     /// Full record for `tool_name`, including `last_verified`.
     pub fn record_of(&self, tool_name: &str) -> (Availability, Option<&str>, Option<&str>) {
+        if self.malformed {
+            return (Availability::Off, Some(MALFORMED_REASON), None);
+        }
         match self.entry_for(tool_name) {
             Some(e) => (e.state, e.reason.as_deref(), e.last_verified.as_deref()),
             None => (Availability::Available, None, None),
@@ -422,6 +439,23 @@ mod tests {
         assert!(!p.agent_usable("weather"), "a malformed map must deny everything");
         assert!(!p.agent_usable("crucible_status"));
         assert!(!p.agent_usable("literally_anything"));
+    }
+
+    #[test]
+    fn a_malformed_policy_reports_off_consistently_not_available() {
+        // Round-3 review: deny and REPORT must agree. Previously agent_usable() said
+        // "no" while state_of() said "available", so the denial message read
+        // "`weather` is currently available and cannot be called."
+        let p = AvailabilityPolicy::from_json("{not json");
+        let (state, reason) = p.state_of("weather");
+        assert_eq!(state, Availability::Off, "a malformed policy must REPORT off, not available");
+        assert!(reason.unwrap().contains("failed to parse"));
+        let msg = p.denial_message("weather");
+        assert!(msg.contains("off"), "denial must say off: {msg}");
+        assert!(!msg.contains("currently available"), "must never say 'available ... cannot be called': {msg}");
+        let (rstate, rreason, _) = p.record_of("weather");
+        assert_eq!(rstate, Availability::Off);
+        assert!(rreason.is_some());
     }
 
     #[test]
