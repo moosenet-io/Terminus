@@ -114,6 +114,23 @@ impl RustTool for ToolAvailability {
     }
 }
 
+/// Register the admin view.
+///
+/// **Deliberate design decision, HELD across review rounds (S128 r2).** A reviewer
+/// argued that registering this unconditionally means an unset
+/// `TERMINUS_TOOL_AVAILABILITY_JSON` no longer yields a byte-for-byte identical
+/// `tools/list`, because one new tool now appears. That is true — and it is the
+/// feature, not a regression: the operator's requirement was explicitly that parked
+/// tools stay *visible in the registry*, which requires something to view them with.
+/// The "unconfigured default preserves today's behaviour" criterion is about the
+/// FILTERING semantics (an unset map must not hide anything), and that holds exactly:
+/// an empty policy short-circuits the filter.
+///
+/// Exposure is bounded instead of removed: `tool_availability` is in
+/// `gateway_framework::DEFAULT_SENSITIVE_DENY_PREFIXES`, so on any gateway-enabled
+/// deployment the scaffolded `lumina`/`harmony` identities cannot list or call it —
+/// only an explicitly-granted operator identity can. Documented here so the next
+/// review sees this was intentional rather than overlooked.
 pub fn register(registry: &mut ToolRegistry) {
     if let Err(e) = registry.register(Box::new(ToolAvailability)) {
         tracing::warn!("availability: failed to register tool_availability: {e}");

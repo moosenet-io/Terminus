@@ -92,6 +92,15 @@ struct Entry {
 #[derive(Debug, Clone, Default)]
 pub struct AvailabilityPolicy {
     entries: BTreeMap<String, Entry>,
+    /// True when the configured map FAILED TO PARSE. Such a policy denies EVERY tool
+    /// — the literal fail-closed reading of "malformed config fails closed to off".
+    ///
+    /// Review (S128 r2) was right to reject relying on startup validation alone:
+    /// `validate_env()` is only called by a binary that opts in, so any other binary
+    /// linking this crate and serving `handle_mcp` (e.g. `terminus_personal`) would
+    /// have silently un-parked every tool. The flag makes the guarantee a property of
+    /// the POLICY itself, not of one caller remembering to validate.
+    malformed: bool,
 }
 
 impl AvailabilityPolicy {
@@ -110,12 +119,16 @@ impl AvailabilityPolicy {
     /// returned an empty policy here, which failed OPEN — one operator typo and every
     /// parked tool silently came back. Review (S128) correctly rejected that.
     ///
-    /// The fix is NOT to fail closed at runtime either: an empty-on-error policy in
-    /// the other direction would take EVERY tool offline, which is a far worse outage
-    /// than the one it prevents. Instead the error is surfaced to
-    /// [`validate_env`], which the server calls at STARTUP and refuses to boot on —
-    /// so a malformed map is caught at deploy time, by the operator who just wrote it,
-    /// and a running service is never silently governed by a policy nobody understood.
+    /// (Correcting an inverted rationale in the first revision, caught in review: an
+    /// EMPTY policy makes every tool *Available* — it fails OPEN, not closed. The
+    /// earlier comment claimed the opposite and reasoned from it.)
+    ///
+    /// Two things now provide the guarantee, belt and braces:
+    /// 1. [`validate_env`] — a binary calls it at STARTUP and refuses to boot, so the
+    ///    operator who just edited the map sees the error at deploy. Preferred.
+    /// 2. [`AvailabilityPolicy::malformed`] — if a binary somehow serves without
+    ///    validating, the resulting policy denies EVERY tool. Loud and safe rather
+    ///    than silently re-parking nothing.
     pub fn try_from_json(raw: &str) -> Result<Self, String> {
         let parsed: BTreeMap<String, RawEntry> = serde_json::from_str(raw)
             .map_err(|e| format!("{AVAILABILITY_ENV} is not valid JSON: {e}"))?;
@@ -141,17 +154,21 @@ impl AvailabilityPolicy {
                 Entry { state, reason: raw_entry.reason, last_verified: raw_entry.last_verified },
             );
         }
-        Ok(Self { entries })
+        Ok(Self { entries, malformed: false })
     }
 
-    /// Lenient parse used by [`policy`] once [`validate_env`] has already proven the
-    /// document parses. A malformed document here yields an empty policy — but that
-    /// path is unreachable in a correctly-started server, because startup validation
-    /// refuses to boot first.
+    /// Lenient parse used by [`policy`]. A malformed document here yields a policy
+    /// flagged [`AvailabilityPolicy::malformed`], which denies EVERY tool — so a
+    /// binary that never calls [`validate_env`] still fails closed rather than
+    /// silently un-parking everything.
     pub fn from_json(raw: &str) -> Self {
         Self::try_from_json(raw).unwrap_or_else(|e| {
-            tracing::error!("availability: {e} — serving an EMPTY policy; this should be unreachable because startup validation refuses to boot on a malformed map");
-            Self::default()
+            tracing::error!(
+                "availability: {e} — FAILING CLOSED: every tool is unavailable until the \
+                 map is fixed. (A binary that calls validate_env() at startup refuses to \
+                 boot instead, which is the preferred way to hit this.)"
+            );
+            Self { entries: BTreeMap::new(), malformed: true }
         })
     }
 
@@ -205,8 +222,20 @@ impl AvailabilityPolicy {
     }
 
     /// Whether an AGENT may see/call `tool_name`.
+    ///
+    /// A MALFORMED policy denies everything — fail closed, per the acceptance
+    /// criterion. This is deliberately NOT "ignore the map and allow everything":
+    /// that direction re-exposes exactly the dead tools the feature exists to park.
     pub fn agent_usable(&self, tool_name: &str) -> bool {
+        if self.malformed {
+            return false;
+        }
         self.state_of(tool_name).0.agent_usable()
+    }
+
+    /// Whether the configured map failed to parse.
+    pub fn is_malformed(&self) -> bool {
+        self.malformed
     }
 
     /// The denial message handed back on a `tools/call` for an unavailable tool.
@@ -223,8 +252,10 @@ impl AvailabilityPolicy {
         }
     }
 
+    /// Whether this policy has no effect. A MALFORMED policy is never "empty" — it
+    /// denies everything, so the caller must NOT short-circuit past it.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && !self.malformed
     }
 
     /// Number of loaded rules — the admin view reports this so an operator can tell
@@ -378,6 +409,28 @@ mod tests {
         assert_eq!(state, Availability::Off);
         assert_eq!(reason, Some("retired"));
         assert_eq!(last, Some("2026-07-30"));
+    }
+
+    #[test]
+    fn a_malformed_policy_denies_every_tool_fail_closed() {
+        // The literal acceptance criterion. Review r2 correctly rejected relying on
+        // startup validation alone: another binary (terminus_personal) serves
+        // handle_mcp without calling validate_env, and would have silently un-parked
+        // everything.
+        let p = AvailabilityPolicy::from_json("{not json");
+        assert!(p.is_malformed());
+        assert!(!p.agent_usable("weather"), "a malformed map must deny everything");
+        assert!(!p.agent_usable("crucible_status"));
+        assert!(!p.agent_usable("literally_anything"));
+    }
+
+    #[test]
+    fn a_malformed_policy_is_not_reported_as_empty() {
+        // `is_empty()` short-circuits the tools/list filter. If a malformed policy
+        // reported itself empty, the filter would be skipped and the fail-closed
+        // guarantee would evaporate at exactly the moment it matters.
+        let p = AvailabilityPolicy::from_json("{not json");
+        assert!(!p.is_empty(), "a malformed policy must not be short-circuited as a no-op");
     }
 
     #[test]
