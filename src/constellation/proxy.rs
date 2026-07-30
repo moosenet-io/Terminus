@@ -66,6 +66,10 @@
 //! regardless of how much data Muse held. The `art/` arm is excluded: Muse
 //! serves artwork unauthenticated by design.
 //!
+//! Note the Muse arm still passes `auth_failure_detail: None` — see the inline
+//! comment in [`proxy_muse`] for why masking a 401 would make the GUI render
+//! the unavailable-body as if it were real panel data.
+//!
 //! ## LGUI-05: Lumina bearer injection (spec §6, decision D2)
 //! [`proxy_lumina`] is the one namespaced arm that authenticates itself to
 //! its backend. It attaches two headers the shared [`proxy`] helper doesn't
@@ -427,7 +431,20 @@ pub async fn proxy_muse(
         body,
         principal.as_deref(),
         &extra_headers,
-        Some("muse auth failed"),
+        // Deliberately NO `auth_failure_detail`, unlike the Lumina arm — this is
+        // not an oversight and not mere consistency with the other arms.
+        //
+        // The hint converts an upstream 401 into `200 + {available:false,...}`.
+        // Lumina's client understands that shape; constellation-web's Muse hooks
+        // do NOT. `useMuseSection` degrades only on a `null`/`undefined` body, so
+        // an `{available:false}` object arrives as DATA and gets rendered as if it
+        // were `MuseStats`/`MuseGaps` — broken cards instead of the clean
+        // "degraded" card the panel already knows how to draw.
+        //
+        // A verbatim 401 is strictly better here: the hook's `classifyError` turns
+        // it into a real error detail, which is also far more diagnostic than a
+        // masked one if the token is ever misconfigured.
+        None,
     )
     .await
 }
@@ -807,6 +824,41 @@ mod tests {
     }
 
     // ── TERM #549: Muse bearer injection ───────────────────────────────────
+
+    #[tokio::test]
+    async fn muse_arm_forwards_an_upstream_401_verbatim_rather_than_masking_it() {
+        // Regression guard for a mistake made and caught during TERM #549: giving
+        // the Muse arm an `auth_failure_detail` turns an upstream 401 into
+        // `200 + {available:false}`. constellation-web's `useMuseSection`
+        // degrades only on a null body, so that object would be rendered as real
+        // panel data. A verbatim 401 lets the hook's `classifyError` produce a
+        // proper error state instead.
+        async fn unauthorized() -> Response {
+            (StatusCode::UNAUTHORIZED, "nope").into_response()
+        }
+        let app = axum::Router::new().route("/premiere", axum::routing::get(unauthorized));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback"); // pii-test-fixture
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let resp = proxy(
+            "muse",
+            Some(format!("http://{addr}")), // pii-test-fixture
+            "premiere",
+            None,
+            Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            None,
+            &muse_upstream_headers(Some("t".to_string())),
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
 
     #[test]
     fn muse_upstream_headers_attaches_the_bearer_when_a_token_is_configured() {
