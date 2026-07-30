@@ -26,7 +26,7 @@
 // visit briefly shows empty tiles that fill in. That is a slow image, NOT a broken one (the art
 // endpoint returns 200 with a valid JPEG — verified directly), and NOT something the panel can fix
 // client-side. The real fix is a server-side thumbnail variant, tracked as MUSE #100.
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { ChartCard } from '../../viz/ChartCard';
 import { useMuseLibrary, useMuseLibraryTable, museArtUrlAt, type MuseLibraryItem } from '../../hooks/useMuse';
 import { LibraryTableView } from './LibraryTableView';
