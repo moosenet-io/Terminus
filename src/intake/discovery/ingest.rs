@@ -553,6 +553,7 @@ mod tests {
             is_instruct: None,
             gated: None,
             quant_dtype: None,
+            has_gguf: None,
         }
     }
 

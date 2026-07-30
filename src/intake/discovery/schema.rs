@@ -499,6 +499,16 @@ pub struct DiscoveryCandidate {
     /// Dominant dtype key of `safetensors.parameters` (e.g. `"BF16"`, `"Q4_K_M"`)
     /// — refines the VRAM estimate. `None` when absent.
     pub quant_dtype: Option<String>,
+    /// Whether the HF repo ships a pre-built GGUF weight file (any `*.gguf` in
+    /// the model-info `siblings[]` list, case-insensitive) — a PRACTICAL
+    /// SERVEABILITY signal: the fleet serves GGUF via ollama/llama.cpp and the
+    /// ingest path (`ollama pull hf.co/<repo>`) only accepts GGUF repos, so a
+    /// safetensors-only repo is neither ingestable nor serveable. `Some(true)` =
+    /// a GGUF exists; `Some(false)` = siblings known but none is GGUF; `None` =
+    /// unmeasured / no siblings signal. The selector hard-filters on this
+    /// (fail-closed on `None`); `COALESCE`-protected on upsert so a bare listing
+    /// re-observation never erases a measured value.
+    pub has_gguf: Option<bool>,
 }
 
 /// The migration SQL, applied out-of-band by an operator (matching
@@ -532,6 +542,17 @@ pub const MODEL_DISCOVERY_MODALITY_MIGRATION_SQL: &str =
 /// so a test can assert its shape without a live Postgres.
 pub const MODEL_DISCOVERY_PRACTICAL_MIGRATION_SQL: &str =
     include_str!("../../../migrations/S127-ask4-practical-metadata.sql");
+
+/// Ask-4 GGUF-availability (S127b) additive migration: adds the nullable
+/// `has_gguf` boolean parsed from the HF model-info `siblings[]` list by the
+/// MEASURE/ENRICH step — a practical serveability signal (the fleet serves GGUF
+/// via ollama/llama.cpp; `ollama pull hf.co/<repo>` only accepts GGUF repos).
+/// Additive/idempotent (`ADD COLUMN IF NOT EXISTS`), applied out-of-band by an
+/// operator exactly like the DISC-01/CB-02/S127 migrations. Kept byte-identical
+/// to the canonical copy in `migrations/`; the const exists so a test can assert
+/// its shape without a live Postgres.
+pub const MODEL_DISCOVERY_GGUF_MIGRATION_SQL: &str =
+    include_str!("../../../migrations/S127b-ask4-gguf-availability.sql");
 
 #[cfg(test)]
 mod tests {
@@ -814,6 +835,13 @@ mod tests {
             );
         }
         assert!(sql.contains("idx_discovery_candidate_license"));
+    }
+
+    #[test]
+    fn gguf_migration_sql_additively_adds_the_has_gguf_column() {
+        let sql = MODEL_DISCOVERY_GGUF_MIGRATION_SQL;
+        assert!(sql.contains("ALTER TABLE model_discovery_candidate"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS has_gguf"));
     }
 
     #[test]

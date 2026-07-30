@@ -44,7 +44,7 @@ fn is_missing_relation_error(msg: &str) -> bool {
 const READ_BROCHURE_SQL: &str = "SELECT model_name, hf_repo, category, status, gfx1151_class, \
      size_b, vram_footprint_gb, discovery_source, discovery_score, discovered_at, last_seen_at, \
      fetched_at, marked_for_fleet_at, evicted_at, retained_profile, rationale, modality, \
-     published_at, updated_at, license, arch, is_instruct, gated, quant_dtype \
+     published_at, updated_at, license, arch, is_instruct, gated, quant_dtype, has_gguf \
      FROM model_discovery_candidate ORDER BY model_name";
 
 /// Row shape the brochure SELECT decodes into, before `category`/`status` are
@@ -84,6 +84,8 @@ struct BrochureRow {
     is_instruct: Option<bool>,
     gated: Option<bool>,
     quant_dtype: Option<String>,
+    /// S127b GGUF-availability; NULL = not yet measured.
+    has_gguf: Option<bool>,
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for BrochureRow {
@@ -114,6 +116,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for BrochureRow {
             is_instruct: row.try_get("is_instruct")?,
             gated: row.try_get("gated")?,
             quant_dtype: row.try_get("quant_dtype")?,
+            has_gguf: row.try_get("has_gguf")?,
         })
     }
 }
@@ -177,6 +180,7 @@ pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, Too
             is_instruct,
             gated,
             quant_dtype,
+            has_gguf,
         } = row;
         let category = FleetCategory::from_str(&category).map_err(|e| {
             ToolError::Database(format!(
@@ -229,6 +233,7 @@ pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, Too
             is_instruct,
             gated,
             quant_dtype,
+            has_gguf,
         });
     }
     Ok(out)

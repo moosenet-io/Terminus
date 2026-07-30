@@ -89,6 +89,7 @@ use crate::intake::discovery::schema::{CandidateStatus, DiscoveryCandidate};
 /// `arch`/`is_instruct`/`gated`/`quant_dtype`, S127) are all `COALESCE`-
 /// protected identically: a MEASURE/ENRICH pass writes real values, and a later
 /// bare-listing re-observation (which carries them as `NULL`) never erases them.
+/// The S127b `has_gguf` serveability flag is `COALESCE`-protected the same way.
 ///
 /// `gfx1151_class` keeps its CASE (not COALESCE) semantics — see
 /// [`resolve_gfx1151_on_conflict`] for the pure mirror this SQL implements: a
@@ -108,9 +109,10 @@ pub async fn upsert_candidate(
              (model_name, hf_repo, category, status, gfx1151_class, size_b, \
               vram_footprint_gb, discovery_source, discovery_score, \
               discovered_at, last_seen_at, rationale, modality, \
-              published_at, updated_at, license, arch, is_instruct, gated, quant_dtype) \
+              published_at, updated_at, license, arch, is_instruct, gated, quant_dtype, \
+              has_gguf) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), $10, $11, \
-                 $12, $13, $14, $15, $16, $17, $18) \
+                 $12, $13, $14, $15, $16, $17, $18, $19) \
          ON CONFLICT (model_name) DO UPDATE SET \
              hf_repo = EXCLUDED.hf_repo, \
              category = EXCLUDED.category, \
@@ -131,7 +133,8 @@ pub async fn upsert_candidate(
              arch = COALESCE(EXCLUDED.arch, model_discovery_candidate.arch), \
              is_instruct = COALESCE(EXCLUDED.is_instruct, model_discovery_candidate.is_instruct), \
              gated = COALESCE(EXCLUDED.gated, model_discovery_candidate.gated), \
-             quant_dtype = COALESCE(EXCLUDED.quant_dtype, model_discovery_candidate.quant_dtype)",
+             quant_dtype = COALESCE(EXCLUDED.quant_dtype, model_discovery_candidate.quant_dtype), \
+             has_gguf = COALESCE(EXCLUDED.has_gguf, model_discovery_candidate.has_gguf)",
     )
     .bind(&candidate.model_name)
     .bind(&candidate.hf_repo)
@@ -151,6 +154,7 @@ pub async fn upsert_candidate(
     .bind(candidate.is_instruct)
     .bind(candidate.gated)
     .bind(candidate.quant_dtype.as_deref())
+    .bind(candidate.has_gguf)
     .execute(pool)
     .await
     .map_err(|e| {
