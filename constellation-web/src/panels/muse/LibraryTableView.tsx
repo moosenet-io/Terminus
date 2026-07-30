@@ -84,6 +84,10 @@ export function LibraryTableView({ rows }: { rows: MuseLibraryTableRow[] }) {
             <th style={TH}>Year</th>
             <th style={TH}>Kind</th>
             <th style={TH}>Quality profile</th>
+            {/* The guide's upgrade-signal column, verbatim: "On disk / cutoff". codex correctly
+                noted that rendering a Files count instead dropped a guide element that IS
+                buildable — both `on_disk` and `cutoff_met` are in the projection. */}
+            <th style={TH}>On disk / cutoff</th>
             <th style={{ ...TH, textAlign: 'right' }}>Files</th>
             <th style={{ ...TH, textAlign: 'right' }}>Size</th>
             <th style={TH}>Status</th>
@@ -102,6 +106,36 @@ export function LibraryTableView({ rows }: { rows: MuseLibraryTableRow[] }) {
                 <td style={{ ...TD, color: 'var(--text-200)' }}>{r.kind}</td>
                 {/* No profile configured → em-dash. Do NOT substitute a default profile name. */}
                 <td style={{ ...TD, color: 'var(--text-200)' }}>{r.quality_profile_name ?? '—'}</td>
+                {/* on_disk is a definite boolean; cutoff_met is TRISTATE and the null case is the
+                    whole point — `null` means no quality profile is configured, i.e. UNKNOWN. It
+                    renders as an em-dash with no badge: reading it as "meets cutoff" would invent a
+                    quality judgement about the operator's file, and reading it as "needs upgrade"
+                    would invent a defect. On this deployment every row is null. */}
+                <td style={{ ...TD, fontFamily: 'var(--font-mono)', color: 'var(--text-200)' }}>
+                  <span style={{ color: r.on_disk ? 'var(--ok, #4ade80)' : 'var(--text-300)' }}>
+                    {r.on_disk ? '✓' : '✗'}
+                  </span>
+                  {' / '}
+                  <span
+                    title={
+                      r.cutoff_met === null
+                        ? 'No quality profile configured — cutoff unknown'
+                        : r.cutoff_met
+                          ? 'Meets cutoff'
+                          : 'Below cutoff — upgrade available'
+                    }
+                    style={{
+                      color:
+                        r.cutoff_met === null
+                          ? 'var(--text-300)'
+                          : r.cutoff_met
+                            ? 'var(--ok, #4ade80)'
+                            : 'var(--warn, #fbbf24)',
+                    }}
+                  >
+                    {r.cutoff_met === null ? '—' : r.cutoff_met ? '✓' : '↑'}
+                  </span>
+                </td>
                 <td style={TD_NUM}>{r.file_count}</td>
                 <td style={TD_NUM}>{formatSize(r.size_bytes)}</td>
                 <td style={{ ...TD, color: status.tone, fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-2xs, 10px)' }}>
