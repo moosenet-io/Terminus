@@ -55,6 +55,21 @@
 //! [`crate::constellation::audit::record_mutating_request`] before the
 //! backend call is attempted.
 //!
+//! ## TERM #549: Muse bearer injection
+//!
+//! [`proxy_muse`] authenticates to Muse with `Authorization: Bearer
+//! <CONSTELLATION_MUSE_TOKEN>` (point-of-use read via
+//! [`config::constellation_muse_token`]; absent ⇒ no header, so a token-less
+//! dev Muse still works). Without it every read against Muse's *protected*
+//! router — `/premiere`, `/api/graph/*` — answered 401, each constellation
+//! Muse panel degraded to "not yet wired", and the section rendered empty
+//! regardless of how much data Muse held. The `art/` arm is excluded: Muse
+//! serves artwork unauthenticated by design.
+//!
+//! Note the Muse arm still passes `auth_failure_detail: None` — see the inline
+//! comment in [`proxy_muse`] for why masking a 401 would make the GUI render
+//! the unavailable-body as if it were real panel data.
+//!
 //! ## LGUI-05: Lumina bearer injection (spec §6, decision D2)
 //! [`proxy_lumina`] is the one namespaced arm that authenticates itself to
 //! its backend. It attaches two headers the shared [`proxy`] helper doesn't
@@ -324,6 +339,25 @@ fn lumina_upstream_headers(token: Option<String>, principal: Option<&str>) -> Ve
     headers
 }
 
+/// The `extra_upstream_headers` [`proxy_muse`] passes to [`proxy`] — the Muse
+/// counterpart of [`lumina_upstream_headers`], pulled out as a pure function
+/// for the same reason (directly unit-testable, no axum round-trip).
+///
+/// `token` is the point-of-use `CONSTELLATION_MUSE_TOKEN` read; `None` ⇒ no
+/// `Authorization` header at all, so a token-less dev Muse keeps working.
+///
+/// Deliberately narrower than the Lumina builder: Muse has no `X-*-User`
+/// convention, so the verified principal is NOT forwarded as a header here.
+/// Muse scopes per-account reads from its own token identity, and inventing a
+/// user header it does not read would be dead weight that looks load-bearing.
+fn muse_upstream_headers(token: Option<String>) -> Vec<(&'static str, String)> {
+    let mut headers = Vec::new();
+    if let Some(token) = token {
+        headers.push(("authorization", format!("Bearer {token}")));
+    }
+    headers
+}
+
 /// LGUI-05 (spec §6, D2): the one namespaced arm that authenticates itself
 /// to its backend — see the module doc's "LGUI-05: Lumina bearer injection"
 /// section for the full design and why the two headers built here can never
@@ -376,6 +410,17 @@ pub async fn proxy_muse(
     if path.starts_with("art/") {
         return proxy_muse_art(&path, query.as_deref(), method, &headers, body, principal.as_deref()).await;
     }
+    // TERM #549: authenticate to Muse. Its protected router (`/premiere`, the
+    // `/api/graph/*` set) answered 401 for every GUI read before this, which
+    // surfaced as permanently "not yet wired" Muse panels. Same point-of-use
+    // read + fail-soft-when-absent posture as the Lumina arm above.
+    //
+    // NOTE the `art/` early return above deliberately does NOT get the bearer:
+    // Muse serves `/art/{kind}/{id}` unauthenticated by design (MUSE-27), and
+    // that arm is raw binary passthrough, so a token there would be sent for
+    // nothing.
+    let extra_headers = muse_upstream_headers(config::constellation_muse_token());
+
     proxy(
         "muse",
         config::constellation_muse_url(),
@@ -385,7 +430,20 @@ pub async fn proxy_muse(
         &headers,
         body,
         principal.as_deref(),
-        &[],
+        &extra_headers,
+        // Deliberately NO `auth_failure_detail`, unlike the Lumina arm — this is
+        // not an oversight and not mere consistency with the other arms.
+        //
+        // The hint converts an upstream 401 into `200 + {available:false,...}`.
+        // Lumina's client understands that shape; constellation-web's Muse hooks
+        // do NOT. `useMuseSection` degrades only on a `null`/`undefined` body, so
+        // an `{available:false}` object arrives as DATA and gets rendered as if it
+        // were `MuseStats`/`MuseGaps` — broken cards instead of the clean
+        // "degraded" card the panel already knows how to draw.
+        //
+        // A verbatim 401 is strictly better here: the hook's `classifyError` turns
+        // it into a real error detail, which is also far more diagnostic than a
+        // masked one if the token is ever misconfigured.
         None,
     )
     .await
@@ -765,6 +823,67 @@ mod tests {
         std::env::remove_var("CONSTELLATION_AUDIT_LOG_PATH");
     }
 
+    // ── TERM #549: Muse bearer injection ───────────────────────────────────
+
+    #[tokio::test]
+    async fn muse_arm_forwards_an_upstream_401_verbatim_rather_than_masking_it() {
+        // Regression guard for a mistake made and caught during TERM #549: giving
+        // the Muse arm an `auth_failure_detail` turns an upstream 401 into
+        // `200 + {available:false}`. constellation-web's `useMuseSection`
+        // degrades only on a null body, so that object would be rendered as real
+        // panel data. A verbatim 401 lets the hook's `classifyError` produce a
+        // proper error state instead.
+        async fn unauthorized() -> Response {
+            (StatusCode::UNAUTHORIZED, "nope").into_response()
+        }
+        let app = axum::Router::new().route("/premiere", axum::routing::get(unauthorized));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback"); // pii-test-fixture
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let resp = proxy(
+            "muse",
+            Some(format!("http://{addr}")), // pii-test-fixture
+            "premiere",
+            None,
+            Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            None,
+            &muse_upstream_headers(Some("t".to_string())),
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn muse_upstream_headers_attaches_the_bearer_when_a_token_is_configured() {
+        let headers = muse_upstream_headers(Some("muse-token".to_string()));
+        assert_eq!(headers, vec![("authorization", "Bearer muse-token".to_string())]);
+    }
+
+    #[test]
+    fn muse_upstream_headers_are_empty_without_a_token() {
+        // Fail-soft, matching the Lumina arm: no token means unauthenticated
+        // passthrough (a token-less dev Muse keeps working), never a synthesised
+        // or empty Authorization header — an `Authorization: Bearer ` with no
+        // value would be worse than none, since Muse would reject it outright.
+        assert!(muse_upstream_headers(None).is_empty());
+    }
+
+    #[test]
+    fn muse_upstream_headers_never_forward_a_user_header() {
+        // Unlike Lumina, Muse has no X-*-User convention. Asserting the ABSENCE
+        // keeps a future edit from bolting on a header Muse does not read.
+        let headers = muse_upstream_headers(Some("t".to_string()));
+        assert!(headers.iter().all(|(k, _)| *k != "x-lumina-user" && *k != "x-muse-user"));
+        assert_eq!(headers.len(), 1);
+    }
+
     // ── LGUI-05: Lumina bearer injection (spec §6, D2) ──────────────────────
 
     #[test]
@@ -959,6 +1078,69 @@ mod tests {
         assert_eq!(parsed["system"], "lumina");
         assert_eq!(parsed["available"], false);
         assert_eq!(parsed["detail"], "lumina auth failed");
+    }
+
+    /// TERM-549 (review follow-up): the two unit tests above prove `muse_upstream_headers`
+    /// BUILDS the right header, but not that `proxy` actually puts it ON THE WIRE, nor that it
+    /// stays off the browser-facing response. This closes both halves against a real loopback
+    /// upstream: the upstream captures what it received out-of-band (a shared slot, NOT the
+    /// response body -- echoing the token back would make the assertion self-defeating), then we
+    /// assert the client-visible response never contains the token literal.
+    #[tokio::test]
+    #[serial]
+    async fn muse_bearer_reaches_the_upstream_on_the_wire_and_never_the_browser_response() {
+        const TOKEN: &str = "muse-token-fixture-value"; // pii-test-fixture
+        let seen: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let captured = Arc::clone(&seen);
+
+        let app = axum::Router::new().route(
+            "/stats",
+            axum::routing::get(move |headers: HeaderMap| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let got = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    *captured.lock().unwrap() = got;
+                    // Deliberately a token-free body -- see the doc comment above.
+                    (StatusCode::OK, "{\"library_size\":1}").into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback"); // pii-test-fixture
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let resp = proxy(
+            "muse",
+            Some(format!("http://{addr}")), // pii-test-fixture
+            "stats",
+            None,
+            Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            None,
+            &muse_upstream_headers(Some(TOKEN.to_string())),
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some(format!("Bearer {TOKEN}").as_str()),
+            "the bearer must actually reach the Muse upstream, not just be built in memory"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains(TOKEN),
+            "the Muse token must never appear in the browser-facing response body"
+        );
     }
 
     /// Regression: `auth_failure_detail: None` (every non-Lumina arm) leaves a `401` from the
