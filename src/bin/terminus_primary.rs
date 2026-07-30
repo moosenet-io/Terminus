@@ -136,6 +136,30 @@ const DEFAULT_MESH_HEALTH_INTERVAL_SECS: u64 = 30;
 async fn main() {
     terminus_rs::intake::init_tracing();
 
+    // TAVAIL-01: validate the tool-availability map BEFORE serving anything.
+    //
+    // This is where "malformed availability config fails closed" lives. Silently
+    // ignoring an unparseable map fails OPEN (every parked tool quietly comes back);
+    // emptying the policy on error fails closed so hard the assistant loses every
+    // tool. Refusing to BOOT is the honest third option: the operator who just edited
+    // the map sees the error immediately at deploy, and a running service is never
+    // governed by a policy nobody understood. An unset variable is valid and means
+    // "no rules" — the untouched default.
+    match terminus_rs::availability::validate_env() {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("availability: {n} tool-availability rule(s) loaded"),
+        Err(e) => {
+            eprintln!("FATAL: {e}");
+            eprintln!(
+                "Refusing to start: the tool-availability map must parse, or the \
+                 server would run under a policy that was never understood. \
+                 Fix {} and restart.",
+                terminus_rs::availability::AVAILABILITY_ENV
+            );
+            std::process::exit(1);
+        }
+    }
+
     let port: u16 = std::env::var("TERMINUS_PRIMARY_PORT")
         .ok()
         .and_then(|v| v.parse().ok())

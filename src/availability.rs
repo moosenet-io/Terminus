@@ -70,12 +70,19 @@ struct RawEntry {
     state: String,
     #[serde(default)]
     reason: Option<String>,
+    /// When the operator last CONFIRMED this state (free-form, e.g. "2026-07-30").
+    /// Availability is deliberately operator-confirmed rather than auto-inferred from
+    /// a failed probe — a flaky upstream would otherwise flap tools off — so the human
+    /// reading the admin view needs to know how stale that confirmation is.
+    #[serde(default)]
+    last_verified: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct Entry {
     state: Availability,
     reason: Option<String>,
+    last_verified: Option<String>,
 }
 
 /// Resolved availability policy. Keys are matched as EXACT names first, then as
@@ -97,22 +104,21 @@ impl AvailabilityPolicy {
         }
     }
 
-    /// Parse a policy from JSON. A wholly unparseable document yields an empty
-    /// policy plus a loud error: refusing to serve ANY tool because one operator
-    /// typo broke the JSON would be a far worse outage than ignoring the map, and
-    /// the per-entry fail-closed rule below still protects the entries that DID
-    /// parse.
-    pub fn from_json(raw: &str) -> Self {
-        let parsed: BTreeMap<String, RawEntry> = match serde_json::from_str(raw) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(
-                    "availability: {AVAILABILITY_ENV} is not valid JSON ({e}) — \
-                     ignoring it; every tool stays available. Fix the map."
-                );
-                return Self::default();
-            }
-        };
+    /// Parse a policy from JSON, or `Err` describing why it could not be parsed.
+    ///
+    /// **Whole-document failure is NOT silently tolerated.** An earlier revision
+    /// returned an empty policy here, which failed OPEN — one operator typo and every
+    /// parked tool silently came back. Review (S128) correctly rejected that.
+    ///
+    /// The fix is NOT to fail closed at runtime either: an empty-on-error policy in
+    /// the other direction would take EVERY tool offline, which is a far worse outage
+    /// than the one it prevents. Instead the error is surfaced to
+    /// [`validate_env`], which the server calls at STARTUP and refuses to boot on —
+    /// so a malformed map is caught at deploy time, by the operator who just wrote it,
+    /// and a running service is never silently governed by a policy nobody understood.
+    pub fn try_from_json(raw: &str) -> Result<Self, String> {
+        let parsed: BTreeMap<String, RawEntry> = serde_json::from_str(raw)
+            .map_err(|e| format!("{AVAILABILITY_ENV} is not valid JSON: {e}"))?;
 
         let mut entries = BTreeMap::new();
         for (key, raw_entry) in parsed {
@@ -130,9 +136,23 @@ impl AvailabilityPolicy {
                     Availability::Off
                 }
             };
-            entries.insert(key, Entry { state, reason: raw_entry.reason });
+            entries.insert(
+                key,
+                Entry { state, reason: raw_entry.reason, last_verified: raw_entry.last_verified },
+            );
         }
-        Self { entries }
+        Ok(Self { entries })
+    }
+
+    /// Lenient parse used by [`policy`] once [`validate_env`] has already proven the
+    /// document parses. A malformed document here yields an empty policy — but that
+    /// path is unreachable in a correctly-started server, because startup validation
+    /// refuses to boot first.
+    pub fn from_json(raw: &str) -> Self {
+        Self::try_from_json(raw).unwrap_or_else(|e| {
+            tracing::error!("availability: {e} — serving an EMPTY policy; this should be unreachable because startup validation refuses to boot on a malformed map");
+            Self::default()
+        })
     }
 
     /// The resolved state for `tool_name`, plus the operator's reason if any.
@@ -141,21 +161,47 @@ impl AvailabilityPolicy {
     /// family-wide `"crucible_" => off` can still be overridden by a specific
     /// `"crucible_status" => available`.
     pub fn state_of(&self, tool_name: &str) -> (Availability, Option<&str>) {
+        self.entry_for(tool_name)
+            .map(|e| (e.state, e.reason.as_deref()))
+            .unwrap_or((Availability::Available, None))
+    }
+
+    /// Full record for `tool_name`, including `last_verified`.
+    pub fn record_of(&self, tool_name: &str) -> (Availability, Option<&str>, Option<&str>) {
+        match self.entry_for(tool_name) {
+            Some(e) => (e.state, e.reason.as_deref(), e.last_verified.as_deref()),
+            None => (Availability::Available, None, None),
+        }
+    }
+
+    /// Resolve the governing entry, if any.
+    ///
+    /// A MESH-federated tool is advertised namespaced (`<namespace>__<tool>`), so a
+    /// family rule authored against the BARE name (`"crucible_"`) must still govern
+    /// `"ct322__crucible_status"` — otherwise a parked tool re-appears the moment it
+    /// is reached through an upstream. This mirrors
+    /// `gateway_framework::deny_matches`, which closes the same hole for deny
+    /// prefixes. Matching order: exact raw name, exact bare name, then longest
+    /// prefix over either form.
+    fn entry_for(&self, tool_name: &str) -> Option<&Entry> {
         if let Some(e) = self.entries.get(tool_name) {
-            return (e.state, e.reason.as_deref());
+            return Some(e);
+        }
+        let bare = crate::mesh::merge::split_namespaced(tool_name).map(|(_, b)| b);
+        if let Some(b) = bare {
+            if let Some(e) = self.entries.get(b) {
+                return Some(e);
+            }
         }
         let mut best: Option<(&String, &Entry)> = None;
         for (key, entry) in &self.entries {
-            if tool_name.starts_with(key.as_str())
-                && best.map_or(true, |(bk, _)| key.len() > bk.len())
-            {
+            let hit = tool_name.starts_with(key.as_str())
+                || bare.map_or(false, |b| b.starts_with(key.as_str()));
+            if hit && best.map_or(true, |(bk, _)| key.len() > bk.len()) {
                 best = Some((key, entry));
             }
         }
-        match best {
-            Some((_, e)) => (e.state, e.reason.as_deref()),
-            None => (Availability::Available, None),
-        }
+        best.map(|(_, e)| e)
     }
 
     /// Whether an AGENT may see/call `tool_name`.
@@ -179,6 +225,31 @@ impl AvailabilityPolicy {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Number of loaded rules — the admin view reports this so an operator can tell
+    /// "my 12 rules loaded" from "my map silently did not parse".
+    pub fn rule_count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Validate the availability map at STARTUP, before serving anything.
+///
+/// This is where "malformed config fails closed" actually lives: the server refuses
+/// to start rather than run under a policy that did not parse. Catching it here — at
+/// deploy, in front of the operator who just edited the map — is strictly better than
+/// either silently ignoring it (fails open: parked tools come back) or emptying it
+/// (fails closed so hard the assistant loses every tool).
+///
+/// An UNSET or blank variable is valid and means "no rules" — that is the untouched
+/// default for every deployment that never opts in.
+pub fn validate_env() -> Result<usize, String> {
+    match std::env::var(AVAILABILITY_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => {
+            AvailabilityPolicy::try_from_json(&raw).map(|p| p.rule_count())
+        }
+        _ => Ok(0),
     }
 }
 
@@ -262,12 +333,57 @@ mod tests {
     }
 
     #[test]
-    fn malformed_json_is_ignored_not_a_global_outage() {
-        // One typo must not take every tool down; per-entry fail-closed still applies
-        // to entries that DO parse.
-        let p = policy("{not json");
-        assert!(p.is_empty());
-        assert!(p.agent_usable("crucible_status"));
+    fn malformed_json_is_a_hard_error_not_a_silent_empty_policy() {
+        // Review (S128) correctly rejected the original behaviour here: returning an
+        // empty policy on a parse failure fails OPEN — one typo and every parked tool
+        // silently comes back. `try_from_json` now reports the error so STARTUP can
+        // refuse to boot on it (see `validate_env`).
+        let err = AvailabilityPolicy::try_from_json("{not json").unwrap_err();
+        assert!(err.contains(AVAILABILITY_ENV), "error must name the variable: {err}");
+    }
+
+    #[test]
+    fn validate_env_rejects_a_malformed_map() {
+        // The startup gate itself: a malformed document is an Err, which
+        // terminus_primary turns into a refusal to boot.
+        assert!(AvailabilityPolicy::try_from_json("{\"a\": }").is_err());
+        // ...while a well-formed one reports its rule count.
+        let n = AvailabilityPolicy::try_from_json(r#"{"a_":{"state":"off"},"b_":{"state":"broken"}}"#)
+            .unwrap()
+            .rule_count();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn namespaced_federated_names_are_governed_by_a_bare_family_rule() {
+        // A mesh upstream advertises `<namespace>__<tool>`. A family rule authored
+        // against the BARE name must still park it, or a tool switched off locally
+        // silently reappears the moment it is reached through an upstream.
+        let p = policy(r#"{"crucible_": {"state":"off","reason":"retired"}}"#);
+        assert!(!p.agent_usable("crucible_status"), "bare name must be parked");
+        assert!(
+            !p.agent_usable("ct322__crucible_status"),
+            "the namespaced form must be parked by the same bare family rule"
+        );
+        // An unrelated namespaced tool is untouched.
+        assert!(p.agent_usable("ct322__weather"));
+    }
+
+    #[test]
+    fn last_verified_round_trips_into_the_record() {
+        let p = policy(
+            r#"{"soma_": {"state":"off","reason":"retired","last_verified":"2026-07-30"}}"#,
+        );
+        let (state, reason, last) = p.record_of("soma_status");
+        assert_eq!(state, Availability::Off);
+        assert_eq!(reason, Some("retired"));
+        assert_eq!(last, Some("2026-07-30"));
+    }
+
+    #[test]
+    fn rule_count_reports_the_real_number_not_a_boolean() {
+        let p = policy(r#"{"a_":{"state":"off"},"b_":{"state":"off"},"c_":{"state":"broken"}}"#);
+        assert_eq!(p.rule_count(), 3, "admin view must show how many rules actually loaded");
     }
 
     #[test]

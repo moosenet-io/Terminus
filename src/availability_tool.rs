@@ -74,7 +74,7 @@ impl RustTool for ToolAvailability {
             if !prefix.is_empty() && !t.name.starts_with(prefix) {
                 continue;
             }
-            let (state, reason) = pol.state_of(&t.name);
+            let (state, reason, last_verified) = pol.record_of(&t.name);
             match state {
                 Availability::Available => n_avail += 1,
                 Availability::Off => n_off += 1,
@@ -90,6 +90,10 @@ impl RustTool for ToolAvailability {
                 "state": state.as_str(),
                 "agent_visible": state.agent_usable(),
                 "reason": reason,
+                // When the operator last CONFIRMED this state. Availability is
+                // operator-confirmed, never auto-inferred from a failed probe, so a
+                // stale stamp is the signal that a parked tool deserves re-checking.
+                "last_verified": last_verified,
             }));
         }
 
@@ -100,7 +104,7 @@ impl RustTool for ToolAvailability {
                 "available": n_avail,
                 "off": n_off,
                 "broken": n_broken,
-                "policy_rules": if pol.is_empty() { 0 } else { 1 },
+                "policy_rules": pol.rule_count(),
             },
             "note": "Tools in state 'off' or 'broken' remain REGISTERED and listed here, \
                      but are hidden from agent tool listings and refused at call time.",

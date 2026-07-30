@@ -191,6 +191,13 @@ pub const DEFAULT_SENSITIVE_DENY_PREFIXES: &[&str] = &[
     "routines_batch_",
     "soma_rename_agent",
     "soma_skill_approve",
+    // TAVAIL-01: the availability ADMIN view. It enumerates the ENTIRE compiled-in
+    // tool inventory together with the operator's free-text reasons for parking
+    // things — an operational map of the fleet that a personal-assistant or
+    // build-orchestrator identity has no business reading. Denied here so it is
+    // reachable only by an explicitly-granted operator identity, not by the
+    // scaffolded defaults (review finding, S128).
+    "tool_availability",
 ];
 
 /// A single identity's grant, in either of two shapes:

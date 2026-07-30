@@ -618,28 +618,6 @@ async fn handle_mcp(
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-            // TAVAIL-01: availability gate, FAIL CLOSED and BEFORE any dispatch.
-            // The tools/list filter alone is not enough — an agent holding a catalog
-            // cached from before a tool was parked would still be able to invoke it.
-            // This is the gate that actually protects; the list filter is only what
-            // stops the model being tempted in the first place.
-            //
-            // The message names the state + the operator's reason rather than a bare
-            // "not found", so the model parks the tool instead of hunting for it
-            // (the exact failure mode that made `deep_research` waste loop turns).
-            {
-                let avail = crate::availability::policy();
-                if !name.is_empty() && !avail.agent_usable(name) {
-                    let detail = avail.denial_message(name);
-                    tracing::warn!("availability: refused tools/call for unavailable tool {name}");
-                    // -32000 (server error), matching the JSON-RPC convention used for
-                    // an application-level refusal rather than -32601 "method not
-                    // found" — the tool EXISTS and is deliberately parked, and saying
-                    // otherwise is what sends a model hunting for it.
-                    return sse_response(id, Err((-32000, detail)), "");
-                }
-            }
-
             // MESH-10: the canonical principal + the namespace (if any) the
             // advertised name parses to -- computed once up front so both
             // the pre-dispatch deny path (mesh routing hasn't run yet, so it
@@ -701,6 +679,38 @@ async fn handle_mcp(
             } else {
                 None
             };
+
+            // TAVAIL-01: availability gate — AFTER authorization, BEFORE dispatch.
+            //
+            // Ordering is deliberate and was corrected in review: running this BEFORE
+            // `guard()` leaked existence, letting an UNAUTHORIZED caller learn that a
+            // tool exists and read the operator's reason for parking it. Authorization
+            // decides what you may know about; availability then decides whether the
+            // thing you are allowed to use actually works.
+            //
+            // Still before dispatch, because the `tools/list` filter alone is not
+            // enough: an agent holding a catalog cached from before a tool was parked
+            // would otherwise still invoke it. The list filter stops the model being
+            // tempted; THIS is the gate that protects.
+            //
+            // The refusal names the state + reason rather than "not found" — a
+            // "not found" is what sends a model hunting for the tool, which is exactly
+            // how the `deep_research` phantom burned loop turns.
+            {
+                let avail = crate::availability::policy();
+                if !name.is_empty() && !avail.agent_usable(name) {
+                    let detail = avail.denial_message(name);
+                    tracing::warn!("availability: refused tools/call for unavailable tool {name}");
+                    return sse_response(
+                        id,
+                        Ok(json!({
+                            "content": [{"type": "text", "text": detail}],
+                            "isError": true
+                        })),
+                        "",
+                    );
+                }
+            }
 
             // MESH-03: a namespaced name (`<namespace>__<tool>`) routes to
             // its owning mesh upstream (or a clean "unavailable" tool-error
