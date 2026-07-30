@@ -15,7 +15,8 @@ use serde_json::{json, Value};
 
 use crate::availability::{policy, Availability};
 use crate::error::ToolError;
-use crate::registry::{RustTool, ToolRegistry};
+use crate::registry::ToolRegistry;
+use crate::tool::RustTool;
 
 pub struct ToolAvailability;
 

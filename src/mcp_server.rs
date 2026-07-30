@@ -609,7 +609,7 @@ async fn handle_mcp(
                 });
                 let hidden = before - tools.len();
                 if hidden > 0 {
-                    debug!("availability: hid {hidden} unavailable tool(s) from tools/list");
+                    tracing::debug!("availability: hid {hidden} unavailable tool(s) from tools/list");
                 }
             }
             sse_response(id, Ok(json!({"tools": tools})), "")
@@ -631,7 +631,7 @@ async fn handle_mcp(
                 let avail = crate::availability::policy();
                 if !name.is_empty() && !avail.agent_usable(name) {
                     let detail = avail.denial_message(name);
-                    warn!("availability: refused tools/call for unavailable tool {name}");
+                    tracing::warn!("availability: refused tools/call for unavailable tool {name}");
                     // -32000 (server error), matching the JSON-RPC convention used for
                     // an application-level refusal rather than -32601 "method not
                     // found" — the tool EXISTS and is deliberately parked, and saying
