@@ -101,7 +101,13 @@ function OnDeckSection() {
               }}
             >
               <img
-                src={museArtUrl('poster', item.id)}
+                // TERM #550: 'media_item', NOT 'poster'. Muse's art resolver
+                // keys on ENTITY KIND ('media_item' | 'media_metadata') and
+                // treats the variant as a separate ?variant= param -- 'poster'
+                // matched no kind, so every on-deck poster silently fell through
+                // to the placeholder. MUSE #84 returns item.id as the
+                // media_item_id for exactly this call.
+                src={museArtUrl('media_item', item.id)}
                 alt=""
                 aria-hidden
                 style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
