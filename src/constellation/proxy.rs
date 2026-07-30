@@ -1080,6 +1080,69 @@ mod tests {
         assert_eq!(parsed["detail"], "lumina auth failed");
     }
 
+    /// TERM-549 (review follow-up): the two unit tests above prove `muse_upstream_headers`
+    /// BUILDS the right header, but not that `proxy` actually puts it ON THE WIRE, nor that it
+    /// stays off the browser-facing response. This closes both halves against a real loopback
+    /// upstream: the upstream captures what it received out-of-band (a shared slot, NOT the
+    /// response body -- echoing the token back would make the assertion self-defeating), then we
+    /// assert the client-visible response never contains the token literal.
+    #[tokio::test]
+    #[serial]
+    async fn muse_bearer_reaches_the_upstream_on_the_wire_and_never_the_browser_response() {
+        const TOKEN: &str = "muse-token-fixture-value"; // pii-test-fixture
+        let seen: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let captured = Arc::clone(&seen);
+
+        let app = axum::Router::new().route(
+            "/stats",
+            axum::routing::get(move |headers: HeaderMap| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let got = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    *captured.lock().unwrap() = got;
+                    // Deliberately a token-free body -- see the doc comment above.
+                    (StatusCode::OK, "{\"library_size\":1}").into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback"); // pii-test-fixture
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let resp = proxy(
+            "muse",
+            Some(format!("http://{addr}")), // pii-test-fixture
+            "stats",
+            None,
+            Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            None,
+            &muse_upstream_headers(Some(TOKEN.to_string())),
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some(format!("Bearer {TOKEN}").as_str()),
+            "the bearer must actually reach the Muse upstream, not just be built in memory"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains(TOKEN),
+            "the Muse token must never appear in the browser-facing response body"
+        );
+    }
+
     /// Regression: `auth_failure_detail: None` (every non-Lumina arm) leaves a `401` from the
     /// upstream forwarded VERBATIM -- the LGUI-05 degrade-on-401 behavior is Lumina-specific,
     /// not a change to `harmony`/`chord`/`muse`'s existing pass-through semantics.
