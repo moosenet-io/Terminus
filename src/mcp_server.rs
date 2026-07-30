@@ -588,11 +588,57 @@ async fn handle_mcp(
             if let Some(gateway) = &state.gateway {
                 tools = gateway.filter_catalog_for_principal(principal.as_ref(), tools);
             }
+            // TAVAIL-01: availability filter — COMPOSES WITH the authorization filter
+            // above, never replaces it. Authorization answers "may THIS principal use
+            // it"; availability answers "does this tool work at all, for anyone". A
+            // tool is advertised only if BOTH allow it, and availability can only ever
+            // REMOVE (it never re-grants something the gateway just filtered out).
+            //
+            // Applied unconditionally — including when `state.gateway` is None — because
+            // a dead backend is dead regardless of whether this process gates identity.
+            // With no `TERMINUS_TOOL_AVAILABILITY_JSON` configured the policy is empty
+            // and this is a byte-for-byte no-op.
+            let avail = crate::availability::policy();
+            if !avail.is_empty() {
+                let before = tools.len();
+                tools.retain(|t| {
+                    t.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| avail.agent_usable(n))
+                        .unwrap_or(true)
+                });
+                let hidden = before - tools.len();
+                if hidden > 0 {
+                    debug!("availability: hid {hidden} unavailable tool(s) from tools/list");
+                }
+            }
             sse_response(id, Ok(json!({"tools": tools})), "")
         }
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+
+            // TAVAIL-01: availability gate, FAIL CLOSED and BEFORE any dispatch.
+            // The tools/list filter alone is not enough — an agent holding a catalog
+            // cached from before a tool was parked would still be able to invoke it.
+            // This is the gate that actually protects; the list filter is only what
+            // stops the model being tempted in the first place.
+            //
+            // The message names the state + the operator's reason rather than a bare
+            // "not found", so the model parks the tool instead of hunting for it
+            // (the exact failure mode that made `deep_research` waste loop turns).
+            {
+                let avail = crate::availability::policy();
+                if !name.is_empty() && !avail.agent_usable(name) {
+                    let detail = avail.denial_message(name);
+                    warn!("availability: refused tools/call for unavailable tool {name}");
+                    // -32000 (server error), matching the JSON-RPC convention used for
+                    // an application-level refusal rather than -32601 "method not
+                    // found" — the tool EXISTS and is deliberately parked, and saying
+                    // otherwise is what sends a model hunting for it.
+                    return sse_response(id, Err((-32000, detail)), "");
+                }
+            }
 
             // MESH-10: the canonical principal + the namespace (if any) the
             // advertised name parses to -- computed once up front so both

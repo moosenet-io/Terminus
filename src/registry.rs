@@ -121,6 +121,7 @@ pub struct ToolInfo {
 pub fn register_all(registry: &mut ToolRegistry) {
     crate::ansible::register(registry);
     crate::approval::register(registry);
+    crate::availability_tool::register(registry); // TAVAIL-01: admin view of tool availability
     crate::compiler::register(registry); // BLD-05: compiler_build (single build door)
     crate::cortex::register(registry);
     crate::council::register(registry);
