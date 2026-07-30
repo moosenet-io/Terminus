@@ -109,8 +109,11 @@ Set `TERMINUS_TOOL_AVAILABILITY_JSON` to a map of tool name (or name **prefix**)
   time** (so a stale cached catalog cannot invoke it). The refusal names the state and the
   reason rather than "not found", so the model parks it instead of hunting for it.
 - **Fail-closed** — an unrecognised state resolves to `off`, never `available`: a typo must
-  never silently re-expose a dead tool. An **unset** variable means every tool is available
-  (unchanged behaviour).
+  never silently re-expose a dead tool. A map that fails to parse parks **everything** and the
+  service refuses to start. A variable that is **set but blank** is treated as a configuration
+  error (almost always a failed template substitution such as `VAR=$MISSING`) and also fails
+  closed — to disable availability rules, **unset** the variable rather than blanking it. Only
+  a genuinely **unset** variable means "no rules, everything available" (unchanged behaviour).
 - **Composes with authorization** — availability is principal-independent and can only
   *remove*. The per-identity gateway allowlist still applies independently; a tool is offered
   only if both allow it.

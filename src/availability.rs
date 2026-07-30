@@ -114,8 +114,23 @@ impl AvailabilityPolicy {
     /// (everything `Available`) — the exact pre-TAVAIL-01 behaviour.
     pub fn from_env() -> Self {
         match std::env::var(AVAILABILITY_ENV) {
+            // SET and non-blank: parse it.
             Ok(raw) if !raw.trim().is_empty() => Self::from_json(&raw),
-            _ => Self::default(),
+            // SET but BLANK: a configuration ERROR, not "no rules" — and it fails
+            // CLOSED. Round-4 review caught this: the realistic way a variable ends up
+            // blank is not an operator typing spaces, it is a templating accident
+            // (`VAR=$MISSING_VAR`), which would otherwise silently un-park every dead
+            // tool. An operator who wants no rules UNSETS the variable.
+            Ok(_) => {
+                tracing::error!(
+                    "availability: {AVAILABILITY_ENV} is SET but blank — treating as a \
+                     configuration error and FAILING CLOSED (every tool unavailable). \
+                     To disable availability rules, UNSET the variable instead."
+                );
+                Self { entries: BTreeMap::new(), malformed: true }
+            }
+            // UNSET: genuinely unconfigured — everything available, unchanged behaviour.
+            Err(_) => Self::default(),
         }
     }
 
@@ -297,7 +312,14 @@ pub fn validate_env() -> Result<usize, String> {
         Ok(raw) if !raw.trim().is_empty() => {
             AvailabilityPolicy::try_from_json(&raw).map(|p| p.rule_count())
         }
-        _ => Ok(0),
+        // SET but blank — a configuration error (very likely a failed template
+        // substitution). Refuse to boot rather than silently un-park everything.
+        Ok(_) => Err(format!(
+            "{AVAILABILITY_ENV} is SET but blank. This is almost always a failed \
+             template substitution. To disable availability rules, UNSET the variable."
+        )),
+        // UNSET — genuinely unconfigured, zero rules.
+        Err(_) => Ok(0),
     }
 }
 
@@ -439,6 +461,32 @@ mod tests {
         assert!(!p.agent_usable("weather"), "a malformed map must deny everything");
         assert!(!p.agent_usable("crucible_status"));
         assert!(!p.agent_usable("literally_anything"));
+    }
+
+    #[test]
+    fn a_blank_but_set_variable_fails_closed_not_open() {
+        // Round-4 review: unset and set-but-blank must behave DIFFERENTLY. A blank
+        // value is realistically a templating accident (`VAR=$MISSING`), and treating
+        // it as "no rules" would silently un-park every dead tool.
+        let err = validate_env_for(Some("   ")).unwrap_err();
+        assert!(err.contains("SET but blank"), "must name the real cause: {err}");
+        // ...whereas genuinely UNSET is valid and means zero rules.
+        assert_eq!(validate_env_for(None).unwrap(), 0);
+    }
+
+    /// Test seam mirroring `validate_env`'s decision without touching process env
+    /// (which would make the test order-dependent — see the PCON-08 hermeticity guard).
+    fn validate_env_for(raw: Option<&str>) -> Result<usize, String> {
+        match raw {
+            Some(r) if !r.trim().is_empty() => {
+                AvailabilityPolicy::try_from_json(r).map(|p| p.rule_count())
+            }
+            Some(_) => Err(format!(
+                "{AVAILABILITY_ENV} is SET but blank. This is almost always a failed \
+                 template substitution. To disable availability rules, UNSET the variable."
+            )),
+            None => Ok(0),
+        }
     }
 
     #[test]
