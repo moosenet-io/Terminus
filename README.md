@@ -82,6 +82,42 @@ flowchart LR
 | `mesh` | Upstream Terminus federation registry, unified `Principal` identity, optional embedded tailnet | [reference/mesh](docs/reference/mesh.md) |
 | `broker` | Out-of-process tool workers: route table, three transport tiers, blue-green rollout | [reference/broker](docs/reference/broker.md) |
 | `pg` | The single sanctioned Postgres door: identity-scoped, approval-gated `pg_*` suite | [reference/pg](docs/reference/pg.md) |
+| `availability` | Tool availability state (`available`/`off`/`broken`) — park a dead tool without de-registering it; `tool_availability` is the admin view | see below |
+
+### Tool availability — parking a tool without removing it
+
+A tool whose backend has been retired should stop being offered to agents, but it should
+still be **visible in the registry** so an operator can see what exists and why it is
+parked. Deleting it loses that history; leaving it enabled makes the assistant try a dead
+tool and report confusing failures.
+
+Set `TERMINUS_TOOL_AVAILABILITY_JSON` to a map of tool name (or name **prefix**) to state:
+
+```jsonc
+{
+  "crucible_": { "state": "off",    "reason": "retired 2026-07-30" },
+  "odyssey_":  { "state": "off",    "reason": "retired 2026-07-30" },
+  "hearth_shopping_list": { "state": "broken", "reason": "backend fault" }
+}
+```
+
+- **States** — `available` (default), `off` (deliberately parked), `broken` (known-failing).
+  `off` and `broken` behave identically to an agent; the distinction is for the human.
+- **Matching** — an exact tool name wins over a prefix; among prefixes the longest wins, so
+  a family-wide `"crucible_": off` can still be overridden by `"crucible_status": available`.
+- **Effect** — a non-`available` tool is hidden from `tools/list` and **refused at call
+  time** (so a stale cached catalog cannot invoke it). The refusal names the state and the
+  reason rather than "not found", so the model parks it instead of hunting for it.
+- **Fail-closed** — an unrecognised state resolves to `off`, never `available`: a typo must
+  never silently re-expose a dead tool. An **unset** variable means every tool is available
+  (unchanged behaviour).
+- **Composes with authorization** — availability is principal-independent and can only
+  *remove*. The per-identity gateway allowlist still applies independently; a tool is offered
+  only if both allow it.
+- **Admin view** — `tool_availability` lists every registered tool with its state and reason
+  (optionally filtered by `prefix` or `state`).
+
+Changing availability takes effect on service restart, like every other `Environment=` knob.
 
 The full inventory (17 subsystems, plus `compiler`, `constellation-web`, `compat`,
 and the crate-root modules) is in [docs/reference/index.md](docs/reference/index.md).
