@@ -325,7 +325,12 @@ export function LibraryPanel() {
 
   const shown = view === 'table' ? tableRows.length : visible.length;
   const total = data?.counts.owned ?? 0;
-  const loaded = owned.length;
+  // Per-VIEW loaded count. The grid and the table are separate endpoints with
+  // separate page sizes (240 vs 500), so a single `loaded` produced a
+  // self-contradictory subtitle in table view — "500 of 240 loaded" (codex).
+  const loaded = view === 'table' ? (table.data?.length ?? 0) : owned.length;
+  // The search placeholder must agree with whichever view is on screen.
+  const searchScopeCount = loaded;
 
   return (
     <ChartCard
@@ -359,7 +364,7 @@ export function LibraryPanel() {
                 setQuery('');
               }
             }}
-            placeholder={`Search these ${loaded} titles…   (Esc clears)`}
+            placeholder={`Search these ${searchScopeCount} titles…   (Esc clears)`}
             aria-label="Search loaded titles"
             style={{
               flex: '1 1 240px',
@@ -391,24 +396,39 @@ export function LibraryPanel() {
             groups so "movies I don't own yet" is expressible; a single chip row
             could not say that. */}
         <div style={{ display: 'flex', gap: 'var(--space-3)', alignItems: 'center', flexWrap: 'wrap' }}>
-          <span style={{ display: 'inline-flex', gap: 2, alignItems: 'center' }}>
-            <span style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', marginRight: 4 }}>kind</span>
+          {/* Each axis is a labelled group. Without this a screen reader meets
+              several ambiguous buttons — two of them effectively "everything" —
+              with no way to tell which axis they belong to (codex). */}
+          <span role="group" aria-label="Filter by kind" style={{ display: 'inline-flex', gap: 2, alignItems: 'center' }}>
+            <span aria-hidden style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', marginRight: 4 }}>kind</span>
             {(['all', 'movie', 'show'] as KindFilter[]).map(k => (
-              <button key={k} onClick={() => setKind(k)} aria-pressed={kind === k} style={chip(kind === k)}>
+              <button
+                key={k}
+                onClick={() => setKind(k)}
+                aria-pressed={kind === k}
+                aria-label={k === 'all' ? 'All kinds' : k === 'movie' ? 'Movies' : 'Series'}
+                style={chip(kind === k)}
+              >
                 {k === 'all' ? 'All' : k === 'movie' ? 'Movies' : 'Series'}
               </button>
             ))}
           </span>
-          <span style={{ display: 'inline-flex', gap: 2, alignItems: 'center' }}>
-            <span style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', marginRight: 4 }}>have</span>
+          <span role="group" aria-label="Filter by availability" style={{ display: 'inline-flex', gap: 2, alignItems: 'center' }}>
+            <span aria-hidden style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', marginRight: 4 }}>have</span>
             {(['all', 'on_disk', 'wanted'] as AvailFilter[]).map(a => (
-              <button key={a} onClick={() => setAvail(a)} aria-pressed={avail === a} style={chip(avail === a)}>
+              <button
+                key={a}
+                onClick={() => setAvail(a)}
+                aria-pressed={avail === a}
+                aria-label={a === 'all' ? 'Any availability' : a === 'on_disk' ? 'On disk' : 'Wanted'}
+                style={chip(avail === a)}
+              >
                 {a === 'all' ? 'Any' : a === 'on_disk' ? 'On disk' : 'Wanted'}
               </button>
             ))}
           </span>
-          <span style={{ display: 'inline-flex', gap: 2, alignItems: 'center' }}>
-            <span style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', marginRight: 4 }}>sort</span>
+          <span role="group" aria-label="Sort order" style={{ display: 'inline-flex', gap: 2, alignItems: 'center' }}>
+            <span aria-hidden style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', marginRight: 4 }}>sort</span>
             {SORTS.map(sd => (
               <button key={sd.key} onClick={() => setSort(sd.key)} aria-pressed={sort === sd.key} style={chip(sort === sd.key)}>
                 {sd.label}
@@ -435,7 +455,7 @@ export function LibraryPanel() {
               tabIndex={0}
               style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}
             >
-              {visible.length === 0 && loaded > 0 ? (
+              {visible.length === 0 && owned.length > 0 ? (
                 <div style={{ padding: 'var(--space-3)', fontSize: 'var(--fs-xs)', color: 'var(--text-300)' }}>
                   No titles match this filter.
                 </div>
