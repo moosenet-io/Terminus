@@ -50,6 +50,7 @@ import { BackendsPanel } from './chord/BackendsPanel';
 import { OverviewPanel as LuminaOverviewPanel } from './lumina/OverviewPanel';
 import { RosterPanel as ModelsRosterPanel } from './models/RosterPanel';
 import { DashboardPanel as MuseDashboardPanel } from './muse/DashboardPanel';
+import { LibraryPanel as MuseLibraryPanel } from './muse/LibraryPanel';
 import { TastePanel as MuseTastePanel } from './muse/TastePanel';
 import { ChannelsPanel as MuseChannelsPanel } from './muse/ChannelsPanel';
 import { OverviewPanel as MintOverviewPanel } from './mint/OverviewPanel';
@@ -261,6 +262,19 @@ registerPanel({
   icon: '◎',
   available: true,
   component: MuseDashboardPanel,
+});
+
+// MGUI-01 (S129): the poster wall — guide screen 02. Registered directly after Dashboard
+// because the operator's reason for opening Muse is to look at media. Unlike the per-account
+// panels this binds a PUBLIC Muse route, so it populates with no upstream bearer.
+registerPanel({
+  id: 'muse.library',
+  system: 'muse',
+  title: 'Library',
+  path: '/muse/library',
+  icon: '▦',
+  available: true,
+  component: MuseLibraryPanel,
 });
 
 registerPanel({
