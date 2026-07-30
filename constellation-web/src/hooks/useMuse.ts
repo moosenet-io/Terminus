@@ -343,3 +343,19 @@ export function useMuseChannelActions() {
 export function museArtUrl(kind: string, id: string): string {
   return `/api/muse/art/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`;
 }
+
+/** MGUI-15: the same-origin art URL at a RENDITION width (MUSE #100).
+ *
+ *  `width` must be on Muse's rendition ladder — the server answers `400` for
+ *  anything else BY DESIGN (an off-ladder width is an amplification vector, so it
+ *  is rejected rather than clamped). The ladder is mirrored here as a union type
+ *  so an off-ladder value cannot be written in the first place; if Muse's ladder
+ *  changes, this type is the thing that must change with it.
+ *
+ *  Without a width the endpoint serves the FULL-SIZE master — 1.9 MB for one
+ *  poster — which is what made the first cut of the poster wall slow. */
+export type MuseArtWidth = 160 | 320 | 640;
+
+export function museArtUrlAt(kind: string, id: string, width: MuseArtWidth): string {
+  return `${museArtUrl(kind, id)}?w=${width}`;
+}
