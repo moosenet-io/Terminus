@@ -139,6 +139,67 @@ export function useMuseGaps(): MuseSection<MuseGaps> {
   return useMuseSection<MuseGaps>('/gaps');
 }
 
+// ── Library (muse.library) — MGUI-01 ─────────────────────────────────────────
+//
+// `GET /api/library` is on Muse's PUBLIC router, so unlike the per-account sections above
+// it needs no upstream bearer and populates today. Every field name below was copied from a
+// live capture through the proxy, not inferred:
+//   {"counts":{"on_disk":1629,"owned":1892,"wanted":0},
+//    "owned":[{"availability":"on_disk","backdrop_url":"...","imdb_id":"tt...","kind":"movie",
+//              "media_item_id":6655,"media_metadata_id":1225,"monitored":false,
+//              "poster_url":"/art/media_metadata/1225","title":"The Martian",
+//              "tmdb_id":"286217","tvdb_id":null,"year":2015}],
+//    "wanted":[]}
+
+export interface MuseLibraryCounts {
+  owned: number;
+  on_disk: number;
+  wanted: number;
+}
+
+export interface MuseLibraryItem {
+  media_item_id: number;
+  media_metadata_id: number;
+  kind: string;
+  title: string;
+  year: number | null;
+  /** `"on_disk"` when a file exists, else `"monitored"`. The badge derives from THIS, never
+   *  from `monitored` — a title can be owned-and-unmonitored or monitored-with-no-file, and
+   *  re-deriving would mislabel both. */
+  availability: string;
+  monitored: boolean;
+  /** Muse-relative art path. NOT used for `<img src>` — see `museArtUrl`, which adds the
+   *  same-origin proxy prefix the browser needs. */
+  poster_url: string;
+  backdrop_url: string;
+  tmdb_id: string | null;
+  tvdb_id: string | null;
+  imdb_id: string | null;
+}
+
+export interface MuseWantedItem {
+  monitored_item_id: number;
+  media_metadata_id: number;
+  library_id: number;
+  kind: string;
+  title: string;
+  year: number | null;
+  availability: string;
+  poster_url: string;
+}
+
+export interface MuseLibrary {
+  counts: MuseLibraryCounts;
+  owned: MuseLibraryItem[];
+  wanted: MuseWantedItem[];
+}
+
+/** The poster wall's data. `limit` bounds the page Muse returns — the panel reports the
+ *  untruncated `counts.owned` separately so a capped page never reads as the whole library. */
+export function useMuseLibrary(limit = 120): MuseSection<MuseLibrary> {
+  return useMuseSection<MuseLibrary>(`/api/library?limit=${encodeURIComponent(String(limit))}`);
+}
+
 // ── Taste (muse.taste) ───────────────────────────────────────────────────────
 
 export interface MuseTastePoint {
