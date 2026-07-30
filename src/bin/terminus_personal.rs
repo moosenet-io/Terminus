@@ -267,6 +267,25 @@ fn log_secret_fetch_outcome(outcome: &SecretFetchOutcome) {
 async fn main() {
     terminus_rs::intake::init_tracing();
 
+    // TAVAIL-01: validate the tool-availability map before serving. This binary also
+    // serves `handle_mcp`, so it needs the same startup gate as terminus_primary —
+    // review (S128 r2) correctly flagged that validating in only ONE binary left the
+    // fail-closed guarantee dependent on which entry point happened to be running.
+    // (The policy itself also fails closed on a malformed map, but failing at DEPLOY
+    // in front of the operator beats failing at runtime in front of the user.)
+    match terminus_rs::availability::validate_env() {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("availability: {n} tool-availability rule(s) loaded"),
+        Err(e) => {
+            eprintln!("FATAL: {e}");
+            eprintln!(
+                "Refusing to start: fix {} and restart.",
+                terminus_rs::availability::AVAILABILITY_ENV
+            );
+            std::process::exit(1);
+        }
+    }
+
     let secret_outcome = fetch_downstream_secrets_from_infisical().await;
     log_secret_fetch_outcome(&secret_outcome);
 

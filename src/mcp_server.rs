@@ -588,6 +588,30 @@ async fn handle_mcp(
             if let Some(gateway) = &state.gateway {
                 tools = gateway.filter_catalog_for_principal(principal.as_ref(), tools);
             }
+            // TAVAIL-01: availability filter — COMPOSES WITH the authorization filter
+            // above, never replaces it. Authorization answers "may THIS principal use
+            // it"; availability answers "does this tool work at all, for anyone". A
+            // tool is advertised only if BOTH allow it, and availability can only ever
+            // REMOVE (it never re-grants something the gateway just filtered out).
+            //
+            // Applied unconditionally — including when `state.gateway` is None — because
+            // a dead backend is dead regardless of whether this process gates identity.
+            // With no `TERMINUS_TOOL_AVAILABILITY_JSON` configured the policy is empty
+            // and this is a byte-for-byte no-op.
+            let avail = crate::availability::policy();
+            if !avail.is_empty() {
+                let before = tools.len();
+                tools.retain(|t| {
+                    t.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| avail.agent_usable(n))
+                        .unwrap_or(true)
+                });
+                let hidden = before - tools.len();
+                if hidden > 0 {
+                    tracing::debug!("availability: hid {hidden} unavailable tool(s) from tools/list");
+                }
+            }
             sse_response(id, Ok(json!({"tools": tools})), "")
         }
         "tools/call" => {
@@ -655,6 +679,38 @@ async fn handle_mcp(
             } else {
                 None
             };
+
+            // TAVAIL-01: availability gate — AFTER authorization, BEFORE dispatch.
+            //
+            // Ordering is deliberate and was corrected in review: running this BEFORE
+            // `guard()` leaked existence, letting an UNAUTHORIZED caller learn that a
+            // tool exists and read the operator's reason for parking it. Authorization
+            // decides what you may know about; availability then decides whether the
+            // thing you are allowed to use actually works.
+            //
+            // Still before dispatch, because the `tools/list` filter alone is not
+            // enough: an agent holding a catalog cached from before a tool was parked
+            // would otherwise still invoke it. The list filter stops the model being
+            // tempted; THIS is the gate that protects.
+            //
+            // The refusal names the state + reason rather than "not found" — a
+            // "not found" is what sends a model hunting for the tool, which is exactly
+            // how the `deep_research` phantom burned loop turns.
+            {
+                let avail = crate::availability::policy();
+                if !name.is_empty() && !avail.agent_usable(name) {
+                    let detail = avail.denial_message(name);
+                    tracing::warn!("availability: refused tools/call for unavailable tool {name}");
+                    return sse_response(
+                        id,
+                        Ok(json!({
+                            "content": [{"type": "text", "text": detail}],
+                            "isError": true
+                        })),
+                        "",
+                    );
+                }
+            }
 
             // MESH-03: a namespaced name (`<namespace>__<tool>`) routes to
             // its owning mesh upstream (or a clean "unavailable" tool-error
