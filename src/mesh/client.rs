@@ -186,7 +186,7 @@ impl std::fmt::Debug for UpstreamClient {
 /// answered with a non-MCP error body. That surfaced as
 /// `"returned an unparseable response: error decoding response body"`, the pool marked
 /// the upstream unhealthy, and ALL of its tools silently vanished from the merged
-/// catalog — for `<host>`, all 40 Proxmox tools, mid-conversation, with the assistant
+/// catalog — for the Proxmox upstream, all 40 of its tools, mid-conversation, with the assistant
 /// then telling the operator it had no access to their own hardware.
 ///
 /// A stale session is a RECOVERABLE condition, not a dead upstream, so it must be
@@ -311,7 +311,7 @@ impl UpstreamClient {
             "params": {}
         });
         // TERM #565: this is the CATALOG call — a stale session here is what silently
-        // dropped all 40 <host> tools from the merged catalog. Retry once with a fresh
+        // dropped all 40 Proxmox-upstream tools from the merged catalog. Retry once with a fresh
         // handshake before letting the pool conclude the upstream is down.
         let resp = self.with_session_retry(|| self.post_rpc(body.clone())).await?;
 
@@ -910,19 +910,19 @@ mod session_recovery_tests {
 
     #[test]
     fn an_unparseable_body_is_treated_as_a_stale_session() {
-        // This is the EXACT shape that dropped all 40 <host> tools (TERM #565):
+        // This is the EXACT shape that dropped all 40 tools of the Proxmox upstream (TERM #565):
         // "returned an unparseable response: error decoding response body".
-        let e = UpstreamClientError::BadResponse("<host>".into(), "error decoding response body".into());
+        let e = UpstreamClientError::BadResponse("upstream-a".into(), "error decoding response body".into());
         assert!(
             looks_like_stale_session(&e),
-            "the observed <host> failure mode must be retried, not treated as an outage"
+            "the observed upstream failure mode must be retried, not treated as an outage"
         );
     }
 
     #[test]
     fn session_shaped_4xx_is_retried() {
         for status in [400u16, 404] {
-            let e = UpstreamClientError::Rejected("<host>".into(), status, "no session".into());
+            let e = UpstreamClientError::Rejected("upstream-a".into(), status, "no session".into());
             assert!(looks_like_stale_session(&e), "{status} should re-handshake");
         }
     }
@@ -934,7 +934,7 @@ mod session_recovery_tests {
         // a stale session. Retrying a real conflict masks it for a round trip and
         // teaches the classifier a shape it has no evidence for.
         for status in [409u16, 422, 429, 500, 502, 503] {
-            let e = UpstreamClientError::Rejected("<host>".into(), status, "nope".into());
+            let e = UpstreamClientError::Rejected("upstream-a".into(), status, "nope".into());
             assert!(
                 !looks_like_stale_session(&e),
                 "{status} must NOT be re-handshaked as a session issue"
@@ -947,11 +947,11 @@ mod session_recovery_tests {
         // The classifier must be a narrow allowlist, not "retry unless proven
         // otherwise" — the whole risk of a retry layer is that it quietly widens.
         let cases = [
-            UpstreamClientError::Unreachable("<host>".into(), "refused".into()),
-            UpstreamClientError::Timeout("<host>".into(), "deadline".into()),
-            UpstreamClientError::TlsConfig("<host>".into(), "bad cert".into()),
-            UpstreamClientError::Rejected("<host>".into(), 401, "denied".into()),
-            UpstreamClientError::Rejected("<host>".into(), 403, "forbidden".into()),
+            UpstreamClientError::Unreachable("upstream-a".into(), "refused".into()),
+            UpstreamClientError::Timeout("upstream-a".into(), "deadline".into()),
+            UpstreamClientError::TlsConfig("upstream-a".into(), "bad cert".into()),
+            UpstreamClientError::Rejected("upstream-a".into(), 401, "denied".into()),
+            UpstreamClientError::Rejected("upstream-a".into(), 403, "forbidden".into()),
         ];
         for e in cases {
             assert!(!looks_like_stale_session(&e), "must not retry: {e}");
@@ -963,7 +963,7 @@ mod session_recovery_tests {
         // A fresh handshake cannot fix a bad credential, and retrying would hide a
         // real misconfiguration behind a second identical failure.
         for status in [401u16, 403] {
-            let e = UpstreamClientError::Rejected("<host>".into(), status, "denied".into());
+            let e = UpstreamClientError::Rejected("upstream-a".into(), status, "denied".into());
             assert!(!looks_like_stale_session(&e), "{status} must NOT be retried as a session issue");
         }
     }
@@ -972,7 +972,7 @@ mod session_recovery_tests {
     fn a_genuine_outage_is_not_retried() {
         // Transport failures are real unreachability — the pool's health tracking owns
         // those, and retrying only doubles the latency before the same conclusion.
-        let e = UpstreamClientError::Unreachable("<host>".into(), "connection refused".into());
+        let e = UpstreamClientError::Unreachable("upstream-a".into(), "connection refused".into());
         assert!(!looks_like_stale_session(&e));
     }
 }
