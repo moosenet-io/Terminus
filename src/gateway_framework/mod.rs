@@ -72,7 +72,7 @@
 pub mod audit;
 pub mod rate_limit;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::http::StatusCode;
@@ -529,8 +529,9 @@ impl From<Vec<String>> for Grant {
 /// - `{"allow": [...], "deny": [...]}` — [`Grant::AllowDeny`]; either key may
 ///   be omitted (defaulting to empty), but NO other key may be present.
 ///
-/// Rejected (each returns `Err` and the identity is DROPPED — see
-/// [`AllowlistPolicy::from_env`] — never silently coerced into something
+/// Rejected (each returns `Err` and the identity is DENIED — its entry is
+/// dropped AND any scaffold/guest baseline the seeding pass gave it is revoked,
+/// see [`build_entries`] — never silently coerced into, or left at, something
 /// broader):
 /// - Any other JSON type (string/number/bool/null, array of non-strings).
 /// - An unknown key on the object form — the typo case above.
@@ -595,6 +596,12 @@ fn validate_grant(value: &Value) -> Result<Grant, String> {
 /// whereas rejecting loses nothing that could ever have matched and surfaces
 /// the typo. Same reasoning as [`validate_entries`] rejecting, rather than
 /// trimming, a whitespace-bearing grant entry.
+///
+/// Round 3 completes that rule rather than softening it: the trimmed name IS
+/// consulted, but only to REVOKE ([`revoke_seeded_for_invalid_key`]). Trimming
+/// stays refused in the granting direction and is honoured in the denying one —
+/// `" lumina": [...]` still grants `lumina` nothing, and now also strips the
+/// scaffold wildcard it was evidently meant to narrow.
 fn validate_identity_key(id: &str) -> Result<(), String> {
     if id.is_empty() {
         return Err("an empty identity key matches no principal and is a config error".to_string());
@@ -699,11 +706,95 @@ fn scaffold_defaults() -> HashMap<String, Grant> {
         .collect()
 }
 
+/// TRTR-05 (round 3): REVOKE whatever [`build_entries`] had already seeded for
+/// the identity an INVALID env key was evidently trying to configure, so a
+/// malformed key can never leave that identity at a broader posture than the
+/// operator was reaching for. Returns the names actually revoked (for the log).
+///
+/// Two names are considered: the key exactly as written (which only ever has a
+/// seeded entry if a guest identity was declared with the same degenerate
+/// spelling), and — the case that matters — its TRIMMED form, because
+/// `" lumina": [...]` is unmistakably an attempt to configure `lumina`, which
+/// the scaffold has already seeded with `allow: ["*"]`.
+///
+/// This does NOT contradict [`validate_identity_key`]'s reject-don't-trim
+/// decision, it completes it: trimming is refused in the GRANTING direction
+/// (never synthesise a permission nobody wrote) and honoured in the DENYING
+/// direction (a legible intent to control an identity must never resolve to a
+/// wider grant than the one that failed to parse). Removal, rather than
+/// inserting a deny-all entry, is deliberate: it returns the identity to this
+/// module's canonical "no entry ⇒ denied" state and adds no map key for a name
+/// the operator never validly wrote.
+///
+/// `valid_keys` is every identity the SAME config configures VALIDLY, and the
+/// trimmed name is skipped when it is one of them. That is a determinism fix,
+/// not a softening: a config carrying both `" lumina"` (invalid) and `"lumina"`
+/// (valid) is iterated in `HashMap` order, so without this guard the outcome
+/// would depend on which entry happened to be visited last — an authorization
+/// decision decided by hash ordering. An explicit, well-formed entry is an
+/// unambiguous statement of intent and outranks a heuristic reading of a
+/// malformed one; the malformed key still grants nothing.
+fn revoke_seeded_for_invalid_key(
+    entries: &mut HashMap<String, Grant>,
+    id: &str,
+    valid_keys: &HashSet<&str>,
+) -> Vec<String> {
+    let mut revoked = Vec::new();
+    if entries.remove(id).is_some() {
+        revoked.push(id.to_string());
+    }
+    let trimmed = id.trim();
+    if trimmed != id
+        && !trimmed.is_empty()
+        && !valid_keys.contains(trimmed)
+        && entries.remove(trimmed).is_some()
+    {
+        revoked.push(trimmed.to_string());
+    }
+    revoked
+}
+
 /// The body of [`AllowlistPolicy::from_env`], taking its two config reads as
 /// arguments so the load rules (precedence, per-key and per-grant validation,
 /// the unrestricted-wildcard warning) are testable without mutating process
 /// env from parallel test threads. Semantics are exactly `from_env`'s — see its
 /// doc comment; nothing here reads config itself.
+///
+/// # TRTR-05 (round 3): an INVALID entry DENIES its identity — it never leaves
+/// a seeded default in place
+///
+/// The map is built by SEEDING first (scaffold, then guest baselines) and
+/// applying the operator's explicit entries ON TOP. That ordering created a
+/// fail-OPEN trap: an invalid explicit entry used to be skipped, which left the
+/// identity sitting at whatever the seeding pass had given it — a malformed
+/// `lumina` entry kept the scaffold's `allow: ["*"]`, a malformed `guest-*`
+/// entry kept the guest baseline. An operator writing an entry to NARROW
+/// `lumina` and fat-fingering the JSON shape silently got the full wildcard
+/// instead of the restriction they intended, with nothing but a log line to say
+/// so. That is the same fail-open-on-malformed trap [`validate_grant`] exists to
+/// kill, one level up, in the seeding interaction.
+///
+/// So: writing an entry for an identity is an expression of intent to CONTROL
+/// that identity. If that intent cannot be parsed we must not fall back to a
+/// BROADER posture the operator did not write. The asymmetry is the whole
+/// argument (same shape as [`validate_entries`]'s reject-don't-trim rule and
+/// [`validate_grant`]'s unknown-key rejection): a wrongly-denied identity is
+/// recoverable in seconds — it is loud, it is obvious from behaviour, and
+/// fixing the JSON restores it — whereas a silently-retained wildcard is not
+/// detectable from behaviour at all, because everything keeps working exactly
+/// as it did.
+///
+/// The blast radius stays exactly one identity: the map as a whole is still NOT
+/// rejected over one bad entry (that would turn a typo into a fleet-wide
+/// outage), and every other identity's grant is untouched.
+///
+/// **Deliberate asymmetry, NOT an oversight:** when the WHOLE JSON fails to
+/// parse (the `Err` arm below), the scaffold IS retained. That case is
+/// different in kind — there is no per-identity entry to read an intent from,
+/// so nothing says the operator meant to narrow `lumina` at all, and denying
+/// every scaffolded identity on any JSON typo would brick the assistant fleet
+/// rather than narrow it. The rule above applies to a parsed entry whose intent
+/// is legible but unparseable, not to the absence of any entry.
 fn build_entries(raw: &str, guest_identities: Vec<String>) -> HashMap<String, Grant> {
     let mut entries = scaffold_defaults();
 
@@ -718,37 +809,77 @@ fn build_entries(raw: &str, guest_identities: Vec<String>) -> HashMap<String, Gr
 
     match serde_json::from_str::<HashMap<String, Value>>(raw) {
         Ok(parsed) => {
-            for (id, value) in parsed {
+            // Every identity this config configures VALIDLY. Needed BEFORE the
+            // loop because `parsed` is a `HashMap` and iterates in arbitrary
+            // order: a config carrying both `" lumina"` and `"lumina"` would
+            // otherwise resolve differently run to run (see
+            // `revoke_seeded_for_invalid_key`). Validating twice is free at
+            // config scale and keeps the outcome order-independent.
+            let valid_keys: HashSet<&str> = parsed
+                .iter()
+                .filter(|(k, v)| validate_identity_key(k).is_ok() && validate_grant(v).is_ok())
+                .map(|(k, _)| k.as_str())
+                .collect();
+
+            for (id, value) in &parsed {
                 // TRTR-05 (round 2): the KEY is validated first, on the same
-                // drop-this-entry-only terms as a malformed grant VALUE below.
-                // A degenerate key (empty / whitespace-only / whitespace-padded)
-                // can never match a real principal, so dropping it removes
-                // nothing that was ever reachable -- but leaving it in place
-                // would leave a config entry that LOOKS like it grants
-                // something and silently does not. The whole map is NOT
-                // rejected: that would turn one typo into a fleet-wide outage.
-                if let Err(e) = validate_identity_key(&id) {
-                    tracing::warn!(
-                        "gateway_framework: TERMINUS_GATEWAY_ALLOWLIST_JSON has an invalid \
-                         identity key {id:?} ({e}) -- that entry is DROPPED; every other \
-                         identity's grant is unaffected"
+                // deny-this-identity-only terms as a malformed grant VALUE
+                // below. A degenerate key (empty / whitespace-only /
+                // whitespace-padded) can never match a real principal, so the
+                // entry itself grants nothing -- but leaving it at that would
+                // leave a config entry that LOOKS like it grants something and
+                // silently does not. Round 3: it must also REVOKE whatever the
+                // seeding pass gave the identity it was evidently aimed at, or
+                // `" lumina": ["time_now"]` leaves lumina on the scaffold
+                // wildcard. The whole map is NOT rejected: that would turn one
+                // typo into a fleet-wide outage.
+                if let Err(e) = validate_identity_key(id) {
+                    let revoked = revoke_seeded_for_invalid_key(&mut entries, id, &valid_keys);
+                    let effect = if revoked.is_empty() {
+                        "no identity gains a grant from it".to_string()
+                    } else {
+                        format!(
+                            "the identity it evidently meant to configure ({}) is now DENIED \
+                             every tool, inference route and admin op -- its seeded \
+                             scaffold/guest baseline has been REVOKED rather than left in \
+                             place, because a grant that failed to parse must never resolve \
+                             to a BROADER posture than the one that was written",
+                            revoked.join(", ")
+                        )
+                    };
+                    tracing::error!(
+                        "gateway_framework: SECURITY: TERMINUS_GATEWAY_ALLOWLIST_JSON has an \
+                         INVALID identity key {id:?} ({e}) -- that entry is DROPPED and \
+                         {effect}. Fix the key and restart; every other identity's grant is \
+                         unaffected"
                     );
                     continue;
                 }
-                // Per-identity validation: one bad entry denies THAT
-                // identity (it keeps its scaffold/guest default, or has no
-                // entry at all and is default-denied), rather than either
-                // being coerced into something broader OR nuking every
-                // other identity's config.
-                match validate_grant(&value) {
+                // Per-identity validation: one bad entry DENIES that identity
+                // outright -- it does not keep its scaffold/guest default (see
+                // this function's doc comment: falling back to the seeded,
+                // BROADER posture was the fail-open bug) -- rather than either
+                // being coerced into something broader OR nuking every other
+                // identity's config.
+                match validate_grant(value) {
                     Ok(grant) => {
-                        entries.insert(id, grant);
+                        entries.insert(id.clone(), grant);
                     }
-                    Err(e) => tracing::error!(
-                        "gateway_framework: TERMINUS_GATEWAY_ALLOWLIST_JSON entry for \
-                         identity '{id}' is invalid ({e}) -- that identity is DENIED (its \
-                         grant is dropped, never widened) until the config is fixed"
-                    ),
+                    Err(e) => {
+                        let revoked_seed = entries.remove(id).is_some();
+                        let seed_note = if revoked_seed {
+                            " (its seeded scaffold/guest baseline has been REVOKED, so a \
+                             malformed narrowing can never leave a broader posture in place)"
+                        } else {
+                            ""
+                        };
+                        tracing::error!(
+                            "gateway_framework: SECURITY: TERMINUS_GATEWAY_ALLOWLIST_JSON \
+                             entry for identity '{id}' is INVALID ({e}) -- '{id}' is now \
+                             DENIED every tool, inference route and admin op{seed_note}. Fix \
+                             the JSON and restart; every other identity's grant is unaffected"
+                        );
+                    }
                 }
             }
         }
@@ -820,12 +951,13 @@ impl AllowlistPolicy {
     ///   JSON, and an explicit env entry still wins if the operator wants to
     ///   shape one by hand.
     /// - Every env entry is validated by [`validate_grant`] INDIVIDUALLY, and
-    ///   an invalid one is DROPPED (that identity falls back to its
-    ///   scaffold/guest default, or to default-deny) rather than being coerced
-    ///   into a broader grant or discarding the whole map. A malformed grant
-    ///   is never allow-all.
+    ///   an invalid one DENIES that identity outright — it does NOT fall back
+    ///   to its scaffold/guest default (round 3: that fallback was itself
+    ///   fail-open — see [`build_entries`]) and is never coerced into a broader
+    ///   grant, nor does it discard the whole map. A malformed grant is never
+    ///   allow-all, and never allow-as-before.
     /// - Every env KEY is validated by [`validate_identity_key`], on the same
-    ///   drop-that-entry-only terms.
+    ///   deny-that-identity-only terms.
     pub fn from_env() -> Self {
         Self {
             entries: build_entries(
@@ -2682,6 +2814,211 @@ mod tests {
         let seeded = AllowlistPolicy::new(build_entries("{}", vec!["guest-sam".to_string()]));
         assert!(seeded.is_allowed("guest-sam", "weather"));
         assert!(!seeded.is_allowed("guest-sam", CALENDAR_CONTEXT_PROBE));
+    }
+
+    // ── TRTR-05 (round 3): an INVALID entry DENIES its identity; it never ──
+    // ── leaves a pre-SEEDED (broader) grant in place                     ──
+    //
+    // The map seeds the scaffold + guest baselines FIRST and applies explicit
+    // entries on top, so "skip the bad entry" used to mean the identity kept
+    // whatever seeding had given it -- a malformed `lumina` entry silently
+    // retained `allow: ["*"]`. Every assertion below goes through the PUBLIC
+    // decision path (`is_allowed` / `is_allowed_admin` / `filter_tools`, the
+    // same `Grant::permits` decision `filter_catalog_for_principal` and
+    // `guard()` use), not by inspecting the map, so it pins the behaviour an
+    // operator actually experiences.
+
+    /// Deliberately BROKEN grant shapes -- each is exactly the kind of typo an
+    /// operator makes while NARROWING an identity: a misspelled `deny` key, a
+    /// bare string instead of an array, a non-string entry, a `*` on the deny
+    /// side. Every one must produce denial, never the seeded wildcard.
+    const MALFORMED_GRANTS: &[&str] = &[
+        r#"{"allow": ["time_now"], "denny": ["github_"]}"#,
+        r#""time_now""#,
+        r#"[123]"#,
+        r#"{"allow": ["time_now"], "deny": ["github_*"]}"#,
+        r#"{"allow": ["ledger *"]}"#,
+    ];
+
+    /// The load-bearing case: a malformed explicit entry for a SCAFFOLDED
+    /// identity (`lumina`) must DENY it, not leave it on the scaffold's
+    /// `allow: ["*"]`. The operator was trying to narrow lumina; a broken
+    /// narrowing must not resolve to the wildcard they were narrowing away
+    /// from.
+    #[test]
+    fn malformed_grant_for_scaffolded_identity_denies_it_not_the_scaffold_wildcard() {
+        for bad in MALFORMED_GRANTS {
+            let raw = format!(r#"{{"lumina": {bad}, "reporting": ["ledger_accounts"]}}"#);
+            let policy = AllowlistPolicy::new(build_entries(&raw, Vec::new()));
+
+            // Ordinary tools the scaffold WOULD have allowed: all denied now.
+            for action in ["reminder_poll", "ledger_accounts", "weather", "time_now"] {
+                assert!(
+                    !policy.is_allowed("lumina", action),
+                    "malformed lumina grant {bad} must DENY '{action}', not fall back to the \
+                     scaffold wildcard"
+                );
+            }
+            // Inference route too -- the scaffold's `*` covered these as well.
+            assert!(!policy.is_allowed("lumina", "/v1/chat/completions"));
+            // Admin path (regression guard: the scaffold never granted admin,
+            // and a denied identity must not start to).
+            assert!(!policy.is_allowed_admin("lumina", "admin:register_worker"));
+            // Catalog filtering -- the `tools/list` visibility side of the
+            // same decision -- yields nothing.
+            assert!(
+                policy
+                    .filter_tools("lumina", vec![tool_json("time_now"), tool_json("weather")])
+                    .is_empty(),
+                "a denied identity must see an EMPTY catalog"
+            );
+
+            // Positive control: nothing else in the map is affected.
+            assert!(policy.is_allowed("reporting", "ledger_accounts"));
+            assert!(!policy.is_allowed("reporting", "github_push_repo"));
+            // ... including the OTHER scaffolded identity, which had no entry.
+            assert!(policy.is_allowed("harmony", "reminder_poll"));
+            assert!(!policy.is_allowed("harmony", "github_push_repo"));
+        }
+    }
+
+    /// Same rule for a SEEDED GUEST identity: a malformed explicit entry must
+    /// deny the guest outright, not leave them on the guest baseline.
+    #[test]
+    fn malformed_grant_for_seeded_guest_identity_denies_it_not_the_guest_baseline() {
+        for bad in MALFORMED_GRANTS {
+            let raw = format!(r#"{{"guest-alex": {bad}}}"#);
+            let policy = AllowlistPolicy::new(build_entries(
+                &raw,
+                vec!["guest-alex".to_string(), "guest-sam".to_string()],
+            ));
+
+            for action in ["time_now", "weather", crate::inference_proxy::AGENT_EXECUTE_PATH] {
+                assert!(
+                    !policy.is_allowed("guest-alex", action),
+                    "malformed guest grant {bad} must DENY '{action}', not fall back to the \
+                     guest baseline"
+                );
+            }
+            assert!(!policy.is_allowed_admin("guest-alex", "admin:register_worker"));
+            assert!(policy
+                .filter_tools("guest-alex", vec![tool_json("time_now")])
+                .is_empty());
+
+            // Positive control: the other seeded guest keeps the baseline.
+            assert!(policy.is_allowed("guest-sam", "weather"));
+            assert!(!policy.is_allowed("guest-sam", CALENDAR_CONTEXT_PROBE));
+        }
+    }
+
+    /// A malformed identity KEY aimed at a seeded identity revokes that
+    /// identity's seed too. `" lumina"` is unmistakably an attempt to configure
+    /// `lumina`; the key is still never TRIMMED INTO A GRANT (that direction
+    /// stays fail-closed), but the intent to control lumina is legible enough
+    /// that lumina must not be left on the scaffold wildcard.
+    #[test]
+    fn malformed_identity_key_for_a_seeded_identity_revokes_the_seed() {
+        for bad_key in [" lumina", "lumina ", "\tlumina"] {
+            let raw = format!(
+                r#"{{"{}": ["time_now"], "reporting": ["ledger_accounts"]}}"#,
+                bad_key.escape_default()
+            );
+            let policy = AllowlistPolicy::new(build_entries(&raw, Vec::new()));
+
+            // Neither the padded spelling nor the real one is granted anything.
+            for action in ["time_now", "reminder_poll", "/v1/chat/completions"] {
+                assert!(!policy.is_allowed(bad_key, action));
+                assert!(
+                    !policy.is_allowed("lumina", action),
+                    "key {bad_key:?} must revoke lumina's scaffold, not leave it on the wildcard"
+                );
+            }
+            assert!(!policy.is_allowed_admin("lumina", "admin:register_worker"));
+            assert!(policy.filter_tools("lumina", vec![tool_json("time_now")]).is_empty());
+
+            // Positive controls: everything else is untouched.
+            assert!(policy.is_allowed("reporting", "ledger_accounts"));
+            assert!(policy.is_allowed("harmony", "reminder_poll"));
+        }
+        // A guest baseline is revoked the same way.
+        let policy = AllowlistPolicy::new(build_entries(
+            r#"{" guest-alex": ["time_now"]}"#,
+            vec!["guest-alex".to_string(), "guest-sam".to_string()],
+        ));
+        assert!(!policy.is_allowed("guest-alex", "weather"));
+        assert!(policy.is_allowed("guest-sam", "weather"), "positive control");
+    }
+
+    /// Second positive control, and the one that proves the fix did not simply
+    /// start denying every override: a VALID explicit entry for a scaffolded
+    /// identity still applies in full, replacing (not merging with) the
+    /// scaffold.
+    #[test]
+    fn valid_override_of_a_scaffolded_identity_still_applies_normally() {
+        let policy = AllowlistPolicy::new(build_entries(
+            r#"{"lumina": {"allow": ["time_now", "ledger_*"], "deny": ["ledger_write"]}}"#,
+            Vec::new(),
+        ));
+        assert!(policy.is_allowed("lumina", "time_now"));
+        assert!(policy.is_allowed("lumina", "ledger_accounts"));
+        assert!(!policy.is_allowed("lumina", "ledger_write"), "deny layer still applies");
+        // Replaced, not merged: the scaffold's broad `*` is gone.
+        assert!(!policy.is_allowed("lumina", "reminder_poll"));
+        assert_eq!(
+            policy.filter_tools("lumina", vec![tool_json("time_now"), tool_json("reminder_poll")]),
+            vec![tool_json("time_now")]
+        );
+        // And a valid guest override applies too.
+        let policy = AllowlistPolicy::new(build_entries(
+            r#"{"guest-alex": ["time_now"]}"#,
+            vec!["guest-alex".to_string()],
+        ));
+        assert!(policy.is_allowed("guest-alex", "time_now"));
+        assert!(!policy.is_allowed("guest-alex", "weather"), "override replaces the baseline");
+    }
+
+    /// The other stale-state instance found while fixing the above: a config
+    /// carrying BOTH a malformed key (`" lumina"`) and a VALID entry for the
+    /// same identity (`"lumina"`) is iterated in `HashMap` order, so without a
+    /// guard the result would depend on which was visited last -- an
+    /// authorization decision decided by hash ordering. The explicit valid
+    /// entry wins, every time. Looped so a flaky ordering cannot pass by luck.
+    #[test]
+    fn valid_entry_beats_a_malformed_key_for_the_same_identity_deterministically() {
+        for _ in 0..64 {
+            let policy = AllowlistPolicy::new(build_entries(
+                r#"{" lumina": ["*"], "lumina": ["time_now"], "reporting": ["ledger_accounts"]}"#,
+                Vec::new(),
+            ));
+            assert!(policy.is_allowed("lumina", "time_now"), "the valid entry must win");
+            assert!(!policy.is_allowed("lumina", "reminder_poll"), "and only that entry");
+            assert!(!policy.is_allowed("lumina", "*"));
+            assert!(!policy.is_allowed(" lumina", "time_now"));
+            assert!(policy.is_allowed("reporting", "ledger_accounts"));
+        }
+        // But when the same-identity entry is ITSELF malformed, both readings
+        // agree: denied.
+        for _ in 0..64 {
+            let policy = AllowlistPolicy::new(build_entries(
+                r#"{" lumina": ["*"], "lumina": {"allow": ["*"], "denny": []}}"#,
+                Vec::new(),
+            ));
+            assert!(!policy.is_allowed("lumina", "time_now"));
+            assert!(!policy.is_allowed("lumina", "reminder_poll"));
+        }
+    }
+
+    /// The deliberate ASYMMETRY, pinned so it is not "fixed" by accident: when
+    /// the WHOLE JSON is unparseable there is no per-identity intent to read,
+    /// so the scaffold is RETAINED (denying every scaffolded identity on any
+    /// JSON typo would take the fleet down rather than narrow it). This is the
+    /// one case where a broader prior value legitimately survives bad input.
+    #[test]
+    fn wholly_unparseable_json_still_retains_the_scaffold_by_design() {
+        let policy = AllowlistPolicy::new(build_entries("not valid json", Vec::new()));
+        assert!(policy.is_allowed("lumina", "reminder_poll"));
+        assert!(!policy.is_allowed("lumina", "github_push_repo"));
+        assert!(!policy.is_allowed("anyone-else", "anything"));
     }
 
     /// The validator itself, in isolation -- the shapes it accepts and rejects.

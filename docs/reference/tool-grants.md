@@ -160,10 +160,32 @@ unconditionally in the router regardless of any grant.
 ## Validation — fail-closed
 
 Every entry in `TERMINUS_GATEWAY_ALLOWLIST_JSON` is validated at load. **A
-malformed grant is never treated as allow-all**; it is dropped, and the
-identity falls back to its scaffold/guest default or (if it has none) to
-default-deny. The failure is logged at `error` naming the identity and the
-reason.
+malformed grant is never treated as allow-all, and never leaves the identity at
+whatever it had before**: the entry is dropped AND any scaffold/guest baseline
+the seeding pass gave that identity is revoked, so the identity ends up
+default-denied. The failure is logged at `error`, naming the identity, the
+reason, and the fact that the identity is now denied.
+
+That last part is the point. The map is built by seeding the scaffolded
+(`lumina`, `harmony`) and guest identities first and applying your explicit
+entries on top, so "skip the bad entry" would mean an operator who writes an
+entry to *narrow* `lumina` and mistypes the JSON shape silently keeps the full
+`allow: ["*"]` scaffold — the fail-open direction, invisible from behaviour.
+Writing an entry for an identity is an expression of intent to control it; if
+that intent cannot be parsed, the identity is denied rather than left broader
+than you wrote. A wrong denial is loud and fixed in seconds; a silently retained
+wildcard is not detectable at all. Only the offending identity is affected —
+one bad entry never invalidates the rest of the map.
+
+The same applies to a malformed identity *key*: `{" lumina": [...]}` grants
+`lumina` nothing (keys are rejected, never trimmed into a grant nobody wrote)
+**and** revokes `lumina`'s seeded scaffold, because the intent to configure
+`lumina` is legible even though the key is not usable.
+
+One deliberate exception: if the **whole** JSON fails to parse there is no
+per-identity intent to read, so the scaffold is retained (denying every
+scaffolded identity on any JSON typo would take the fleet down rather than
+narrow it). It is logged at `error`.
 
 Rejected:
 
