@@ -220,7 +220,19 @@ pub const DEFAULT_SENSITIVE_DENY_PREFIXES: &[&str] = &[
 /// library mutation) alongside the discovery tools, which is precisely the kind
 /// of accidental widening this list exists to prevent.
 ///
+/// The list also carries ONE inference route, because a grant of tools alone
+/// would be inert: a guest talks to the assistant through
+/// `crate::inference_proxy::AGENT_EXECUTE_PATH`, which is gated as an
+/// [`ActionKind::Inference`] action against this same allow list. Without it a
+/// guest could not open a conversation at all. The RAW completion routes
+/// (`/v1/chat/completions` and friends) are deliberately NOT granted — those
+/// bypass the router's own per-principal tool selection and let the caller pick
+/// the model and prompt directly. A guest gets the assistant, not the engine.
+///
 /// Why each of these is safe for someone who is not the operator:
+/// - `/v1/agent/execute` — the assistant turn itself. Every tool the router
+///   dispatches inside that turn is re-checked against this same grant, so the
+///   route grants conversation, not reach.
 /// - `time_now` — the authoritative fleet clock (CLK-01). Reads no user data,
 ///   takes no arguments that reach a backend, mutates nothing.
 /// - `weather` — a public third-party forecast lookup for a location the caller
@@ -242,6 +254,7 @@ pub const DEFAULT_SENSITIVE_DENY_PREFIXES: &[&str] = &[
 /// `tool_availability`, and anything else that exists now or later. None of
 /// them are named above, so none are reachable.
 pub const GUEST_BASELINE_ALLOW: &[&str] = &[
+    crate::inference_proxy::AGENT_EXECUTE_PATH,
     "time_now",
     "weather",
     "news_headlines",
@@ -576,7 +589,8 @@ fn scaffold_defaults() -> HashMap<String, Grant> {
 /// enrolled identity may use. Config-driven
 /// (`crate::config::gateway_allowlist_json`, a JSON object of
 /// `identity -> [action, ...]` OR `identity -> {"allow": [...], "deny":
-/// [...]}` — see [`Grant`]/[`RawGrant`]). Default-deny: an identity with no
+/// [...]}` — see [`Grant`], parsed by [`validate_grant`]). Default-deny: an
+/// identity with no
 /// entry in the policy at all is denied every action — see this module's
 /// doc for why (no prior identity-scoped mechanism to fall back to, and the
 /// TGW-04 spec item's edge case calls for a clean denial, not a silent
@@ -2198,6 +2212,25 @@ mod tests {
         let id = identity("guest-relative");
         assert!(fw.guard(Some(&id), "weather", ActionKind::Tool).await.is_ok());
         assert!(fw.guard(Some(&id), "admin:register_worker", ActionKind::Admin).await.is_err());
+    }
+
+    /// The baseline grants the ASSISTANT (a scoped agent turn) but not the
+    /// ENGINE (raw completions, where the caller picks the model and prompt and
+    /// the router's per-principal tool selection does not apply).
+    #[tokio::test]
+    async fn guest_baseline_grants_the_assistant_turn_but_not_raw_inference() {
+        let fw = framework_with(guest_policy(), 10);
+        let id = identity("guest-relative");
+        assert!(
+            fw.guard(Some(&id), crate::inference_proxy::AGENT_EXECUTE_PATH, ActionKind::Inference)
+                .await
+                .is_ok(),
+            "a guest must be able to open an assistant turn, or the tool grant is inert"
+        );
+        assert!(fw
+            .guard(Some(&id), crate::inference_proxy::CHAT_COMPLETIONS_PATH, ActionKind::Inference)
+            .await
+            .is_err());
     }
 
     /// `tools/list` visibility matches callability: a guest is SHOWN only the

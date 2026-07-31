@@ -100,8 +100,9 @@ TERMINUS_GATEWAY_GUEST_IDENTITIES=guest-alex,guest-sam
 
 Today's surface (`GUEST_BASELINE_ALLOW`, exact tool names):
 
-| Tool | Why it is safe for a non-operator |
+| Entry | Why it is safe for a non-operator |
 |---|---|
+| `/v1/agent/execute` | The assistant turn itself — a guest must be able to *talk* to Lumina or the tool grant is inert. Every tool the router dispatches inside the turn is re-checked against this same grant, so the route grants conversation, not reach. The raw completion routes (`/v1/chat/completions`, …) are **not** granted: those bypass per-principal tool selection and let the caller pick the model and prompt. A guest gets the assistant, not the engine. |
 | `time_now` | The authoritative fleet clock. No arguments reach a backend, nothing is read or written. |
 | `weather` | Public third-party forecast for a caller-supplied location. No fleet or household state. |
 | `news_headlines`, `news_search`, `news_topic` | Public news retrieval, read-only. |
@@ -216,8 +217,8 @@ the household meal-planning tools.
    TERMINUS_GATEWAY_GUEST_IDENTITIES=guest-alex
    ```
 
-   At this point `guest-alex` can call the nine baseline tools and nothing
-   else, and `tools/list` shows exactly those nine.
+   At this point `guest-alex` can open an assistant turn and call the nine
+   baseline tools, and nothing else — `tools/list` shows exactly those nine.
 
 3. **Add the extra tools, if any.** An explicit `TERMINUS_GATEWAY_ALLOWLIST_JSON`
    entry *replaces* the baseline for that identity, so restate the baseline
@@ -227,6 +228,7 @@ the household meal-planning tools.
    {
      "guest-alex": {
        "allow": [
+         "/v1/agent/execute",
          "time_now", "weather",
          "news_headlines", "news_search", "news_topic",
          "media_search", "media_recommend", "media_recently_added", "media_on_deck",

@@ -155,8 +155,9 @@ deny entries are literal **prefixes** that win even over an allow `"*"`.
 
 **Guest / family identities** get a deliberately different construction. Name
 them in `TERMINUS_GATEWAY_GUEST_IDENTITIES` (comma-separated) and each gets the
-baseline surface — `time_now`, `weather`, `news_*` (three tools), and the four
-media *discovery* tools — as an **exactly enumerated allowlist**, not a wildcard
+baseline surface — the assistant route `/v1/agent/execute` (but not raw
+completions), `time_now`, `weather`, `news_*` (three tools), and the four media
+*discovery* tools — as an **exactly enumerated allowlist**, not a wildcard
 minus a denylist. That is the load-bearing choice: with a denylist every tool
 family added in future would be granted to houseguests the day it registers.
 With the allowlist a new family is invisible to a guest until someone
