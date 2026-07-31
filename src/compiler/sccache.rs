@@ -244,7 +244,7 @@ pub fn resolve(dataset_root: &str) -> SccacheEnv {
     from_secret_with_probe(
         env_nonempty(SCCACHE_REDIS_SECRET).as_deref(),
         dataset_root,
-        |host, port| tcp_reachable(host, port, timeout),
+        |parts| redis_usable(parts, timeout),
     )
 }
 
@@ -257,17 +257,136 @@ fn probe_timeout() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
-/// Fast bounded TCP-connect reachability check. `true` iff a connection to any
-/// resolved address of `host:port` succeeds within `timeout`. Non-fatal —
-/// callers fall open when it is `false`.
-fn tcp_reachable(host: &str, port: u16, timeout: std::time::Duration) -> bool {
+/// Fast bounded TCP-connect reachability check. `Some(stream)` iff a connection
+/// to any resolved address of `host:port` succeeds within `timeout`. Non-fatal —
+/// callers fall open when it is `None`.
+fn tcp_connect(host: &str, port: u16, timeout: std::time::Duration) -> Option<std::net::TcpStream> {
     use std::net::ToSocketAddrs;
-    match (host, port).to_socket_addrs() {
-        Ok(addrs) => addrs
-            .into_iter()
-            .any(|addr| std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()),
-        Err(_) => false,
+    let addrs = (host, port).to_socket_addrs().ok()?;
+    addrs
+        .into_iter()
+        .find_map(|addr| std::net::TcpStream::connect_timeout(&addr, timeout).ok())
+}
+
+/// Encode a RESP array command (`*N\r\n$len\r\n<arg>\r\n…`) — the wire form every
+/// Redis server accepts, including during the pre-auth phase.
+fn resp_command(args: &[&str]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+        out.extend_from_slice(a.as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
+    out
+}
+
+/// TERM #564: a REAL usability probe for the sccache Redis backend — connect,
+/// **AUTHENTICATE**, and `PING`. `true` only when the server answers `+PONG`.
+///
+/// This replaces a bare TCP-connect check, and the difference is the whole bug.
+/// sccache's "fail open" only ever existed at *resolve* time here; sccache
+/// itself fails **CLOSED at run time**. A Redis that is listening but rejects
+/// our credentials passed the old TCP probe, so the compiler wired
+/// `RUSTC_WRAPPER=sccache` + the Redis backend, and then EVERY cargo invocation
+/// died about one second in with:
+///
+/// ```text
+/// sccache: error: Server startup failed: cache storage failed to read: …
+///     service: redis  path: .sccache_check
+///     Source: NOAUTH: Authentication required.
+/// ```
+///
+/// cargo exits 101 having compiled nothing and run zero tests — which the
+/// `mode=test` gate then reported as a bare `FAIL (0 passed, 0 failed, 0
+/// ignored)`. A cache outage MUST degrade to a slower cold build, never a dead
+/// gate (module doc, requirement 2), so auth failure has to fall open exactly
+/// like unreachability does.
+///
+/// Deliberately hand-rolled RESP over a plain `TcpStream` (no redis client
+/// dependency, no async runtime) and strictly bounded by `timeout` on connect,
+/// read, and write — resolving the sccache backend must never stall a build.
+/// Any error, timeout, or non-`+PONG` reply ⇒ `false` ⇒ fail open. A `rediss://`
+/// (TLS) endpoint is NOT spoken here: we only do the plain-TCP reachability half
+/// for it and accept it, since attempting a plaintext RESP handshake against a
+/// TLS listener would produce a false negative and needlessly disable the cache.
+fn redis_usable(parts: &RedisUrlParts, timeout: std::time::Duration) -> bool {
+    use std::io::{Read, Write};
+
+    let (host, port) = endpoint_host_port(parts);
+    let Some(mut stream) = tcp_connect(&host, port, timeout) else {
+        return false;
+    };
+    // TLS endpoint: we can't speak plaintext RESP to it. Reachability is all we
+    // can honestly assert, so keep the pre-existing behavior for `rediss://`.
+    if parts.endpoint.starts_with("rediss://") {
+        return true;
+    }
+    if stream.set_read_timeout(Some(timeout)).is_err()
+        || stream.set_write_timeout(Some(timeout)).is_err()
+    {
+        return false;
+    }
+
+    let mut req = Vec::new();
+    if let Some(pass) = parts.password.as_deref() {
+        // ACL form (`AUTH <user> <pass>`) when a username is present, legacy
+        // single-arg form otherwise — matching what sccache itself will send.
+        match parts.username.as_deref() {
+            Some(user) => req.extend_from_slice(&resp_command(&["AUTH", user, pass])),
+            None => req.extend_from_slice(&resp_command(&["AUTH", pass])),
+        }
+    }
+    req.extend_from_slice(&resp_command(&["PING"]));
+    if stream.write_all(&req).is_err() || stream.flush().is_err() {
+        return false;
+    }
+
+    // Read whatever arrives within the budget. A successful exchange is short
+    // (`+OK\r\n+PONG\r\n`), so a small buffer and a single bounded read attempt
+    // loop is enough; we stop as soon as we can decide.
+    // A successful exchange is short (`+OK\r\n+PONG\r\n`); an auth failure is a
+    // single `-NOAUTH …` / `-WRONGPASS …` error line. Read until we can decide,
+    // hit EOF/error, or fill the small buffer — every read bounded by `timeout`.
+    let mut seen: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 128];
+    while seen.len() < 512 {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                seen.extend_from_slice(&buf[..n]);
+                // `+PONG` ⇒ usable. A `-` error reply ⇒ unusable. Either way we
+                // have our answer and must not block for more bytes.
+                if find(&seen, b"+PONG") || find(&seen, b"-") {
+                    break;
+                }
+            }
+        }
+    }
+    if find(&seen, b"+PONG") {
+        return true;
+    }
+    let reply = String::from_utf8_lossy(&seen);
+    // The server's own error line (`-NOAUTH …`, `-WRONGPASS …`) is a status
+    // string, never an echo of the credential we sent, so it is safe to log and
+    // is the single most useful thing an operator can see here.
+    let detail = reply.lines().next().unwrap_or("").trim();
+    warn!(
+        "sccache: Redis endpoint {}:{} did not answer PING (auth rejected, or not a Redis \
+         server): {:?} — falling open to the local cache dir. The build is UNAFFECTED apart \
+         from a cold cache; previously this misconfiguration made every cargo invocation \
+         die at sccache startup with zero tests run (TERM #564)",
+        host, port, detail
+    );
+    false
+}
+
+/// Whether `needle` occurs anywhere in `hay`. Tiny helper so the RESP reply
+/// decision above reads plainly (and is unit-testable).
+fn find(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return needle.is_empty();
+    }
+    hay.windows(needle.len()).any(|w| w == needle)
 }
 
 /// The `(host, port)` for the reachability probe. The port was already validated
@@ -282,17 +401,23 @@ pub fn endpoint_host_port(parts: &RedisUrlParts) -> (String, u16) {
 /// ⇒ fail-open local dir. Retained for the split-env / fail-open-on-missing
 /// tests; production goes through [`resolve`] (which probes).
 pub fn from_secret(secret_url: Option<&str>, dataset_root: &str) -> SccacheEnv {
-    from_secret_with_probe(secret_url, dataset_root, |_, _| true)
+    from_secret_with_probe(secret_url, dataset_root, |_| true)
 }
 
 /// The full builder (the injectable test entry point): selects Redis mode ONLY
-/// when the URL parses AND `probe(host, port)` returns `true`; otherwise fails
-/// OPEN to the local disk cache. Injecting `probe` makes the unreachable-endpoint
+/// when the URL parses AND `probe(parts)` returns `true`; otherwise fails
+/// OPEN to the local disk cache. Injecting `probe` makes the unusable-endpoint
 /// decision offline-testable.
+///
+/// TERM #564: `probe` takes the WHOLE [`RedisUrlParts`] (not just host+port) so
+/// production can check that the endpoint is not merely listening but actually
+/// USABLE with our credentials — see [`redis_usable`]. A reachable-but-
+/// unauthenticated Redis used to pass the old host/port-only probe and then kill
+/// every build at sccache startup.
 pub fn from_secret_with_probe(
     secret_url: Option<&str>,
     dataset_root: &str,
-    probe: impl Fn(&str, u16) -> bool,
+    probe: impl Fn(&RedisUrlParts) -> bool,
 ) -> SccacheEnv {
     let mut vars = BTreeMap::new();
     // Always wrap rustc with sccache; the backend below decides where objects go.
@@ -313,11 +438,12 @@ pub fn from_secret_with_probe(
         None => return fail_open(vars),
     };
 
-    // Reachability gate: a syntactically valid but dead endpoint falls open.
-    let (host, port) = endpoint_host_port(&parts);
-    if !probe(&host, port) {
+    // Usability gate: a syntactically valid but dead — or reachable-but-
+    // unauthenticated (TERM #564) — endpoint falls open.
+    if !probe(&parts) {
+        let (host, port) = endpoint_host_port(&parts);
         warn!(
-            "sccache: Redis endpoint {}:{} unreachable — falling open to local cache dir",
+            "sccache: Redis endpoint {}:{} unusable — falling open to local cache dir",
             host, port
         );
         return fail_open(vars);
@@ -491,7 +617,7 @@ mod tests {
         let env = from_secret_with_probe(
             Some("redis://default:pw@dead-host:6379/1"),
             DATASET,
-            |_, _| false, // injected: endpoint unreachable
+            |_| false, // injected: endpoint unusable
         );
         assert_eq!(env.mode, SccacheMode::LocalDir);
         assert_eq!(
@@ -511,8 +637,9 @@ mod tests {
         let env = from_secret_with_probe(
             Some("redis://default:pw@cache-host:6390/2"),
             DATASET,
-            |h, p| {
-                *seen.borrow_mut() = (h.to_string(), p);
+            |parts| {
+                let (h, p) = endpoint_host_port(parts);
+                *seen.borrow_mut() = (h, p);
                 true
             },
         );
@@ -563,7 +690,7 @@ mod tests {
         let env = from_secret_with_probe(
             Some("redis://default:pw@host:notaport/1"),
             DATASET,
-            |_, _| true, // even if host:6379 were reachable…
+            |_| true, // even if host:6379 were reachable…
         );
         assert_eq!(env.mode, SccacheMode::LocalDir);
         assert!(env.vars.contains_key("SCCACHE_DIR"));
@@ -575,5 +702,86 @@ mod tests {
     fn describe_never_contains_password() {
         let env = from_secret(Some("redis://default:sup3rsecret@h:6379/1"), DATASET);
         assert!(!env.describe().contains("sup3rsecret"));
+    }
+
+    // ── TERM #564: the probe must judge USABILITY, not mere reachability ─────
+
+    #[test]
+    fn resp_command_encodes_wire_form() {
+        assert_eq!(resp_command(&["PING"]), b"*1\r\n$4\r\nPING\r\n".to_vec());
+        assert_eq!(
+            resp_command(&["AUTH", "default", "pw"]),
+            b"*3\r\n$4\r\nAUTH\r\n$7\r\ndefault\r\n$2\r\npw\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn find_locates_resp_markers() {
+        assert!(find(b"+OK\r\n+PONG\r\n", b"+PONG"));
+        assert!(find(b"-NOAUTH Authentication required.\r\n", b"-"));
+        assert!(!find(b"+OK\r\n", b"+PONG"));
+        // A needle longer than the haystack can never match.
+        assert!(!find(b"+P", b"+PONG"));
+    }
+
+    /// The regression this whole change exists for: an endpoint that is
+    /// LISTENING but rejects our credentials must fall OPEN to the local dir.
+    /// Before TERM #564 the probe only TCP-connected, so this selected Redis
+    /// mode and every subsequent `cargo` invocation died ~1s in with
+    /// `sccache: error: Server startup failed … NOAUTH: Authentication
+    /// required.` — zero tests compiled, which the mode=test gate then reported
+    /// as a bare `0 passed, 0 failed`.
+    #[test]
+    fn reachable_but_unauthenticated_endpoint_falls_open() {
+        let env = from_secret_with_probe(
+            Some("redis://default:wrongpw@cache-host:6380/1"),
+            DATASET,
+            // Injected: TCP is fine, AUTH/PING is not — exactly what
+            // `redis_usable` returns for a NOAUTH/WRONGPASS reply.
+            |_| false,
+        );
+        assert_eq!(env.mode, SccacheMode::LocalDir);
+        assert_eq!(
+            env.vars.get("SCCACHE_DIR").map(String::as_str),
+            Some("/data/build/cache/sccache")
+        );
+        // Crucially: no half-configured Redis env is handed to the build.
+        assert!(!env.vars.contains_key("SCCACHE_REDIS_ENDPOINT"));
+        assert!(!env.vars.contains_key("SCCACHE_REDIS_PASSWORD"));
+        // …and sccache is still wired as the wrapper (the cache degrades, the
+        // build does not break).
+        assert!(env.vars.contains_key("RUSTC_WRAPPER"));
+    }
+
+    /// The probe receives the credentials, not just host+port — otherwise it
+    /// could not have authenticated at all (this is the signature change).
+    #[test]
+    fn probe_receives_full_parts_including_credentials() {
+        let seen: std::cell::RefCell<Option<RedisUrlParts>> = std::cell::RefCell::new(None);
+        let env = from_secret_with_probe(
+            Some("redis://alice:s3cret@cache-host:6390/2"),
+            DATASET,
+            |parts| {
+                *seen.borrow_mut() = Some(parts.clone());
+                true
+            },
+        );
+        assert_eq!(env.mode, SccacheMode::Redis);
+        let got = seen.borrow().clone().expect("probe was called");
+        assert_eq!(got.username.as_deref(), Some("alice"));
+        assert_eq!(got.password.as_deref(), Some("s3cret"));
+        assert_eq!(got.db.as_deref(), Some("2"));
+        assert_eq!(endpoint_host_port(&got), ("cache-host".to_string(), 6390));
+    }
+
+    /// A DEAD endpoint (no TCP at all) still falls open — `redis_usable` is a
+    /// strict superset of the old reachability check, so the pre-existing
+    /// behavior is preserved. Uses a port nothing listens on, exercising the
+    /// REAL production probe rather than an injected one.
+    #[test]
+    fn real_probe_on_dead_endpoint_is_unusable() {
+        // 127.0.0.1:1 — reserved, never listening.
+        let parts = parse_redis_url("redis://default:pw@127.0.0.1:1").unwrap();
+        assert!(!redis_usable(&parts, std::time::Duration::from_millis(200)));
     }
 }
