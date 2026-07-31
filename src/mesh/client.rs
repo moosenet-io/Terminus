@@ -261,7 +261,10 @@ impl UpstreamClient {
             "method": "tools/list",
             "params": {}
         });
-        let resp = self.post_rpc(body).await?;
+        // TERM #565: this is the CATALOG call — a stale session here is what silently
+        // dropped all 40 <host> tools from the merged catalog. Retry once with a fresh
+        // handshake before letting the pool conclude the upstream is down.
+        let resp = self.with_session_retry(|| self.post_rpc(body.clone())).await?;
 
         if let Some(err) = resp.get("error") {
             return Err(UpstreamClientError::BadResponse(self.name.clone(), err.to_string()));
@@ -303,7 +306,8 @@ impl UpstreamClient {
             "method": "tools/call",
             "params": {"name": name, "arguments": arguments}
         });
-        let resp = self.post_rpc(body).await?;
+        // TERM #565: retry once on a stale session rather than reporting an outage.
+        let resp = self.with_session_retry(|| self.post_rpc(body.clone())).await?;
 
         if let Some(err) = resp.get("error") {
             let message = err
@@ -338,6 +342,69 @@ impl UpstreamClient {
         matches!(req.send().await, Ok(resp) if resp.status().is_success())
     }
 
+/// Whether an error looks like a STALE SESSION rather than a dead upstream.
+///
+/// TERM #565 root cause: `ensure_session` short-circuits whenever ANY session id is
+/// cached — it never checks the session is still alive. When the upstream expires or
+/// forgets it (a restart, an idle timeout, an nginx hop recycling), the next call is
+/// answered with a non-MCP error body. That surfaced as
+/// `"returned an unparseable response: error decoding response body"`, the pool marked
+/// the upstream unhealthy, and ALL of its tools silently vanished from the merged
+/// catalog — for `<host>`, all 40 Proxmox tools, mid-conversation, with the assistant
+/// then telling the operator it had no access to their own hardware.
+///
+/// A stale session is a RECOVERABLE condition, not a dead upstream, so it must be
+/// retried with a fresh handshake rather than treated as an outage.
+fn looks_like_stale_session(e: &UpstreamClientError) -> bool {
+    match e {
+        // The upstream answered, but not with MCP — the classic expired-session shape
+        // (an HTML or plain-text error page where a JSON-RPC envelope was expected).
+        UpstreamClientError::BadResponse(_, _) => true,
+        // 4xx: the request was understood and refused. 404/400 are what MCP servers
+        // return for an unknown session id. 401/403 are auth, not session, and a fresh
+        // handshake will not help — do not mask a credential problem as a retry.
+        UpstreamClientError::Rejected(_, status, _) => {
+            *status == 400 || *status == 404 || *status == 409
+        }
+        // Transport failures are genuine unreachability; the pool's health tracking
+        // already handles those and retrying would just double the latency.
+        _ => false,
+    }
+}
+
+impl UpstreamClient {
+    /// Run `op`, and if it fails in a way that looks like an expired session, DROP the
+    /// cached session id and try exactly once more with a fresh `initialize`.
+    ///
+    /// Exactly once: a second failure is a real problem and must surface, not spin.
+    async fn with_session_retry<F, Fut, T>(&self, op: F) -> Result<T, UpstreamClientError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, UpstreamClientError>>,
+    {
+        match op().await {
+            Ok(v) => Ok(v),
+            Err(e) if looks_like_stale_session(&e) => {
+                tracing::warn!(
+                    "mesh: upstream {:?} looks like a stale session ({e}) — clearing it and \
+                     re-initializing once before treating this as an outage",
+                    self.name
+                );
+                self.clear_session();
+                self.initialize().await?;
+                op().await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Drop the cached session id so the next call re-handshakes.
+    fn clear_session(&self) {
+        *self.session_id.lock().expect("session_id mutex poisoned") = None;
+    }
+}
+
+impl UpstreamClient {
     /// Ensure this client has a live `Mcp-Session-Id` for this upstream,
     /// (re-)running `initialize` if one isn't already cached. Cheap when a
     /// session is already held (a `Mutex` check, no network call).
@@ -818,5 +885,47 @@ mod tests {
             err,
             UpstreamClientError::Unreachable(_, _) | UpstreamClientError::Timeout(_, _)
         ));
+    }
+}
+
+#[cfg(test)]
+mod session_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn an_unparseable_body_is_treated_as_a_stale_session() {
+        // This is the EXACT shape that dropped all 40 <host> tools (TERM #565):
+        // "returned an unparseable response: error decoding response body".
+        let e = UpstreamClientError::BadResponse("<host>".into(), "error decoding response body".into());
+        assert!(
+            looks_like_stale_session(&e),
+            "the observed <host> failure mode must be retried, not treated as an outage"
+        );
+    }
+
+    #[test]
+    fn session_shaped_4xx_is_retried() {
+        for status in [400u16, 404, 409] {
+            let e = UpstreamClientError::Rejected("<host>".into(), status, "no session".into());
+            assert!(looks_like_stale_session(&e), "{status} should re-handshake");
+        }
+    }
+
+    #[test]
+    fn auth_failures_are_not_masked_as_stale_sessions() {
+        // A fresh handshake cannot fix a bad credential, and retrying would hide a
+        // real misconfiguration behind a second identical failure.
+        for status in [401u16, 403] {
+            let e = UpstreamClientError::Rejected("<host>".into(), status, "denied".into());
+            assert!(!looks_like_stale_session(&e), "{status} must NOT be retried as a session issue");
+        }
+    }
+
+    #[test]
+    fn a_genuine_outage_is_not_retried() {
+        // Transport failures are real unreachability — the pool's health tracking owns
+        // those, and retrying only doubles the latency before the same conclusion.
+        let e = UpstreamClientError::Unreachable("<host>".into(), "connection refused".into());
+        assert!(!looks_like_stale_session(&e));
     }
 }
