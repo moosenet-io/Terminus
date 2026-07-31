@@ -82,12 +82,19 @@ fact alone, a worker-control admin.
 | Posture | Applies to | Shape |
 |---|---|---|
 | **Scaffolded service** | `lumina`, `harmony` (`SCAFFOLDED_IDENTITIES`) | `allow: ["*"]` minus `DEFAULT_SENSITIVE_DENY_PREFIXES` |
-| **Guest / family** | identities named in `TERMINUS_GATEWAY_GUEST_IDENTITIES` | `GUEST_BASELINE_ALLOW` (exact names) plus the same sensitive deny layer |
+| **Guest / family** | identities named in `TERMINUS_GATEWAY_GUEST_IDENTITIES` | `GUEST_BASELINE_ALLOW` (exact names) plus the same sensitive deny layer — and it is a **ceiling**, see below |
 | **Operator** | whatever the operator configures, conventionally `["*"]` | List form, unrestricted — see [the wildcard question](#the-legacy-wildcard-question) |
 
 Precedence at load: scaffold defaults → guest baseline → `TERMINUS_GATEWAY_ALLOWLIST_JSON`.
-The env JSON wins **per identity, in full** — it replaces that identity's grant,
-it is never merged with the default.
+
+For a **non-guest** identity the env JSON wins **per identity, in full** — it
+replaces that identity's grant, it is never merged with the default.
+
+For a **guest** identity it does not. Naming an identity in
+`TERMINUS_GATEWAY_GUEST_IDENTITIES` is a classification, and that classification
+is an **upper bound**: the explicit entry is *intersected* with
+`GUEST_BASELINE_ALLOW`, so it may **narrow** a guest but can never widen one.
+See [Guest classification is a ceiling](#guest-classification-is-a-ceiling).
 
 ## The guest / family baseline
 
@@ -152,10 +159,57 @@ kept as defence in depth for the predictable future edit where someone widens
 the allow set or copies this grant as the starting point for a new household
 role.
 
-A guest identity has no admin grant, so no control-plane op is reachable. And
-because guests are still principals, the operator-guarded tool set
-(`approval_*` and everything `crate::approval::is_guarded` covers) is blocked
-unconditionally in the router regardless of any grant.
+A guest identity has no admin grant, so no control-plane op is reachable — and
+that holds regardless of what `TERMINUS_GATEWAY_ALLOWLIST_JSON` says about it,
+per the ceiling below. Because guests are still principals, the operator-guarded
+tool set (`approval_*` and everything `crate::approval::is_guarded` covers) is
+blocked unconditionally in the router regardless of any grant.
+
+### Guest classification is a ceiling
+
+**An identity named in `TERMINUS_GATEWAY_GUEST_IDENTITIES` can never resolve to
+more than `GUEST_BASELINE_ALLOW`, whatever `TERMINUS_GATEWAY_ALLOWLIST_JSON`
+says about it.** An explicit entry for a guest is *intersected* with the
+baseline (`clamp_to_guest_ceiling`), not substituted for it:
+
+| Explicit entry for `guest-alex` | Effective grant |
+|---|---|
+| *(none)* | the full baseline |
+| `["weather"]` | `["weather"]` — **narrowing works, and is the point of writing an entry** |
+| `["*"]` | exactly the baseline — clamped, and logged |
+| `{"allow": ["google_calendar_today", "commute_estimate"], "deny": []}` | *nothing* — every entry is outside the ceiling |
+| `["weather", "infisical_get_secret"]` | `["weather"]` |
+| `["admin:*"]` | *nothing*; a guest never holds an admin grant |
+
+This closes a real hole. Before it, an explicit entry replaced the baseline in
+full, so `{"guest-alex": ["*"]}` — one wildcard, typed once, or a line
+copy-pasted from an operator identity two lines above — gave a houseguest
+`google_calendar_today` and `commute_estimate`. `GatewayFramework::caller_context`
+then minted an **entitled** context for them, and `weather` answered an omitted
+location with the operator's calendar event summary or configured home/work
+address. A protection whose entire job is to bound what a guest can reach must
+not be escapable by editing the config it is supposed to bound.
+
+**Why intersect rather than reject the entry outright.** A malformed grant is
+denied outright (below) because it has no legible meaning — there is nothing to
+honour. A widening grant *is* legible: every baseline tool it names is an intent
+we can honour exactly, so intersecting satisfies the invariant while still doing
+what you asked wherever that is permissible. It also fails in the recoverable
+direction — a clamped guest keeps working, a denied guest is an outage for a
+household member who did nothing wrong. The security property is identical
+either way; the tie breaks on operability.
+
+**A clamp is never silent.** It is logged at `warn`, naming the identity, the
+entries dropped as outside the baseline, the effective allow list, and the fact
+that guest classification is a ceiling — so an operator who wrote a wider grant
+learns it was reduced rather than quietly getting something other than what they
+wrote. **To grant an identity more than the baseline, remove it from
+`TERMINUS_GATEWAY_GUEST_IDENTITIES`** — it is then not a guest, and its entry
+applies in full like any other.
+
+The ceiling composes with the fail-closed validation below rather than softening
+it: a *malformed* entry for a guest still denies that guest outright, it does not
+fall back to the clamped baseline.
 
 ## Validation — fail-closed
 
@@ -265,29 +319,48 @@ the household meal-planning tools.
    At this point `guest-alex` can open an assistant turn and call the nine
    baseline tools, and nothing else — `tools/list` shows exactly those nine.
 
-3. **Add the extra tools, if any.** An explicit `TERMINUS_GATEWAY_ALLOWLIST_JSON`
-   entry *replaces* the baseline for that identity, so restate the baseline
-   alongside the additions:
+3. **Add the extra tools, if any — and note that this is where the ceiling
+   bites.** While `guest-alex` is listed in `TERMINUS_GATEWAY_GUEST_IDENTITIES`,
+   an explicit entry is intersected with `GUEST_BASELINE_ALLOW`, so
+   `hearth_recipe_search` in the JSON below would simply be **clamped away**
+   (and logged) — it is not in the baseline. A guest entry can narrow, not
+   extend. There are exactly two correct moves:
 
-   ```jsonc
-   {
-     "guest-alex": {
-       "allow": [
-         "/v1/agent/execute",
-         "time_now", "weather",
-         "news_headlines", "news_search", "news_topic",
-         "media_search", "media_recommend", "media_recently_added", "media_on_deck",
-         "hearth_recipe_search", "hearth_what_can_i_make"
-       ],
-       "deny": ["github_", "infisical_", "approval_", "ansible_"]
+   - **Preferred: widen the baseline itself.** If the household meal-planning
+     tools are safe for *every* guest, add them to `GUEST_BASELINE_ALLOW` in
+     `src/gateway_framework/mod.rs` (a deliberate, reviewed code edit — which is
+     the property the allowlist exists to force) and every guest gets them. Keep
+     the entries **exact names**: resist `"hearth_*"`, which would sweep in
+     `hearth_pantry_add`/`hearth_shopping_list` (household state writes).
+
+   - **Otherwise: this principal is not a guest.** Remove it from
+     `TERMINUS_GATEWAY_GUEST_IDENTITIES` and grant it explicitly, restating the
+     baseline alongside the additions — at which point the entry applies in full,
+     and so does the responsibility for what it names:
+
+     ```jsonc
+     {
+       "alex-workstation": {
+         "allow": [
+           "/v1/agent/execute",
+           "time_now", "weather",
+           "news_headlines", "news_search", "news_topic",
+           "media_search", "media_recommend", "media_recently_added", "media_on_deck",
+           "hearth_recipe_search", "hearth_what_can_i_make"
+         ],
+         "deny": ["github_", "infisical_", "approval_", "ansible_"]
+       }
      }
-   }
-   ```
+     ```
 
-   Keep it an enumerated allow list — resist `"hearth_*"`, which would grant
-   `hearth_pantry_add`/`hearth_shopping_list` (household state writes) as well.
-   The `deny` block is redundant against this allow list and is kept as defence
-   in depth for later edits.
+     Do **not** name `google_calendar_today` or `commute_estimate` here unless
+     you mean it: those grants are what `GatewayFramework::caller_context` reads
+     to decide whether a tool may fold the operator's calendar or home/work
+     addresses into an answer. The `deny` block is redundant against this allow
+     list and is kept as defence in depth for later edits.
+
+   Narrowing, by contrast, works normally on a guest —
+   `{"guest-alex": ["weather"]}` gives them `weather` and nothing else.
 
 4. **Restart the service.** Grants are read at startup, like every other
    `Environment=` knob.
@@ -306,7 +379,8 @@ the household meal-planning tools.
 | `AllowlistPolicy` | struct | `src/gateway_framework/mod.rs` | The grant map; `is_allowed`, `is_allowed_admin`, `filter_tools`. |
 | `Grant` | enum | `src/gateway_framework/mod.rs` | `List` (legacy, no deny layer) or `AllowDeny`. |
 | `validate_grant` | fn | `src/gateway_framework/mod.rs` | Fail-closed per-identity config validation. |
-| `GUEST_BASELINE_ALLOW` / `guest_baseline_grant` | const / fn | `src/gateway_framework/mod.rs` | The guest/family surface. |
+| `GUEST_BASELINE_ALLOW` / `guest_baseline_grant` | const / fn | `src/gateway_framework/mod.rs` | The guest/family surface — and the ceiling a guest's explicit grant is clamped to. |
+| `clamp_to_guest_ceiling` | fn | `src/gateway_framework/mod.rs` | Intersects a guest's explicit grant with `GUEST_BASELINE_ALLOW`, so an override can narrow but never widen. |
 | `SCAFFOLDED_IDENTITIES` / `DEFAULT_SENSITIVE_DENY_PREFIXES` | consts | `src/gateway_framework/mod.rs` | The `lumina`/`harmony` service posture. |
 | `is_model_blocked` | fn | `src/agent_router/mod.rs` | Unconditional operator-guarded block, independent of any grant. |
 

@@ -1958,6 +1958,106 @@ mod tests {
         }
     }
 
+    /// TRTR-05 (round 4) END-TO-END: the guest ceiling, driven through the REAL
+    /// config path and the REAL gateway entitlement decision into this tool.
+    ///
+    /// This is the test that would have caught the hole. A guest whose
+    /// `TERMINUS_GATEWAY_ALLOWLIST_JSON` entry tries to hand them the context
+    /// probes — by wildcard, or by naming
+    /// `google_calendar_today`/`commute_estimate` outright — is CLAMPED to
+    /// `GUEST_BASELINE_ALLOW`, so `GatewayFramework::caller_context` mints an
+    /// untrusted context and `weather` asks which place they meant. Before the
+    /// clamp, each of these grants produced an ENTITLED context and this tool
+    /// answered with the operator's appointment (summary + address) or home
+    /// address.
+    ///
+    /// Nothing here is stubbed between the config string and the tool output:
+    /// config JSON → `build_entries` (seeding, validation, clamp) →
+    /// `AllowlistPolicy` → `GatewayFramework::caller_context(Principal)` →
+    /// `Weather::execute_with_caller`.
+    #[tokio::test]
+    async fn trtr05_e2e_a_guest_granted_the_probes_by_config_still_gets_asked() {
+        use crate::gateway_framework::{AllowlistPolicy, GatewayFramework};
+        use crate::gateway_framework::rate_limit::InProcessRateLimiter;
+        use crate::mesh::{Principal, PrincipalSource};
+
+        for override_json in [
+            r#"["*"]"#,
+            r#"{"allow": ["*"], "deny": []}"#,
+            r#"{"allow": ["weather", "google_calendar_today", "commute_estimate"], "deny": []}"#,
+            r#"["/v1/agent/execute", "time_now", "weather", "google_calendar_today", "commute_estimate"]"#,
+        ] {
+            let raw = format!(r#"{{"guest-alex": {override_json}}}"#);
+            let fw = GatewayFramework::new(
+                AllowlistPolicy::from_config_for_test(&raw, vec!["guest-alex".to_string()]),
+                Arc::new(InProcessRateLimiter::new(10, 1000.0)),
+            );
+            let guest_principal = Principal::new("guest-alex", PrincipalSource::MtlsCert);
+            let caller = fw.caller_context(Some(&guest_principal));
+
+            // The gateway's own view: not entitled, whatever the config said.
+            assert!(
+                !caller.may_infer_from_calendar() && !caller.may_infer_from_routine(),
+                "config {override_json} minted an ENTITLED context for a guest"
+            );
+            // ...and the guest can still USE weather -- the clamp did not lock
+            // them out, it bounded them (the operability half of intersect).
+            assert!(
+                fw.permits_tool("guest-alex", "weather"),
+                "config {override_json}: a clamped guest must keep the baseline surface"
+            );
+
+            let server = MockServer::start();
+            let geo = server.mock(|when, then| {
+                when.method(GET).path("/geo/1.0/direct");
+                then.status(200).json_body(geo_body());
+            });
+            server.mock(|when, then| {
+                when.method(GET).path("/data/2.5/weather");
+                then.status(200).json_body(current_body());
+            });
+            let tool = Weather {
+                cfg: cfg_full(
+                    &server,
+                    routine_of(Some(OPERATOR_HOME), Some(OPERATOR_WORK)),
+                    events(operator_day()),
+                ),
+            };
+
+            let out = tool
+                .execute_with_caller(json!({"when": "current"}), caller)
+                .await
+                .unwrap()
+                .text;
+
+            assert_eq!(out, ASK_MESSAGE, "config {override_json}: the guest must be ASKED");
+            assert_no_operator_context(&out);
+            assert_eq!(
+                geo.hits(),
+                0,
+                "config {override_json}: nothing was resolved, so nothing may be geocoded"
+            );
+
+            // POSITIVE CONTROL, same config map, same tool: the operator's own
+            // scaffolded identity IS entitled and DOES get the calendar answer
+            // -- so the assertions above are the gate working, not inference
+            // switched off for everybody.
+            let operator_caller =
+                fw.caller_context(Some(&Principal::new("lumina", PrincipalSource::MtlsCert)));
+            assert!(
+                operator_caller.may_infer_from_calendar(),
+                "config {override_json}: the operator path must not be degraded"
+            );
+            let out = tool
+                .execute_with_caller(json!({"when": "current"}), operator_caller)
+                .await
+                .unwrap()
+                .text;
+            assert!(out.contains(OPERATOR_EVENT_PLACE), "{out}");
+            assert!(geo.hits() >= 1, "the operator's resolved location WAS geocoded");
+        }
+    }
+
     // ── tomorrow → /data/2.5/forecast, tomorrow extraction ───────────────────
 
     #[tokio::test]

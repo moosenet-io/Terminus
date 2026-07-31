@@ -165,6 +165,16 @@ deliberately adds it. Media acquisition/mutation (`media_request`,
 `media_delete`, `media_organize`, `media_taste_feedback`) is excluded for the
 same reason the entries are exact names rather than a `media_*` prefix.
 
+That baseline is a **ceiling, not a default**. For every other identity an
+explicit `TERMINUS_GATEWAY_ALLOWLIST_JSON` entry wins in full; for a guest it is
+*intersected* with the baseline, so an entry may **narrow** a guest and can never
+widen one. A `{"guest-alex": ["*"]}` — one wildcard, or a line copy-pasted from
+an operator identity — would otherwise have handed a houseguest
+`google_calendar_today`/`commute_estimate`, which is what the gateway reads to
+decide whether a tool may fold the operator's calendar or home address into an
+answer. A clamp is logged loudly; to grant more than the baseline, take the
+identity out of `TERMINUS_GATEWAY_GUEST_IDENTITIES`.
+
 Grants are **validated fail-closed** at load: a malformed entry (wrong JSON
 type, an unknown key such as a misspelled `deny`, a whitespace/empty entry, a
 `*` in a deny prefix where it would silently match nothing) is **dropped and
