@@ -560,23 +560,26 @@ const MOCK_MUSE_STATS = {
   last_ingest_at: new Date(Date.now() - 45 * 60000).toISOString(),
 };
 
-const MOCK_MUSE_CHANNELS = {
-  channels: [
-    { id: 'ch-1', name: 'Mock Channel One', item_count: 12 },
-    { id: 'ch-2', name: 'Mock Channel Two', item_count: 5 },
-  ],
-};
+// MGUI-10 review fix: this mock previously answered `{channels:[{id:'ch-1', …, item_count}]}` —
+// an envelope and an element shape Muse has never returned. Live `GET /api/channels` answers a
+// BARE ARRAY of `ChannelSummary` (Muse `src/web/guide.rs:35`). A mock that disagrees with its
+// endpoint is a false-green generator: every panel built against it looks correct in mock mode
+// and breaks on real data. Matched to the server struct.
+const MOCK_MUSE_CHANNELS = [
+  { id: 1, name: 'Mock Channel One', kind: 'series', mode: 'shuffle', channel_number: 1.0, enabled: true },
+  { id: 2, name: 'Mock Channel Two', kind: 'movie', mode: 'ordered', channel_number: 2.0, enabled: true },
+];
 
 const MOCK_MUSE_LINEUP: Record<string, { channel_id: string; lineup: Array<{ id: string; title: string; position: number }> }> = {
-  'ch-1': {
-    channel_id: 'ch-1',
+  '1': {
+    channel_id: '1',
     lineup: [
       { id: 'md-1', title: 'Example Feature Film', position: 1 },
       { id: 'md-2', title: 'Example Series S1E4', position: 2 },
     ],
   },
-  'ch-2': {
-    channel_id: 'ch-2',
+  '2': {
+    channel_id: '2',
     lineup: [
       { id: 'md-3', title: 'Example Upcoming Release', position: 1 },
     ],
@@ -590,6 +593,28 @@ const MOCK_MUSE_GUIDE = {
     { channel_id: 'ch-2', title: 'Example Upcoming Release', start: new Date().toISOString(), end: new Date(Date.now() + 90 * 60000).toISOString() },
   ],
 };
+
+// MGUI-10: Muse's HDHomeRun-compatible tuner discovery document, mirroring a LIVE capture
+// through the proxy field-for-field (PascalCase is the HDHomeRun wire format). Only the host
+// in the URLs is a placeholder -- real addresses never go in committed source.
+const MOCK_MUSE_TUNER = {
+  BaseURL: 'http://muse.internal:8098',
+  DeviceAuth: 'muse',
+  DeviceID: 'MUSE0001',
+  FirmwareName: 'muse-tuner',
+  FirmwareVersion: '0.1.0',
+  FriendlyName: 'Muse TV',
+  LineupURL: 'http://muse.internal:8098/lineup.json',
+  Manufacturer: 'Muse',
+  ManufacturerURL: 'http://muse.internal:8098/',
+  ModelNumber: 'MUSE-TUNER-1',
+  TunerCount: 4,
+};
+
+// The HDHomeRun lineup the tuner advertises. A BARE ARRAY, and empty on the live deployment
+// -- so the element shape is UNVERIFIED and the mock keeps it empty rather than inventing
+// entries whose fields nobody has observed. Consumers use only its length.
+const MOCK_MUSE_TUNER_LINEUP: unknown[] = [];
 
 // CONST-20: 5 clusters deliberately -- exercises the ">4 clusters fold to Other" rule (spec
 // §5.4/§4.2 ALL_PAIRS_CEILING) with real mock data instead of only being provable by editing
@@ -858,6 +883,10 @@ const MOCK_GET: Record<string, unknown> = {
   'muse /api/graph/watch-history': MOCK_MUSE_WATCH_HISTORY,
   'muse /api/graph/group-dynamics': MOCK_MUSE_GROUP_DYNAMICS,
   'muse /guide': MOCK_MUSE_GUIDE,
+  // MGUI-10: tuner telemetry for the programming grid's footer. Plain passthrough paths under
+  // the existing `proxy_muse` arm (no proxy.rs change) -- both verified live.
+  'muse /discover.json': MOCK_MUSE_TUNER,
+  'muse /lineup.json': MOCK_MUSE_TUNER_LINEUP,
   // `/status` is ONE real endpoint; LGUI-09's PersonaPanel only reads a narrow slice
   // (`LuminaPersonaStatusFlags` -- onboarding_complete/dynamic_prompt) of the SAME response
   // LGUI-06's Overview panel reads in full (`LuminaStatus`). `MOCK_LUMINA_STATUS` is a superset
@@ -1626,6 +1655,10 @@ const mockAdapter: AggregationClient = {
 //            POST /playground/run
 //   muse (CONST-19; CONST-20 builds its panels against these): GET /on_deck, GET /premiere,
 //            GET /gaps, GET /api/channels, GET /api/channels/{id}/lineup, GET /guide,
+//            GET /discover.json, GET /lineup.json (MGUI-10 tuner telemetry — HDHomeRun-shaped,
+//            both verified live; note /guide answers an HTML page wrapped by the proxy as
+//            {raw}, and /api/channels answers a BARE ARRAY live vs the {channels:[]} envelope
+//            mocked here — see hooks/useMuse.ts's museGuideEntries/museChannelList),
 //            GET /api/graph/{taste-clusters,watch-history,group-dynamics}, GET /art/{kind}/{id}
 //            (binary passthrough -- see crate::constellation::proxy's module doc; this generic
 //            request<T>() path is JSON-typed, art responses should be fetched by <img src> URL,

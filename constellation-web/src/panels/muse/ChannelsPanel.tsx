@@ -2,9 +2,15 @@
 // operator-gated compose/maintenance mutations (spec §5.4). Same independent per-section
 // degrade boundary as the other two Muse panels (see DashboardPanel's top comment).
 //
-// Guide grid is rendered as a plain `DataTable` timeline (channel/title/start/end columns),
-// deliberately NOT an EPG-widget layout -- spec §5.4 is explicit about this ("rendered as a
-// DataTable timeline, not an EPG widget").
+// Guide: TWO views behind the standard chart|table toggle (MGUI-10, S129).
+//   - `chart` (default) is the design guide's screen 09 PROGRAMMING GRID -- channels × time,
+//     proportional programme blocks, now marker, tuner telemetry. See ProgrammingGrid.tsx's
+//     header for what it renders today (an empty state, honestly) and for every guide element
+//     deliberately omitted for want of a backing field.
+//   - `table` is the original plain `DataTable` timeline (channel/title/start/end columns) that
+//     CONST-20 shipped per spec §5.4 ("rendered as a DataTable timeline, not an EPG widget").
+//     It is KEPT, not replaced: it is the only view showing exact start/end timestamps, and it
+//     stays the accessible/dense twin of the grid per the module-wide table-view rule (§4.2/§4.4).
 //
 // Compose/maintenance: gated by merged CONST-27's canonical RoleGate (disabled + tooltip for
 // a viewer session; server-side 403 is the enforcement) + the local ConfirmDialog stand-in
@@ -20,31 +26,36 @@ import type { DataTableColumn } from '../../components/DataTable';
 import { Button } from '../../components/Button';
 import { Badge } from '../../components/Badge';
 import { RoleGate } from '../../components/RoleGate';
-import { ConfirmDialog } from '../../components/ConfirmDialog';
+import { useTableView, TableViewControls } from '../../viz/TableViewToggle';
+import { ProgrammingGrid } from './ProgrammingGrid';
 import {
   useMuseChannels,
   useMuseLineup,
   useMuseGuide,
-  useMuseChannelActions,
+  museChannelList,
+  museGuideEntries,
   type MuseChannel,
   type MuseLineupItem,
   type MuseGuideEntry,
 } from '../../hooks/useMuse';
 
-type PendingAction = { kind: 'compose' | 'maintenance'; channelId: string; channelName: string } | null;
-
 function ChannelsListSection({
   selectedId,
   onSelect,
-  onRequestAction,
 }: {
-  selectedId: string | null;
+  selectedId: number | null;
   onSelect: (channel: MuseChannel) => void;
-  onRequestAction: (kind: 'compose' | 'maintenance', channel: MuseChannel) => void;
 }) {
   const { data, loading, degraded } = useMuseChannels();
-  const channels = data?.channels ?? [];
-  const empty = !loading && !degraded && channels.length === 0;
+  // MGUI-10: normalized, because live `/api/channels` answers a bare array while the mock
+  // answers a `{channels:[…]}` envelope -- see `museChannelList`'s comment.
+  const parsed = museChannelList(data);
+  const channels = parsed ?? [];
+  // An unparseable body is NOT an empty library, so it must not render "No channels yet".
+  // `museChannelList` returns null for a shape it does not recognize precisely so this
+  // distinction survives to the UI (gpt56).
+  const unrecognized = !loading && !degraded && parsed === null;
+  const empty = !loading && !degraded && parsed !== null && channels.length === 0;
 
   // Auto-select the first channel once the list resolves (review fix): the spec requires
   // channels + LINEUP + guide to render on mocks — without this, the lineup section idled
@@ -79,16 +90,40 @@ function ChannelsListSection({
         </button>
       ),
     },
-    { key: 'items', header: 'Items', align: 'right', render: c => String(c.item_count) },
+    // Real `ChannelSummary` fields. The old "Items" column read `c.item_count`, which Muse
+    // does not return — see `MuseChannel`'s comment.
+    { key: 'kind', header: 'Kind', render: c => [c.kind, c.mode].filter(Boolean).join(' · ') || '—' },
+    {
+      key: 'number',
+      header: 'No.',
+      align: 'right',
+      render: c => (typeof c.channel_number === 'number' ? String(c.channel_number) : '—'),
+    },
     {
       key: 'actions',
       header: 'Actions',
       align: 'right',
-      render: c => (
+      render: () => (
         <RoleGate>
           <div style={{ display: 'flex', gap: 'var(--space-2)', justifyContent: 'flex-end' }}>
-            <Button variant="secondary" size="sm" onClick={() => onRequestAction('compose', c)}>Compose</Button>
-            <Button variant="ghost" size="sm" onClick={() => onRequestAction('maintenance', c)}>Maintenance</Button>
+            {/* Both controls render VISIBLY DISABLED rather than being removed, so the
+                design's shape stays legible — same treatment as Discover's Request CTA.
+                Neither can be honestly wired from this surface today:
+                  compose      — `POST /channels/{id}/compose` exists, but requires a
+                                 non-empty `show_media_item_ids`; there is no show picker
+                                 here, and a one-click call would just 400.
+                  maintenance  — there is NO per-channel maintenance route. Probed live:
+                                 `/channels/{id}/maintenance` and `/api/channels/{id}/
+                                 maintenance` both 404. Muse has a GLOBAL `POST /ops/
+                                 maintenance` on its authenticated router, which is a
+                                 different operation; firing it from a per-channel button
+                                 would misrepresent its scope. */}
+            <Button variant="secondary" size="sm" disabled aria-describedby="channel-actions-note">
+              Compose
+            </Button>
+            <Button variant="ghost" size="sm" disabled aria-describedby="channel-actions-note">
+              Maintenance
+            </Button>
           </div>
         </RoleGate>
       ),
@@ -101,16 +136,24 @@ function ChannelsListSection({
       height={channels.length === 0 ? 120 : Math.min(60 + channels.length * 40, 320)}
       loading={loading}
       degraded={degraded}
-      empty={empty}
-      emptyMessage="No channels yet"
-      emptyHint="Muse channels appear here once composed"
+      empty={empty || unrecognized}
+      emptyMessage={unrecognized ? 'Channel list not understood' : 'No channels yet'}
+      emptyHint={
+        unrecognized
+          ? 'GET /api/channels returned a body that is neither a list nor a {channels: […]} envelope — no claim is made about how many channels exist'
+          : 'Muse channels appear here once composed'
+      }
     >
-      <DataTable columns={columns} rows={channels} rowKey={c => c.id} emptyMessage="No channels yet" />
+      <div id="channel-actions-note" style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', marginBottom: 'var(--space-2)' }}>
+        Compose needs an explicit show selection (no picker on this surface yet); per-channel
+        maintenance has no route in Muse. Both are shown disabled rather than hidden.
+      </div>
+      <DataTable columns={columns} rows={channels} rowKey={c => String(c.id)} emptyMessage="No channels yet" />
     </ChartCard>
   );
 }
 
-function LineupSection({ channelId, channelName }: { channelId: string | null; channelName: string | null }) {
+function LineupSection({ channelId, channelName }: { channelId: number | null; channelName: string | null }) {
   const { data, loading, degraded } = useMuseLineup(channelId);
   const lineup = data?.lineup ?? [];
   const empty = channelId !== null && !loading && !degraded && lineup.length === 0;
@@ -144,96 +187,66 @@ const GUIDE_COLUMNS: DataTableColumn<MuseGuideEntry>[] = [
   { key: 'end', header: 'End', render: r => new Date(r.end).toLocaleString() },
 ];
 
+/** The grid needs a stable body height (ChartCard fixes it) — tall enough for the axis, a
+ *  handful of channel rows and the telemetry footer, without the card growing unboundedly. */
+const GRID_HEIGHT = 320;
+
 function GuideSection() {
   const { data, loading, degraded } = useMuseGuide();
-  const entries = data?.entries ?? [];
-  const empty = !loading && !degraded && entries.length === 0;
+  const { entries, htmlOnly } = museGuideEntries(data);
+  const { view, setView } = useTableView('chart');
+
+  // MGUI-10: the grid also renders CHANNEL ROWS, so it is meaningful with zero programme
+  // entries (an existing channel with an empty schedule is real, reportable state). Only the
+  // TABLE view — which is entries-only — is empty when there are no entries. Handing
+  // `empty` to the card in grid view would replace an informative empty state (which names
+  // the missing route and the HTML `/guide`) with a generic "no data" card.
+  const empty = view === 'table' && !loading && !degraded && entries.length === 0;
+
+  // Never asserts a cause. `htmlOnly` is an observed response shape, not an inference.
+  const subtitle = htmlOnly
+    ? '/guide serves an HTML page, not a programme feed'
+    : view === 'chart'
+      ? 'Channels × time'
+      : 'Timeline (exact start/end)';
+
   return (
     <ChartCard
       title="Guide"
-      subtitle="Timeline (table view, not an EPG grid — spec §5.4)"
-      height={Math.min(60 + entries.length * 36, 280)}
+      subtitle={subtitle}
+      controls={<TableViewControls view={view} onChange={setView} />}
+      height={view === 'chart' ? GRID_HEIGHT : Math.min(60 + entries.length * 36, 280)}
       loading={loading}
       degraded={degraded}
       empty={empty}
       emptyMessage="No guide data yet"
       emptyHint="Scheduled programming will list here once channels have a lineup"
     >
-      <DataTable columns={GUIDE_COLUMNS} rows={entries} rowKey={(r, i) => `${r.channel_id}-${i}`} emptyMessage="No guide data yet" />
+      {view === 'chart' ? (
+        <ProgrammingGrid />
+      ) : (
+        <DataTable columns={GUIDE_COLUMNS} rows={entries} rowKey={(r, i) => `${r.channel_id}-${i}`} emptyMessage="No guide data yet" />
+      )}
     </ChartCard>
   );
 }
 
 export function ChannelsPanel() {
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
   const [selectedName, setSelectedName] = useState<string | null>(null);
-  const [pending, setPending] = useState<PendingAction>(null);
-  const [busy, setBusy] = useState(false);
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
-  const { composeChannel, runMaintenance } = useMuseChannelActions();
-
-  function requestAction(kind: 'compose' | 'maintenance', channel: MuseChannel) {
-    setStatusMessage(null);
-    setPending({ kind, channelId: channel.id, channelName: channel.name });
-  }
-
-  async function confirmAction() {
-    if (!pending) return;
-    setBusy(true);
-    try {
-      const result = pending.kind === 'compose'
-        ? await composeChannel(pending.channelId)
-        : await runMaintenance(pending.channelId);
-      const status = (result as { status?: string } | null)?.status ?? 'ok';
-      setStatusMessage(`${pending.kind} on "${pending.channelName}": ${status}`);
-    } catch (err) {
-      setStatusMessage(`${pending.kind} on "${pending.channelName}" failed: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      setBusy(false);
-      setPending(null);
-    }
-  }
 
   return (
     <div style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
-      {statusMessage && (
-        <div
-          role="status"
-          aria-live="polite"
-          style={{
-            fontFamily: 'var(--font-mono)',
-            fontSize: 'var(--fs-sm)',
-            color: 'var(--text-200)',
-            background: 'var(--bg-elevated)',
-            border: '1px solid var(--border)',
-            borderRadius: 'var(--radius-md)',
-            padding: 'var(--space-2) var(--space-3)',
-          }}
-        >
-          {statusMessage}
-        </div>
-      )}
       <ChannelsListSection
         selectedId={selectedId}
         onSelect={channel => {
           setSelectedId(channel.id);
           setSelectedName(channel.name);
         }}
-        onRequestAction={requestAction}
       />
       <LineupSection channelId={selectedId} channelName={selectedName} />
       <GuideSection />
 
-      <ConfirmDialog
-        open={pending !== null}
-        title={pending?.kind === 'compose' ? 'Compose channel?' : 'Run channel maintenance?'}
-        description={pending ? `This will queue a ${pending.kind} run for "${pending.channelName}".` : undefined}
-        confirmLabel={pending?.kind === 'compose' ? 'Compose' : 'Run maintenance'}
-        destructive={pending?.kind === 'maintenance'}
-        busy={busy}
-        onConfirm={confirmAction}
-        onCancel={() => setPending(null)}
-      />
     </div>
   );
 }

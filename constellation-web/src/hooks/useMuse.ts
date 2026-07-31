@@ -456,16 +456,67 @@ export function useMuseGroupDynamics(): MuseSection<MuseGroupDynamics> {
 
 // ── Channels (muse.channels) ─────────────────────────────────────────────────
 
+/** Muse's real `ChannelSummary` — Muse `src/web/guide.rs:35`, cross-checked against a live
+ *  `GET /api/channels` on <host> (`.67:8098`, probed directly, bypassing the proxy).
+ *
+ *  THERE IS NO `item_count`. An earlier version of this interface declared `{id: string,
+ *  name: string, item_count: number}` — a shape taken from the MOCK adapter rather than from
+ *  the API, which Muse has never returned. Because the live list is empty today, every read
+ *  of it was `undefined` and nothing rendered, so the divergence stayed invisible; the first
+ *  real channel would have rendered "undefined items" and a numeric id compared against a
+ *  string. Typed from the server struct now, and the mock was corrected to match it. */
 export interface MuseChannel {
-  id: string;
+  id: number;
   name: string;
-  item_count: number;
+  kind: string;
+  mode: string;
+  channel_number: number | null;
+  enabled: boolean;
 }
 export interface MuseChannels {
   channels: MuseChannel[];
 }
-export function useMuseChannels(): MuseSection<MuseChannels> {
-  return useMuseSection<MuseChannels>('/api/channels');
+
+/** MGUI-10: the LIVE `GET /api/channels` (captured through the proxy on this deployment)
+ *  answers a BARE ARRAY — `[]` — while the mock adapter answers the `{channels:[…]}`
+ *  envelope this module was originally typed against. Both shapes are therefore accepted
+ *  and normalized by `museChannelList` below.
+ *
+ *  This is not defensive padding: it is a real contract divergence. It happens to be
+ *  invisible today only because the array is empty (`data?.channels` is `undefined`, which
+ *  `?? []` swallows) — the moment a channel exists, the un-normalized read would render an
+ *  empty channel list against a non-empty backend. */
+export type MuseChannelsResponse = MuseChannels | MuseChannel[];
+
+/** Normalize either observed `/api/channels` shape to a plain list.
+ *
+ *  Returns `null` — NOT `[]` — for a shape we do not recognize, and for no data at all. An
+ *  earlier version collapsed both into `[]`, which handed callers a value indistinguishable
+ *  from a genuinely empty list and let the grid state "GET /api/channels returned an empty
+ *  list" about a payload it had never successfully parsed (gpt56). `[]` now means exactly one
+ *  thing: the server returned a list and it had no elements. */
+export function museChannelList(data: MuseChannelsResponse | null): MuseChannel[] | null {
+  const list = data === null ? null : Array.isArray(data) ? data : Array.isArray(data.channels) ? data.channels : null;
+  if (list === null) return null;
+  // Element-level validation, not just container-shape. `[null]` previously reached
+  // `buildRows`, where reading `c.id` THREW and took the panel down; `[{}]` produced a row
+  // labelled `undefined`. Neither is an empty list and neither is a channel, so an array
+  // whose elements are not channels is `null` — unreadable — like any other unknown shape
+  // (gpt56). Muse is typed Rust serializing Vec<ChannelSummary> and cannot itself emit
+  // these, but the proxy sits in between and `useMuseSection` renders any 2xx body as data.
+  return list.every(isMuseChannel) ? list : null;
+}
+
+function isMuseChannel(v: unknown): v is MuseChannel {
+  if (typeof v !== 'object' || v === null) return false;
+  const c = v as Record<string, unknown>;
+  // id + name are what every render path dereferences; the rest degrade to a dash on their
+  // own, so requiring them would reject a channel over a cosmetic field.
+  return typeof c.id === 'number' && typeof c.name === 'string';
+}
+
+export function useMuseChannels(): MuseSection<MuseChannelsResponse> {
+  return useMuseSection<MuseChannelsResponse>('/api/channels');
 }
 
 export interface MuseLineupItem {
@@ -480,8 +531,12 @@ export interface MuseLineup {
 /** `channelId === null` renders an idle (not degraded, not loading) section -- use this while
  *  no channel is selected yet, so the lineup ChartCard shows its own empty state, not a spurious
  *  "not yet wired" degrade. */
-export function useMuseLineup(channelId: string | null): MuseSection<MuseLineup> {
-  return useMuseSection<MuseLineup>(channelId ? `/api/channels/${encodeURIComponent(channelId)}/lineup` : null);
+export function useMuseLineup(channelId: number | null): MuseSection<MuseLineup> {
+  // `channelId !== null`, never a truthiness test: channel ids are i64 and 0 is a legal id,
+  // which a truthy check would silently treat as "no channel selected" (codex).
+  return useMuseSection<MuseLineup>(
+    channelId !== null ? `/api/channels/${encodeURIComponent(String(channelId))}/lineup` : null,
+  );
 }
 
 export interface MuseGuideEntry {
@@ -493,25 +548,182 @@ export interface MuseGuideEntry {
 export interface MuseGuide {
   entries: MuseGuideEntry[];
 }
-export function useMuseGuide(): MuseSection<MuseGuide> {
-  return useMuseSection<MuseGuide>('/guide');
+
+/** MGUI-10: what `GET /guide` ACTUALLY returns on this deployment, captured through the
+ *  proxy: `{"raw":"<!doctype html>\n<html lang=\"en\">…<title>Muse — Channel Guide</title>…"}`.
+ *
+ *  `/guide` is a rendered HTML PAGE — Muse's own human-facing channel guide — not a
+ *  structured programme feed. The proxy wraps a non-JSON upstream body in `{raw}`, which is
+ *  why it arrives as JSON at all. The mock adapter answers the `{entries:[…]}` envelope
+ *  this module was typed against, so both shapes are declared here.
+ *
+ *  There is no JSON programme feed behind it today: `/api/guide`, `/guide.json`,
+ *  `/api/channels/guide`, `/xmltv` and `/api/epg` all answer 404 (probed directly).
+ *
+ *  **The grid deliberately does NOT parse `raw`.** Scraping programme blocks out of an HTML
+ *  string would manufacture data whose provenance the panel cannot vouch for, and would
+ *  silently break on any markup change. When `raw` is present the grid says so and renders
+ *  from `/api/channels` alone. */
+export type MuseGuideResponse = MuseGuide | { raw: string };
+
+/** Structured programme entries, or `[]` when the response carried none. The second value
+ *  reports the HTML-page case specifically, so the UI can explain WHY there are no blocks
+ *  instead of implying the schedule is empty. */
+export function museGuideEntries(data: MuseGuideResponse | null): {
+  entries: MuseGuideEntry[];
+  htmlOnly: boolean;
+  /** False whenever the body was not a readable schedule: not an `entries` list of valid
+   *  entries, and not an HTML `raw` page.
+   *
+   *  `null` counts as UNRECOGNIZED, not as an idle sentinel. In practice a null/absent body
+   *  is already marked degraded by `useMuseSection` (see its `.then`), and `gridState` ranks
+   *  loading and degraded above this flag, so the value cannot change what renders today.
+   *  It is reported this way regardless because "recognized" must be a property of the BODY
+   *  alone — a parser that returns `true` for "no body" is only safe as long as every caller
+   *  happens to check loading and degraded first, and that is not a guarantee a pure function
+   *  can make about its callers (codex, gpt56). */
+  recognized: boolean;
+} {
+  // A scalar 2xx body (`true`, `42`, `"x"`) is not an object, and `'entries' in data` THROWS
+  // on a primitive — it crashed the panel instead of reaching the unrecognized state (codex).
+  if (typeof data !== 'object' || data === null) return { entries: [], htmlOnly: false, recognized: false };
+  if ('entries' in data && Array.isArray(data.entries)) {
+    return data.entries.every(isMuseGuideEntry)
+      ? { entries: data.entries, htmlOnly: false, recognized: true }
+      : { entries: [], htmlOnly: false, recognized: false };
+  }
+  if ('raw' in data && typeof data.raw === 'string') return { entries: [], htmlOnly: true, recognized: true };
+  return { entries: [], htmlOnly: false, recognized: false };
+}
+
+function isMuseGuideEntry(v: unknown): v is MuseGuideEntry {
+  if (typeof v !== 'object' || v === null) return false;
+  const e = v as Record<string, unknown>;
+  if (
+    typeof e.channel_id !== 'string' ||
+    typeof e.title !== 'string' ||
+    typeof e.start !== 'string' ||
+    typeof e.end !== 'string'
+  ) {
+    return false;
+  }
+  const start = parseGuideInstant(e.start);
+  const end = parseGuideInstant(e.end);
+  // `end === start` is allowed: a zero-length programme is drawn as a hairline by
+  // blockGeometry, which is a deliberate existing behaviour. Only end BEFORE start is invalid.
+  return start !== null && end !== null && end >= start;
+}
+
+/** Parse an ISO-8601 instant, rejecting dates that do not exist on the calendar.
+ *
+ *  `Date.parse` is not enough on its own: it silently ROLLS OVER an out-of-range day, so
+ *  "2026-02-30T00:00:00Z" parses happily as 2026-03-02 and the grid would place a programme
+ *  on a date the response never carried (codex — verified: Date.parse of that string returns
+ *  the March 2 instant, while a month above 12 does return NaN). The calendar fields are
+ *  therefore checked explicitly, against the string, before the instant is trusted.
+ *
+ *  Only the Y-M-D triple is validated this way; it is the part `Date.parse` rolls over. An
+ *  explicit UTC offset is left to `Date.parse`, since a legitimate offset can shift the UTC
+ *  date and a naive comparison against the parsed value would reject valid timestamps. */
+/** Days in a month under the PROLEPTIC GREGORIAN calendar, computed arithmetically.
+ *
+ *  Deliberately not `new Date(Date.UTC(year, month, 0)).getUTCDate()`, the obvious trick: JS
+ *  maps years 0–99 onto 1900–1999, so year 0000 was measured as 1900 and its real February 29
+ *  (year zero IS a leap year) was rejected as nonexistent (codex, gpt56). The failure is in
+ *  the safe direction — a valid body marked unreadable rather than an invalid one accepted —
+ *  but it is still wrong, and the arithmetic form has no such edge. */
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) {
+    const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+    return leap ? 29 : 28;
+  }
+  return [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+}
+
+export function parseGuideInstant(value: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T/.exec(value);
+  if (m === null) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  if (month < 1 || month > 12 || day < 1) return null;
+  if (day > daysInMonth(year, month)) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+
+
+export function useMuseGuide(): MuseSection<MuseGuideResponse> {
+  return useMuseSection<MuseGuideResponse>('/guide');
+}
+
+// ── Tuner telemetry (MGUI-10) ────────────────────────────────────────────────
+//
+// The guide's programming-grid footer reads "now · 21:14 · MUSE0001 tuner advertising
+// /discover.json". That is REAL and reachable: Muse serves an HDHomeRun-compatible
+// discovery document. Live capture through the proxy:
+//   {"BaseURL":"http://…:8098","DeviceAuth":"muse","DeviceID":"MUSE0001",
+//    "FirmwareName":"muse-tuner","FirmwareVersion":"0.1.0","FriendlyName":"Muse TV",
+//    "LineupURL":"http://…/lineup.json","Manufacturer":"Muse",
+//    "ManufacturerURL":"http://…/","ModelNumber":"MUSE-TUNER-1","TunerCount":4}
+//
+// Field names are PascalCase because that is the HDHomeRun wire format, not a style slip.
+// Every field below was in that capture; nothing is inferred.
+
+export interface MuseTunerDiscovery {
+  DeviceID: string;
+  FriendlyName: string;
+  ModelNumber: string;
+  FirmwareName: string;
+  FirmwareVersion: string;
+  /** How many concurrent tuners the device advertises. This is a DECLARED capacity, not a
+   *  live in-use count — there is no per-tuner occupancy field in the document, so the UI
+   *  must never render it as "3 of 4 tuners busy". */
+  TunerCount: number;
+  /** Absolute upstream URLs (Muse's own origin). Shown as text only — they are not
+   *  same-origin, so they are never fetched from the browser. */
+  BaseURL: string;
+  LineupURL: string;
+}
+
+export function useMuseTuner(): MuseSection<MuseTunerDiscovery> {
+  return useMuseSection<MuseTunerDiscovery>('/discover.json');
+}
+
+/** `GET /lineup.json` — the HDHomeRun lineup the tuner advertises to clients (Plex, etc.).
+ *  A BARE ARRAY; it is `[]` on this deployment, so the ELEMENT SHAPE IS UNVERIFIED. It is
+ *  typed `unknown[]` and only its LENGTH is used, because typing fields nobody has observed
+ *  would be a guess dressed as a contract. */
+export function useMuseTunerLineup(): MuseSection<unknown[]> {
+  return useMuseSection<unknown[]>('/lineup.json');
 }
 
 /** Compose/maintenance mutations -- both operator-RoleGated + ConfirmDialog-confirmed at the
  *  call site (ChannelsPanel), never fired directly from a click handler. See the aggregation
  *  client's mockWriteFor comment for why these paths aren't in the original §5.4 route list. */
+/** Body of `POST /channels/{id}/compose` — Muse `src/channels/routes.rs:50`. `show_media_item_ids`
+ *  is REQUIRED and must be non-empty; the handler rejects an empty list with 400. Compose is
+ *  therefore not a zero-argument "rebuild this channel" trigger: it schedules a session from an
+ *  explicit set of shows the caller chooses. */
+export interface MuseComposeRequest {
+  show_media_item_ids: number[];
+  target_session_ms?: number;
+}
+
 export function useMuseChannelActions() {
-  const composeChannel = useCallback(async (channelId: string) => {
-    return getAggregationClient().request('muse', `/api/channels/${encodeURIComponent(channelId)}/compose`, {
+  // Path verified live: `POST /channels/{id}/compose` -> 415 (route present, reached the JSON
+  // body extractor), while `POST /api/channels/{id}/compose` -> 404. The previous `/api/`-
+  // prefixed path did not exist; it is mounted on Muse's OPEN router at the root, not under
+  // the `/api` prefix that carries the channel READ routes (Muse `src/http/mod.rs:212`).
+  const composeChannel = useCallback(async (channelId: number, body: MuseComposeRequest) => {
+    return getAggregationClient().request('muse', `/channels/${encodeURIComponent(String(channelId))}/compose`, {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
     });
   }, []);
-  const runMaintenance = useCallback(async (channelId: string) => {
-    return getAggregationClient().request('muse', `/api/channels/${encodeURIComponent(channelId)}/maintenance`, {
-      method: 'POST',
-    });
-  }, []);
-  return { composeChannel, runMaintenance };
+  return { composeChannel };
 }
 
 /** Same-origin, relative art URL for `<img src>` -- deliberately NOT routed through
@@ -536,4 +748,101 @@ export type MuseArtWidth = 160 | 320 | 640;
 
 export function museArtUrlAt(kind: string, id: string, width: MuseArtWidth): string {
   return `${museArtUrl(kind, id)}?w=${width}`;
+}
+
+// ── Request lifecycle (MGUI-08) ──────────────────────────────────────────────
+//
+// Shapes below are transcribed from Muse's own handlers
+// (`src/web/dashboard.rs::get_request_detail` / `get_requests_queue`), NOT from a
+// live capture: `GET /api/requests` returns `{requests: [], tiers: {}, total: 0}` on
+// this deployment, so there is no request id to sample a detail response from. That
+// is a statement about what the list endpoint returned, and nothing more — it does
+// not establish anything about whether any worker or request path has run.
+
+/** One stop on the lifecycle stepper. Muse emits the fixed happy-path order
+ *  `requested → approved → searching → grabbed → available`, each marked
+ *  `reached | current | pending` from the row's REAL `status`. An unrecognized
+ *  state string is rendered as-is, never coerced. */
+export interface MuseRequestStep {
+  label: string;
+  state: string;
+}
+
+/** The `media_requests` row, serialized wholesale by the handler (`"request": request`).
+ *  Every field here exists on the Rust `MediaRequest` struct — there is deliberately no
+ *  release/score/seeder field, because none is persisted on the row (see the panel). */
+export interface MuseRequestRow {
+  id: number;
+  provider_ids: Record<string, unknown> | null;
+  media_kind: string;
+  title: string;
+  requested_by: string | null;
+  status: string;
+  /** `NULL` on a row that was never classified. Renders as an absence, never as a tier. */
+  tier: string | null;
+  quality_profile_id: number | null;
+  note: string | null;
+  monitored_item_id: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `GET /api/requests/:id`. A miss returns `{found: false, request_id}` with NO
+ *  `request`/`steps` — every consumer must therefore treat those as optional rather
+ *  than dereferencing them. */
+export interface MuseRequestDetail {
+  found: boolean;
+  request_id?: number;
+  request?: MuseRequestRow;
+  status?: string;
+  steps?: MuseRequestStep[];
+  /** `"denied" | "failed"` when the request ended off the happy path, else `null`. */
+  terminal?: string | null;
+}
+
+export function useMuseRequestDetail(id: string | null): MuseSection<MuseRequestDetail> {
+  return useMuseSection<MuseRequestDetail>(id ? `/api/requests/${encodeURIComponent(id)}` : null);
+}
+
+/** A `download_queue` row as `GET /api/requests/queue` serializes it. `request_id` is
+ *  what lets a per-request view show the release that was ACTUALLY grabbed for it.
+ *
+ *  `progress` is hard-coded `null` by the handler — Muse documents it as a SEAM
+ *  (qBittorrent per-torrent progress is not persisted). It is typed nullable here so
+ *  no caller can default it into a 0% bar. */
+export interface MuseDownloadQueueRow {
+  id: number;
+  request_id: number | null;
+  monitored_item_id: number | null;
+  release_title: string;
+  indexer: string | null;
+  protocol: string | null;
+  status: string;
+  size_bytes: number | null;
+  added_at: string;
+  progress: number | null;
+}
+
+/** The wanted set + download queue. This panel only reads `queue` (filtered to one
+ *  `request_id`), so `wanted` is typed loosely on purpose — MGUI-09/14's own queue
+ *  surface is the place that renders it. */
+export function useMuseDownloadQueue(): MuseSection<{ wanted: unknown[]; queue: MuseDownloadQueueRow[] }> {
+  return useMuseSection<{ wanted: unknown[]; queue: MuseDownloadQueueRow[] }>('/api/requests/queue');
+}
+
+/** The acquisition-gate slice of `/api/settings`, read narrowly.
+ *
+ *  Deliberately NOT a general settings hook: this reads exactly the two booleans the
+ *  lifecycle panel is allowed to reason about, so it cannot accidentally grow into a
+ *  second, competing notion of "what the settings say". `master_enabled` is included
+ *  because Muse's own gate is `master_enabled && acquisition.enabled`
+ *  (`ExperienceSettings::is_acquisition_enabled`) — see the panel for how that is used
+ *  only to make the SAFE verdict stronger, never to manufacture an armed one. */
+export interface MuseAcquisitionGate {
+  master_enabled: boolean;
+  acquisition: { enabled: boolean };
+}
+
+export function useMuseAcquisitionGate(): MuseSection<MuseAcquisitionGate> {
+  return useMuseSection<MuseAcquisitionGate>('/api/settings');
 }
