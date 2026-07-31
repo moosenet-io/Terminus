@@ -118,6 +118,26 @@ pub struct ToolInfo {
 ///
 /// Each tool module provides its own `register` function. This top-level
 /// function calls all of them in sequence. CHORD-06..13 populate this.
+/// TRTR-02: the process-wide, fully-registered core tool registry.
+///
+/// Registering ~400 tools costs real work, and the relocated router needs the registry
+/// on EVERY agent turn — rebuilding it per request would add that cost to exactly the
+/// path the operator uses most, which is the opposite of the point. The registry is
+/// immutable after registration (`call` takes `&self`) and `RustTool: Send + Sync`, so
+/// one shared instance is safe to hand out for the process lifetime.
+///
+/// Callers that genuinely need a private, mutable registry (tests, the availability
+/// admin view) can still build their own with `ToolRegistry::new()` + `register_all`.
+pub fn shared() -> &'static ToolRegistry {
+    static SHARED: std::sync::OnceLock<ToolRegistry> = std::sync::OnceLock::new();
+    SHARED.get_or_init(|| {
+        let mut r = ToolRegistry::new();
+        register_all(&mut r);
+        tracing::debug!("registry: shared core registry initialised with {} tools", r.len());
+        r
+    })
+}
+
 pub fn register_all(registry: &mut ToolRegistry) {
     crate::ansible::register(registry);
     crate::approval::register(registry);

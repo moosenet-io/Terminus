@@ -119,7 +119,7 @@ pub async fn dispatch_tool(
                 // upstream. Refresh off the critical path, and only the one caller
                 // that claimed it (no thundering herd).
                 if claim {
-                    spawn_refresh(registry, cache, name, args.clone(), key.clone());
+                    spawn_refresh(cache, name, args.clone(), key.clone());
                 }
                 return Dispatch::Ok { text: with_as_of(value, fetched_at), cached: true };
             }
@@ -159,21 +159,14 @@ fn with_as_of(value: String, fetched_at: u64) -> String {
 }
 
 /// Refresh a stale entry in the background.
-fn spawn_refresh(
-    _registry: &ToolRegistry,
-    cache: &ToolCache,
-    name: &str,
-    args: Value,
-    key: String,
-) {
-    // A fresh registry is built inside the task because `ToolRegistry` is not `Sync`-
-    // shareable here; building it is cheap relative to the upstream call being
-    // refreshed, and this runs off the critical path by construction.
+fn spawn_refresh(cache: &ToolCache, name: &str, args: Value, key: String) {
+    // Uses the SHARED registry (`registry::shared()`), which is `&'static` and already
+    // registered — the refresh must not pay a ~400-tool registration just to re-fetch
+    // one value.
     let cache = cache.clone();
     let name = name.to_string();
     tokio::spawn(async move {
-        let mut reg = ToolRegistry::new();
-        crate::registry::register_all(&mut reg);
+        let reg = crate::registry::shared();
         match reg.call(&name, args).await {
             Some(Ok(text)) => cache.put(&key, text).await,
             // A failed refresh must leave the last-good value intact.

@@ -278,7 +278,6 @@ mod tests {
             mtls_server_identity: "terminus-server-test".to_string(),
             personal_federation: None,
             inference_proxy: None,
-            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
         }

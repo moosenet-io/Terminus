@@ -440,11 +440,12 @@ async fn handle_agent_execute(
         .and_then(|c| c.as_str())
         .unwrap_or("");
 
-    let mut registry = crate::registry::ToolRegistry::new();
-    crate::registry::register_all(&mut registry);
+    // Shared, already-registered registry — rebuilding ~400 tools per turn would put
+    // that cost on the hottest path in the system (TRTR-02/08 exist to make this fast).
+    let registry = crate::registry::shared();
 
     let deps = crate::agent_router::RouterDeps {
-        registry: &registry,
+        registry,
         cache: state.tool_cache(),
         chord,
         gateway: state.gateway.as_ref(),
@@ -1758,7 +1759,6 @@ mod tests {
                 personal_federation: None,
                 inference_proxy: None,
                 tool_cache: Default::default(),
-            tool_cache: Default::default(),
                 gateway: None,
                 mesh_pool: None,
                 principal_resolver: PrincipalResolver::default(),

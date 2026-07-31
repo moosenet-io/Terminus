@@ -830,6 +830,7 @@ mod tests {
             auth_token: None,
             personal_federation: None::<PersonalFederationClient>,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
