@@ -313,8 +313,11 @@ fn spawn_refresh(
     let name = name.to_string();
     tokio::spawn(async move {
         // A tool parked between the original call and this refresh must not be
-        // re-fetched.
+        // re-fetched — but the claim MUST be released, or the entry stays marked
+        // refreshing until hard expiry and no later caller can ever refresh it
+        // (round-5 review).
         if !crate::availability::policy().agent_usable(&name) {
+            cache.clear_refreshing(&key).await;
             return;
         }
         // Re-authorize the REFRESH itself. router_dispatch is the routing half only and
@@ -328,7 +331,12 @@ fn spawn_refresh(
                 .await
             {
                 Ok(c) => ctx = Some(c),
-                Err(_) => return, // permission revoked since the foreground call
+                Err(_) => {
+                    // Permission revoked since the foreground call. Release the claim
+                    // so the entry is not stranded.
+                    cache.clear_refreshing(&key).await;
+                    return;
+                }
             }
         }
         match state.router_dispatch(&name, args, principal.as_ref()).await {
@@ -649,16 +657,32 @@ pub async fn execute(
                 };
             }
             let t0 = Instant::now();
-            let d = dispatch_tool(
-                Some(deps.state),
-                deps.cache,
-                deps.gateway,
-                deps.principal,
-                &call.name,
-                call.arguments.clone(),
-                principal_name,
+            // BOUND THE TOOL CALL ITSELF. The budget previously bounded only the
+            // inference hop, so a single hung upstream could overrun both the router
+            // budget AND the caller's egress timeout — the dead-socket failure the
+            // invariant exists to prevent, arriving from the other direction
+            // (round-5 review).
+            let per_tool = cfg.budget.saturating_sub(started.elapsed());
+            let d = match tokio::time::timeout(
+                per_tool,
+                dispatch_tool(
+                    Some(deps.state),
+                    deps.cache,
+                    deps.gateway,
+                    deps.principal,
+                    &call.name,
+                    call.arguments.clone(),
+                    principal_name,
+                ),
             )
-            .await;
+            .await
+            {
+                Ok(d) => d,
+                Err(_) => Dispatch::Failed(format!(
+                    "`{}` did not return within the remaining time budget.",
+                    call.name
+                )),
+            };
             let (text, status, cached) = match d {
                 Dispatch::Ok { text, cached } => (text, "ok", cached),
                 Dispatch::Unavailable(m) => (m, "unavailable", false),
@@ -952,6 +976,17 @@ mod tests {
         for other in [r#"[1,2,3]"#, r#""a string""#, "plain text"] {
             let out = with_as_of(other.to_string(), 1_700_000_000);
             assert!(out.contains("cached"), "shape {other} lost its freshness note: {out}");
+        }
+    }
+
+    #[test]
+    fn the_clamp_holds_even_for_a_tiny_caller_timeout() {
+        // A degenerate caller timeout must still yield a STRICTLY smaller budget —
+        // saturating_sub could otherwise produce budget == caller (round-5 review).
+        for caller in [1u64, 5, 10, 16, 30, 120, 600] {
+            let b = crate::config::clamp_router_budget(90, caller);
+            assert!(b < caller, "budget {b} must be strictly below caller {caller}");
+            assert!(b >= 1, "budget must remain usable, got {b}");
         }
     }
 

@@ -679,16 +679,25 @@ pub fn mtls_primary_server_identity() -> String {
 /// because that caller-side timeout is not ours to assume forever — a deployment that
 /// tunes one must be able to tune the other. Default 90 s.
 pub fn router_budget_secs() -> u64 {
-    // CLAMPED below the caller's egress timeout. An unclamped override (e.g. 120) would
-    // reintroduce the exact dead-socket failure the invariant guards against: the client
-    // gives up before the router can return its own structured error. Round-4 review
-    // flagged that documenting the ordering was not the same as enforcing it.
-    let ceiling = caller_egress_timeout_secs().saturating_sub(15).max(5);
-    env_nonempty("TERMINUS_ROUTER_BUDGET_SECS")
+    let requested = env_nonempty("TERMINUS_ROUTER_BUDGET_SECS")
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
-        .map(|n| n.min(ceiling))
-        .unwrap_or_else(|| 90u64.min(ceiling))
+        .unwrap_or(90);
+    clamp_router_budget(requested, caller_egress_timeout_secs())
+}
+
+/// Clamp a requested router budget STRICTLY below the caller's egress timeout.
+///
+/// Documenting the ordering is not enforcing it (round-4), and `saturating_sub` alone
+/// is not enough either: for a small caller timeout it can yield a budget EQUAL to the
+/// caller's, which still loses the race (round-5). Pure function so the invariant is
+/// testable across the whole range rather than asserted on one default.
+pub fn clamp_router_budget(requested: u64, caller_timeout: u64) -> u64 {
+    // Leave headroom for the response hop, but never at the cost of the strict bound.
+    let headroom = 15u64.min(caller_timeout.saturating_sub(1));
+    let ceiling = caller_timeout.saturating_sub(headroom).max(1);
+    let ceiling = ceiling.min(caller_timeout.saturating_sub(1).max(1));
+    requested.min(ceiling)
 }
 
 /// The CALLER's egress timeout in seconds (lumina-core's is 120). Configurable so a
