@@ -31,13 +31,26 @@ import { Link } from 'react-router-dom';
 import { ChartCard } from '../../viz/ChartCard';
 import { useMuseLibrary, useMuseLibraryTable, museArtUrlAt, type MuseLibraryItem } from '../../hooks/useMuse';
 import { LibraryTableView } from './LibraryTableView';
+import { CardSizeSlider, useCardSize } from './CardSizeSlider';
+import { cardGridTemplate, fluidBodyHeight, CATALOG_TRACK_BASE } from '../../lib/catalogLayout';
 
 /** How many titles to request. Bounded because this is a browse surface, not an export; the
  *  header reports the untruncated total from `counts.owned` alongside it so a capped page can
  *  never read as "this is your whole library". */
 const PAGE_LIMIT = 240;
-/** `ChartCard` takes an explicit body height in px; the poster wall scrolls inside it. */
-const PANEL_BODY_HEIGHT = 720;
+/** MGUI-18: the poster wall's body FOLLOWS THE VIEWPORT.
+ *
+ *  It used to be a flat `720`, which is the operator's "the card area does not resize with the
+ *  window": a 1440p portrait monitor got the same 720px box as a 768px ultraportable — a dead
+ *  void below on one, a claustrophobic 3-row scroller on the other. Now it is a `clamp()`, so
+ *  the browser re-resolves it on every resize with no JS listener.
+ *
+ *  `reserve` ≈ global bar (52) + the ChartCard's padding and header + the two filter rows
+ *  inside the body. `min` keeps ~2 poster rows visible on the shortest sane viewport rather
+ *  than degrading to a one-row peephole; `max` stops a 4K portrait panel from producing a
+ *  single scroll region taller than an arm's reach. */
+const PANEL_BODY_HEIGHT = fluidBodyHeight({ min: 340, max: 1400, reserve: 150 });
+
 /** The table view is denser than the grid, so it can afford more rows per fetch. */
 const TABLE_LIMIT = 500;
 
@@ -192,6 +205,8 @@ export function LibraryPanel() {
   const [avail, setAvail] = useState<AvailFilter>('all');
   const [sort, setSort] = useState<SortKey>('title_asc');
   const [view, setView] = useState<View>('grid');
+  // MGUI-18: persisted across reloads and shared with the other Muse catalog grids.
+  const [cardSize, setCardSize] = useCardSize();
   const table = useMuseLibraryTable(TABLE_LIMIT, view === 'table');
 
   const scrollerRef = useRef<HTMLDivElement | null>(null);
@@ -350,6 +365,12 @@ export function LibraryPanel() {
           : 'Poster wall'
       }
       height={PANEL_BODY_HEIGHT}
+      // The card-size control lives in the header `controls` slot, which is where ChartCard
+      // puts VIEW controls (the log-scale-toggle slot). It is not a filter — it changes how
+      // the same result set is drawn, never which titles are in it — so the dataviz rule that
+      // keeps filters out of a ChartCard does not apply. It is hidden in table view, where
+      // there are no cards for it to size.
+      controls={view === 'grid' ? <CardSizeSlider value={cardSize} onChange={setCardSize} /> : undefined}
       loading={loading}
       degraded={degraded}
       empty={empty}
@@ -472,7 +493,7 @@ export function LibraryPanel() {
                 <div
                   style={{
                     display: 'grid',
-                    gridTemplateColumns: 'repeat(auto-fill, minmax(112px, 1fr))',
+                    gridTemplateColumns: cardGridTemplate(cardSize, CATALOG_TRACK_BASE.poster),
                     gap: 'var(--space-3)',
                     paddingRight: 'var(--space-1)',
                   }}
@@ -509,6 +530,11 @@ export function LibraryPanel() {
               <div
                 role="navigation"
                 aria-label="Jump to letter"
+                // MGUI-18: 27 letters in a 10px column need ~330px of height and ~14px of
+                // width it cannot spare on a phone, where the wall is 1–2 tiles across and
+                // "jump to M" saves almost nothing. Hidden by a media query (globals.css)
+                // rather than a JS width check, so it costs no listener and no re-render.
+                className="muse-alpha-rail"
                 style={{
                   display: 'flex',
                   flexDirection: 'column',

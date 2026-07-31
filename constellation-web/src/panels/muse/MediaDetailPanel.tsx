@@ -26,8 +26,11 @@ import { useMemo } from 'react';
 import { useParams } from 'react-router-dom';
 import { ChartCard } from '../../viz/ChartCard';
 import { useMuseMediaDetail, museArtUrl, museArtUrlAt, type MuseMediaFile } from '../../hooks/useMuse';
+import { fluidBodyHeight } from '../../lib/catalogLayout';
 
-const PANEL_BODY_HEIGHT = 720;
+/** MGUI-18: fluid, matching the Library wall this page is opened from — a fixed 720px bench
+ *  clipped the detail body on a laptop and left a void on a portrait monitor. */
+const PANEL_BODY_HEIGHT = fluidBodyHeight({ min: 340, max: 1400, reserve: 150 });
 
 /** Pull a display value out of the loosely-typed metadata blob without pretending the
  *  field is guaranteed. Returns null for absent/blank so callers can omit. */

@@ -1,7 +1,11 @@
 // CONST-17: empty state for ChartCard — centered muted message + a one-line data-provenance
 // hint (§2.6/§4.3), never a blank box.
 interface ChartEmptyProps {
-  height: number;
+  /** MGUI-18: any CSS length, not just px — a fluid `clamp(...)` body passes its own
+   *  expression straight through so the empty state fills exactly the box the chart would
+   *  have. A plain number still means px (React's own style semantics), so every existing
+   *  numeric caller is unchanged. */
+  height: number | string;
   message: string;
   hint?: string;
 }

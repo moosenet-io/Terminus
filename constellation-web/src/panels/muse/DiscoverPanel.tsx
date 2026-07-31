@@ -25,11 +25,16 @@
 // button being a lie.
 import { ChartCard } from '../../viz/ChartCard';
 import { useMuseDiscover, museArtUrlAt } from '../../hooks/useMuse';
+import { CardSizeSlider, useCardSize } from './CardSizeSlider';
+import { cardGridTemplate, fluidBodyHeight, CATALOG_TRACK_BASE } from '../../lib/catalogLayout';
 
-const PANEL_BODY_HEIGHT = 560;
+/** MGUI-18: fluid, for the same reason as the Library wall — a fixed 560px box left a portrait
+ *  monitor mostly empty and an ultraportable scrolling a two-row peephole. */
+const PANEL_BODY_HEIGHT = fluidBodyHeight({ min: 300, max: 1200, reserve: 150 });
 
 export function DiscoverPanel() {
   const { data, loading, degraded } = useMuseDiscover();
+  const [cardSize, setCardSize] = useCardSize();
 
   const items = data?.items ?? [];
   // Deliberately NOT passed to ChartCard's `empty`: the standard empty state cannot
@@ -41,6 +46,11 @@ export function DiscoverPanel() {
       title="Discover"
       subtitle={data ? `beyond your library · region ${data.region}` : 'beyond your library'}
       height={PANEL_BODY_HEIGHT}
+      // Only offered when there are cards to size. Showing a size control over one of the two
+      // honest empty states would imply the emptiness is a display problem the operator can
+      // adjust away, which is exactly the wrong reading — those states are about provider
+      // configuration and about a genuinely empty result.
+      controls={!showSeam && items.length > 0 ? <CardSizeSlider value={cardSize} onChange={setCardSize} /> : undefined}
       loading={loading}
       degraded={degraded}
     >
@@ -99,7 +109,7 @@ export function DiscoverPanel() {
             <div
               style={{
                 display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))',
+                gridTemplateColumns: cardGridTemplate(cardSize, CATALOG_TRACK_BASE.discover),
                 gap: 'var(--space-3)',
               }}
             >

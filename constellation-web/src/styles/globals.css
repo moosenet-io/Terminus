@@ -140,6 +140,12 @@
      width so short pages read as a composed column rather than top-left-anchored in a huge
      canvas with a yawning void to the right/below (the "tech-demo" tell). Additive token. */
   --content-max: 1280px;
+  /* MGUI-18: the CATALOG cap, for panels that opt in via `PanelDescriptor.wide` — a poster
+     wall or a media table is not prose, so POL-03's reading measure leaves an ultrawide with
+     a 1280px column and empty desk either side (the operator's "does not resize with the
+     window"). Still capped rather than uncapped: past ~2200px even a poster grid stops
+     scanning as a grid and the eye has nowhere to rest. */
+  --content-max-wide: 2200px;
 
   /* ── Elevation + glow (glow = brand emphasis, reserved: see §2.4) ───────────── */
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
@@ -728,4 +734,41 @@ body {
     radial-gradient(1px 1px at 45% 90%, rgba(244, 242, 251, 0.6), transparent),
     radial-gradient(1px 1px at 92% 30%, rgba(244, 242, 251, 0.8), transparent);
   animation: lumina-twinkle var(--dur-flow) var(--ease-in-out) infinite;
+}
+
+/* ── MGUI-18: Muse catalog responsiveness ─────────────────────────────────────
+   The operator's four named form factors are vertical (portrait monitor), ultrawide,
+   ultraportable (small laptop) and mobile. Three of the four are handled entirely by
+   sizing that is already fluid and needs no rule here:
+
+     - vertical / portrait : `fluidBodyHeight()`'s `calc(100dvh - reserve)` grows the card
+                             body to fill the tall viewport, up to its `max`.
+     - ultraportable       : the same clamp SHRINKS toward its `min`, and the shell's own
+                             rail already steps 220px → 56px icons below 1100px.
+     - ultrawide           : `--content-max-wide` on `wide` panels, plus `auto-fill`, which
+                             simply resolves more columns as the container grows.
+
+   Only MOBILE needs actual rules, because at ~390px two controls stop being worth their
+   space. Both are media queries, not JS width checks: no listener, no re-render, and they
+   re-evaluate on rotation and on a resized desktop window alike. (The rail itself is
+   already a drawer overlay below 760px — see railVariantFor in App.tsx — so it does not
+   eat the screen on a phone.) */
+
+/* The A–Z jump rail: 27 letters need ~330px of column height and ~14px of width that a
+   phone cannot spare, on a wall that is 1–2 tiles wide where "jump to M" saves almost
+   nothing. Removed from the layout entirely rather than shrunk — a 6px letter is not a
+   touch target. The grid it sat beside simply reclaims the width. */
+@media (max-width: 560px) {
+  .muse-alpha-rail { display: none; }
+}
+
+/* The card-size slider keeps its (native, keyboard-operable) range input at every width —
+   it is the control the operator asked for and matters MOST on a small screen. Below 600px
+   the surrounding text is dropped instead, so the row still fits beside the card title:
+   the input's own `aria-label` carries the full explanation, so nothing is lost to a screen
+   reader, only to sighted redundancy. */
+@media (max-width: 600px) {
+  .muse-card-size > label,
+  .muse-card-size > span[aria-live] { display: none; }
+  .muse-card-size > input[type='range'] { width: 76px; }
 }
