@@ -909,6 +909,19 @@ mod tests {
         Arc::new(FakeCalendar(v.as_array().cloned().unwrap_or_default()))
     }
 
+    /// A raw iCal VEVENT the user DECLINED whose organiser copy is still
+    /// `STATUS:CONFIRMED` — the normal shape of a declined invite. Built as raw iCal
+    /// (not a `"status": "declined"` JSON literal) so the tests below span the real
+    /// parse path. The attendee address is an RFC 2606 placeholder.
+    fn confirmed_but_declined_ical() -> String {
+        let attendee = "ATTENDEE;CN=Me;PARTSTAT=DECLINED:mailto:<email>"; // pii-test-fixture
+        format!(
+            "BEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Offsite in Denver\r\n\
+             DTSTART:20260601T090000Z\r\nLOCATION:Denver, CO\r\n\
+             STATUS:CONFIRMED\r\n{attendee}\r\nEND:VEVENT\r\n"
+        )
+    }
+
     fn geo_body() -> Value {
         json!([{ "name": "San Francisco", "lat": 37.7749, "lon": -122.4194, "country": "US" }])
     }
@@ -1505,6 +1518,74 @@ mod tests {
         geo.assert();
         assert!(out.contains("Austin"), "{out}");
         assert!(!out.contains("Denver"), "{out}");
+    }
+
+    /// END-TO-END, from RAW iCAL: an event the user DECLINED whose `STATUS` is still
+    /// `CONFIRMED` — the normal shape of a declined invite, since declining changes
+    /// the attendee's PARTSTAT and not the organiser's STATUS — must not supply its
+    /// LOCATION. The tool falls through to the routine.
+    ///
+    /// This goes through `parse_ical`/`event_status` rather than a hand-written
+    /// `"status": "declined"` JSON literal ON PURPOSE: the bug was in that computation,
+    /// and the resolver's own tests (which take `status` as given) could never see it.
+    /// Only a test that spans the wiring catches a `status` field that is correct at
+    /// one end and wrong at the other.
+    #[tokio::test]
+    async fn execute_skips_a_confirmed_but_declined_event_end_to_end() {
+        let cal = crate::google::caldav::location_events_from_ical(
+            &confirmed_but_declined_ical(),
+            "primary",
+        );
+        assert_eq!(cal.len(), 1, "fixture must yield exactly one event");
+
+        let server = MockServer::start();
+        let geo_home = server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct").query_param("q", "1 Home Rd");
+            then.status(200).json_body(geo_body());
+        });
+        let geo_denver = server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct").query_param("q", "Denver, CO");
+            then.status(200).json_body(geo_body());
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/data/2.5/weather");
+            then.status(200).json_body(current_body());
+        });
+        let tool = Weather {
+            cfg: cfg_full(
+                &server,
+                routine_of(Some("1 Home Rd"), None),
+                events(Value::Array(cal)),
+            ),
+        };
+        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+        assert_eq!(geo_denver.hits(), 0, "a declined event must never be geocoded: {out}");
+        geo_home.assert();
+        assert!(out.contains("1 Home Rd"), "must fall through to the routine: {out}");
+        assert!(!out.contains("Denver"), "declined location must not surface: {out}");
+    }
+
+    /// Same event, but with NO routine configured: the tool must ASK rather than fall
+    /// back to the declined event's location. "Skip it" must not degrade to "use it
+    /// anyway when there is nothing else".
+    #[tokio::test]
+    async fn execute_asks_rather_than_using_a_declined_events_location() {
+        let cal = crate::google::caldav::location_events_from_ical(
+            &confirmed_but_declined_ical(),
+            "primary",
+        );
+
+        let server = MockServer::start();
+        let geo = server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct");
+            then.status(200).json_body(geo_body());
+        });
+        let tool = Weather {
+            cfg: cfg_full(&server, Routine::default(), events(Value::Array(cal))),
+        };
+        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+        assert_eq!(out, ASK_MESSAGE);
+        assert_eq!(geo.hits(), 0, "nothing resolvable — must not geocode: {out}");
     }
 
     // ── POSITIVE CONTROLS ────────────────────────────────────────────────────
