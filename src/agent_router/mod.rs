@@ -192,9 +192,14 @@ pub async fn dispatch_tool(
     }
 
     // Live fetch, routed exactly like `tools/call`: mesh -> core -> broker -> personal.
+    // No dispatch state = a wiring bug in the host, not a model mistake. Say so
+    // distinctly so it is never mistaken for "that tool does not exist".
     let Some(st) = state else {
         finish!(gate_ctx, false, Some("no dispatch state"),
-            Dispatch::Unknown(format!("`{name}` cannot be dispatched here.")));
+            Dispatch::Unknown(format!(
+                "`{name}` cannot be dispatched: this server has no tool-dispatch state \
+                 configured."
+            )));
     };
     match st.router_dispatch(name, args, principal_obj).await {
         Ok(text) => {
@@ -204,6 +209,17 @@ pub async fn dispatch_tool(
             finish!(gate_ctx, true, None, Dispatch::Ok { text, cached: false });
         }
         Err(e) => {
+            // A tool that exists NOWHERE (core, broker, mesh, personal) is a model
+            // mistake, not a transient failure — surface it as Unknown so the model
+            // stops retrying, and do NOT record a cache failure for a name that was
+            // never a real tool.
+            if e.contains("is not a tool that exists here") {
+                finish!(gate_ctx, false, Some("unknown tool"),
+                    Dispatch::Unknown(format!(
+                        "`{name}` is not a tool that exists here. Do not call it again; \
+                         answer with the tools you were given."
+                    )));
+            }
             // An error is NEVER cached as a value — only a short backoff, and any
             // existing good value is preserved.
             if policy.is_some() {
@@ -705,12 +721,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatching_an_unknown_tool_says_so_plainly() {
+    async fn dispatching_without_state_reports_a_wiring_fault_not_a_missing_tool() {
+        // Distinct from "that tool does not exist": no dispatch state is a HOST
+        // misconfiguration, and conflating the two would send an operator hunting for
+        // a tool-name bug that is not there.
         let cache = ToolCache::default();
-        match dispatch_tool(None, &cache, None, None, "does_not_exist", json!({}), None).await {
+        match dispatch_tool(None, &cache, None, None, "weather", json!({}), None).await {
             Dispatch::Unknown(msg) => {
-                assert!(msg.contains("not a tool that exists"));
-                // Must not read like a transient failure the model should retry.
+                assert!(msg.contains("no tool-dispatch state"), "got: {msg}");
                 assert!(!msg.to_lowercase().contains("try again"));
             }
             other => panic!("expected Unknown, got {other:?}"),
