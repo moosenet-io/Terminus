@@ -672,6 +672,19 @@ pub fn mtls_primary_server_identity() -> String {
 /// `TERMINUS_ROUTER_LOCAL=0` is the documented rollback: it restores the exact
 /// pre-TRTR-02 behaviour without a redeploy, which is what makes flipping this on
 /// safe for a live assistant.
+/// TRTR-02: the router's wall-clock budget, seconds.
+///
+/// MUST stay below the CALLER's egress timeout (lumina-core's is 120 s) so the
+/// router's own structured error surfaces instead of a dead socket. Configurable
+/// because that caller-side timeout is not ours to assume forever — a deployment that
+/// tunes one must be able to tune the other. Default 90 s.
+pub fn router_budget_secs() -> u64 {
+    env_nonempty("TERMINUS_ROUTER_BUDGET_SECS")
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(90)
+}
+
 pub fn router_local_enabled() -> bool {
     match std::env::var("TERMINUS_ROUTER_LOCAL") {
         Ok(v) => !matches!(v.trim(), "0" | "false" | "no" | "off"),

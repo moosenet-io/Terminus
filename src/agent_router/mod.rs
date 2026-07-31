@@ -87,7 +87,7 @@ pub enum Dispatch {
 /// user's data to another.
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_tool(
-    state: Option<&crate::mcp_server::McpServerState>,
+    state: Option<&std::sync::Arc<crate::mcp_server::McpServerState>>,
     cache: &ToolCache,
     gateway: Option<&crate::gateway_framework::GatewayFramework>,
     principal_obj: Option<&Principal>,
@@ -172,7 +172,16 @@ pub async fn dispatch_tool(
                 // upstream. Refresh off the critical path, and only the one caller
                 // that claimed it (no thundering herd).
                 if claim {
-                    spawn_refresh(cache, name, args.clone(), key.clone());
+                    if let Some(st) = state {
+                        spawn_refresh(
+                            st,
+                            cache,
+                            principal_obj.cloned(),
+                            name,
+                            args.clone(),
+                            key.clone(),
+                        );
+                    }
                 }
                 finish!(gate_ctx, true, Some("cache-stale"),
                     Dispatch::Ok { text: with_as_of(value, fetched_at), cached: true });
@@ -257,33 +266,52 @@ fn with_as_of(value: String, fetched_at: u64) -> String {
     if fetched_at == 0 {
         return value;
     }
-    // Do NOT append to a JSON payload: many tools return structured JSON, and a
-    // trailing prose note would make it unparseable for any structured consumer
-    // (review finding). Freshness for those is carried in the step log instead.
-    if serde_json::from_str::<Value>(&value).is_ok() {
-        return value;
+    // A trailing prose note would make a JSON payload unparseable, but simply dropping
+    // the stamp (as the first cut did) left the model unable to say "as of ..." for
+    // structured results — so it might present day-old headlines as current. Instead:
+    // inject `_cached_at` INTO a JSON object, which preserves parseability AND keeps
+    // the freshness claim honest. Arrays/scalars and plain text get the prose form.
+    match serde_json::from_str::<Value>(&value) {
+        Ok(Value::Object(mut m)) => {
+            m.insert("_cached_at".to_string(), Value::from(fetched_at));
+            Value::Object(m).to_string()
+        }
+        Ok(_) => value,
+        Err(_) => format!("{value}\n\n(cached; fetched at {fetched_at} epoch-seconds)"),
     }
-    format!("{value}\n\n(cached; fetched at {fetched_at} epoch-seconds)")
 }
 
 /// Refresh a stale entry in the background.
-fn spawn_refresh(cache: &ToolCache, name: &str, args: Value, key: String) {
-    // Uses the SHARED registry (`registry::shared()`), which is `&'static` and already
-    // registered — the refresh must not pay a ~400-tool registration just to re-fetch
-    // one value.
+fn spawn_refresh(
+    state: &std::sync::Arc<crate::mcp_server::McpServerState>,
+    cache: &ToolCache,
+    principal: Option<Principal>,
+    name: &str,
+    args: Value,
+    key: String,
+) {
+    // Round-3 review: this used to call the core registry DIRECTLY, which bypassed
+    // gateway authorization + auditing, the mesh/broker/personal dispatch precedence,
+    // AND principal forwarding. Latent today (only core news_/weather are cached) but
+    // a real bypass the moment a cache policy is added to a federated or per-principal
+    // tool — and a background task quietly holding weaker authorization than the
+    // foreground call is exactly the kind of asymmetry that turns into an incident.
+    //
+    // It now goes through the SAME `router_dispatch` the foreground path uses, with
+    // the principal carried so a per-principal key is filled by that principal's data.
+    let state = state.clone();
     let cache = cache.clone();
     let name = name.to_string();
     tokio::spawn(async move {
-        // Re-check availability: a tool parked between the original call and this
-        // refresh must not be re-fetched (review consistency finding).
+        // A tool parked between the original call and this refresh must not be
+        // re-fetched.
         if !crate::availability::policy().agent_usable(&name) {
             return;
         }
-        let reg = crate::registry::shared();
-        match reg.call(&name, args).await {
-            Some(Ok(text)) => cache.put(&key, text).await,
+        match state.router_dispatch(&name, args, principal.as_ref()).await {
+            Ok(text) => cache.put(&key, text).await,
             // A failed refresh must leave the last-good value intact.
-            _ => cache.record_failure(&key).await,
+            Err(_) => cache.record_failure(&key).await,
         }
     });
 }
@@ -376,7 +404,7 @@ impl Default for RouterConfig {
             // selection, tiering, and GPU lifecycle (north-star Module Contract cl. 1).
             model: crate::config::router_model_alias(),
             max_steps: MAX_STEPS,
-            budget: DEFAULT_BUDGET,
+            budget: Duration::from_secs(crate::config::router_budget_secs()),
         }
     }
 }
@@ -403,7 +431,7 @@ pub struct RouterDeps<'a> {
     /// SAME precedence as `tools/call` (mesh -> core -> broker -> personal). A
     /// core-registry-only dispatch would be blind to `pve__*` (mesh-federated), i.e.
     /// exactly the Proxmox tools the operator asks about.
-    pub state: &'a crate::mcp_server::McpServerState,
+    pub state: &'a std::sync::Arc<crate::mcp_server::McpServerState>,
     pub cache: &'a ToolCache,
     pub chord: &'a InferenceProxyClient,
     pub gateway: Option<&'a crate::gateway_framework::GatewayFramework>,
@@ -850,14 +878,30 @@ mod tests {
     }
 
     #[test]
-    fn freshness_note_never_corrupts_a_json_payload() {
-        // Many tools return structured JSON; appending prose would make it unparseable
-        // for a structured consumer.
+    fn freshness_reaches_the_model_without_corrupting_json() {
+        // A JSON object keeps its shape AND gains the stamp — dropping it entirely
+        // (the first cut) left the model unable to say "as of ...", so it could present
+        // day-old headlines as current.
         let j = r#"{"articles":[],"count":0}"#.to_string();
-        assert_eq!(with_as_of(j.clone(), 1_700_000_000), j, "JSON must pass through untouched");
-        // Plain text still gets the honest "as of" annotation.
+        let out = with_as_of(j, 1_700_000_000);
+        let v: Value = serde_json::from_str(&out).expect("must stay parseable JSON");
+        assert_eq!(v["_cached_at"], 1_700_000_000u64);
+        assert_eq!(v["count"], 0, "original fields must survive");
+
+        // A JSON array/scalar has nowhere to put a field — left untouched rather than
+        // silently reshaped.
+        let arr = r#"[1,2,3]"#.to_string();
+        assert_eq!(with_as_of(arr.clone(), 1_700_000_000), arr);
+
+        // Plain text gets the prose form.
         let t = "Current weather: 68F".to_string();
         assert!(with_as_of(t, 1_700_000_000).contains("cached"));
+    }
+
+    #[test]
+    fn a_zero_timestamp_adds_no_annotation() {
+        let t = "live result".to_string();
+        assert_eq!(with_as_of(t.clone(), 0), t, "a live (uncached) result must not claim to be cached");
     }
 
     #[test]
