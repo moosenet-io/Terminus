@@ -42,6 +42,8 @@
 //! NOTE: temperatures are always fetched and displayed in metric+imperial, so
 //! OPENWEATHER_UNITS is no longer consulted (canonical fetch is always metric).
 
+pub mod location;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -632,7 +634,7 @@ The legacy 'when' field still works ('current', 'tomorrow', 'week') but prefer \
             "properties": {
                 "location": {
                     "type": "string",
-                    "description": "Any city, town, address, landmark, or 'lat,lon' — e.g. 'Tampa', 'Tampa, Florida', 'Paris'. Optional; defaults to the user's home."
+                    "description": "Any city, town, address, landmark, or 'lat,lon'. Optional — when omitted the location is resolved from your calendar, then your home/work routine, and if none of those are known you will be ASKED rather than a place being guessed."
                 },
                 "days": {
                     "type": "integer",

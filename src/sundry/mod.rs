@@ -260,26 +260,56 @@ impl RustTool for SearxngSearch {
     }
 
     fn description(&self) -> &str {
-        "Query MooseNet SearXNG via NPM and return JSON results."
+        // The old description ("Query MooseNet SearXNG via NPM") named internal
+        // plumbing rather than the capability, so a model could not tell WHEN to use
+        // it. Describe the job, not the implementation.
+        "Search the web and return results. Use for current events, facts, and \
+         anything you do not already know. (Not for weather — use the `weather` tool.)"
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "q": {"type": "string"},
-                "categories": {"type": "string", "default": "general"},
-                "language": {"type": "string", "default": "en-US"}
+                // Documented, and `query` is accepted as an alias — see `execute`.
+                "q": {
+                    "type": "string",
+                    "description": "The search terms. (`query` is also accepted.)"
+                },
+                "categories": {
+                    "type": "string",
+                    "default": "general",
+                    "description": "SearXNG category, e.g. general, news, images, science."
+                },
+                "language": {
+                    "type": "string",
+                    "default": "en-US",
+                    "description": "Result language, e.g. en-US."
+                }
             },
             "required": ["q"]
         })
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        // TOLERANT INPUT. The parameter is `q` (SearXNG's own name), but `query` is the
+        // name a model naturally reaches for — and did: a live turn failed with
+        // "Invalid argument: q is required" in 1ms and the user saw a broken response.
+        // This tool is in the router's ALWAYS-OFFERED essentials, so that failure was
+        // reachable on any turn. Accepting the obvious synonym costs nothing and
+        // removes a whole class of dead turn.
         let q = args
             .get("q")
+            .or_else(|| args.get("query"))
+            .or_else(|| args.get("search"))
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgument("q is required".into()))?;
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ToolError::InvalidArgument(
+                    "a search term is required — pass it as `q` (or `query`)".into(),
+                )
+            })?;
         let categories = args
             .get("categories")
             .and_then(Value::as_str)
@@ -491,5 +521,56 @@ mod tests {
         let result = tool.execute(json!({"q": "rust"})).await;
         assert!(matches!(result, Err(ToolError::Http(_))));
         std::env::remove_var("SEARXNG_URL");
+    }
+}
+
+#[cfg(test)]
+mod searxng_input_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Mirrors `SearxngSearch::execute`'s argument resolution so the tolerance
+    /// contract is testable without a live SearXNG instance.
+    fn resolve_q(args: &Value) -> Option<String> {
+        args.get("q")
+            .or_else(|| args.get("query"))
+            .or_else(|| args.get("search"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn the_documented_name_works() {
+        assert_eq!(resolve_q(&json!({"q": "rust"})).as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn the_name_a_model_actually_guesses_also_works() {
+        // A live turn failed with "q is required" because the model sent `query`.
+        // searxng_search is in the router's always-offered essentials, so that dead
+        // turn was reachable on ANY request.
+        assert_eq!(resolve_q(&json!({"query": "san francisco weather"})).as_deref(),
+                   Some("san francisco weather"));
+        assert_eq!(resolve_q(&json!({"search": "news"})).as_deref(), Some("news"));
+    }
+
+    #[test]
+    fn the_documented_name_wins_when_both_are_present() {
+        assert_eq!(resolve_q(&json!({"q": "a", "query": "b"})).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn blank_and_missing_are_still_rejected() {
+        // Tolerance must not become "search for nothing".
+        assert!(resolve_q(&json!({})).is_none());
+        assert!(resolve_q(&json!({"q": "   "})).is_none());
+        assert!(resolve_q(&json!({"query": ""})).is_none());
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed() {
+        assert_eq!(resolve_q(&json!({"q": "  rust  "})).as_deref(), Some("rust"));
     }
 }
