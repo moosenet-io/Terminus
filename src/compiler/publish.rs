@@ -579,6 +579,257 @@ pub async fn verify_sha_artifact(
     Ok(())
 }
 
+/// TERM #565 (round-2 review finding 1) — the module's DEFAULT target triple, the
+/// ONLY target whose artifact a `current` pointer may be aimed at.
+///
+/// ## The hazard this type exists to make unrepresentable
+///
+/// An artifact lives at `<channel>/<sha>/<target>/<bin>` — target-ADDRESSED. The
+/// `current` pointer ([`current_pointer_path`]) is keyed by `(module, channel)`
+/// only — target-AGNOSTIC. Nothing in the pointer records which target's artifact
+/// it means, and every consumer (`compiler_release` promote / rollback / current,
+/// and the updater behind them) resolves the artifact under
+/// `effective_triple(module)`. So blessing a sha that was built for some OTHER
+/// target leaves the live pointer aimed at a sha whose artifact those consumers
+/// cannot find — a module whose live release is unresolvable.
+///
+/// Allowlisting the triple does NOT address this: `x86_64-unknown-linux-gnu` and
+/// `x86_64-unknown-linux-musl` are both perfectly supported targets, and a
+/// gnu-target build of a musl-default module is exactly the broken case. The
+/// hazard is the DISAGREEMENT with the module default, not the identity of the
+/// triple.
+///
+/// ## The rule
+///
+/// A pointer flip is permitted ONLY when the artifact's target equals the
+/// module's effective default. An off-default target may still be BUILT and
+/// GATED (the TERM #564 use case: a one-off native-glibc build of a musl-default
+/// module, which is why chord / terminus-primary need `TARGET_NATIVE=1`) — it
+/// simply cannot silently become the live release.
+///
+/// The value is CONSTRUCTIBLE ONLY from a module name, via
+/// [`DefaultTarget::for_module`], which resolves through `effective_triple` — the
+/// single resolution point `compiler_release` also uses. No production caller can
+/// pass its own target as its own "default" and defeat the guard; the only other
+/// constructor is `#[cfg(test)]`.
+///
+/// ## default-target MIGRATION — now DETECTED, still not PREVENTED
+///
+/// This guard is a WRITE-TIME check on the flip. It stops a NEW off-default
+/// artifact from being blessed. It does NOT cover the pointer going stale UNDER
+/// an unchanged pointer: an operator edits `BUILD_MODULE_TARGET_<MODULE>` (or the
+/// fleet `BUILD_TARGET_TRIPLE`) from target A to target B while `current` still
+/// names a sha whose artifact was only ever built for A. No flip occurs, so
+/// nothing re-runs this guard — but `compiler_release` now resolves
+/// `effective_triple(module) = B` and the live pointer becomes unresolvable,
+/// reached by the CONFIG door instead of the write door.
+///
+/// **What round-7 added (`resolve_pointer` / `resolve_current`):** the read side
+/// now DETECTS this. `compiler_release op=current` resolves the pointer to a
+/// concrete artifact path under the effective target, and `rollback` resolves
+/// `current.prev` the same way; either failing to resolve returns a diagnostic
+/// naming the sha, the resolved target, the exact path checked, and (when the sha
+/// dir holds other target subdirs) the target it WAS built for — pointing
+/// explicitly at a changed `BUILD_MODULE_TARGET_*` / `BUILD_TARGET_TRIPLE` as the
+/// likely cause. Nothing is guessed, repaired, or silently served from another
+/// target. So the hazard is no longer SILENT: it surfaces as an actionable error
+/// at the first read instead of a bare not-found inside whichever consumer
+/// happened to hit it.
+///
+/// TODO(term-564-followup — default-target migration, STILL OPEN): detection is
+/// not prevention. What remains is automatic handling at CONFIG-CHANGE time,
+/// which a build-time guard cannot own:
+/// 1. **Validate at config-change time** — when a module's effective target
+///    changes, check that every channel's `current` still resolves under the new
+///    target and refuse / loudly alarm if it does not (the check itself is now
+///    a one-line `resolve_current` call; what is missing is a hook that runs it
+///    when the config changes).
+/// 2. **Migrate the pointer** — rebuild the blessed sha for the new target and
+///    re-point `current` at it (or roll `current` back to a sha that does
+///    resolve) as part of the target change.
+///
+/// The underlying target-agnostic pointer is PRE-EXISTING (it predates TERM
+/// #564/#565); this branch narrows the failure from silent-and-confusing to
+/// loud-and-named, and does not claim to close it.
+///
+/// No Plane item exists for this yet (no reachable Plane tool at the time of
+/// writing, and improvising a raw API call would violate the single-sanctioned-door
+/// rule), so THIS COMMENT IS THE RECORD. File it when the tool is reachable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultTarget(String);
+
+impl DefaultTarget {
+    /// Resolve `module`'s default target through the single resolution point
+    /// (`BUILD_MODULE_TARGET_<MODULE>` → `BUILD_TARGET_TRIPLE` → the fleet default).
+    pub fn for_module(module: &str) -> Self {
+        Self(super::effective_triple(module))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Test-only constructor, so the pointer-target invariant can be exercised
+    /// without mutating process-wide env. Deliberately NOT available to
+    /// production code — see the type doc.
+    #[cfg(test)]
+    pub fn from_raw_for_test(target: &str) -> Self {
+        Self(target.to_string())
+    }
+}
+
+/// The single guard behind every pointer flip: refuse to aim a target-agnostic
+/// `current` pointer at an artifact built for a non-default target. See
+/// [`DefaultTarget`] for the full rationale.
+fn guard_pointer_target(
+    module: &str,
+    channel: &str,
+    target: &str,
+    default: &DefaultTarget,
+) -> Result<(), ToolError> {
+    if target == default.as_str() {
+        return Ok(());
+    }
+    Err(ToolError::InvalidArgument(format!(
+        "refusing to move {module}/{channel} current onto an artifact built for target \
+         {target:?}: this module's default target is {default:?}, and the current pointer is \
+         keyed by (module, channel) with NO target component — so the flip would leave the live \
+         pointer on a sha whose artifact compiler_release (which resolves \
+         effective_triple({module:?}) = {default:?}) cannot find. An off-default target may be \
+         BUILT and GATED, but never blessed; change this module's BUILD_MODULE_TARGET_* config \
+         if {target:?} is meant to be its release target.",
+        default = default.as_str()
+    )))
+}
+
+/// A `current` / `current.prev` pointer RESOLVED to a concrete artifact path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPointer {
+    /// The sha the pointer names.
+    pub sha: String,
+    /// The target the pointer was resolved UNDER (the module's effective triple,
+    /// unless the caller overrode it).
+    pub target: String,
+    /// The artifact path that exists for `(sha, target, bin)`.
+    pub artifact_path: PathBuf,
+}
+
+/// List the target-triple subdirs actually present under a sha dir — i.e. the
+/// targets this sha WAS built for. Best-effort: a missing/unreadable sha dir is
+/// an empty list. Used ONLY to enrich a resolution diagnostic; it is NEVER a
+/// fallback (see [`resolve_pointer`]).
+async fn targets_present_for_sha(
+    dataset_root: &Path,
+    module: &str,
+    channel: &str,
+    sha: &str,
+) -> Vec<String> {
+    let dir = sha_dir(dataset_root, module, channel, sha);
+    let mut found = Vec::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                if let Some(name) = entry.file_name().to_str() {
+                    found.push(name.to_string());
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// TERM #565 (round-7) — the READ-SIDE detector for the default-target MIGRATION
+/// hazard documented on [`DefaultTarget`].
+///
+/// [`guard_pointer_target`] closes the WRITE door: no flip can aim a pointer at
+/// an off-default artifact. It cannot close the CONFIG door — an operator edits
+/// `BUILD_MODULE_TARGET_<MODULE>` (or the fleet `BUILD_TARGET_TRIPLE`) from A to
+/// B while `current` still names a sha only ever built for A. No flip occurs, so
+/// no write-time guard re-runs, and every consumer afterwards resolves under B
+/// and finds nothing. That cannot be PREVENTED from the build path (it would mean
+/// owning the config-change path), but it CAN be DETECTED here, at the one place
+/// a pointer becomes an artifact path, and reported as a named cause instead of a
+/// bare not-found from whichever consumer happened to hit it first.
+///
+/// Returns `Ok(None)` when the channel has no pointer of this kind yet (an
+/// unblessed channel is not an error). Returns `Ok(Some(..))` when the pointer's
+/// artifact exists under `target`. Otherwise returns a diagnostic naming the sha,
+/// the resolved target, the exact path checked, and — when the sha dir holds
+/// OTHER target subdirs — which targets it WAS built for.
+///
+/// It NEVER guesses, repairs, or falls back to another target: a wrong artifact
+/// silently promoted is far worse than a loud error. The remedy is always an
+/// operator action (rebuild the sha for the new target, or roll the channel back
+/// to a sha that resolves).
+pub async fn resolve_pointer(
+    dataset_root: &Path,
+    module: &str,
+    channel: &str,
+    pointer: &str,
+    sha: Option<String>,
+    target: &str,
+    bin: &str,
+) -> Result<Option<ResolvedPointer>, ToolError> {
+    let Some(sha) = sha else {
+        return Ok(None);
+    };
+    let artifact_path = artifact_abs_path(dataset_root, module, channel, &sha, target, bin);
+    if tokio::fs::try_exists(&artifact_path).await.unwrap_or(false) {
+        return Ok(Some(ResolvedPointer {
+            sha,
+            target: target.to_string(),
+            artifact_path,
+        }));
+    }
+    let built_for = targets_present_for_sha(dataset_root, module, channel, &sha).await;
+    let built_for_note = if built_for.is_empty() {
+        String::from(
+            " No target dir exists for this sha at all, so it was either never built into this \
+             channel or has been pruned.",
+        )
+    } else {
+        format!(
+            " This sha IS present for target(s) [{}] — i.e. it was built and blessed for a \
+             DIFFERENT target than the one now configured.",
+            built_for.join(", ")
+        )
+    };
+    Err(ToolError::NotFound(format!(
+        "{module}/{channel} {pointer} points at sha {sha}, but no artifact exists for target \
+         {target:?}: checked {path}. This usually means the module's configured target changed \
+         (BUILD_MODULE_TARGET_<MODULE> / BUILD_TARGET_TRIPLE) after this pointer was set.\
+         {built_for_note} The pointer is NOT repaired automatically and no other target is \
+         substituted: rebuild {sha} for {target:?} and re-bless it, or roll {module}/{channel} \
+         back to a sha that does resolve under {target:?}.",
+        path = artifact_path.display()
+    )))
+}
+
+/// Resolve a channel's live `current` pointer to its artifact under `target`.
+/// See [`resolve_pointer`] — this is the read-side entry point `compiler_release`
+/// uses so a query of the live release pointer surfaces the migration hazard
+/// rather than handing a consumer a sha nothing can find.
+pub async fn resolve_current(
+    dataset_root: &Path,
+    module: &str,
+    channel: &str,
+    target: &str,
+    bin: &str,
+) -> Result<Option<ResolvedPointer>, ToolError> {
+    let sha = read_current(dataset_root, module, channel).await?;
+    resolve_pointer(
+        dataset_root,
+        module,
+        channel,
+        CURRENT_POINTER,
+        sha,
+        target,
+        bin,
+    )
+    .await
+}
+
 /// The outcome of a `set_current` pointer flip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetCurrentOutcome {
@@ -603,6 +854,13 @@ pub struct SetCurrentOutcome {
 /// whose binary/`.sha256` is missing, corrupt, or checksum-mismatched. The flip is
 /// refused (fail closed) on any verification failure. Callers must therefore pass
 /// the `target`/`bin` that address the artifact.
+///
+/// TERM #565: this is ALSO the single choke point for the POINTER-TARGET
+/// invariant — `target` must equal the module's [`DefaultTarget`], because the
+/// pointer written here has no target component. Every pointer flip in the store
+/// (`bless_build`, `promote`, `rollback_current`) routes through this function,
+/// so an off-default target can never leave `current` aimed at an artifact
+/// `compiler_release` cannot resolve.
 #[allow(clippy::too_many_arguments)]
 pub async fn set_current(
     dataset_root: &Path,
@@ -610,10 +868,13 @@ pub async fn set_current(
     channel: &str,
     sha: &str,
     target: &str,
+    default_target: &DefaultTarget,
     bin: &str,
     action: &str,
     from_channel: Option<&str>,
 ) -> Result<SetCurrentOutcome, ToolError> {
+    // The pointer is target-agnostic: refuse BEFORE any verification or write.
+    guard_pointer_target(module, channel, target, default_target)?;
     // Never move `current` onto an unverified sha — the pointer flip itself is the
     // choke point, independent of what the caller already checked.
     verify_sha_artifact(dataset_root, module, channel, sha, target, bin).await?;
@@ -668,8 +929,12 @@ pub async fn rollback_current(
     module: &str,
     channel: &str,
     target: &str,
+    default_target: &DefaultTarget,
     bin: &str,
 ) -> Result<SetCurrentOutcome, ToolError> {
+    // TERM #565: refuse an off-default target up front, so a rollback cannot even
+    // begin to aim the target-agnostic pointer at an unresolvable artifact.
+    guard_pointer_target(module, channel, target, default_target)?;
     let prev = read_previous(dataset_root, module, channel)
         .await?
         .ok_or_else(|| {
@@ -677,6 +942,21 @@ pub async fn rollback_current(
                 "no previous blessed sha recorded for {module}/{channel}; nothing to roll back to"
             ))
         })?;
+    // TERM #565 (round-7): resolve the rollback target under the EFFECTIVE target
+    // BEFORE verifying it, so a pointer stranded by a default-target change
+    // reports that named cause instead of a bare missing-binary. Purely a better
+    // diagnostic on an already-failing path — the fail-closed verification below
+    // is unchanged, and nothing is repaired or substituted.
+    resolve_pointer(
+        dataset_root,
+        module,
+        channel,
+        PREVIOUS_POINTER,
+        Some(prev.clone()),
+        target,
+        bin,
+    )
+    .await?;
     // Explicit, clearly-attributed verification of the rollback target (in
     // addition to the check inside `set_current`), so the refusal names rollback.
     verify_sha_artifact(dataset_root, module, channel, &prev, target, bin)
@@ -687,7 +967,18 @@ pub async fn rollback_current(
                  a verified artifact (missing/corrupt): {e}"
             ))
         })?;
-    set_current(dataset_root, module, channel, &prev, target, bin, "rollback", None).await
+    set_current(
+        dataset_root,
+        module,
+        channel,
+        &prev,
+        target,
+        default_target,
+        bin,
+        "rollback",
+        None,
+    )
+    .await
 }
 
 /// Recursively copy a directory tree (files + subdirs; no symlinks in an artifact
@@ -847,9 +1138,14 @@ pub async fn promote(
     to_channel: &str,
     sha: &str,
     target: &str,
+    default_target: &DefaultTarget,
     bin: &str,
     retain: usize,
 ) -> Result<PromoteOutcome, ToolError> {
+    // 0. TERM #565: the pointer-target invariant, checked BEFORE any artifact
+    //    copy — a promote for an off-default target is refused outright rather
+    //    than copying a tree it may never bless.
+    guard_pointer_target(module, to_channel, target, default_target)?;
     // 1. Idempotent no-op FIRST — checked against the DESTINATION only. If the
     //    destination is already blessed at this sha AND its own copy verifies,
     //    re-promoting is a no-op regardless of the source: `stable` is independent
@@ -911,6 +1207,7 @@ pub async fn promote(
         to_channel,
         sha,
         target,
+        default_target,
         bin,
         action,
         Some(from_channel),
@@ -953,15 +1250,20 @@ pub struct BuildBlessOutcome {
 /// (promote-by-copy, no recompile). This guard is the structural guarantee that
 /// the CURRENT-pointer bless at build time is experimental-only, independent of
 /// whatever channel a caller might route the build into.
+#[allow(clippy::too_many_arguments)]
 pub async fn bless_build(
     dataset_root: &Path,
     module: &str,
     channel: &str,
     sha: &str,
     target: &str,
+    default_target: &DefaultTarget,
     bin: &str,
     retain: usize,
 ) -> Result<BuildBlessOutcome, ToolError> {
+    // TERM #565: an off-default-target build never blesses. Checked here too (in
+    // addition to `set_current`) so the refusal happens before the manifest write.
+    guard_pointer_target(module, channel, target, default_target)?;
     if is_promote_only_channel(channel) {
         return Err(ToolError::InvalidArgument(format!(
             "compiler_build may not bless the promote-only channel {channel:?}; a build blesses \
@@ -970,7 +1272,18 @@ pub async fn bless_build(
     }
     write_manifest(dataset_root, module, channel, sha, target, bin).await?;
     // set_current verifies the just-published sha before flipping (fail-closed).
-    let set = set_current(dataset_root, module, channel, sha, target, bin, "bless", None).await?;
+    let set = set_current(
+        dataset_root,
+        module,
+        channel,
+        sha,
+        target,
+        default_target,
+        bin,
+        "bless",
+        None,
+    )
+    .await?;
     // Prune reads the real current + current.prev pointers itself.
     let pruned = prune_channel(dataset_root, module, channel, retain).await?;
     Ok(BuildBlessOutcome {
@@ -1174,6 +1487,14 @@ mod tests {
 
     const T: &str = "x86_64-unknown-linux-musl";
 
+    /// The module DEFAULT target for these tests — equal to `T`, so every
+    /// pre-existing test builds and blesses the module's own default target and
+    /// the TERM #565 pointer-target guard is a no-op for them. The mismatch case
+    /// has its own dedicated test below.
+    fn dt() -> DefaultTarget {
+        DefaultTarget::from_raw_for_test(T)
+    }
+
     /// Deterministically set a path's mtime (and atime) to `secs` since the epoch
     /// via `utimes(2)`, so retention's newest-first ordering is testable without a
     /// wall-clock race (no extra crate; `libc` is already a dep).
@@ -1199,10 +1520,24 @@ mod tests {
         bin: &str,
         payload: &[u8],
     ) -> String {
+        seed_artifact_for_target(root, module, channel, T, bin, payload).await
+    }
+
+    /// Same, for an explicit target triple (so the off-default-target case has a
+    /// GENUINE, fully-verifiable artifact on disk — the guard must refuse it for
+    /// being off-default, not for being missing or corrupt).
+    async fn seed_artifact_for_target(
+        root: &Path,
+        module: &str,
+        channel: &str,
+        target: &str,
+        bin: &str,
+        payload: &[u8],
+    ) -> String {
         let dir = tempfile::tempdir().unwrap();
         let built = dir.path().join(bin);
         tokio::fs::write(&built, payload).await.unwrap();
-        let p = publish_local(root, module, channel, T, bin, &built)
+        let p = publish_local(root, module, channel, target, bin, &built)
             .await
             .unwrap();
         p.sha256
@@ -1214,7 +1549,7 @@ mod tests {
         let root = dir.path();
         let sha = seed_artifact(root, "m", "experimental", "m", b"v1").await;
 
-        let out = set_current(root, "m", "experimental", &sha, T, "m", "bless", None)
+        let out = set_current(root, "m", "experimental", &sha, T, &dt(), "m", "bless", None)
             .await
             .unwrap();
         assert!(out.changed);
@@ -1240,11 +1575,11 @@ mod tests {
         let root = dir.path();
         let sha = seed_artifact(root, "m", "experimental", "m", b"v1").await;
 
-        let a = set_current(root, "m", "experimental", &sha, T, "m", "bless", None)
+        let a = set_current(root, "m", "experimental", &sha, T, &dt(), "m", "bless", None)
             .await
             .unwrap();
         assert!(a.changed);
-        let b = set_current(root, "m", "experimental", &sha, T, "m", "bless", None)
+        let b = set_current(root, "m", "experimental", &sha, T, &dt(), "m", "bless", None)
             .await
             .unwrap();
         assert!(!b.changed, "re-blessing the same sha must be a no-op");
@@ -1260,7 +1595,7 @@ mod tests {
         let root = dir.path();
         assert_eq!(read_current(root, "m", "stable").await.unwrap(), None);
         let sha = seed_artifact(root, "m", "stable", "m", b"blob").await;
-        set_current(root, "m", "stable", &sha, T, "m", "bless", None)
+        set_current(root, "m", "stable", &sha, T, &dt(), "m", "bless", None)
             .await
             .unwrap();
         assert_eq!(read_current(root, "m", "stable").await.unwrap(), Some(sha));
@@ -1291,7 +1626,7 @@ mod tests {
     async fn promote_refuses_unbuilt_sha_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let err = promote(root, "m", "experimental", "stable", "notbuilt", T, "m", 2)
+        let err = promote(root, "m", "experimental", "stable", "notbuilt", T, &dt(), "m", 2)
             .await
             .unwrap_err();
         assert!(format!("{err:?}").contains("refusing to promote"));
@@ -1305,7 +1640,7 @@ mod tests {
         let root = dir.path();
         let sha = seed_artifact(root, "chord", "experimental", "chord", b"chord-bin-v7").await;
 
-        let out = promote(root, "chord", "experimental", "stable", &sha, T, "chord", 2)
+        let out = promote(root, "chord", "experimental", "stable", &sha, T, &dt(), "chord", 2)
             .await
             .unwrap();
         assert!(out.copied, "stable must get its own copy of the sha tree");
@@ -1326,11 +1661,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let sha = seed_artifact(root, "m", "experimental", "m", b"v1").await;
-        let first = promote(root, "m", "experimental", "stable", &sha, T, "m", 2)
+        let first = promote(root, "m", "experimental", "stable", &sha, T, &dt(), "m", 2)
             .await
             .unwrap();
         assert!(first.copied && !first.already_current);
-        let second = promote(root, "m", "experimental", "stable", &sha, T, "m", 2)
+        let second = promote(root, "m", "experimental", "stable", &sha, T, &dt(), "m", 2)
             .await
             .unwrap();
         assert!(second.already_current, "second promote must be a no-op");
@@ -1349,7 +1684,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let sha = seed_artifact(root, "m", "experimental", "m", b"v1").await;
-        let first = promote(root, "m", "experimental", "stable", &sha, T, "m", 2)
+        let first = promote(root, "m", "experimental", "stable", &sha, T, &dt(), "m", 2)
             .await
             .unwrap();
         assert!(first.copied && !first.already_current);
@@ -1365,7 +1700,7 @@ mod tests {
                 .unwrap()
         );
 
-        let repeat = promote(root, "m", "experimental", "stable", &sha, T, "m", 2)
+        let repeat = promote(root, "m", "experimental", "stable", &sha, T, &dt(), "m", 2)
             .await
             .expect("re-promote of an already-released sha must succeed, not error");
         assert!(repeat.already_current, "must be an idempotent no-op");
@@ -1386,7 +1721,7 @@ mod tests {
         let root = dir.path();
         let sha = seed_artifact(root, "m", "experimental", "m", b"v1").await;
 
-        let out = bless_build(root, "m", "experimental", &sha, T, "m", 2)
+        let out = bless_build(root, "m", "experimental", &sha, T, &dt(), "m", 2)
             .await
             .unwrap();
         assert!(out.blessed);
@@ -1409,7 +1744,7 @@ mod tests {
         let root = dir.path();
         let sha = seed_artifact(root, "m", "stable", "m", b"v1").await;
 
-        let err = bless_build(root, "m", "stable", &sha, T, "m", 2)
+        let err = bless_build(root, "m", "stable", &sha, T, &dt(), "m", 2)
             .await
             .unwrap_err();
         assert!(
@@ -1434,16 +1769,16 @@ mod tests {
         let sha2 = seed_artifact(root, "m", "experimental", "m", b"two").await;
         assert_ne!(sha1, sha2);
 
-        promote(root, "m", "experimental", "stable", &sha1, T, "m", 2)
+        promote(root, "m", "experimental", "stable", &sha1, T, &dt(), "m", 2)
             .await
             .unwrap();
-        promote(root, "m", "experimental", "stable", &sha2, T, "m", 2)
+        promote(root, "m", "experimental", "stable", &sha2, T, &dt(), "m", 2)
             .await
             .unwrap();
         assert_eq!(read_current(root, "m", "stable").await.unwrap(), Some(sha2.clone()));
         assert_eq!(read_previous(root, "m", "stable").await.unwrap(), Some(sha1.clone()));
 
-        let rb = rollback_current(root, "m", "stable", T, "m").await.unwrap();
+        let rb = rollback_current(root, "m", "stable", T, &dt(), "m").await.unwrap();
         assert!(rb.changed);
         assert_eq!(read_current(root, "m", "stable").await.unwrap(), Some(sha1.clone()));
         // Rollback is itself reversible: prev now points at sha2.
@@ -1456,7 +1791,7 @@ mod tests {
     async fn rollback_with_no_previous_errors() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        assert!(rollback_current(root, "m", "stable", T, "m").await.is_err());
+        assert!(rollback_current(root, "m", "stable", T, &dt(), "m").await.is_err());
     }
 
     #[tokio::test]
@@ -1465,10 +1800,10 @@ mod tests {
         let root = dir.path();
         let sha1 = seed_artifact(root, "m", "experimental", "m", b"one").await;
         let sha2 = seed_artifact(root, "m", "experimental", "m", b"two").await;
-        promote(root, "m", "experimental", "stable", &sha1, T, "m", 2)
+        promote(root, "m", "experimental", "stable", &sha1, T, &dt(), "m", 2)
             .await
             .unwrap();
-        promote(root, "m", "experimental", "stable", &sha2, T, "m", 2)
+        promote(root, "m", "experimental", "stable", &sha2, T, &dt(), "m", 2)
             .await
             .unwrap();
         // current=sha2, current.prev=sha1.
@@ -1477,7 +1812,7 @@ mod tests {
         // (a) Corrupt the rollback target's binary under stable → verify fails.
         let binp = artifact_abs_path(root, "m", "stable", &sha1, T, "m");
         tokio::fs::write(&binp, b"tampered").await.unwrap();
-        let err = rollback_current(root, "m", "stable", T, "m")
+        let err = rollback_current(root, "m", "stable", T, &dt(), "m")
             .await
             .unwrap_err();
         assert!(
@@ -1491,7 +1826,7 @@ mod tests {
         tokio::fs::remove_dir_all(sha_dir(root, "m", "stable", &sha1))
             .await
             .unwrap();
-        assert!(rollback_current(root, "m", "stable", T, "m").await.is_err());
+        assert!(rollback_current(root, "m", "stable", T, &dt(), "m").await.is_err());
         assert_eq!(read_current(root, "m", "stable").await.unwrap(), Some(sha2));
     }
 
@@ -1500,7 +1835,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         // A sha whose artifact was never published → the pointer flip is refused.
-        let err = set_current(root, "m", "experimental", "deadbeef", T, "m", "bless", None)
+        let err = set_current(root, "m", "experimental", "deadbeef", T, &dt(), "m", "bless", None)
             .await
             .unwrap_err();
         assert!(
@@ -1525,10 +1860,10 @@ mod tests {
             shas.push(sha);
         }
         // Bless sha1 then sha3 → current=sha3, current.prev=sha1 (the OLDEST).
-        set_current(root, "m", "experimental", &shas[0], T, "m", "bless", None)
+        set_current(root, "m", "experimental", &shas[0], T, &dt(), "m", "bless", None)
             .await
             .unwrap();
-        set_current(root, "m", "experimental", &shas[2], T, "m", "bless", None)
+        set_current(root, "m", "experimental", &shas[2], T, &dt(), "m", "bless", None)
             .await
             .unwrap();
         assert_eq!(
@@ -1536,7 +1871,7 @@ mod tests {
             Some(shas[0].clone())
         );
         // Idempotent re-bless of the current sha (its `previous` return is sha3).
-        let set = set_current(root, "m", "experimental", &shas[2], T, "m", "bless", None)
+        let set = set_current(root, "m", "experimental", &shas[2], T, &dt(), "m", "bless", None)
             .await
             .unwrap();
         assert!(!set.changed);
@@ -1554,7 +1889,7 @@ mod tests {
             "the rollback target sha dir must survive"
         );
         // And a rollback to it still succeeds (proves it stayed verifiable).
-        let rb = rollback_current(root, "m", "experimental", T, "m")
+        let rb = rollback_current(root, "m", "experimental", T, &dt(), "m")
             .await
             .unwrap();
         assert_eq!(rb.sha, shas[0]);
@@ -1571,7 +1906,7 @@ mod tests {
             // Ensure a distinct, increasing mtime ordering for the sha dirs.
             let d = sha_dir(root, "m", "experimental", &sha);
             set_mtime(&d, 1_000 + i as i64);
-            set_current(root, "m", "experimental", &sha, T, "m", "bless", None)
+            set_current(root, "m", "experimental", &sha, T, &dt(), "m", "bless", None)
                 .await
                 .unwrap();
             shas.push(sha);
@@ -1636,5 +1971,290 @@ mod tests {
         assert_eq!(read.sha256, sha);
         assert!(read.artifact_rel.contains(&sha));
         assert!(read.sha256_rel.ends_with("chord.sha256"));
+    }
+    // ── TERM #565 (round-2 review finding 1): the POINTER-TARGET invariant ────
+    //
+    // The artifact is target-addressed (`<sha>/<target>/<bin>`); the `current`
+    // pointer is NOT (`<channel>/current`, keyed by module+channel only). So the
+    // ONLY target whose artifact `current` may be aimed at is the module's
+    // effective default — the one `compiler_release` resolves. Anything else
+    // leaves the live pointer on a sha whose artifact release cannot find.
+    //
+    // MUTATION CHECK for a future reader: delete the `guard_pointer_target` call
+    // in `set_current` (and the two early ones in `promote` / `bless_build`) and
+    // EVERY assertion below flips — the calls succeed and `current` is written.
+
+    /// The off-default target here is a REAL, fully-verifiable artifact (seeded
+    /// under its own target dir, correct sha + sidecar), so the refusal can only
+    /// be the pointer-target invariant — not verify-before-bless doing the work.
+    const OFF: &str = "x86_64-unknown-linux-gnu";
+
+    #[tokio::test]
+    async fn bless_build_refuses_an_off_default_target_and_leaves_current_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert_ne!(OFF, T, "the fixture must actually be off-default");
+
+        let sha = seed_artifact_for_target(root, "m", "experimental", OFF, "m", b"native").await;
+        // Sanity: the artifact really is complete and verifiable at OFF.
+        verify_sha_artifact(root, "m", "experimental", &sha, OFF, "m")
+            .await
+            .expect("the off-default artifact is genuine — only its TARGET is wrong");
+
+        let err = bless_build(root, "m", "experimental", &sha, OFF, &dt(), "m", 2)
+            .await
+            .expect_err("an off-default-target build must never bless current");
+        assert!(
+            matches!(err, ToolError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+
+        // THE invariant: the live pointer was not created/moved.
+        assert_eq!(
+            read_current(root, "m", "experimental").await.unwrap(),
+            None,
+            "current must not exist after a refused off-default bless"
+        );
+        assert!(
+            !tokio::fs::try_exists(&current_pointer_path(root, "m", "experimental"))
+                .await
+                .unwrap(),
+            "no current pointer file may be written at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_current_refuses_an_off_default_target_and_does_not_disturb_the_pointer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // A legitimate default-target release is already live.
+        let good = seed_artifact(root, "m", "experimental", "m", b"default").await;
+        bless_build(root, "m", "experimental", &good, T, &dt(), "m", 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_current(root, "m", "experimental").await.unwrap().as_deref(),
+            Some(good.as_str())
+        );
+
+        // Now an off-default-target build tries to take the pointer.
+        let off = seed_artifact_for_target(root, "m", "experimental", OFF, "m", b"native").await;
+        assert_ne!(off, good);
+        let err = set_current(root, "m", "experimental", &off, OFF, &dt(), "m", "bless", None)
+            .await
+            .expect_err("set_current is the choke point — it must refuse");
+        assert!(matches!(err, ToolError::InvalidArgument(_)), "{err:?}");
+
+        // The previously-good release is untouched — no hijack, no dangling prev.
+        assert_eq!(
+            read_current(root, "m", "experimental").await.unwrap().as_deref(),
+            Some(good.as_str()),
+            "the live pointer must still name the DEFAULT-target artifact"
+        );
+        assert_eq!(read_previous(root, "m", "experimental").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn promote_and_rollback_refuse_an_off_default_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let off = seed_artifact_for_target(root, "m", "experimental", OFF, "m", b"native").await;
+        let err = promote(root, "m", "experimental", "stable", &off, OFF, &dt(), "m", 2)
+            .await
+            .expect_err("promote must refuse an off-default target");
+        assert!(matches!(err, ToolError::InvalidArgument(_)), "{err:?}");
+        assert_eq!(read_current(root, "m", "stable").await.unwrap(), None);
+        // Refused BEFORE any copy — stable never got a tree.
+        assert!(
+            !tokio::fs::try_exists(&sha_dir(root, "m", "stable", &off))
+                .await
+                .unwrap(),
+            "a refused promote must not have copied the artifact tree"
+        );
+
+        let err = rollback_current(root, "m", "stable", OFF, &dt(), "m")
+            .await
+            .expect_err("rollback must refuse an off-default target");
+        assert!(matches!(err, ToolError::InvalidArgument(_)), "{err:?}");
+    }
+
+    /// The default-target path is UNCHANGED — without this, a guard hardwired to
+    /// refuse everything would pass the three tests above.
+    #[tokio::test]
+    async fn the_module_default_target_still_blesses_normally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sha = seed_artifact(root, "m", "experimental", "m", b"default").await;
+        let out = bless_build(root, "m", "experimental", &sha, T, &dt(), "m", 2)
+            .await
+            .unwrap();
+        assert!(out.blessed);
+        assert_eq!(
+            read_current(root, "m", "experimental").await.unwrap().as_deref(),
+            Some(sha.as_str())
+        );
+    }
+
+    /// `DefaultTarget::for_module` is the ONLY production constructor, and it
+    /// resolves through the single resolution point (`effective_triple`) — so a
+    /// caller cannot pass its own target as its own "default" and defeat the guard.
+    #[test]
+    fn default_target_for_module_matches_the_single_resolution_point() {
+        let m = "a-module-with-no-configured-target-xyz";
+        assert_eq!(
+            DefaultTarget::for_module(m).as_str(),
+            super::super::effective_triple(m)
+        );
+    }
+
+    // ── TERM #565 round-7: read-side detection of the config-door hazard ──────
+    //
+    // The write door is guarded (above). These cover the CONFIG door: a pointer
+    // blessed for target A while the module's effective target is later changed
+    // to B out of band. Nothing re-runs the write guard, so the read side must
+    // detect it and say WHY — without guessing or falling back to A.
+
+    /// Pointer set for target A; effective target is then B; no artifact exists
+    /// under B ⇒ resolving the live pointer returns a diagnostic that NAMES the
+    /// sha, the resolved target, the path checked, the target it was actually
+    /// built for, and the config knobs that are the likely cause.
+    #[tokio::test]
+    async fn resolve_current_diagnoses_a_pointer_stranded_by_a_default_target_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Blessed legitimately under target A (== the module default at the time).
+        let sha = seed_artifact(root, "m", "experimental", "m", b"built-for-A").await;
+        bless_build(root, "m", "experimental", &sha, T, &dt(), "m", 2)
+            .await
+            .unwrap();
+
+        // Config door: the module's effective target is now OFF (B). The pointer
+        // is untouched, so no write-time guard ran.
+        let err = resolve_current(root, "m", "experimental", OFF, "m")
+            .await
+            .expect_err("a pointer that resolves to nothing under B must be an error");
+        let msg = format!("{err:?}");
+        assert!(matches!(err, ToolError::NotFound(_)), "{msg}");
+        let checked = artifact_abs_path(root, "m", "experimental", &sha, OFF, "m")
+            .display()
+            .to_string();
+        assert!(
+            msg.contains(&checked),
+            "the diagnostic must name the path it checked: {msg}"
+        );
+        // The sha and the target must be named IN THEIR OWN RIGHT — the checked
+        // path happens to contain both as components, so assert against the
+        // message with that path elided, or a diagnostic that only echoed a path
+        // would pass.
+        let prose = msg.replace(&checked, "<CHECKED-PATH>");
+        assert!(
+            prose.contains(&sha),
+            "the diagnostic must name the sha, not only embed it in the path: {msg}"
+        );
+        assert!(
+            prose.contains(OFF),
+            "the diagnostic must name the RESOLVED target: {msg}"
+        );
+        assert!(
+            prose.contains(T),
+            "the diagnostic must name the target the sha WAS built for: {msg}"
+        );
+        assert!(
+            msg.contains("BUILD_MODULE_TARGET_") && msg.contains("BUILD_TARGET_TRIPLE"),
+            "the diagnostic must name the likely cause (the target config): {msg}"
+        );
+
+        // Detection only — nothing repaired, nothing substituted.
+        assert_eq!(
+            read_current(root, "m", "experimental").await.unwrap().as_deref(),
+            Some(sha.as_str()),
+            "the detector must not touch the pointer"
+        );
+    }
+
+    /// POSITIVE CONTROL — the normal case still resolves. Without this, a
+    /// detector hardwired to always error would pass the test above.
+    #[tokio::test]
+    async fn resolve_current_resolves_normally_under_the_effective_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let sha = seed_artifact(root, "m", "experimental", "m", b"built-for-A").await;
+        bless_build(root, "m", "experimental", &sha, T, &dt(), "m", 2)
+            .await
+            .unwrap();
+
+        let resolved = resolve_current(root, "m", "experimental", T, "m")
+            .await
+            .expect("the pointer resolves under the module's own default target")
+            .expect("a blessed channel resolves to Some");
+        assert_eq!(resolved.sha, sha);
+        assert_eq!(resolved.target, T);
+        assert_eq!(
+            resolved.artifact_path,
+            artifact_abs_path(root, "m", "experimental", &sha, T, "m")
+        );
+        assert!(tokio::fs::try_exists(&resolved.artifact_path).await.unwrap());
+
+        // And an unblessed channel is `None`, not an error.
+        assert!(resolve_current(root, "m", "stable", T, "m")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// The other read of a live release pointer: `rollback` resolves
+    /// `current.prev`. A prev stranded by the same config change reports the same
+    /// named cause instead of a bare missing-binary, and `current` is untouched.
+    #[tokio::test]
+    async fn rollback_diagnoses_a_prev_pointer_stranded_by_a_default_target_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Two blesses under target A, so `current.prev` names the first.
+        let one = seed_artifact(root, "m", "experimental", "m", b"one").await;
+        bless_build(root, "m", "experimental", &one, T, &dt(), "m", 2)
+            .await
+            .unwrap();
+        let two = seed_artifact(root, "m", "experimental", "m", b"two").await;
+        bless_build(root, "m", "experimental", &two, T, &dt(), "m", 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_previous(root, "m", "experimental").await.unwrap().as_deref(),
+            Some(one.as_str())
+        );
+
+        // Config door: the module's effective default is now OFF, so the guard
+        // is satisfied (target == default) but `current.prev` was built for A.
+        let off_default = DefaultTarget::from_raw_for_test(OFF);
+        let err = rollback_current(root, "m", "experimental", OFF, &off_default, "m")
+            .await
+            .expect_err("rolling back onto an unresolvable prev must be refused");
+        let msg = format!("{err:?}");
+        let checked = artifact_abs_path(root, "m", "experimental", &one, OFF, "m")
+            .display()
+            .to_string();
+        let prose = msg.replace(&checked, "<CHECKED-PATH>");
+        assert!(
+            prose.contains(&one),
+            "the diagnostic must name the prev sha in its own right: {msg}"
+        );
+        assert!(
+            prose.contains(OFF),
+            "the diagnostic must name the target: {msg}"
+        );
+        assert!(
+            msg.contains("BUILD_MODULE_TARGET_") && msg.contains("BUILD_TARGET_TRIPLE"),
+            "the diagnostic must name the likely cause: {msg}"
+        );
+        assert_eq!(
+            read_current(root, "m", "experimental").await.unwrap().as_deref(),
+            Some(two.as_str()),
+            "a refused rollback must leave current untouched"
+        );
     }
 }

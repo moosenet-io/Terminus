@@ -1285,6 +1285,91 @@ fn effective_triple(module: &str) -> String {
     host::module_target(module).unwrap_or_else(target_triple)
 }
 
+/// The two target triples the fleet actually builds and publishes today:
+/// NATIVE glibc (the openssl-via-ssh2 modules — chord, terminus — which the musl
+/// default silently mis-builds) and musl-static (the portable-artifact default).
+const BASE_SUPPORTED_TARGETS: [&str; 2] =
+    ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"];
+
+/// Env var (comma-separated) extending [`BASE_SUPPORTED_TARGETS`], so a genuinely
+/// new target can be adopted by CONFIG without a code change — same discipline as
+/// `BUILD_TARGET_TRIPLE` / `BUILD_MODULE_TARGET_<MODULE>`.
+const BUILD_ALLOWED_TARGETS: &str = "BUILD_ALLOWED_TARGETS";
+
+/// Sanity-check an EXPLICIT caller-supplied `target` against the set this fleet
+/// can actually build for `module` — a typo or a target with no installed std
+/// should be rejected in milliseconds rather than after a long doomed compile.
+///
+/// ## What this is NOT (round-2 review finding 1, corrected)
+///
+/// An earlier revision of this doc claimed the allowlist prevented the
+/// pointer/artifact-path DISAGREEMENT hazard. It does not, and cannot: the hazard
+/// is a build whose target differs from the MODULE'S DEFAULT — and
+/// `x86_64-unknown-linux-gnu` vs a musl-default module is exactly that case with
+/// both triples "supported". The real fix is the pointer-target invariant
+/// enforced by [`should_bless_current`] and, fail-closed at the store layer,
+/// `publish::DefaultTarget` / `publish::set_current`: an off-default target is
+/// BUILD/GATE-only and never advances `current`. This function is a cheap
+/// pre-flight filter layered on top of that, nothing more.
+///
+/// Fleet fact this encodes: chord and terminus-primary are openssl-via-ssh2 and
+/// must be built native-glibc; the musl default silently blocks them. Both
+/// triples stay selectable (that is the point of the argument — a one-off native
+/// build of a musl-default module is exactly the TERM #564 use case), but only
+/// from a KNOWN set.
+///
+/// Always accepted, in addition to the allowlist: `module_default` — whatever
+/// this module's own `BUILD_MODULE_TARGET_<MODULE>` / `BUILD_TARGET_TRIPLE`
+/// config already resolves to. An explicit target equal to the default is a
+/// no-op, and config is trusted (it is how a new target is adopted).
+fn check_target_supported(
+    module: &str,
+    target: &str,
+    module_default: &str,
+) -> Result<(), ToolError> {
+    if target == module_default {
+        return Ok(());
+    }
+    if BASE_SUPPORTED_TARGETS.contains(&target) {
+        return Ok(());
+    }
+    let extra = env_nonempty(BUILD_ALLOWED_TARGETS).unwrap_or_default();
+    if extra.split(',').map(str::trim).any(|t| t == target) {
+        return Ok(());
+    }
+    let mut supported: Vec<String> = BASE_SUPPORTED_TARGETS.iter().map(|t| t.to_string()).collect();
+    if !supported.iter().any(|t| t == module_default) {
+        supported.push(module_default.to_string());
+    }
+    Err(ToolError::InvalidArgument(format!(
+        "target {target:?} is not a supported build target for module {module:?} (supported: \
+         {}). Extend {BUILD_ALLOWED_TARGETS} (or this module's BUILD_MODULE_TARGET_* config) to \
+         adopt a new target. Note: a supported target that is not this module's DEFAULT still \
+         builds and gates, but is never blessed as the live release — the current pointer has no \
+         target component.",
+        supported.join(", ")
+    )))
+}
+
+/// TERM #565 (round-2 review finding 1) — may THIS build advance the module's
+/// `<channel>/current` pointer?
+///
+/// Two reasons it may not:
+/// 1. `relayed` — the build host has no RW dataset mount, so the relay TARGET
+///    host owns the pointer flip (pre-existing rule).
+/// 2. the artifact was built for a target OTHER than the module's effective
+///    default. The artifact is target-addressed (`<sha>/<target>/<bin>`) but the
+///    `current` pointer is keyed by `(module, channel)` with NO target component,
+///    and `compiler_release` resolves `effective_triple(module)` — so blessing an
+///    off-default target's sha would leave the live pointer on an artifact
+///    release cannot resolve. Such a build is BUILD/GATE-only.
+///
+/// Pure + total, so the invariant is unit-testable without a dataset or a build;
+/// `publish::bless_build` enforces the same rule fail-closed at the store layer.
+fn should_bless_current(relayed: bool, target: &str, module_default: &str) -> bool {
+    !relayed && target == module_default
+}
+
 /// The per-channel retention count for the artifact store's pruning (BLD-07).
 /// Config-driven and floored at 2 — the store never keeps fewer than 2 shas nor
 /// prunes the current/previous pointer targets.
@@ -2044,6 +2129,54 @@ impl CargoTestSummary {
     }
 }
 
+/// TERM #564: the maximum size of the diagnostic output tail carried on a FAILED
+/// test-gate result. Bounded so a runaway build log can never blow up a tool
+/// result / event payload, but generous enough to carry a real cargo/rustc error
+/// (which is what the caller actually needs to debug a gate that compiled
+/// nothing).
+const TEST_GATE_OUTPUT_TAIL_BYTES: usize = 6000;
+/// TERM #564: the maximum number of LINES kept in that tail (whichever bound
+/// bites first).
+const TEST_GATE_OUTPUT_TAIL_LINES: usize = 80;
+
+/// TERM #564: the trailing slice of a build/test run's ALREADY-REDACTED combined
+/// stdout+stderr, for surfacing on a FAILED gate. Pure — testable.
+///
+/// This exists because a `mode=test` run that never compiled — an sccache/Redis
+/// startup failure, a `--locked` lockfile mismatch, a registry-auth failure, a
+/// rustc error, a missing toolchain — produces NO `test result:` line at all, so
+/// the parsed [`CargoTestSummary`] is all zeros and the gate used to report a
+/// bare `FAIL (0 passed, 0 failed, 0 ignored)` with the underlying cargo stderr
+/// DISCARDED. That verdict is meaningless in both directions (a failure you
+/// cannot diagnose, and an "empty run" indistinguishable from a real one) and
+/// cost a full debugging cycle. The tail is the fix: the gate now always hands
+/// back what the compiler actually said.
+///
+/// Takes the LAST lines (an error is emitted at the end of a cargo run), keeps
+/// at most [`TEST_GATE_OUTPUT_TAIL_LINES`] of them, then trims to the last
+/// [`TEST_GATE_OUTPUT_TAIL_BYTES`] bytes on a char boundary. The input is
+/// already redacted by `run_test`/`drain_pipe` (S7), so this never needs to
+/// scrub secrets itself — it only ever narrows an already-safe string.
+fn test_gate_output_tail(output: &str) -> String {
+    let trimmed = output.trim_end();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let start = lines.len().saturating_sub(TEST_GATE_OUTPUT_TAIL_LINES);
+    let tail = lines[start..].join("\n");
+    if tail.len() <= TEST_GATE_OUTPUT_TAIL_BYTES {
+        return tail;
+    }
+    // Trim from the FRONT (keep the end — that is where the error is), snapping
+    // forward to the next char boundary so we never split a UTF-8 sequence.
+    let mut cut = tail.len() - TEST_GATE_OUTPUT_TAIL_BYTES;
+    while cut < tail.len() && !tail.is_char_boundary(cut) {
+        cut += 1;
+    }
+    tail[cut..].to_string()
+}
+
 /// The GATE verdict for a `mode=test` run (pure — testable). PASSES iff BOTH the
 /// cargo process exited 0 (`exit_success`) AND the parsed summary is clean
 /// (`summary.all_passed()`). Requiring the exit code is the load-bearing half for
@@ -2723,6 +2856,25 @@ pub async fn run_merge_regate(module: &str, git_ref: &str) -> Result<bool, ToolE
             "wait": true,
         }))
         .await?;
+    // TERM #564: a re-gate that compiled NOTHING is still `Ok(false)` (fail
+    // closed — never merge), but the merge queue's own log must not be left with
+    // a silent, uninterpretable red. Surface the underlying compiler output.
+    if let Some(s) = out.structured.as_ref() {
+        if s.get("no_test_summary").and_then(Value::as_bool) == Some(true) {
+            let output_tail = s
+                .get("output_tail")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            tracing::warn!(
+                module = %module,
+                git_ref = %git_ref,
+                output_tail = %output_tail,
+                "compiler merge re-gate: cargo produced NO test summary — the test build \
+                 itself failed (nothing compiled); treating as RED"
+            );
+        }
+    }
     out.structured
         .as_ref()
         .and_then(|s| s.get("passed"))
@@ -2789,6 +2941,10 @@ impl RustTool for CompilerBuild {
                 "source_dir": {
                     "type": "string",
                     "description": "Override the source tree location (defaults to ${BUILD_DATASET_ROOT}/src/<module>/<ref>)."
+                },
+                "target": {
+                    "type": "string",
+                    "description": "TERM #564: Rust target triple to build/gate against (e.g. x86_64-unknown-linux-gnu for the NATIVE-glibc openssl-via-ssh2 modules chord/terminus, x86_64-unknown-linux-musl for a portable static artifact). Defaults to this MODULE's own configured target — its BUILD_MODULE_TARGET_<MODULE> override if set, else the fleet-wide BUILD_TARGET_TRIPLE — so per-module native/musl selection is automatic and needs NO caller flag; this argument only exists to override that default for a one-off build. Same default resolution compiler_release uses, so a build and its promote/rollback can never disagree on the target. An explicit value is ALLOWLIST-CHECKED: it must be a supported fleet target (native-glibc or musl-static), this module's own configured default, or listed in BUILD_ALLOWED_TARGETS — an unknown target is rejected up front rather than after a doomed compile. TERM #565 — IMPORTANT: an explicit target that DIFFERS from this module's default makes the build BUILD/GATE-ONLY. The artifact is published (and reported) but <channel>/current is NOT advanced onto it, because the current pointer is keyed by (module, channel) with no target component and compiler_release resolves the module default — blessing an off-default target would leave the live pointer on an artifact release cannot find. The result reports off_default_target=true and bless_skipped_reason=\"off-default-target\". To make a different target a module's RELEASE target, change its BUILD_MODULE_TARGET_<MODULE> config."
                 },
                 "request_id": {
                     "type": "string",
@@ -3223,9 +3379,35 @@ impl CompilerBuild {
         // over the fleet-wide `BUILD_TARGET_TRIPLE` — see `effective_triple`'s
         // doc for why harmony needs this (musl-static, for a portable artifact
         // on an older-glibc deploy host than the builder).
-        let triple = effective_triple(&module);
-        // `target` (the triple, override or default) comes from config but is
-        // used as a path segment.
+        // TERM #564: an EXPLICIT caller-supplied `target` wins over both (this is
+        // the argument `effective_triple`'s doc already promised but that
+        // `compiler_build` never actually exposed — so a caller had no way at all
+        // to request a different target through the single sanctioned build
+        // door). Unset ⇒ the per-module default above ⇒ zero behavior change.
+        //
+        // Review finding 4: an explicit caller target is ALLOWLIST-CHECKED against
+        // this module's supported set, not merely segment-validated — see
+        // `check_target_supported` for why a free-form target here is a real
+        // publish-contract hazard rather than a mere cargo failure.
+        let module_default = effective_triple(&module);
+        let triple = match args.get("target").and_then(Value::as_str) {
+            Some(t) => {
+                let t = t.to_string();
+                // Path-safety first (so a rejected target never reaches a log or
+                // path), then the semantic contract check.
+                validate_segment("target", &t)?;
+                check_target_supported(&module, &t, &module_default)?;
+                t
+            }
+            None => module_default.clone(),
+        };
+        // TERM #565 (round-2 review finding 1): an explicit target that DIFFERS
+        // from this module's effective default is BUILD/GATE-only — it must not
+        // advance the target-agnostic `experimental/current` pointer. See
+        // `should_bless_current` and `publish::DefaultTarget`.
+        let off_default_target = triple != module_default;
+        // `target` (the triple, caller-supplied, per-module override, or default)
+        // is used as a `--target` value AND a path segment.
         validate_segment("target", &triple)?;
 
         // sccache env (fail-open to a local dir if Redis is unconfigured).
@@ -3381,10 +3563,10 @@ impl CompilerBuild {
         // BLD-COMPTEST: for `mode=test` there is no binary to publish — `built_bin`
         // is left as an unused placeholder on that path (the function returns with
         // the gate result, below, before the publish section ever reads it), and
-        // `test_outcome` (process-exit-success, parsed [`CargoTestSummary`]) is set
-        // instead.
+        // `test_outcome` (process-exit-success, parsed [`CargoTestSummary`], and —
+        // TERM #564 — the bounded diagnostic output TAIL) is set instead.
         let built_bin: PathBuf;
-        let mut test_outcome: Option<(bool, CargoTestSummary)> = None;
+        let mut test_outcome: Option<(bool, CargoTestSummary, String)> = None;
 
         if resolved.is_local() {
             // ── LOCAL build (primary, in place) ──────────────────────────────
@@ -3555,7 +3737,11 @@ impl CompilerBuild {
                     Some(&tap),
                 )
                 .await?;
-                test_outcome = Some((exit_success, parse_cargo_test_output(&output)));
+                test_outcome = Some((
+                    exit_success,
+                    parse_cargo_test_output(&output),
+                    test_gate_output_tail(&output),
+                ));
                 built_bin = PathBuf::new(); // unused: mode=test never reaches publish
             } else {
                 run(
@@ -4017,7 +4203,11 @@ impl CompilerBuild {
                 if let Some(g) = secret_guard.as_mut() {
                     g.disarm();
                 }
-                test_outcome = Some((exit_success, parse_cargo_test_output(&output)));
+                test_outcome = Some((
+                    exit_success,
+                    parse_cargo_test_output(&output),
+                    test_gate_output_tail(&output),
+                ));
                 // No binary was produced to retrieve/publish for mode=test.
                 built_bin = PathBuf::new();
             } else {
@@ -4081,7 +4271,7 @@ impl CompilerBuild {
         // terminal `Tested` event, so a caller polls `compiler_progress` for a
         // gate exactly as it would for a build.
         if is_test_mode {
-            let (exit_success, summary) =
+            let (exit_success, summary, output_tail) =
                 test_outcome.expect("mode=test always sets test_outcome before this point");
             // GATE verdict: require BOTH a zero cargo exit AND a clean parsed
             // summary — see `test_gate_passed`. A clean earlier summary followed
@@ -4109,6 +4299,21 @@ impl CompilerBuild {
                 "process_exit_success": exit_success,
                 "test_counts": summary.to_json(),
                 "failing_tests": summary.failing_tests,
+                // TERM #564: a FAILED gate ALWAYS carries the underlying
+                // compiler output tail. `no_test_summary` distinguishes the two
+                // fundamentally different failures a caller must never confuse:
+                //   - `false` → cargo ran tests and some FAILED (`failing_tests`
+                //     is the actionable list).
+                //   - `true`  → cargo NEVER PRODUCED A TEST SUMMARY: nothing was
+                //     compiled/run at all (sccache/Redis startup failure, a
+                //     `--locked` lockfile mismatch, a registry-auth failure, a
+                //     rustc/link error, a missing toolchain). The old bare
+                //     `0 passed, 0 failed` was indistinguishable from a real
+                //     empty run and had no diagnostic whatsoever.
+                // Omitted (null) on a PASS — the tail is a failure diagnostic,
+                // not a routine payload.
+                "no_test_summary": !summary.summary_found,
+                "output_tail": if passed { Value::Null } else { json!(output_tail) },
                 "published": false,
                 "blessed_current": false,
                 "caps": {
@@ -4126,16 +4331,36 @@ impl CompilerBuild {
                 request_id,
                 events::Emit::stage(events::Stage::Tested).message(structured.to_string()),
             );
-            let text = format!(
-                "cargo test {module}@{git_ref} on {host}: {verdict} ({passed_n} passed, \
-                 {failed_n} failed, {ignored_n} ignored) [request_id={rid}]",
-                host = resolved.role.as_str(),
-                verdict = if passed { "PASS" } else { "FAIL" },
-                passed_n = summary.passed,
-                failed_n = summary.failed,
-                ignored_n = summary.ignored,
-                rid = request_id,
-            );
+            // TERM #564 — FAIL LOUD. A gate that COMPILED NOTHING must say so and
+            // show the compiler's own words; it must NEVER render as a bare
+            // `0 passed, 0 failed`, which reads identically to a legitimately
+            // empty suite and gives the caller nothing to act on.
+            let text = if !summary.summary_found {
+                format!(
+                    "cargo test {module}@{git_ref} on {host}: BUILD FAILED — cargo produced NO \
+                     test summary, so ZERO tests ran (this is NOT `0 passed, 0 failed`: nothing \
+                     compiled). process_exit_success={exit_success}. Last output:\n{tail}\n\
+                     [request_id={rid}]",
+                    host = resolved.role.as_str(),
+                    tail = if output_tail.is_empty() {
+                        "<the build produced no output at all>"
+                    } else {
+                        output_tail.as_str()
+                    },
+                    rid = request_id,
+                )
+            } else {
+                format!(
+                    "cargo test {module}@{git_ref} on {host}: {verdict} ({passed_n} passed, \
+                     {failed_n} failed, {ignored_n} ignored) [request_id={rid}]",
+                    host = resolved.role.as_str(),
+                    verdict = if passed { "PASS" } else { "FAIL" },
+                    passed_n = summary.passed,
+                    failed_n = summary.failed,
+                    ignored_n = summary.ignored,
+                    rid = request_id,
+                )
+            };
             return Ok(ToolOutput::with_structured(text, structured));
         }
 
@@ -4213,9 +4438,19 @@ impl CompilerBuild {
         // Skipped on the INTERIM relay path — the build host lacks the dataset
         // mount, so it cannot (and must not) write a local pointer; the relay
         // target host owns that flip. `compiler_release` promotes to `stable`.
+        //
+        // TERM #565: nor does an OFF-DEFAULT-TARGET build. The artifact is
+        // target-addressed (`<sha>/<target>/<bin>`) but `current` is not, so
+        // blessing a non-default target's sha would leave the live pointer on an
+        // artifact `compiler_release` (which resolves `effective_triple(module)`)
+        // cannot find. Such a build is BUILD/GATE-only: it is published and
+        // reported, it just never becomes the live release. `publish::bless_build`
+        // would ALSO refuse it — this branch is what turns that refusal into a
+        // clean, reported skip instead of a failed build.
         let mut blessed_current = false;
         let mut pruned: Vec<String> = Vec::new();
-        if !published.relayed {
+        let bless_current = should_bless_current(published.relayed, &triple, &module_default);
+        if bless_current {
             // A build blesses ONLY the experimental/build channel; `bless_build`
             // refuses any promote-only channel (stable is compiler_release-only).
             let bless = publish::bless_build(
@@ -4224,6 +4459,7 @@ impl CompilerBuild {
                 channel,
                 &published.sha256,
                 &triple,
+                &publish::DefaultTarget::for_module(&module),
                 &bin,
                 retain_per_channel(),
             )
@@ -4231,6 +4467,13 @@ impl CompilerBuild {
             blessed_current = bless.blessed;
             pruned = bless.pruned;
         }
+        let bless_skipped_reason: Option<&str> = if bless_current {
+            None
+        } else if published.relayed {
+            Some("relayed")
+        } else {
+            Some("off-default-target")
+        };
 
         // Terminal success for this tool's scope → `published` (with the sha).
         // (`deployed`/`rolled_back` belong to the downstream updater stage.)
@@ -4240,12 +4483,22 @@ impl CompilerBuild {
         );
 
         let text = format!(
-            "Built {module}@{git_ref} on {host} ({sccache}); artifact {sha} → {path}{relayed} [request_id={rid}]",
+            "Built {module}@{git_ref} on {host} ({sccache}); artifact {sha} → {path}{relayed}{off} [request_id={rid}]",
             host = resolved.role.as_str(),
             sccache = sccache_env.describe(),
             sha = &published.sha256,
             path = published.artifact_path.display(),
             relayed = if published.relayed { " (relayed)" } else { "" },
+            // Make the skipped bless IMPOSSIBLE to miss in the human-readable
+            // result — an off-default-target build is deliberately not a release.
+            off = if off_default_target {
+                format!(
+                    " — BUILD/GATE ONLY: target {triple} is not this module's default \
+                     ({module_default}), so {channel}/current was NOT advanced"
+                )
+            } else {
+                String::new()
+            },
             rid = request_id,
         );
         let structured = json!({
@@ -4267,6 +4520,12 @@ impl CompilerBuild {
             "relayed": published.relayed,
             "current_channel": channel,
             "blessed_current": blessed_current,
+            // TERM #565: why `current` was not advanced, when it was not —
+            // "relayed" (the relay target owns the flip) or "off-default-target"
+            // (a BUILD/GATE-only build that must never become the live release).
+            "bless_skipped_reason": bless_skipped_reason,
+            "module_default_target": module_default,
+            "off_default_target": off_default_target,
             "pruned": pruned,
             "sccache_mode": sccache_env.mode.as_str(),
             "caps": {
@@ -4387,7 +4646,17 @@ impl RustTool for CompilerRelease {
 
         match op.as_str() {
             "current" => {
-                let current = publish::read_current(&root, &module, &to_channel).await?;
+                // TERM #565 (round-7): this is the READ side — the point a live
+                // release pointer becomes an artifact path for a consumer. RESOLVE
+                // it under the effective target rather than handing back a bare
+                // sha, so a pointer stranded by an out-of-band default-target
+                // change (BUILD_MODULE_TARGET_<MODULE> / BUILD_TARGET_TRIPLE
+                // edited after the bless) is reported here, with its cause named,
+                // instead of surfacing as a confusing not-found in whichever
+                // consumer hit it first. Fail-closed: no fallback target is tried.
+                let resolved =
+                    publish::resolve_current(&root, &module, &to_channel, &target, &bin).await?;
+                let current = resolved.as_ref().map(|r| r.sha.clone());
                 let previous = publish::read_previous(&root, &module, &to_channel).await?;
                 let text = match &current {
                     Some(sha) => format!("{module}/{to_channel} current = {sha}"),
@@ -4399,12 +4668,23 @@ impl RustTool for CompilerRelease {
                     "channel": to_channel,
                     "current": current,
                     "previous": previous,
+                    "target": target,
+                    "artifact_path": resolved
+                        .as_ref()
+                        .map(|r| r.artifact_path.to_string_lossy().to_string()),
                 });
                 Ok(ToolOutput::with_structured(text, structured))
             }
             "rollback" => {
-                let out =
-                    publish::rollback_current(&root, &module, &to_channel, &target, &bin).await?;
+                let out = publish::rollback_current(
+                    &root,
+                    &module,
+                    &to_channel,
+                    &target,
+                    &publish::DefaultTarget::for_module(&module),
+                    &bin,
+                )
+                .await?;
                 let text = format!(
                     "Rolled {module}/{to_channel} back to {sha} (was {was})",
                     sha = out.sha,
@@ -4437,6 +4717,7 @@ impl RustTool for CompilerRelease {
                     &to_channel,
                     &sha,
                     &target,
+                    &publish::DefaultTarget::for_module(&module),
                     &bin,
                     retain_per_channel(),
                 )
@@ -5494,6 +5775,215 @@ mod tests {
         // Unlike cargo_build_argv, there is no --bin (a gate tests the whole
         // crate/workspace at the manifest, not one binary's tests).
         assert!(!argv.iter().any(|a| a == "--bin"));
+    }
+
+    // ── TERM #564: a gate that compiled NOTHING must be loud, not `0 passed` ──
+
+    /// The exact real-world failure that motivated this: sccache could not start
+    /// (Redis `NOAUTH`), so cargo exited 101 having compiled nothing and printed
+    /// no `test result:` line at all. The parsed summary is therefore all-zeros
+    /// AND `summary_found == false` — which the gate must NOT render as a benign
+    /// `0 passed, 0 failed`.
+    #[test]
+    fn sccache_startup_failure_yields_no_summary_and_is_never_a_pass() {
+        let output = "\
+Running as unit: terminus-build-chord-abc.scope; invocation ID: deadbeef
+sccache: error: Server startup failed: cache storage failed to read: Unexpected (temporary) at read => extension error
+
+Context:
+   service: redis
+   path: .sccache_check
+
+Source:
+   NOAUTH: Authentication required.
+";
+        let summary = parse_cargo_test_output(output);
+        assert!(
+            !summary.summary_found,
+            "cargo never printed a `test result:` line"
+        );
+        assert_eq!((summary.passed, summary.failed), (0, 0));
+        // Never a pass, on either exit status — this is the fail-closed half.
+        assert!(!test_gate_passed(false, &summary));
+        assert!(!test_gate_passed(true, &summary));
+        // …and the diagnostic the gate now reports actually names the cause.
+        let tail = test_gate_output_tail(output);
+        assert!(tail.contains("NOAUTH: Authentication required."));
+        assert!(tail.contains("Server startup failed"));
+    }
+
+    #[test]
+    fn output_tail_keeps_the_end_and_is_bounded() {
+        // Empty input ⇒ empty tail (no panic, nothing to say).
+        assert_eq!(test_gate_output_tail(""), "");
+        assert_eq!(test_gate_output_tail("   \n\n "), "");
+
+        // Short input passes through (trailing whitespace trimmed).
+        assert_eq!(test_gate_output_tail("error: boom\n"), "error: boom");
+
+        // Line-bounded: only the LAST TEST_GATE_OUTPUT_TAIL_LINES survive, and
+        // the END (where the error is) is what is kept.
+        let many = (0..500)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail = test_gate_output_tail(&many);
+        assert!(tail.ends_with("line499"));
+        assert!(!tail.contains("line0\n"));
+        assert_eq!(tail.lines().count(), TEST_GATE_OUTPUT_TAIL_LINES);
+
+        // Byte-bounded: one enormous line is trimmed from the FRONT.
+        let huge = "x".repeat(TEST_GATE_OUTPUT_TAIL_BYTES * 3) + "THE-ERROR";
+        let tail = test_gate_output_tail(&huge);
+        assert!(tail.len() <= TEST_GATE_OUTPUT_TAIL_BYTES);
+        assert!(tail.ends_with("THE-ERROR"));
+    }
+
+    /// The byte-trim must never split a multi-byte char (it would panic on the
+    /// slice, turning a diagnostic into a crash).
+    #[test]
+    fn output_tail_never_splits_a_utf8_char() {
+        let huge = "é".repeat(TEST_GATE_OUTPUT_TAIL_BYTES) + "END";
+        let tail = test_gate_output_tail(&huge);
+        assert!(tail.len() <= TEST_GATE_OUTPUT_TAIL_BYTES);
+        assert!(tail.ends_with("END"));
+    }
+
+    /// A REAL empty run (a crate whose suite genuinely has zero tests) still
+    /// prints a `test result:` line, so it is distinguishable from "nothing
+    /// compiled" — this is precisely the distinction the old bare `0 passed,
+    /// 0 failed` destroyed.
+    #[test]
+    fn genuinely_empty_suite_is_distinguishable_from_a_failed_build() {
+        let empty_but_ran =
+            "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let s = parse_cargo_test_output(empty_but_ran);
+        assert!(s.summary_found);
+        assert!(test_gate_passed(true, &s), "a real empty run is a PASS");
+
+        let never_built = parse_cargo_test_output("error: could not compile `chord`\n");
+        assert!(!never_built.summary_found);
+        assert!(!test_gate_passed(false, &never_built));
+    }
+
+    /// TERM #564: `compiler_build` must EXPOSE a `target` argument. Without it a
+    /// caller had no way to select a target through the single sanctioned build
+    /// door at all (`compiler_release` had one; `compiler_build` did not).
+    #[test]
+    fn compiler_build_schema_exposes_target() {
+        let params = CompilerBuild.parameters();
+        let props = params
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("schema has properties");
+        let target = props
+            .get("target")
+            .expect("compiler_build exposes `target`");
+        assert_eq!(target.get("type").and_then(Value::as_str), Some("string"));
+        // `target` is optional — the per-module default must keep working with
+        // no caller flag at all.
+        let required: Vec<&str> = params
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert!(!required.contains(&"target"));
+        assert_eq!(required, vec!["module", "ref"]);
+    }
+
+    // ── Review finding 4: an explicit `target` is allowlisted, not free-form ──
+
+    /// Both fleet targets stay selectable — that IS the point of the argument
+    /// (a one-off native-glibc build of a musl-default module is the TERM #564
+    /// use case), as does the module's own configured default.
+    #[test]
+    fn supported_targets_are_accepted() {
+        let default = "x86_64-unknown-linux-musl";
+        assert!(check_target_supported("chord", "x86_64-unknown-linux-gnu", default).is_ok());
+        assert!(check_target_supported("chord", "x86_64-unknown-linux-musl", default).is_ok());
+        // A module whose configured default is something else still accepts it
+        // (config is trusted — it is how a new target gets adopted).
+        assert!(
+            check_target_supported("harmony", "aarch64-unknown-linux-gnu", "aarch64-unknown-linux-gnu")
+                .is_ok()
+        );
+    }
+
+    // ── TERM #565 (round-2 finding 1): off-default target ⇒ BUILD/GATE only ──
+
+    /// The allowlist above does NOT close the pointer/artifact-path hazard: gnu
+    /// and musl are BOTH supported, so a gnu build of a musl-default module is
+    /// allowlist-clean and still off-default. What actually closes it is this:
+    /// a build only advances `current` when its target IS the module default.
+    ///
+    /// MUTATION CHECK: relax `should_bless_current` to `!relayed` and the two
+    /// off-default assertions below flip to true.
+    #[test]
+    fn an_off_default_target_build_never_advances_the_current_pointer() {
+        let musl = "x86_64-unknown-linux-musl";
+        let gnu = "x86_64-unknown-linux-gnu";
+
+        // The normal case is unchanged: default target, local publish ⇒ bless.
+        assert!(should_bless_current(false, musl, musl));
+        // The TERM #564 use case — a one-off native-glibc build of a musl-default
+        // module — still BUILDS, but must never become the live release.
+        assert!(!should_bless_current(false, gnu, musl));
+        // …and symmetrically for a gnu-default module built musl.
+        assert!(!should_bless_current(false, musl, gnu));
+        // A relayed build never blesses locally either (pre-existing rule).
+        assert!(!should_bless_current(true, musl, musl));
+        assert!(!should_bless_current(true, gnu, musl));
+    }
+
+    /// Both halves of the invariant are enforceable without a dataset: the pure
+    /// decision above, and — fail-closed, at the store layer —
+    /// `publish::bless_build` / `publish::set_current`, which refuse an
+    /// off-default target outright (see the `publish` tests). Belt and braces:
+    /// even if a future caller forgot the check above, the flip is refused.
+    #[test]
+    fn default_target_type_only_resolves_through_effective_triple() {
+        let m = "term565-no-override-module";
+        assert_eq!(
+            publish::DefaultTarget::for_module(m).as_str(),
+            effective_triple(m)
+        );
+    }
+
+    /// The hazard the allowlist DOES close: an unknown-but-segment-SAFE target
+    /// (a typo, or a triple with no installed std) is rejected up front rather
+    /// than after a long doomed compile.
+    #[test]
+    fn unsupported_target_is_rejected_even_though_segment_safe() {
+        let default = "x86_64-unknown-linux-musl";
+        // Segment-safe: passes the path check, so only the contract check catches it.
+        assert!(validate_segment("target", "wasm32-wasi").is_ok());
+        let err = check_target_supported("chord", "wasm32-wasi", default).unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)), "{err:?}");
+        let msg = format!("{err:?}");
+        // The error names the supported set so the caller can act on it.
+        assert!(msg.contains("x86_64-unknown-linux-gnu"), "{msg}");
+        assert!(msg.contains("x86_64-unknown-linux-musl"), "{msg}");
+
+        // A plausible-looking typo of a real triple is rejected too.
+        assert!(check_target_supported("chord", "x86_64-unknown-linux-gnuu", default).is_err());
+    }
+
+    /// A new target is adoptable by CONFIG (no code change) — same discipline as
+    /// `BUILD_TARGET_TRIPLE` / `BUILD_MODULE_TARGET_<MODULE>`.
+    // `ScopedEnv` takes the process-wide `ENV_TEST_LOCK` itself, so this needs no
+    // extra `#[serial]` — same as the other env-toggling tests in this module.
+    #[test]
+    fn allowed_targets_env_extends_the_supported_set() {
+        let default = "x86_64-unknown-linux-musl";
+        let _env = ScopedEnv::new().set(
+            BUILD_ALLOWED_TARGETS,
+            "aarch64-unknown-linux-musl, riscv64gc-unknown-linux-gnu",
+        );
+        assert!(check_target_supported("m", "aarch64-unknown-linux-musl", default).is_ok());
+        // Whitespace around a comma-separated entry is tolerated.
+        assert!(check_target_supported("m", "riscv64gc-unknown-linux-gnu", default).is_ok());
+        // …but the env is an allowlist, not a bypass.
+        assert!(check_target_supported("m", "wasm32-wasi", default).is_err());
     }
 
     #[test]
