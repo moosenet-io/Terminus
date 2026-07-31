@@ -365,7 +365,7 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
       <CommandPalette
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}
-        panels={panels}
+        panels={navigablePanels}
         onNavigate={navigate}
         // CONST-27 merged: the real session role now gates operator-only commands (a
         // viewer session hides/disables them; server-side 403 remains the enforcement).

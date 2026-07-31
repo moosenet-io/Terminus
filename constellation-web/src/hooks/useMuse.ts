@@ -252,10 +252,13 @@ export interface MuseMediaDetail {
   backdrop_url: string;
   media_item: Record<string, unknown> | null;
   metadata: Record<string, unknown> | null;
+  /** Absent (not merely empty) on a `found: false` response — always default before
+   *  dereferencing. */
   files: MuseMediaFile[];
   enrichment: unknown[];
-  /** `null` on this deployment for every title — verify_match has never run.
-   *  A null MUST render as "no verdict", never as CONSISTENT. */
+  /** `null` for every title sampled on this deployment. A null means NO VERDICT WAS
+   *  RECORDED — it does not establish which pass did or did not run, and it MUST
+   *  render as "no verdict", never as CONSISTENT. */
   match_verdict: unknown | null;
 }
 

@@ -101,6 +101,10 @@ export function MediaDetailPanel() {
 
   // `found: false` is a real not-found, distinct from a degraded endpoint.
   const notFound = !loading && !degraded && data !== null && data.found === false;
+  // Defaulted because a found:false (or partial) response omits these arrays entirely
+  // — dereferencing them threw instead of letting the not-found state render.
+  const files = data?.files ?? [];
+  const enrichment = data?.enrichment ?? [];
   const artId = metaNum(meta, 'id');
 
   return (
@@ -197,10 +201,13 @@ export function MediaDetailPanel() {
 
           <div>
             <div style={{ fontSize: 'var(--fs-2xs, 10px)', textTransform: 'uppercase', letterSpacing: '0.04em', color: 'var(--text-400, var(--text-300))', marginBottom: 4 }}>
-              On disk · {data?.files.length ?? 0} file{(data?.files.length ?? 0) === 1 ? '' : 's'}
+              {/* `files` is ABSENT (not empty) on a found:false response, so this must
+                  not dereference `.length` — codex caught it crashing the panel instead
+                  of rendering the intended not-found state. */}
+              On disk · {files.length} file{files.length === 1 ? '' : 's'}
             </div>
-            {data && data.files.length > 0 ? (
-              data.files.map(f => <FileRow key={f.id} f={f} />)
+            {files.length > 0 ? (
+              files.map(f => <FileRow key={f.id} f={f} />)
             ) : (
               <NotRunNote what="No files recorded for this title." />
             )}
@@ -223,8 +230,8 @@ export function MediaDetailPanel() {
             <div style={{ fontSize: 'var(--fs-2xs, 10px)', textTransform: 'uppercase', letterSpacing: '0.04em', color: 'var(--text-400, var(--text-300))', marginBottom: 4 }}>
               Enrichment
             </div>
-            {data && data.enrichment.length > 0 ? (
-              <Row label="entries" value={String(data.enrichment.length)} />
+            {enrichment.length > 0 ? (
+              <Row label="entries" value={String(enrichment.length)} />
             ) : (
               <NotRunNote what="No cached enrichment recorded for this title." />
             )}
