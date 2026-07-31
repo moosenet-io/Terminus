@@ -196,7 +196,7 @@ pub async fn dispatch_tool(
         finish!(gate_ctx, false, Some("no dispatch state"),
             Dispatch::Unknown(format!("`{name}` cannot be dispatched here.")));
     };
-    match st.router_dispatch(name, args).await {
+    match st.router_dispatch(name, args, principal_obj).await {
         Ok(text) => {
             if policy.is_some() {
                 cache.put(&key, text.clone()).await;

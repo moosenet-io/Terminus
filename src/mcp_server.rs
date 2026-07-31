@@ -320,7 +320,12 @@ impl McpServerState {
     /// Authorization, the model-block, and availability are enforced by the CALLER
     /// (`agent_router::dispatch_tool`) before this runs; this function is the routing
     /// half only, so the two concerns stay separable and testable.
-    pub async fn router_dispatch(&self, name: &str, args: Value) -> Result<String, String> {
+    pub async fn router_dispatch(
+        &self,
+        name: &str,
+        args: Value,
+        principal: Option<&Principal>,
+    ) -> Result<String, String> {
         // 1. Mesh upstream (a namespaced name is never coincidentally a local tool).
         if let Some(pool) = &self.mesh_pool {
             match crate::mesh::resolve_call_route(name, pool) {
@@ -351,7 +356,11 @@ impl McpServerState {
         }
         // 4. Personal federation.
         if let Some(pf) = &self.personal_federation {
-            return pf.call_tool(name, args).await.map_err(|e| e.to_string());
+            return match pf.call_tool(name, args, principal).await {
+                Ok(r) if r.is_error => Err(r.text),
+                Ok(r) => Ok(r.text),
+                Err(e) => Err(e.to_string()),
+            };
         }
         Err(format!("`{name}` is not a tool that exists here"))
     }
@@ -539,14 +548,8 @@ async fn handle_agent_execute(
         .and_then(|c| c.as_str())
         .unwrap_or("");
 
-    // The LIVE registry snapshot, not a static one — `state.registry` is an `ArcSwap`
-    // that can be hot-swapped (broker worker rollout), and using a private static copy
-    // would silently pin the router to a stale implementation while the rest of the
-    // server moved on (review finding). Cheap: this is an Arc load, not a rebuild.
-    let registry = state.registry.load();
-
     let deps = crate::agent_router::RouterDeps {
-        registry: &registry,
+        state: &state,
         cache: state.tool_cache(),
         chord,
         gateway: state.gateway.as_ref(),
