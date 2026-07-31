@@ -39,6 +39,17 @@ describe('/api/channels shape normalization', () => {
     expect(museChannelList(null)).toBeNull();
   });
 
+  it('rejects an array whose ELEMENTS are not channels', () => {
+    // Container shape is not enough. `[null]` used to reach buildRows and THROW on `c.id`;
+    // `[{}]` produced a row labelled undefined. Neither is an empty list, and neither is a
+    // channel — so the payload is unreadable, not empty.
+    expect(museChannelList([null] as never)).toBeNull();
+    expect(museChannelList([{}] as never)).toBeNull();
+    expect(museChannelList({ channels: [{ id: 'not-a-number', name: 'x' }] } as never)).toBeNull();
+    // A valid channel still passes, and one bad element invalidates the batch.
+    expect(museChannelList([ch(1, 'A'), {} as never] as never)).toBeNull();
+  });
+
   it('keeps [] meaning exactly one thing: the server returned a list with no elements', () => {
     // This test previously asserted the OPPOSITE — that null and unrecognized payloads both
     // yield `[]`. That contract was the enabling half of the false-empty bug: it made an
@@ -46,6 +57,15 @@ describe('/api/channels shape normalization', () => {
     expect(museChannelList([])).toEqual([]);
     expect(museChannelList({ channels: [] })).toEqual([]);
     expect(museChannelList({} as never)).toBeNull();
+  });
+});
+
+describe('/guide payload validation', () => {
+  it('reports a malformed guide body as unrecognized rather than an empty schedule', () => {
+    expect(museGuideEntries({ entries: [{ nope: 1 }] } as never).recognized).toBe(false);
+    expect(museGuideEntries({ surprise: true } as never).recognized).toBe(false);
+    expect(museGuideEntries({ entries: [entry('ch-1', 0, 1)] }).recognized).toBe(true);
+    expect(museGuideEntries({ raw: '<html></html>' }).recognized).toBe(true);
   });
 });
 
@@ -142,6 +162,7 @@ describe('never asserts an empty list before one arrives', () => {
     channelsDegraded: false,
     channelsRecognized: true,
     guideDegraded: false,
+    guideRecognized: true,
     rowCount: 0,
   };
 
@@ -176,6 +197,10 @@ describe('never asserts an empty list before one arrives', () => {
     // zero rows is not a complete observation while it is down.
     expect(gridState({ ...base, guideDegraded: true, rowCount: 2 })).toBe('guide-degraded');
     expect(gridState({ ...base, guideDegraded: true, rowCount: 0 })).toBe('guide-degraded');
+  });
+
+  it('refuses to call an UNPARSEABLE guide body an empty schedule', () => {
+    expect(gridState({ ...base, guideRecognized: false })).toBe('guide-unrecognized');
   });
 
   it('only calls it empty once BOTH fetches settled successfully with zero rows', () => {

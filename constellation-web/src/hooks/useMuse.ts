@@ -496,9 +496,23 @@ export type MuseChannelsResponse = MuseChannels | MuseChannel[];
  *  list" about a payload it had never successfully parsed (gpt56). `[]` now means exactly one
  *  thing: the server returned a list and it had no elements. */
 export function museChannelList(data: MuseChannelsResponse | null): MuseChannel[] | null {
-  if (data === null) return null;
-  if (Array.isArray(data)) return data;
-  return Array.isArray(data.channels) ? data.channels : null;
+  const list = data === null ? null : Array.isArray(data) ? data : Array.isArray(data.channels) ? data.channels : null;
+  if (list === null) return null;
+  // Element-level validation, not just container-shape. `[null]` previously reached
+  // `buildRows`, where reading `c.id` THREW and took the panel down; `[{}]` produced a row
+  // labelled `undefined`. Neither is an empty list and neither is a channel, so an array
+  // whose elements are not channels is `null` — unreadable — like any other unknown shape
+  // (gpt56). Muse is typed Rust serializing Vec<ChannelSummary> and cannot itself emit
+  // these, but the proxy sits in between and `useMuseSection` renders any 2xx body as data.
+  return list.every(isMuseChannel) ? list : null;
+}
+
+function isMuseChannel(v: unknown): v is MuseChannel {
+  if (typeof v !== 'object' || v === null) return false;
+  const c = v as Record<string, unknown>;
+  // id + name are what every render path dereferences; the rest degrade to a dash on their
+  // own, so requiring them would reject a channel over a cosmetic field.
+  return typeof c.id === 'number' && typeof c.name === 'string';
 }
 
 export function useMuseChannels(): MuseSection<MuseChannelsResponse> {
@@ -558,11 +572,33 @@ export type MuseGuideResponse = MuseGuide | { raw: string };
 export function museGuideEntries(data: MuseGuideResponse | null): {
   entries: MuseGuideEntry[];
   htmlOnly: boolean;
+  /** False when the body was neither an `entries` list of valid entries nor an HTML `raw`
+   *  page. Without this, a malformed-but-2xx guide body yielded zero entries with
+   *  `degraded === false`, and the grid was free to call the schedule empty — the same
+   *  false-empty the channel parser was fixed for, one endpoint over (gpt56). `null` input
+   *  is reported as recognized: that is the idle/loading case, which the caller's own
+   *  loading and degraded flags already describe. */
+  recognized: boolean;
 } {
-  if (data === null) return { entries: [], htmlOnly: false };
-  if ('entries' in data && Array.isArray(data.entries)) return { entries: data.entries, htmlOnly: false };
-  if ('raw' in data && typeof data.raw === 'string') return { entries: [], htmlOnly: true };
-  return { entries: [], htmlOnly: false };
+  if (data === null) return { entries: [], htmlOnly: false, recognized: true };
+  if ('entries' in data && Array.isArray(data.entries)) {
+    return data.entries.every(isMuseGuideEntry)
+      ? { entries: data.entries, htmlOnly: false, recognized: true }
+      : { entries: [], htmlOnly: false, recognized: false };
+  }
+  if ('raw' in data && typeof data.raw === 'string') return { entries: [], htmlOnly: true, recognized: true };
+  return { entries: [], htmlOnly: false, recognized: false };
+}
+
+function isMuseGuideEntry(v: unknown): v is MuseGuideEntry {
+  if (typeof v !== 'object' || v === null) return false;
+  const e = v as Record<string, unknown>;
+  return (
+    typeof e.channel_id === 'string' &&
+    typeof e.title === 'string' &&
+    typeof e.start === 'string' &&
+    typeof e.end === 'string'
+  );
 }
 
 export function useMuseGuide(): MuseSection<MuseGuideResponse> {

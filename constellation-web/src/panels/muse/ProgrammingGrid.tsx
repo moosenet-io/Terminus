@@ -184,6 +184,7 @@ export type GridState =
   | 'channels-degraded'
   | 'channels-unrecognized'
   | 'guide-degraded'
+  | 'guide-unrecognized'
   | 'empty'
   | 'grid';
 
@@ -195,6 +196,8 @@ export function gridState(input: {
    *  empty list: an unparseable body is not an observation that there are no channels. */
   channelsRecognized: boolean;
   guideDegraded: boolean;
+  /** `false` when the guide body parsed as neither an entries list nor an HTML page. */
+  guideRecognized: boolean;
   rowCount: number;
 }): GridState {
   if (input.channelsLoading || input.guideLoading) return 'loading';
@@ -205,6 +208,7 @@ export function gridState(input: {
   // and because the guide can itself contribute rows for channels the list does not carry,
   // a failed guide fetch means even `rowCount === 0` is not a complete observation (codex).
   if (input.guideDegraded) return 'guide-degraded';
+  if (!input.guideRecognized) return 'guide-unrecognized';
   return input.rowCount === 0 ? 'empty' : 'grid';
 }
 
@@ -392,7 +396,7 @@ export function ProgrammingGrid({ nowMs = Date.now() }: ProgrammingGridProps) {
 
   const parsedChannels = museChannelList(channelsSection.data);
   const channels = parsedChannels ?? [];
-  const { entries, htmlOnly } = museGuideEntries(guideSection.data);
+  const { entries, htmlOnly, recognized: guideRecognized } = museGuideEntries(guideSection.data);
 
   const win = useMemo(() => deriveWindow(entries, nowMs), [entries, nowMs]);
   const rows = useMemo(() => buildRows(channels, entries), [channels, entries]);
@@ -414,6 +418,7 @@ export function ProgrammingGrid({ nowMs = Date.now() }: ProgrammingGridProps) {
     channelsDegraded: channelsSection.degraded !== false,
     channelsRecognized: parsedChannels !== null,
     guideDegraded: guideSection.degraded !== false,
+    guideRecognized,
     rowCount: rows.length,
   });
 
@@ -462,6 +467,20 @@ export function ProgrammingGrid({ nowMs = Date.now() }: ProgrammingGridProps) {
           {guideSection.degraded === false ? 'unknown error' : guideSection.degraded.detail}. Drawing
           the channel rows without it would present an empty schedule as though nothing were
           scheduled, which is not what was observed.
+        </div>
+        <TunerTelemetry nowMs={nowMs} />
+      </div>
+    );
+  }
+
+  if (state === 'guide-unrecognized') {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)', height: '100%', justifyContent: 'center', padding: 'var(--space-3)', fontSize: 'var(--fs-xs)', color: 'var(--text-300)' }}>
+        <div style={{ color: 'var(--text-200)' }}>Guide not understood.</div>
+        <div>
+          <code style={{ fontFamily: 'var(--font-mono)' }}>GET /guide</code> returned successfully,
+          but the body was neither a programme list nor the HTML guide page. No claim is made about
+          what is scheduled — the response could not be read.
         </div>
         <TunerTelemetry nowMs={nowMs} />
       </div>
