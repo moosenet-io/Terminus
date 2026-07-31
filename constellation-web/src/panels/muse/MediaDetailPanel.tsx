@@ -7,17 +7,20 @@
 // THE CORRECTNESS RULE HERE IS OMISSION. The guide's mockup shows a match verdict
 // ("✓ CONSISTENT · 0.94"), an enrichment cache, and a "More like this" vector-recall
 // strip. On this deployment `match_verdict` is **null** and `enrichment` is **empty**
-// for every title — verify_match and the enrichment pass have never run. So those
-// sections are OMITTED, not rendered blank and not defaulted:
+// for every title sampled. That is all it establishes — it does NOT establish that
+// verify_match or the enrichment pass never ran (an earlier version of this comment
+// claimed exactly that, and reviewers caught it twice). So those sections are OMITTED,
+// not rendered blank and not defaulted:
 //
 //   - A defaulted "CONSISTENT" would assert that a file has been PROVEN to be what it
 //     claims. Nothing has verified it. That is a claim about the operator's data
 //     integrity, and inventing it is the worst thing this panel could do.
-//   - An empty enrichment box would read as "we looked and found nothing" rather than
-//     "we never looked".
+//   - An empty enrichment box would read as "we looked and found nothing", which is a
+//     stronger claim than "nothing is recorded".
 //
-// Each omitted section leaves a one-line note saying which pass has not run, so the
-// absence is legible instead of mysterious.
+// Each omitted section leaves a one-line note stating the ABSENCE that was actually
+// observed — "no verdict recorded", not a diagnosis of which pass did or did not run —
+// so the gap is legible without inventing a cause for it.
 import { useMemo } from 'react';
 import { useParams } from 'react-router-dom';
 import { ChartCard } from '../../viz/ChartCard';
@@ -50,8 +53,9 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-/** A section that exists in the design but has no data because a pipeline has not run.
- *  Says WHICH pass is missing — an unexplained gap reads as a bug. */
+/** A section that exists in the design but has no data recorded. States the observed
+ *  absence, never a diagnosis of why — an unexplained gap reads as a bug, but a
+ *  wrongly-diagnosed one sends the operator to fix the wrong thing. */
 function NotRunNote({ what }: { what: string }) {
   return (
     <div style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', fontStyle: 'italic' }}>
