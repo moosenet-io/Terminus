@@ -23,9 +23,35 @@
 //!    location it used and why, so a wrong inference is visible and correctable.
 //! 3. **Routine** — home/work from configuration, chosen by time of day.
 //! 4. **Ask** — never guess.
+//!
+//! ## Whose calendar? Whose home? (TRTR-05 privacy gate)
+//! Steps 2 and 3 are **process-global, not per-caller**: `events_now()` reads the
+//! OPERATOR's Google calendar and the routine reads the OPERATOR's configured home
+//! and work addresses. Terminus is a multi-principal gateway — a houseguest with a
+//! guest grant can call `weather` — so resolving an omitted location for whoever
+//! happens to be asking would answer a guest's "what's the weather?" with the
+//! operator's whereabouts, attributed out loud ("using <place> — from your calendar
+//! (<event summary>)"). An appointment summary and its address are among the most
+//! sensitive things this fleet holds.
+//!
+//! So both inference steps are gated on [`crate::tool::CallerContext`], which the
+//! gateway derives from the server-verified principal. A caller who is not
+//! positively entitled to a source SKIPS it, and skipping every source lands on
+//! **ask** — which is exactly the behaviour this module was already built to make
+//! safe and honest. An explicit location is unaffected: it never touched either
+//! source in the first place, so the legitimate guest use ("weather in Paris?")
+//! works identically.
+//!
+//! The asymmetry that decides every ambiguous case: a spurious "which location did
+//! you mean?" costs one turn; a leaked home address cannot be taken back. Hence
+//! `CallerContext::untrusted()` — the value produced by an absent, unauthenticated
+//! or unrecognised principal, and by any dispatch path that does not thread one —
+//! grants nothing.
 
 use async_trait::async_trait;
 use serde_json::Value;
+
+use crate::tool::CallerContext;
 
 /// Where today's calendar events come from.
 ///
@@ -186,22 +212,35 @@ impl Routine {
     }
 }
 
-/// The full chain.
+/// The full chain, for a caller whose entitlement to each source of OPERATOR
+/// context is already decided (see this module's privacy note).
+///
+/// `caller` gates steps 2 and 3 INDEPENDENTLY. The calendar check is repeated
+/// here even though [`resolve_with_calendar`] already declines to FETCH events
+/// for an unentitled caller: this function is public and pure, and a future
+/// caller that hands it an events slice from somewhere else must not be able to
+/// route operator data through it just because it skipped the fetch gate. Two
+/// cheap checks, no way in.
 pub fn resolve(
     explicit: Option<&str>,
     calendar_events: &[Value],
     routine: &Routine,
     hour_local: u32,
     is_weekday: bool,
+    caller: CallerContext,
 ) -> Resolved {
     if let Some(e) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
         return Resolved::Found { location: e.to_string(), source: LocationSource::Explicit };
     }
-    if let Some((loc, summary)) = from_calendar(calendar_events) {
-        return Resolved::Found { location: loc, source: LocationSource::Calendar(summary) };
+    if caller.may_infer_from_calendar() {
+        if let Some((loc, summary)) = from_calendar(calendar_events) {
+            return Resolved::Found { location: loc, source: LocationSource::Calendar(summary) };
+        }
     }
-    if let Some((loc, which)) = routine.pick(hour_local, is_weekday) {
-        return Resolved::Found { location: loc, source: LocationSource::Routine(which) };
+    if caller.may_infer_from_routine() {
+        if let Some((loc, which)) = routine.pick(hour_local, is_weekday) {
+            return Resolved::Found { location: loc, source: LocationSource::Routine(which) };
+        }
     }
     Resolved::AskUser
 }
@@ -212,18 +251,30 @@ pub fn resolve(
 /// `resolve` above is the pure core it delegates to. Keeping the fetch here — and
 /// SHORT-CIRCUITING it when an explicit location was given — means a named
 /// location never costs a calendar round-trip.
+///
+/// TRTR-05: the fetch is ALSO short-circuited for a caller not entitled to the
+/// operator's calendar. Not fetching (rather than fetching and then discarding)
+/// is the stronger property and the one the tests assert on: an unentitled
+/// caller must not cause a read of the operator's calendar at all, so the data
+/// is never in this process's memory on their behalf — nothing to leak through a
+/// log line, an error message or a later refactor.
 pub async fn resolve_with_calendar(
     explicit: Option<&str>,
     calendar: &dyn CalendarSource,
     routine: &Routine,
     hour_local: u32,
     is_weekday: bool,
+    caller: CallerContext,
 ) -> Resolved {
     if let Some(e) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
         return Resolved::Found { location: e.to_string(), source: LocationSource::Explicit };
     }
-    let events = calendar.events_now().await;
-    resolve(None, &events, routine, hour_local, is_weekday)
+    let events = if caller.may_infer_from_calendar() {
+        calendar.events_now().await
+    } else {
+        Vec::new()
+    };
+    resolve(None, &events, routine, hour_local, is_weekday, caller)
 }
 
 /// The local hour (0..=23) and weekday-ness used for routine inference.
@@ -250,10 +301,51 @@ mod tests {
         }
     }
 
+    /// A caller entitled to BOTH sources of operator context — what the gateway
+    /// derives for the operator's own identity (it is allowed
+    /// `google_calendar_today` and `commute_estimate` directly).
+    fn operator() -> CallerContext {
+        CallerContext::new(true, true)
+    }
+
+    /// A household guest: allowed to call `weather`, entitled to neither source.
+    /// Identical to `CallerContext::untrusted()` — which is the point: the
+    /// unauthenticated/unknown caller and the known-but-unentitled caller are
+    /// treated exactly alike, so there is no third, softer path.
+    fn guest() -> CallerContext {
+        CallerContext::default()
+    }
+
+    /// A calendar that COUNTS reads, so a test can assert the operator's
+    /// calendar was never touched — not merely that its data didn't appear in
+    /// the answer.
+    struct CountingCalendar {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        events: Vec<Value>,
+    }
+
+    #[async_trait]
+    impl CalendarSource for CountingCalendar {
+        async fn events_now(&self) -> Vec<Value> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.events.clone()
+        }
+    }
+
+    /// The operator's calendar as it realistically looks: an event whose SUMMARY
+    /// is itself sensitive (what the appointment is) and whose location is a
+    /// street address. Placeholders only — never a real name or address.
+    fn sensitive_events() -> Vec<Value> {
+        vec![json!({
+            "summary": "Dentist appointment — 000 Placeholder St", // pii-test-fixture: obvious placeholder, this test asserts it NEVER reaches a guest
+            "location": "000 Placeholder St, Examplecity", // pii-test-fixture: obvious placeholder standing in for a home/appointment address
+        })]
+    }
+
     #[test]
     fn an_explicit_location_always_wins() {
         let evs = vec![json!({"summary": "Trip", "location": "Denver"})];
-        let r = resolve(Some("Paris"), &evs, &routine(Some("Omaha"), None), 10, true);
+        let r = resolve(Some("Paris"), &evs, &routine(Some("Omaha"), None), 10, true, operator());
         assert_eq!(
             r,
             Resolved::Found { location: "Paris".into(), source: LocationSource::Explicit }
@@ -266,7 +358,7 @@ mod tests {
         // The whole point: if you are travelling, the weather you care about is where
         // you will BE, not where you live.
         let evs = vec![json!({"summary": "Client onsite", "location": "Denver, CO"})];
-        let r = resolve(None, &evs, &routine(Some("Omaha"), None), 10, true);
+        let r = resolve(None, &evs, &routine(Some("Omaha"), None), 10, true, operator());
         match &r {
             Resolved::Found { location, source: LocationSource::Calendar(s) } => {
                 assert_eq!(location, "Denver, CO");
@@ -289,7 +381,7 @@ mod tests {
             "TBD",
         ] {
             let evs = vec![json!({"summary": "Sync", "location": virt})];
-            let r = resolve(None, &evs, &routine(Some("Omaha"), None), 10, true);
+            let r = resolve(None, &evs, &routine(Some("Omaha"), None), 10, true, operator());
             match r {
                 Resolved::Found { source: LocationSource::Routine(_), .. } => {}
                 other => panic!("{virt} must not be used as a place, got {other:?}"),
@@ -303,7 +395,7 @@ mod tests {
             json!({"summary": "Cancelled trip", "location": "Denver", "status": "cancelled"}),
             json!({"summary": "Real trip", "location": "Austin"}),
         ];
-        match resolve(None, &evs, &routine(Some("Omaha"), None), 10, true) {
+        match resolve(None, &evs, &routine(Some("Omaha"), None), 10, true, operator()) {
             Resolved::Found { location, .. } => assert_eq!(location, "Austin"),
             other => panic!("expected Austin, got {other:?}"),
         }
@@ -311,7 +403,7 @@ mod tests {
 
     #[test]
     fn the_routine_picks_work_during_working_hours() {
-        let r = resolve(None, &[], &routine(Some("Home St"), Some("Office Rd")), 11, true);
+        let r = resolve(None, &[], &routine(Some("Home St"), Some("Office Rd")), 11, true, operator());
         match &r {
             Resolved::Found { location, source: LocationSource::Routine(w) } => {
                 assert_eq!(location, "Office Rd");
@@ -325,7 +417,7 @@ mod tests {
     #[test]
     fn the_routine_picks_home_outside_working_hours_and_at_weekends() {
         for (hour, weekday) in [(7u32, true), (20, true), (11, false)] {
-            match resolve(None, &[], &routine(Some("Home St"), Some("Office Rd")), hour, weekday) {
+            match resolve(None, &[], &routine(Some("Home St"), Some("Office Rd")), hour, weekday, operator()) {
                 Resolved::Found { location, .. } => assert_eq!(location, "Home St"),
                 other => panic!("hour={hour} weekday={weekday}: {other:?}"),
             }
@@ -337,7 +429,7 @@ mod tests {
         // THE bug this module exists for. With no location, no calendar and no
         // routine, the old path failed and the model answered for Tampa — the first
         // example in the tool's own schema.
-        let r = resolve(None, &[], &routine(None, None), 10, true);
+        let r = resolve(None, &[], &routine(None, None), 10, true, operator());
         assert_eq!(r, Resolved::AskUser);
     }
 
@@ -354,7 +446,7 @@ mod tests {
     #[test]
     fn an_empty_or_whitespace_explicit_location_falls_through() {
         // "" must not be treated as a real answer.
-        let r = resolve(Some("   "), &[], &routine(Some("Home St"), None), 10, true);
+        let r = resolve(Some("   "), &[], &routine(Some("Home St"), None), 10, true, operator());
         match r {
             Resolved::Found { location, source: LocationSource::Routine(_) } => {
                 assert_eq!(location, "Home St")
@@ -366,9 +458,107 @@ mod tests {
     #[test]
     fn an_event_with_no_location_is_skipped() {
         let evs = vec![json!({"summary": "Focus time"})];
-        match resolve(None, &evs, &routine(Some("Home St"), None), 10, true) {
+        match resolve(None, &evs, &routine(Some("Home St"), None), 10, true, operator()) {
             Resolved::Found { source: LocationSource::Routine(_), .. } => {}
             other => panic!("got {other:?}"),
         }
+    }
+
+    // ── TRTR-05 privacy gate ────────────────────────────────────────────────
+    // The leak these exist for: `weather` is granted to household GUESTS, and
+    // without a caller gate a guest asking "what's the weather?" is answered
+    // with the OPERATOR's whereabouts — attributed out loud, event summary and
+    // all. Assert on the SUMMARY specifically: it is the most sensitive part,
+    // and it is the part the attribution string quotes verbatim.
+
+    #[tokio::test]
+    async fn a_guest_who_omits_the_location_never_reads_the_operators_calendar() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cal = CountingCalendar { calls: calls.clone(), events: sensitive_events() };
+        let r = resolve_with_calendar(
+            None,
+            &cal,
+            &routine(Some("000 Placeholder St"), Some("111 Placeholder Ave")), // pii-test-fixture: obvious placeholders standing in for the operator's home/work addresses
+            10,
+            true,
+            guest(),
+        )
+        .await;
+
+        assert_eq!(r, Resolved::AskUser, "a guest with no location must be ASKED");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the operator's calendar must not be READ on a guest's behalf at all"
+        );
+        assert!(r.attribution().is_none(), "no attribution derived from operator data");
+    }
+
+    #[tokio::test]
+    async fn a_guests_explicit_location_still_works_and_costs_no_calendar_read() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cal = CountingCalendar { calls: calls.clone(), events: sensitive_events() };
+        let r =
+            resolve_with_calendar(Some("Paris"), &cal, &routine(None, None), 10, true, guest()).await;
+        assert_eq!(
+            r,
+            Resolved::Found { location: "Paris".into(), source: LocationSource::Explicit },
+            "the legitimate guest use — a named place — must be unchanged"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// POSITIVE CONTROL. Without this, "guest gets asked" would also pass if the
+    /// fix had simply disabled inference for everybody.
+    #[tokio::test]
+    async fn the_operator_still_gets_the_calendar_chain_and_the_attribution() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cal = CountingCalendar { calls: calls.clone(), events: sensitive_events() };
+        let r = resolve_with_calendar(None, &cal, &routine(None, None), 10, true, operator()).await;
+        match &r {
+            Resolved::Found { location, source: LocationSource::Calendar(summary) } => {
+                assert!(location.contains("Placeholder St"));
+                assert!(summary.contains("Dentist"));
+            }
+            other => panic!("the operator must still get the calendar chain, got {other:?}"),
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(r.attribution().unwrap().contains("calendar"));
+    }
+
+    #[test]
+    fn an_unentitled_caller_cannot_route_events_through_the_pure_resolver() {
+        // `resolve` is public: the fetch gate is not the only door. Handing it
+        // events directly must not work either.
+        let r = resolve(None, &sensitive_events(), &routine(Some("000 Placeholder St"), None), 10, true, guest()); // pii-test-fixture: obvious placeholder home address
+        assert_eq!(r, Resolved::AskUser);
+    }
+
+    #[test]
+    fn the_two_sources_are_gated_independently() {
+        // Entitled to the routine but not the calendar: the calendar event is
+        // ignored, the routine still answers. (And the converse.)
+        let routine_only = CallerContext::new(false, true);
+        match resolve(None, &sensitive_events(), &routine(Some("Home St"), None), 10, true, routine_only) {
+            Resolved::Found { location, source: LocationSource::Routine(_) } => {
+                assert_eq!(location, "Home St")
+            }
+            other => panic!("got {other:?}"),
+        }
+        let calendar_only = CallerContext::new(true, false);
+        match resolve(None, &[], &routine(Some("Home St"), None), 10, true, calendar_only) {
+            Resolved::AskUser => {}
+            other => panic!("no calendar hit and no routine entitlement must ASK, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_default_caller_context_is_the_fail_closed_one() {
+        // Load-bearing: every dispatch path that does not thread a caller, and
+        // every future one that forgets to, must land here.
+        let d = CallerContext::default();
+        assert!(!d.may_infer_from_calendar());
+        assert!(!d.may_infer_from_routine());
+        assert_eq!(d, CallerContext::untrusted());
     }
 }

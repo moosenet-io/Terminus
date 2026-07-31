@@ -61,7 +61,7 @@ use std::sync::Arc;
 
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
-use crate::tool::RustTool;
+use crate::tool::{CallerContext, RustTool};
 use location::{CalendarSource, NoCalendar, Resolved, Routine};
 
 const DEFAULT_BASE_URL: &str = "https://api.openweathermap.org";
@@ -132,7 +132,13 @@ impl WeatherConfig {
     /// the location in the answer and (b) ASK when nothing resolves. This is the
     /// ONE resolution path — `location::resolve*` is not called anywhere else, and
     /// there is no longer a COMMUTE_HOME-only branch to fall back into.
-    async fn resolve_location(&self, input: Option<&str>) -> Resolved {
+    ///
+    /// TRTR-05: `caller` decides whether the calendar/routine steps run at all.
+    /// The calendar and the home/work routine are the OPERATOR's, and this tool
+    /// is reachable by household guests — so for anyone not entitled to those
+    /// sources the chain is explicit→ASK, and the operator's calendar is not
+    /// even read. See `location`'s privacy note.
+    async fn resolve_location(&self, input: Option<&str>, caller: CallerContext) -> Resolved {
         let (hour, weekday) = location::local_hour_and_weekday();
         location::resolve_with_calendar(
             input,
@@ -140,6 +146,7 @@ impl WeatherConfig {
             &self.routine,
             hour,
             weekday,
+            caller,
         )
         .await
     }
@@ -691,8 +698,32 @@ answer says which place it used and why."
         })
     }
 
+    /// TRTR-05: `execute` carries NO caller identity, so it is the fail-closed
+    /// entry point — it resolves as [`CallerContext::untrusted`], i.e. an
+    /// omitted location is ASKED about rather than inferred from the operator's
+    /// calendar or routine. An authorized dispatch path supplies the real caller
+    /// via `execute_with_caller` below; anything else (a self-test, an internal
+    /// helper, a future path that forgets to thread one) gets the safe answer
+    /// rather than the operator's whereabouts.
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let resolved = self.cfg.resolve_location(args["location"].as_str()).await;
+        self.run(args, CallerContext::untrusted()).await
+    }
+
+    /// The authorized path: the gateway derived what operator context this
+    /// caller is entitled to (`GatewayFramework::caller_context`) from the same
+    /// server-verified principal it authorized the call with.
+    async fn execute_with_caller(
+        &self,
+        args: Value,
+        caller: CallerContext,
+    ) -> Result<crate::tool::ToolOutput, ToolError> {
+        Ok(crate::tool::ToolOutput::text_only(self.run(args, caller).await?))
+    }
+}
+
+impl Weather {
+    async fn run(&self, args: Value, caller: CallerContext) -> Result<String, ToolError> {
+        let resolved = self.cfg.resolve_location(args["location"].as_str(), caller).await;
         let (location, attribution) = match &resolved {
             Resolved::Found { location, .. } => (location.clone(), resolved.attribution()),
             // ASK. Deliberately `Ok`, not `Err`: an error is what made the model
@@ -874,6 +905,30 @@ mod tests {
         Routine { home: home.map(str::to_string), work: work.map(str::to_string) }
     }
 
+    /// The caller context the gateway derives for the OPERATOR's own identity:
+    /// entitled to both sources of operator context, because it is already
+    /// allowed to call `google_calendar_today` and `commute_estimate` directly.
+    fn operator() -> CallerContext {
+        CallerContext::new(true, true)
+    }
+
+    /// A household GUEST: allowed to call `weather` (it is in
+    /// `GUEST_BASELINE_ALLOW`) and entitled to neither source of operator
+    /// context — identical to the untrusted default.
+    fn guest() -> CallerContext {
+        CallerContext::untrusted()
+    }
+
+    impl Weather {
+        /// Test-only: drive the tool as the OPERATOR, which is what every
+        /// pre-TRTR-05 test meant by `execute`. Kept explicit so the guest tests
+        /// below read as the deliberate contrast they are, rather than as the
+        /// odd one out.
+        async fn execute_as_operator(&self, args: Value) -> Result<String, ToolError> {
+            self.execute_with_caller(args, operator()).await.map(|o| o.text)
+        }
+    }
+
     /// A config with no calendar and an optional home — the pre-existing helper's
     /// semantics, preserved so the older tests keep testing what they tested.
     fn cfg_for(server: &MockServer, home: Option<&str>) -> WeatherConfig {
@@ -971,7 +1026,7 @@ mod tests {
             routine_of(Some("Reno NV"), None),
             events(json!([{"summary": "Trip", "location": "Denver"}])),
         );
-        match c.resolve_location(Some("Paris")).await {
+        match c.resolve_location(Some("Paris"), operator()).await {
             Resolved::Found { location, source: LocationSource::Explicit } => {
                 assert_eq!(location, "Paris")
             }
@@ -985,7 +1040,7 @@ mod tests {
             routine_of(Some("123 Home St"), None),
             events(json!([{"summary": "Client onsite", "location": "Denver, CO"}])),
         );
-        match c.resolve_location(None).await {
+        match c.resolve_location(None, operator()).await {
             Resolved::Found { location, source: LocationSource::Calendar(s) } => {
                 assert_eq!(location, "Denver, CO");
                 assert_eq!(s, "Client onsite");
@@ -993,7 +1048,7 @@ mod tests {
             other => panic!("expected the calendar to win, got {other:?}"),
         }
         // whitespace is treated as omitted, and still consults the calendar
-        match c.resolve_location(Some("  ")).await {
+        match c.resolve_location(Some("  "), operator()).await {
             Resolved::Found { source: LocationSource::Calendar(_), .. } => {}
             other => panic!("blank location must fall through, got {other:?}"),
         }
@@ -1002,7 +1057,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_falls_back_to_the_routine_when_the_calendar_is_empty() {
         let c = offline_cfg(routine_of(Some("123 Home St"), None), Arc::new(NoCalendar));
-        match c.resolve_location(None).await {
+        match c.resolve_location(None, operator()).await {
             Resolved::Found { location, source: LocationSource::Routine(_) } => {
                 assert_eq!(location, "123 Home St")
             }
@@ -1015,7 +1070,7 @@ mod tests {
         // THE live bug. Previously this returned NotConfigured, the model retried,
         // and it answered for a city lifted out of this tool's own schema.
         let c = offline_cfg(Routine::default(), Arc::new(NoCalendar));
-        assert_eq!(c.resolve_location(None).await, Resolved::AskUser);
+        assert_eq!(c.resolve_location(None, operator()).await, Resolved::AskUser);
     }
 
     #[test]
@@ -1087,7 +1142,7 @@ mod tests {
             then.status(200).json_body(current_body());
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
-        let out = tool.execute(json!({"location": "Tampa Florida"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"location": "Tampa Florida"})).await.unwrap();
         geo_full.assert();  // no-comma string tried first
         geo_comma.assert(); // comma variant resolved it
         wx.assert();
@@ -1112,7 +1167,7 @@ mod tests {
             then.status(200).json_body(current_body());
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
-        let out = tool.execute(json!({"location": "SF", "days": 3})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"location": "SF", "days": 3})).await.unwrap();
         fc.assert();
         assert_eq!(wx.hits(), 0, "days>=2 must not hit the current endpoint");
         assert!(out.contains("3-day forecast"));
@@ -1135,7 +1190,7 @@ mod tests {
             then.status(200).json_body(forecast_body());
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
-        let out = tool.execute(json!({"location": "SF", "days": 7})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"location": "SF", "days": 7})).await.unwrap();
         assert!(out.contains("3-day forecast"), "{out}");
     }
 
@@ -1155,7 +1210,7 @@ mod tests {
             then.status(200).json_body(forecast_body());
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
-        let out = tool.execute(json!({"location": "SF", "days": 1})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"location": "SF", "days": 1})).await.unwrap();
         wx.assert();
         assert_eq!(fc.hits(), 0, "days=1 must use the current endpoint");
         assert!(out.starts_with("Current weather"));
@@ -1175,7 +1230,7 @@ mod tests {
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
         let out = tool
-            .execute(json!({"location": "SF", "days": 3, "when": "current"}))
+            .execute_as_operator(json!({"location": "SF", "days": 3, "when": "current"}))
             .await
             .unwrap();
         fc.assert();
@@ -1204,7 +1259,7 @@ mod tests {
         });
         // Bare call → defaults to COMMUTE_HOME (the full address) → must succeed.
         let tool = Weather { cfg: cfg_for(&server, Some("123 Main St, San Jose, CA 95123")) };
-        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"when": "current"})).await.unwrap();
         geo_full.assert(); // full address was tried first
         geo_city.assert(); // coarser variant resolved it
         wx.assert();
@@ -1219,7 +1274,7 @@ mod tests {
             then.status(200).json_body(json!([]));
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
-        match tool.execute(json!({"location": "Nowhere, ZZ", "when": "current"})).await {
+        match tool.execute_as_operator(json!({"location": "Nowhere, ZZ", "when": "current"})).await {
             Err(ToolError::NotFound(m)) => assert!(m.contains("Could not geocode")),
             other => panic!("expected NotFound, got {other:?}"),
         }
@@ -1248,7 +1303,7 @@ mod tests {
         });
 
         let tool = Weather { cfg: cfg_for(&server, None) };
-        let out = tool.execute(json!({"location": "San Francisco", "when": "current"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"location": "San Francisco", "when": "current"})).await.unwrap();
         geo.assert();
         wx.assert();
         assert!(out.contains("clear sky"));
@@ -1271,7 +1326,7 @@ mod tests {
             then.status(200).json_body(current_body());
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
-        let out = tool.execute(json!({"location": "SF"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"location": "SF"})).await.unwrap();
         // both unit systems for temp and feels-like
         assert!(out.contains("°F") && out.contains("°C"), "{out}");
         assert!(out.contains("feels like"), "{out}");
@@ -1297,7 +1352,7 @@ mod tests {
             then.status(200).json_body(rainy_current_body());
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
-        let out = tool.execute(json!({"location": "SF"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"location": "SF"})).await.unwrap();
         assert!(out.contains("precipitation"), "{out}");
         assert!(out.contains("1.2 mm rain"), "{out}");
         let low = out.to_lowercase();
@@ -1318,7 +1373,7 @@ mod tests {
             then.status(200).json_body(forecast_body());
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
-        let out = tool.execute(json!({"location": "SF", "days": 3})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"location": "SF", "days": 3})).await.unwrap();
         // dual range, e.g. 2026-06-10 12–16C → 54–61F  // pii-test-fixture
         assert!(out.contains("°F") && out.contains("°C"), "{out}");
         // precipitation probability surfaced for the rainy day (max pop 0.8)
@@ -1340,7 +1395,7 @@ mod tests {
             then.status(200).json_body(current_body());
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
-        let out = tool.execute(json!({"location": "San Francisco"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"location": "San Francisco"})).await.unwrap();
         wx.assert();
         assert!(out.starts_with("Current weather"));
     }
@@ -1360,7 +1415,7 @@ mod tests {
         });
         let tool = Weather { cfg: cfg_for(&server, Some("1 Home Rd")) };
         // No "location" key at all.
-        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"when": "current"})).await.unwrap();
         geo.assert();
         assert!(out.contains("1 Home Rd"));
     }
@@ -1391,7 +1446,7 @@ mod tests {
         };
         // An Ok answer, NOT an error: an error is what made the model retry and
         // invent a city.
-        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"when": "current"})).await.unwrap();
         assert_eq!(out, ASK_MESSAGE);
         assert_eq!(geo.hits(), 0, "nothing to geocode — must not call out");
         assert_eq!(wx.hits(), 0);
@@ -1426,7 +1481,7 @@ mod tests {
                 events(json!([{"summary": "Client onsite", "location": "Denver, CO"}])),
             ),
         };
-        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"when": "current"})).await.unwrap();
         geo.assert();
         assert!(out.contains("Denver, CO"), "{out}");
         assert!(out.to_lowercase().contains("calendar"), "must attribute: {out}");
@@ -1455,7 +1510,7 @@ mod tests {
                     events(json!([{"summary": "Sync", "location": virt}])),
                 ),
             };
-            let out = tool.execute(json!({"when": "current"})).await.unwrap();
+            let out = tool.execute_as_operator(json!({"when": "current"})).await.unwrap();
             geo_home.assert();
             assert!(out.contains("1 Home Rd"), "{virt} → {out}");
             assert!(
@@ -1486,7 +1541,7 @@ mod tests {
                 events(json!([{"summary": "Client onsite", "location": "Denver, CO"}])),
             ),
         };
-        let out = tool.execute(json!({"location": "Reykjavik"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"location": "Reykjavik"})).await.unwrap();
         geo.assert();
         assert!(out.starts_with("Current weather for Reykjavik"), "{out}");
         assert!(!out.to_lowercase().contains("calendar"), "{out}");
@@ -1514,7 +1569,7 @@ mod tests {
                 ])),
             ),
         };
-        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"when": "current"})).await.unwrap();
         geo.assert();
         assert!(out.contains("Austin"), "{out}");
         assert!(!out.contains("Denver"), "{out}");
@@ -1558,7 +1613,7 @@ mod tests {
                 events(Value::Array(cal)),
             ),
         };
-        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"when": "current"})).await.unwrap();
         assert_eq!(geo_denver.hits(), 0, "a declined event must never be geocoded: {out}");
         geo_home.assert();
         assert!(out.contains("1 Home Rd"), "must fall through to the routine: {out}");
@@ -1583,7 +1638,7 @@ mod tests {
         let tool = Weather {
             cfg: cfg_full(&server, Routine::default(), events(Value::Array(cal))),
         };
-        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"when": "current"})).await.unwrap();
         assert_eq!(out, ASK_MESSAGE);
         assert_eq!(geo.hits(), 0, "nothing resolvable — must not geocode: {out}");
     }
@@ -1619,7 +1674,7 @@ mod tests {
                     events(json!([{"summary": summary, "location": place}])),
                 ),
             };
-            let out = tool.execute(json!({"when": "current"})).await.unwrap();
+            let out = tool.execute_as_operator(json!({"when": "current"})).await.unwrap();
             assert!(out.contains(place), "calendar location must reach the answer: {out}");
             assert!(out.contains(summary), "event summary must reach the answer: {out}");
             seen.push(out);
@@ -1651,7 +1706,7 @@ mod tests {
             Arc::new(CountingCalendar(hits.clone())),
         );
         assert_eq!(
-            Weather { cfg: cfg.clone() }.execute(json!({"when": "current"})).await.unwrap(),
+            Weather { cfg: cfg.clone() }.execute_as_operator(json!({"when": "current"})).await.unwrap(),
             ASK_MESSAGE
         );
         assert_eq!(hits.load(Ordering::SeqCst), 1, "the calendar must be consulted");
@@ -1666,12 +1721,177 @@ mod tests {
             when.method(GET).path("/data/2.5/weather");
             then.status(200).json_body(current_body());
         });
-        Weather { cfg }.execute(json!({"location": "Reykjavik"})).await.unwrap();
+        Weather { cfg }.execute_as_operator(json!({"location": "Reykjavik"})).await.unwrap();
         assert_eq!(
             hits.load(Ordering::SeqCst),
             1,
             "an explicit location must not cost a calendar fetch"
         );
+    }
+
+    // ── TRTR-05: THE GUEST PRIVACY GATE, END TO END AT THE TOOL BOUNDARY ────
+    //
+    // `weather` is granted to household guests (`GUEST_BASELINE_ALLOW`). Before
+    // this gate, a guest asking "what's the weather?" with no location got the
+    // OPERATOR's whereabouts, attributed out loud with the calendar event's
+    // SUMMARY — "using <address> — from your calendar (Dentist appointment …)".
+    // These drive `Weather` at the tool boundary, the path a guest's turn
+    // actually reaches.
+
+    /// The operator's day, as the fixtures model it. Placeholders only — never a
+    /// real name or address. The SUMMARY is the most sensitive field (it says
+    /// what the appointment IS), so it is what the guest assertions pin.
+    const OPERATOR_EVENT_SUMMARY: &str = "Dentist appointment"; // pii-test-fixture: obvious placeholder for a real calendar entry
+    const OPERATOR_EVENT_PLACE: &str = "000 Placeholder St, Examplecity"; // pii-test-fixture: obvious placeholder for a real appointment address
+    const OPERATOR_HOME: &str = "111 Placeholder Ave, Examplecity"; // pii-test-fixture: obvious placeholder for the operator's home address
+
+    fn operator_day() -> Value {
+        json!([{ "summary": OPERATOR_EVENT_SUMMARY, "location": OPERATOR_EVENT_PLACE }])
+    }
+
+    /// Everything a guest's answer must never contain.
+    fn assert_no_operator_context(out: &str) {
+        for leaked in [OPERATOR_EVENT_SUMMARY, OPERATOR_EVENT_PLACE, OPERATOR_HOME] {
+            assert!(!out.contains(leaked), "leaked operator context {leaked:?} into: {out}");
+        }
+        assert!(
+            !out.to_lowercase().contains("calendar"),
+            "no attribution derived from operator data: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_guest_omitting_the_location_is_asked_and_the_calendar_is_never_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingCalendar(Arc<AtomicUsize>, Vec<Value>);
+        #[async_trait]
+        impl CalendarSource for CountingCalendar {
+            async fn events_now(&self) -> Vec<Value> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                self.1.clone()
+            }
+        }
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server = MockServer::start();
+        let geo = server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct");
+            then.status(200).json_body(geo_body());
+        });
+        let tool = Weather {
+            cfg: cfg_full(
+                &server,
+                routine_of(Some(OPERATOR_HOME), None),
+                Arc::new(CountingCalendar(
+                    hits.clone(),
+                    operator_day().as_array().cloned().unwrap(),
+                )),
+            ),
+        };
+
+        // `execute` (no caller) IS the guest/unknown path: untrusted by
+        // construction. Asserted explicitly below via `execute_with_caller` too.
+        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+
+        assert_eq!(out, ASK_MESSAGE, "a guest with no location must be ASKED");
+        assert_no_operator_context(&out);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the operator's calendar must not be read on a guest's behalf"
+        );
+        assert_eq!(geo.hits(), 0, "nothing resolved — nothing to geocode");
+
+        // ...and identically for an explicitly-guest caller.
+        let out = tool
+            .execute_with_caller(json!({"when": "current"}), guest())
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out, ASK_MESSAGE);
+        assert_no_operator_context(&out);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// The legitimate guest use must be completely unaffected.
+    #[tokio::test]
+    async fn a_guest_naming_a_location_gets_a_normal_forecast() {
+        let server = MockServer::start();
+        let geo = server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct").query_param("q", "Reykjavik");
+            then.status(200).json_body(geo_body());
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/data/2.5/weather");
+            then.status(200).json_body(current_body());
+        });
+        let tool = Weather {
+            cfg: cfg_full(&server, routine_of(Some(OPERATOR_HOME), None), events(operator_day())),
+        };
+        let out = tool
+            .execute_with_caller(json!({"location": "Reykjavik", "when": "current"}), guest())
+            .await
+            .unwrap()
+            .text;
+        geo.assert();
+        assert!(out.contains("clear sky"), "a real forecast: {out}");
+        assert_no_operator_context(&out);
+    }
+
+    /// POSITIVE CONTROL for the gate: the SAME config and the SAME arguments,
+    /// asked as the operator, must still resolve from the calendar and attribute
+    /// it. Without this, "the guest is asked" would also pass if the fix had
+    /// simply switched inference off for everybody.
+    #[tokio::test]
+    async fn the_operator_omitting_the_location_still_gets_the_calendar_answer() {
+        let server = MockServer::start();
+        let geo = server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct").query_param("q", OPERATOR_EVENT_PLACE);
+            then.status(200).json_body(geo_body());
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/data/2.5/weather");
+            then.status(200).json_body(current_body());
+        });
+        let tool = Weather {
+            cfg: cfg_full(&server, routine_of(Some(OPERATOR_HOME), None), events(operator_day())),
+        };
+        let out = tool.execute_as_operator(json!({"when": "current"})).await.unwrap();
+        geo.assert();
+        assert!(out.contains(OPERATOR_EVENT_PLACE), "{out}");
+        assert!(out.contains(OPERATOR_EVENT_SUMMARY), "must attribute the event: {out}");
+        assert!(out.to_lowercase().contains("calendar"), "{out}");
+    }
+
+    /// The routine (home/work addresses) is gated separately from the calendar:
+    /// a guest with an empty calendar must still not be answered with the
+    /// operator's home address.
+    #[tokio::test]
+    async fn a_guest_never_falls_back_to_the_operators_home_address() {
+        let server = MockServer::start();
+        let geo = server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct");
+            then.status(200).json_body(geo_body());
+        });
+        let tool = Weather {
+            cfg: cfg_full(&server, routine_of(Some(OPERATOR_HOME), Some("Office Rd")), Arc::new(NoCalendar)),
+        };
+        let out = tool
+            .execute_with_caller(json!({"when": "current"}), guest())
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out, ASK_MESSAGE);
+        assert_no_operator_context(&out);
+        assert_eq!(geo.hits(), 0);
+
+        // The operator, same config, still gets it (positive control).
+        server.mock(|when, then| {
+            when.method(GET).path("/data/2.5/weather");
+            then.status(200).json_body(current_body());
+        });
+        let out = tool.execute_as_operator(json!({"when": "current"})).await.unwrap();
+        assert!(out.contains(OPERATOR_HOME), "the operator's routine fallback must survive: {out}");
     }
 
     // ── tomorrow → /data/2.5/forecast, tomorrow extraction ───────────────────
@@ -1688,7 +1908,7 @@ mod tests {
             then.status(200).json_body(forecast_body());
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
-        let out = tool.execute(json!({"location": "SF", "when": "tomorrow"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"location": "SF", "when": "tomorrow"})).await.unwrap();
         fc.assert();
         // Second distinct date is 2026-06-10 with "light rain", 12–19.  // pii-test-fixture
         assert!(out.contains("2026-06-10"));  // pii-test-fixture
@@ -1712,7 +1932,7 @@ mod tests {
             then.status(200).json_body(forecast_body());
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
-        let out = tool.execute(json!({"location": "SF", "when": "week"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"location": "SF", "when": "week"})).await.unwrap();
         fc.assert();
         // Three distinct days present (clamped to what the mock returns).
         assert!(out.contains("3-day forecast"));
@@ -1736,7 +1956,7 @@ mod tests {
             then.status(200).json_body(current_body());
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
-        let out = tool.execute(json!({"location": "37.77,-122.41"})).await.unwrap();
+        let out = tool.execute_as_operator(json!({"location": "37.77,-122.41"})).await.unwrap();
         // geocode endpoint should NOT have been called
         assert_eq!(geo.hits(), 0);
         wx.assert();
@@ -1753,7 +1973,7 @@ mod tests {
             then.status(200).json_body(geo_body());
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
-        let r = tool.execute(json!({"location": "SF", "when": "yesterday"})).await;
+        let r = tool.execute_as_operator(json!({"location": "SF", "when": "yesterday"})).await;
         assert!(matches!(r, Err(ToolError::InvalidArgument(_))));
     }
 

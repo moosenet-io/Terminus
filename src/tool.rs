@@ -34,6 +34,62 @@ impl ToolOutput {
     }
 }
 
+/// What the DISPATCH LAYER knows about the caller of ONE tool invocation.
+///
+/// TRTR-05 (privacy). Some tools can answer a question by reaching for context
+/// the OPERATOR owns — the operator's calendar, the operator's configured home
+/// and work addresses — even though the tool itself looks stateless. That is
+/// safe for the operator and a disclosure for anyone else, so a tool that does
+/// it must know who is asking. This struct is the ONLY channel by which it may
+/// find out: it is constructed by the gateway from the same server-verified
+/// `Principal` that `GatewayFramework::guard` authorizes, and it is never
+/// derived from tool arguments, a header, or an env var.
+///
+/// **Fail closed by construction.** `Default` (and `untrusted()`) is "we know
+/// nothing about this caller", with every capability `false`. Every existing
+/// dispatch path that does not thread a caller therefore gets the safe value,
+/// and a NEW dispatch path that forgets to thread one is safe by default rather
+/// than accidentally operator-privileged. A spurious "which location did you
+/// mean?" costs one conversational turn; a leaked home or appointment address
+/// cannot be taken back.
+///
+/// Each flag is a permission to USE ONE SOURCE of operator context, and the
+/// gateway grants it only when the caller is already authorized for the tool
+/// that exposes that source directly (`google_calendar_today`,
+/// `commute_estimate`) — so an inference can never disclose anything the caller
+/// could not have fetched for itself. See
+/// `crate::gateway_framework::GatewayFramework::caller_context`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallerContext {
+    may_infer_from_calendar: bool,
+    may_infer_from_routine: bool,
+}
+
+impl CallerContext {
+    /// The fail-closed value: an unknown, unauthenticated or unrecognised
+    /// caller. No operator context may be used on its behalf.
+    pub const fn untrusted() -> Self {
+        Self { may_infer_from_calendar: false, may_infer_from_routine: false }
+    }
+
+    /// Build a context from an explicit per-source decision. Only the gateway
+    /// (and tests) should call this — see the struct doc.
+    pub const fn new(may_infer_from_calendar: bool, may_infer_from_routine: bool) -> Self {
+        Self { may_infer_from_calendar, may_infer_from_routine }
+    }
+
+    /// May a tool consult the OPERATOR's calendar on this caller's behalf?
+    pub const fn may_infer_from_calendar(&self) -> bool {
+        self.may_infer_from_calendar
+    }
+
+    /// May a tool consult the OPERATOR's configured home/work routine on this
+    /// caller's behalf?
+    pub const fn may_infer_from_routine(&self) -> bool {
+        self.may_infer_from_routine
+    }
+}
+
 /// A Rust tool implementation that can be registered in the ToolRegistry
 /// and used as a fallback when the fleet-host MCP backend is unavailable.
 ///
@@ -68,6 +124,26 @@ pub trait RustTool: Send + Sync + 'static {
     async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let text = self.execute(args).await?;
         Ok(ToolOutput { text, structured: None })
+    }
+
+    /// Execute the tool knowing WHO is calling (TRTR-05).
+    ///
+    /// The default implementation ignores the caller and delegates to
+    /// `execute_structured`, so the ~400 tools that answer the same way for
+    /// everybody are untouched. A tool overrides this ONLY if its answer can
+    /// otherwise contain operator/household context the caller did not supply
+    /// and may not be entitled to (today: `weather`, whose location resolution
+    /// can reach the operator's calendar and home/work addresses).
+    ///
+    /// An overriding tool must treat [`CallerContext::untrusted`] — the value
+    /// every un-plumbed path and `execute()` itself produce — as "not the
+    /// operator", never as "unknown, proceed".
+    async fn execute_with_caller(
+        &self,
+        args: Value,
+        _caller: CallerContext,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute_structured(args).await
     }
 }
 

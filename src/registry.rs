@@ -87,6 +87,25 @@ impl ToolRegistry {
         Some(tool.execute_structured(args).await)
     }
 
+    /// Execute a named tool, carrying what the dispatch layer knows about the
+    /// CALLER (TRTR-05, `crate::tool::CallerContext`).
+    ///
+    /// This is the dispatch entry point every authorized request path should
+    /// use: `call`/`call_structured` cannot express "who is asking", so a tool
+    /// reached through them always sees [`CallerContext::untrusted`] and must
+    /// withhold any operator context. Callers that genuinely have no principal
+    /// (internal/self-test paths) can keep using them and get exactly that
+    /// fail-closed behaviour.
+    pub async fn call_with_caller(
+        &self,
+        name: &str,
+        args: Value,
+        caller: crate::tool::CallerContext,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        let tool = self.tools.get(name)?;
+        Some(tool.execute_with_caller(args, caller).await)
+    }
+
     pub fn len(&self) -> usize {
         self.tools.len()
     }

@@ -200,6 +200,24 @@ pub const DEFAULT_SENSITIVE_DENY_PREFIXES: &[&str] = &[
     "tool_availability",
 ];
 
+/// TRTR-05 (privacy): the tool that reads the OPERATOR's calendar directly.
+///
+/// Used by [`GatewayFramework::caller_context`] as the PROBE for "may a tool
+/// fold calendar-derived context into this principal's answer?" — a principal
+/// already authorized to call this tool learns nothing new when `weather`
+/// resolves a location from an event, while one who is not must never receive
+/// it second-hand. Probing an existing grant rather than adding a second
+/// identity list is deliberate: there is exactly one place to edit, so the two
+/// can never drift apart.
+pub const CALENDAR_CONTEXT_PROBE: &str = "google_calendar_today";
+
+/// TRTR-05 (privacy): the tool that already exposes the operator's configured
+/// home/work addresses (`COMMUTE_HOME`/`COMMUTE_WORK`) directly. The
+/// routine-inference counterpart of [`CALENDAR_CONTEXT_PROBE`]; the two are
+/// probed separately so a principal trusted with one source is not
+/// automatically handed the other.
+pub const ROUTINE_CONTEXT_PROBE: &str = "commute_estimate";
+
 /// TRTR-05: the GUEST/FAMILY baseline surface — the exact set of tool names a
 /// non-operator household identity (a family member, a houseguest) may call.
 ///
@@ -235,8 +253,23 @@ pub const DEFAULT_SENSITIVE_DENY_PREFIXES: &[&str] = &[
 ///   route grants conversation, not reach.
 /// - `time_now` — the authoritative fleet clock (CLK-01). Reads no user data,
 ///   takes no arguments that reach a backend, mutates nothing.
-/// - `weather` — a public third-party forecast lookup for a location the caller
-///   supplies. No fleet state, no household data.
+/// - `weather` — a public third-party forecast for a location the caller
+///   supplies EXPLICITLY, and only that. The tool can otherwise resolve an
+///   omitted location from the OPERATOR's calendar or home/work routine
+///   (`crate::weather::location`), which would hand a houseguest the operator's
+///   whereabouts — including an event summary such as an appointment and its
+///   address — from a tool that looks stateless. That inference is gated on
+///   [`CALENDAR_CONTEXT_PROBE`]/[`ROUTINE_CONTEXT_PROBE`], neither of which is
+///   granted here, so a guest who omits the location is ASKED which place they
+///   mean and receives no location, no event summary and no attribution. What
+///   makes `weather` safe for a guest is therefore the explicit-location-only
+///   path, NOT an absence of household data in the tool — the tool has access
+///   to plenty; the grant is what withholds it. (An earlier version of this
+///   comment claimed "no household data", which was true when it was written
+///   and stopped being true when location inference landed. A justification
+///   that silently goes stale is how this nearly shipped: if a future edit
+///   widens what `weather` may reach, re-derive this line rather than trusting
+///   it.)
 /// - `news_headlines`, `news_search`, `news_topic` — public news retrieval.
 ///   Read-only, no fleet or household state.
 /// - `media_search`, `media_recommend`, `media_recently_added`, `media_on_deck`
@@ -1263,6 +1296,36 @@ impl GatewayFramework {
         self.inner.allowlist.is_allowed(identity, tool)
     }
 
+    /// TRTR-05 (privacy): what OPERATOR context a tool may use on this
+    /// principal's behalf — see [`crate::tool::CallerContext`].
+    ///
+    /// The rule is "no confused deputy": a tool may fold in a source of
+    /// operator context ONLY if this principal is already authorized to read
+    /// that source directly, via the very same [`AllowlistPolicy`] decision
+    /// `guard()` enforces. So an inference can never disclose something the
+    /// caller could not have fetched for itself, and there is no second
+    /// identity channel to keep in sync — a grant edit moves both at once.
+    ///
+    /// Fail-closed in every ambiguous case: `principal: None` (no
+    /// server-verified transport identity) grants nothing, and an identity with
+    /// no allowlist entry at all is default-denied by `is_allowed`, so it
+    /// grants nothing either. The guest/family baseline
+    /// ([`GUEST_BASELINE_ALLOW`]) names neither probe tool, so a guest never
+    /// gets operator context — which is the whole point.
+    ///
+    /// Read-only, exactly like [`Self::permits_tool`]: this is not an attempt,
+    /// so it consumes no rate-limit budget and writes no audit entry. The audit
+    /// entry for the tool call itself is written by the caller as usual.
+    pub fn caller_context(&self, principal: Option<&Principal>) -> crate::tool::CallerContext {
+        let Some(p) = principal else {
+            return crate::tool::CallerContext::untrusted();
+        };
+        crate::tool::CallerContext::new(
+            self.permits_tool(p.name(), CALENDAR_CONTEXT_PROBE),
+            self.permits_tool(p.name(), ROUTINE_CONTEXT_PROBE),
+        )
+    }
+
     pub fn filter_catalog_for_principal(&self, principal: Option<&Principal>, tools: Vec<Value>) -> Vec<Value> {
         match principal {
             Some(p) => self.inner.allowlist.filter_tools(p.name(), tools),
@@ -2213,6 +2276,56 @@ mod tests {
                  by someone remembering to deny '{future_tool}'"
             );
         }
+    }
+
+    // ── TRTR-05 privacy: operator context is not implied by a tool grant ────
+
+    /// A guest may call `weather`, but that must NOT entitle it to the operator
+    /// context `weather` can otherwise reach — the whole leak this gate closes.
+    #[test]
+    fn a_guest_gets_no_operator_context_even_though_it_may_call_weather() {
+        let fw = framework_with(guest_policy(), 10);
+        let id = identity("guest-relative");
+        assert!(fw.permits_tool("guest-relative", "weather"));
+        // ...and neither probe is in the baseline, so:
+        let ctx = fw.caller_context(Some(&id));
+        assert!(!ctx.may_infer_from_calendar());
+        assert!(!ctx.may_infer_from_routine());
+    }
+
+    /// The probe tools are the ones that expose each source DIRECTLY — the
+    /// no-confused-deputy rule. If either name ever drifts from the real tool,
+    /// this test fails rather than silently granting nothing (or everything).
+    #[test]
+    fn the_context_probes_name_tools_a_guest_is_denied_and_a_broad_identity_is_allowed() {
+        let guest = framework_with(guest_policy(), 10);
+        for probe in [CALENDAR_CONTEXT_PROBE, ROUTINE_CONTEXT_PROBE] {
+            assert!(
+                !guest.permits_tool("guest-relative", probe),
+                "'{probe}' must not be reachable by a guest identity"
+            );
+        }
+        // The scaffolded service posture (allow `*` minus sensitive prefixes) —
+        // what the operator's own turns run under — keeps both.
+        let scaffold = framework_with(AllowlistPolicy::new(scaffold_defaults()), 10);
+        let lumina = identity("lumina");
+        let ctx = scaffold.caller_context(Some(&lumina));
+        assert!(ctx.may_infer_from_calendar(), "the operator path must not be degraded");
+        assert!(ctx.may_infer_from_routine(), "the operator path must not be degraded");
+    }
+
+    /// Fail-closed: no server-verified principal, or one with no allowlist entry
+    /// at all, gets nothing. An unauthenticated caller must never be handed
+    /// inferred household data.
+    #[test]
+    fn caller_context_is_fail_closed_for_absent_and_unknown_principals() {
+        let fw = framework_with(guest_policy(), 10);
+        assert_eq!(fw.caller_context(None), crate::tool::CallerContext::untrusted());
+        let stranger = identity("never-enrolled");
+        assert_eq!(
+            fw.caller_context(Some(&stranger)),
+            crate::tool::CallerContext::untrusted()
+        );
     }
 
     /// A guest holds no admin power, by the same kind-aware rule that stops a
