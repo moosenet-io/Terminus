@@ -1,7 +1,7 @@
 // MGUI-10: the rules that make the programming grid HONEST rather than decorative. Each test
 // below guards a specific "never invent data" invariant, not just arithmetic.
 import { describe, it, expect } from 'vitest';
-import { museChannelList, museGuideEntries, type MuseGuideEntry, type MuseChannel } from '../../hooks/useMuse';
+import { museChannelList, museGuideEntries, parseGuideInstant, type MuseGuideEntry, type MuseChannel } from '../../hooks/useMuse';
 import { deriveWindow, blockGeometry, buildRows, gridState } from './ProgrammingGrid';
 
 const T0 = Date.UTC(2026, 6, 31, 20, 0, 0); // 20:00Z
@@ -60,6 +60,28 @@ describe('/api/channels shape normalization', () => {
   });
 });
 
+describe('calendar-strict timestamp parsing', () => {
+  // Date.parse alone ROLLS OVER an impossible day: "2026-02-30" becomes 2026-03-02, which
+  // would place a programme on a date the response never carried.
+  it('rejects days that do not exist on the calendar', () => {
+    expect(parseGuideInstant('2026-02-30T00:00:00Z')).toBeNull();
+    expect(parseGuideInstant('2026-04-31T00:00:00Z')).toBeNull();
+    expect(parseGuideInstant('2026-13-01T00:00:00Z')).toBeNull();
+    expect(parseGuideInstant('2026-01-00T00:00:00Z')).toBeNull();
+  });
+
+  it('honors real leap years in both directions', () => {
+    expect(parseGuideInstant('2024-02-29T00:00:00Z')).not.toBeNull(); // 2024 IS a leap year
+    expect(parseGuideInstant('2026-02-29T00:00:00Z')).toBeNull();     // 2026 is not
+  });
+
+  it('accepts ordinary instants, including an explicit non-UTC offset', () => {
+    expect(parseGuideInstant('2026-07-31T21:00:00Z')).not.toBeNull();
+    expect(parseGuideInstant('2026-07-31T21:00:00+02:00')).not.toBeNull();
+    expect(parseGuideInstant('not-a-date')).toBeNull();
+  });
+});
+
 describe('/guide payload validation', () => {
   it('does not CRASH on a scalar 2xx body', () => {
     // `'entries' in data` throws on a primitive. This reached the panel and took it down
@@ -71,6 +93,8 @@ describe('/guide payload validation', () => {
   });
 
   it('rejects entries whose timestamps cannot be read, or that end before they start', () => {
+    const rollover = { channel_id: 'c', title: 't', start: '2026-02-30T00:00:00Z', end: '2026-02-30T01:00:00Z' };
+    expect(museGuideEntries({ entries: [rollover] } as never).recognized).toBe(false);
     const bad = { channel_id: 'c', title: 't', start: 'not-a-date', end: 'also-not' };
     expect(museGuideEntries({ entries: [bad] } as never).recognized).toBe(false);
     const backwards = { channel_id: 'c', title: 't', start: '2026-07-31T21:00:00Z', end: '2026-07-31T20:00:00Z' };

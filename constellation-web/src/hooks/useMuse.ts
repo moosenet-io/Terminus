@@ -607,16 +607,38 @@ function isMuseGuideEntry(v: unknown): v is MuseGuideEntry {
   ) {
     return false;
   }
-  // Timestamps are validated SEMANTICALLY, not just as strings. `start: "not-a-date"` used to
-  // pass: deriveWindow then skipped it and blockGeometry returned null, so the entry vanished
-  // and its channel row rendered "no scheduled programming" — presenting an unreadable
-  // schedule as an empty one (gpt56). An entry whose times cannot be read is not a programme.
-  const start = Date.parse(e.start);
-  const end = Date.parse(e.end);
+  const start = parseGuideInstant(e.start);
+  const end = parseGuideInstant(e.end);
   // `end === start` is allowed: a zero-length programme is drawn as a hairline by
   // blockGeometry, which is a deliberate existing behaviour. Only end BEFORE start is invalid.
-  return Number.isFinite(start) && Number.isFinite(end) && end >= start;
+  return start !== null && end !== null && end >= start;
 }
+
+/** Parse an ISO-8601 instant, rejecting dates that do not exist on the calendar.
+ *
+ *  `Date.parse` is not enough on its own: it silently ROLLS OVER an out-of-range day, so
+ *  "2026-02-30T00:00:00Z" parses happily as 2026-03-02 and the grid would place a programme
+ *  on a date the response never carried (codex — verified: Date.parse of that string returns
+ *  the March 2 instant, while a month above 12 does return NaN). The calendar fields are
+ *  therefore checked explicitly, against the string, before the instant is trusted.
+ *
+ *  Only the Y-M-D triple is validated this way; it is the part `Date.parse` rolls over. An
+ *  explicit UTC offset is left to `Date.parse`, since a legitimate offset can shift the UTC
+ *  date and a naive comparison against the parsed value would reject valid timestamps. */
+export function parseGuideInstant(value: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T/.exec(value);
+  if (m === null) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  if (month < 1 || month > 12 || day < 1) return null;
+  // Day 0 of the following month is the last day of this one — leap years included.
+  if (day > new Date(Date.UTC(year, month, 0)).getUTCDate()) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+
 
 export function useMuseGuide(): MuseSection<MuseGuideResponse> {
   return useMuseSection<MuseGuideResponse>('/guide');
