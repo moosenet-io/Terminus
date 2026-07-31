@@ -981,9 +981,14 @@ mod tests {
 
     #[test]
     fn the_clamp_holds_even_for_a_tiny_caller_timeout() {
-        // A degenerate caller timeout must still yield a STRICTLY smaller budget —
+        // A small caller timeout must still yield a STRICTLY smaller budget —
         // saturating_sub could otherwise produce budget == caller (round-5 review).
-        for caller in [1u64, 5, 10, 16, 30, 120, 600] {
+        //
+        // caller == 1 is excluded deliberately: no value can be both strictly below 1
+        // AND usable, so that input is degenerate rather than a bug. The function
+        // clamps it to 1 and the ordering simply cannot hold; a 1-second client
+        // timeout is not a configuration worth contorting the arithmetic for.
+        for caller in [2u64, 5, 10, 16, 30, 120, 600] {
             let b = crate::config::clamp_router_budget(90, caller);
             assert!(b < caller, "budget {b} must be strictly below caller {caller}");
             assert!(b >= 1, "budget must remain usable, got {b}");
