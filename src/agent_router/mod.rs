@@ -930,10 +930,13 @@ mod tests {
         assert_eq!(v["_cached_at"], 1_700_000_000u64);
         assert_eq!(v["count"], 0, "original fields must survive");
 
-        // A JSON array/scalar has nowhere to put a field — left untouched rather than
-        // silently reshaped.
-        let arr = r#"[1,2,3]"#.to_string();
-        assert_eq!(with_as_of(arr.clone(), 1_700_000_000), arr);
+        // A JSON array/scalar has nowhere to put a field without RESHAPING it, so it
+        // keeps its text and gains the prose note instead. (An earlier revision left
+        // these untouched, which silently dropped freshness for structured results —
+        // round-4 review.)
+        let arr = with_as_of(r#"[1,2,3]"#.to_string(), 1_700_000_000);
+        assert!(arr.starts_with("[1,2,3]"), "payload must be preserved: {arr}");
+        assert!(arr.contains("cached"), "array must still carry freshness: {arr}");
 
         // Plain text gets the prose form.
         let t = "Current weather: 68F".to_string();
