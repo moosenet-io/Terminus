@@ -300,6 +300,66 @@ pub struct RouterDeps<'a> {
     pub principal: Option<&'a Principal>,
 }
 
+/// TRTR-02 — the SSE progress-event wire contract.
+///
+/// **This is deliberately Chord's existing frame vocabulary, byte-for-byte.**
+/// lumina-core's `AgenticSseState` parser already consumes exactly these `type`s, so
+/// emitting the same frames means the client needs NO change to talk to the relocated
+/// router — TRTR-04 becomes a verification step rather than a risky contract change on
+/// a live assistant. Unknown frame types are ignored by that parser, so adding fields
+/// later stays backward compatible.
+///
+/// Frames: `started`, `tool_call_started`, `tool_call_complete`,
+/// `security_event_occurred`, `complete`. Only `complete` is load-bearing — the parser
+/// FAILS the turn if the stream ends without one, so every exit path must emit it.
+pub mod sse {
+    use serde_json::{json, Value};
+
+    pub fn frame(v: &Value) -> String {
+        format!("data: {v}\n\n")
+    }
+
+    pub fn started() -> String {
+        frame(&json!({"type": "started"}))
+    }
+
+    pub fn tool_call_started(tool: &str) -> String {
+        frame(&json!({"type": "tool_call_started", "tool_name": tool}))
+    }
+
+    pub fn tool_call_complete(tool: &str, duration_ms: u64, status: &str) -> String {
+        frame(&json!({
+            "type": "tool_call_complete",
+            "tool_name": tool,
+            "duration_ms": duration_ms,
+            "status": status,
+        }))
+    }
+
+    pub fn complete(response: &str) -> String {
+        frame(&json!({"type": "complete", "response": response}))
+    }
+}
+
+/// Render a finished turn as the full SSE stream a client expects.
+///
+/// Built as one buffered body rather than a true incremental stream: a turn is short
+/// (seconds), the client's own parser buffers to frame boundaries anyway, and the
+/// progressive-display benefit does not justify threading a channel through the loop
+/// for the first cut. The frame CONTRACT is identical either way, so moving to true
+/// incremental emission later is an internal change.
+pub fn render_sse(outcome: &RouterOutcome) -> String {
+    let mut out = String::new();
+    out.push_str(&sse::started());
+    for s in &outcome.steps {
+        out.push_str(&sse::tool_call_started(&s.tool));
+        out.push_str(&sse::tool_call_complete(&s.tool, s.duration_ms, s.status));
+    }
+    // ALWAYS last, and always present: the parser fails the turn without it.
+    out.push_str(&sse::complete(&outcome.response));
+    out
+}
+
 /// Run one agentic turn: select tools, ask Chord, dispatch what it asks for, repeat.
 ///
 /// Returns the assistant's final text plus a step log. Every exit path produces a
@@ -545,6 +605,60 @@ mod tests {
             }
             other => panic!("expected Unknown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sse_always_ends_with_a_complete_frame() {
+        // lumina-core's parser FAILS the turn if the stream ends without `complete`,
+        // so every exit path must emit one — including a timed-out or empty turn.
+        let o = RouterOutcome {
+            response: "answer".into(),
+            steps: vec![],
+            turns: 1,
+            status: "ok",
+        };
+        let s = render_sse(&o);
+        assert!(s.trim_end().ends_with("}"), "stream must end with a frame");
+        assert!(s.contains("\"type\": \"complete\"") || s.contains("\"type\":\"complete\""));
+    }
+
+    #[test]
+    fn sse_emits_paired_start_and_complete_for_each_tool() {
+        let o = RouterOutcome {
+            response: "answer".into(),
+            steps: vec![
+                Step { tool: "weather".into(), status: "ok", cached: true, duration_ms: 3 },
+                Step { tool: "news_headlines".into(), status: "ok", cached: false, duration_ms: 40 },
+            ],
+            turns: 3,
+            status: "ok",
+        };
+        let s = render_sse(&o);
+        assert_eq!(s.matches("tool_call_started").count(), 2);
+        assert_eq!(s.matches("tool_call_complete").count(), 2);
+        assert!(s.contains("weather"));
+        assert!(s.contains("news_headlines"));
+    }
+
+    #[test]
+    fn sse_frames_are_double_newline_terminated() {
+        // SSE framing: a frame the client cannot terminate is a frame it never sees.
+        let f = sse::complete("x");
+        assert!(f.starts_with("data: "));
+        assert!(f.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn a_timed_out_turn_still_emits_complete() {
+        let o = RouterOutcome {
+            response: "partial".into(),
+            steps: vec![Step { tool: "weather".into(), status: "ok", cached: false, duration_ms: 5 }],
+            turns: 2,
+            status: "timeout",
+        };
+        let s = render_sse(&o);
+        assert!(s.contains("complete"), "a timeout must not strand the client waiting");
+        assert!(s.contains("partial"), "the partial answer must reach the user");
     }
 
     #[test]

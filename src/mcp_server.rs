@@ -471,8 +471,24 @@ async fn handle_agent_execute(
         ctx.record_result(true, None);
     }
 
-    // Response shape matches what lumina-core already reads back from
-    // `/v1/agent/execute`, so TRTR-04 is a destination change, not a contract change.
+    // TRTR-02/04: honour the caller's streaming preference with CHORD'S EXISTING
+    // frame vocabulary. lumina-core sets `stream: true` and parses
+    // `tool_call_started`/`tool_call_complete`/`complete` — emitting the same frames
+    // means the client needs NO change to talk to the relocated router, which is what
+    // makes TRTR-04 a verification step instead of a risky contract change on a live
+    // assistant. Its parser FAILS a turn that ends without `complete`, so
+    // `render_sse` always emits one, including on timeout.
+    let wants_stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    if wants_stream {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            crate::agent_router::render_sse(&outcome),
+        )
+            .into_response();
+    }
+
+    // Non-streaming callers get the same JSON shape Chord returned.
     (
         StatusCode::OK,
         [("content-type", "application/json")],
