@@ -30,6 +30,11 @@
 //   select count(*) from taste_context_centroids -> 0     (MUSE #88)
 //
 // An empty array alone would not license those statements; a direct count does.
+//
+// But the RENDERING is still driven by the response, never by those counts: the
+// counts were a point-in-time measurement, so hardcoding "none" would make this panel
+// lie the moment either pipeline runs. The counts justify the explanatory sentence
+// shown WHILE the arrays are empty — nothing more.
 import { useMemo } from 'react';
 import { useMuseTasteProfile } from '../../hooks/useMuse';
 import { ChartCard } from '../../viz/ChartCard';
@@ -81,6 +86,7 @@ export function TasteProfile() {
   const decades = data?.decade_lean ?? [];
   const genres = data?.genre_lean ?? [];
   const div = data?.divergence ?? null;
+  const centroids = data?.centroids ?? [];
   const maxDecade = decades.reduce((m, d) => Math.max(m, d.weight), 0);
   const maxGenre = genres.reduce((m, g) => Math.max(m, g.weight), 0);
 
@@ -144,7 +150,7 @@ export function TasteProfile() {
                 ))}
               </div>
             ) : (
-              <Missing what="No genre lean. The genre tables are empty (verified directly: genres and media_metadata_genres both have 0 rows), so no genre preference can be derived — MUSE #90." />
+              <Missing what="No genre lean returned. The genre tables were empty when last checked directly (genres and media_metadata_genres both 0 rows), so no genre preference can be derived — MUSE #90." />
             )}
           </div>
         </div>
@@ -196,7 +202,18 @@ export function TasteProfile() {
             <div style={{ fontSize: 'var(--fs-2xs, 10px)', textTransform: 'uppercase', letterSpacing: '0.04em', color: 'var(--text-400, var(--text-300))', marginBottom: 4 }}>
               Context centroids
             </div>
-            <Missing what="None. The embedding tables are empty (verified directly: personas, embeddings and taste_context_centroids all have 0 rows) — MUSE #88." />
+            {/* Driven by the RESPONSE, not by the zero-row counts. Those counts were a
+                point-in-time measurement; they do not make emptiness a permanent
+                invariant, and hardcoding "None" would make this panel start LYING the
+                moment the embedding pipeline runs (codex). The counts only justify the
+                explanatory sentence shown while it is in fact empty. */}
+            {centroids.length > 0 ? (
+              <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-100)', fontFamily: 'var(--font-mono)' }}>
+                {centroids.length} centroid{centroids.length === 1 ? '' : 's'}
+              </div>
+            ) : (
+              <Missing what="None returned. The embedding tables were empty when last checked directly (personas, embeddings and taste_context_centroids all 0 rows) — MUSE #88." />
+            )}
           </div>
         </div>
       </div>

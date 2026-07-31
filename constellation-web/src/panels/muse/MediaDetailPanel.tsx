@@ -228,7 +228,12 @@ export function MediaDetailPanel() {
             <div style={{ fontSize: 'var(--fs-2xs, 10px)', textTransform: 'uppercase', letterSpacing: '0.04em', color: 'var(--text-400, var(--text-300))', marginBottom: 4 }}>
               Match verdict
             </div>
-            {data?.match_verdict ? (
+            {/* EXPLICIT null/undefined check, not truthiness: `null` is the documented
+                absence sentinel, so a recorded but falsy verdict (0, "", false) would
+                otherwise render as "no verdict recorded" — reporting an absence where
+                a real verdict exists, which is the same class of lie this panel exists
+                to avoid, pointed the other way (codex). */}
+            {data?.match_verdict !== null && data?.match_verdict !== undefined ? (
               <Row label="verdict" value={JSON.stringify(data.match_verdict)} />
             ) : (
               <AbsenceNote what="No verdict recorded for this file. Nothing is implied about whether it matches — absence of a verdict is not a verdict." />
