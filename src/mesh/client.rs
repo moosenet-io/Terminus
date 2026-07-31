@@ -198,13 +198,28 @@ fn looks_like_stale_session(e: &UpstreamClientError) -> bool {
     match e {
         // The upstream answered, but not with MCP — the classic expired-session shape
         // (an HTML or plain-text error page where a JSON-RPC envelope was expected).
+        //
+        // DELIBERATE BREADTH, with the trade-off stated: a BadResponse that is NOT a
+        // stale session costs exactly one extra round trip before the same failure
+        // surfaces. The failure it prevents is the observed one — 40 tools vanishing
+        // from the catalog mid-conversation, with the assistant telling the operator it
+        // has no access to their own hardware. One wasted request is cheap against that.
+        //
+        // Note this does NOT sweep in tool-level errors: `list_tools`/`call_tool`
+        // construct `BadResponse` for a JSON-RPC `error` in a 200 OUTSIDE the retry
+        // closure (the closure wraps only `post_rpc`), so an upstream's application
+        // error is never re-sent.
         UpstreamClientError::BadResponse(_, _) => true,
         // 4xx: the request was understood and refused. 404/400 are what MCP servers
         // return for an unknown session id. 401/403 are auth, not session, and a fresh
         // handshake will not help — do not mask a credential problem as a retry.
-        UpstreamClientError::Rejected(_, status, _) => {
-            *status == 400 || *status == 404 || *status == 409
-        }
+        //
+        // 409 was in the first cut and is REMOVED: both reviewers flagged it as a loose
+        // fit for "unknown session" (it usually means an application-level conflict),
+        // and no upstream here was observed emitting it for a stale session. Retrying
+        // a genuine conflict would mask it for one extra round trip and teach the
+        // classifier a shape it has no evidence for.
+        UpstreamClientError::Rejected(_, status, _) => *status == 400 || *status == 404,
         // Transport failures are genuine unreachability; the pool's health tracking
         // already handles those and retrying would just double the latency.
         _ => false,
@@ -906,9 +921,40 @@ mod session_recovery_tests {
 
     #[test]
     fn session_shaped_4xx_is_retried() {
-        for status in [400u16, 404, 409] {
+        for status in [400u16, 404] {
             let e = UpstreamClientError::Rejected("<host>".into(), status, "no session".into());
             assert!(looks_like_stale_session(&e), "{status} should re-handshake");
+        }
+    }
+
+    #[test]
+    fn application_level_4xx_and_5xx_are_not_retried() {
+        // Review tightened this: 409 was in the first cut, but it usually means an
+        // application-level conflict and no upstream here was observed emitting it for
+        // a stale session. Retrying a real conflict masks it for a round trip and
+        // teaches the classifier a shape it has no evidence for.
+        for status in [409u16, 422, 429, 500, 502, 503] {
+            let e = UpstreamClientError::Rejected("<host>".into(), status, "nope".into());
+            assert!(
+                !looks_like_stale_session(&e),
+                "{status} must NOT be re-handshaked as a session issue"
+            );
+        }
+    }
+
+    #[test]
+    fn every_non_session_variant_is_rejected_by_the_classifier() {
+        // The classifier must be a narrow allowlist, not "retry unless proven
+        // otherwise" — the whole risk of a retry layer is that it quietly widens.
+        let cases = [
+            UpstreamClientError::Unreachable("<host>".into(), "refused".into()),
+            UpstreamClientError::Timeout("<host>".into(), "deadline".into()),
+            UpstreamClientError::TlsConfig("<host>".into(), "bad cert".into()),
+            UpstreamClientError::Rejected("<host>".into(), 401, "denied".into()),
+            UpstreamClientError::Rejected("<host>".into(), 403, "forbidden".into()),
+        ];
+        for e in cases {
+            assert!(!looks_like_stale_session(&e), "must not retry: {e}");
         }
     }
 
