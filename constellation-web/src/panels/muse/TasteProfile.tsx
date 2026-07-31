@@ -10,13 +10,26 @@
 //   decade_lean   5 entries   REAL
 //   divergence    adventurousness / contrarian_index / mainstream_score /
 //                 guilty_pleasures[2]                     REAL
-//   genre_lean    []          EMPTY — the genres tables are unpopulated (MUSE #90)
-//   centroids     []          EMPTY — no embeddings computed (MUSE #88)
+//   genre_lean    []          EMPTY
+//   centroids     []          EMPTY
 //
-// So the genre bars and the context centroids the guide shows CANNOT be drawn. They
-// are omitted with a one-line reason each, rather than rendered as empty axes that
-// would read as "this household has no genre preferences" — a claim about the
-// operator's taste that the data does not support.
+// So the genre bars and the context centroids the guide shows cannot be drawn. They
+// are omitted rather than rendered as empty axes, which would read as "this household
+// has no genre preferences" — a claim about the operator's taste that an empty array
+// does not support.
+//
+// The copy DOES name a cause for these two, which is a deliberate exception to the
+// state-only-what-you-observed rule applied elsewhere in this sprint. It is justified
+// because the cause was established INDEPENDENTLY, by querying the database directly
+// rather than by inferring it from the empty response:
+//
+//   select count(*) from genres                  -> 0
+//   select count(*) from media_metadata_genres   -> 0     (MUSE #90)
+//   select count(*) from personas                -> 0
+//   select count(*) from embeddings              -> 0
+//   select count(*) from taste_context_centroids -> 0     (MUSE #88)
+//
+// An empty array alone would not license those statements; a direct count does.
 import { useMemo } from 'react';
 import { useMuseTasteProfile } from '../../hooks/useMuse';
 import { ChartCard } from '../../viz/ChartCard';
@@ -131,7 +144,7 @@ export function TasteProfile() {
                 ))}
               </div>
             ) : (
-              <Missing what="No genre lean — the genre tables are unpopulated, so no genre preference can be derived (MUSE #90)." />
+              <Missing what="No genre lean. The genre tables are empty (verified directly: genres and media_metadata_genres both have 0 rows), so no genre preference can be derived — MUSE #90." />
             )}
           </div>
         </div>
@@ -183,7 +196,7 @@ export function TasteProfile() {
             <div style={{ fontSize: 'var(--fs-2xs, 10px)', textTransform: 'uppercase', letterSpacing: '0.04em', color: 'var(--text-400, var(--text-300))', marginBottom: 4 }}>
               Context centroids
             </div>
-            <Missing what="None — no embeddings have been computed on this deployment (MUSE #88)." />
+            <Missing what="None. The embedding tables are empty (verified directly: personas, embeddings and taste_context_centroids all have 0 rows) — MUSE #88." />
           </div>
         </div>
       </div>

@@ -13,8 +13,9 @@
 // not rendered blank and not defaulted:
 //
 //   - A defaulted "CONSISTENT" would assert that a file has been PROVEN to be what it
-//     claims. Nothing has verified it. That is a claim about the operator's data
-//     integrity, and inventing it is the worst thing this panel could do.
+//     claims, on the strength of a field that is empty. That is a claim about the
+//     operator's data integrity manufactured from an absence, and inventing it is the
+//     worst thing this panel could do.
 //   - An empty enrichment box would read as "we looked and found nothing", which is a
 //     stronger claim than "nothing is recorded".
 //
@@ -53,10 +54,14 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-/** A section that exists in the design but has no data recorded. States the observed
+/** A section that exists in the design but whose data is absent. States the observed
  *  absence, never a diagnosis of why — an unexplained gap reads as a bug, but a
- *  wrongly-diagnosed one sends the operator to fix the wrong thing. */
-function NotRunNote({ what }: { what: string }) {
+ *  wrongly-diagnosed one sends the operator to fix the wrong thing.
+ *
+ *  Named `AbsenceNote`, not `NotRunNote`: the old name encoded the very inference
+ *  (that some pass did not run) that the copy was corrected to stop making. A helper
+ *  whose name contradicts its contract invites the next author to reintroduce it. */
+function AbsenceNote({ what }: { what: string }) {
   return (
     <div style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', fontStyle: 'italic' }}>
       {what}
@@ -213,11 +218,11 @@ export function MediaDetailPanel() {
             {files.length > 0 ? (
               files.map(f => <FileRow key={f.id} f={f} />)
             ) : (
-              <NotRunNote what="No files recorded for this title." />
+              <AbsenceNote what="No files recorded for this title." />
             )}
           </div>
 
-          {/* The two guide sections with no data source on this deployment. Omitted
+          {/* The two guide sections whose fields come back null/empty here. Omitted
               rather than defaulted — see the module doc. */}
           <div>
             <div style={{ fontSize: 'var(--fs-2xs, 10px)', textTransform: 'uppercase', letterSpacing: '0.04em', color: 'var(--text-400, var(--text-300))', marginBottom: 4 }}>
@@ -226,7 +231,7 @@ export function MediaDetailPanel() {
             {data?.match_verdict ? (
               <Row label="verdict" value={JSON.stringify(data.match_verdict)} />
             ) : (
-              <NotRunNote what="No verdict recorded for this file. Nothing is implied about whether it matches — absence of a verdict is not a verdict." />
+              <AbsenceNote what="No verdict recorded for this file. Nothing is implied about whether it matches — absence of a verdict is not a verdict." />
             )}
           </div>
 
@@ -237,7 +242,7 @@ export function MediaDetailPanel() {
             {enrichment.length > 0 ? (
               <Row label="entries" value={String(enrichment.length)} />
             ) : (
-              <NotRunNote what="No cached enrichment recorded for this title." />
+              <AbsenceNote what="No cached enrichment recorded for this title." />
             )}
           </div>
         </div>
