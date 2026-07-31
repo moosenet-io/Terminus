@@ -121,7 +121,7 @@ pub async fn dispatch_tool(
     // to put a human in the loop; a model that could call `approval_grant` would
     // approve its own guarded requests and dissolve that gate entirely.
     let bare = crate::mesh::split_namespaced(name).map(|(_, b)| b).unwrap_or(name);
-    if crate::approval::is_guarded(bare) {
+    if is_model_blocked(bare) {
         return Dispatch::Denied(format!(
             "`{name}` requires operator approval and cannot be invoked by an assistant. \
              Ask the operator to run it."
@@ -194,6 +194,25 @@ pub async fn dispatch_tool(
         }
         None => Dispatch::Unknown(format!("`{name}` is not registered.")),
     }
+}
+
+/// Tools an assistant may NEVER invoke, whatever its grant says.
+///
+/// Two families, and the second is the one that bit us:
+/// 1. [`crate::approval::is_guarded`] — the operator-guarded set (ansible/openhands/
+///    <secret-manager>/routines/mirror-push/pg).
+/// 2. The **approval mechanism itself** (`approval_grant`, `approval_deny`). These are
+///    NOT in the guarded list — they are only covered by the gateway's `approval_`
+///    DENY PREFIX, which applies to `Grant::AllowDeny` identities (the scaffolded
+///    `lumina`/`harmony`) but NOT to a legacy `Grant::List(["*"])` identity such as
+///    `moose`/`claude`. So a wildcard-granted caller could have had a model approve its
+///    own guarded requests, dissolving the human-in-the-loop gate. Blocked here
+///    unconditionally, mirroring Chord's `is_llm_blocked`.
+///
+/// This is defence in depth, not the primary control: `guard()` above is. A model must
+/// not be able to reach the approval mechanism even if an allowlist is misconfigured.
+pub fn is_model_blocked(bare_name: &str) -> bool {
+    crate::approval::is_guarded(bare_name) || bare_name.starts_with("approval_")
 }
 
 /// Annotate a cached payload with when it was fetched.
@@ -724,7 +743,7 @@ mod tests {
         // gate entirely.
         let reg = ToolRegistry::new();
         let cache = ToolCache::default();
-        for guarded in ["approval_grant", "approval_deny"] {
+        for guarded in ["approval_grant", "approval_deny", "infisical_get_secret", "pg_ddl", "ansible_run_playbook"] {
             match dispatch_tool(&reg, &cache, None, None, guarded, json!({}), None).await {
                 Dispatch::Denied(msg) => {
                     assert!(msg.contains("operator approval"), "got: {msg}");
@@ -732,6 +751,23 @@ mod tests {
                 other => panic!("{guarded} must be DENIED, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn the_model_block_covers_both_families() {
+        // The operator-guarded set...
+        assert!(is_model_blocked("infisical_get_secret"));
+        assert!(is_model_blocked("pg_ddl"));
+        assert!(is_model_blocked("ansible_run_playbook"));
+        // ...AND the approval mechanism itself, which is NOT in that set and is
+        // otherwise only covered by a deny prefix that a Grant::List(["*"]) identity
+        // bypasses entirely.
+        assert!(is_model_blocked("approval_grant"));
+        assert!(is_model_blocked("approval_deny"));
+        // Ordinary tools are unaffected.
+        assert!(!is_model_blocked("weather"));
+        assert!(!is_model_blocked("news_headlines"));
+        assert!(!is_model_blocked("pve__get_nodes"));
     }
 
     #[tokio::test]
