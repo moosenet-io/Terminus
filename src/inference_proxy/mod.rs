@@ -220,6 +220,55 @@ impl InferenceProxyClient {
     /// doc's "Errors" section. Whatever Chord itself returns once reached
     /// (its own success or error status) is relayed unchanged, not
     /// reinterpreted here.
+    /// TRTR-02: a TYPED chat-completion call to Chord, for the in-process tool router.
+    ///
+    /// [`forward`](Self::forward) relays a streaming `Response` straight back to an
+    /// mTLS caller — exactly right for proxying, useless for a loop that must READ the
+    /// model's tool calls and decide what to do next. This variant buffers the
+    /// response and returns parsed JSON.
+    ///
+    /// Unlike `forward`, this DOES bound the total response time: a router turn runs
+    /// inside a wall-clock budget, and an unbounded inference call would blow through
+    /// it and leave the user staring at a dead socket instead of the router's own
+    /// error.
+    pub async fn chat_completion(
+        &self,
+        body: serde_json::Value,
+        caller_identity: Option<&str>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, String> {
+        let jwt = mint_service_jwt().map_err(|e| format!("jwt minting failed: {e}"))?;
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let mut req = self
+            .http
+            .post(&url)
+            .bearer_auth(jwt)
+            .header("content-type", "application/json")
+            .timeout(timeout)
+            .json(&body);
+        if let Some(identity) = caller_identity {
+            if let Ok(hv) = HeaderValue::from_str(identity) {
+                req = req.header(CLIENT_IDENTITY_HEADER, hv);
+            }
+        }
+        let resp = req.send().await.map_err(|e| {
+            if e.is_timeout() {
+                "inference timed out".to_string()
+            } else {
+                format!("inference unreachable: {e}")
+            }
+        })?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| format!("reading inference body: {e}"))?;
+        if !status.is_success() {
+            // Truncated: an upstream error body can be large, and the useful signal is
+            // at the front. Never echoed to the end user verbatim.
+            let head: String = text.chars().take(300).collect();
+            return Err(format!("inference HTTP {status}: {head}"));
+        }
+        serde_json::from_str(&text).map_err(|e| format!("inference returned non-JSON: {e}"))
+    }
+
     pub async fn forward(
         &self,
         path: &str,

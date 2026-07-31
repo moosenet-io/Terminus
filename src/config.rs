@@ -666,6 +666,19 @@ pub fn mtls_primary_server_identity() -> String {
 /// tiering, GPU lifecycle, and fallback (north-star Module Contract clause 1). Reads
 /// `TERMINUS_ROUTER_MODEL`; defaults to the fast assistant tier because tool selection
 /// is a routing decision, not the answer the user reads.
+/// TRTR-02: whether the tool router runs LOCALLY in Terminus (default) or blind-
+/// forwards `/v1/agent/execute` to Chord as before.
+///
+/// `TERMINUS_ROUTER_LOCAL=0` is the documented rollback: it restores the exact
+/// pre-TRTR-02 behaviour without a redeploy, which is what makes flipping this on
+/// safe for a live assistant.
+pub fn router_local_enabled() -> bool {
+    match std::env::var("TERMINUS_ROUTER_LOCAL") {
+        Ok(v) => !matches!(v.trim(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
+}
+
 pub fn router_model_alias() -> String {
     env_nonempty("TERMINUS_ROUTER_MODEL").unwrap_or_else(|| "lumina-fast".to_string())
 }

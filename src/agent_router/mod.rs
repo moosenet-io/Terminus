@@ -300,6 +300,161 @@ pub struct RouterDeps<'a> {
     pub principal: Option<&'a Principal>,
 }
 
+/// Run one agentic turn: select tools, ask Chord, dispatch what it asks for, repeat.
+///
+/// Returns the assistant's final text plus a step log. Every exit path produces a
+/// USABLE answer — a timeout or step-cap still returns what was learned so far rather
+/// than an error page, because a partial answer beats a dead turn.
+pub async fn execute(
+    deps: RouterDeps<'_>,
+    system_prompt: &str,
+    user_message: &str,
+    cfg: RouterConfig,
+) -> RouterOutcome {
+    let started = Instant::now();
+    let mut steps: Vec<Step> = Vec::new();
+
+    let catalog = deps.registry.list();
+    let selected = select::select_tools(&catalog, user_message, deps.gateway, deps.principal);
+    let principal_name = deps.principal.map(|p| p.name());
+
+    let mut messages: Vec<Value> = Vec::new();
+    if !system_prompt.is_empty() {
+        messages.push(json!({"role": "system", "content": system_prompt}));
+    }
+    messages.push(json!({"role": "user", "content": user_message}));
+
+    let tools = tools_payload(&selected);
+    let mut turns = 0usize;
+
+    loop {
+        if let Some(reason) = should_stop(steps.len(), cfg.max_steps, started, cfg.budget) {
+            return RouterOutcome {
+                response: partial_answer(&messages, reason),
+                steps,
+                turns,
+                status: reason,
+            };
+        }
+
+        // Give the inference call only the time left in the budget, so one slow
+        // completion cannot overrun the turn.
+        let remaining = cfg.budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return RouterOutcome {
+                response: partial_answer(&messages, "timeout"),
+                steps,
+                turns,
+                status: "timeout",
+            };
+        }
+
+        let mut body = json!({
+            "model": cfg.model,
+            "messages": messages,
+        });
+        if !selected.is_empty() {
+            body["tools"] = tools.clone();
+        }
+
+        turns += 1;
+        let completion = match deps.chord.chat_completion(body, principal_name, remaining).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("agent_router: inference failed: {e}");
+                return RouterOutcome {
+                    response: partial_answer(&messages, "inference_error"),
+                    steps,
+                    turns,
+                    status: "inference_error",
+                };
+            }
+        };
+
+        let calls = parse_tool_calls(&completion);
+        if calls.is_empty() {
+            let content = parse_content(&completion);
+            return RouterOutcome {
+                response: content,
+                steps,
+                turns,
+                status: "ok",
+            };
+        }
+
+        // Echo the assistant's tool-call turn back into the transcript, or the model
+        // loses track of what it just asked for.
+        if let Some(msg) = completion
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|c| c.get("message"))
+        {
+            messages.push(msg.clone());
+        }
+
+        for call in calls {
+            let t0 = Instant::now();
+            let d = dispatch_tool(
+                deps.registry,
+                deps.cache,
+                &call.name,
+                call.arguments.clone(),
+                principal_name,
+            )
+            .await;
+            let (text, status, cached) = match d {
+                Dispatch::Ok { text, cached } => (text, "ok", cached),
+                Dispatch::Unavailable(m) => (m, "unavailable", false),
+                Dispatch::Unknown(m) => (m, "unknown", false),
+                Dispatch::Failed(m) => (
+                    // The model gets a clean, non-leaky failure it can act on.
+                    format!("`{}` failed: {m}", call.name),
+                    "failed",
+                    false,
+                ),
+            };
+            steps.push(Step {
+                tool: call.name.clone(),
+                status,
+                cached,
+                duration_ms: t0.elapsed().as_millis() as u64,
+            });
+            tracing::info!(
+                "agent_router: tool={} status={} cached={} ms={}",
+                call.name,
+                status,
+                cached,
+                t0.elapsed().as_millis()
+            );
+            messages.push(tool_result_message(&call.id, &text));
+        }
+    }
+}
+
+/// Best-effort answer when the loop ends without the model producing one.
+///
+/// Returns the last tool result rather than an error string: if the user asked for
+/// the weather and we fetched it but ran out of budget before the model could phrase
+/// it, the data is still worth more than "something went wrong".
+fn partial_answer(messages: &[Value], reason: &str) -> String {
+    let last_tool = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str());
+    match (last_tool, reason) {
+        (Some(t), _) if !t.is_empty() => format!(
+            "I ran out of time composing a full reply, but here is what I found:\n\n{t}"
+        ),
+        (_, "inference_error") => {
+            "I could not reach the inference service just now — please try again.".to_string()
+        }
+        _ => "I could not complete that request in time — please try again.".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

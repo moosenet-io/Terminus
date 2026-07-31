@@ -109,6 +109,11 @@ pub struct McpServerState {
     /// `terminus_personal`, which has no inference-proxy role) means those
     /// routes are not mounted at all.
     pub inference_proxy: Option<InferenceProxyClient>,
+
+    /// TRTR-08: shared TTL cache for high-traffic tool results (news, weather).
+    /// Lives on the server state so it survives across requests — a per-request cache
+    /// would never hit, which is the whole point.
+    pub tool_cache: crate::tool_cache::ToolCache,
     /// TGW-04: when set, EVERY request through this server (tool calls —
     /// core and federated-personal — AND the four inference-proxy routes
     /// below) is gated by the shared identity → allowlist → rate-limit →
@@ -251,6 +256,13 @@ pub fn build_router(state: Arc<McpServerState>) -> Router {
 /// `handle_mcp`'s personal-tool federation branch already does. Otherwise
 /// (this binary has no inference-proxy role configured), return a clean
 /// `503` rather than silently 404ing or hanging.
+impl McpServerState {
+    /// The process-wide tool result cache (TRTR-08).
+    pub fn tool_cache(&self) -> &crate::tool_cache::ToolCache {
+        &self.tool_cache
+    }
+}
+
 async fn handle_inference_proxy(
     state: Arc<McpServerState>,
     path: &'static str,
@@ -339,6 +351,18 @@ async fn handle_infer(
     handle_inference_proxy(state, INFER_PATH, identity, tailnet, headers, body).await
 }
 
+/// `/v1/agent/execute` — the agentic tool turn.
+///
+/// TRTR-02: this used to BLIND-FORWARD to Chord, which ran the tool loop against its
+/// own catalog. That catalog had no caller identity (so tool exposure could not be
+/// scoped per user) and pointed at a stale backend (so news/weather/Proxmox were
+/// invisible to the assistant). The loop now runs HERE, where the principal is already
+/// resolved and authorization already lives; Chord is called only for the
+/// tool-selecting sub-agent's inference.
+///
+/// Gated by `TERMINUS_ROUTER_LOCAL` (default ON once deployed). Setting it to `0`
+/// restores the exact previous blind-forward behaviour — a documented rollback that
+/// needs no redeploy.
 async fn handle_agent_execute(
     State(state): State<Arc<McpServerState>>,
     identity: Option<Extension<ClientIdentity>>,
@@ -346,7 +370,127 @@ async fn handle_agent_execute(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle_inference_proxy(state, AGENT_EXECUTE_PATH, identity, tailnet, headers, body).await
+    if !crate::config::router_local_enabled() {
+        return handle_inference_proxy(state, AGENT_EXECUTE_PATH, identity, tailnet, headers, body)
+            .await;
+    }
+
+    let principal = resolve_principal(
+        &state.principal_resolver,
+        identity.as_ref().map(|Extension(i)| i),
+        tailnet.as_ref().map(|Extension(t)| t),
+    );
+
+    // Same gate the forwarding path applies, on the same resolved principal — the
+    // router is a caller of the sanctioned path, never a way around it.
+    let gate_ctx = match &state.gateway {
+        Some(gateway) => {
+            match gateway
+                .guard(principal.as_ref(), AGENT_EXECUTE_PATH, ActionKind::Inference)
+                .await
+            {
+                Ok(ctx) => Some(ctx),
+                Err(denial) => return denial,
+            }
+        }
+        None => None,
+    };
+
+    let Some(chord) = state.inference_proxy.as_ref() else {
+        // No inference configured on this binary — the router cannot run.
+        let r = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("content-type", "application/json")],
+            json!({"error": "no inference backend configured"}).to_string(),
+        )
+            .into_response();
+        if let Some(ctx) = gate_ctx {
+            ctx.record_result(AuditResult::Error, Some("no inference backend")).await;
+        }
+        return r;
+    };
+
+    let req: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            let r = (
+                StatusCode::BAD_REQUEST,
+                [("content-type", "application/json")],
+                json!({"error": format!("invalid request body: {e}")}).to_string(),
+            )
+                .into_response();
+            if let Some(ctx) = gate_ctx {
+                ctx.record_result(AuditResult::Error, Some("invalid body")).await;
+            }
+            return r;
+        }
+    };
+
+    let system_prompt = req.get("system_prompt").and_then(|v| v.as_str()).unwrap_or("");
+    // Newest user turn drives selection — that is what the request is actually about.
+    let user_message = req
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|a| {
+            a.iter()
+                .rev()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        })
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+
+    let mut registry = crate::registry::ToolRegistry::new();
+    crate::registry::register_all(&mut registry);
+
+    let deps = crate::agent_router::RouterDeps {
+        registry: &registry,
+        cache: state.tool_cache(),
+        chord,
+        gateway: state.gateway.as_ref(),
+        principal: principal.as_ref(),
+    };
+
+    let outcome = crate::agent_router::execute(
+        deps,
+        system_prompt,
+        user_message,
+        crate::agent_router::RouterConfig::default(),
+    )
+    .await;
+
+    tracing::info!(
+        "agent_router: complete status={} turns={} tools={} identity={}",
+        outcome.status,
+        outcome.turns,
+        outcome.steps.len(),
+        principal.as_ref().map(|p| p.name()).unwrap_or("<none>")
+    );
+
+    if let Some(ctx) = gate_ctx {
+        ctx.record_result(AuditResult::Success, None).await;
+    }
+
+    // Response shape matches what lumina-core already reads back from
+    // `/v1/agent/execute`, so TRTR-04 is a destination change, not a contract change.
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        json!({
+            "response": outcome.response,
+            "status": outcome.status,
+            "turns": outcome.turns,
+            "tools_called": outcome.steps.len(),
+            "execution_log": outcome.steps.iter().map(|s| json!({
+                "tool": s.tool,
+                "status": s.status,
+                "cached": s.cached,
+                "duration_ms": s.duration_ms,
+            })).collect::<Vec<_>>(),
+        })
+        .to_string(),
+    )
+        .into_response()
 }
 
 async fn handle_coding_select(
@@ -1304,6 +1448,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
@@ -1462,6 +1607,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
@@ -1595,6 +1741,8 @@ mod tests {
                 auth_token: None,
                 personal_federation: None,
                 inference_proxy: None,
+                tool_cache: Default::default(),
+            tool_cache: Default::default(),
                 gateway: None,
                 mesh_pool: None,
                 principal_resolver: PrincipalResolver::default(),
@@ -1656,6 +1804,7 @@ mod tests {
                     .with_timeout(std::time::Duration::from_millis(200)),
             ),
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
@@ -1732,6 +1881,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
@@ -1802,6 +1952,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
@@ -1851,6 +2002,7 @@ mod tests {
             auth_token: Some("secret-abc".to_string()),
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
@@ -1880,6 +2032,7 @@ mod tests {
             auth_token: Some("secret-abc".to_string()),
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
@@ -2065,6 +2218,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: Some(gateway),
             mesh_pool: None,
             principal_resolver,
@@ -2237,6 +2391,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: Some(gateway),
             mesh_pool: Some(Arc::new(mesh_pool)),
             principal_resolver: PrincipalResolver::default(),
