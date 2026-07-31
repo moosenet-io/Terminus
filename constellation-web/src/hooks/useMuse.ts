@@ -325,6 +325,92 @@ export function useMuseTasteProfile(): MuseSection<MuseTasteProfile> {
   return useMuseSection<MuseTasteProfile>('/api/taste');
 }
 
+// ── Curation (MGUI-09) ───────────────────────────────────────────────────────
+
+export interface MuseCurationItem {
+  media_item_id?: number;
+  media_metadata_id?: number;
+  title: string;
+  kind?: string;
+  /** Server-composed, grounded narration. Rendered VERBATIM — see CurationPanel. */
+  reason?: string;
+  rationale?: string;
+  tag?: string;
+  source?: string;
+  fit?: number;
+  taste_fit?: number;
+  score?: number;
+}
+
+export function useMuseCuration(): MuseSection<{ account_id: number; recommendations: MuseCurationItem[] }> {
+  return useMuseSection<{ account_id: number; recommendations: MuseCurationItem[] }>('/api/curation');
+}
+
+// ── Wanted + download queue (MGUI-14) ────────────────────────────────────────
+
+export interface MuseWantedRow {
+  monitored_item_id?: number;
+  media_metadata_id?: number;
+  title: string;
+  kind?: string;
+  year?: number | null;
+  quality_profile_name?: string | null;
+  status?: string;
+  note?: string;
+}
+
+export interface MuseQueueRow {
+  id?: number;
+  title: string;
+  client?: string;
+  status?: string;
+  progress?: number;
+  size_bytes?: number | null;
+  eta_seconds?: number | null;
+  download_speed?: number | null;
+}
+
+export function useMuseRequestsQueue(): MuseSection<{ wanted: MuseWantedRow[]; queue: MuseQueueRow[] }> {
+  return useMuseSection<{ wanted: MuseWantedRow[]; queue: MuseQueueRow[] }>('/api/requests/queue');
+}
+
+// ── Settings (MGUI-11 / 12 / 13) ─────────────────────────────────────────────
+// Shapes copied from a live `GET /api/settings` capture.
+
+export interface MuseSettings {
+  master_enabled: boolean;
+  acquisition: { enabled: boolean } & Record<string, unknown>;
+  adaptation_loop: { enabled: boolean; aggressiveness: number };
+  channel_director: { enabled: boolean; serendipity_percent: number };
+  discord_bot: { enabled: boolean; promotion_cadence_secs: number; promotion_match_threshold: number; trusted_friends: unknown[] };
+  /** ALREADY masked server-side. The panel never renders it regardless — see
+   *  IntegrationsSettings: a mask still leaks shape (length, prefix). */
+  discord_bot_token_masked: string | null;
+  kg_viz: { enabled: boolean; taste_neighbor_threshold: number; watch_history_limit: number };
+  question_frequency: { frequency: string; silent_mode: boolean };
+  sharing: { granularity: string };
+  watch_together: { enabled: boolean };
+  whats_hot: { enabled: boolean; source_weights: Record<string, unknown> };
+  personas: unknown[];
+}
+
+export function useMuseSettings(): MuseSection<MuseSettings> {
+  return useMuseSection<MuseSettings>('/api/settings');
+}
+
+export interface MuseIndexer {
+  id: number;
+  name: string;
+  enabled: boolean;
+  protocol: string;
+  privacy: string;
+  categories: unknown[];
+}
+
+export function useMuseIndexers(): MuseSection<{ configured: boolean; reachable: boolean; indexers: MuseIndexer[] }> {
+  return useMuseSection<{ configured: boolean; reachable: boolean; indexers: MuseIndexer[] }>('/api/indexers');
+}
+
 // ── Taste (muse.taste) ───────────────────────────────────────────────────────
 
 export interface MuseTastePoint {
