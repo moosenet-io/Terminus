@@ -25,16 +25,27 @@ const ch = (id: number, name: string): MuseChannel => ({
 });
 
 describe('/api/channels shape normalization', () => {
-  // The live endpoint answers a bare array; the mock answers an envelope. Reading only
-  // `data.channels` would render an empty list against a populated backend.
-  it('accepts both the live bare array and the mocked envelope', () => {
+  // The live endpoint answers a bare array. The envelope form is still accepted because it
+  // is the shape the guide's own reference payloads use; the mock was corrected to the live
+  // bare array in this change, so the envelope case here is contract tolerance, not a
+  // description of what the mock returns.
+  it('accepts both the live bare array and the envelope form', () => {
     expect(museChannelList([ch(1, 'A')])).toHaveLength(1);
     expect(museChannelList({ channels: [ch(1, 'A')] })).toHaveLength(1);
   });
 
-  it('yields an empty list rather than a guess for a null or unrecognized payload', () => {
-    expect(museChannelList(null)).toEqual([]);
-    expect(museChannelList({} as never)).toEqual([]);
+  it('returns null — not [] — for a body it cannot read', () => {
+    expect(museChannelList({ unexpected: true } as never)).toBeNull();
+    expect(museChannelList(null)).toBeNull();
+  });
+
+  it('keeps [] meaning exactly one thing: the server returned a list with no elements', () => {
+    // This test previously asserted the OPPOSITE — that null and unrecognized payloads both
+    // yield `[]`. That contract was the enabling half of the false-empty bug: it made an
+    // unread body indistinguishable from an observed empty list. Reversed deliberately.
+    expect(museChannelList([])).toEqual([]);
+    expect(museChannelList({ channels: [] })).toEqual([]);
+    expect(museChannelList({} as never)).toBeNull();
   });
 });
 
@@ -125,7 +136,14 @@ describe('never asserts an empty list before one arrives', () => {
   // channels fetch produced zero rows and rendered copy stating as fact that
   // "GET /api/channels returned an empty list" — an observation of a response that did not
   // exist. Each case below pins one state where that sentence must NOT be reachable.
-  const base = { channelsLoading: false, guideLoading: false, channelsDegraded: false, rowCount: 0 };
+  const base = {
+    channelsLoading: false,
+    guideLoading: false,
+    channelsDegraded: false,
+    channelsRecognized: true,
+    guideDegraded: false,
+    rowCount: 0,
+  };
 
   it('reports loading while the channels fetch is in flight, not emptiness', () => {
     expect(gridState({ ...base, channelsLoading: true })).toBe('loading');
@@ -146,7 +164,21 @@ describe('never asserts an empty list before one arrives', () => {
     expect(gridState({ ...base, channelsLoading: true, channelsDegraded: true })).toBe('loading');
   });
 
-  it('only calls it empty once the fetch has settled successfully with zero rows', () => {
+  it('refuses to call an UNPARSEABLE channels body empty', () => {
+    // `museChannelList` returns null for a shape it cannot read. Collapsing that to `[]`
+    // would let the grid report "returned an empty list" about a body it never parsed.
+    expect(gridState({ ...base, channelsRecognized: false })).toBe('channels-unrecognized');
+  });
+
+  it('surfaces a failed GUIDE fetch instead of implying an empty schedule', () => {
+    // Channel rows with no blocks read as "nothing is scheduled". A guide that failed to
+    // load is a different statement — and since the guide can itself contribute rows, even
+    // zero rows is not a complete observation while it is down.
+    expect(gridState({ ...base, guideDegraded: true, rowCount: 2 })).toBe('guide-degraded');
+    expect(gridState({ ...base, guideDegraded: true, rowCount: 0 })).toBe('guide-degraded');
+  });
+
+  it('only calls it empty once BOTH fetches settled successfully with zero rows', () => {
     expect(gridState(base)).toBe('empty');
   });
 

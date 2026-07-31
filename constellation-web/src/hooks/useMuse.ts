@@ -488,12 +488,17 @@ export interface MuseChannels {
  *  empty channel list against a non-empty backend. */
 export type MuseChannelsResponse = MuseChannels | MuseChannel[];
 
-/** Normalize either observed `/api/channels` shape to a plain list. An unrecognized shape
- *  yields `[]` rather than a guess — we do not know what its channels would be. */
-export function museChannelList(data: MuseChannelsResponse | null): MuseChannel[] {
-  if (data === null) return [];
+/** Normalize either observed `/api/channels` shape to a plain list.
+ *
+ *  Returns `null` — NOT `[]` — for a shape we do not recognize, and for no data at all. An
+ *  earlier version collapsed both into `[]`, which handed callers a value indistinguishable
+ *  from a genuinely empty list and let the grid state "GET /api/channels returned an empty
+ *  list" about a payload it had never successfully parsed (gpt56). `[]` now means exactly one
+ *  thing: the server returned a list and it had no elements. */
+export function museChannelList(data: MuseChannelsResponse | null): MuseChannel[] | null {
+  if (data === null) return null;
   if (Array.isArray(data)) return data;
-  return Array.isArray(data.channels) ? data.channels : [];
+  return Array.isArray(data.channels) ? data.channels : null;
 }
 
 export function useMuseChannels(): MuseSection<MuseChannelsResponse> {
@@ -513,7 +518,11 @@ export interface MuseLineup {
  *  no channel is selected yet, so the lineup ChartCard shows its own empty state, not a spurious
  *  "not yet wired" degrade. */
 export function useMuseLineup(channelId: number | null): MuseSection<MuseLineup> {
-  return useMuseSection<MuseLineup>(channelId ? `/api/channels/${encodeURIComponent(channelId)}/lineup` : null);
+  // `channelId !== null`, never a truthiness test: channel ids are i64 and 0 is a legal id,
+  // which a truthy check would silently treat as "no channel selected" (codex).
+  return useMuseSection<MuseLineup>(
+    channelId !== null ? `/api/channels/${encodeURIComponent(String(channelId))}/lineup` : null,
+  );
 }
 
 export interface MuseGuideEntry {

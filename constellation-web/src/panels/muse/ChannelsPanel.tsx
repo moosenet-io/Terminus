@@ -49,8 +49,13 @@ function ChannelsListSection({
   const { data, loading, degraded } = useMuseChannels();
   // MGUI-10: normalized, because live `/api/channels` answers a bare array while the mock
   // answers a `{channels:[…]}` envelope -- see `museChannelList`'s comment.
-  const channels = museChannelList(data);
-  const empty = !loading && !degraded && channels.length === 0;
+  const parsed = museChannelList(data);
+  const channels = parsed ?? [];
+  // An unparseable body is NOT an empty library, so it must not render "No channels yet".
+  // `museChannelList` returns null for a shape it does not recognize precisely so this
+  // distinction survives to the UI (gpt56).
+  const unrecognized = !loading && !degraded && parsed === null;
+  const empty = !loading && !degraded && parsed !== null && channels.length === 0;
 
   // Auto-select the first channel once the list resolves (review fix): the spec requires
   // channels + LINEUP + guide to render on mocks — without this, the lineup section idled
@@ -131,9 +136,13 @@ function ChannelsListSection({
       height={channels.length === 0 ? 120 : Math.min(60 + channels.length * 40, 320)}
       loading={loading}
       degraded={degraded}
-      empty={empty}
-      emptyMessage="No channels yet"
-      emptyHint="Muse channels appear here once composed"
+      empty={empty || unrecognized}
+      emptyMessage={unrecognized ? 'Channel list not understood' : 'No channels yet'}
+      emptyHint={
+        unrecognized
+          ? 'GET /api/channels returned a body that is neither a list nor a {channels: […]} envelope — no claim is made about how many channels exist'
+          : 'Muse channels appear here once composed'
+      }
     >
       <div id="channel-actions-note" style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', marginBottom: 'var(--space-2)' }}>
         Compose needs an explicit show selection (no picker on this surface yet); per-channel

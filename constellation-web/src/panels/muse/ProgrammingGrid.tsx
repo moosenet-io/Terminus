@@ -179,16 +179,32 @@ export function buildRows(channels: MuseChannel[], entries: MuseGuideEntry[]): G
  *  Order matters. `loading` outranks everything (nothing has been observed yet), and
  *  `degraded` outranks `empty` (an error is not an empty list). Only when the channel fetch
  *  has actually SETTLED SUCCESSFULLY may zero rows be reported as an observed emptiness. */
-export type GridState = 'loading' | 'channels-degraded' | 'empty' | 'grid';
+export type GridState =
+  | 'loading'
+  | 'channels-degraded'
+  | 'channels-unrecognized'
+  | 'guide-degraded'
+  | 'empty'
+  | 'grid';
 
 export function gridState(input: {
   channelsLoading: boolean;
   guideLoading: boolean;
   channelsDegraded: boolean;
+  /** `false` when `museChannelList` could not parse the payload as a list. Distinct from an
+   *  empty list: an unparseable body is not an observation that there are no channels. */
+  channelsRecognized: boolean;
+  guideDegraded: boolean;
   rowCount: number;
 }): GridState {
   if (input.channelsLoading || input.guideLoading) return 'loading';
   if (input.channelsDegraded) return 'channels-degraded';
+  if (!input.channelsRecognized) return 'channels-unrecognized';
+  // Outranks BOTH `empty` and `grid`. Channel rows with no blocks would otherwise read as
+  // "these channels have nothing scheduled" when the schedule simply could not be fetched;
+  // and because the guide can itself contribute rows for channels the list does not carry,
+  // a failed guide fetch means even `rowCount === 0` is not a complete observation (codex).
+  if (input.guideDegraded) return 'guide-degraded';
   return input.rowCount === 0 ? 'empty' : 'grid';
 }
 
@@ -374,7 +390,8 @@ export function ProgrammingGrid({ nowMs = Date.now() }: ProgrammingGridProps) {
   const channelsSection = useMuseChannels();
   const guideSection = useMuseGuide();
 
-  const channels = museChannelList(channelsSection.data);
+  const parsedChannels = museChannelList(channelsSection.data);
+  const channels = parsedChannels ?? [];
   const { entries, htmlOnly } = museGuideEntries(guideSection.data);
 
   const win = useMemo(() => deriveWindow(entries, nowMs), [entries, nowMs]);
@@ -395,6 +412,8 @@ export function ProgrammingGrid({ nowMs = Date.now() }: ProgrammingGridProps) {
     channelsLoading: channelsSection.loading,
     guideLoading: guideSection.loading,
     channelsDegraded: channelsSection.degraded !== false,
+    channelsRecognized: parsedChannels !== null,
+    guideDegraded: guideSection.degraded !== false,
     rowCount: rows.length,
   });
 
@@ -413,6 +432,36 @@ export function ProgrammingGrid({ nowMs = Date.now() }: ProgrammingGridProps) {
           <code style={{ fontFamily: 'var(--font-mono)' }}>GET /api/channels</code> did not return a
           list: {channelsSection.degraded === false ? 'unknown error' : channelsSection.degraded.detail}. This is an error, not an empty library — nothing
           is implied here about whether channels exist.
+        </div>
+        <TunerTelemetry nowMs={nowMs} />
+      </div>
+    );
+  }
+
+  if (state === 'channels-unrecognized') {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)', height: '100%', justifyContent: 'center', padding: 'var(--space-3)', fontSize: 'var(--fs-xs)', color: 'var(--text-300)' }}>
+        <div style={{ color: 'var(--text-200)' }}>Channel list not understood.</div>
+        <div>
+          <code style={{ fontFamily: 'var(--font-mono)' }}>GET /api/channels</code> returned a body
+          that is neither a list nor a <code style={{ fontFamily: 'var(--font-mono)' }}>{'{channels: […]}'}</code>{' '}
+          envelope. Nothing is claimed about how many channels exist — the response could not be read.
+        </div>
+        <TunerTelemetry nowMs={nowMs} />
+      </div>
+    );
+  }
+
+  if (state === 'guide-degraded') {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)', height: '100%', justifyContent: 'center', padding: 'var(--space-3)', fontSize: 'var(--fs-xs)', color: 'var(--text-300)' }}>
+        <div style={{ color: 'var(--text-200)' }}>Guide unavailable.</div>
+        <div>
+          The channel list loaded, but{' '}
+          <code style={{ fontFamily: 'var(--font-mono)' }}>GET /guide</code> did not:{' '}
+          {guideSection.degraded === false ? 'unknown error' : guideSection.degraded.detail}. Drawing
+          the channel rows without it would present an empty schedule as though nothing were
+          scheduled, which is not what was observed.
         </div>
         <TunerTelemetry nowMs={nowMs} />
       </div>
