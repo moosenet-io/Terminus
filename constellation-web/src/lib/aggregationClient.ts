@@ -560,23 +560,26 @@ const MOCK_MUSE_STATS = {
   last_ingest_at: new Date(Date.now() - 45 * 60000).toISOString(),
 };
 
-const MOCK_MUSE_CHANNELS = {
-  channels: [
-    { id: 'ch-1', name: 'Mock Channel One', item_count: 12 },
-    { id: 'ch-2', name: 'Mock Channel Two', item_count: 5 },
-  ],
-};
+// MGUI-10 review fix: this mock previously answered `{channels:[{id:'ch-1', …, item_count}]}` —
+// an envelope and an element shape Muse has never returned. Live `GET /api/channels` answers a
+// BARE ARRAY of `ChannelSummary` (Muse `src/web/guide.rs:35`). A mock that disagrees with its
+// endpoint is a false-green generator: every panel built against it looks correct in mock mode
+// and breaks on real data. Matched to the server struct.
+const MOCK_MUSE_CHANNELS = [
+  { id: 1, name: 'Mock Channel One', kind: 'series', mode: 'shuffle', channel_number: 1.0, enabled: true },
+  { id: 2, name: 'Mock Channel Two', kind: 'movie', mode: 'ordered', channel_number: 2.0, enabled: true },
+];
 
 const MOCK_MUSE_LINEUP: Record<string, { channel_id: string; lineup: Array<{ id: string; title: string; position: number }> }> = {
-  'ch-1': {
-    channel_id: 'ch-1',
+  '1': {
+    channel_id: '1',
     lineup: [
       { id: 'md-1', title: 'Example Feature Film', position: 1 },
       { id: 'md-2', title: 'Example Series S1E4', position: 2 },
     ],
   },
-  'ch-2': {
-    channel_id: 'ch-2',
+  '2': {
+    channel_id: '2',
     lineup: [
       { id: 'md-3', title: 'Example Upcoming Release', position: 1 },
     ],

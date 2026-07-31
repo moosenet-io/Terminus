@@ -26,14 +26,12 @@ import type { DataTableColumn } from '../../components/DataTable';
 import { Button } from '../../components/Button';
 import { Badge } from '../../components/Badge';
 import { RoleGate } from '../../components/RoleGate';
-import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { useTableView, TableViewControls } from '../../viz/TableViewToggle';
 import { ProgrammingGrid } from './ProgrammingGrid';
 import {
   useMuseChannels,
   useMuseLineup,
   useMuseGuide,
-  useMuseChannelActions,
   museChannelList,
   museGuideEntries,
   type MuseChannel,
@@ -41,16 +39,12 @@ import {
   type MuseGuideEntry,
 } from '../../hooks/useMuse';
 
-type PendingAction = { kind: 'compose' | 'maintenance'; channelId: string; channelName: string } | null;
-
 function ChannelsListSection({
   selectedId,
   onSelect,
-  onRequestAction,
 }: {
-  selectedId: string | null;
+  selectedId: number | null;
   onSelect: (channel: MuseChannel) => void;
-  onRequestAction: (kind: 'compose' | 'maintenance', channel: MuseChannel) => void;
 }) {
   const { data, loading, degraded } = useMuseChannels();
   // MGUI-10: normalized, because live `/api/channels` answers a bare array while the mock
@@ -91,16 +85,40 @@ function ChannelsListSection({
         </button>
       ),
     },
-    { key: 'items', header: 'Items', align: 'right', render: c => String(c.item_count) },
+    // Real `ChannelSummary` fields. The old "Items" column read `c.item_count`, which Muse
+    // does not return — see `MuseChannel`'s comment.
+    { key: 'kind', header: 'Kind', render: c => [c.kind, c.mode].filter(Boolean).join(' · ') || '—' },
+    {
+      key: 'number',
+      header: 'No.',
+      align: 'right',
+      render: c => (typeof c.channel_number === 'number' ? String(c.channel_number) : '—'),
+    },
     {
       key: 'actions',
       header: 'Actions',
       align: 'right',
-      render: c => (
+      render: () => (
         <RoleGate>
           <div style={{ display: 'flex', gap: 'var(--space-2)', justifyContent: 'flex-end' }}>
-            <Button variant="secondary" size="sm" onClick={() => onRequestAction('compose', c)}>Compose</Button>
-            <Button variant="ghost" size="sm" onClick={() => onRequestAction('maintenance', c)}>Maintenance</Button>
+            {/* Both controls render VISIBLY DISABLED rather than being removed, so the
+                design's shape stays legible — same treatment as Discover's Request CTA.
+                Neither can be honestly wired from this surface today:
+                  compose      — `POST /channels/{id}/compose` exists, but requires a
+                                 non-empty `show_media_item_ids`; there is no show picker
+                                 here, and a one-click call would just 400.
+                  maintenance  — there is NO per-channel maintenance route. Probed live:
+                                 `/channels/{id}/maintenance` and `/api/channels/{id}/
+                                 maintenance` both 404. Muse has a GLOBAL `POST /ops/
+                                 maintenance` on its authenticated router, which is a
+                                 different operation; firing it from a per-channel button
+                                 would misrepresent its scope. */}
+            <Button variant="secondary" size="sm" disabled aria-describedby="channel-actions-note">
+              Compose
+            </Button>
+            <Button variant="ghost" size="sm" disabled aria-describedby="channel-actions-note">
+              Maintenance
+            </Button>
           </div>
         </RoleGate>
       ),
@@ -117,12 +135,16 @@ function ChannelsListSection({
       emptyMessage="No channels yet"
       emptyHint="Muse channels appear here once composed"
     >
-      <DataTable columns={columns} rows={channels} rowKey={c => c.id} emptyMessage="No channels yet" />
+      <div id="channel-actions-note" style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', marginBottom: 'var(--space-2)' }}>
+        Compose needs an explicit show selection (no picker on this surface yet); per-channel
+        maintenance has no route in Muse. Both are shown disabled rather than hidden.
+      </div>
+      <DataTable columns={columns} rows={channels} rowKey={c => String(c.id)} emptyMessage="No channels yet" />
     </ChartCard>
   );
 }
 
-function LineupSection({ channelId, channelName }: { channelId: string | null; channelName: string | null }) {
+function LineupSection({ channelId, channelName }: { channelId: number | null; channelName: string | null }) {
   const { data, loading, degraded } = useMuseLineup(channelId);
   const lineup = data?.lineup ?? [];
   const empty = channelId !== null && !loading && !degraded && lineup.length === 0;
@@ -201,75 +223,21 @@ function GuideSection() {
 }
 
 export function ChannelsPanel() {
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
   const [selectedName, setSelectedName] = useState<string | null>(null);
-  const [pending, setPending] = useState<PendingAction>(null);
-  const [busy, setBusy] = useState(false);
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
-  const { composeChannel, runMaintenance } = useMuseChannelActions();
-
-  function requestAction(kind: 'compose' | 'maintenance', channel: MuseChannel) {
-    setStatusMessage(null);
-    setPending({ kind, channelId: channel.id, channelName: channel.name });
-  }
-
-  async function confirmAction() {
-    if (!pending) return;
-    setBusy(true);
-    try {
-      const result = pending.kind === 'compose'
-        ? await composeChannel(pending.channelId)
-        : await runMaintenance(pending.channelId);
-      const status = (result as { status?: string } | null)?.status ?? 'ok';
-      setStatusMessage(`${pending.kind} on "${pending.channelName}": ${status}`);
-    } catch (err) {
-      setStatusMessage(`${pending.kind} on "${pending.channelName}" failed: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      setBusy(false);
-      setPending(null);
-    }
-  }
 
   return (
     <div style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
-      {statusMessage && (
-        <div
-          role="status"
-          aria-live="polite"
-          style={{
-            fontFamily: 'var(--font-mono)',
-            fontSize: 'var(--fs-sm)',
-            color: 'var(--text-200)',
-            background: 'var(--bg-elevated)',
-            border: '1px solid var(--border)',
-            borderRadius: 'var(--radius-md)',
-            padding: 'var(--space-2) var(--space-3)',
-          }}
-        >
-          {statusMessage}
-        </div>
-      )}
       <ChannelsListSection
         selectedId={selectedId}
         onSelect={channel => {
           setSelectedId(channel.id);
           setSelectedName(channel.name);
         }}
-        onRequestAction={requestAction}
       />
       <LineupSection channelId={selectedId} channelName={selectedName} />
       <GuideSection />
 
-      <ConfirmDialog
-        open={pending !== null}
-        title={pending?.kind === 'compose' ? 'Compose channel?' : 'Run channel maintenance?'}
-        description={pending ? `This will queue a ${pending.kind} run for "${pending.channelName}".` : undefined}
-        confirmLabel={pending?.kind === 'compose' ? 'Compose' : 'Run maintenance'}
-        destructive={pending?.kind === 'maintenance'}
-        busy={busy}
-        onConfirm={confirmAction}
-        onCancel={() => setPending(null)}
-      />
     </div>
   );
 }

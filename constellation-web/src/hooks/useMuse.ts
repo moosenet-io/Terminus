@@ -456,10 +456,22 @@ export function useMuseGroupDynamics(): MuseSection<MuseGroupDynamics> {
 
 // ── Channels (muse.channels) ─────────────────────────────────────────────────
 
+/** Muse's real `ChannelSummary` — Muse `src/web/guide.rs:35`, cross-checked against a live
+ *  `GET /api/channels` on <host> (`.67:8098`, probed directly, bypassing the proxy).
+ *
+ *  THERE IS NO `item_count`. An earlier version of this interface declared `{id: string,
+ *  name: string, item_count: number}` — a shape taken from the MOCK adapter rather than from
+ *  the API, which Muse has never returned. Because the live list is empty today, every read
+ *  of it was `undefined` and nothing rendered, so the divergence stayed invisible; the first
+ *  real channel would have rendered "undefined items" and a numeric id compared against a
+ *  string. Typed from the server struct now, and the mock was corrected to match it. */
 export interface MuseChannel {
-  id: string;
+  id: number;
   name: string;
-  item_count: number;
+  kind: string;
+  mode: string;
+  channel_number: number | null;
+  enabled: boolean;
 }
 export interface MuseChannels {
   channels: MuseChannel[];
@@ -500,7 +512,7 @@ export interface MuseLineup {
 /** `channelId === null` renders an idle (not degraded, not loading) section -- use this while
  *  no channel is selected yet, so the lineup ChartCard shows its own empty state, not a spurious
  *  "not yet wired" degrade. */
-export function useMuseLineup(channelId: string | null): MuseSection<MuseLineup> {
+export function useMuseLineup(channelId: number | null): MuseSection<MuseLineup> {
   return useMuseSection<MuseLineup>(channelId ? `/api/channels/${encodeURIComponent(channelId)}/lineup` : null);
 }
 
@@ -592,18 +604,28 @@ export function useMuseTunerLineup(): MuseSection<unknown[]> {
 /** Compose/maintenance mutations -- both operator-RoleGated + ConfirmDialog-confirmed at the
  *  call site (ChannelsPanel), never fired directly from a click handler. See the aggregation
  *  client's mockWriteFor comment for why these paths aren't in the original §5.4 route list. */
+/** Body of `POST /channels/{id}/compose` — Muse `src/channels/routes.rs:50`. `show_media_item_ids`
+ *  is REQUIRED and must be non-empty; the handler rejects an empty list with 400. Compose is
+ *  therefore not a zero-argument "rebuild this channel" trigger: it schedules a session from an
+ *  explicit set of shows the caller chooses. */
+export interface MuseComposeRequest {
+  show_media_item_ids: number[];
+  target_session_ms?: number;
+}
+
 export function useMuseChannelActions() {
-  const composeChannel = useCallback(async (channelId: string) => {
-    return getAggregationClient().request('muse', `/api/channels/${encodeURIComponent(channelId)}/compose`, {
+  // Path verified live: `POST /channels/{id}/compose` -> 415 (route present, reached the JSON
+  // body extractor), while `POST /api/channels/{id}/compose` -> 404. The previous `/api/`-
+  // prefixed path did not exist; it is mounted on Muse's OPEN router at the root, not under
+  // the `/api` prefix that carries the channel READ routes (Muse `src/http/mod.rs:212`).
+  const composeChannel = useCallback(async (channelId: number, body: MuseComposeRequest) => {
+    return getAggregationClient().request('muse', `/channels/${encodeURIComponent(String(channelId))}/compose`, {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
     });
   }, []);
-  const runMaintenance = useCallback(async (channelId: string) => {
-    return getAggregationClient().request('muse', `/api/channels/${encodeURIComponent(channelId)}/maintenance`, {
-      method: 'POST',
-    });
-  }, []);
-  return { composeChannel, runMaintenance };
+  return { composeChannel };
 }
 
 /** Same-origin, relative art URL for `<img src>` -- deliberately NOT routed through

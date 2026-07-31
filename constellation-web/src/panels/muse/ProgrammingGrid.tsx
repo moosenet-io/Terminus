@@ -13,14 +13,21 @@
 //   • `GET /guide` returns `{"raw":"<!doctype html>…"}` — Muse's own HUMAN-FACING guide
 //     page, not a programme feed. There is no JSON schedule endpoint behind it today
 //     (`/api/guide`, `/guide.json`, `/api/channels/guide`, `/xmltv`, `/api/epg` all 404).
-//   • `channels.compose` — the thing that would CREATE a channel — is implemented and
-//     tested but HAS NO HTTP ROUTE MOUNTED (stated as a seam in the design guide itself,
-//     screen 08: "channels.compose is implemented + tested; no HTTP route mounts it yet").
+//   • `channels.compose` IS mounted, at `POST /channels/{id}/compose` (Muse
+//     `src/http/mod.rs:212`, on the OPEN router). An earlier version of this file — and of
+//     the empty-state copy — claimed it had "no HTTP route mounted". That was FALSE. It
+//     repeated a seam noted in the design guide (screen 08) that Muse has since closed under
+//     MUSE-31, without checking the running server. Probed directly against Muse on <host>:
+//     `POST /channels/999999/compose` -> 415 (route present, reached the body extractor)
+//     while `POST /api/channels/999999/compose` -> 404. The GUI was also calling the latter.
+//     What is actually true is narrower: compose requires a non-empty `show_media_item_ids`
+//     (`src/channels/routes.rs:50-59`), so it cannot be driven from a one-click button, and
+//     no show picker exists on this surface yet.
 //
-// The empty state says exactly those three things and nothing more. In particular it does
-// NOT claim a compose worker failed, stalled, or has not run — nothing in any response
-// reports worker state, so that would be an invented cause. "There are no channels" is
-// observable; "here is why there are no channels" is not, beyond the missing route.
+// The empty state says exactly those things and nothing more. In particular it does NOT
+// claim a compose worker failed, stalled, or has not run — nothing in any response reports
+// worker state, so that would be an invented cause. "There are no channels" is observable;
+// "here is why there are no channels" is not.
 //
 // ── WHAT IS DELIBERATELY ABSENT FROM THE GUIDE'S SCREEN 09 ───────────────────────────────
 //
@@ -29,9 +36,12 @@
 //   • **The fixed "48h window".** The axis span is DERIVED from the programme entries that
 //     actually exist. A hardcoded 48h axis on an empty grid would be a fabricated frame,
 //     complete with a meaningless now-marker position.
-//   • **`ch.mode` badge** (per-channel mode chip). `/api/channels` is empty here, so the
-//     element shape is unverified; the only channel fields this module has ever observed are
-//     `id`/`name`/`item_count`. A badge with no backing field is not shipped.
+//   • **`ch.mode` badge** (per-channel mode chip) is now DRAWN, as plain text beneath the
+//     channel name. The element shape is no longer a guess: `kind`/`mode`/`channel_number`/
+//     `enabled` are read off Muse's `ChannelSummary` struct (`src/web/guide.rs:35`). The live
+//     list is empty, so no real values have been observed — but the FIELDS are typed from the
+//     server, not from the mock, which is what the earlier `item_count` was and why it was
+//     wrong.
 //   • **Directional-tone coding** of programme blocks (colour by kind/genre). A guide entry
 //     carries `channel_id`/`title`/`start`/`end` and nothing categorical. Every block is
 //     therefore drawn in the same neutral tone — a colour scale over an absent field would
@@ -142,19 +152,44 @@ export function buildRows(channels: MuseChannel[], entries: MuseGuideEntry[]): G
     if (list) list.push(e);
     else byChannel.set(e.channel_id, [e]);
   }
+  // Channel ids are i64 on the wire; guide entries carry `channel_id` as a STRING. Compared
+  // as strings so the two sides actually match — `byChannel.get(1)` against a map keyed by
+  // "1" silently misses, which would orphan every programme block into an "unlisted" row.
   const rows: GridRow[] = channels.map(c => ({
-    key: c.id,
+    key: String(c.id),
     label: c.name,
     channel: c,
-    entries: byChannel.get(c.id) ?? [],
+    entries: byChannel.get(String(c.id)) ?? [],
   }));
-  const known = new Set(channels.map(c => c.id));
+  const known = new Set(channels.map(c => String(c.id)));
   for (const [channelId, list] of byChannel) {
     if (!known.has(channelId)) {
       rows.push({ key: `unlisted:${channelId}`, label: channelId, channel: null, entries: list });
     }
   }
   return rows;
+}
+
+/** What the grid is entitled to SAY, given the state of its two fetches.
+ *
+ *  Extracted as a pure function purely so it is testable: the bug this guards against was a
+ *  claim about a response ("returned an empty list") rendered when no response existed. There
+ *  is no DOM test harness in this package, so a component test could not pin it; this can.
+ *
+ *  Order matters. `loading` outranks everything (nothing has been observed yet), and
+ *  `degraded` outranks `empty` (an error is not an empty list). Only when the channel fetch
+ *  has actually SETTLED SUCCESSFULLY may zero rows be reported as an observed emptiness. */
+export type GridState = 'loading' | 'channels-degraded' | 'empty' | 'grid';
+
+export function gridState(input: {
+  channelsLoading: boolean;
+  guideLoading: boolean;
+  channelsDegraded: boolean;
+  rowCount: number;
+}): GridState {
+  if (input.channelsLoading || input.guideLoading) return 'loading';
+  if (input.channelsDegraded) return 'channels-degraded';
+  return input.rowCount === 0 ? 'empty' : 'grid';
 }
 
 function hhmm(ms: number): string {
@@ -214,9 +249,13 @@ function ChannelRow({ row, win }: { row: GridRow; win: TimeWindow }) {
           {row.label}
         </div>
         <div style={{ fontSize: 'var(--fs-2xs, 10px)', fontFamily: 'var(--font-mono)', color: 'var(--text-400, var(--text-300))' }}>
-          {/* `item_count` is a real channel field. The unlisted-channel row has no channel
-              record at all, so it says so instead of showing a zero it cannot justify. */}
-          {row.channel ? `${row.channel.item_count} items` : 'not in channel list'}
+          {/* `kind`/`mode` are real `ChannelSummary` fields. This previously rendered
+              `item_count`, which Muse does not return — it would have printed "undefined
+              items" for the first real channel. The unlisted-channel row has no channel
+              record at all, so it says so rather than showing values it cannot justify. */}
+          {row.channel
+            ? [row.channel.kind, row.channel.mode].filter(Boolean).join(' · ') || 'channel'
+            : 'not in channel list'}
         </div>
       </div>
       <div style={{ position: 'relative', flex: 1, minHeight: 34, padding: '4px 0' }}>
@@ -341,7 +380,46 @@ export function ProgrammingGrid({ nowMs = Date.now() }: ProgrammingGridProps) {
   const win = useMemo(() => deriveWindow(entries, nowMs), [entries, nowMs]);
   const rows = useMemo(() => buildRows(channels, entries), [channels, entries]);
 
-  if (rows.length === 0) {
+  // ── NEVER ASSERT AN EMPTY LIST BEFORE ONE ARRIVES ───────────────────────────────────────
+  // `museChannelList(null)` returns `[]`, so a still-loading or FAILED fetch produced zero
+  // rows and fell straight into the empty state below, which states as fact that
+  // "GET /api/channels returned an empty list". While loading, no such response exists yet;
+  // when degraded, the response was an ERROR, not an empty list. Either way the sentence was
+  // a fabricated observation — the precise failure this panel exists to prevent, committed by
+  // the panel itself (codex).
+  //
+  // The parent card cannot cover this: `ChannelsPanel` drives its chrome from its OWN
+  // `useMuseGuide()` instance and passes `empty` only in table view, so in grid view it
+  // renders these children while its own request is still in flight.
+  const state = gridState({
+    channelsLoading: channelsSection.loading,
+    guideLoading: guideSection.loading,
+    channelsDegraded: channelsSection.degraded !== false,
+    rowCount: rows.length,
+  });
+
+  if (state === 'loading') {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', fontSize: 'var(--fs-xs)', color: 'var(--text-400, var(--text-300))' }}>
+        Loading channels and guide…
+      </div>
+    );
+  }
+  if (state === 'channels-degraded') {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)', height: '100%', justifyContent: 'center', padding: 'var(--space-3)', fontSize: 'var(--fs-xs)', color: 'var(--text-300)' }}>
+        <div style={{ color: 'var(--text-200)' }}>Channel list unavailable.</div>
+        <div>
+          <code style={{ fontFamily: 'var(--font-mono)' }}>GET /api/channels</code> did not return a
+          list: {channelsSection.degraded === false ? 'unknown error' : channelsSection.degraded.detail}. This is an error, not an empty library — nothing
+          is implied here about whether channels exist.
+        </div>
+        <TunerTelemetry nowMs={nowMs} />
+      </div>
+    );
+  }
+
+  if (state === 'empty') {
     return (
       <div
         style={{
@@ -362,8 +440,10 @@ export function ProgrammingGrid({ nowMs = Date.now() }: ProgrammingGridProps) {
           <code style={{ fontFamily: 'var(--font-mono)' }}>GET /api/channels</code> returned an empty list.
         </div>
         <div>
-          Channel creation (<code style={{ fontFamily: 'var(--font-mono)' }}>channels.compose</code>) is
-          implemented and tested but has no HTTP route mounted, so no channel can be created from here.
+          Composing a channel (
+          <code style={{ fontFamily: 'var(--font-mono)' }}>POST /channels/{'{id}'}/compose</code>) requires
+          an explicit set of shows (<code style={{ fontFamily: 'var(--font-mono)' }}>show_media_item_ids</code>),
+          and this surface has no show picker yet — so a channel cannot be composed from here.
         </div>
         {htmlOnly && (
           <div>

@@ -1,8 +1,8 @@
 // MGUI-10: the rules that make the programming grid HONEST rather than decorative. Each test
 // below guards a specific "never invent data" invariant, not just arithmetic.
 import { describe, it, expect } from 'vitest';
-import { museChannelList, museGuideEntries, type MuseGuideEntry } from '../../hooks/useMuse';
-import { deriveWindow, blockGeometry, buildRows } from './ProgrammingGrid';
+import { museChannelList, museGuideEntries, type MuseGuideEntry, type MuseChannel } from '../../hooks/useMuse';
+import { deriveWindow, blockGeometry, buildRows, gridState } from './ProgrammingGrid';
 
 const T0 = Date.UTC(2026, 6, 31, 20, 0, 0); // 20:00Z
 const entry = (channel_id: string, offsetH: number, durH: number, title = 'x'): MuseGuideEntry => ({
@@ -12,12 +12,24 @@ const entry = (channel_id: string, offsetH: number, durH: number, title = 'x'): 
   end: new Date(T0 + (offsetH + durH) * 3_600_000).toISOString(),
 });
 
+/** A `ChannelSummary` as Muse actually returns it (Muse `src/web/guide.rs:35`) — no
+ *  `item_count`, numeric id. These fixtures previously used the MOCK's invented shape, so
+ *  they passed while the production type was wrong. */
+const ch = (id: number, name: string): MuseChannel => ({
+  id,
+  name,
+  kind: 'series',
+  mode: 'shuffle',
+  channel_number: null,
+  enabled: true,
+});
+
 describe('/api/channels shape normalization', () => {
   // The live endpoint answers a bare array; the mock answers an envelope. Reading only
   // `data.channels` would render an empty list against a populated backend.
   it('accepts both the live bare array and the mocked envelope', () => {
-    expect(museChannelList([{ id: 'a', name: 'A', item_count: 1 }])).toHaveLength(1);
-    expect(museChannelList({ channels: [{ id: 'a', name: 'A', item_count: 1 }] })).toHaveLength(1);
+    expect(museChannelList([ch(1, 'A')])).toHaveLength(1);
+    expect(museChannelList({ channels: [ch(1, 'A')] })).toHaveLength(1);
   });
 
   it('yields an empty list rather than a guess for a null or unrecognized payload', () => {
@@ -90,7 +102,7 @@ describe('block geometry', () => {
 
 describe('row assembly', () => {
   it('keeps a channel with no programming as an explicit empty row', () => {
-    const rows = buildRows([{ id: 'ch-1', name: 'One', item_count: 3 }], []);
+    const rows = buildRows([ch(1, 'One')], []);
     expect(rows).toHaveLength(1);
     expect(rows[0].entries).toEqual([]);
   });
@@ -104,5 +116,41 @@ describe('row assembly', () => {
 
   it('produces no rows at all when there are neither channels nor entries', () => {
     expect(buildRows([], [])).toEqual([]);
+  });
+});
+
+
+describe('never asserts an empty list before one arrives', () => {
+  // The regression: `museChannelList(null)` yields `[]`, so a still-in-flight or FAILED
+  // channels fetch produced zero rows and rendered copy stating as fact that
+  // "GET /api/channels returned an empty list" — an observation of a response that did not
+  // exist. Each case below pins one state where that sentence must NOT be reachable.
+  const base = { channelsLoading: false, guideLoading: false, channelsDegraded: false, rowCount: 0 };
+
+  it('reports loading while the channels fetch is in flight, not emptiness', () => {
+    expect(gridState({ ...base, channelsLoading: true })).toBe('loading');
+  });
+
+  it('reports loading while the GUIDE fetch is in flight too', () => {
+    // Both feed the grid; either one outstanding means the row set is not yet settled.
+    expect(gridState({ ...base, guideLoading: true })).toBe('loading');
+  });
+
+  it('distinguishes a failed channels fetch from an empty one', () => {
+    // An error is not an empty list. Collapsing the two is what let the panel claim the
+    // library had no channels when the request had in fact failed.
+    expect(gridState({ ...base, channelsDegraded: true })).toBe('channels-degraded');
+  });
+
+  it('ranks loading above degraded', () => {
+    expect(gridState({ ...base, channelsLoading: true, channelsDegraded: true })).toBe('loading');
+  });
+
+  it('only calls it empty once the fetch has settled successfully with zero rows', () => {
+    expect(gridState(base)).toBe('empty');
+  });
+
+  it('renders the grid when rows exist', () => {
+    expect(gridState({ ...base, rowCount: 3 })).toBe('grid');
   });
 });
