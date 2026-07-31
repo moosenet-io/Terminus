@@ -72,9 +72,23 @@ impl CachePolicy {
 ///   masquerade as now.
 /// - Severe-weather ALERTS are deliberately ABSENT from this table (see
 ///   `is_never_cached`): a stale storm warning is worse than a slow one.
+///
+/// `per_principal` is a PRIVACY judgement, not a freshness one:
+/// - `news_` — the same public headlines for everybody; the args fully determine
+///   the answer, so one shared entry is correct.
+/// - `weather` — **per-principal (TRTR-05)**. It looks like a pure function of
+///   its arguments, and for an explicit location it is. But with the location
+///   OMITTED the answer depends on WHO asked: the operator's answer is resolved
+///   from the operator's calendar/home-work routine and is attributed out loud
+///   ("using <place> — from your calendar (<event summary>)"), while a guest is
+///   asked which place they mean. Sharing one entry keyed on `weather` + `{}`
+///   would hand the operator's cached, attributed answer straight to the next
+///   guest who asks — routing round the caller gate in `crate::weather` entirely,
+///   since a cache hit never reaches the tool. The cost is a lower hit rate
+///   across household members; the alternative is a disclosure.
 const SEED_POLICY: &[(&str, CachePolicy)] = &[
     ("news_", CachePolicy::new(900, 86_400, false)),
-    ("weather", CachePolicy::new(1_200, 21_600, false)),
+    ("weather", CachePolicy::new(1_200, 21_600, true)),
 ];
 
 /// Tools that must NEVER be served from cache regardless of any prefix policy.
@@ -351,6 +365,23 @@ mod tests {
         assert!(policy_for("news_headlines").is_some());
         assert!(policy_for("news_search").is_some());
         assert!(policy_for("weather").is_some());
+    }
+
+    /// TRTR-05: with the location OMITTED, `weather`'s answer depends on WHO
+    /// asked — the operator's is resolved from their calendar/routine and says
+    /// so. A shared cache entry would serve that answer to the next guest who
+    /// asks the identical question, and a cache hit never reaches the tool's own
+    /// caller gate, so this key is the only thing standing in the way.
+    #[test]
+    fn weather_is_cached_per_principal_so_one_answer_is_never_reused_across_people() {
+        let p = policy_for("weather").expect("weather is cached");
+        assert!(p.per_principal, "weather answers are principal-specific");
+        let same_question = json!({});
+        let operator = ToolCache::key("weather", &same_question, Some("operator-identity"), p.per_principal);
+        let guest = ToolCache::key("weather", &same_question, Some("guest-identity"), p.per_principal);
+        let anon = ToolCache::key("weather", &same_question, None, p.per_principal);
+        assert_ne!(operator, guest);
+        assert_ne!(operator, anon);
     }
 
     #[test]

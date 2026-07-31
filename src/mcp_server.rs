@@ -345,9 +345,24 @@ impl McpServerState {
             }
         }
         // 2. Core registry.
+        //
+        // TRTR-05: carry what the gateway knows about this principal into
+        // dispatch, so a tool that can otherwise fold in OPERATOR context
+        // (`weather`'s calendar/routine location inference) learns who is
+        // actually asking. `caller_context` is read-only — the authorization
+        // decision and its audit entry are made by this function's CALLER, which
+        // is the one place that knows whether this is a foreground turn or a
+        // background cache refresh. With no gateway configured there is no
+        // verified principal at all, and `CallerContext::untrusted()` is the
+        // correct, fail-closed answer.
+        let caller = self
+            .gateway
+            .as_ref()
+            .map(|gw| gw.caller_context(principal))
+            .unwrap_or_default();
         let reg = self.registry.load();
-        if let Some(r) = reg.call(name, args.clone()).await {
-            return r.map_err(|e| e.to_string());
+        if let Some(r) = reg.call_with_caller(name, args.clone(), caller).await {
+            return r.map(|o| o.text).map_err(|e| e.to_string());
         }
         // 3. Broker worker routes.
         let broker_routes = self.broker_routes.load();
@@ -1234,7 +1249,19 @@ async fn handle_mcp(
                     )
                 }
                 Some(CallRoute::Local) | None => match reg
-                .call_structured(name, arguments.clone())
+                .call_with_caller(
+                    name,
+                    arguments.clone(),
+                    // TRTR-05: the same server-verified principal `guard()` just
+                    // authorized above decides what OPERATOR context a tool may
+                    // use on this caller's behalf. No gateway = no verified
+                    // identity = the fail-closed default.
+                    state
+                        .gateway
+                        .as_ref()
+                        .map(|gw| gw.caller_context(principal.as_ref()))
+                        .unwrap_or_default(),
+                )
                 .await
             {
                 Some(Ok(output)) => {
