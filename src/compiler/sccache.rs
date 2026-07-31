@@ -432,61 +432,95 @@ fn redis_usable(parts: &RedisUrlParts, timeout: std::time::Duration) -> bool {
 /// that would slow every healthy build for no additional signal.
 const POST_SUCCESS_DRAIN_MS: u64 = 100;
 
-/// Bounded post-success check: `true` iff NOTHING unexpected arrives on `stream`
-/// within [`POST_SUCCESS_DRAIN_MS`] after a complete, affirmative reply.
+/// Bounded post-success check: `true` iff we can CONFIRM that nothing
+/// unexpected arrives on `stream` within [`POST_SUCCESS_DRAIN_MS`] after a
+/// complete, affirmative reply.
 ///
 /// `evaluate_probe_reply` rejects trailing garbage that was already COALESCED
 /// into the read buffer, but it can only judge bytes it has been given. This
 /// closes the segmentation hole: the invariant is "trailing garbage is ALWAYS
 /// unhealthy", not "trailing garbage that happened to land in the first read".
 ///
-/// ⚠ READ THIS BEFORE "FIXING" THE TIMEOUT HANDLING — it is the inverse of the
-/// rest of this module. Everywhere else a read timeout means "the server never
-/// answered" ⇒ UNUSABLE. HERE the server has already answered correctly and we
-/// are only listening for bytes we hope never come, so a timeout with nothing
-/// received is the EXPECTED HEALTHY outcome ⇒ `true`. Treating it as a failure
-/// would declare every real Redis unusable and give the whole fleet cold builds.
+/// **The rule, stated once, with no list of exceptions to remember: the ONLY
+/// healthy outcomes of this check are a CLEAN EOF and BOUNDED SILENCE.
+/// Everything else — unsolicited bytes, a connection reset, any other I/O
+/// error, or an inability to bound the read at all — is UNHEALTHY.** An earlier
+/// round of this code stated the rule as "…and any other error is also healthy,
+/// because we already hold a good reply", and that exception is exactly what let
+/// a check that never COMPLETED report itself as a check that PASSED.
 ///
-/// The three outcomes:
-/// - `Ok(0)` — clean EOF, server closed with nothing further. Healthy: a close
-///   is not garbage.
-/// - `Ok(n > 0)` — unsolicited bytes. UNHEALTHY ⇒ the caller falls open.
-/// - `Err(timeout)` — silence for the whole window. Healthy (see above).
+/// Why "could not verify ⇒ unhealthy" is the right asymmetry: "unhealthy" here
+/// is not a failure, it is a FALLBACK. The caller drops to the local sccache dir
+/// and the build proceeds, just without a shared cache. So:
+/// - wrongly unhealthy ⇒ a slower build. Recoverable, invisible, cheap.
+/// - wrongly healthy ⇒ cargo launches with `RUSTC_WRAPPER=sccache` against a
+///   Redis we could NOT verify, dies ~1 s in having compiled nothing, and the
+///   gate reports `0 passed / 0 failed / no summary` — which every consumer
+///   misreads as "no failures". That is the original TERM #564 bug.
 ///
-/// Any other I/O error is also treated as healthy: we already have a complete,
-/// well-formed, affirmative reply, and a post-reply reset/error is not evidence
-/// of trailing garbage. The asymmetry still holds — a false "unhealthy" only
-/// costs a slower local build — but it does not license inventing failures on a
-/// server that answered us correctly.
+/// Returning `true` because verification could not be COMPLETED is fail-closed
+/// disguised as fail-open. Do not reintroduce it.
+///
+/// ⚠ READ THIS BEFORE "FIXING" THE TIMEOUT HANDLING — the timeout arm is the
+/// inverse of every other timeout in this module. Everywhere else a read timeout
+/// means "the server never answered" ⇒ UNUSABLE. HERE the server has already
+/// answered correctly and we are only listening for bytes we hope never come, so
+/// a timeout with nothing received is the EXPECTED HEALTHY outcome ⇒ `true`.
+/// Treating it as a failure would declare every real Redis unusable and give the
+/// whole fleet cold builds. That single inversion is deliberate; nothing else in
+/// here is.
+///
+/// The decision itself lives in [`post_success_drain_is_healthy`], which is pure
+/// and exhaustively unit-tested.
 fn no_unsolicited_trailing_bytes(stream: &mut std::net::TcpStream) -> bool {
     use std::io::Read;
 
     let window = std::time::Duration::from_millis(POST_SUCCESS_DRAIN_MS);
     if stream.set_read_timeout(Some(window)).is_err() {
-        // Without a bounded read we could block indefinitely; the reply we hold
-        // is already complete and valid, so accept it rather than risk a stall.
-        return true;
+        // We cannot BOUND the read, so we cannot run the check at all: an
+        // unbounded read could stall the build, and returning early would report
+        // "verified" for a verification that never happened. Unhealthy ⇒ the
+        // caller falls open to the local cache dir.
+        return post_success_drain_is_healthy(None);
     }
     let mut buf = [0u8; 64];
-    match stream.read(&mut buf) {
-        // Clean EOF with nothing further — healthy.
-        Ok(0) => true,
+    post_success_drain_is_healthy(Some(&stream.read(&mut buf)))
+}
+
+/// The WHOLE decision of the post-success drain, as a pure function over the
+/// read's outcome — so every arm is directly unit-testable, including the
+/// "could not bound the read" case, which cannot be provoked through a live
+/// socket without unreasonable contortions.
+///
+/// `read` is `None` when the read could not even be ATTEMPTED under a bound
+/// (i.e. `set_read_timeout` failed).
+///
+/// | outcome | verdict |
+/// |---|---|
+/// | `None` — the read could not be bounded, so nothing was verified | **UNHEALTHY** |
+/// | `Ok(0)` — clean EOF, server closed saying nothing further | healthy |
+/// | `Ok(n > 0)` — unsolicited trailing bytes | **UNHEALTHY** |
+/// | `Err(WouldBlock)` / `Err(TimedOut)` — bounded silence | healthy |
+/// | `Err(_)` — reset, or any other I/O error | **UNHEALTHY** |
+///
+/// Two healthy outcomes, everything else unhealthy. That rule is easier to keep
+/// true than the list of exceptions it replaced.
+fn post_success_drain_is_healthy(read: Option<&std::io::Result<usize>>) -> bool {
+    match read {
+        // Could not bound the read ⇒ could not verify ⇒ not healthy.
+        None => false,
+        // Clean EOF with nothing further — healthy. A close is not garbage.
+        Some(Ok(0)) => true,
         // Unsolicited bytes after a complete reply — unhealthy, fall open.
-        Ok(_) => false,
-        // ⚠ The window expired in silence. That is the GOOD case here (inverse of
-        // every other timeout in this module — see the doc comment above).
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
-        {
-            true
-        }
-        // Some other post-reply I/O error (e.g. a reset). We already hold a
-        // complete, well-formed, affirmative reply and observed no trailing
-        // bytes, so this is not evidence of garbage.
-        Err(_) => true,
+        Some(Ok(_)) => false,
+        // ⚠ A window that expired in SILENCE is the GOOD case here (the one
+        // deliberate inversion — see the doc comment above). Every OTHER I/O
+        // error (a reset, in particular) means the check did not complete, and
+        // an incomplete check is never a pass.
+        Some(Err(e)) => matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
     }
 }
 
@@ -1242,6 +1276,140 @@ mod tests {
              the server's hold: took {:?}",
             started.elapsed()
         );
+    }
+
+    // ── Round-5 finding: an INCOMPLETE post-success check is not a PASS ──────
+    //
+    // Two paths used to return `true` (healthy) from `no_unsolicited_trailing_bytes`
+    // without having verified anything: a non-timeout `Err(_)` from the drain read,
+    // and a `set_read_timeout` failure. Both are now UNHEALTHY. "Unhealthy" is a
+    // FALLBACK (local cache dir, slower build), not a failure; a false "healthy"
+    // is the original TERM #564 dead-gate. The cheap mistake is the correct one.
+
+    /// Like [`spawn_fake_redis`], but after writing a COMPLETE, VALID reply and
+    /// waiting `gap`, it aborts the connection with `SO_LINGER = 0` so the peer
+    /// observes an **ECONNRESET**, not a clean FIN. That is the only way to drive
+    /// the drain's non-timeout `Err(_)` arm through a real socket.
+    ///
+    /// The `gap` matters: it gives the probe time to consume the reply first, so
+    /// the reset lands while the probe is in its post-success drain with an empty
+    /// receive buffer (a reset arriving with unread data would instead destroy
+    /// the reply, and the test would pass for the wrong reason). The mutation
+    /// check below is what proves the intended arm is the one being exercised.
+    #[cfg(unix)]
+    fn spawn_fake_redis_then_reset(
+        reply: &'static [u8],
+        gap: std::time::Duration,
+    ) -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let mut scratch = [0u8; 256];
+                let _ = sock.read(&mut scratch);
+                let _ = sock.write_all(reply);
+                let _ = sock.flush();
+                std::thread::sleep(gap);
+                // SO_LINGER = 0 ⇒ close() emits RST instead of FIN, which is
+                // what makes the peer's next read fail with ECONNRESET.
+                // `TcpStream::set_linger` is still unstable on the pinned
+                // toolchain (rust #88494), so set the sockopt directly; `libc`
+                // is already a direct dependency of this crate.
+                use std::os::unix::io::AsRawFd;
+                let linger = libc::linger {
+                    l_onoff: 1,
+                    l_linger: 0,
+                };
+                // SAFETY: `sock` is a live, owned socket fd for the duration of
+                // this call, and `&linger`/its size describe a correctly-typed
+                // `struct linger` for SOL_SOCKET/SO_LINGER.
+                let rc = unsafe {
+                    libc::setsockopt(
+                        sock.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_LINGER,
+                        &linger as *const libc::linger as *const libc::c_void,
+                        std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                    )
+                };
+                debug_assert_eq!(rc, 0, "SO_LINGER=0 must be settable for the reset test");
+                drop(sock);
+            }
+        });
+        addr
+    }
+
+    /// A server that answers `+OK\r\n+PONG\r\n` correctly and then ABRUPTLY
+    /// RESETS the connection. The reply looked good, but the post-success check
+    /// could not be completed — so we did not verify the absence of trailing
+    /// garbage, and an unverified probe must fall open.
+    ///
+    /// Mutation-check for a future reader: flip the `Some(Err(_))` arm of
+    /// `post_success_drain_is_healthy` back to `true` and this test goes RED
+    /// (verified when it was written).
+    #[test]
+    #[cfg(unix)]
+    fn real_probe_rejects_a_connection_reset_after_pong() {
+        let addr = spawn_fake_redis_then_reset(
+            b"+OK\r\n+PONG\r\n",
+            std::time::Duration::from_millis(40),
+        );
+        assert!(
+            !probe_against(addr, "redis://default:placeholder-password@127.0.0.1:{port}/1"),
+            "a peer that resets the connection after +PONG left the post-success check \
+             INCOMPLETE — an incomplete verification must fall open, never report healthy"
+        );
+    }
+
+    /// The pure decision function, every arm — including the `set_read_timeout`
+    /// failure path (`None`), which is not reachable through a live socket
+    /// without unreasonable contortions and is therefore covered here directly.
+    ///
+    /// Mutation-checks (each verified when written): flipping `None => false` to
+    /// `true`, or `Some(Err(_)) => …` to unconditional `true`, turns the
+    /// correspondingly-named assertion below RED.
+    #[test]
+    fn post_success_drain_only_clean_eof_and_bounded_silence_are_healthy() {
+        use std::io::{Error, ErrorKind};
+
+        // ── the ONLY two healthy outcomes ────────────────────────────────────
+        assert!(
+            post_success_drain_is_healthy(Some(&Ok(0))),
+            "clean EOF is healthy: a close is not garbage"
+        );
+        assert!(
+            post_success_drain_is_healthy(Some(&Err(Error::from(ErrorKind::WouldBlock)))),
+            "bounded silence after +PONG is the EXPECTED healthy outcome"
+        );
+        assert!(
+            post_success_drain_is_healthy(Some(&Err(Error::from(ErrorKind::TimedOut)))),
+            "bounded silence (reported as TimedOut on some platforms) is healthy"
+        );
+
+        // ── everything else is unhealthy ─────────────────────────────────────
+        assert!(
+            !post_success_drain_is_healthy(None),
+            "a read we could not BOUND verified nothing — reporting healthy there is \
+             fail-closed disguised as fail-open (set_read_timeout failure path)"
+        );
+        assert!(
+            !post_success_drain_is_healthy(Some(&Ok(1))),
+            "unsolicited trailing bytes are unhealthy"
+        );
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::NotConnected,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !post_success_drain_is_healthy(Some(&Err(Error::from(kind)))),
+                "{kind:?} left the post-success check incomplete — unhealthy"
+            );
+        }
     }
 
     /// Finding 1: a `rediss://` (TLS) endpoint is unverifiable by this plaintext
