@@ -91,6 +91,29 @@ it is never merged with the default.
 
 ## The guest / family baseline
 
+> ### ⚠ Scope: what the guest baseline does **not** protect (TERM #577)
+>
+> The baseline constrains a caller that authenticates as its **own gateway
+> principal** — its own client cert / tailnet identity / named PAT, with its own
+> entry in this map. It does **not** yet distinguish two humans sharing one
+> identity, and today they do: **every person who talks to Lumina arrives at the
+> gateway as `identity=lumina`.** The mTLS principal names the *service*, not the
+> person; the human identity known at the web edge (`X-Lumina-User`,
+> `src/constellation/proxy.rs`) is not forwarded through Chord and never reaches
+> `gateway_framework`.
+>
+> So a houseguest conversing with the assistant today is authorized as `lumina`
+> — holding `google_calendar_today`, `commute_estimate` and full inference — and
+> neither this list nor the weather entitlement gate applies to them. The same
+> limit applies to the per-principal tool cache: it isolates `lumina` from
+> `guest-alex`, not two humans who are both `lumina`.
+>
+> **Provisioning guest identities without closing TERM #577 gives a FALSE sense
+> of containment.** The guest surface is real only for a separately
+> authenticated principal. Closing the gap needs end-to-end human-identity
+> propagation — design work tracked as **TERM #577** (a blocker for the `hearth`
+> family sprint), not a wider or cleverer grant map.
+
 Set `TERMINUS_GATEWAY_GUEST_IDENTITIES` to a comma-separated list of identity
 names and each gets the baseline grant:
 
@@ -104,7 +127,7 @@ Today's surface (`GUEST_BASELINE_ALLOW`, exact tool names):
 |---|---|
 | `/v1/agent/execute` | The assistant turn itself — a guest must be able to *talk* to Lumina or the tool grant is inert. Every tool the router dispatches inside the turn is re-checked against this same grant, so the route grants conversation, not reach. The raw completion routes (`/v1/chat/completions`, …) are **not** granted: those bypass per-principal tool selection and let the caller pick the model and prompt. A guest gets the assistant, not the engine. |
 | `time_now` | The authoritative fleet clock. No arguments reach a backend, nothing is read or written. |
-| `weather` | Public third-party forecast for a caller-supplied location. No fleet or household state. |
+| `weather` | Public third-party forecast for a location the caller supplies **explicitly**. The tool *can* otherwise infer an omitted location from the operator's calendar or home/work routine; that inference is gated on `CALENDAR_CONTEXT_PROBE`/`ROUTINE_CONTEXT_PROBE`, neither of which is granted here. What makes it safe for a guest principal is the explicit-location-only path, **not** an absence of household data in the tool — and see the scope warning above for who is (and is not) a guest principal. |
 | `news_headlines`, `news_search`, `news_topic` | Public news retrieval, read-only. |
 | `media_search`, `media_recommend`, `media_recently_added`, `media_on_deck` | Media **discovery** — browsing the catalogue. |
 

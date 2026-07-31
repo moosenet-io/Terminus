@@ -209,6 +209,21 @@ pub const DEFAULT_SENSITIVE_DENY_PREFIXES: &[&str] = &[
 /// it second-hand. Probing an existing grant rather than adding a second
 /// identity list is deliberate: there is exactly one place to edit, so the two
 /// can never drift apart.
+///
+/// # SCOPE — what this gate does NOT protect
+///
+/// The entitlement is per GATEWAY PRINCIPAL, and a principal names a SERVICE,
+/// not a person. Every human who talks to Lumina arrives here as
+/// `identity=lumina`, which HOLDS this probe tool — the human identity known at
+/// the web edge (`X-Lumina-User`) is not forwarded through Chord and never
+/// reaches this module. So this gate withholds operator context from a caller
+/// authenticating as its OWN principal; it does NOT withhold it from a
+/// houseguest talking to the assistant, because that person *is* `lumina` as
+/// far as this decision can see. Reading it as household-level privacy is the
+/// misreading to avoid; provisioning guest identities without closing the gap
+/// gives a FALSE sense of containment. Closing it needs end-to-end
+/// human-identity propagation — **TERM #577**, a blocker for the `hearth`
+/// family sprint.
 pub const CALENDAR_CONTEXT_PROBE: &str = "google_calendar_today";
 
 /// TRTR-05 (privacy): the tool that already exposes the operator's configured
@@ -216,10 +231,38 @@ pub const CALENDAR_CONTEXT_PROBE: &str = "google_calendar_today";
 /// routine-inference counterpart of [`CALENDAR_CONTEXT_PROBE`]; the two are
 /// probed separately so a principal trusted with one source is not
 /// automatically handed the other.
+///
+/// # SCOPE
+///
+/// Same limit as [`CALENDAR_CONTEXT_PROBE`], and for the same reason: this
+/// probe distinguishes gateway PRINCIPALS, not humans. A houseguest conversing
+/// with the assistant is authorized as `lumina`, which holds this tool, so the
+/// gate does not contain them. See TERM #577.
 pub const ROUTINE_CONTEXT_PROBE: &str = "commute_estimate";
 
 /// TRTR-05: the GUEST/FAMILY baseline surface — the exact set of tool names a
 /// non-operator household identity (a family member, a houseguest) may call.
+///
+/// # SCOPE — what this does NOT protect (read before provisioning a guest)
+///
+/// This list constrains a caller that authenticates as its OWN gateway
+/// principal — its own client cert / tailnet identity / named PAT, with its own
+/// entry in the grant map. It does NOT yet distinguish two humans who share one
+/// identity, and today they do: **every person who talks to Lumina arrives at
+/// this gateway as `identity=lumina`.** The mTLS `Principal` names the SERVICE,
+/// not the person; the human identity known at the web edge
+/// (`X-Lumina-User`, `crate::constellation::proxy`) is not forwarded through
+/// Chord and never reaches this module. So a houseguest conversing with the
+/// assistant is authorized as `lumina` — which holds
+/// [`CALENDAR_CONTEXT_PROBE`], [`ROUTINE_CONTEXT_PROBE`] and full inference —
+/// and none of the narrowing below applies to them.
+///
+/// Provisioning guest identities WITHOUT closing that gap therefore buys a
+/// FALSE sense of containment: this surface is real only for a separately
+/// authenticated principal, not for whoever is currently in the room. Closing
+/// it needs end-to-end human-identity propagation (design work, tracked as
+/// **TERM #577**, a blocker for the `hearth` family sprint) — not a wider or
+/// cleverer grant map.
 ///
 /// **This is an ALLOWLIST by construction, and that is the load-bearing
 /// property.** The scaffolded `lumina`/`harmony` posture is
@@ -533,6 +576,44 @@ fn validate_grant(value: &Value) -> Result<Grant, String> {
     }
 }
 
+/// TRTR-05 (round 2): validate one TOP-LEVEL IDENTITY KEY of
+/// `TERMINUS_GATEWAY_ALLOWLIST_JSON`, on the same rule [`validate_entries`]
+/// applies to the entries inside a grant.
+///
+/// An identity is a principal name (`crate::mesh::Principal` — an mTLS client
+/// cert CN, a tailnet WhoIs name, a named-PAT identity): never empty, never
+/// whitespace-bearing. A key that is empty, whitespace-only, or
+/// whitespace-PADDED (`" lumina"`) can therefore never match any real
+/// principal, while reading in a config review as though it grants something.
+/// That gap between what the config appears to say and what it does is the
+/// hazard — such a key is harmless today only by accident, and it is weaker
+/// than the fail-closed property the rest of this parsing claims.
+///
+/// A padded key is REJECTED rather than trimmed, deliberately: trimming would
+/// synthesise a grant the operator did not literally write (`" moose": ["*"]`
+/// silently becoming a real wildcard for `moose`) — the fail-OPEN direction —
+/// whereas rejecting loses nothing that could ever have matched and surfaces
+/// the typo. Same reasoning as [`validate_entries`] rejecting, rather than
+/// trimming, a whitespace-bearing grant entry.
+fn validate_identity_key(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("an empty identity key matches no principal and is a config error".to_string());
+    }
+    if id.trim().is_empty() {
+        return Err(
+            "a whitespace-only identity key matches no principal and is a config error".to_string()
+        );
+    }
+    if id.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "identity key '{id}' contains whitespace; principal names never do, so it could never \
+             match. It is NOT trimmed to a valid name -- trimming would synthesise a grant that \
+             was never written"
+        ));
+    }
+    Ok(())
+}
+
 /// Which side of a grant an entry sits on — allow entries may carry a trailing
 /// `*` wildcard, deny entries are literal prefixes and may not (see
 /// [`validate_grant`]).
@@ -618,6 +699,81 @@ fn scaffold_defaults() -> HashMap<String, Grant> {
         .collect()
 }
 
+/// The body of [`AllowlistPolicy::from_env`], taking its two config reads as
+/// arguments so the load rules (precedence, per-key and per-grant validation,
+/// the unrestricted-wildcard warning) are testable without mutating process
+/// env from parallel test threads. Semantics are exactly `from_env`'s — see its
+/// doc comment; nothing here reads config itself.
+fn build_entries(raw: &str, guest_identities: Vec<String>) -> HashMap<String, Grant> {
+    let mut entries = scaffold_defaults();
+
+    // TRTR-05: guest/family identities, declared by the operator in
+    // `TERMINUS_GATEWAY_GUEST_IDENTITIES`, get the narrow allowlist-built
+    // baseline. Applied AFTER the scaffold and BEFORE the env JSON, so an
+    // explicit env entry still wins for any identity the operator wants to
+    // shape by hand.
+    for id in guest_identities {
+        entries.insert(id, guest_baseline_grant());
+    }
+
+    match serde_json::from_str::<HashMap<String, Value>>(raw) {
+        Ok(parsed) => {
+            for (id, value) in parsed {
+                // TRTR-05 (round 2): the KEY is validated first, on the same
+                // drop-this-entry-only terms as a malformed grant VALUE below.
+                // A degenerate key (empty / whitespace-only / whitespace-padded)
+                // can never match a real principal, so dropping it removes
+                // nothing that was ever reachable -- but leaving it in place
+                // would leave a config entry that LOOKS like it grants
+                // something and silently does not. The whole map is NOT
+                // rejected: that would turn one typo into a fleet-wide outage.
+                if let Err(e) = validate_identity_key(&id) {
+                    tracing::warn!(
+                        "gateway_framework: TERMINUS_GATEWAY_ALLOWLIST_JSON has an invalid \
+                         identity key {id:?} ({e}) -- that entry is DROPPED; every other \
+                         identity's grant is unaffected"
+                    );
+                    continue;
+                }
+                // Per-identity validation: one bad entry denies THAT
+                // identity (it keeps its scaffold/guest default, or has no
+                // entry at all and is default-denied), rather than either
+                // being coerced into something broader OR nuking every
+                // other identity's config.
+                match validate_grant(&value) {
+                    Ok(grant) => {
+                        entries.insert(id, grant);
+                    }
+                    Err(e) => tracing::error!(
+                        "gateway_framework: TERMINUS_GATEWAY_ALLOWLIST_JSON entry for \
+                         identity '{id}' is invalid ({e}) -- that identity is DENIED (its \
+                         grant is dropped, never widened) until the config is fixed"
+                    ),
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                "gateway_framework: TERMINUS_GATEWAY_ALLOWLIST_JSON is not valid JSON \
+                 ({e}) -- falling back to the scaffold-only allowlist policy (deny-all \
+                 except the lumina/harmony safe default)"
+            );
+        }
+    }
+
+    for (id, grant) in &entries {
+        if is_unrestricted_wildcard(grant) {
+            tracing::warn!(
+                "gateway_framework: identity '{id}' holds an UNRESTRICTED wildcard grant -- \
+                 every tool and inference route, with no sensitive-deny layer. Intended for \
+                 operator identities only; see docs/reference/tool-grants.md"
+            );
+        }
+    }
+
+    entries
+}
+
 /// Per-identity allow policy: which tool names / inference routes each
 /// enrolled identity may use. Config-driven
 /// (`crate::config::gateway_allowlist_json`, a JSON object of
@@ -668,61 +824,16 @@ impl AllowlistPolicy {
     ///   scaffold/guest default, or to default-deny) rather than being coerced
     ///   into a broader grant or discarding the whole map. A malformed grant
     ///   is never allow-all.
+    /// - Every env KEY is validated by [`validate_identity_key`], on the same
+    ///   drop-that-entry-only terms.
     pub fn from_env() -> Self {
-        let raw = crate::config::gateway_allowlist_json();
-        let mut entries = scaffold_defaults();
-
-        // TRTR-05: guest/family identities, declared by the operator in
-        // `TERMINUS_GATEWAY_GUEST_IDENTITIES`, get the narrow allowlist-built
-        // baseline. Applied AFTER the scaffold and BEFORE the env JSON, so an
-        // explicit env entry still wins for any identity the operator wants to
-        // shape by hand.
-        for id in crate::config::gateway_guest_identities() {
-            entries.insert(id, guest_baseline_grant());
+        Self {
+            entries: build_entries(
+                &crate::config::gateway_allowlist_json(),
+                crate::config::gateway_guest_identities(),
+            ),
         }
-
-        match serde_json::from_str::<HashMap<String, Value>>(&raw) {
-            Ok(parsed) => {
-                for (id, value) in parsed {
-                    // Per-identity validation: one bad entry denies THAT
-                    // identity (it keeps its scaffold/guest default, or has no
-                    // entry at all and is default-denied), rather than either
-                    // being coerced into something broader OR nuking every
-                    // other identity's config.
-                    match validate_grant(&value) {
-                        Ok(grant) => {
-                            entries.insert(id, grant);
-                        }
-                        Err(e) => tracing::error!(
-                            "gateway_framework: TERMINUS_GATEWAY_ALLOWLIST_JSON entry for \
-                             identity '{id}' is invalid ({e}) -- that identity is DENIED (its \
-                             grant is dropped, never widened) until the config is fixed"
-                        ),
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    "gateway_framework: TERMINUS_GATEWAY_ALLOWLIST_JSON is not valid JSON \
-                     ({e}) -- falling back to the scaffold-only allowlist policy (deny-all \
-                     except the lumina/harmony safe default)"
-                );
-            }
-        }
-
-        for (id, grant) in &entries {
-            if is_unrestricted_wildcard(grant) {
-                tracing::warn!(
-                    "gateway_framework: identity '{id}' holds an UNRESTRICTED wildcard grant -- \
-                     every tool and inference route, with no sensitive-deny layer. Intended for \
-                     operator identities only; see docs/reference/tool-grants.md"
-                );
-            }
-        }
-
-        Self { entries }
     }
-
     /// Whether `identity` is a known entry in the policy at all (distinct
     /// from `is_allowed`, which also checks the specific action) — used to
     /// distinguish "identity has zero configured permissions" from
@@ -1310,8 +1421,11 @@ impl GatewayFramework {
     /// server-verified transport identity) grants nothing, and an identity with
     /// no allowlist entry at all is default-denied by `is_allowed`, so it
     /// grants nothing either. The guest/family baseline
-    /// ([`GUEST_BASELINE_ALLOW`]) names neither probe tool, so a guest never
-    /// gets operator context — which is the whole point.
+    /// ([`GUEST_BASELINE_ALLOW`]) names neither probe tool, so a guest
+    /// PRINCIPAL never gets operator context — which is the whole point. Note
+    /// the scope limit documented on [`GUEST_BASELINE_ALLOW`]: a human who
+    /// shares the assistant's `lumina` identity is not a guest principal here
+    /// and IS handed operator context (TERM #577).
     ///
     /// Read-only, exactly like [`Self::permits_tool`]: this is not an attempt,
     /// so it consumes no rate-limit budget and writes no audit entry. The audit
@@ -2481,5 +2595,106 @@ mod tests {
         let widened = Grant::AllowDeny { allow: vec!["*".to_string()], deny };
         assert!(widened.permits("weather"));
         assert!(!widened.permits("github_push_repo"));
+    }
+
+    // ── TRTR-05 (round 2): degenerate IDENTITY KEYS ──────────────────────
+    //
+    // Exercised through `build_entries` (the body of `from_env`, with its two
+    // config reads passed in) so the assertions are deterministic and do not
+    // race other tests over the process env.
+
+    /// An EMPTY identity key is dropped, and dropping it costs nothing else:
+    /// the rest of the map parses exactly as it would have.
+    #[test]
+    fn empty_identity_key_is_dropped_rest_of_map_intact() {
+        let entries = build_entries(
+            r#"{"": ["*"], "reporting": ["ledger_accounts"]}"#,
+            Vec::new(),
+        );
+        assert!(!entries.contains_key(""), "an empty identity key must not become an entry");
+        let policy = AllowlistPolicy::new(entries);
+        assert!(!policy.has_any_entry(""));
+        assert!(!policy.is_allowed("", "anything_at_all"));
+        // Positive control within the same map: the good entry is untouched.
+        assert!(policy.is_allowed("reporting", "ledger_accounts"));
+        assert!(!policy.is_allowed("reporting", "github_push_repo"));
+        // And the scaffold defaults still landed.
+        assert!(policy.is_allowed("lumina", "weather"));
+    }
+
+    /// A WHITESPACE-ONLY key likewise -- it matches no principal, so it is a
+    /// config error, not a grant.
+    #[test]
+    fn whitespace_only_identity_key_is_dropped_rest_of_map_intact() {
+        for blank in ["   ", "\t", "\n", " \t "] {
+            let raw = format!(r#"{{"{}": ["*"], "reporting": ["ledger_accounts"]}}"#,
+                blank.escape_default());
+            let entries = build_entries(&raw, Vec::new());
+            assert!(
+                !entries.contains_key(blank),
+                "whitespace-only identity key {blank:?} must not become an entry"
+            );
+            let policy = AllowlistPolicy::new(entries);
+            assert!(!policy.is_allowed(blank, "anything_at_all"));
+            assert!(policy.is_allowed("reporting", "ledger_accounts"));
+        }
+    }
+
+    /// A whitespace-PADDED key is REJECTED, not trimmed. This is the decision
+    /// worth pinning: trimming would synthesise a grant nobody wrote (`" moose"`
+    /// silently becoming a real wildcard for `moose`), which is the fail-OPEN
+    /// direction. Rejecting loses nothing -- a padded key could never have
+    /// matched a principal name -- and surfaces the typo.
+    #[test]
+    fn whitespace_padded_identity_key_is_rejected_not_trimmed() {
+        let entries = build_entries(
+            r#"{" moose": ["*"], "reporting ": ["ledger_accounts"], "one two": ["*"]}"#,
+            Vec::new(),
+        );
+        // Neither the padded key nor its trimmed form gains an entry.
+        for key in [" moose", "moose", "reporting ", "reporting", "one two"] {
+            assert!(
+                !entries.contains_key(key),
+                "padded key must be dropped and NOT trimmed into a real grant: {key:?}"
+            );
+        }
+        let policy = AllowlistPolicy::new(entries);
+        assert!(!policy.is_allowed("moose", "anything_at_all"), "trimming here would be fail-open");
+        assert!(!policy.is_allowed(" moose", "anything_at_all"));
+        assert!(!policy.is_allowed("reporting", "ledger_accounts"));
+    }
+
+    /// Positive control: a map of well-formed keys is completely unaffected by
+    /// the key validation -- no working config's meaning changes.
+    #[test]
+    fn valid_identity_keys_are_unaffected_by_key_validation() {
+        let entries = build_entries(
+            r#"{"moose": ["*"], "guest-alex": ["time_now"], "ct322_relay": {"allow": ["*"], "deny": ["github_"]}}"#,
+            Vec::new(),
+        );
+        let policy = AllowlistPolicy::new(entries);
+        assert!(policy.is_allowed("moose", "literally_anything"));
+        assert!(policy.is_allowed("guest-alex", "time_now"));
+        assert!(!policy.is_allowed("guest-alex", "google_calendar_today"));
+        assert!(policy.is_allowed("ct322_relay", "ledger_accounts"));
+        assert!(!policy.is_allowed("ct322_relay", "github_push_repo"));
+        // The guest seeding path still works alongside it.
+        let seeded = AllowlistPolicy::new(build_entries("{}", vec!["guest-sam".to_string()]));
+        assert!(seeded.is_allowed("guest-sam", "weather"));
+        assert!(!seeded.is_allowed("guest-sam", CALENDAR_CONTEXT_PROBE));
+    }
+
+    /// The validator itself, in isolation -- the shapes it accepts and rejects.
+    #[test]
+    fn validate_identity_key_shapes() {
+        for bad in ["", " ", "\t", "\n", " moose", "moose ", "one two", " "] {
+            assert!(
+                validate_identity_key(bad).is_err(),
+                "degenerate identity key {bad:?} must be rejected"
+            );
+        }
+        for good in ["moose", "lumina", "guest-alex", "ct322_relay", "harmony"] {
+            assert!(validate_identity_key(good).is_ok(), "{good:?} is a valid principal name");
+        }
     }
 }
