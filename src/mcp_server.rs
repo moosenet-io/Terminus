@@ -405,7 +405,7 @@ async fn handle_agent_execute(
         )
             .into_response();
         if let Some(ctx) = gate_ctx {
-            ctx.record_result(AuditResult::Error, Some("no inference backend")).await;
+            ctx.record_result(false, Some("no inference backend"));
         }
         return r;
     };
@@ -420,7 +420,7 @@ async fn handle_agent_execute(
             )
                 .into_response();
             if let Some(ctx) = gate_ctx {
-                ctx.record_result(AuditResult::Error, Some("invalid body")).await;
+                ctx.record_result(false, Some("invalid body"));
             }
             return r;
         }
@@ -468,7 +468,7 @@ async fn handle_agent_execute(
     );
 
     if let Some(ctx) = gate_ctx {
-        ctx.record_result(AuditResult::Success, None).await;
+        ctx.record_result(true, None);
     }
 
     // Response shape matches what lumina-core already reads back from
