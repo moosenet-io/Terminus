@@ -52,6 +52,7 @@ import { RosterPanel as ModelsRosterPanel } from './models/RosterPanel';
 import { DashboardPanel as MuseDashboardPanel } from './muse/DashboardPanel';
 import { LibraryPanel as MuseLibraryPanel } from './muse/LibraryPanel';
 import { MediaDetailPanel as MuseMediaDetailPanel } from './muse/MediaDetailPanel';
+import { RequestLifecyclePanel as MuseRequestLifecyclePanel } from './muse/RequestLifecyclePanel';
 import { DiscoverPanel as MuseDiscoverPanel } from './muse/DiscoverPanel';
 import { RequestsPanel as MuseRequestsPanel } from './muse/RequestsPanel';
 import { SettingsPanel as MuseSettingsPanel } from './muse/SettingsPanel';
@@ -297,6 +298,21 @@ registerPanel({
   // id to navigate to).
   hideInRail: true,
   component: MuseMediaDetailPanel,
+});
+
+// MGUI-08: one request's lifecycle (guide screen 06). Like `muse.library.detail` this
+// is a PARAMETERIZED detail route reached from a request row — `hideInRail` keeps it
+// out of both the rail and the command palette, where a link to `/muse/requests/:id`
+// would have no id to navigate to.
+registerPanel({
+  id: 'muse.requests.detail',
+  system: 'muse',
+  title: 'Request lifecycle',
+  path: '/muse/requests/:id',
+  icon: '◷',
+  available: true,
+  hideInRail: true,
+  component: MuseRequestLifecyclePanel,
 });
 
 // MGUI-04: guide screen 05.
