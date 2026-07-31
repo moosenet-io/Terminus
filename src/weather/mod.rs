@@ -3,18 +3,26 @@
 //! One LLM-callable tool:
 //!   weather  — current / tomorrow / this-week weather for a location.
 //!
-//! Location resolution (BUG 1): when `location` is omitted or empty the tool
-//! defaults to the operator's home address from the COMMUTE_HOME env var (the
-//! same source of truth the commute tools use). This is what stops the model
-//! from asking "which city?" — the description advertises the default and the
-//! code injects it deterministically. If COMMUTE_HOME is also unset and no
-//! location was given, a clear NotConfigured error is returned rather than a
-//! silent failure.
+//! Location resolution: when `location` is omitted or empty the tool resolves it
+//! through the chain in [`location`] — **calendar → home/work routine → ASK** —
+//! and NEVER invents a place.
 //!
-//! FUTURE ENHANCEMENT: an Engram "where does {user} live" lookup could be a
-//! further fallback when COMMUTE_HOME is unset. That is intentionally OUT OF
-//! SCOPE here — COMMUTE_HOME is the single env-based source of truth, per the
-//! repo's inference de-bloat rules (env/Python over LLM).
+//! This module previously resolved a missing location from `COMMUTE_HOME` alone.
+//! With that env var unset the tool failed instantly, the model retried, and it
+//! answered for **Tampa** — the first example in this tool's own JSON schema. An
+//! example in a schema becomes a default in practice, and a silently-substituted
+//! location is indistinguishable from a wrong one. Hence three changes here:
+//!   1. the chain above is WIRED into `resolve_location` (it was previously
+//!      implemented in `location.rs` and never called — dead code);
+//!   2. an unresolvable location returns [`location::ASK_MESSAGE`] as a normal
+//!      successful answer, not an error — an error is what made the model retry
+//!      and invent in the first place;
+//!   3. the schema and description name NO city, so there is nothing to copy.
+//!
+//! Calendar access goes through [`crate::google::caldav::GoogleCalendarSource`],
+//! the module that already owns Google credentials — this tool holds only a
+//! `dyn CalendarSource` and never reads a secret. When Google is unconfigured the
+//! source is `NoCalendar` and the chain degrades to routine→ask.
 //!
 //! Forecast extraction (BUG 2): the OpenWeatherMap free tier exposes current
 //! conditions at /data/2.5/weather and a 5-day / 3-hour forecast at
@@ -37,18 +45,24 @@
 //!   OPENWEATHER_API_KEY  — OpenWeatherMap API key (free tier works)
 //! Optional env:
 //!   OPENWEATHER_API_URL  — base URL (default https://api.openweathermap.org)
-//!   COMMUTE_HOME         — default location when none is supplied
+//!   COMMUTE_HOME         — home address for routine inference (shared with the
+//!                          commute tools; a plain address, not a secret)
+//!   COMMUTE_WORK         — work address for routine inference
 //!
 //! NOTE: temperatures are always fetched and displayed in metric+imperial, so
 //! OPENWEATHER_UNITS is no longer consulted (canonical fetch is always metric).
 
+pub mod location;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
+use location::{CalendarSource, NoCalendar, Resolved, Routine};
 
 const DEFAULT_BASE_URL: &str = "https://api.openweathermap.org";
 /// Canonical fetch unit. Temperatures are always retrieved in metric (Celsius)
@@ -63,9 +77,12 @@ struct WeatherConfig {
     api_key: String,
     base_url: String,
     units: String,
-    /// Operator home address, reused from the commute tools' COMMUTE_HOME so a
-    /// bare `weather` call resolves to "where I live" without re-prompting.
-    home: Option<String>,
+    /// Home/work addresses (COMMUTE_HOME / COMMUTE_WORK, shared with the commute
+    /// tools) — the THIRD step of the resolution chain, below the calendar.
+    routine: Routine,
+    /// Today's calendar, behind a trait object so this tool never reaches Google
+    /// directly. `NoCalendar` when Google is unconfigured (degrade to routine→ask).
+    calendar: Arc<dyn CalendarSource>,
 }
 
 impl WeatherConfig {
@@ -78,11 +95,25 @@ impl WeatherConfig {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        // The calendar comes from the module that owns Google access. When Google
+        // is unconfigured we take `NoCalendar` — an explicit, typed statement that
+        // the chain is routine→ask, rather than a silent hole.
+        let calendar: Arc<dyn CalendarSource> = match crate::google::GoogleConfig::from_env() {
+            Ok(g) => Arc::new(crate::google::caldav::GoogleCalendarSource::new(g)),
+            Err(e) => {
+                tracing::info!(
+                    "weather: Google calendar unavailable for location resolution ({e}); \
+                     falling back to home/work routine, then asking"
+                );
+                Arc::new(NoCalendar)
+            }
+        };
         Ok(Self {
             api_key,
             base_url: base_url.trim_end_matches('/').to_string(),
             units: CANONICAL_UNITS.to_string(),
-            home: std::env::var("COMMUTE_HOME").ok().filter(|s| !s.is_empty()),
+            routine: Routine::from_env(),
+            calendar,
         })
     }
 
@@ -94,24 +125,24 @@ impl WeatherConfig {
             .map_err(|e| ToolError::Http(e.to_string()))
     }
 
-    /// Resolve the caller-supplied location into something the OWM API accepts.
-    /// An absent/empty location falls back to COMMUTE_HOME (BUG 1); if that is
-    /// also unset we return a clear, actionable NotConfigured error rather than
-    /// silently guessing.
-    fn resolve_location(&self, input: Option<&str>) -> Result<String, ToolError> {
-        let trimmed = input.map(str::trim).filter(|s| !s.is_empty());
-        match trimmed {
-            Some(loc) => Ok(loc.to_string()),
-            None => self.home.clone().ok_or_else(|| {
-                ToolError::NotConfigured(
-                    "No location given and COMMUTE_HOME is not configured. \
-                     Set COMMUTE_HOME to a default home address or pass a 'location'."
-                        .into(),
-                )
-            }),
-        }
+    /// Resolve the caller-supplied location through the full chain:
+    /// explicit → calendar → home/work routine → ASK.
+    ///
+    /// Returns a [`Resolved`], NOT a bare string, so the caller can (a) attribute
+    /// the location in the answer and (b) ASK when nothing resolves. This is the
+    /// ONE resolution path — `location::resolve*` is not called anywhere else, and
+    /// there is no longer a COMMUTE_HOME-only branch to fall back into.
+    async fn resolve_location(&self, input: Option<&str>) -> Resolved {
+        let (hour, weekday) = location::local_hour_and_weekday();
+        location::resolve_with_calendar(
+            input,
+            self.calendar.as_ref(),
+            &self.routine,
+            hour,
+            weekday,
+        )
+        .await
     }
-
 }
 
 // ── Temperature / wind helpers (pure Rust, no LLM) ───────────────────────────
@@ -211,8 +242,11 @@ async fn geocode(
         }
     }
 
+    // No example city here either: this string is returned to the model, and a
+    // model with no location will happily adopt whatever place it is shown.
     Err(ToolError::NotFound(format!(
-        "Could not geocode '{location}' (try a city name, e.g. 'San Jose, CA')"
+        "Could not geocode '{location}'. Ask the user for a city (and state/country \
+         if ambiguous) — do not substitute one."
     )))
 }
 
@@ -611,19 +645,27 @@ impl RustTool for Weather {
     }
 
     fn description(&self) -> &str {
+        // NO CITY NAMES ANYWHERE IN THIS TEXT — deliberate, load-bearing, and
+        // tested (`description_and_schema_name_no_city`). The previous wording
+        // listed example cities here; with the location unresolvable the model
+        // copied the first one and answered for a city the user has no connection
+        // to. Describe the SHAPE of the argument, never an instance of it.
         "Get the weather for ANY place — ALWAYS use this tool for weather questions \
 instead of a web search. It works for any city, town, address, landmark, or \
-'lat,lon' anywhere in the world, not just the user's home. It returns BOTH current \
-conditions AND multi-day forecasts (up to ~5–6 days ahead) directly from live \
-weather data. \
-Pass 'location' (e.g. 'Tampa', 'Tampa, Florida', 'Paris', '123 Main St, San Jose CA') \
-— it is OPTIONAL and defaults to the user's home, so you never need to ask which \
-city when they mean home. \
+'lat,lon' anywhere in the world, not just where the user lives. It returns BOTH \
+current conditions AND multi-day forecasts (up to ~5–6 days ahead) directly from \
+live weather data. \
+Pass 'location' as the user named it (a city, a town, a full street address, a \
+landmark, or a 'lat,lon' pair). It is OPTIONAL: when omitted, the tool resolves the \
+place itself from the user's calendar, then their home/work routine, and if neither \
+is known it ASKS them. NEVER invent, assume, or fill in a location the user did not \
+give — leave it out and let the tool ask. \
 Pass 'days' (1–7) for a forecast: days=1 (or omit) gives current conditions; \
 days=3 gives a 3-day forecast with each day's high/low and conditions; days=5 gives \
 a 5-day forecast, etc. (clamped to what the data provides). \
 The legacy 'when' field still works ('current', 'tomorrow', 'week') but prefer \
-'days'. Returns a short human-readable summary."
+'days'. Returns a short human-readable summary; when the location was inferred the \
+answer says which place it used and why."
     }
 
     fn parameters(&self) -> Value {
@@ -632,7 +674,7 @@ The legacy 'when' field still works ('current', 'tomorrow', 'week') but prefer \
             "properties": {
                 "location": {
                     "type": "string",
-                    "description": "Any city, town, address, landmark, or 'lat,lon' — e.g. 'Tampa', 'Tampa, Florida', 'Paris'. Optional; defaults to the user's home."
+                    "description": "Any city, town, address, landmark, or 'lat,lon'. Optional — when omitted the location is resolved from your calendar, then your home/work routine, and if none of those are known you will be ASKED rather than a place being guessed."
                 },
                 "days": {
                     "type": "integer",
@@ -650,16 +692,24 @@ The legacy 'when' field still works ('current', 'tomorrow', 'week') but prefer \
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let location = self.cfg.resolve_location(args["location"].as_str())?;
+        let resolved = self.cfg.resolve_location(args["location"].as_str()).await;
+        let (location, attribution) = match &resolved {
+            Resolved::Found { location, .. } => (location.clone(), resolved.attribution()),
+            // ASK. Deliberately `Ok`, not `Err`: an error is what made the model
+            // retry and answer for a city out of the schema. A plain-language
+            // question is a valid, final answer to "what's the weather?" when we
+            // genuinely do not know where the user means.
+            Resolved::AskUser => return Ok(location::ASK_MESSAGE.to_string()),
+        };
         let mode = Mode::resolve(&args)?;
 
         let client = WeatherConfig::client()?;
         let (lat, lon) = geocode(&client, &self.cfg, &location).await?;
 
-        match mode {
+        let report = match mode {
             Mode::Current => {
                 let body = fetch_current(&client, &self.cfg, lat, lon).await?;
-                Ok(format_current(&self.cfg, &location, &body))
+                format_current(&self.cfg, &location, &body)
             }
             Mode::Tomorrow => {
                 let body = fetch_forecast(&client, &self.cfg, lat, lon).await?;
@@ -674,10 +724,10 @@ The legacy 'when' field still works ('current', 'tomorrow', 'week') but prefer \
                     .ok_or_else(|| {
                         ToolError::NotFound("No forecast available for tomorrow".into())
                     })?;
-                Ok(format!(
+                format!(
                     "Tomorrow's weather for {location} — {}",
                     format_day(&self.cfg, &day)
-                ))
+                )
             }
             // Multi-day forecast: up to `n` distinct days, clamped to what the
             // API returns (~6). `Mode::Week` is `n == FORECAST_MAX_DAYS`.
@@ -697,9 +747,19 @@ The legacy 'when' field still works ('current', 'tomorrow', 'week') but prefer \
                 for d in &days {
                     out.push_str(&format!("- {}\n", format_day(&self.cfg, d)));
                 }
-                Ok(out)
+                out
             }
-        }
+        };
+
+        // ATTRIBUTION. When the location was INFERRED (calendar or routine) the
+        // answer says so, up front. Without this, a wrong inference is silent and
+        // the user has no way to tell a right answer from a confidently wrong one
+        // — which is exactly how "the weather in Tampa" went unnoticed. An
+        // explicit location gets no prefix: they already know what they asked for.
+        Ok(match attribution {
+            Some(a) => format!("{a}.\n{report}"),
+            None => report,
+        })
     }
 }
 
@@ -796,14 +856,70 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use httpmock::prelude::*;
+    use location::{LocationSource, ASK_MESSAGE};
 
+    /// A calendar the test controls. This is the mock half of the seam — see
+    /// `wiring_is_not_stubbed_*` below for the positive controls that make a
+    /// hardwired `resolve_location` fail.
+    struct FakeCalendar(Vec<Value>);
+
+    #[async_trait]
+    impl CalendarSource for FakeCalendar {
+        async fn events_now(&self) -> Vec<Value> {
+            self.0.clone()
+        }
+    }
+
+    fn routine_of(home: Option<&str>, work: Option<&str>) -> Routine {
+        Routine { home: home.map(str::to_string), work: work.map(str::to_string) }
+    }
+
+    /// A config with no calendar and an optional home — the pre-existing helper's
+    /// semantics, preserved so the older tests keep testing what they tested.
     fn cfg_for(server: &MockServer, home: Option<&str>) -> WeatherConfig {
+        cfg_full(server, routine_of(home, None), Arc::new(NoCalendar))
+    }
+
+    fn cfg_full(
+        server: &MockServer,
+        routine: Routine,
+        calendar: Arc<dyn CalendarSource>,
+    ) -> WeatherConfig {
         WeatherConfig {
             api_key: "testkey".into(),
             base_url: server.base_url(),
             units: "metric".into(),
-            home: home.map(str::to_string),
+            routine,
+            calendar,
         }
+    }
+
+    /// A config for the pure-resolution tests (no HTTP involved).
+    fn offline_cfg(routine: Routine, calendar: Arc<dyn CalendarSource>) -> WeatherConfig {
+        WeatherConfig {
+            api_key: "k".into(),
+            base_url: "http://x".into(),
+            units: "metric".into(),
+            routine,
+            calendar,
+        }
+    }
+
+    fn events(v: Value) -> Arc<dyn CalendarSource> {
+        Arc::new(FakeCalendar(v.as_array().cloned().unwrap_or_default()))
+    }
+
+    /// A raw iCal VEVENT the user DECLINED whose organiser copy is still
+    /// `STATUS:CONFIRMED` — the normal shape of a declined invite. Built as raw iCal
+    /// (not a `"status": "declined"` JSON literal) so the tests below span the real
+    /// parse path. The attendee address is an RFC 2606 placeholder.
+    fn confirmed_but_declined_ical() -> String {
+        let attendee = "ATTENDEE;CN=Me;PARTSTAT=DECLINED:mailto:<email>"; // pii-test-fixture
+        format!(
+            "BEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Offsite in Denver\r\n\
+             DTSTART:20260601T090000Z\r\nLOCATION:Denver, CO\r\n\
+             STATUS:CONFIRMED\r\n{attendee}\r\nEND:VEVENT\r\n"
+        )
     }
 
     fn geo_body() -> Value {
@@ -841,47 +957,65 @@ mod tests {
         })
     }
 
-    // ── location resolution (BUG 1) ──────────────────────────────────────────
+    // ── location resolution, AT THE CONFIG LEVEL ─────────────────────────────
+    //
+    // These exercise `WeatherConfig::resolve_location` — the PRODUCTION entry
+    // point — not `location::resolve` standalone. The bug being fixed here was
+    // precisely that `location::resolve` was fully implemented, fully tested, and
+    // never called; a test that only calls the module proves nothing about the
+    // tool. The end-to-end `execute`-level tests further down close the loop.
 
-    #[test]
-    fn resolve_explicit_location_passthrough() {
-        let c = WeatherConfig {
-            api_key: "k".into(),
-            base_url: "http://x".into(),
-            units: "metric".into(),
-            home: Some("Reno NV".into()),
-        };
-        assert_eq!(c.resolve_location(Some("Paris")).unwrap(), "Paris");
-    }
-
-    #[test]
-    fn resolve_omitted_location_falls_back_to_home() {
-        let c = WeatherConfig {
-            api_key: "k".into(),
-            base_url: "http://x".into(),
-            units: "metric".into(),
-            home: Some("123 Home St".into()),
-        };
-        assert_eq!(c.resolve_location(None).unwrap(), "123 Home St");
-        // empty string is treated as omitted
-        assert_eq!(c.resolve_location(Some("  ")).unwrap(), "123 Home St");
-    }
-
-    #[test]
-    fn resolve_missing_location_and_home_errors() {
-        let c = WeatherConfig {
-            api_key: "k".into(),
-            base_url: "http://x".into(),
-            units: "metric".into(),
-            home: None,
-        };
-        match c.resolve_location(None) {
-            Err(ToolError::NotConfigured(msg)) => {
-                assert!(msg.contains("COMMUTE_HOME"));
-                assert!(msg.contains("location"));
+    #[tokio::test]
+    async fn resolve_explicit_location_passthrough() {
+        let c = offline_cfg(
+            routine_of(Some("Reno NV"), None),
+            events(json!([{"summary": "Trip", "location": "Denver"}])),
+        );
+        match c.resolve_location(Some("Paris")).await {
+            Resolved::Found { location, source: LocationSource::Explicit } => {
+                assert_eq!(location, "Paris")
             }
-            other => panic!("expected NotConfigured, got {other:?}"),
+            other => panic!("explicit must win, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_omitted_location_prefers_the_calendar_over_the_routine() {
+        let c = offline_cfg(
+            routine_of(Some("123 Home St"), None),
+            events(json!([{"summary": "Client onsite", "location": "Denver, CO"}])),
+        );
+        match c.resolve_location(None).await {
+            Resolved::Found { location, source: LocationSource::Calendar(s) } => {
+                assert_eq!(location, "Denver, CO");
+                assert_eq!(s, "Client onsite");
+            }
+            other => panic!("expected the calendar to win, got {other:?}"),
+        }
+        // whitespace is treated as omitted, and still consults the calendar
+        match c.resolve_location(Some("  ")).await {
+            Resolved::Found { source: LocationSource::Calendar(_), .. } => {}
+            other => panic!("blank location must fall through, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_falls_back_to_the_routine_when_the_calendar_is_empty() {
+        let c = offline_cfg(routine_of(Some("123 Home St"), None), Arc::new(NoCalendar));
+        match c.resolve_location(None).await {
+            Resolved::Found { location, source: LocationSource::Routine(_) } => {
+                assert_eq!(location, "123 Home St")
+            }
+            other => panic!("expected the routine, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_asks_when_nothing_is_known() {
+        // THE live bug. Previously this returned NotConfigured, the model retried,
+        // and it answered for a city lifted out of this tool's own schema.
+        let c = offline_cfg(Routine::default(), Arc::new(NoCalendar));
+        assert_eq!(c.resolve_location(None).await, Resolved::AskUser);
     }
 
     #[test]
@@ -1231,12 +1365,313 @@ mod tests {
         assert!(out.contains("1 Home Rd"));
     }
 
+    // ── THE LIVE BUG, END TO END AT THE TOOL BOUNDARY ────────────────────────
+    //
+    // Everything below drives `Weather::execute` — the path the model actually
+    // reaches. The previous round of tests passed against `location.rs` while the
+    // tool still ran the old COMMUTE_HOME-only branch, so "tests are green" said
+    // nothing about the live behaviour. These would all fail if the wiring were
+    // removed.
+
+    /// Nothing resolvable → the tool ASKS, in plain language, naming NO city, and
+    /// makes no network call at all (nothing to geocode).
     #[tokio::test]
-    async fn omitted_location_no_home_errors() {
+    async fn execute_asks_when_nothing_resolves_and_names_no_city() {
         let server = MockServer::start();
-        let tool = Weather { cfg: cfg_for(&server, None) };
-        let r = tool.execute(json!({"when": "current"})).await;
-        assert!(matches!(r, Err(ToolError::NotConfigured(_))));
+        let geo = server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct");
+            then.status(200).json_body(geo_body());
+        });
+        let wx = server.mock(|when, then| {
+            when.method(GET).path("/data/2.5/weather");
+            then.status(200).json_body(current_body());
+        });
+        let tool = Weather {
+            cfg: cfg_full(&server, Routine::default(), Arc::new(NoCalendar)),
+        };
+        // An Ok answer, NOT an error: an error is what made the model retry and
+        // invent a city.
+        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+        assert_eq!(out, ASK_MESSAGE);
+        assert_eq!(geo.hits(), 0, "nothing to geocode — must not call out");
+        assert_eq!(wx.hits(), 0);
+        // The regression guard: the ask must never seed a place.
+        let low = out.to_lowercase();
+        for city in [
+            "tampa", "florida", "paris", "omaha", "san jose", "foster city",
+            "new york", "london",
+        ] {
+            assert!(!low.contains(city), "the ask must not name {city:?}: {out}");
+        }
+    }
+
+    /// A calendar event supplies the location, and the answer SAYS so.
+    #[tokio::test]
+    async fn execute_uses_a_calendar_event_and_attributes_it() {
+        let server = MockServer::start();
+        let geo = server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct").query_param("q", "Denver, CO");
+            then.status(200).json_body(geo_body());
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/data/2.5/weather");
+            then.status(200).json_body(current_body());
+        });
+        let tool = Weather {
+            cfg: cfg_full(
+                &server,
+                // A home is configured — the calendar must still win, because the
+                // weather you care about is where you will BE.
+                routine_of(Some("1 Home Rd"), None),
+                events(json!([{"summary": "Client onsite", "location": "Denver, CO"}])),
+            ),
+        };
+        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+        geo.assert();
+        assert!(out.contains("Denver, CO"), "{out}");
+        assert!(out.to_lowercase().contains("calendar"), "must attribute: {out}");
+        assert!(out.contains("Client onsite"), "must name the event: {out}");
+        assert!(!out.contains("1 Home Rd"), "the routine must not win: {out}");
+    }
+
+    /// A video-call "location" is NOT a place — the tool falls through to the
+    /// routine rather than geocoding a meeting link.
+    #[tokio::test]
+    async fn execute_ignores_a_virtual_event_location() {
+        for virt in ["https://zoom.us/j/123", "Microsoft Teams Meeting", "TBD"] {
+            let server = MockServer::start();
+            let geo_home = server.mock(|when, then| {
+                when.method(GET).path("/geo/1.0/direct").query_param("q", "1 Home Rd");
+                then.status(200).json_body(geo_body());
+            });
+            server.mock(|when, then| {
+                when.method(GET).path("/data/2.5/weather");
+                then.status(200).json_body(current_body());
+            });
+            let tool = Weather {
+                cfg: cfg_full(
+                    &server,
+                    routine_of(Some("1 Home Rd"), None),
+                    events(json!([{"summary": "Sync", "location": virt}])),
+                ),
+            };
+            let out = tool.execute(json!({"when": "current"})).await.unwrap();
+            geo_home.assert();
+            assert!(out.contains("1 Home Rd"), "{virt} → {out}");
+            assert!(
+                out.to_lowercase().contains("home"),
+                "must attribute the routine: {out}"
+            );
+            assert!(!out.contains(virt), "{virt} must never be used as a place: {out}");
+        }
+    }
+
+    /// An explicit location beats a calendar event AND is not attributed (the
+    /// user already knows what they asked for).
+    #[tokio::test]
+    async fn execute_explicit_location_wins_and_is_not_attributed() {
+        let server = MockServer::start();
+        let geo = server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct").query_param("q", "Reykjavik");
+            then.status(200).json_body(geo_body());
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/data/2.5/weather");
+            then.status(200).json_body(current_body());
+        });
+        let tool = Weather {
+            cfg: cfg_full(
+                &server,
+                routine_of(Some("1 Home Rd"), None),
+                events(json!([{"summary": "Client onsite", "location": "Denver, CO"}])),
+            ),
+        };
+        let out = tool.execute(json!({"location": "Reykjavik"})).await.unwrap();
+        geo.assert();
+        assert!(out.starts_with("Current weather for Reykjavik"), "{out}");
+        assert!(!out.to_lowercase().contains("calendar"), "{out}");
+    }
+
+    /// A cancelled event is not where the user will be — the next real event wins.
+    #[tokio::test]
+    async fn execute_skips_a_cancelled_event() {
+        let server = MockServer::start();
+        let geo = server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct").query_param("q", "Austin");
+            then.status(200).json_body(geo_body());
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/data/2.5/weather");
+            then.status(200).json_body(current_body());
+        });
+        let tool = Weather {
+            cfg: cfg_full(
+                &server,
+                Routine::default(),
+                events(json!([
+                    {"summary": "Cancelled trip", "location": "Denver", "status": "cancelled"},
+                    {"summary": "Real trip", "location": "Austin"}
+                ])),
+            ),
+        };
+        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+        geo.assert();
+        assert!(out.contains("Austin"), "{out}");
+        assert!(!out.contains("Denver"), "{out}");
+    }
+
+    /// END-TO-END, from RAW iCAL: an event the user DECLINED whose `STATUS` is still
+    /// `CONFIRMED` — the normal shape of a declined invite, since declining changes
+    /// the attendee's PARTSTAT and not the organiser's STATUS — must not supply its
+    /// LOCATION. The tool falls through to the routine.
+    ///
+    /// This goes through `parse_ical`/`event_status` rather than a hand-written
+    /// `"status": "declined"` JSON literal ON PURPOSE: the bug was in that computation,
+    /// and the resolver's own tests (which take `status` as given) could never see it.
+    /// Only a test that spans the wiring catches a `status` field that is correct at
+    /// one end and wrong at the other.
+    #[tokio::test]
+    async fn execute_skips_a_confirmed_but_declined_event_end_to_end() {
+        let cal = crate::google::caldav::location_events_from_ical(
+            &confirmed_but_declined_ical(),
+            "primary",
+        );
+        assert_eq!(cal.len(), 1, "fixture must yield exactly one event");
+
+        let server = MockServer::start();
+        let geo_home = server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct").query_param("q", "1 Home Rd");
+            then.status(200).json_body(geo_body());
+        });
+        let geo_denver = server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct").query_param("q", "Denver, CO");
+            then.status(200).json_body(geo_body());
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/data/2.5/weather");
+            then.status(200).json_body(current_body());
+        });
+        let tool = Weather {
+            cfg: cfg_full(
+                &server,
+                routine_of(Some("1 Home Rd"), None),
+                events(Value::Array(cal)),
+            ),
+        };
+        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+        assert_eq!(geo_denver.hits(), 0, "a declined event must never be geocoded: {out}");
+        geo_home.assert();
+        assert!(out.contains("1 Home Rd"), "must fall through to the routine: {out}");
+        assert!(!out.contains("Denver"), "declined location must not surface: {out}");
+    }
+
+    /// Same event, but with NO routine configured: the tool must ASK rather than fall
+    /// back to the declined event's location. "Skip it" must not degrade to "use it
+    /// anyway when there is nothing else".
+    #[tokio::test]
+    async fn execute_asks_rather_than_using_a_declined_events_location() {
+        let cal = crate::google::caldav::location_events_from_ical(
+            &confirmed_but_declined_ical(),
+            "primary",
+        );
+
+        let server = MockServer::start();
+        let geo = server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct");
+            then.status(200).json_body(geo_body());
+        });
+        let tool = Weather {
+            cfg: cfg_full(&server, Routine::default(), events(Value::Array(cal))),
+        };
+        let out = tool.execute(json!({"when": "current"})).await.unwrap();
+        assert_eq!(out, ASK_MESSAGE);
+        assert_eq!(geo.hits(), 0, "nothing resolvable — must not geocode: {out}");
+    }
+
+    // ── POSITIVE CONTROLS ────────────────────────────────────────────────────
+    //
+    // The trap this change exists to avoid: a suite that passes against code the
+    // tool never calls. A mock seam can be satisfied by a stub, so these two
+    // tests pin behaviour that NO constant and NO ignored-calendar implementation
+    // can produce. If `resolve_location` were hardwired to any fixed answer — a
+    // city, the home address, always-ASK, or "ignore the calendar" — at least one
+    // of them fails.
+
+    /// Two DIFFERENT calendars must produce two DIFFERENT locations, from the
+    /// same config and the same arguments. A hardwired return cannot do this.
+    #[tokio::test]
+    async fn wiring_is_not_stubbed_calendar_content_changes_the_answer() {
+        let mut seen: Vec<String> = Vec::new();
+        for (place, summary) in [("Austin", "Trip A"), ("Reykjavik", "Trip B")] {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.method(GET).path("/geo/1.0/direct").query_param("q", place);
+                then.status(200).json_body(geo_body());
+            });
+            server.mock(|when, then| {
+                when.method(GET).path("/data/2.5/weather");
+                then.status(200).json_body(current_body());
+            });
+            let tool = Weather {
+                cfg: cfg_full(
+                    &server,
+                    routine_of(Some("1 Home Rd"), None),
+                    events(json!([{"summary": summary, "location": place}])),
+                ),
+            };
+            let out = tool.execute(json!({"when": "current"})).await.unwrap();
+            assert!(out.contains(place), "calendar location must reach the answer: {out}");
+            assert!(out.contains(summary), "event summary must reach the answer: {out}");
+            seen.push(out);
+        }
+        assert_ne!(seen[0], seen[1], "the answer must depend on the calendar");
+    }
+
+    /// The calendar is actually CONSULTED — the seam is awaited, not skipped. A
+    /// wiring that ignored the source (or short-circuited to the routine) would
+    /// leave this counter at zero.
+    #[tokio::test]
+    async fn wiring_is_not_stubbed_the_calendar_is_actually_consulted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingCalendar(Arc<AtomicUsize>);
+        #[async_trait]
+        impl CalendarSource for CountingCalendar {
+            async fn events_now(&self) -> Vec<Value> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Vec::new()
+            }
+        }
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server = MockServer::start();
+        let cfg = cfg_full(
+            &server,
+            Routine::default(),
+            Arc::new(CountingCalendar(hits.clone())),
+        );
+        assert_eq!(
+            Weather { cfg: cfg.clone() }.execute(json!({"when": "current"})).await.unwrap(),
+            ASK_MESSAGE
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the calendar must be consulted");
+
+        // ...and NOT consulted when the caller named a place: an explicit
+        // location short-circuits the chain before any calendar round-trip.
+        server.mock(|when, then| {
+            when.method(GET).path("/geo/1.0/direct");
+            then.status(200).json_body(geo_body());
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/data/2.5/weather");
+            then.status(200).json_body(current_body());
+        });
+        Weather { cfg }.execute(json!({"location": "Reykjavik"})).await.unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "an explicit location must not cost a calendar fetch"
+        );
     }
 
     // ── tomorrow → /data/2.5/forecast, tomorrow extraction ───────────────────
@@ -1405,13 +1840,7 @@ mod tests {
 
     #[test]
     fn tool_name_and_schema_stable() {
-        let cfg = WeatherConfig {
-            api_key: "k".into(),
-            base_url: "http://x".into(),
-            units: "metric".into(),
-            home: None,
-        };
-        let t = Weather { cfg };
+        let t = Weather { cfg: offline_cfg(Routine::default(), Arc::new(NoCalendar)) };
         assert_eq!(t.name(), "weather");
         let p = t.parameters();
         assert_eq!(p["type"], "object");
@@ -1419,12 +1848,40 @@ mod tests {
         assert!(p["properties"]["when"]["enum"].is_array());
         assert!(p["properties"]["days"].is_object());
         let d = t.description().to_lowercase();
-        // description advertises the home default so the model won't re-prompt
-        assert!(d.contains("home"));
+        // describes the resolution chain rather than a default city
+        assert!(d.contains("calendar"));
         assert!(d.contains("optional"));
         // and steers the model to use this over a web search, for any place + days
         assert!(d.contains("web search"));
         assert!(d.contains("days"));
         assert!(d.contains("any"));
+    }
+
+    /// THE SCHEMA REGRESSION GUARD. "Tampa" reached the user because it was the
+    /// first example in this tool's own `location` description — the model had
+    /// nothing else and copied it. Nothing a model reads may name a place.
+    #[test]
+    fn description_and_schema_name_no_city() {
+        let t = Weather { cfg: offline_cfg(Routine::default(), Arc::new(NoCalendar)) };
+        let mut texts = vec![t.description().to_lowercase()];
+        let p = t.parameters();
+        for key in ["location", "days", "when"] {
+            texts.push(p["properties"][key]["description"].to_string().to_lowercase());
+        }
+        // Cities that have actually been invented in live turns, plus the usual
+        // schema-example suspects.
+        for city in [
+            "tampa", "florida", "paris", "london", "new york", "san jose",
+            "foster city", "san francisco", "omaha", "denver", "seattle", "tokyo",
+        ] {
+            for t in &texts {
+                assert!(!t.contains(city), "schema text must not name {city:?}: {t}");
+            }
+        }
+        // ...and the location description must positively describe the CHAIN.
+        let loc = p["properties"]["location"]["description"].as_str().unwrap().to_lowercase();
+        assert!(loc.contains("calendar"), "{loc}");
+        assert!(loc.contains("routine") || loc.contains("home/work"), "{loc}");
+        assert!(loc.contains("ask"), "{loc}");
     }
 }
