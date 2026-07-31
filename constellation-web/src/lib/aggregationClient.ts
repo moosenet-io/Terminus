@@ -591,6 +591,28 @@ const MOCK_MUSE_GUIDE = {
   ],
 };
 
+// MGUI-10: Muse's HDHomeRun-compatible tuner discovery document, mirroring a LIVE capture
+// through the proxy field-for-field (PascalCase is the HDHomeRun wire format). Only the host
+// in the URLs is a placeholder -- real addresses never go in committed source.
+const MOCK_MUSE_TUNER = {
+  BaseURL: 'http://muse.internal:8098',
+  DeviceAuth: 'muse',
+  DeviceID: 'MUSE0001',
+  FirmwareName: 'muse-tuner',
+  FirmwareVersion: '0.1.0',
+  FriendlyName: 'Muse TV',
+  LineupURL: 'http://muse.internal:8098/lineup.json',
+  Manufacturer: 'Muse',
+  ManufacturerURL: 'http://muse.internal:8098/',
+  ModelNumber: 'MUSE-TUNER-1',
+  TunerCount: 4,
+};
+
+// The HDHomeRun lineup the tuner advertises. A BARE ARRAY, and empty on the live deployment
+// -- so the element shape is UNVERIFIED and the mock keeps it empty rather than inventing
+// entries whose fields nobody has observed. Consumers use only its length.
+const MOCK_MUSE_TUNER_LINEUP: unknown[] = [];
+
 // CONST-20: 5 clusters deliberately -- exercises the ">4 clusters fold to Other" rule (spec
 // §5.4/§4.2 ALL_PAIRS_CEILING) with real mock data instead of only being provable by editing
 // the mock in a manual check.
@@ -858,6 +880,10 @@ const MOCK_GET: Record<string, unknown> = {
   'muse /api/graph/watch-history': MOCK_MUSE_WATCH_HISTORY,
   'muse /api/graph/group-dynamics': MOCK_MUSE_GROUP_DYNAMICS,
   'muse /guide': MOCK_MUSE_GUIDE,
+  // MGUI-10: tuner telemetry for the programming grid's footer. Plain passthrough paths under
+  // the existing `proxy_muse` arm (no proxy.rs change) -- both verified live.
+  'muse /discover.json': MOCK_MUSE_TUNER,
+  'muse /lineup.json': MOCK_MUSE_TUNER_LINEUP,
   // `/status` is ONE real endpoint; LGUI-09's PersonaPanel only reads a narrow slice
   // (`LuminaPersonaStatusFlags` -- onboarding_complete/dynamic_prompt) of the SAME response
   // LGUI-06's Overview panel reads in full (`LuminaStatus`). `MOCK_LUMINA_STATUS` is a superset
@@ -1626,6 +1652,10 @@ const mockAdapter: AggregationClient = {
 //            POST /playground/run
 //   muse (CONST-19; CONST-20 builds its panels against these): GET /on_deck, GET /premiere,
 //            GET /gaps, GET /api/channels, GET /api/channels/{id}/lineup, GET /guide,
+//            GET /discover.json, GET /lineup.json (MGUI-10 tuner telemetry — HDHomeRun-shaped,
+//            both verified live; note /guide answers an HTML page wrapped by the proxy as
+//            {raw}, and /api/channels answers a BARE ARRAY live vs the {channels:[]} envelope
+//            mocked here — see hooks/useMuse.ts's museGuideEntries/museChannelList),
 //            GET /api/graph/{taste-clusters,watch-history,group-dynamics}, GET /art/{kind}/{id}
 //            (binary passthrough -- see crate::constellation::proxy's module doc; this generic
 //            request<T>() path is JSON-typed, art responses should be fetched by <img src> URL,

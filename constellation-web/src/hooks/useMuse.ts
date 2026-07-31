@@ -378,8 +378,28 @@ export interface MuseChannel {
 export interface MuseChannels {
   channels: MuseChannel[];
 }
-export function useMuseChannels(): MuseSection<MuseChannels> {
-  return useMuseSection<MuseChannels>('/api/channels');
+
+/** MGUI-10: the LIVE `GET /api/channels` (captured through the proxy on this deployment)
+ *  answers a BARE ARRAY — `[]` — while the mock adapter answers the `{channels:[…]}`
+ *  envelope this module was originally typed against. Both shapes are therefore accepted
+ *  and normalized by `museChannelList` below.
+ *
+ *  This is not defensive padding: it is a real contract divergence. It happens to be
+ *  invisible today only because the array is empty (`data?.channels` is `undefined`, which
+ *  `?? []` swallows) — the moment a channel exists, the un-normalized read would render an
+ *  empty channel list against a non-empty backend. */
+export type MuseChannelsResponse = MuseChannels | MuseChannel[];
+
+/** Normalize either observed `/api/channels` shape to a plain list. An unrecognized shape
+ *  yields `[]` rather than a guess — we do not know what its channels would be. */
+export function museChannelList(data: MuseChannelsResponse | null): MuseChannel[] {
+  if (data === null) return [];
+  if (Array.isArray(data)) return data;
+  return Array.isArray(data.channels) ? data.channels : [];
+}
+
+export function useMuseChannels(): MuseSection<MuseChannelsResponse> {
+  return useMuseSection<MuseChannelsResponse>('/api/channels');
 }
 
 export interface MuseLineupItem {
@@ -407,8 +427,80 @@ export interface MuseGuideEntry {
 export interface MuseGuide {
   entries: MuseGuideEntry[];
 }
-export function useMuseGuide(): MuseSection<MuseGuide> {
-  return useMuseSection<MuseGuide>('/guide');
+
+/** MGUI-10: what `GET /guide` ACTUALLY returns on this deployment, captured through the
+ *  proxy: `{"raw":"<!doctype html>\n<html lang=\"en\">…<title>Muse — Channel Guide</title>…"}`.
+ *
+ *  `/guide` is a rendered HTML PAGE — Muse's own human-facing channel guide — not a
+ *  structured programme feed. The proxy wraps a non-JSON upstream body in `{raw}`, which is
+ *  why it arrives as JSON at all. The mock adapter answers the `{entries:[…]}` envelope
+ *  this module was typed against, so both shapes are declared here.
+ *
+ *  There is no JSON programme feed behind it today: `/api/guide`, `/guide.json`,
+ *  `/api/channels/guide`, `/xmltv` and `/api/epg` all answer 404 (probed directly).
+ *
+ *  **The grid deliberately does NOT parse `raw`.** Scraping programme blocks out of an HTML
+ *  string would manufacture data whose provenance the panel cannot vouch for, and would
+ *  silently break on any markup change. When `raw` is present the grid says so and renders
+ *  from `/api/channels` alone. */
+export type MuseGuideResponse = MuseGuide | { raw: string };
+
+/** Structured programme entries, or `[]` when the response carried none. The second value
+ *  reports the HTML-page case specifically, so the UI can explain WHY there are no blocks
+ *  instead of implying the schedule is empty. */
+export function museGuideEntries(data: MuseGuideResponse | null): {
+  entries: MuseGuideEntry[];
+  htmlOnly: boolean;
+} {
+  if (data === null) return { entries: [], htmlOnly: false };
+  if ('entries' in data && Array.isArray(data.entries)) return { entries: data.entries, htmlOnly: false };
+  if ('raw' in data && typeof data.raw === 'string') return { entries: [], htmlOnly: true };
+  return { entries: [], htmlOnly: false };
+}
+
+export function useMuseGuide(): MuseSection<MuseGuideResponse> {
+  return useMuseSection<MuseGuideResponse>('/guide');
+}
+
+// ── Tuner telemetry (MGUI-10) ────────────────────────────────────────────────
+//
+// The guide's programming-grid footer reads "now · 21:14 · MUSE0001 tuner advertising
+// /discover.json". That is REAL and reachable: Muse serves an HDHomeRun-compatible
+// discovery document. Live capture through the proxy:
+//   {"BaseURL":"http://…:8098","DeviceAuth":"muse","DeviceID":"MUSE0001",
+//    "FirmwareName":"muse-tuner","FirmwareVersion":"0.1.0","FriendlyName":"Muse TV",
+//    "LineupURL":"http://…/lineup.json","Manufacturer":"Muse",
+//    "ManufacturerURL":"http://…/","ModelNumber":"MUSE-TUNER-1","TunerCount":4}
+//
+// Field names are PascalCase because that is the HDHomeRun wire format, not a style slip.
+// Every field below was in that capture; nothing is inferred.
+
+export interface MuseTunerDiscovery {
+  DeviceID: string;
+  FriendlyName: string;
+  ModelNumber: string;
+  FirmwareName: string;
+  FirmwareVersion: string;
+  /** How many concurrent tuners the device advertises. This is a DECLARED capacity, not a
+   *  live in-use count — there is no per-tuner occupancy field in the document, so the UI
+   *  must never render it as "3 of 4 tuners busy". */
+  TunerCount: number;
+  /** Absolute upstream URLs (Muse's own origin). Shown as text only — they are not
+   *  same-origin, so they are never fetched from the browser. */
+  BaseURL: string;
+  LineupURL: string;
+}
+
+export function useMuseTuner(): MuseSection<MuseTunerDiscovery> {
+  return useMuseSection<MuseTunerDiscovery>('/discover.json');
+}
+
+/** `GET /lineup.json` — the HDHomeRun lineup the tuner advertises to clients (Plex, etc.).
+ *  A BARE ARRAY; it is `[]` on this deployment, so the ELEMENT SHAPE IS UNVERIFIED. It is
+ *  typed `unknown[]` and only its LENGTH is used, because typing fields nobody has observed
+ *  would be a guess dressed as a contract. */
+export function useMuseTunerLineup(): MuseSection<unknown[]> {
+  return useMuseSection<unknown[]>('/lineup.json');
 }
 
 /** Compose/maintenance mutations -- both operator-RoleGated + ConfirmDialog-confirmed at the
