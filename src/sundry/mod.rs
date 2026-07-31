@@ -260,26 +260,76 @@ impl RustTool for SearxngSearch {
     }
 
     fn description(&self) -> &str {
-        "Query MooseNet SearXNG via NPM and return JSON results."
+        // The old description ("Query MooseNet SearXNG via NPM") named internal
+        // plumbing rather than the capability, so a model could not tell WHEN to use
+        // it. Describe the job, not the implementation.
+        "Search the web and return results. Use for current events, facts, and \
+         anything you do not already know. (Not for weather — use the `weather` tool.)"
     }
 
+    /// NOTE ON `required: ["q"]` (verified 2026-07-31, deliberately unchanged).
+    ///
+    /// A review finding asked whether declaring only `q` as required makes the
+    /// tolerant `q`/`query`/`search` handling in `execute` unreachable. It does
+    /// not: **nothing in this codebase validates tool arguments against this
+    /// schema before `execute` runs.** `tools/call` in `mcp_server.rs` takes
+    /// `params.arguments` verbatim, applies the authorization and availability
+    /// gates, and hands the raw `Value` to `ToolRegistry::call`, which calls
+    /// `tool.execute(args)` directly (`registry.rs`); there is no JSON-Schema
+    /// crate in the dependency tree on either side of the door. So a model that
+    /// sends `query` reaches the tolerant code and succeeds — the fallback is
+    /// live, not inert.
+    ///
+    /// `required: ["q"]` therefore stays as the STEER: it tells the model the
+    /// canonical name (so most calls arrive as `q`) and states that a search term
+    /// is mandatory. Relaxing it would only weaken that signal — "exactly one
+    /// non-blank query term" is enforced in `execute`, which rejects blank and
+    /// absent alike, and that enforcement is what actually runs.
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "q": {"type": "string"},
-                "categories": {"type": "string", "default": "general"},
-                "language": {"type": "string", "default": "en-US"}
+                // Documented, and `query`/`search` are accepted as aliases — see
+                // `execute`. Kept out of `properties` on purpose: advertising three
+                // names invites a model to send more than one.
+                "q": {
+                    "type": "string",
+                    "description": "The search terms — REQUIRED, and must be non-blank. Send them as `q`; the aliases `query` and `search` are also accepted, but send exactly one."
+                },
+                "categories": {
+                    "type": "string",
+                    "default": "general",
+                    "description": "SearXNG category, e.g. general, news, images, science."
+                },
+                "language": {
+                    "type": "string",
+                    "default": "en-US",
+                    "description": "Result language, e.g. en-US."
+                }
             },
             "required": ["q"]
         })
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        // TOLERANT INPUT. The parameter is `q` (SearXNG's own name), but `query` is the
+        // name a model naturally reaches for — and did: a live turn failed with
+        // "Invalid argument: q is required" in 1ms and the user saw a broken response.
+        // This tool is in the router's ALWAYS-OFFERED essentials, so that failure was
+        // reachable on any turn. Accepting the obvious synonym costs nothing and
+        // removes a whole class of dead turn.
         let q = args
             .get("q")
+            .or_else(|| args.get("query"))
+            .or_else(|| args.get("search"))
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgument("q is required".into()))?;
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ToolError::InvalidArgument(
+                    "a search term is required — pass it as `q` (or `query`)".into(),
+                )
+            })?;
         let categories = args
             .get("categories")
             .and_then(Value::as_str)
@@ -491,5 +541,56 @@ mod tests {
         let result = tool.execute(json!({"q": "rust"})).await;
         assert!(matches!(result, Err(ToolError::Http(_))));
         std::env::remove_var("SEARXNG_URL");
+    }
+}
+
+#[cfg(test)]
+mod searxng_input_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Mirrors `SearxngSearch::execute`'s argument resolution so the tolerance
+    /// contract is testable without a live SearXNG instance.
+    fn resolve_q(args: &Value) -> Option<String> {
+        args.get("q")
+            .or_else(|| args.get("query"))
+            .or_else(|| args.get("search"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn the_documented_name_works() {
+        assert_eq!(resolve_q(&json!({"q": "rust"})).as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn the_name_a_model_actually_guesses_also_works() {
+        // A live turn failed with "q is required" because the model sent `query`.
+        // searxng_search is in the router's always-offered essentials, so that dead
+        // turn was reachable on ANY request.
+        assert_eq!(resolve_q(&json!({"query": "san francisco weather"})).as_deref(),
+                   Some("san francisco weather"));
+        assert_eq!(resolve_q(&json!({"search": "news"})).as_deref(), Some("news"));
+    }
+
+    #[test]
+    fn the_documented_name_wins_when_both_are_present() {
+        assert_eq!(resolve_q(&json!({"q": "a", "query": "b"})).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn blank_and_missing_are_still_rejected() {
+        // Tolerance must not become "search for nothing".
+        assert!(resolve_q(&json!({})).is_none());
+        assert!(resolve_q(&json!({"q": "   "})).is_none());
+        assert!(resolve_q(&json!({"query": ""})).is_none());
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed() {
+        assert_eq!(resolve_q(&json!({"q": "  rust  "})).as_deref(), Some("rust"));
     }
 }

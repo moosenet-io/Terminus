@@ -47,6 +47,13 @@ struct CalendarEvent {
     location: Option<String>,
     /// The calendar id this event was fetched from.
     calendar: String,
+    /// RFC 5545 `STATUS` (`CONFIRMED` / `TENTATIVE` / `CANCELLED`), lower-cased,
+    /// or `"declined"` when the account's own ATTENDEE line says PARTSTAT=DECLINED.
+    ///
+    /// Parsed because a consumer that INFERS something from an event (the weather
+    /// tool's location resolution) must not infer it from an event the user is not
+    /// attending. Empty when the event carries no status.
+    status: String,
 }
 
 // ── Date/time validation & conversion ────────────────────────────────────────
@@ -196,6 +203,45 @@ fn extract_property(block: &str, key: &str) -> Option<String> {
     None
 }
 
+/// The effective status of one VEVENT block, lower-cased.
+///
+/// Precedence — deliberately NOT "explicit STATUS wins":
+/// 1. `STATUS:CANCELLED` wins outright: the organiser called it off, so no
+///    attendee reply can make it a place the user will be.
+/// 2. Otherwise an ATTENDEE line carrying `PARTSTAT=DECLINED` wins, **even when
+///    `STATUS:CONFIRMED` or `STATUS:TENTATIVE` is present**. That combination is
+///    the NORMAL shape of a declined invite — declining does not change the
+///    organiser's `STATUS` — so checking `STATUS` first and returning early made
+///    every declined-but-confirmed meeting look attended. Downstream, the weather
+///    tool would take such an event's LOCATION and report the forecast for a city
+///    the user declined to travel to, with no signal to them that it was wrong.
+/// 3. Otherwise the explicit `STATUS`, lower-cased. 4. Otherwise empty.
+///
+/// Both "cancelled" and "declined" mean the same thing to a consumer: do not infer
+/// a location from this event.
+///
+/// (We deliberately do not try to match the account's own address on the ATTENDEE
+/// line: Google returns per-calendar views in which the account's own PARTSTAT is
+/// the one present, and matching on an aliased/delegated address is unreliable.
+/// Erring toward "skip this event" only ever costs us a fallback to the next event
+/// or to the routine — never a wrong place.)
+fn event_status(block: &str) -> String {
+    let explicit = extract_property(block, "STATUS")
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
+
+    if explicit.as_deref() == Some("cancelled") {
+        return "cancelled".to_string();
+    }
+    for line in block.lines() {
+        let upper = line.to_uppercase();
+        if upper.starts_with("ATTENDEE") && upper.contains("PARTSTAT=DECLINED") {
+            return "declined".to_string();
+        }
+    }
+    explicit.unwrap_or_default()
+}
+
 /// Parse an iCal Multi-Status body into events, tagging each with `calendar`.
 fn parse_ical(body: &str, calendar: &str) -> Vec<CalendarEvent> {
     let unfolded = unfold_ical(body);
@@ -215,6 +261,7 @@ fn parse_ical(body: &str, calendar: &str) -> Vec<CalendarEvent> {
         let dtstart = extract_property(block, "DTSTART").unwrap_or_default();
         let dtend = extract_property(block, "DTEND").unwrap_or_default();
         let location = extract_property(block, "LOCATION");
+        let status = event_status(block);
 
         if uid.is_empty() && summary.is_empty() && dtstart.is_empty() {
             continue;
@@ -227,6 +274,7 @@ fn parse_ical(body: &str, calendar: &str) -> Vec<CalendarEvent> {
             dtend,
             location,
             calendar: calendar.to_string(),
+            status,
         });
     }
 
@@ -657,6 +705,76 @@ impl RustTool for CalendarConflicts {
     }
 }
 
+// ── Calendar as a location source (for the weather tool) ─────────────────────
+
+/// Adapts this module's CalDAV read path to [`crate::weather::location::CalendarSource`].
+///
+/// WHY IT LIVES HERE: the weather tool must not reach Google itself. Google access
+/// is owned by this module — one auth model (`GoogleConfig`, Basic auth with the
+/// app password), one URL scheme, one parser. The weather tool holds only the
+/// trait object, so it never touches a credential (skill S7) and no second Google
+/// client exists to drift.
+pub struct GoogleCalendarSource {
+    cfg: GoogleConfig,
+    http: reqwest::Client,
+}
+
+impl GoogleCalendarSource {
+    pub fn new(cfg: GoogleConfig) -> Self {
+        Self { cfg, http: reqwest::Client::new() }
+    }
+}
+
+#[async_trait]
+impl crate::weather::location::CalendarSource for GoogleCalendarSource {
+    /// Today's events, earliest first, as the JSON shape the resolver consumes.
+    ///
+    /// FAILS SOFT, deliberately: an unreachable calendar yields an EMPTY list, so
+    /// resolution falls through to routine→ask. The whole point of this change is
+    /// that a missing signal produces a QUESTION, never a guessed city — turning a
+    /// calendar outage into an error would revive the retry-and-invent loop.
+    async fn events_now(&self) -> Vec<Value> {
+        let today = chrono::Utc::now().date_naive();
+        let start = format!("{}T000000Z", today.format("%Y%m%d"));
+        let end = format!("{}T235959Z", today.format("%Y%m%d"));
+        let events = match collect_events(&self.http, &self.cfg, &start, &end).await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("weather: calendar unavailable for location resolution — {e}");
+                return Vec::new();
+            }
+        };
+        to_location_events(events)
+    }
+}
+
+/// The exact JSON shape `events_now` hands to the weather tool's resolver.
+///
+/// Factored out of `events_now` so a test can drive the WHOLE path — raw iCal →
+/// [`parse_ical`] → [`event_status`] → this mapping → the weather tool — without a
+/// network round-trip. The unit tests above prove `event_status`; only an end-to-end
+/// test proves the `status` it computes actually reaches the consumer that acts on it.
+fn to_location_events(events: Vec<CalendarEvent>) -> Vec<Value> {
+    events
+        .into_iter()
+        .map(|e| {
+            json!({
+                "summary": e.summary,
+                "location": e.location,
+                "status": e.status,
+                "dtstart": e.dtstart,
+            })
+        })
+        .collect()
+}
+
+/// Test-only seam: parse an iCal body exactly as the live calendar source does and
+/// return the events in the shape the weather tool consumes.
+#[cfg(test)]
+pub(crate) fn location_events_from_ical(body: &str, calendar: &str) -> Vec<Value> {
+    to_location_events(parse_ical(body, calendar))
+}
+
 // ── Registration ─────────────────────────────────────────────────────────────
 
 /// Register: google_calendar_today, _week, _add, _conflicts.
@@ -799,6 +917,89 @@ mod tests {
         assert!(parse_ical("BEGIN:VCALENDAR\nEND:VCALENDAR\n", "c").is_empty());
     }
 
+    // ── status (consumed by weather location resolution) ────────────────────────
+
+    #[test]
+    fn event_status_reads_status_then_declined_partstat() {
+        // DECLINED outranks CONFIRMED/TENTATIVE but NOT CANCELLED. A declined invite
+        // normally still reads STATUS:CONFIRMED (declining changes the attendee's
+        // PARTSTAT, not the organiser's STATUS), so reading STATUS first and returning
+        // early would report every declined meeting as attended — see the mixed-case
+        // test below. CANCELLED stays on top because it already means "not happening",
+        // and both it and "declined" tell a consumer the same thing: do not infer a
+        // location from this event.
+        assert_eq!(event_status("SUMMARY:x\nSTATUS:CANCELLED\n"), "cancelled");
+        assert_eq!(event_status("SUMMARY:x\nSTATUS:CONFIRMED\n"), "confirmed");
+        assert_eq!(event_status("SUMMARY:x\nSTATUS:TENTATIVE\n"), "tentative");
+        // No STATUS, but the user declined → treated as declined, so nothing
+        // downstream infers a location from an event they are not attending.
+        assert_eq!(
+            event_status("SUMMARY:x\nATTENDEE;PARTSTAT=DECLINED:mailto:<email>\n"), // pii-test-fixture
+            "declined"
+        );
+        // An accepted invite carries no special status.
+        assert_eq!(
+            event_status("SUMMARY:x\nATTENDEE;PARTSTAT=ACCEPTED:mailto:<email>\n"), // pii-test-fixture
+            ""
+        );
+        assert_eq!(event_status("SUMMARY:x\n"), "");
+    }
+
+    /// One ATTENDEE line saying "no". The address is an RFC 2606 placeholder; the
+    /// marker comment is the repo's convention for an email-shaped test fixture.
+    const DECLINED_ATTENDEE: &str = "ATTENDEE;CN=Me;PARTSTAT=DECLINED:mailto:<email>"; // pii-test-fixture
+
+    /// The real-world shape the old STATUS-first ordering got wrong: the organiser's
+    /// copy stays CONFIRMED (or TENTATIVE) after the user declines. Reported as
+    /// "confirmed", the weather tool would take the event's LOCATION and answer for a
+    /// city the user is not going to — confidently wrong, with no signal to them.
+    #[test]
+    fn a_declined_partstat_outranks_confirmed_and_tentative_status() {
+        for status in ["CONFIRMED", "TENTATIVE"] {
+            let block = format!("SUMMARY:Offsite\nSTATUS:{status}\n{DECLINED_ATTENDEE}\n");
+            assert_eq!(
+                event_status(&block),
+                "declined",
+                "STATUS:{status} + PARTSTAT=DECLINED must be declined"
+            );
+        }
+    }
+
+    /// CANCELLED still wins over a declined PARTSTAT — an event the organiser called
+    /// off is cancelled regardless of who replied what. (Both answers are equally safe
+    /// downstream; this pins which one is reported.)
+    #[test]
+    fn a_cancelled_status_outranks_a_declined_partstat() {
+        let block = format!("SUMMARY:Offsite\nSTATUS:CANCELLED\n{DECLINED_ATTENDEE}\n");
+        assert_eq!(event_status(&block), "cancelled");
+    }
+
+    /// End of the parse path: a CONFIRMED-but-declined VEVENT must reach consumers
+    /// tagged `declined`, not `confirmed`, with its LOCATION intact but unusable.
+    #[test]
+    fn parse_ical_tags_a_confirmed_but_declined_event_as_declined() {
+        let body = format!(
+            "BEGIN:VEVENT\r\nUID:u9\r\nSUMMARY:Offsite\r\n\
+             DTSTART:20260601T090000Z\r\nLOCATION:Reykjavik\r\n\
+             STATUS:CONFIRMED\r\n{DECLINED_ATTENDEE}\r\nEND:VEVENT\r\n"
+        );
+        let evs = parse_ical(&body, "cal");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].status, "declined");
+        assert_eq!(evs[0].location.as_deref(), Some("Reykjavik"));
+    }
+
+    #[test]
+    fn parse_ical_carries_status_and_location() {
+        let body = "BEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Onsite\r\n\
+                    DTSTART:20260601T090000Z\r\nLOCATION:Somewhereville\r\n\
+                    STATUS:CANCELLED\r\nEND:VEVENT\r\n";
+        let evs = parse_ical(body, "cal");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].status, "cancelled");
+        assert_eq!(evs[0].location.as_deref(), Some("Somewhereville"));
+    }
+
     // ── dedup / sort ────────────────────────────────────────────────────────────
 
     #[test]
@@ -811,6 +1012,7 @@ mod tests {
                 dtend: "".into(),
                 location: None,
                 calendar: "a".into(),
+                status: String::new(),
             },
             CalendarEvent {
                 uid: "u1".into(),
@@ -819,6 +1021,7 @@ mod tests {
                 dtend: "".into(),
                 location: None,
                 calendar: "a".into(),
+                status: String::new(),
             },
             CalendarEvent {
                 uid: "u1".into(),
@@ -827,6 +1030,7 @@ mod tests {
                 dtend: "".into(),
                 location: None,
                 calendar: "b".into(),
+                status: String::new(),
             },
         ];
         let out = dedup_and_sort(evs);
@@ -895,6 +1099,7 @@ mod tests {
             dtend: "20260601T093000Z".into(),
             location: Some("Room A".into()),
             calendar: "cal@x".into(),
+            status: String::new(),
         }];
         let out = format_events("Today", &evs);
         assert!(out.contains("Standup"));
