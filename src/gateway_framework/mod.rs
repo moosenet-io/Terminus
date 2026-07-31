@@ -1013,6 +1013,18 @@ impl GatewayFramework {
     /// never the unfiltered input — a caller with no identity at all must
     /// never be shown tools it could not subsequently call, mirroring
     /// `guard`'s own fail-closed rule for the missing-identity case.
+    /// TRTR-02: read-only "may this identity use this tool" predicate.
+    ///
+    /// The relocated tool router needs to SELECT from a per-identity catalog before it
+    /// ever dispatches, and selection must not consume rate-limit quota or emit a
+    /// denial audit entry — nothing is being attempted yet. `guard()` remains the
+    /// enforcement path; this is the same underlying `is_allowed` decision exposed
+    /// without the side effects, exactly as `filter_catalog_for_principal` already
+    /// does for `tools/list`.
+    pub fn permits_tool(&self, identity: &str, tool: &str) -> bool {
+        self.inner.allowlist.is_allowed(identity, tool)
+    }
+
     pub fn filter_catalog_for_principal(&self, principal: Option<&Principal>, tools: Vec<Value>) -> Vec<Value> {
         match principal {
             Some(p) => self.inner.allowlist.filter_tools(p.name(), tools),

@@ -660,6 +660,16 @@ pub fn mtls_primary_server_identity() -> String {
 /// a co-located deploy — a loopback default only, never a real non-loopback
 /// host baked in. An operator overrides this if Chord is not co-located with
 /// `terminus-primary`.
+/// TRTR-02: the Chord NAMED PROXY the tool-selecting sub-agent runs on.
+///
+/// A logical route, never a concrete model name — Chord owns model selection,
+/// tiering, GPU lifecycle, and fallback (north-star Module Contract clause 1). Reads
+/// `TERMINUS_ROUTER_MODEL`; defaults to the fast assistant tier because tool selection
+/// is a routing decision, not the answer the user reads.
+pub fn router_model_alias() -> String {
+    env_nonempty("TERMINUS_ROUTER_MODEL").unwrap_or_else(|| "lumina-fast".to_string())
+}
+
 pub fn chord_personal_federation_url() -> String {
     // Loopback default (precedent: `crate::intake::gpu_authority`'s own
     // chord-base-url helper uses the same literal).
