@@ -53,6 +53,8 @@ import { DashboardPanel as MuseDashboardPanel } from './muse/DashboardPanel';
 import { LibraryPanel as MuseLibraryPanel } from './muse/LibraryPanel';
 import { MediaDetailPanel as MuseMediaDetailPanel } from './muse/MediaDetailPanel';
 import { DiscoverPanel as MuseDiscoverPanel } from './muse/DiscoverPanel';
+import { RequestsPanel as MuseRequestsPanel } from './muse/RequestsPanel';
+import { SettingsPanel as MuseSettingsPanel } from './muse/SettingsPanel';
 import { TastePanel as MuseTastePanel } from './muse/TastePanel';
 import { ChannelsPanel as MuseChannelsPanel } from './muse/ChannelsPanel';
 import { OverviewPanel as MintOverviewPanel } from './mint/OverviewPanel';
@@ -318,6 +320,17 @@ registerPanel({
   component: MuseTastePanel,
 });
 
+// MGUI-09 + MGUI-14: curation + the wanted/download queue (guide screens 08 and 16).
+registerPanel({
+  id: 'muse.requests',
+  system: 'muse',
+  title: 'Requests',
+  path: '/muse/requests',
+  icon: '⇄',
+  available: true,
+  component: MuseRequestsPanel,
+});
+
 registerPanel({
   id: 'muse.channels',
   system: 'muse',
@@ -326,6 +339,18 @@ registerPanel({
   icon: '▭',
   available: true,
   component: MuseChannelsPanel,
+});
+
+// MGUI-11/12/13: the three Settings screens (12, 13, 14) as one surface. Last in the
+// rail, matching the guide's own tab order.
+registerPanel({
+  id: 'muse.settings',
+  system: 'muse',
+  title: 'Settings',
+  path: '/muse/settings',
+  icon: '⚙',
+  available: true,
+  component: MuseSettingsPanel,
 });
 
 // ── Models (CGUI-09) ─────────────────────────────────────────────────────────
