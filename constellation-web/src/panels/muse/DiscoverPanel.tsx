@@ -75,10 +75,21 @@ export function DiscoverPanel() {
               </>
             ) : (
               <>
-                <div style={{ color: 'var(--text-100)' }}>No trending provider configured.</div>
+                <div style={{ color: 'var(--text-100)' }}>
+                  {data?.metadata_provider_only
+                    ? 'Configured for metadata, but not for trending.'
+                    : 'No trending provider configured.'}
+                </div>
+                {/* MUSE #111: render the SERVER's reason when it sends one. The endpoint now
+                    distinguishes "no TMDb client at all" from "a key-less proxy that serves movie
+                    metadata but has no trending endpoint" — two states needing completely
+                    different operator actions. This panel printed one generic sentence telling the
+                    operator to configure TMDb, which was actively misleading on this deployment:
+                    TMDb IS configured, just without an API key, and no amount of configuring it
+                    "in Muse" would have helped. The code that knows the fact should state it. */}
                 <div>
-                  Discover needs a metadata/trending provider (TMDb) configured in Muse before it can
-                  show anything beyond your library.
+                  {data?.reason ??
+                    'Discover needs a metadata/trending provider (TMDb) configured in Muse before it can show anything beyond your library.'}
                 </div>
               </>
             )}
