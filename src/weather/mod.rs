@@ -1744,6 +1744,7 @@ mod tests {
     const OPERATOR_EVENT_SUMMARY: &str = "Dentist appointment"; // pii-test-fixture: obvious placeholder for a real calendar entry
     const OPERATOR_EVENT_PLACE: &str = "000 Placeholder St, Examplecity"; // pii-test-fixture: obvious placeholder for a real appointment address
     const OPERATOR_HOME: &str = "111 Placeholder Ave, Examplecity"; // pii-test-fixture: obvious placeholder for the operator's home address
+    const OPERATOR_WORK: &str = "222 Placeholder Rd, Examplecity"; // pii-test-fixture: obvious placeholder for the operator's work address
 
     fn operator_day() -> Value {
         json!([{ "summary": OPERATOR_EVENT_SUMMARY, "location": OPERATOR_EVENT_PLACE }])
@@ -1751,7 +1752,7 @@ mod tests {
 
     /// Everything a guest's answer must never contain.
     fn assert_no_operator_context(out: &str) {
-        for leaked in [OPERATOR_EVENT_SUMMARY, OPERATOR_EVENT_PLACE, OPERATOR_HOME] {
+        for leaked in [OPERATOR_EVENT_SUMMARY, OPERATOR_EVENT_PLACE, OPERATOR_HOME, OPERATOR_WORK] {
             assert!(!out.contains(leaked), "leaked operator context {leaked:?} into: {out}");
         }
         assert!(
@@ -1866,6 +1867,17 @@ mod tests {
     /// The routine (home/work addresses) is gated separately from the calendar:
     /// a guest with an empty calendar must still not be answered with the
     /// operator's home address.
+    ///
+    /// **This test must not depend on the wall clock.** `Routine::pick` chooses
+    /// work over home on a weekday between 09:00 and 17:59, from the REAL clock
+    /// (`local_hour_and_weekday`), so a positive control that hardcoded "the
+    /// operator gets HOME" failed every weekday daytime run — observed picking
+    /// the office at 09:03 on a Friday. A security test that is red on half the
+    /// calendar is a test people learn to ignore, so the claim is asserted the
+    /// way it is actually meant: **the guest gets NEITHER routine address, the
+    /// operator gets exactly ONE of them.** Which one is business logic that the
+    /// hour-parameterised checks at the bottom of this test (and
+    /// `location::tests::the_routine_picks_*`) pin down deterministically.
     #[tokio::test]
     async fn a_guest_never_falls_back_to_the_operators_home_address() {
         let server = MockServer::start();
@@ -1873,8 +1885,9 @@ mod tests {
             when.method(GET).path("/geo/1.0/direct");
             then.status(200).json_body(geo_body());
         });
+        let routine = routine_of(Some(OPERATOR_HOME), Some(OPERATOR_WORK));
         let tool = Weather {
-            cfg: cfg_full(&server, routine_of(Some(OPERATOR_HOME), Some("Office Rd")), Arc::new(NoCalendar)),
+            cfg: cfg_full(&server, routine.clone(), Arc::new(NoCalendar)),
         };
         let out = tool
             .execute_with_caller(json!({"when": "current"}), guest())
@@ -1883,15 +1896,60 @@ mod tests {
             .text;
         assert_eq!(out, ASK_MESSAGE);
         assert_no_operator_context(&out);
-        assert_eq!(geo.hits(), 0);
+        assert_eq!(geo.hits(), 0, "nothing resolved — nothing to geocode");
 
-        // The operator, same config, still gets it (positive control).
+        // The operator, same config, still gets a routine answer (positive
+        // control). WHICH routine location depends on the hour, so assert on
+        // "one of them, attributed as a routine" rather than on home.
         server.mock(|when, then| {
             when.method(GET).path("/data/2.5/weather");
             then.status(200).json_body(current_body());
         });
         let out = tool.execute_as_operator(json!({"when": "current"})).await.unwrap();
-        assert!(out.contains(OPERATOR_HOME), "the operator's routine fallback must survive: {out}");
+        let home = out.contains(OPERATOR_HOME);
+        let work = out.contains(OPERATOR_WORK);
+        assert!(
+            home ^ work,
+            "the operator's routine fallback must survive and name exactly one \
+             configured location: {out}"
+        );
+        assert!(
+            out.contains("using your home location") || out.contains("using your work location"),
+            "and attribute it as the routine inference it is: {out}"
+        );
+        assert!(geo.hits() >= 1, "the operator's resolved location WAS geocoded");
+
+        // ...and deterministically, at every time of day and both kinds of day:
+        // the guest is always ASKED and the operator always gets a routine hit.
+        // This is the same gate driven through the hour-parameterised resolver,
+        // so weekday-daytime / weekday-evening / weekend are all covered on
+        // every run instead of whichever one the clock happens to be in.
+        for (hour, weekday) in [(11u32, true), (20, true), (11, false), (3, false)] {
+            let g = location::resolve_with_calendar(
+                None, &NoCalendar, &routine, hour, weekday, guest(),
+            )
+            .await;
+            assert_eq!(
+                g,
+                Resolved::AskUser,
+                "guest must be ASKED at hour={hour} weekday={weekday}"
+            );
+            assert!(g.attribution().is_none());
+
+            let o = location::resolve_with_calendar(
+                None, &NoCalendar, &routine, hour, weekday, operator(),
+            )
+            .await;
+            match &o {
+                Resolved::Found { location, source: LocationSource::Routine(_) } => {
+                    assert!(
+                        location == OPERATOR_HOME || location == OPERATOR_WORK,
+                        "hour={hour} weekday={weekday}: {location}"
+                    );
+                }
+                other => panic!("operator must still get a routine hit at hour={hour} weekday={weekday}, got {other:?}"),
+            }
+        }
     }
 
     // ── tomorrow → /data/2.5/forecast, tomorrow extraction ───────────────────
