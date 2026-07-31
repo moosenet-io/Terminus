@@ -440,12 +440,14 @@ async fn handle_agent_execute(
         .and_then(|c| c.as_str())
         .unwrap_or("");
 
-    // Shared, already-registered registry — rebuilding ~400 tools per turn would put
-    // that cost on the hottest path in the system (TRTR-02/08 exist to make this fast).
-    let registry = crate::registry::shared();
+    // The LIVE registry snapshot, not a static one — `state.registry` is an `ArcSwap`
+    // that can be hot-swapped (broker worker rollout), and using a private static copy
+    // would silently pin the router to a stale implementation while the rest of the
+    // server moved on (review finding). Cheap: this is an Arc load, not a rebuild.
+    let registry = state.registry.load();
 
     let deps = crate::agent_router::RouterDeps {
-        registry,
+        registry: &registry,
         cache: state.tool_cache(),
         chord,
         gateway: state.gateway.as_ref(),

@@ -75,19 +75,59 @@ pub enum Dispatch {
     Unknown(String),
     /// The tool ran and failed.
     Failed(String),
+    /// The caller is NOT AUTHORIZED for this tool (or it is operator-guarded).
+    /// Distinct from `Unavailable` so the audit trail can tell "you may not" from
+    /// "nobody may right now".
+    Denied(String),
 }
 
 /// Dispatch one tool call locally, through the cache when the tool has a policy.
 ///
 /// `principal` is threaded in because a per-principal cache policy must not serve one
 /// user's data to another.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_tool(
     registry: &ToolRegistry,
     cache: &ToolCache,
+    gateway: Option<&crate::gateway_framework::GatewayFramework>,
+    principal_obj: Option<&Principal>,
     name: &str,
     args: Value,
     principal: Option<&str>,
 ) -> Dispatch {
+    // ── AUTHORIZATION, ENFORCED AT DISPATCH ──────────────────────────────────
+    // Review (S128) caught this as the load-bearing hole: SELECTION IS ADVISORY.
+    // The model can emit a tool_call for ANY name — including one injected by
+    // untrusted content it just read from a news or web tool — so filtering the
+    // offered list is not an enforcement boundary. Without this check an existing,
+    // available, but UNAUTHORIZED tool would dispatch straight through
+    // `registry.call`, defeating the entire premise of relocating the router for
+    // per-principal scoping.
+    //
+    // `guard()` (not the read-only `permits_tool`) is used deliberately: this IS an
+    // attempt, so it must consume rate-limit budget and emit an audit entry exactly
+    // like the `tools/call` path does.
+    if let Some(gw) = gateway {
+        if let Err(_denial) = gw.guard(principal_obj, name, crate::gateway_framework::ActionKind::Tool).await {
+            return Dispatch::Denied(format!(
+                "`{name}` is not available to you. Do not call it again; answer with the \
+                 tools you were given."
+            ));
+        }
+    }
+
+    // ── OPERATOR-GUARDED TOOLS ARE NEVER MODEL-INVOCABLE ─────────────────────
+    // Ported from Chord's `is_llm_blocked` hard block. The approval mechanism exists
+    // to put a human in the loop; a model that could call `approval_grant` would
+    // approve its own guarded requests and dissolve that gate entirely.
+    let bare = crate::mesh::split_namespaced(name).map(|(_, b)| b).unwrap_or(name);
+    if crate::approval::is_guarded(bare) {
+        return Dispatch::Denied(format!(
+            "`{name}` requires operator approval and cannot be invoked by an assistant. \
+             Ask the operator to run it."
+        ));
+    }
+
     // Availability is re-checked HERE, not just at selection: selection is a snapshot,
     // and a tool parked in between must still be refused.
     let avail = crate::availability::policy();
@@ -123,7 +163,16 @@ pub async fn dispatch_tool(
                 }
                 return Dispatch::Ok { text: with_as_of(value, fetched_at), cached: true };
             }
-            Lookup::Miss | Lookup::Backoff => { /* fall through to a live fetch */ }
+            // A recent fetch FAILED and we are backing off. Falling through here would
+            // hammer a down upstream on every turn — the exact thing the backoff
+            // exists to prevent. Report the failure instead; there is no cached value
+            // to serve (a usable one would have returned Fresh/Stale above).
+            Lookup::Backoff => {
+                return Dispatch::Failed(format!(
+                    "`{name}` recently failed and is backing off; try again shortly."
+                ));
+            }
+            Lookup::Miss => { /* fall through to a live fetch */ }
         }
     }
 
@@ -155,6 +204,12 @@ fn with_as_of(value: String, fetched_at: u64) -> String {
     if fetched_at == 0 {
         return value;
     }
+    // Do NOT append to a JSON payload: many tools return structured JSON, and a
+    // trailing prose note would make it unparseable for any structured consumer
+    // (review finding). Freshness for those is carried in the step log instead.
+    if serde_json::from_str::<Value>(&value).is_ok() {
+        return value;
+    }
     format!("{value}\n\n(cached; fetched at {fetched_at} epoch-seconds)")
 }
 
@@ -166,6 +221,11 @@ fn spawn_refresh(cache: &ToolCache, name: &str, args: Value, key: String) {
     let cache = cache.clone();
     let name = name.to_string();
     tokio::spawn(async move {
+        // Re-check availability: a tool parked between the original call and this
+        // refresh must not be re-fetched (review consistency finding).
+        if !crate::availability::policy().agent_usable(&name) {
+            return;
+        }
         let reg = crate::registry::shared();
         match reg.call(&name, args).await {
             Some(Ok(text)) => cache.put(&key, text).await,
@@ -451,6 +511,8 @@ pub async fn execute(
             let d = dispatch_tool(
                 deps.registry,
                 deps.cache,
+                deps.gateway,
+                deps.principal,
                 &call.name,
                 call.arguments.clone(),
                 principal_name,
@@ -466,6 +528,7 @@ pub async fn execute(
                     "failed",
                     false,
                 ),
+                Dispatch::Denied(m) => (m, "denied", false),
             };
             steps.push(Step {
                 tool: call.name.clone(),
@@ -590,7 +653,7 @@ mod tests {
     async fn dispatching_an_unknown_tool_says_so_plainly() {
         let reg = ToolRegistry::new();
         let cache = ToolCache::default();
-        match dispatch_tool(&reg, &cache, "does_not_exist", json!({}), None).await {
+        match dispatch_tool(&reg, &cache, None, None, "does_not_exist", json!({}), None).await {
             Dispatch::Unknown(msg) => {
                 assert!(msg.contains("not a tool that exists"));
                 // Must not read like a transient failure the model should retry.
@@ -652,6 +715,63 @@ mod tests {
         let s = render_sse(&o);
         assert!(s.contains("complete"), "a timeout must not strand the client waiting");
         assert!(s.contains("partial"), "the partial answer must reach the user");
+    }
+
+    #[tokio::test]
+    async fn an_operator_guarded_tool_is_never_model_invocable() {
+        // Ported from Chord's is_llm_blocked. A model that could call approval_grant
+        // would approve its own guarded requests and dissolve the human-in-the-loop
+        // gate entirely.
+        let reg = ToolRegistry::new();
+        let cache = ToolCache::default();
+        for guarded in ["approval_grant", "approval_deny"] {
+            match dispatch_tool(&reg, &cache, None, None, guarded, json!({}), None).await {
+                Dispatch::Denied(msg) => {
+                    assert!(msg.contains("operator approval"), "got: {msg}");
+                }
+                other => panic!("{guarded} must be DENIED, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_namespaced_guarded_tool_is_also_blocked() {
+        // A guarded tool re-exported through a mesh upstream must not become
+        // invocable just because it arrived namespaced.
+        let reg = ToolRegistry::new();
+        let cache = ToolCache::default();
+        match dispatch_tool(&reg, &cache, None, None, "ct322__approval_grant", json!({}), None).await {
+            Dispatch::Denied(_) => {}
+            other => panic!("namespaced guarded tool must be DENIED, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backing_off_tool_is_not_refetched() {
+        // Falling through on Backoff would hammer a down upstream every turn — the
+        // exact thing the backoff exists to prevent.
+        let cache = ToolCache::default();
+        let key = ToolCache::key("news_headlines", &json!({}), None, false);
+        cache.record_failure(&key).await;
+        let reg = ToolRegistry::new();
+        match dispatch_tool(&reg, &cache, None, None, "news_headlines", json!({}), None).await {
+            Dispatch::Failed(m) => assert!(m.contains("backing off"), "got: {m}"),
+            // If the registry lacks the tool the Unknown path is also acceptable here;
+            // what must NOT happen is a silent live re-fetch.
+            Dispatch::Unknown(_) => {}
+            other => panic!("expected backoff to be enforced, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn freshness_note_never_corrupts_a_json_payload() {
+        // Many tools return structured JSON; appending prose would make it unparseable
+        // for a structured consumer.
+        let j = r#"{"articles":[],"count":0}"#.to_string();
+        assert_eq!(with_as_of(j.clone(), 1_700_000_000), j, "JSON must pass through untouched");
+        // Plain text still gets the honest "as of" annotation.
+        let t = "Current weather: 68F".to_string();
+        assert!(with_as_of(t, 1_700_000_000).contains("cached"));
     }
 
     #[test]
