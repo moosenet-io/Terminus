@@ -178,6 +178,40 @@ impl std::fmt::Debug for UpstreamClient {
     }
 }
 
+/// Whether an error looks like a STALE SESSION rather than a dead upstream.
+///
+/// TERM #565 root cause: `ensure_session` short-circuits whenever ANY session id is
+/// cached — it never checks the session is still alive. When the upstream expires or
+/// forgets it (a restart, an idle timeout, an nginx hop recycling), the next call is
+/// answered with a non-MCP error body. That surfaced as
+/// `"returned an unparseable response: error decoding response body"`, the pool marked
+/// the upstream unhealthy, and ALL of its tools silently vanished from the merged
+/// catalog — for `<host>`, all 40 Proxmox tools, mid-conversation, with the assistant
+/// then telling the operator it had no access to their own hardware.
+///
+/// A stale session is a RECOVERABLE condition, not a dead upstream, so it must be
+/// retried with a fresh handshake rather than treated as an outage.
+///
+/// (Free function, deliberately outside the impl: it is pure classification over an
+/// error value and is unit-testable without constructing a live client.)
+fn looks_like_stale_session(e: &UpstreamClientError) -> bool {
+    match e {
+        // The upstream answered, but not with MCP — the classic expired-session shape
+        // (an HTML or plain-text error page where a JSON-RPC envelope was expected).
+        UpstreamClientError::BadResponse(_, _) => true,
+        // 4xx: the request was understood and refused. 404/400 are what MCP servers
+        // return for an unknown session id. 401/403 are auth, not session, and a fresh
+        // handshake will not help — do not mask a credential problem as a retry.
+        UpstreamClientError::Rejected(_, status, _) => {
+            *status == 400 || *status == 404 || *status == 409
+        }
+        // Transport failures are genuine unreachability; the pool's health tracking
+        // already handles those and retrying would just double the latency.
+        _ => false,
+    }
+}
+
+
 impl UpstreamClient {
     /// Build a client for `server`, resolving its transport (mTLS client
     /// identity, or a bearer token) eagerly — cheap for mTLS (in-process
@@ -342,37 +376,6 @@ impl UpstreamClient {
         matches!(req.send().await, Ok(resp) if resp.status().is_success())
     }
 
-/// Whether an error looks like a STALE SESSION rather than a dead upstream.
-///
-/// TERM #565 root cause: `ensure_session` short-circuits whenever ANY session id is
-/// cached — it never checks the session is still alive. When the upstream expires or
-/// forgets it (a restart, an idle timeout, an nginx hop recycling), the next call is
-/// answered with a non-MCP error body. That surfaced as
-/// `"returned an unparseable response: error decoding response body"`, the pool marked
-/// the upstream unhealthy, and ALL of its tools silently vanished from the merged
-/// catalog — for `<host>`, all 40 Proxmox tools, mid-conversation, with the assistant
-/// then telling the operator it had no access to their own hardware.
-///
-/// A stale session is a RECOVERABLE condition, not a dead upstream, so it must be
-/// retried with a fresh handshake rather than treated as an outage.
-fn looks_like_stale_session(e: &UpstreamClientError) -> bool {
-    match e {
-        // The upstream answered, but not with MCP — the classic expired-session shape
-        // (an HTML or plain-text error page where a JSON-RPC envelope was expected).
-        UpstreamClientError::BadResponse(_, _) => true,
-        // 4xx: the request was understood and refused. 404/400 are what MCP servers
-        // return for an unknown session id. 401/403 are auth, not session, and a fresh
-        // handshake will not help — do not mask a credential problem as a retry.
-        UpstreamClientError::Rejected(_, status, _) => {
-            *status == 400 || *status == 404 || *status == 409
-        }
-        // Transport failures are genuine unreachability; the pool's health tracking
-        // already handles those and retrying would just double the latency.
-        _ => false,
-    }
-}
-
-impl UpstreamClient {
     /// Run `op`, and if it fails in a way that looks like an expired session, DROP the
     /// cached session id and try exactly once more with a fresh `initialize`.
     ///
@@ -402,9 +405,7 @@ impl UpstreamClient {
     fn clear_session(&self) {
         *self.session_id.lock().expect("session_id mutex poisoned") = None;
     }
-}
 
-impl UpstreamClient {
     /// Ensure this client has a live `Mcp-Session-Id` for this upstream,
     /// (re-)running `initialize` if one isn't already cached. Cheap when a
     /// session is already held (a `Mutex` check, no network call).
