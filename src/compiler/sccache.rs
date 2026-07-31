@@ -385,7 +385,23 @@ fn redis_usable(parts: &RedisUrlParts, timeout: std::time::Duration) -> bool {
         }
     }
     if matches!(verdict, ProbeVerdict::Usable) {
-        return true;
+        // The parser is satisfied by the bytes we have — but "satisfied" only
+        // covers what already arrived. TCP does not preserve message boundaries,
+        // so `+OK\r\n+PONG\r\n` and a later `GARBAGE\r\n` can land in SEPARATE
+        // segments; returning here would accept a chatty non-Redis server purely
+        // because its extra bytes were slow. Spend one small bounded window
+        // confirming nothing else is coming (round-3 review finding).
+        if no_unsolicited_trailing_bytes(&mut stream) {
+            return true;
+        }
+        warn!(
+            "sccache: Redis endpoint {}:{} answered AUTH/PING correctly but then sent \
+             UNSOLICITED trailing bytes — we spoke only AUTH/PING, so this is not a \
+             well-behaved Redis. Treating it as unusable and falling open to the local cache \
+             dir. The build is UNAFFECTED apart from a cold cache (TERM #564)",
+            host, port
+        );
+        return false;
     }
     let reply = String::from_utf8_lossy(&seen);
     // The server's own error line (`-NOAUTH …`, `-WRONGPASS …`) is a status
@@ -400,6 +416,78 @@ fn redis_usable(parts: &RedisUrlParts, timeout: std::time::Duration) -> bool {
         host, port, detail
     );
     false
+}
+
+/// How long to watch for unsolicited trailing bytes AFTER the probe's reply is
+/// already complete and affirmative (round-3 review finding).
+///
+/// The tradeoff, explicitly: this window is paid by every HEALTHY probe, because
+/// a healthy Redis says nothing more after `+PONG` and the only way to learn that
+/// is to wait. So it must be small — but a segmented `GARBAGE` line from a chatty
+/// non-Redis server on loopback or a LAN arrives in well under a millisecond, so
+/// even a short window catches it. 100 ms is far longer than any plausible
+/// same-datacentre inter-segment gap, far shorter than the probe's own
+/// `DEFAULT_PROBE_MS` (300 ms) budget, and utterly negligible against a build
+/// that this probe runs ONCE for. Do NOT extend this to the full probe timeout:
+/// that would slow every healthy build for no additional signal.
+const POST_SUCCESS_DRAIN_MS: u64 = 100;
+
+/// Bounded post-success check: `true` iff NOTHING unexpected arrives on `stream`
+/// within [`POST_SUCCESS_DRAIN_MS`] after a complete, affirmative reply.
+///
+/// `evaluate_probe_reply` rejects trailing garbage that was already COALESCED
+/// into the read buffer, but it can only judge bytes it has been given. This
+/// closes the segmentation hole: the invariant is "trailing garbage is ALWAYS
+/// unhealthy", not "trailing garbage that happened to land in the first read".
+///
+/// ⚠ READ THIS BEFORE "FIXING" THE TIMEOUT HANDLING — it is the inverse of the
+/// rest of this module. Everywhere else a read timeout means "the server never
+/// answered" ⇒ UNUSABLE. HERE the server has already answered correctly and we
+/// are only listening for bytes we hope never come, so a timeout with nothing
+/// received is the EXPECTED HEALTHY outcome ⇒ `true`. Treating it as a failure
+/// would declare every real Redis unusable and give the whole fleet cold builds.
+///
+/// The three outcomes:
+/// - `Ok(0)` — clean EOF, server closed with nothing further. Healthy: a close
+///   is not garbage.
+/// - `Ok(n > 0)` — unsolicited bytes. UNHEALTHY ⇒ the caller falls open.
+/// - `Err(timeout)` — silence for the whole window. Healthy (see above).
+///
+/// Any other I/O error is also treated as healthy: we already have a complete,
+/// well-formed, affirmative reply, and a post-reply reset/error is not evidence
+/// of trailing garbage. The asymmetry still holds — a false "unhealthy" only
+/// costs a slower local build — but it does not license inventing failures on a
+/// server that answered us correctly.
+fn no_unsolicited_trailing_bytes(stream: &mut std::net::TcpStream) -> bool {
+    use std::io::Read;
+
+    let window = std::time::Duration::from_millis(POST_SUCCESS_DRAIN_MS);
+    if stream.set_read_timeout(Some(window)).is_err() {
+        // Without a bounded read we could block indefinitely; the reply we hold
+        // is already complete and valid, so accept it rather than risk a stall.
+        return true;
+    }
+    let mut buf = [0u8; 64];
+    match stream.read(&mut buf) {
+        // Clean EOF with nothing further — healthy.
+        Ok(0) => true,
+        // Unsolicited bytes after a complete reply — unhealthy, fall open.
+        Ok(_) => false,
+        // ⚠ The window expired in silence. That is the GOOD case here (inverse of
+        // every other timeout in this module — see the doc comment above).
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            true
+        }
+        // Some other post-reply I/O error (e.g. a reset). We already hold a
+        // complete, well-formed, affirmative reply and observed no trailing
+        // bytes, so this is not evidence of garbage.
+        Err(_) => true,
+    }
 }
 
 /// The index of the first occurrence of `needle` in `hay`, if any.
@@ -963,6 +1051,44 @@ mod tests {
         addr
     }
 
+    /// Like [`spawn_fake_redis`], but writes the reply in TWO segments with a
+    /// deliberate gap, then holds the socket open. This is what makes the
+    /// round-3 finding testable: `first` is flushed on its own (so it really is
+    /// its own TCP segment), the probe's parser is satisfied by it, and only
+    /// `second` — sent `gap` later — reveals whether the probe checked for
+    /// trailing bytes or returned the moment it was satisfied.
+    ///
+    /// `second: None` ⇒ nothing more is ever sent, but the connection is HELD
+    /// OPEN for `hold` (no EOF): the case that breaks if a post-success drain
+    /// waits too long or reads a timeout as failure.
+    fn spawn_fake_redis_segmented(
+        first: &'static [u8],
+        gap: std::time::Duration,
+        second: Option<&'static [u8]>,
+        hold: std::time::Duration,
+    ) -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let mut scratch = [0u8; 256];
+                let _ = sock.read(&mut scratch);
+                let _ = sock.write_all(first);
+                let _ = sock.flush();
+                std::thread::sleep(gap);
+                if let Some(bytes) = second {
+                    let _ = sock.write_all(bytes);
+                    let _ = sock.flush();
+                }
+                // Hold the socket open so the probe sees silence, not EOF.
+                std::thread::sleep(hold);
+            }
+        });
+        addr
+    }
+
     fn probe_against(addr: std::net::SocketAddr, url_tmpl: &str) -> bool {
         let url = url_tmpl.replace("{port}", &addr.port().to_string());
         let parts = parse_redis_url(&url).expect("test URL parses");
@@ -1010,6 +1136,10 @@ mod tests {
 
     /// The positive control — without it, a probe hardwired to `false` would pass
     /// every test above. A server that authenticates and answers `+PONG` IS usable.
+    ///
+    /// This is also the CLEAN-CLOSE case for the round-3 post-success drain:
+    /// `spawn_fake_redis` drops the socket right after writing, so the drain sees
+    /// EOF with no extra bytes. A clean close is not garbage and must stay healthy.
     #[test]
     fn real_probe_accepts_a_healthy_listener() {
         let addr = spawn_fake_redis(Some(b"+OK\r\n+PONG\r\n"));
@@ -1037,12 +1167,80 @@ mod tests {
     /// unsolicited trailing bytes is not a clean reply. Paired with
     /// `real_probe_accepts_a_healthy_listener` (same server, minus the garbage),
     /// so this cannot pass by the probe simply being broken.
+    ///
+    /// Round-3 note: this test writes the whole reply in ONE `write_all`, so
+    /// WHICH layer rejects it (the parser's same-buffer check, or the bounded
+    /// post-success drain) depends on TCP segmentation — it is not deterministic.
+    /// `real_probe_rejects_trailing_garbage_in_a_later_segment` makes the
+    /// segmented case explicit and deliberate. This test is still worth keeping:
+    /// it is the COALESCED path, which is what a real chatty server on loopback
+    /// most often produces, and together the two pin both layers.
     #[test]
     fn real_probe_rejects_trailing_garbage_after_pong() {
         let addr = spawn_fake_redis(Some(b"+PONG\r\nGARBAGE\r\n"));
         assert!(
             !probe_against(addr, "redis://127.0.0.1:{port}"),
             "trailing data after the reply must be judged unusable (fail open)"
+        );
+    }
+
+    // ── Round-3 finding: SEGMENTED trailing garbage ──────────────────────────
+    //
+    // Timing margins, chosen deliberately for a loaded shared build host:
+    //   * garbage gap        = 20 ms  — 5× under the 100 ms drain window
+    //   * drain window       = 100 ms (`POST_SUCCESS_DRAIN_MS`)
+    //   * hold-open          = 1500 ms — 15× over the drain window
+    //   * probe timeout      = 400 ms (`probe_against`)
+    // Every margin is an order of magnitude, so a scheduling hiccup of tens of
+    // milliseconds cannot flip any of these tests.
+
+    /// The round-3 finding, made explicit: the fake server flushes a COMPLETE,
+    /// VALID reply, waits, and only THEN sends garbage. `evaluate_probe_reply`
+    /// cannot see this — the garbage is not in the buffer when the parser is
+    /// satisfied — so this fails unless `redis_usable` performs its bounded
+    /// post-success check. Removing that check must turn this test RED
+    /// (mutation-verified).
+    #[test]
+    fn real_probe_rejects_trailing_garbage_in_a_later_segment() {
+        let addr = spawn_fake_redis_segmented(
+            b"+OK\r\n+PONG\r\n",
+            std::time::Duration::from_millis(20),
+            Some(b"GARBAGE\r\n"),
+            std::time::Duration::from_millis(1500),
+        );
+        assert!(
+            !probe_against(addr, "redis://default:placeholder-password@127.0.0.1:{port}/1"),
+            "trailing garbage arriving in a LATER TCP segment must still be judged unusable — \
+             the invariant is that trailing garbage is always unhealthy, not merely garbage \
+             that happened to land in the first read"
+        );
+    }
+
+    /// The positive control for the test above, and the case that regresses if
+    /// the post-success drain waits too long or misreads its timeout as failure:
+    /// a healthy server that answers correctly and then holds the connection OPEN
+    /// and SILENT (no EOF) must still be USABLE, and must not cost more than the
+    /// bounded drain window.
+    #[test]
+    fn real_probe_accepts_a_healthy_listener_that_holds_the_socket_open() {
+        let addr = spawn_fake_redis_segmented(
+            b"+OK\r\n+PONG\r\n",
+            std::time::Duration::from_millis(20),
+            None,
+            std::time::Duration::from_millis(1500),
+        );
+        let started = std::time::Instant::now();
+        assert!(
+            probe_against(addr, "redis://default:placeholder-password@127.0.0.1:{port}/1"),
+            "silence after a correct reply is the EXPECTED healthy outcome — a read timeout in \
+             the post-success window must not be read as a failure"
+        );
+        // The drain must be BOUNDED and small: it is paid by every healthy probe.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the post-success check must be bounded and short, not the full probe timeout or \
+             the server's hold: took {:?}",
+            started.elapsed()
         );
     }
 
