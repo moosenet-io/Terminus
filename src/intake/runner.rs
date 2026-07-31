@@ -852,9 +852,11 @@ pub struct SttSuiteOutcome {
 
 /// SUITE-STT: run the speech-to-text suite end-to-end against `model_name`.
 ///
-/// Loads the STT corpus manifest from `INTAKE_CORPUS_DIR`
-/// (`[{ "audio_file", "reference" }, ...]`, e.g. the bundled sweep-host corpus at
-/// `/opt/ollama-models/mint-corpora/stt/`), then for each clip: reads the audio
+/// Loads the STT corpus manifest from the `stt/` subdirectory of the
+/// operator-configured `INTAKE_CORPUS_DIR` (`[{ "audio_file", "reference" },
+/// ...]`; see [`crate::intake::newcats::voice_transcription::STT_SUBDIR`]).
+/// There is no compiled-in default corpus location — an unset var fails clean
+/// with `NotConfigured`. Then, for each clip: reads the audio
 /// bytes, derives the clip duration from its WAV header
 /// ([`crate::intake::newcats::voice_transcription::wav_duration_ms`]), transcribes
 /// it through [`crate::intake::infer::transcribe_with_metrics`] (the `openai`
