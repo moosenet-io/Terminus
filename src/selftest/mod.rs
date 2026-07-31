@@ -28,8 +28,9 @@
 //! [`decide_probe_action`], including the accepted residual risk):
 //!   1. **Guarded registry (AUTHORITATIVE).** [`crate::approval::is_guarded`] on
 //!      the bare name is the fleet's canonical machine-readable classifier for
-//!      approval-gated/dangerous tools (<secret-manager>/ansible/openhands/routines/
-//!      pg_ddl/pg_admin/pg_execute/git_public_mirror_*). Checked FIRST and
+//!      approval-gated/dangerous tools (the secrets-manager, config-management,
+//!      agent-runner and scheduler tool families, plus `pg_ddl`/`pg_admin`/
+//!      `pg_execute`/`git_public_mirror_*`). Checked FIRST and
 //!      independent of any name heuristic, so a guarded tool whose name contains
 //!      a read token (e.g. `infisical_get_secret`, `openhands_get_status`) is
 //!      still skipped. This is the guarantee a name allowlist alone cannot give.
@@ -364,7 +365,14 @@ const WRITE_VERB_TOKENS: &[&str] = &[
 ];
 
 /// Name prefixes that mark an entire tool family as unsafe to probe.
-const WRITE_PREFIXES: &[&str] = &["<host>", "ansible"];
+///
+/// These are TOOL-NAME prefixes, not host names: the values are matched with
+/// `starts_with` by [`is_write_destructive`], so they are load-bearing for the
+/// fail-closed write-deny gate and cannot be reworded or suffixed without
+/// narrowing that gate (e.g. `"pve_"` would stop matching a `pvelist`-shaped
+/// tool). Hence the explicit PII-gate exemption on the line below rather than a
+/// rewrite.
+const WRITE_PREFIXES: &[&str] = &["<host>", "ansible"]; // pii-test-fixture: tool-name prefixes for the write-deny gate, not host names (see doc above)
 
 /// AFFIRMATIVE read-only allowlist — the PRIMARY, fail-closed gate. A tool is
 /// only ever CALLED if its name affirmatively matches one of these read/query
@@ -506,8 +514,9 @@ pub fn bare_tool_name(name: &str) -> &str {
 pub enum ProbeAction {
     /// Vetoed by the fleet's machine-readable guarded registry
     /// (`crate::approval::is_guarded`) — the STRONGEST, authoritative gate.
-    /// Approval-gated/dangerous tools (<secret-manager>/ansible/openhands/routines/
-    /// pg_ddl/pg_admin/pg_execute/git_public_mirror_*) are skipped by REGISTRY,
+    /// Approval-gated/dangerous tools (the secrets-manager, config-management,
+    /// agent-runner and scheduler tool families, plus `pg_ddl`/`pg_admin`/
+    /// `pg_execute`/`git_public_mirror_*`) are skipped by REGISTRY,
     /// independent of what their name looks like.
     SkipGuarded,
     /// Vetoed by the destructive-name deny gate (write/mutation token/prefix).
@@ -535,7 +544,7 @@ pub enum ProbeAction {
 ///      `SkipGuarded`, never probed. This is the guarantee a name-token
 ///      allowlist alone cannot provide.
 ///   2. **Destructive-name deny (second veto).** Any write/mutation token or
-///      `<host>*`/`ansible*` prefix ⇒ `SkipDestructive`, even if a read token also
+///      `WRITE_PREFIXES` tool-family prefix ⇒ `SkipDestructive`, even if a read token also
 ///      matched (`queue_status`).
 ///   3. **Required-args.** Any tool with required params ⇒ `NeedsArgs` — never
 ///      called, no fabricated arguments.

@@ -97,3 +97,47 @@ pub mod text_similarity;
 pub mod tool_routing;
 pub mod tts;
 pub mod voice_transcription;
+
+/// Test-only RAII helpers shared by the newcats suites' env-var tests.
+#[cfg(test)]
+pub(crate) mod testenv {
+    /// Save/restore guard for a process-global env var (TERM #569).
+    ///
+    /// Restoring on the LAST line of a test is not enough: if the code under
+    /// test panics, the restore never runs and the mutated var leaks into
+    /// whatever the harness runs next — the exact ambient-state class PCON-08
+    /// exists to stop. `Drop` runs on unwind, so this holds either way.
+    ///
+    /// Distinct from `intake::assistant::runner`'s `EnvVarGuard`, which always
+    /// REMOVES on drop; these tests must put back a pre-existing operator value
+    /// (`INTAKE_CORPUS_DIR` is set in the live sweep environment).
+    pub(crate) struct ScopedEnvVar {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl ScopedEnvVar {
+        /// Capture `key`'s current value, then set it to `value`.
+        pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+
+        /// Capture `key`'s current value, then unset it.
+        pub(crate) fn unset(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}

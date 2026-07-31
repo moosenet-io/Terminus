@@ -247,8 +247,9 @@ pub async fn dispatch_tool(
 /// Tools an assistant may NEVER invoke, whatever its grant says.
 ///
 /// Two families, and the second is the one that bit us:
-/// 1. [`crate::approval::is_guarded`] — the operator-guarded set (ansible/openhands/
-///    <secret-manager>/routines/mirror-push/pg).
+/// 1. [`crate::approval::is_guarded`] — the operator-guarded set (the
+///    config-management, agent-runner, secrets-manager and scheduler tool
+///    families, plus mirror-push and the `pg_*` tools).
 /// 2. The **approval mechanism itself** (`approval_grant`, `approval_deny`). These are
 ///    NOT in the guarded list — they are only covered by the gateway's `approval_`
 ///    DENY PREFIX, which applies to `Grant::AllowDeny` identities (the scaffolded

@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn per_principal_keys_do_not_collide_across_users() {
         let args = json!({});
-        let a = ToolCache::key("my_locations", &args, Some("<operator>"), true);
+        let a = ToolCache::key("my_locations", &args, Some("alice"), true);
         let b = ToolCache::key("my_locations", &args, Some("guest"), true);
         assert_ne!(a, b, "user-scoped results must never be shared between principals");
         // And an unidentified caller gets its own bucket, not a named user's.
@@ -409,7 +409,7 @@ mod tests {
     fn non_per_principal_keys_are_shared() {
         let args = json!({"country": "us"});
         assert_eq!(
-            ToolCache::key("news_headlines", &args, Some("<operator>"), false),
+            ToolCache::key("news_headlines", &args, Some("alice"), false),
             ToolCache::key("news_headlines", &args, Some("guest"), false),
             "world-scoped data should be shared, that is the point of the cache"
         );

@@ -597,6 +597,10 @@ mod tests {
     }
 
     #[test]
+    // PCON-08: mutates the process-global `CHORD_ENSURE_UP_TIMEOUT_SECS` that
+    // `crate::config::ensure_up_timeout_secs()` reads; joins the `intake_env`
+    // serial group so no parallel test observes a half-applied value.
+    #[serial_test::serial(intake_env)]
     fn ensure_up_timeout_is_clamped_below_client_timeout() {
         // The effective ceiling can never reach lumina's 120s client timeout,
         // no matter how large the env is set (T1).

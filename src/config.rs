@@ -1460,8 +1460,9 @@ pub fn constellation_lumina_token() -> Option<String> {
 /// (unauthenticated passthrough), which keeps a token-less dev Muse working —
 /// the same fail-soft posture as the Lumina arm rather than a hard failure.
 ///
-/// The value is Muse's own `MUSE_API_TOKEN`, materialized from <secret-manager> into
-/// this process's environment; never a literal in config or source (S7).
+/// The value is Muse's own `MUSE_API_TOKEN`, materialized from the fleet
+/// secrets manager into this process's environment; never a literal in config
+/// or source (S7).
 ///
 /// Why this exists (TERM #549): the constellation GUI's Muse panels read
 /// per-account routes that live on Muse's *protected* router — `/premiere` and

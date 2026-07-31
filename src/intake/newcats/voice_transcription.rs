@@ -395,7 +395,7 @@ mod tests {
     }
 
     /// The in-repo fixture manifest parses into typed entries — proves the
-    /// loader without committing the ~3MB <host> corpus.
+    /// loader without committing the ~3MB sweep-host corpus.
     #[test]
     fn manifest_fixture_parses() {
         let raw = include_str!("fixtures/stt_manifest.json");

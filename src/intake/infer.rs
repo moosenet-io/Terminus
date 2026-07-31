@@ -2638,6 +2638,10 @@ mod tests {
     }
 
     #[test]
+    // PCON-08: `ENV_LOCK` below only serializes the tests in THIS module; the
+    // `intake_env` serial group extends that to every env-mutating intake test
+    // crate-wide (and is what the textual hermeticity lint can see).
+    #[serial_test::serial(intake_env)]
     fn remote_override_reaches_resolve_backend_choke_point() {
         // End-to-end through the single resolution choke point every dispatch
         // path funnels through: with the global set, an untagged model (which
@@ -4138,6 +4142,9 @@ mod tests {
     /// answers (after a delay) makes `ensure_up` succeed, then the non-`openai` kind
     /// lands in the "does not support" arm with a measurable elapsed.
     #[tokio::test]
+    // PCON-08: see `remote_override_reaches_resolve_backend_choke_point` — the
+    // module-local `ENV_LOCK` is widened to the crate-wide `intake_env` group.
+    #[serial_test::serial(intake_env)]
     async fn imagegen_records_latency_on_unsupported_backend() {
         let _env = ENV_LOCK.lock().unwrap();
         let server = httpmock::MockServer::start_async().await;
@@ -4180,6 +4187,9 @@ mod tests {
     /// is unhealthy (after a delay) makes `ensure_up` return `Err` with measurable
     /// elapsed — and no systemctl side effects.
     #[tokio::test]
+    // PCON-08: see `remote_override_reaches_resolve_backend_choke_point` — the
+    // module-local `ENV_LOCK` is widened to the crate-wide `intake_env` group.
+    #[serial_test::serial(intake_env)]
     async fn transcribe_records_latency_on_ensure_up_failure() {
         let _env = ENV_LOCK.lock().unwrap();
         let server = httpmock::MockServer::start_async().await;
