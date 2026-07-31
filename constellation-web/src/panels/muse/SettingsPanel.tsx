@@ -155,8 +155,19 @@ function SectionNote({ children }: { children: React.ReactNode }) {
  */
 function AcquisitionSettings({ settings }: { settings: SettingsSection }) {
   const { data, loading, degraded } = settings;
+
+  // SETTLED-ONLY. `useMuseSection` clears `data` on degrade and on error, and
+  // `ChartCard` renders a skeleton instead of children while `loading` — so today a
+  // stale gate value cannot reach the screen. This guard makes that property LOCAL
+  // anyway: a safety readout must not depend on a sibling component's rendering
+  // choice or on a hook's clearing behaviour staying as it is. `fetchOnce` sets
+  // `loading` before every refresh while `data` still holds the PREVIOUS snapshot, so
+  // without this the gate would be computed from a value that is being re-read
+  // (reviewers' final point, and correct in principle even though ChartCard currently
+  // masks it).
+  const settled = !loading && !degraded && data !== null;
   // The guide's gate 1 is acquisition.enabled — NOT master_enabled.
-  const gate1 = data?.acquisition.enabled ?? null;
+  const gate1 = settled ? data.acquisition.enabled : null;
   // Gate 2 (MUSE_ARR_REQUEST_AUTO_TIER_ENABLED) is an env var this endpoint does not
   // return. Represented as unknown, never inferred.
   const gate2Known = false;
