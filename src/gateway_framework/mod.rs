@@ -623,6 +623,18 @@ impl AllowlistPolicy {
     /// than panicking the process at startup — a config typo should not
     /// crash the gateway, it should just deny everyone else until fixed
     /// (loudly logged so the operator notices).
+    ///
+    /// TRTR-05 adds two things to that:
+    /// - Identities named in `TERMINUS_GATEWAY_GUEST_IDENTITIES` are seeded
+    ///   with [`guest_baseline_grant`] between the scaffold and the env JSON,
+    ///   so a household guest has the narrow safe surface without hand-writing
+    ///   JSON, and an explicit env entry still wins if the operator wants to
+    ///   shape one by hand.
+    /// - Every env entry is validated by [`validate_grant`] INDIVIDUALLY, and
+    ///   an invalid one is DROPPED (that identity falls back to its
+    ///   scaffold/guest default, or to default-deny) rather than being coerced
+    ///   into a broader grant or discarding the whole map. A malformed grant
+    ///   is never allow-all.
     pub fn from_env() -> Self {
         let raw = crate::config::gateway_allowlist_json();
         let mut entries = scaffold_defaults();
