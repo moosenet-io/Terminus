@@ -1296,22 +1296,21 @@ const BASE_SUPPORTED_TARGETS: [&str; 2] =
 /// `BUILD_TARGET_TRIPLE` / `BUILD_MODULE_TARGET_<MODULE>`.
 const BUILD_ALLOWED_TARGETS: &str = "BUILD_ALLOWED_TARGETS";
 
-/// Review finding 4 — validate an EXPLICIT caller-supplied `target` against the
-/// set this fleet can actually build AND publish for `module`.
+/// Sanity-check an EXPLICIT caller-supplied `target` against the set this fleet
+/// can actually build for `module` — a typo or a target with no installed std
+/// should be rejected in milliseconds rather than after a long doomed compile.
 ///
-/// `validate_segment` alone is NOT sufficient here, and the reason is a publish
-/// hazard rather than a mere build failure. `compiler_build` in `mode=build`
-/// publishes to `<sha>/<target>/<bin>` and then blesses `experimental/current`
-/// — and that `current` pointer is keyed by `(module, channel)` ONLY, with no
-/// target component (`publish::current_pointer_path`). So a caller-supplied
-/// off-contract target publishes an artifact under a path nothing else looks in,
-/// while STILL moving the module's live experimental pointer onto that sha. The
-/// downstream `compiler_release` promote/rollback defaults its target to
-/// `effective_triple(module)`, so it then fails to find the artifact — the
-/// disagreement the whole `effective_triple` "single resolution point" doc exists
-/// to prevent. Before this branch `compiler_build` had no `target` argument at
-/// all, so the target was ALWAYS the module's configured one and this could not
-/// arise; exposing the argument is what makes the check necessary.
+/// ## What this is NOT (round-2 review finding 1, corrected)
+///
+/// An earlier revision of this doc claimed the allowlist prevented the
+/// pointer/artifact-path DISAGREEMENT hazard. It does not, and cannot: the hazard
+/// is a build whose target differs from the MODULE'S DEFAULT — and
+/// `x86_64-unknown-linux-gnu` vs a musl-default module is exactly that case with
+/// both triples "supported". The real fix is the pointer-target invariant
+/// enforced by [`should_bless_current`] and, fail-closed at the store layer,
+/// `publish::DefaultTarget` / `publish::set_current`: an off-default target is
+/// BUILD/GATE-only and never advances `current`. This function is a cheap
+/// pre-flight filter layered on top of that, nothing more.
 ///
 /// Fleet fact this encodes: chord and terminus-primary are openssl-via-ssh2 and
 /// must be built native-glibc; the musl default silently blocks them. Both
@@ -1344,12 +1343,31 @@ fn check_target_supported(
     }
     Err(ToolError::InvalidArgument(format!(
         "target {target:?} is not a supported build target for module {module:?} (supported: \
-         {}). A build publishes to <sha>/<target>/<bin> but blesses a target-agnostic \
-         experimental/current pointer, so an off-contract target would move the live pointer \
-         onto a sha whose artifact compiler_release cannot find. Extend {BUILD_ALLOWED_TARGETS} \
-         (or this module's BUILD_MODULE_TARGET_* config) to adopt a new target.",
+         {}). Extend {BUILD_ALLOWED_TARGETS} (or this module's BUILD_MODULE_TARGET_* config) to \
+         adopt a new target. Note: a supported target that is not this module's DEFAULT still \
+         builds and gates, but is never blessed as the live release — the current pointer has no \
+         target component.",
         supported.join(", ")
     )))
+}
+
+/// TERM #565 (round-2 review finding 1) — may THIS build advance the module's
+/// `<channel>/current` pointer?
+///
+/// Two reasons it may not:
+/// 1. `relayed` — the build host has no RW dataset mount, so the relay TARGET
+///    host owns the pointer flip (pre-existing rule).
+/// 2. the artifact was built for a target OTHER than the module's effective
+///    default. The artifact is target-addressed (`<sha>/<target>/<bin>`) but the
+///    `current` pointer is keyed by `(module, channel)` with NO target component,
+///    and `compiler_release` resolves `effective_triple(module)` — so blessing an
+///    off-default target's sha would leave the live pointer on an artifact
+///    release cannot resolve. Such a build is BUILD/GATE-only.
+///
+/// Pure + total, so the invariant is unit-testable without a dataset or a build;
+/// `publish::bless_build` enforces the same rule fail-closed at the store layer.
+fn should_bless_current(relayed: bool, target: &str, module_default: &str) -> bool {
+    !relayed && target == module_default
 }
 
 /// The per-channel retention count for the artifact store's pruning (BLD-07).
@@ -2926,7 +2944,7 @@ impl RustTool for CompilerBuild {
                 },
                 "target": {
                     "type": "string",
-                    "description": "TERM #564: Rust target triple to build/gate against (e.g. x86_64-unknown-linux-gnu for the NATIVE-glibc openssl-via-ssh2 modules chord/terminus, x86_64-unknown-linux-musl for a portable static artifact). Defaults to this MODULE's own configured target — its BUILD_MODULE_TARGET_<MODULE> override if set, else the fleet-wide BUILD_TARGET_TRIPLE — so per-module native/musl selection is automatic and needs NO caller flag; this argument only exists to override that default for a one-off build. Same default resolution compiler_release uses, so a build and its promote/rollback can never disagree on the target. An explicit value is ALLOWLIST-CHECKED: it must be a supported fleet target (native-glibc or musl-static), this module's own configured default, or listed in BUILD_ALLOWED_TARGETS — an unknown target is rejected rather than published under a path the release pointer cannot find."
+                    "description": "TERM #564: Rust target triple to build/gate against (e.g. x86_64-unknown-linux-gnu for the NATIVE-glibc openssl-via-ssh2 modules chord/terminus, x86_64-unknown-linux-musl for a portable static artifact). Defaults to this MODULE's own configured target — its BUILD_MODULE_TARGET_<MODULE> override if set, else the fleet-wide BUILD_TARGET_TRIPLE — so per-module native/musl selection is automatic and needs NO caller flag; this argument only exists to override that default for a one-off build. Same default resolution compiler_release uses, so a build and its promote/rollback can never disagree on the target. An explicit value is ALLOWLIST-CHECKED: it must be a supported fleet target (native-glibc or musl-static), this module's own configured default, or listed in BUILD_ALLOWED_TARGETS — an unknown target is rejected up front rather than after a doomed compile. TERM #565 — IMPORTANT: an explicit target that DIFFERS from this module's default makes the build BUILD/GATE-ONLY. The artifact is published (and reported) but <channel>/current is NOT advanced onto it, because the current pointer is keyed by (module, channel) with no target component and compiler_release resolves the module default — blessing an off-default target would leave the live pointer on an artifact release cannot find. The result reports off_default_target=true and bless_skipped_reason=\"off-default-target\". To make a different target a module's RELEASE target, change its BUILD_MODULE_TARGET_<MODULE> config."
                 },
                 "request_id": {
                     "type": "string",
@@ -3381,8 +3399,13 @@ impl CompilerBuild {
                 check_target_supported(&module, &t, &module_default)?;
                 t
             }
-            None => module_default,
+            None => module_default.clone(),
         };
+        // TERM #565 (round-2 review finding 1): an explicit target that DIFFERS
+        // from this module's effective default is BUILD/GATE-only — it must not
+        // advance the target-agnostic `experimental/current` pointer. See
+        // `should_bless_current` and `publish::DefaultTarget`.
+        let off_default_target = triple != module_default;
         // `target` (the triple, caller-supplied, per-module override, or default)
         // is used as a `--target` value AND a path segment.
         validate_segment("target", &triple)?;
@@ -4415,9 +4438,19 @@ impl CompilerBuild {
         // Skipped on the INTERIM relay path — the build host lacks the dataset
         // mount, so it cannot (and must not) write a local pointer; the relay
         // target host owns that flip. `compiler_release` promotes to `stable`.
+        //
+        // TERM #565: nor does an OFF-DEFAULT-TARGET build. The artifact is
+        // target-addressed (`<sha>/<target>/<bin>`) but `current` is not, so
+        // blessing a non-default target's sha would leave the live pointer on an
+        // artifact `compiler_release` (which resolves `effective_triple(module)`)
+        // cannot find. Such a build is BUILD/GATE-only: it is published and
+        // reported, it just never becomes the live release. `publish::bless_build`
+        // would ALSO refuse it — this branch is what turns that refusal into a
+        // clean, reported skip instead of a failed build.
         let mut blessed_current = false;
         let mut pruned: Vec<String> = Vec::new();
-        if !published.relayed {
+        let bless_current = should_bless_current(published.relayed, &triple, &module_default);
+        if bless_current {
             // A build blesses ONLY the experimental/build channel; `bless_build`
             // refuses any promote-only channel (stable is compiler_release-only).
             let bless = publish::bless_build(
@@ -4426,6 +4459,7 @@ impl CompilerBuild {
                 channel,
                 &published.sha256,
                 &triple,
+                &publish::DefaultTarget::for_module(&module),
                 &bin,
                 retain_per_channel(),
             )
@@ -4433,6 +4467,13 @@ impl CompilerBuild {
             blessed_current = bless.blessed;
             pruned = bless.pruned;
         }
+        let bless_skipped_reason: Option<&str> = if bless_current {
+            None
+        } else if published.relayed {
+            Some("relayed")
+        } else {
+            Some("off-default-target")
+        };
 
         // Terminal success for this tool's scope → `published` (with the sha).
         // (`deployed`/`rolled_back` belong to the downstream updater stage.)
@@ -4442,12 +4483,22 @@ impl CompilerBuild {
         );
 
         let text = format!(
-            "Built {module}@{git_ref} on {host} ({sccache}); artifact {sha} → {path}{relayed} [request_id={rid}]",
+            "Built {module}@{git_ref} on {host} ({sccache}); artifact {sha} → {path}{relayed}{off} [request_id={rid}]",
             host = resolved.role.as_str(),
             sccache = sccache_env.describe(),
             sha = &published.sha256,
             path = published.artifact_path.display(),
             relayed = if published.relayed { " (relayed)" } else { "" },
+            // Make the skipped bless IMPOSSIBLE to miss in the human-readable
+            // result — an off-default-target build is deliberately not a release.
+            off = if off_default_target {
+                format!(
+                    " — BUILD/GATE ONLY: target {triple} is not this module's default \
+                     ({module_default}), so {channel}/current was NOT advanced"
+                )
+            } else {
+                String::new()
+            },
             rid = request_id,
         );
         let structured = json!({
@@ -4469,6 +4520,12 @@ impl CompilerBuild {
             "relayed": published.relayed,
             "current_channel": channel,
             "blessed_current": blessed_current,
+            // TERM #565: why `current` was not advanced, when it was not —
+            // "relayed" (the relay target owns the flip) or "off-default-target"
+            // (a BUILD/GATE-only build that must never become the live release).
+            "bless_skipped_reason": bless_skipped_reason,
+            "module_default_target": module_default,
+            "off_default_target": off_default_target,
             "pruned": pruned,
             "sccache_mode": sccache_env.mode.as_str(),
             "caps": {
@@ -4605,8 +4662,15 @@ impl RustTool for CompilerRelease {
                 Ok(ToolOutput::with_structured(text, structured))
             }
             "rollback" => {
-                let out =
-                    publish::rollback_current(&root, &module, &to_channel, &target, &bin).await?;
+                let out = publish::rollback_current(
+                    &root,
+                    &module,
+                    &to_channel,
+                    &target,
+                    &publish::DefaultTarget::for_module(&module),
+                    &bin,
+                )
+                .await?;
                 let text = format!(
                     "Rolled {module}/{to_channel} back to {sha} (was {was})",
                     sha = out.sha,
@@ -4639,6 +4703,7 @@ impl RustTool for CompilerRelease {
                     &to_channel,
                     &sha,
                     &target,
+                    &publish::DefaultTarget::for_module(&module),
                     &bin,
                     retain_per_channel(),
                 )
@@ -5830,11 +5895,49 @@ Source:
         );
     }
 
-    /// The hazard being closed: an unknown-but-segment-SAFE target would pass
-    /// `validate_segment` yet publish under `<sha>/<target>/<bin>` while blessing
-    /// the target-agnostic `experimental/current` pointer — leaving the live
-    /// pointer on a sha whose artifact `compiler_release` (which defaults to
-    /// `effective_triple`) cannot find. It must be REJECTED up front.
+    // ── TERM #565 (round-2 finding 1): off-default target ⇒ BUILD/GATE only ──
+
+    /// The allowlist above does NOT close the pointer/artifact-path hazard: gnu
+    /// and musl are BOTH supported, so a gnu build of a musl-default module is
+    /// allowlist-clean and still off-default. What actually closes it is this:
+    /// a build only advances `current` when its target IS the module default.
+    ///
+    /// MUTATION CHECK: relax `should_bless_current` to `!relayed` and the two
+    /// off-default assertions below flip to true.
+    #[test]
+    fn an_off_default_target_build_never_advances_the_current_pointer() {
+        let musl = "x86_64-unknown-linux-musl";
+        let gnu = "x86_64-unknown-linux-gnu";
+
+        // The normal case is unchanged: default target, local publish ⇒ bless.
+        assert!(should_bless_current(false, musl, musl));
+        // The TERM #564 use case — a one-off native-glibc build of a musl-default
+        // module — still BUILDS, but must never become the live release.
+        assert!(!should_bless_current(false, gnu, musl));
+        // …and symmetrically for a gnu-default module built musl.
+        assert!(!should_bless_current(false, musl, gnu));
+        // A relayed build never blesses locally either (pre-existing rule).
+        assert!(!should_bless_current(true, musl, musl));
+        assert!(!should_bless_current(true, gnu, musl));
+    }
+
+    /// Both halves of the invariant are enforceable without a dataset: the pure
+    /// decision above, and — fail-closed, at the store layer —
+    /// `publish::bless_build` / `publish::set_current`, which refuse an
+    /// off-default target outright (see the `publish` tests). Belt and braces:
+    /// even if a future caller forgot the check above, the flip is refused.
+    #[test]
+    fn default_target_type_only_resolves_through_effective_triple() {
+        let m = "term565-no-override-module";
+        assert_eq!(
+            publish::DefaultTarget::for_module(m).as_str(),
+            effective_triple(m)
+        );
+    }
+
+    /// The hazard the allowlist DOES close: an unknown-but-segment-SAFE target
+    /// (a typo, or a triple with no installed std) is rejected up front rather
+    /// than after a long doomed compile.
     #[test]
     fn unsupported_target_is_rejected_even_though_segment_safe() {
         let default = "x86_64-unknown-linux-musl";

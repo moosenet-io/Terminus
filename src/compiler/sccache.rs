@@ -441,6 +441,17 @@ enum ProbeVerdict {
 /// yields [`ProbeVerdict::NeedMore`] so a reply split across TCP reads is not
 /// misjudged. Anything malformed, unexpected, or non-affirmative ⇒
 /// [`ProbeVerdict::Unusable`] ⇒ the caller falls open to the local cache dir.
+///
+/// TERM #565 (round-2 review finding 3): the reply must be the expected status
+/// lines and NOTHING ELSE. The whole buffer is validated, not just its prefix — a
+/// `+PONG` followed by ANY unexpected trailing bytes (a further line, or a partial
+/// line we did not ask for) is [`ProbeVerdict::Unusable`], because we only spoke
+/// `AUTH`/`PING` and a well-behaved Redis answers those with exactly one status
+/// line each. Accepting `+PONG\r\nGARBAGE\r\n` would be the same "healthy on
+/// flimsy evidence" bug one level down. This does NOT weaken the tri-state: a
+/// partial reply arrives BEFORE the terminating `+PONG` line, so a split read
+/// still yields `NeedMore` (verified by test) — only bytes AFTER a complete,
+/// satisfied response are rejected.
 fn evaluate_probe_reply(seen: &[u8], expect_auth: bool) -> ProbeVerdict {
     // Split into COMPLETE CRLF-terminated lines; ignore any trailing partial.
     let mut lines: Vec<&[u8]> = Vec::new();
@@ -464,7 +475,15 @@ fn evaluate_probe_reply(seen: &[u8], expect_auth: bool) -> ProbeVerdict {
     }
     match lines.get(next) {
         None => ProbeVerdict::NeedMore,
-        Some(l) if *l == b"+PONG" => ProbeVerdict::Usable,
+        Some(l) if *l == b"+PONG" => {
+            // The response is COMPLETE here. Anything still in the buffer —
+            // another complete line, or a trailing partial one — is unsolicited
+            // and makes this not the bounded reply we asked for.
+            if lines.len() > next + 1 || !rest.is_empty() {
+                return ProbeVerdict::Unusable;
+            }
+            ProbeVerdict::Usable
+        }
         Some(_) => ProbeVerdict::Unusable,
     }
 }
@@ -593,17 +612,17 @@ mod tests {
 
     #[test]
     fn parses_full_authd_url() {
-        let p = parse_redis_url("redis://default:s3cr3t@cache-host:6379/1").unwrap();
-        assert_eq!(p.endpoint, "redis://cache-host:6379");
+        let p = parse_redis_url("redis://default:<email>:6379/1").unwrap(); // pii-test-fixture (synthetic placeholder credential + RFC 2606 .invalid host, not an email)
+        assert_eq!(p.endpoint, "redis://cache.invalid:6379");
         assert_eq!(p.username.as_deref(), Some("default"));
-        assert_eq!(p.password.as_deref(), Some("s3cr3t"));
+        assert_eq!(p.password.as_deref(), Some("placeholder-password"));
         assert_eq!(p.db.as_deref(), Some("1"));
     }
 
     #[test]
     fn parses_url_without_auth_or_db() {
-        let p = parse_redis_url("redis://cache-host:6379").unwrap();
-        assert_eq!(p.endpoint, "redis://cache-host:6379");
+        let p = parse_redis_url("redis://cache.invalid:6379").unwrap();
+        assert_eq!(p.endpoint, "redis://cache.invalid:6379");
         assert_eq!(p.username, None);
         assert_eq!(p.password, None);
         assert_eq!(p.db, None);
@@ -612,9 +631,9 @@ mod tests {
     #[test]
     fn parses_password_only_userinfo() {
         // `redis://:pass@host/2` — no username, password present.
-        let p = parse_redis_url("redis://:onlypass@h:6379/2").unwrap();
+        let p = parse_redis_url("redis://:<email>:6379/2").unwrap(); // pii-test-fixture (synthetic placeholder credential + RFC 2606 .invalid host, not an email)
         assert_eq!(p.username, None);
-        assert_eq!(p.password.as_deref(), Some("onlypass"));
+        assert_eq!(p.password.as_deref(), Some("placeholder-password"));
         assert_eq!(p.db.as_deref(), Some("2"));
     }
 
@@ -633,15 +652,15 @@ mod tests {
         // #[serial] + the guard below isolate SCCACHE_BIN, which
         // `SccacheEnv::binary()` reads ambiently — see `ScopedNoSccacheBin`.
         let _no_bin = ScopedNoSccacheBin::new();
-        let env = from_secret(Some("redis://default:pw@h:6379/1"), DATASET);
+        let env = from_secret(Some("redis://default:<email>:6379/1"), DATASET); // pii-test-fixture (synthetic placeholder credential + RFC 2606 .invalid host, not an email)
         assert_eq!(env.mode, SccacheMode::Redis);
         assert_eq!(
             env.vars.get("SCCACHE_REDIS_ENDPOINT").map(String::as_str),
-            Some("redis://h:6379")
+            Some("redis://cache.invalid:6379")
         );
         assert_eq!(
             env.vars.get("SCCACHE_REDIS_PASSWORD").map(String::as_str),
-            Some("pw")
+            Some("placeholder-password")
         );
         assert_eq!(
             env.vars.get("SCCACHE_REDIS_DB").map(String::as_str),
@@ -695,7 +714,7 @@ mod tests {
         // A syntactically valid but DEAD endpoint (probe returns false) must fall
         // open to the local dir — never select Redis mode.
         let env = from_secret_with_probe(
-            Some("redis://default:pw@dead-host:6379/1"),
+            Some("redis://default:<email>:6379/1"), // pii-test-fixture (synthetic placeholder credential + RFC 2606 .invalid host, not an email)
             DATASET,
             |_| false, // injected: endpoint unusable
         );
@@ -715,7 +734,7 @@ mod tests {
         // Redis mode is selected with the split env.
         let seen = std::cell::RefCell::new((String::new(), 0u16));
         let env = from_secret_with_probe(
-            Some("redis://default:pw@cache-host:6390/2"),
+            Some("redis://default:<email>:6390/2"), // pii-test-fixture (synthetic placeholder credential + RFC 2606 .invalid host, not an email)
             DATASET,
             |parts| {
                 let (h, p) = endpoint_host_port(parts);
@@ -724,21 +743,21 @@ mod tests {
             },
         );
         assert_eq!(env.mode, SccacheMode::Redis);
-        assert_eq!(seen.borrow().0, "cache-host");
+        assert_eq!(seen.borrow().0, "cache.invalid");
         assert_eq!(seen.borrow().1, 6390);
         assert_eq!(
             env.vars.get("SCCACHE_REDIS_ENDPOINT").map(String::as_str),
-            Some("redis://cache-host:6390")
+            Some("redis://cache.invalid:6390")
         );
     }
 
     #[test]
     fn endpoint_host_port_parses_default_and_ipv6() {
-        let p = parse_redis_url("redis://h:6379").unwrap();
-        assert_eq!(endpoint_host_port(&p), ("h".to_string(), 6379));
+        let p = parse_redis_url("redis://cache.invalid:6379").unwrap();
+        assert_eq!(endpoint_host_port(&p), ("cache.invalid".to_string(), 6379));
         // No explicit port ⇒ default 6379.
-        let p2 = parse_redis_url("redis://onlyhost").unwrap();
-        assert_eq!(endpoint_host_port(&p2), ("onlyhost".to_string(), 6379));
+        let p2 = parse_redis_url("redis://no-port.invalid").unwrap();
+        assert_eq!(endpoint_host_port(&p2), ("no-port.invalid".to_string(), 6379));
         // IPv6 literal with port — brackets stripped.
         let p3 = parse_redis_url("redis://[::1]:6380").unwrap();
         assert_eq!(endpoint_host_port(&p3), ("::1".to_string(), 6380));
@@ -748,18 +767,18 @@ mod tests {
     fn malformed_port_makes_url_unparseable() {
         // A PRESENT-but-invalid port fails the whole parse (→ caller fails open),
         // never silently defaults to 6379.
-        assert!(parse_redis_url("redis://host:notaport/1").is_none());
-        assert!(parse_redis_url("redis://host:0/1").is_none()); // zero out of range
-        assert!(parse_redis_url("redis://host:99999/1").is_none()); // > 65535
-        assert!(parse_redis_url("redis://host:/1").is_none()); // empty after ':'
+        assert!(parse_redis_url("redis://cache.invalid:notaport/1").is_none());
+        assert!(parse_redis_url("redis://cache.invalid:0/1").is_none()); // zero out of range
+        assert!(parse_redis_url("redis://cache.invalid:99999/1").is_none()); // > 65535
+        assert!(parse_redis_url("redis://cache.invalid:/1").is_none()); // empty after ':'
         assert!(parse_redis_url("redis://[::1]:notaport").is_none()); // ipv6 bad port
                                                                       // Absent port parses (defaulted to 6379 downstream); a valid port is kept.
-        let absent = parse_redis_url("redis://host/1").unwrap();
+        let absent = parse_redis_url("redis://cache.invalid/1").unwrap();
         assert_eq!(absent.port, None);
-        assert_eq!(endpoint_host_port(&absent), ("host".to_string(), 6379));
-        let valid = parse_redis_url("redis://host:6380/1").unwrap();
+        assert_eq!(endpoint_host_port(&absent), ("cache.invalid".to_string(), 6379));
+        let valid = parse_redis_url("redis://cache.invalid:6380/1").unwrap();
         assert_eq!(valid.port, Some(6380));
-        assert_eq!(endpoint_host_port(&valid), ("host".to_string(), 6380));
+        assert_eq!(endpoint_host_port(&valid), ("cache.invalid".to_string(), 6380));
     }
 
     #[test]
@@ -768,7 +787,7 @@ mod tests {
         // SCCACHE_DIR exactly like a missing/garbage URL — with a probe that would
         // otherwise say "reachable" (proving the port, not reachability, decided it).
         let env = from_secret_with_probe(
-            Some("redis://default:pw@host:notaport/1"),
+            Some("redis://default:<email>:notaport/1"), // pii-test-fixture (synthetic placeholder credential + RFC 2606 .invalid host, not an email)
             DATASET,
             |_| true, // even if host:6379 were reachable…
         );
@@ -780,8 +799,8 @@ mod tests {
 
     #[test]
     fn describe_never_contains_password() {
-        let env = from_secret(Some("redis://default:sup3rsecret@h:6379/1"), DATASET);
-        assert!(!env.describe().contains("sup3rsecret"));
+        let env = from_secret(Some("redis://default:<email>:6379/1"), DATASET); // pii-test-fixture (synthetic placeholder credential + RFC 2606 .invalid host, not an email)
+        assert!(!env.describe().contains("leak-canary-placeholder-password"));
     }
 
     // ── TERM #564: the probe must judge USABILITY, not mere reachability ─────
@@ -790,8 +809,8 @@ mod tests {
     fn resp_command_encodes_wire_form() {
         assert_eq!(resp_command(&["PING"]), b"*1\r\n$4\r\nPING\r\n".to_vec());
         assert_eq!(
-            resp_command(&["AUTH", "default", "pw"]),
-            b"*3\r\n$4\r\nAUTH\r\n$7\r\ndefault\r\n$2\r\npw\r\n".to_vec()
+            resp_command(&["AUTH", "default", "placeholder-password"]),
+            b"*3\r\n$4\r\nAUTH\r\n$7\r\ndefault\r\n$20\r\nplaceholder-password\r\n".to_vec()
         );
     }
 
@@ -855,6 +874,50 @@ mod tests {
         assert_eq!(evaluate_probe_reply(b"", false), NeedMore);
     }
 
+    /// TERM #565 (round-2 review finding 3): a COMPLETE, satisfied response
+    /// followed by ANY unexpected trailing bytes is NOT "usable". The stated
+    /// invariant is that a malformed result is ALWAYS unhealthy; accepting a
+    /// prefix and ignoring the rest of the buffer contradicts it.
+    ///
+    /// Mutation-check for a future reader: delete the trailing-data rejection in
+    /// `evaluate_probe_reply` and every assertion in this test that expects
+    /// `Unusable` flips to `Usable`.
+    #[test]
+    fn probe_reply_rejects_trailing_data_after_a_complete_reply() {
+        use ProbeVerdict::*;
+
+        // The exact byte sequence called out by review.
+        assert_eq!(
+            evaluate_probe_reply(b"+PONG\r\nGARBAGE\r\n", false),
+            Unusable,
+            "a +PONG followed by unsolicited trailing data is not a clean reply"
+        );
+        assert_eq!(
+            evaluate_probe_reply(b"+OK\r\n+PONG\r\nGARBAGE\r\n", true),
+            Unusable
+        );
+        // Trailing data need not be a complete line to be unexpected.
+        assert_eq!(evaluate_probe_reply(b"+PONG\r\nGAR", false), Unusable);
+        // Even a SECOND well-formed status line is unexpected — we sent exactly
+        // one PING (and at most one AUTH), so a second +PONG means we are not
+        // talking to what we think we are talking to.
+        assert_eq!(evaluate_probe_reply(b"+PONG\r\n+PONG\r\n", false), Unusable);
+        // An AUTH reply we never asked for, ahead of the PONG, is likewise not
+        // the expected shape.
+        assert_eq!(evaluate_probe_reply(b"+OK\r\n+PONG\r\n", false), Unusable);
+
+        // …and the tri-state is INTACT: a reply legitimately split across TCP
+        // reads is still NeedMore, never a false negative. These are the exact
+        // prefixes of the two happy-path replies.
+        assert_eq!(evaluate_probe_reply(b"+PON", false), NeedMore);
+        assert_eq!(evaluate_probe_reply(b"+PONG\r", false), NeedMore);
+        assert_eq!(evaluate_probe_reply(b"+OK\r\n", true), NeedMore);
+        assert_eq!(evaluate_probe_reply(b"+OK\r\n+PONG\r", true), NeedMore);
+        // …and each completes to Usable once the final CRLF arrives.
+        assert_eq!(evaluate_probe_reply(b"+PONG\r\n", false), Usable);
+        assert_eq!(evaluate_probe_reply(b"+OK\r\n+PONG\r\n", true), Usable);
+    }
+
     #[test]
     fn find_subslice_locates_or_reports_absent() {
         assert_eq!(find_subslice(b"+OK\r\n+PONG\r\n", b"\r\n"), Some(3));
@@ -913,7 +976,7 @@ mod tests {
     fn real_probe_rejects_a_noauth_listener() {
         let addr = spawn_fake_redis(Some(b"-NOAUTH Authentication required.\r\n"));
         assert!(
-            !probe_against(addr, "redis://default:pw@127.0.0.1:{port}/1"),
+            !probe_against(addr, "redis://default:placeholder-password@127.0.0.1:{port}/1"),
             "a NOAUTH server must be judged unusable (fail open)"
         );
     }
@@ -923,7 +986,7 @@ mod tests {
     fn real_probe_rejects_a_wrongpass_listener() {
         let addr = spawn_fake_redis(Some(b"-WRONGPASS invalid username-password pair\r\n"));
         assert!(
-            !probe_against(addr, "redis://default:pw@127.0.0.1:{port}/1"),
+            !probe_against(addr, "redis://default:placeholder-password@127.0.0.1:{port}/1"),
             "a WRONGPASS server must be judged unusable (fail open)"
         );
     }
@@ -935,7 +998,7 @@ mod tests {
         let addr = spawn_fake_redis(None);
         let started = std::time::Instant::now();
         assert!(
-            !probe_against(addr, "redis://default:pw@127.0.0.1:{port}/1"),
+            !probe_against(addr, "redis://default:placeholder-password@127.0.0.1:{port}/1"),
             "a silent server must be judged unusable (fail open)"
         );
         assert!(
@@ -951,7 +1014,7 @@ mod tests {
     fn real_probe_accepts_a_healthy_listener() {
         let addr = spawn_fake_redis(Some(b"+OK\r\n+PONG\r\n"));
         assert!(
-            probe_against(addr, "redis://default:pw@127.0.0.1:{port}/1"),
+            probe_against(addr, "redis://default:placeholder-password@127.0.0.1:{port}/1"),
             "an authenticating server answering +PONG must be usable"
         );
         // …and with no credentials in the URL, a bare `+PONG` is enough.
@@ -965,8 +1028,21 @@ mod tests {
     fn real_probe_rejects_pong_as_a_mere_substring() {
         let addr = spawn_fake_redis(Some(b"-ERR unknown command '+PONG'\r\n"));
         assert!(
-            !probe_against(addr, "redis://default:pw@127.0.0.1:{port}/1"),
+            !probe_against(addr, "redis://default:placeholder-password@127.0.0.1:{port}/1"),
             "`+PONG` inside an error line is not an affirmative reply"
+        );
+    }
+
+    /// Round-2 finding 3 end-to-end through the REAL probe: a `+PONG` followed by
+    /// unsolicited trailing bytes is not a clean reply. Paired with
+    /// `real_probe_accepts_a_healthy_listener` (same server, minus the garbage),
+    /// so this cannot pass by the probe simply being broken.
+    #[test]
+    fn real_probe_rejects_trailing_garbage_after_pong() {
+        let addr = spawn_fake_redis(Some(b"+PONG\r\nGARBAGE\r\n"));
+        assert!(
+            !probe_against(addr, "redis://127.0.0.1:{port}"),
+            "trailing data after the reply must be judged unusable (fail open)"
         );
     }
 
@@ -978,7 +1054,7 @@ mod tests {
     fn real_probe_treats_tls_endpoint_as_unusable() {
         let addr = spawn_fake_redis(Some(b"+OK\r\n+PONG\r\n"));
         assert!(
-            !probe_against(addr, "rediss://default:pw@127.0.0.1:{port}/1"),
+            !probe_against(addr, "rediss://default:placeholder-password@127.0.0.1:{port}/1"),
             "rediss:// is unverifiable here and must fall open, never be assumed healthy"
         );
     }
@@ -988,7 +1064,7 @@ mod tests {
     #[test]
     fn tls_endpoint_falls_open_to_local_dir_end_to_end() {
         let addr = spawn_fake_redis(Some(b"+OK\r\n+PONG\r\n"));
-        let url = format!("rediss://default:pw@127.0.0.1:{}/1", addr.port());
+        let url = format!("rediss://default:placeholder-password@127.0.0.1:{}/1", addr.port());
         let timeout = std::time::Duration::from_millis(400);
         let env = from_secret_with_probe(Some(&url), DATASET, |p| redis_usable(p, timeout));
         assert_eq!(env.mode, SccacheMode::LocalDir);
@@ -1007,7 +1083,7 @@ mod tests {
     #[test]
     fn real_noauth_endpoint_falls_open_to_local_dir_end_to_end() {
         let addr = spawn_fake_redis(Some(b"-NOAUTH Authentication required.\r\n"));
-        let url = format!("redis://default:pw@127.0.0.1:{}/1", addr.port());
+        let url = format!("redis://default:placeholder-password@127.0.0.1:{}/1", addr.port());
         let timeout = std::time::Duration::from_millis(400);
         let env = from_secret_with_probe(Some(&url), DATASET, |p| redis_usable(p, timeout));
         assert_eq!(env.mode, SccacheMode::LocalDir);
@@ -1032,7 +1108,7 @@ mod tests {
     #[test]
     fn reachable_but_unauthenticated_endpoint_falls_open() {
         let env = from_secret_with_probe(
-            Some("redis://default:wrongpw@cache-host:6380/1"),
+            Some("redis://default:<email>:6380/1"), // pii-test-fixture (synthetic placeholder credential + RFC 2606 .invalid host, not an email)
             DATASET,
             // Injected: TCP is fine, AUTH/PING is not — exactly what
             // `redis_usable` returns for a NOAUTH/WRONGPASS reply.
@@ -1057,7 +1133,7 @@ mod tests {
     fn probe_receives_full_parts_including_credentials() {
         let seen: std::cell::RefCell<Option<RedisUrlParts>> = std::cell::RefCell::new(None);
         let env = from_secret_with_probe(
-            Some("redis://alice:s3cret@cache-host:6390/2"),
+            Some("redis://alice:<email>:6390/2"), // pii-test-fixture (synthetic placeholder credential + RFC 2606 .invalid host, not an email)
             DATASET,
             |parts| {
                 *seen.borrow_mut() = Some(parts.clone());
@@ -1067,9 +1143,9 @@ mod tests {
         assert_eq!(env.mode, SccacheMode::Redis);
         let got = seen.borrow().clone().expect("probe was called");
         assert_eq!(got.username.as_deref(), Some("alice"));
-        assert_eq!(got.password.as_deref(), Some("s3cret"));
+        assert_eq!(got.password.as_deref(), Some("placeholder-password"));
         assert_eq!(got.db.as_deref(), Some("2"));
-        assert_eq!(endpoint_host_port(&got), ("cache-host".to_string(), 6390));
+        assert_eq!(endpoint_host_port(&got), ("cache.invalid".to_string(), 6390));
     }
 
     /// A DEAD endpoint (no TCP at all) still falls open — `redis_usable` is a
@@ -1079,7 +1155,7 @@ mod tests {
     #[test]
     fn real_probe_on_dead_endpoint_is_unusable() {
         // 127.0.0.1:1 — reserved, never listening.
-        let parts = parse_redis_url("redis://default:pw@127.0.0.1:1").unwrap();
+        let parts = parse_redis_url("redis://default:placeholder-password@127.0.0.1:1").unwrap();
         assert!(!redis_usable(&parts, std::time::Duration::from_millis(200)));
     }
 }
