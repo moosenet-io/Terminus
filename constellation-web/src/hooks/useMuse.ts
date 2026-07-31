@@ -572,15 +572,21 @@ export type MuseGuideResponse = MuseGuide | { raw: string };
 export function museGuideEntries(data: MuseGuideResponse | null): {
   entries: MuseGuideEntry[];
   htmlOnly: boolean;
-  /** False when the body was neither an `entries` list of valid entries nor an HTML `raw`
-   *  page. Without this, a malformed-but-2xx guide body yielded zero entries with
-   *  `degraded === false`, and the grid was free to call the schedule empty — the same
-   *  false-empty the channel parser was fixed for, one endpoint over (gpt56). `null` input
-   *  is reported as recognized: that is the idle/loading case, which the caller's own
-   *  loading and degraded flags already describe. */
+  /** False whenever the body was not a readable schedule: not an `entries` list of valid
+   *  entries, and not an HTML `raw` page.
+   *
+   *  `null` counts as UNRECOGNIZED, not as an idle sentinel. In practice a null/absent body
+   *  is already marked degraded by `useMuseSection` (see its `.then`), and `gridState` ranks
+   *  loading and degraded above this flag, so the value cannot change what renders today.
+   *  It is reported this way regardless because "recognized" must be a property of the BODY
+   *  alone — a parser that returns `true` for "no body" is only safe as long as every caller
+   *  happens to check loading and degraded first, and that is not a guarantee a pure function
+   *  can make about its callers (codex, gpt56). */
   recognized: boolean;
 } {
-  if (data === null) return { entries: [], htmlOnly: false, recognized: true };
+  // A scalar 2xx body (`true`, `42`, `"x"`) is not an object, and `'entries' in data` THROWS
+  // on a primitive — it crashed the panel instead of reaching the unrecognized state (codex).
+  if (typeof data !== 'object' || data === null) return { entries: [], htmlOnly: false, recognized: false };
   if ('entries' in data && Array.isArray(data.entries)) {
     return data.entries.every(isMuseGuideEntry)
       ? { entries: data.entries, htmlOnly: false, recognized: true }
@@ -593,12 +599,23 @@ export function museGuideEntries(data: MuseGuideResponse | null): {
 function isMuseGuideEntry(v: unknown): v is MuseGuideEntry {
   if (typeof v !== 'object' || v === null) return false;
   const e = v as Record<string, unknown>;
-  return (
-    typeof e.channel_id === 'string' &&
-    typeof e.title === 'string' &&
-    typeof e.start === 'string' &&
-    typeof e.end === 'string'
-  );
+  if (
+    typeof e.channel_id !== 'string' ||
+    typeof e.title !== 'string' ||
+    typeof e.start !== 'string' ||
+    typeof e.end !== 'string'
+  ) {
+    return false;
+  }
+  // Timestamps are validated SEMANTICALLY, not just as strings. `start: "not-a-date"` used to
+  // pass: deriveWindow then skipped it and blockGeometry returned null, so the entry vanished
+  // and its channel row rendered "no scheduled programming" — presenting an unreadable
+  // schedule as an empty one (gpt56). An entry whose times cannot be read is not a programme.
+  const start = Date.parse(e.start);
+  const end = Date.parse(e.end);
+  // `end === start` is allowed: a zero-length programme is drawn as a hairline by
+  // blockGeometry, which is a deliberate existing behaviour. Only end BEFORE start is invalid.
+  return Number.isFinite(start) && Number.isFinite(end) && end >= start;
 }
 
 export function useMuseGuide(): MuseSection<MuseGuideResponse> {

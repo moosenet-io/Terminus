@@ -61,6 +61,25 @@ describe('/api/channels shape normalization', () => {
 });
 
 describe('/guide payload validation', () => {
+  it('does not CRASH on a scalar 2xx body', () => {
+    // `'entries' in data` throws on a primitive. This reached the panel and took it down
+    // rather than degrading to the unrecognized state.
+    expect(() => museGuideEntries(true as never)).not.toThrow();
+    expect(museGuideEntries(true as never).recognized).toBe(false);
+    expect(museGuideEntries(42 as never).recognized).toBe(false);
+    expect(museGuideEntries(null).recognized).toBe(false);
+  });
+
+  it('rejects entries whose timestamps cannot be read, or that end before they start', () => {
+    const bad = { channel_id: 'c', title: 't', start: 'not-a-date', end: 'also-not' };
+    expect(museGuideEntries({ entries: [bad] } as never).recognized).toBe(false);
+    const backwards = { channel_id: 'c', title: 't', start: '2026-07-31T21:00:00Z', end: '2026-07-31T20:00:00Z' };
+    expect(museGuideEntries({ entries: [backwards] } as never).recognized).toBe(false);
+    // A zero-length programme stays VALID — blockGeometry draws it as a hairline on purpose.
+    const zero = { channel_id: 'c', title: 't', start: '2026-07-31T21:00:00Z', end: '2026-07-31T21:00:00Z' };
+    expect(museGuideEntries({ entries: [zero] } as never).recognized).toBe(true);
+  });
+
   it('reports a malformed guide body as unrecognized rather than an empty schedule', () => {
     expect(museGuideEntries({ entries: [{ nope: 1 }] } as never).recognized).toBe(false);
     expect(museGuideEntries({ surprise: true } as never).recognized).toBe(false);
