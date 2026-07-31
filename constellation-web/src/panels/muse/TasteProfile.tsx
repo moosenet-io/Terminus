@@ -17,8 +17,10 @@
 // are omitted with a one-line reason each, rather than rendered as empty axes that
 // would read as "this household has no genre preferences" — a claim about the
 // operator's taste that the data does not support.
+import { useMemo } from 'react';
 import { useMuseTasteProfile } from '../../hooks/useMuse';
 import { ChartCard } from '../../viz/ChartCard';
+import { RadarChartKit } from '../../viz/RadarChart';
 
 function Bar({ label, value, max }: { label: string; value: number; max: number }) {
   const pct = max > 0 ? Math.max(0, Math.min(100, (value / max) * 100)) : 0;
@@ -68,6 +70,23 @@ export function TasteProfile() {
   const div = data?.divergence ?? null;
   const maxDecade = decades.reduce((m, d) => Math.max(m, d.weight), 0);
   const maxGenre = genres.reduce((m, g) => Math.max(m, g.weight), 0);
+
+  // All-or-nothing: `RadarChartKit` needs equal vertex counts, and more importantly a
+  // radar missing an axis reads as a DIFFERENT shape rather than an incomplete one.
+  // Values are clamped to the component's documented 0..1 domain here (it explicitly
+  // does not re-clamp — an out-of-domain value is a caller bug).
+  const radarAxes = useMemo(() => {
+    const a = div?.adventurousness;
+    const c = div?.contrarian_index;
+    const m = div?.mainstream_score;
+    if (typeof a !== 'number' || typeof c !== 'number' || typeof m !== 'number') return null;
+    const clamp = (v: number) => Math.max(0, Math.min(1, v));
+    return [
+      { axis: 'adventurous', value: clamp(a) },
+      { axis: 'contrarian', value: clamp(c) },
+      { axis: 'mainstream', value: clamp(m) },
+    ];
+  }, [div]);
 
   // `has_data: false` means the taste model has never been computed for this account —
   // materially different from "computed and found nothing".
@@ -123,11 +142,22 @@ export function TasteProfile() {
               You vs the masses
             </div>
             {div ? (
-              <div style={{ display: 'flex', gap: 'var(--space-3)', flexWrap: 'wrap' }}>
-                <Stat label="adventurous" value={div.adventurousness} />
-                <Stat label="contrarian" value={div.contrarian_index} />
-                <Stat label="mainstream" value={div.mainstream_score} />
-              </div>
+              <>
+                {/* The guide's divergence RADAR. Rendered only when all three axes are
+                    present: a radar with a missing vertex is not a partial radar, it is
+                    a differently-shaped one, and the shape is the whole message. When an
+                    axis is absent the scalars below still show exactly what is known. */}
+                {radarAxes ? (
+                  <RadarChartKit data={radarAxes} max={1} height={150} primaryLabel="you" />
+                ) : (
+                  <Missing what="Radar needs all three divergence axes; some are absent, so the figures are shown as values only." />
+                )}
+                <div style={{ display: 'flex', gap: 'var(--space-3)', flexWrap: 'wrap', marginTop: 'var(--space-2)' }}>
+                  <Stat label="adventurous" value={div.adventurousness} />
+                  <Stat label="contrarian" value={div.contrarian_index} />
+                  <Stat label="mainstream" value={div.mainstream_score} />
+                </div>
+              </>
             ) : (
               <Missing what="No divergence computed." />
             )}

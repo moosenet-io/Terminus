@@ -21,7 +21,7 @@
 import { useMemo } from 'react';
 import { useParams } from 'react-router-dom';
 import { ChartCard } from '../../viz/ChartCard';
-import { useMuseMediaDetail, museArtUrlAt, type MuseMediaFile } from '../../hooks/useMuse';
+import { useMuseMediaDetail, museArtUrl, museArtUrlAt, type MuseMediaFile } from '../../hooks/useMuse';
 
 const PANEL_BODY_HEIGHT = 720;
 
@@ -116,7 +116,43 @@ export function MediaDetailPanel() {
       emptyMessage="Title not found"
       emptyHint="This media item id is not in the library"
     >
-      <div style={{ display: 'flex', gap: 'var(--space-4)', height: '100%', minHeight: 0, overflowY: 'auto' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, overflowY: 'auto' }}>
+        {/* The guide's backdrop band. `backdrop_url` was in the payload all along and
+            went unused in the first cut (reviewer finding). Rendered behind a soft
+            fade so the content below stays readable; `aria-hidden` because it carries
+            no information the text does not already give. */}
+        {artId !== null && (
+          <div
+            aria-hidden
+            style={{
+              position: 'relative',
+              height: 140,
+              marginBottom: 'var(--space-3)',
+              borderRadius: 'var(--radius-sm, 4px)',
+              overflow: 'hidden',
+              background: 'var(--space-600)',
+              flex: '0 0 auto',
+            }}
+          >
+            <img
+              src={`${museArtUrl('media_metadata', String(artId))}?variant=fanart`}
+              alt=""
+              style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', opacity: 0.55 }}
+              onError={e => {
+                (e.currentTarget as HTMLImageElement).style.visibility = 'hidden';
+              }}
+            />
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                background: 'linear-gradient(to bottom, rgba(0,0,0,0.1), var(--space-800, #0b0b10))',
+              }}
+            />
+          </div>
+        )}
+
+      <div style={{ display: 'flex', gap: 'var(--space-4)', flex: 1, minHeight: 0 }}>
         <div style={{ flex: '0 0 200px' }}>
           {artId !== null && (
             <img
@@ -179,7 +215,7 @@ export function MediaDetailPanel() {
             {data?.match_verdict ? (
               <Row label="verdict" value={JSON.stringify(data.match_verdict)} />
             ) : (
-              <NotRunNote what="Not verified — verify_match has not run for this file. No verdict is implied either way." />
+              <NotRunNote what="No verdict recorded for this file. Nothing is implied about whether it matches — absence of a verdict is not a verdict." />
             )}
           </div>
 
@@ -190,10 +226,11 @@ export function MediaDetailPanel() {
             {data && data.enrichment.length > 0 ? (
               <Row label="entries" value={String(data.enrichment.length)} />
             ) : (
-              <NotRunNote what="No cached enrichment — the enrichment pass has not run for this title." />
+              <NotRunNote what="No cached enrichment recorded for this title." />
             )}
           </div>
         </div>
+      </div>
       </div>
     </ChartCard>
   );

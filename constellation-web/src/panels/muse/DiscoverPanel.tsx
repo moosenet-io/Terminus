@@ -1,19 +1,22 @@
 // MGUI-04 (S129): muse.discover — guide screen 05, "request from the internet".
 //
 // `GET /api/discover` is PUBLIC and returns `{configured, region, items}`. On this
-// deployment it returns `configured: true` with `items: []` — a trending provider IS
-// set up, but no snapshot has been ingested yet.
+// deployment: `configured: true`, `items: []`.
 //
-// That distinction is the whole point of this panel's empty state. Three different
-// situations would otherwise look identical:
+// The empty state distinguishes the two things the RESPONSE actually tells us apart,
+// because they need different fixes:
 //
-//   configured: false          -> no provider set up; fix is configuration
-//   configured: true, items:[] -> set up, but the trending worker has not run
-//   degraded (non-2xx)         -> the endpoint itself is unreachable
+//   configured: false          -> no provider set up      (a configuration fix)
+//   configured: true, items:[] -> set up, returned nothing (something else)
+//   degraded (non-2xx)         -> endpoint unreachable    (handled by useMuseSection)
 //
-// `useMuseSection` already distinguishes the third. This panel distinguishes the
-// first two rather than rendering one anonymous empty box, because "nothing here"
-// and "nothing has run" call for different fixes and a blank card says neither.
+// It deliberately does NOT name a cause for the second case. An earlier version said
+// "no snapshot has been ingested — the trending worker has not produced one", and a
+// reviewer correctly called that an over-claim: an empty `items` is equally
+// consistent with every trending title already being in the library, or a provider
+// query that simply came back empty. The endpoint reports configuration and items,
+// not why the list is empty, so the panel lists the possibilities instead of
+// asserting one. Naming the wrong cause sends an operator to fix the wrong thing.
 //
 // THE REQUEST CTA IS INERT. Guide screen 05 shows a "Request →" button, but that is
 // the acquisition WRITE path, which lives behind Muse's dual safety gate (MUSEM-05)
@@ -42,6 +45,13 @@ export function DiscoverPanel() {
       degraded={degraded}
     >
       <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)', height: '100%', minHeight: 0 }}>
+        {/* Visible, programmatically-associated explanation for the inert CTA below. */}
+        {items.length > 0 && (
+          <div id="discover-request-disabled-note" style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))' }}>
+            Requesting is a write path behind Muse's dual safety gate, so it is not available from
+            this read-only surface.
+          </div>
+        )}
         {showSeam ? (
           <div
             style={{
@@ -55,11 +65,12 @@ export function DiscoverPanel() {
           >
             {data?.configured ? (
               <>
-                <div style={{ color: 'var(--text-100)' }}>No trending snapshot yet.</div>
+                <div style={{ color: 'var(--text-100)' }}>Nothing to discover right now.</div>
                 <div>
-                  A trending provider <strong>is</strong> configured for region {data.region}, but no
-                  snapshot has been ingested — the trending worker has not produced one. This is a
-                  worker/schedule gap, not a configuration gap.
+                  A trending provider <strong>is</strong> configured for region {data.region}, and it
+                  returned no titles. The endpoint reports configuration and items, not why the list
+                  is empty, so this could be any of: no snapshot ingested yet, every trending title
+                  already in your library, or a provider query that came back empty.
                 </div>
               </>
             ) : (
@@ -108,9 +119,12 @@ export function DiscoverPanel() {
                   <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-100)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={it.title}>
                     {it.title}
                   </div>
+                  {/* Disabled controls are not keyboard-focusable and `title` is not a
+                      reliable accessible explanation, so the reason is ALSO visible text
+                      and associated via aria-describedby (reviewer finding). */}
                   <button
                     disabled
-                    title="Requesting is a write path and lives behind Muse's dual safety gate — not available from this read-only surface."
+                    aria-describedby="discover-request-disabled-note"
                     style={{
                       padding: '2px 8px',
                       fontSize: 'var(--fs-2xs, 10px)',
