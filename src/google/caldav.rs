@@ -47,6 +47,13 @@ struct CalendarEvent {
     location: Option<String>,
     /// The calendar id this event was fetched from.
     calendar: String,
+    /// RFC 5545 `STATUS` (`CONFIRMED` / `TENTATIVE` / `CANCELLED`), lower-cased,
+    /// or `"declined"` when the account's own ATTENDEE line says PARTSTAT=DECLINED.
+    ///
+    /// Parsed because a consumer that INFERS something from an event (the weather
+    /// tool's location resolution) must not infer it from an event the user is not
+    /// attending. Empty when the event carries no status.
+    status: String,
 }
 
 // ── Date/time validation & conversion ────────────────────────────────────────
@@ -196,6 +203,32 @@ fn extract_property(block: &str, key: &str) -> Option<String> {
     None
 }
 
+/// The effective status of one VEVENT block, lower-cased.
+///
+/// `STATUS:CANCELLED` wins outright. Otherwise, an ATTENDEE line carrying
+/// `PARTSTAT=DECLINED` means the user said no — for anything INFERRING where the
+/// user will be, a declined invite is as good as cancelled. (We deliberately do
+/// not try to match the account's own address on the ATTENDEE line: Google
+/// returns per-calendar views in which the account's own PARTSTAT is the one
+/// present, and matching on an aliased/delegated address is unreliable. Erring
+/// toward "skip this event" only ever costs us a fallback to the next event or
+/// to the routine — never a wrong place.)
+fn event_status(block: &str) -> String {
+    if let Some(s) = extract_property(block, "STATUS") {
+        let s = s.trim().to_lowercase();
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    for line in block.lines() {
+        let upper = line.to_uppercase();
+        if upper.starts_with("ATTENDEE") && upper.contains("PARTSTAT=DECLINED") {
+            return "declined".to_string();
+        }
+    }
+    String::new()
+}
+
 /// Parse an iCal Multi-Status body into events, tagging each with `calendar`.
 fn parse_ical(body: &str, calendar: &str) -> Vec<CalendarEvent> {
     let unfolded = unfold_ical(body);
@@ -215,6 +248,7 @@ fn parse_ical(body: &str, calendar: &str) -> Vec<CalendarEvent> {
         let dtstart = extract_property(block, "DTSTART").unwrap_or_default();
         let dtend = extract_property(block, "DTEND").unwrap_or_default();
         let location = extract_property(block, "LOCATION");
+        let status = event_status(block);
 
         if uid.is_empty() && summary.is_empty() && dtstart.is_empty() {
             continue;
@@ -227,6 +261,7 @@ fn parse_ical(body: &str, calendar: &str) -> Vec<CalendarEvent> {
             dtend,
             location,
             calendar: calendar.to_string(),
+            status,
         });
     }
 
@@ -657,6 +692,59 @@ impl RustTool for CalendarConflicts {
     }
 }
 
+// ── Calendar as a location source (for the weather tool) ─────────────────────
+
+/// Adapts this module's CalDAV read path to [`crate::weather::location::CalendarSource`].
+///
+/// WHY IT LIVES HERE: the weather tool must not reach Google itself. Google access
+/// is owned by this module — one auth model (`GoogleConfig`, Basic auth with the
+/// app password), one URL scheme, one parser. The weather tool holds only the
+/// trait object, so it never touches a credential (skill S7) and no second Google
+/// client exists to drift.
+pub struct GoogleCalendarSource {
+    cfg: GoogleConfig,
+    http: reqwest::Client,
+}
+
+impl GoogleCalendarSource {
+    pub fn new(cfg: GoogleConfig) -> Self {
+        Self { cfg, http: reqwest::Client::new() }
+    }
+}
+
+#[async_trait]
+impl crate::weather::location::CalendarSource for GoogleCalendarSource {
+    /// Today's events, earliest first, as the JSON shape the resolver consumes.
+    ///
+    /// FAILS SOFT, deliberately: an unreachable calendar yields an EMPTY list, so
+    /// resolution falls through to routine→ask. The whole point of this change is
+    /// that a missing signal produces a QUESTION, never a guessed city — turning a
+    /// calendar outage into an error would revive the retry-and-invent loop.
+    async fn events_now(&self) -> Vec<Value> {
+        let today = chrono::Utc::now().date_naive();
+        let start = format!("{}T000000Z", today.format("%Y%m%d"));
+        let end = format!("{}T235959Z", today.format("%Y%m%d"));
+        let events = match collect_events(&self.http, &self.cfg, &start, &end).await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("weather: calendar unavailable for location resolution — {e}");
+                return Vec::new();
+            }
+        };
+        events
+            .into_iter()
+            .map(|e| {
+                json!({
+                    "summary": e.summary,
+                    "location": e.location,
+                    "status": e.status,
+                    "dtstart": e.dtstart,
+                })
+            })
+            .collect()
+    }
+}
+
 // ── Registration ─────────────────────────────────────────────────────────────
 
 /// Register: google_calendar_today, _week, _add, _conflicts.
@@ -799,6 +887,38 @@ mod tests {
         assert!(parse_ical("BEGIN:VCALENDAR\nEND:VCALENDAR\n", "c").is_empty());
     }
 
+    // ── status (consumed by weather location resolution) ────────────────────────
+
+    #[test]
+    fn event_status_reads_status_then_declined_partstat() {
+        // Explicit STATUS wins.
+        assert_eq!(event_status("SUMMARY:x\nSTATUS:CANCELLED\n"), "cancelled");
+        assert_eq!(event_status("SUMMARY:x\nSTATUS:CONFIRMED\n"), "confirmed");
+        // No STATUS, but the user declined → treated as declined, so nothing
+        // downstream infers a location from an event they are not attending.
+        assert_eq!(
+            event_status("SUMMARY:x\nATTENDEE;PARTSTAT=DECLINED:mailto:<email>\n"), // pii-test-fixture
+            "declined"
+        );
+        // An accepted invite carries no special status.
+        assert_eq!(
+            event_status("SUMMARY:x\nATTENDEE;PARTSTAT=ACCEPTED:mailto:<email>\n"), // pii-test-fixture
+            ""
+        );
+        assert_eq!(event_status("SUMMARY:x\n"), "");
+    }
+
+    #[test]
+    fn parse_ical_carries_status_and_location() {
+        let body = "BEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Onsite\r\n\
+                    DTSTART:20260601T090000Z\r\nLOCATION:Somewhereville\r\n\
+                    STATUS:CANCELLED\r\nEND:VEVENT\r\n";
+        let evs = parse_ical(body, "cal");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].status, "cancelled");
+        assert_eq!(evs[0].location.as_deref(), Some("Somewhereville"));
+    }
+
     // ── dedup / sort ────────────────────────────────────────────────────────────
 
     #[test]
@@ -811,6 +931,7 @@ mod tests {
                 dtend: "".into(),
                 location: None,
                 calendar: "a".into(),
+                status: String::new(),
             },
             CalendarEvent {
                 uid: "u1".into(),
@@ -819,6 +940,7 @@ mod tests {
                 dtend: "".into(),
                 location: None,
                 calendar: "a".into(),
+                status: String::new(),
             },
             CalendarEvent {
                 uid: "u1".into(),
@@ -827,6 +949,7 @@ mod tests {
                 dtend: "".into(),
                 location: None,
                 calendar: "b".into(),
+                status: String::new(),
             },
         ];
         let out = dedup_and_sort(evs);
@@ -895,6 +1018,7 @@ mod tests {
             dtend: "20260601T093000Z".into(),
             location: Some("Room A".into()),
             calendar: "cal@x".into(),
+            status: String::new(),
         }];
         let out = format_events("Today", &evs);
         assert!(out.contains("Standup"));

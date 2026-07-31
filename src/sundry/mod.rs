@@ -267,14 +267,34 @@ impl RustTool for SearxngSearch {
          anything you do not already know. (Not for weather — use the `weather` tool.)"
     }
 
+    /// NOTE ON `required: ["q"]` (verified 2026-07-31, deliberately unchanged).
+    ///
+    /// A review finding asked whether declaring only `q` as required makes the
+    /// tolerant `q`/`query`/`search` handling in `execute` unreachable. It does
+    /// not: **nothing in this codebase validates tool arguments against this
+    /// schema before `execute` runs.** `tools/call` in `mcp_server.rs` takes
+    /// `params.arguments` verbatim, applies the authorization and availability
+    /// gates, and hands the raw `Value` to `ToolRegistry::call`, which calls
+    /// `tool.execute(args)` directly (`registry.rs`); there is no JSON-Schema
+    /// crate in the dependency tree on either side of the door. So a model that
+    /// sends `query` reaches the tolerant code and succeeds — the fallback is
+    /// live, not inert.
+    ///
+    /// `required: ["q"]` therefore stays as the STEER: it tells the model the
+    /// canonical name (so most calls arrive as `q`) and states that a search term
+    /// is mandatory. Relaxing it would only weaken that signal — "exactly one
+    /// non-blank query term" is enforced in `execute`, which rejects blank and
+    /// absent alike, and that enforcement is what actually runs.
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                // Documented, and `query` is accepted as an alias — see `execute`.
+                // Documented, and `query`/`search` are accepted as aliases — see
+                // `execute`. Kept out of `properties` on purpose: advertising three
+                // names invites a model to send more than one.
                 "q": {
                     "type": "string",
-                    "description": "The search terms. (`query` is also accepted.)"
+                    "description": "The search terms — REQUIRED, and must be non-blank. Send them as `q`; the aliases `query` and `search` are also accepted, but send exactly one."
                 },
                 "categories": {
                     "type": "string",

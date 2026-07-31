@@ -24,7 +24,39 @@
 //! 3. **Routine** — home/work from configuration, chosen by time of day.
 //! 4. **Ask** — never guess.
 
+use async_trait::async_trait;
 use serde_json::Value;
+
+/// Where today's calendar events come from.
+///
+/// This is the SEAM that keeps the weather tool from reaching Google itself.
+/// The production implementation is [`crate::google::caldav::GoogleCalendarSource`],
+/// which goes through the module that already owns Google access (CalDAV, Basic
+/// auth, `GoogleConfig`) — the weather tool never builds an API client, never
+/// reads a credential, and never sees `GOOGLE_APP_PASSWORD`.
+///
+/// Fallible by construction: an implementation returns an EMPTY list when the
+/// calendar is unreachable, so a calendar outage degrades to routine→ask. A
+/// missing calendar must never produce an invented location.
+#[async_trait]
+pub trait CalendarSource: Send + Sync {
+    /// Events relevant to "now", each a JSON object with (optionally) `summary`,
+    /// `location` and `status` — the shape [`from_calendar`] consumes.
+    async fn events_now(&self) -> Vec<Value>;
+}
+
+/// The no-calendar implementation: used when Google is not configured.
+///
+/// Its existence is the explicit statement of the degradation path — with no
+/// calendar the chain is routine→ask, never a guess.
+pub struct NoCalendar;
+
+#[async_trait]
+impl CalendarSource for NoCalendar {
+    async fn events_now(&self) -> Vec<Value> {
+        Vec::new()
+    }
+}
 
 /// Where a resolved location came from — carried so the answer can SAY which place it
 /// used. A silently-substituted location is indistinguishable from a wrong one.
@@ -124,6 +156,7 @@ pub fn from_calendar(events: &[Value]) -> Option<(String, String)> {
 }
 
 /// Routine locations from configuration. Non-secret addresses.
+#[derive(Debug, Clone, Default)]
 pub struct Routine {
     pub home: Option<String>,
     pub work: Option<String>,
@@ -171,6 +204,38 @@ pub fn resolve(
         return Resolved::Found { location: loc, source: LocationSource::Routine(which) };
     }
     Resolved::AskUser
+}
+
+/// The full chain, fetching the calendar through the sanctioned seam.
+///
+/// This is what the weather tool actually calls (`WeatherTool::resolve_location`);
+/// `resolve` above is the pure core it delegates to. Keeping the fetch here — and
+/// SHORT-CIRCUITING it when an explicit location was given — means a named
+/// location never costs a calendar round-trip.
+pub async fn resolve_with_calendar(
+    explicit: Option<&str>,
+    calendar: &dyn CalendarSource,
+    routine: &Routine,
+    hour_local: u32,
+    is_weekday: bool,
+) -> Resolved {
+    if let Some(e) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Resolved::Found { location: e.to_string(), source: LocationSource::Explicit };
+    }
+    let events = calendar.events_now().await;
+    resolve(None, &events, routine, hour_local, is_weekday)
+}
+
+/// The local hour (0..=23) and weekday-ness used for routine inference.
+///
+/// Reads the process-local timezone (`chrono::Local`, i.e. `TZ`/`/etc/localtime`)
+/// rather than UTC: "is it a workday morning?" is a question about the user's
+/// clock, and a UTC answer picks the wrong routine for most of the world.
+pub fn local_hour_and_weekday() -> (u32, bool) {
+    use chrono::{Datelike, Timelike, Weekday};
+    let now = chrono::Local::now();
+    let weekday = !matches!(now.weekday(), Weekday::Sat | Weekday::Sun);
+    (now.hour(), weekday)
 }
 
 #[cfg(test)]
