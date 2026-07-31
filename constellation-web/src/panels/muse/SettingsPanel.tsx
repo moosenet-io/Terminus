@@ -24,7 +24,18 @@
 // shows the VARIABLE NAME and a connected/not-configured state; that is the entire
 // useful signal and it leaks nothing.
 import { ChartCard } from '../../viz/ChartCard';
-import { useMuseSettings, useMuseIndexers, useMuseSubsystems, type MuseSubsystem } from '../../hooks/useMuse';
+import {
+  useMuseSettings,
+  useMuseIndexers,
+  useMuseSubsystems,
+  type MuseSettings,
+  type MuseSection,
+  type MuseSubsystem,
+} from '../../hooks/useMuse';
+
+/** The single shared settings read, passed down so the three sections cannot
+ *  disagree with one another. */
+type SettingsSection = MuseSection<MuseSettings>;
 
 /** A read-only state pill. Deliberately NOT a button: see the module doc. */
 function StatePill({ on, onLabel = 'on', offLabel = 'off' }: { on: boolean; onLabel?: string; offLabel?: string }) {
@@ -43,6 +54,29 @@ function StatePill({ on, onLabel = 'on', offLabel = 'off' }: { on: boolean; onLa
       }}
     >
       {on ? onLabel : offLabel}
+    </span>
+  );
+}
+
+/** Distinct from on/off: a value this surface genuinely cannot see. Rendering it as
+ *  `off` would be an invented fact, and on a safety gate that is the dangerous
+ *  direction. */
+function UnknownPill() {
+  return (
+    <span
+      style={{
+        padding: '1px 8px',
+        fontSize: 'var(--fs-2xs, 10px)',
+        fontFamily: 'var(--font-mono)',
+        textTransform: 'uppercase',
+        letterSpacing: '0.04em',
+        borderRadius: 'var(--radius-xs, 3px)',
+        color: 'var(--text-400, var(--text-300))',
+        border: '1px dashed var(--border)',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      unknown
     </span>
   );
 }
@@ -95,21 +129,46 @@ function SectionNote({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** MGUI-13 — guide screen 14. The dual safety gate, shown as state. */
-function AcquisitionSettings() {
-  const { data, loading, degraded } = useMuseSettings();
-  const master = data?.master_enabled ?? false;
-  const acquisition = data?.acquisition.enabled ?? false;
-  // BOTH must be on for a live grab. Rendering the conjunction explicitly is the
-  // point of the guide's "dual gate" pattern — two separate pills leave the reader to
-  // work out the AND, and getting that wrong in either direction is dangerous.
-  const canGrab = master && acquisition;
+/** MGUI-13 — guide screen 14. The dual safety gate, shown as state.
+ *
+ * THE GATE DEFINITION IS THE GUIDE'S, NOT A GUESS — and my first version got it
+ * wrong in a way that could have MISREPRESENTED SAFETY, which both reviewers caught:
+ *
+ *   guide GATE 1 · master : ExperienceSettings.acquisition.enabled
+ *   guide GATE 2 · tier   : MUSE_ARR_REQUEST_AUTO_TIER_ENABLED
+ *
+ * I had used the top-level `master_enabled` (a DIFFERENT setting — the module master
+ * switch) as gate 1, and never read the tier gate at all. That could have reported
+ * "safe" while the real auto-tier gate was armed.
+ *
+ * `/api/settings` exposes `acquisition.enabled` but NO tier key (verified against the
+ * live payload). So gate 2 is genuinely unknowable from this endpoint, and the panel
+ * says so instead of substituting a field that happens to be nearby.
+ *
+ * The RESULT is therefore only stated when it is actually determinable:
+ *   gate 1 OFF  -> SAFE. Sound regardless of gate 2: either gate off means the
+ *                  request is persisted for review and never actioned.
+ *   gate 1 ON   -> INDETERMINATE from here. It would be armed only if gate 2 is also
+ *                  on, and this surface cannot see gate 2. Claiming "armed" or "safe"
+ *                  would both be guesses, and on a live-grab switch a wrong guess in
+ *                  either direction is the dangerous kind.
+ */
+function AcquisitionSettings({ settings }: { settings: SettingsSection }) {
+  const { data, loading, degraded } = settings;
+  // The guide's gate 1 is acquisition.enabled — NOT master_enabled.
+  const gate1 = data?.acquisition.enabled ?? null;
+  // Gate 2 (MUSE_ARR_REQUEST_AUTO_TIER_ENABLED) is an env var this endpoint does not
+  // return. Represented as unknown, never inferred.
+  const gate2Known = false;
+
+  const result: { label: string; on: boolean } | null =
+    gate1 === false ? { label: 'safe', on: false } : null;
 
   return (
     <ChartCard
       title="Acquisition & safety"
       subtitle="write-path · display only"
-      height={230}
+      height={250}
       loading={loading}
       degraded={degraded}
     >
@@ -120,16 +179,24 @@ function AcquisitionSettings() {
           actioned. Changing them is an operator action with real-world blast radius and does not
           belong on a read-only surface.
         </SectionNote>
-        <SettingRow label="Gate 1 · master" detail="ExperienceSettings.master_enabled" right={<StatePill on={master} />} />
         <SettingRow
-          label="Gate 2 · acquisition"
+          label="Gate 1 · master"
           detail="ExperienceSettings.acquisition.enabled"
-          right={<StatePill on={acquisition} />}
+          right={gate1 === null ? <UnknownPill /> : <StatePill on={gate1} />}
+        />
+        <SettingRow
+          label="Gate 2 · tier"
+          detail="MUSE_ARR_REQUEST_AUTO_TIER_ENABLED — not exposed by /api/settings"
+          right={gate2Known ? <StatePill on={false} /> : <UnknownPill />}
         />
         <SettingRow
           label="Result"
-          detail={canGrab ? 'both gates on — a live grab may fire' : 'a request is persisted for review, never actioned'}
-          right={<StatePill on={canGrab} onLabel="grab armed" offLabel="safe" />}
+          detail={
+            result
+              ? 'gate 1 is off, so a request is persisted for review and never actioned — this holds whatever gate 2 is'
+              : 'cannot be determined here: gate 1 is on and gate 2 is not visible to this surface'
+          }
+          right={result ? <StatePill on={result.on} onLabel="grab armed" offLabel="safe" /> : <UnknownPill />}
         />
       </div>
     </ChartCard>
@@ -137,9 +204,8 @@ function AcquisitionSettings() {
 }
 
 /** MGUI-12 — guide screen 13. Connections + env-var provenance, never a value. */
-function IntegrationsSettings() {
+function IntegrationsSettings({ settings }: { settings: SettingsSection }) {
   const { data, loading, degraded } = useMuseIndexers();
-  const settings = useMuseSettings();
   const indexers = data?.indexers ?? [];
 
   return (
@@ -156,6 +222,10 @@ function IntegrationsSettings() {
           one, since a mask still leaks its length and prefix.
         </SectionNote>
 
+        {/* THREE states, not two. `configured && reachable` collapsed
+            configured-but-unreachable into "not configured", hiding a FAULT behind
+            what reads as an un-done setup step — they need different responses
+            (reviewer finding). */}
         <SettingRow
           label="Prowlarr (indexers)"
           detail={
@@ -163,7 +233,31 @@ function IntegrationsSettings() {
               ? `configured=${data.configured} · reachable=${data.reachable} · ${indexers.length} indexer${indexers.length === 1 ? '' : 's'}`
               : undefined
           }
-          right={<StatePill on={Boolean(data?.configured && data?.reachable)} onLabel="connected" offLabel="not configured" />}
+          right={
+            !data ? (
+              <UnknownPill />
+            ) : !data.configured ? (
+              <StatePill on={false} offLabel="not configured" />
+            ) : data.reachable ? (
+              <StatePill on onLabel="connected" />
+            ) : (
+              <span
+                style={{
+                  padding: '1px 8px',
+                  fontSize: 'var(--fs-2xs, 10px)',
+                  fontFamily: 'var(--font-mono)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.04em',
+                  borderRadius: 'var(--radius-xs, 3px)',
+                  color: 'var(--warn, #fbbf24)',
+                  border: '1px solid var(--warn, #fbbf24)',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                unreachable
+              </span>
+            )
+          }
         />
 
         {indexers.map(ix => (
@@ -182,11 +276,18 @@ function IntegrationsSettings() {
           label="Discord bot"
           detail="DISCORD_BOT_TOKEN (value never displayed)"
           right={
-            <StatePill
-              on={Boolean(settings.data?.discord_bot.enabled)}
-              onLabel="enabled"
-              offLabel={settings.data?.discord_bot_token_masked ? 'configured, off' : 'not configured'}
-            />
+            // Absent settings data is UNKNOWN, not "not configured" — otherwise a
+            // still-loading or degraded settings call reads as a definite negative
+            // (reviewer finding).
+            !settings.data ? (
+              <UnknownPill />
+            ) : (
+              <StatePill
+                on={settings.data.discord_bot.enabled}
+                onLabel="enabled"
+                offLabel={settings.data.discord_bot_token_masked ? 'configured, off' : 'not configured'}
+              />
+            )
           }
         />
       </div>
@@ -195,25 +296,41 @@ function IntegrationsSettings() {
 }
 
 /** MGUI-11 — guide screen 12. Module registry + per-subsystem wiring. */
-function ModuleSettings() {
-  const { data, loading, degraded } = useMuseSettings();
+function ModuleSettings({ settings }: { settings: SettingsSection }) {
+  const { data, loading, degraded } = settings;
   const subs = useMuseSubsystems();
 
   const modules: { label: string; detail: string; on: boolean }[] = data
     ? [
         { label: 'Channel director', detail: `serendipity ${data.channel_director.serendipity_percent}%`, on: data.channel_director.enabled },
         { label: 'Adaptation loop', detail: `aggressiveness ${data.adaptation_loop.aggressiveness}`, on: data.adaptation_loop.enabled },
-        { label: 'KG visualisations', detail: `watch-history limit ${data.kg_viz.watch_history_limit}`, on: data.kg_viz.enabled },
+        {
+          label: 'KG visualisations',
+          detail: `neighbour threshold ${data.kg_viz.taste_neighbor_threshold} · watch-history limit ${data.kg_viz.watch_history_limit}`,
+          on: data.kg_viz.enabled,
+        },
         { label: 'Watch together', detail: '', on: data.watch_together.enabled },
-        { label: "What's hot", detail: '', on: data.whats_hot.enabled },
-        { label: 'Discord bot', detail: `cadence ${data.discord_bot.promotion_cadence_secs}s`, on: data.discord_bot.enabled },
+        {
+          label: "What's hot",
+          detail: `${Object.keys(data.whats_hot.source_weights).length} weighted source${Object.keys(data.whats_hot.source_weights).length === 1 ? '' : 's'}`,
+          on: data.whats_hot.enabled,
+        },
+        {
+          label: 'Discord bot',
+          detail: `cadence ${data.discord_bot.promotion_cadence_secs}s · match ≥ ${data.discord_bot.promotion_match_threshold} · ${data.discord_bot.trusted_friends.length} trusted friend${data.discord_bot.trusted_friends.length === 1 ? '' : 's'}`,
+          on: data.discord_bot.enabled,
+        },
       ]
     : [];
 
   return (
     <ChartCard
       title="Module control"
-      subtitle={data ? `sharing: ${data.sharing.granularity} · questions: ${data.question_frequency.frequency}` : 'module registry'}
+      subtitle={
+        data
+          ? `sharing: ${data.sharing.granularity} · questions: ${data.question_frequency.frequency}${data.question_frequency.silent_mode ? ' (silent)' : ''} · ${data.personas.length} persona${data.personas.length === 1 ? '' : 's'}`
+          : 'module registry'
+      }
       height={300}
       loading={loading}
       degraded={degraded}
@@ -239,11 +356,16 @@ function ModuleSettings() {
 }
 
 export function SettingsPanel() {
+  // ONE settings fetch, shared. Three independent `useMuseSettings()` calls meant
+  // three requests AND three snapshots that could disagree with each other mid-flight
+  // — a settings page showing two different values for the same underlying config is
+  // worse than a slow one (reviewer finding).
+  const settings = useMuseSettings();
   return (
     <div style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
-      <AcquisitionSettings />
-      <IntegrationsSettings />
-      <ModuleSettings />
+      <AcquisitionSettings settings={settings} />
+      <IntegrationsSettings settings={settings} />
+      <ModuleSettings settings={settings} />
     </div>
   );
 }

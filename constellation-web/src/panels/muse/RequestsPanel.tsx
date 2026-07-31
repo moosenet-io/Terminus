@@ -140,7 +140,16 @@ function QueueRow({ q }: { q: MuseQueueRow }) {
         </span>
       </div>
       {pct !== null && (
-        <div style={{ height: 4, background: 'var(--space-600)', borderRadius: 2, overflow: 'hidden', marginTop: 3 }}>
+        // A bare div conveys nothing to assistive tech — the fill is purely visual.
+        // Real progressbar semantics so the value is announced (reviewer finding).
+        <div
+          role="progressbar"
+          aria-valuenow={Math.round(pct)}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-label={`${q.title} download progress`}
+          style={{ height: 4, background: 'var(--space-600)', borderRadius: 2, overflow: 'hidden', marginTop: 3 }}
+        >
           <div style={{ width: `${pct}%`, height: '100%', background: 'var(--accent, #8b5cf6)' }} />
         </div>
       )}
