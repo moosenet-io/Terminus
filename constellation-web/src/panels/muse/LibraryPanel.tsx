@@ -27,6 +27,7 @@
 // endpoint returns 200 with a valid JPEG — verified directly), and NOT something the panel can fix
 // client-side. The real fix is a server-side thumbnail variant, tracked as MUSE #100.
 import { useCallback, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { ChartCard } from '../../viz/ChartCard';
 import { useMuseLibrary, useMuseLibraryTable, museArtUrlAt, type MuseLibraryItem } from '../../hooks/useMuse';
 import { LibraryTableView } from './LibraryTableView';
@@ -106,6 +107,13 @@ function availabilityLabel(availability: string): { text: string; tone: string }
 function PosterTile({ item }: { item: MuseLibraryItem }) {
   const badge = availabilityLabel(item.availability);
   return (
+    // MGUI-03: the tile is the way into the inspection bench. A real <Link> rather
+    // than an onClick so middle-click / open-in-new-tab / keyboard all work.
+    <Link
+      to={`/muse/library/${item.media_item_id}`}
+      style={{ textDecoration: 'none', color: 'inherit', display: 'block', minWidth: 0 }}
+      title={`Open ${item.title}`}
+    >
     <div
       style={{
         display: 'flex',
@@ -173,6 +181,7 @@ function PosterTile({ item }: { item: MuseLibraryItem }) {
         {item.year !== null ? `${item.year} · ${item.kind}` : item.kind}
       </div>
     </div>
+    </Link>
   );
 }
 

@@ -233,6 +233,95 @@ export function useMuseLibraryTable(limit = 500, enabled = true): MuseSection<Mu
   );
 }
 
+// ── Media detail (MGUI-03) ───────────────────────────────────────────────────
+// Shapes copied from a live `GET /api/library/{id}` capture, not inferred.
+
+export interface MuseMediaFile {
+  id: number;
+  relative_path: string;
+  media_info: Record<string, unknown> | null;
+  quality_tier_id: number | null;
+  release_group: string | null;
+  edition: string | null;
+  date_added: string | null;
+}
+
+export interface MuseMediaDetail {
+  found: boolean;
+  poster_url: string;
+  backdrop_url: string;
+  media_item: Record<string, unknown> | null;
+  metadata: Record<string, unknown> | null;
+  files: MuseMediaFile[];
+  enrichment: unknown[];
+  /** `null` on this deployment for every title — verify_match has never run.
+   *  A null MUST render as "no verdict", never as CONSISTENT. */
+  match_verdict: unknown | null;
+}
+
+export function useMuseMediaDetail(id: string | null): MuseSection<MuseMediaDetail> {
+  return useMuseSection<MuseMediaDetail>(id ? `/api/library/${encodeURIComponent(id)}` : null);
+}
+
+// ── Discover (MGUI-04) ───────────────────────────────────────────────────────
+
+export interface MuseDiscover {
+  /** Whether a trending provider is configured at all. Distinguishes "TMDb not
+   *  set up" from "set up but no snapshot ingested yet" — two different fixes. */
+  configured: boolean;
+  region: string;
+  items: {
+    media_metadata_id?: number;
+    tmdb_id?: string;
+    title: string;
+    year?: number | null;
+    kind?: string;
+  }[];
+}
+
+export function useMuseDiscover(): MuseSection<MuseDiscover> {
+  return useMuseSection<MuseDiscover>('/api/discover');
+}
+
+// ── Subsystems (MGUI-06) ─────────────────────────────────────────────────────
+
+export interface MuseSubsystem {
+  key: string;
+  label: string;
+  concern: string;
+  /** The guide's wiring vocabulary: live | worker | seam | unmounted. An
+   *  unrecognized value is shown as-is, never coerced to `live`. */
+  state: string;
+}
+
+export function useMuseSubsystems(): MuseSection<{ subsystems: MuseSubsystem[] }> {
+  return useMuseSection<{ subsystems: MuseSubsystem[] }>('/api/subsystems');
+}
+
+// ── Taste profile (MGUI-07) ──────────────────────────────────────────────────
+
+export interface MuseTasteProfile {
+  account_id: number;
+  has_data: boolean;
+  /** Empty on this deployment — the genres tables are unpopulated (MUSE #90). */
+  genre_lean: { genre: string; weight: number }[];
+  decade_lean: { decade: number; weight: number }[];
+  centroids: unknown[];
+  divergence: {
+    adventurousness?: number;
+    contrarian_index?: number;
+    mainstream_score?: number;
+    computed_at?: string;
+    blind_spots?: unknown[];
+    guilty_pleasures?: { media_metadata_id: number; title: string; rewatch_count: number }[];
+  } | null;
+  profile: Record<string, unknown> | null;
+}
+
+export function useMuseTasteProfile(): MuseSection<MuseTasteProfile> {
+  return useMuseSection<MuseTasteProfile>('/api/taste');
+}
+
 // ── Taste (muse.taste) ───────────────────────────────────────────────────────
 
 export interface MuseTastePoint {

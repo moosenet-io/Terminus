@@ -61,7 +61,13 @@ export function CoreRail({
 
   /** A member module's panel rows, with a status dot in the member's kind colour. */
   const memberRows = (m: ModuleDescriptor): ReactNode => {
-    const panels = getPanelsByModule(m.id);
+    // CONST-22 `hideInRail`: a parameterized / URL-state panel opts out of rail
+    // navigation. `ModuleRail` has always applied this filter; CoreRail did not —
+    // and since App renders CoreRail, the flag had no effect on the shipped shell.
+    // Caught by live verification when MGUI-03's `/muse/library/:id` detail route
+    // showed up as a rail entry (a link to a route with no id to navigate to).
+    // Any other hidden panel, e.g. `models.compare`, was mis-listed the same way.
+    const panels = getPanelsByModule(m.id).filter(p => !p.hideInRail);
     const h = healthFor(m.healthSystem);
     const degraded = degradedSystems.has(m.healthSystem);
     const dotColor = degraded
