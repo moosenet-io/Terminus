@@ -55,6 +55,7 @@ import { MediaDetailPanel as MuseMediaDetailPanel } from './muse/MediaDetailPane
 import { RequestLifecyclePanel as MuseRequestLifecyclePanel } from './muse/RequestLifecyclePanel';
 import { DiscoverPanel as MuseDiscoverPanel } from './muse/DiscoverPanel';
 import { RequestsPanel as MuseRequestsPanel } from './muse/RequestsPanel';
+import { RequestPanel as MuseRequestPanel } from './muse/RequestPanel';
 import { SettingsPanel as MuseSettingsPanel } from './muse/SettingsPanel';
 import { TastePanel as MuseTastePanel } from './muse/TastePanel';
 import { ChannelsPanel as MuseChannelsPanel } from './muse/ChannelsPanel';
@@ -345,6 +346,19 @@ registerPanel({
   icon: '⇄',
   available: true,
   component: MuseRequestsPanel,
+});
+
+// MGUI-16: search the metadata providers and file a request. Titled "Search & request" so it
+// is not read as a duplicate of `muse.requests` — that panel is the queue of requests that
+// already exist, this one is the front of that pipeline. Sits next to it in the rail.
+registerPanel({
+  id: 'muse.request',
+  system: 'muse',
+  title: 'Search & request',
+  path: '/muse/request',
+  icon: '⌕',
+  available: true,
+  component: MuseRequestPanel,
 });
 
 registerPanel({

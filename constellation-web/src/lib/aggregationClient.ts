@@ -849,6 +849,96 @@ function mockEngramSearch(fullPath: string): { results: Memory[] } {
   return { results };
 }
 
+/** MGUI-16 `GET /api/muse/api/search?q=&kind=` — query-dependent, so it is dispatched in
+ *  `mockGetFor` like `/engram/search` rather than sitting in the `MOCK_GET` table.
+ *
+ *  The shapes come from the MGUI-16 CONTRACT (final, in review, not deployed when this was
+ *  written) — not from a capture. Values are plausible, not real, except `tmdb: 286217` /
+ *  `media_metadata_id: 1225` for The Martian, which are from the live `/api/library` capture
+ *  quoted in `hooks/useMuse.ts`.
+ *
+ *  It answers a HEALTHY, COMPLETE search only. There is no magic query that fakes a provider
+ *  error or an uncovered kind: those paths are pinned by `RequestPanel.test.ts` against the
+ *  pure `searchOutcome`, and a mock trapdoor would be a second, divergent definition of what
+ *  a degraded search looks like. */
+const MOCK_MUSE_SEARCH_HITS = [
+  {
+    provider: 'tmdb', kind: 'movie', title: 'The Martian', year: 2015,
+    overview: 'An astronaut is presumed dead and left behind on Mars.',
+    first_aired: '2015-09-30', rating: 7.7, provider_ids: { tmdb: '286217' },
+    poster_url: null, in_library: true, in_catalog: true, ambiguous_match: false,
+    resolution: 'settled', media_metadata_id: 1225,
+  },
+  {
+    provider: 'tmdb', kind: 'movie', title: 'Martian Child', year: 2007,
+    overview: 'A widowed science-fiction writer adopts a boy who believes he is from Mars.',
+    first_aired: '2007-11-02', rating: 6.6, provider_ids: { tmdb: '13649' },
+    // A CHECKED negative: identifiers were looked up and matched nothing.
+    poster_url: null, in_library: false, in_catalog: false, ambiguous_match: false,
+    resolution: 'absent', media_metadata_id: null,
+  },
+  {
+    provider: 'tvdb', kind: 'series', title: 'Martian Successor Nadesico', year: 1996,
+    overview: 'A civilian crew fields Earth’s most advanced battleship.',
+    first_aired: '1996-10-01', rating: 8.1, provider_ids: { tvdb: '76235' },
+    poster_url: null, in_library: false, in_catalog: true, ambiguous_match: false,
+    resolution: 'settled', media_metadata_id: 4102,
+  },
+  {
+    // The AMBIGUOUS case, mocked so the third ownership state is reachable in the harness:
+    // `media_metadata.imdb_id` has no uniqueness constraint, so several catalog rows can share
+    // one id and the endpoint refuses to say whether this title is held.
+    provider: 'tmdb', kind: 'movie', title: 'Martian Land', year: 2015,
+    overview: 'A Mars colony faces a catastrophic sandstorm.',
+    first_aired: '2015-10-06', rating: 3.1, provider_ids: { tmdb: '369847', imdb: 'tt5081774' },
+    poster_url: null, in_library: null, in_catalog: null, ambiguous_match: true,
+    resolution: 'ambiguous_rows', media_metadata_id: null,
+  },
+  {
+    // The UNCHECKED case: the hit carries only a tvmaze id, which lives in a jsonb column and
+    // is not indexed, so nothing was looked up at all. Mocked because it is the state most
+    // easily mistaken for a negative — and the reason `resolution` exists.
+    provider: 'tvdb', kind: 'series', title: 'Mars Mission Zero', year: 2019,
+    overview: 'A documentary crew follows an analogue Mars habitat.',
+    first_aired: '2019-04-11', rating: 6.2, provider_ids: { tvmaze: '41886' },
+    poster_url: null, in_library: null, in_catalog: null, ambiguous_match: false,
+    resolution: 'no_indexed_identifier', media_metadata_id: null,
+  },
+];
+
+function mockMuseSearch(fullPath: string): unknown {
+  const usp = new URLSearchParams(fullPath.split('?')[1] ?? '');
+  const q = (usp.get('q') ?? '').trim().toLowerCase();
+  const kind = usp.get('kind') ?? 'all';
+  const requestedKinds = kind === 'all' ? ['movie', 'series'] : [kind];
+  const results = MOCK_MUSE_SEARCH_HITS.filter(
+    h => requestedKinds.includes(h.kind) && (q === '' || h.title.toLowerCase().includes(q)),
+  );
+  const providers = [
+    { name: 'tmdb', mode: 'radarr_proxy', searchable: ['movie'] },
+    { name: 'tvdb', mode: 'sonarr_proxy', searchable: ['series'] },
+  ].map(p => {
+    const searched = p.searchable.filter(k => requestedKinds.includes(k));
+    const kinds = searched.map(k => {
+      const count = results.filter(r => r.provider === p.name && r.kind === k).length;
+      return { kind: k, status: 'ok', error: null, result_count: count, truncated: false, provider_returned: count, limit: 40 };
+    });
+    return {
+      name: p.name,
+      mode: p.mode,
+      configured: true,
+      searchable_kinds: p.searchable,
+      searched_kinds: searched,
+      // A provider outside the kind filter was genuinely not asked — that is `not_consulted`,
+      // which is NOT an error and must not read as one.
+      status: searched.length === 0 ? 'not_consulted' : 'ok',
+      kinds,
+      result_count: kinds.reduce((n, k) => n + k.result_count, 0),
+    };
+  });
+  return { query: usp.get('q') ?? '', requested_kinds: requestedKinds, providers, complete: true, uncovered_kinds: [], results };
+}
+
 /** GET-style mock lookups, keyed by "{system} {pathname}" (pathname without query string). */
 const MOCK_GET: Record<string, unknown> = {
   'harmony /status': MOCK_STATUS,
@@ -930,6 +1020,9 @@ function mockGetFor(system: SystemId, pathname: string, fullPath: string): unkno
   if (system === 'muse' && pathname.startsWith('/api/channels/') && pathname.endsWith('/lineup')) {
     const channelId = pathname.split('/')[3];
     return MOCK_MUSE_LINEUP[channelId] ?? { channel_id: channelId, lineup: [] };
+  }
+  if (system === 'muse' && pathname === '/api/search') {
+    return mockMuseSearch(fullPath);
   }
   if (system === 'lumina' && pathname === '/analytics') {
     return mockLuminaAnalytics(fullPath);
