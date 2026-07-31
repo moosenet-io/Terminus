@@ -166,8 +166,23 @@ function AcquisitionSettings({ settings }: { settings: SettingsSection }) {
   // (reviewers' final point, and correct in principle even though ChartCard currently
   // masks it).
   const settled = !loading && !degraded && data !== null;
-  // The guide's gate 1 is acquisition.enabled — NOT master_enabled.
-  const gate1 = settled ? data.acquisition.enabled : null;
+  // Gate 1 is Muse's OWN effective predicate, verified in source:
+  //
+  //   settings/mod.rs:143  fn is_acquisition_enabled(&self) -> bool {
+  //                            self.master_enabled && self.acquisition.enabled
+  //                        }
+  //
+  // The guide labels gate 1 as `ExperienceSettings.acquisition.enabled`, and my first
+  // version used that alone. It is not wrong so much as INCOMPLETE: Muse additionally
+  // requires master_enabled, so `acquisition.enabled === true` with master off would
+  // have shown "indeterminate" for a state that is in fact safe. The MGUI-08 agent
+  // building the sibling lifecycle panel caught the divergence.
+  //
+  // Mirroring the backend predicate rather than the guide's label is the right call
+  // for a safety readout: what matters is what the SERVER will actually do, not how
+  // the mockup named the field. The row's detail line names both inputs so the
+  // provenance stays legible.
+  const gate1 = settled ? data.master_enabled && data.acquisition.enabled : null;
   // Gate 2 (MUSE_ARR_REQUEST_AUTO_TIER_ENABLED) is an env var this endpoint does not
   // return. Represented as unknown, never inferred.
   const gate2Known = false;
@@ -192,7 +207,7 @@ function AcquisitionSettings({ settings }: { settings: SettingsSection }) {
         </SectionNote>
         <SettingRow
           label="Gate 1 · master"
-          detail="ExperienceSettings.acquisition.enabled"
+          detail="master_enabled && acquisition.enabled (Muse is_acquisition_enabled)"
           right={gate1 === null ? <UnknownPill /> : <StatePill on={gate1} />}
         />
         <SettingRow
