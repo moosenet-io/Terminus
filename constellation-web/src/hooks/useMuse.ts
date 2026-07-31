@@ -830,6 +830,299 @@ export function useMuseDownloadQueue(): MuseSection<{ wanted: unknown[]; queue: 
   return useMuseSection<{ wanted: unknown[]; queue: MuseDownloadQueueRow[] }>('/api/requests/queue');
 }
 
+// ── Provider search + request (MGUI-16) ──────────────────────────────────────
+//
+// `GET /api/muse/api/search?q=&kind=movie|series|all` — the metadata-provider fan-out that
+// backs the Request page. Every shape below is transcribed from that endpoint's CONTRACT,
+// which is final but **NOT DEPLOYED YET** (it is in review at the time this was written).
+// Nothing here comes from a live capture, and this comment is the only place that fact can
+// be recorded — so no reader mistakes these types for observed behaviour the way the old
+// `item_count` channel type was mistaken for one.
+//
+// The response is deliberately NOT just a result list: it also reports, per provider, what
+// was searched and how it went. That is what makes an honest short list possible. On this
+// deployment keyless TMDb is movies-only and keyless TVDB is series-only, so losing ONE
+// provider loses an entire media kind — a five-result list is then not a short answer, it is
+// half an answer, and `complete`/`uncovered_kinds` are the only things that say so.
+
+/** Per-kind outcome inside one provider's entry. `result_count` is what the provider
+ *  contributed AFTER `limit` was applied; `provider_returned` is what it handed over before
+ *  that. `truncated` is the provider's own verdict — it is never re-derived here by comparing
+ *  the two, because only the server knows whether the upstream itself had more to give. */
+export interface MuseSearchProviderKind {
+  kind: string;
+  /** `"ok" | "partial" | "error" | "not_consulted"`. An unrecognized value renders verbatim. */
+  status: string;
+  /** The provider's own message for a `partial`/`error` kind. `null` when it said nothing. */
+  error: string | null;
+  result_count: number;
+  truncated: boolean;
+  provider_returned: number;
+  limit: number;
+}
+
+/** One metadata provider as the RUNNING deployment reports it. This is the whole point of
+ *  the catalog section: the list of providers is an observation about this server, never a
+ *  hardcoded roster of metadata APIs that exist in the world. */
+export interface MuseSearchProvider {
+  name: string;
+  /** How the provider is reached (e.g. `radarr_proxy`) — rendered as text, not interpreted. */
+  mode: string;
+  configured: boolean;
+  /** Kinds this provider CAN search at all (keyless TMDb: movies only). */
+  searchable_kinds: string[];
+  /** Kinds it was actually asked for on THIS query — the intersection with the kind filter. */
+  searched_kinds: string[];
+  status: string;
+  kinds: MuseSearchProviderKind[];
+  result_count: number;
+}
+
+export interface MuseSearchResult {
+  provider: string;
+  kind: string;
+  title: string;
+  year: number | null;
+  overview: string | null;
+  first_aired: string | null;
+  rating: number | null;
+  /** Provider-native ids (`{"tmdb":"286217"}`), echoed VERBATIM into a request body. Never
+   *  parsed or re-keyed here — Muse owns their meaning. */
+  provider_ids: Record<string, unknown> | null;
+  /** The PROVIDER's poster, an absolute upstream URL — `null` for a hit with no artwork.
+   *  Distinct from Muse's own art: a title Muse does not hold has no `media_metadata` row and
+   *  therefore no `museArtUrl` to serve. */
+  poster_url: string | null;
+  /** TRI-STATE, and the `null` is the whole point:
+   *
+   *    true   — the hit pins exactly one catalog row and that row is HELD (a media_items row
+   *             exists).
+   *    false  — definitively not held: either no catalog row at all, or exactly one row and
+   *             it holds no file.
+   *    null   — UNKNOWN. The hit's identifiers did not agree on a single catalog row, so the
+   *             question was not answered.
+   *
+   *  `null` exists because `media_metadata.imdb_id` has no uniqueness constraint (a plain
+   *  index only), so several catalog rows can share one IMDb id while a provider hit is ONE
+   *  title. "Some row sharing this id is held" is a different statement from "you hold this
+   *  title", and the endpoint refuses to make either.
+   *
+   *  Typed `boolean | null` deliberately: TypeScript cannot catch a JSON `null` at runtime, so
+   *  a `boolean` here would let `!in_library` read a null as "not held" and offer a Request
+   *  button for something the operator may already own. Every consumer must branch on all
+   *  three — see `ownershipState` in RequestPanel.tsx. */
+  in_library: boolean | null;
+  /** Muse knows the title (has metadata) but does not necessarily hold it. `in_catalog`
+   *  WITHOUT `in_library` is the requestable case — the two must never be conflated.
+   *
+   *  TRI-STATE for the same reason `in_library` is: when the hit cannot be resolved to a
+   *  catalog row, whether Muse knows the title was not answered either. `null` must never be
+   *  rendered as "not in the catalog" — see `catalogState` in RequestPanel.tsx. */
+  in_catalog: boolean | null;
+  /** True when the hit's identifiers matched more than one catalog row — the reason
+   *  `in_library` is `null` and `media_metadata_id` could not be pinned.
+   *
+   *  Nullable rather than required: it is an EXPLANATION for a state `in_library` already
+   *  reports on its own, so a body missing it should degrade to "no reason given" rather than
+   *  make the whole search unreadable. `in_library` itself is required, because that one
+   *  decides whether a write control is offered. */
+  ambiguous_match: boolean | null;
+  /**
+   * WHY the two ownership flags say what they say. Always present.
+   *
+   *   settled                — exactly one catalog row, nothing contradicting it.
+   *                            `in_library` is definite.
+   *   absent                 — identifiers were CHECKED and matched nothing. `in_library` is a
+   *                            definite `false`. A real negative.
+   *   no_indexed_identifier  — NOTHING WAS CHECKED. The hit carried no id the endpoint can
+   *                            look up (only tmdb/tvdb/imdb are indexed; tvrage/tvmaze/anilist
+   *                            live in a jsonb column and are not queried). Both flags `null`.
+   *   ambiguous_rows         — several catalog rows reachable; cannot tell which is this one.
+   *   contradicted           — one row, but an identifier it stores disagrees with the hit.
+   *
+   * This field exists because `in_library: false` used to be returned for a hit that was never
+   * looked up at all. "We checked and it isn't there" and "we couldn't check" are different
+   * facts, and the UI must not have to infer which one it got.
+   *
+   * Typed `string`, not a union: the parser accepts any non-empty string and the panel renders
+   * an unrecognized value as unknown-with-the-word-shown. New resolutions may be added
+   * server-side, and rejecting the whole response over one — or silently mapping it onto a
+   * neighbouring case — would be worse than saying "this page does not know that word".
+   */
+  resolution: string;
+  /** `null` whenever the catalog row could not be pinned — including every ambiguous hit. */
+  media_metadata_id: number | null;
+}
+
+export interface MuseSearchResponse {
+  query: string;
+  requested_kinds: string[];
+  providers: MuseSearchProvider[];
+  /** False when the fan-out could not cover everything that was asked for. */
+  complete: boolean;
+  /** Kinds no provider successfully covered. Non-empty means an ENTIRE kind is missing from
+   *  `results` — the results are a subset of the question, not an answer to it. */
+  uncovered_kinds: string[];
+  results: MuseSearchResult[];
+}
+
+function isStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every(x => typeof x === 'string');
+}
+
+/** `null` and `undefined` both mean "absent"; anything else must be the named primitive.
+ *  Absence is tolerated because a field the panel renders as an absence cannot mislead;
+ *  a WRONG TYPE can (a `{}` where a number belongs renders as "[object Object]"). */
+function isNullableNumber(v: unknown): boolean {
+  return v === null || v === undefined || typeof v === 'number';
+}
+function isNullableString(v: unknown): boolean {
+  return v === null || v === undefined || typeof v === 'string';
+}
+
+function isSearchProviderKind(v: unknown): v is MuseSearchProviderKind {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const k = v as Record<string, unknown>;
+  return (
+    typeof k.kind === 'string' &&
+    typeof k.status === 'string' &&
+    isNullableString(k.error) &&
+    typeof k.result_count === 'number' &&
+    typeof k.truncated === 'boolean' &&
+    typeof k.provider_returned === 'number' &&
+    typeof k.limit === 'number'
+  );
+}
+
+function isSearchProvider(v: unknown): v is MuseSearchProvider {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const p = v as Record<string, unknown>;
+  return (
+    typeof p.name === 'string' &&
+    typeof p.mode === 'string' &&
+    typeof p.configured === 'boolean' &&
+    isStringArray(p.searchable_kinds) &&
+    isStringArray(p.searched_kinds) &&
+    typeof p.status === 'string' &&
+    Array.isArray(p.kinds) &&
+    p.kinds.every(isSearchProviderKind) &&
+    typeof p.result_count === 'number'
+  );
+}
+
+function isSearchResult(v: unknown): v is MuseSearchResult {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const r = v as Record<string, unknown>;
+  if (typeof r.provider !== 'string' || typeof r.kind !== 'string' || typeof r.title !== 'string') return false;
+  // Ownership decides whether a WRITE control is offered, so a wrong or missing value here is
+  // not a cosmetic defect: a truthy string would offer a request for a title already on disk,
+  // and an absent field would offer one for a title whose ownership was never reported.
+  //
+  // `in_library` is tri-state — `null` is a legal, meaningful value (ambiguous match), and is
+  // NOT the same as absent. `undefined` is rejected; `null` is kept and rendered as its own
+  // third state.
+  if (r.in_library !== null && typeof r.in_library !== 'boolean') return false;
+  if (r.in_catalog !== null && typeof r.in_catalog !== 'boolean') return false;
+  // `resolution` must be PRESENT and non-empty — it is the only field that distinguishes a
+  // checked negative from an unchecked one, so a hit without it cannot be rendered honestly.
+  // Its VALUE is not whitelisted: an unrecognized resolution is a state this page has no
+  // wording for, which it says out loud (see `ownershipReason`). Whitelisting would reject an
+  // otherwise perfectly good response the first time the server grows a sixth case.
+  if (typeof r.resolution !== 'string' || r.resolution.trim() === '') return false;
+  // Explanatory only — see the field's comment for why an absent one is tolerated.
+  if (r.ambiguous_match !== null && r.ambiguous_match !== undefined && typeof r.ambiguous_match !== 'boolean') return false;
+  if (!isNullableNumber(r.year) || !isNullableNumber(r.rating) || !isNullableNumber(r.media_metadata_id)) return false;
+  if (!isNullableString(r.overview) || !isNullableString(r.first_aired) || !isNullableString(r.poster_url)) return false;
+  // `provider_ids` is forwarded verbatim to `POST /requests` and never rendered, so its VALUES
+  // are not type-checked here — Muse validates the ids it owns. Its container shape is checked
+  // because the panel spreads it into a JSON body, and an array or a scalar there would send
+  // Muse something it cannot read.
+  if (r.provider_ids !== null && r.provider_ids !== undefined) {
+    if (typeof r.provider_ids !== 'object' || Array.isArray(r.provider_ids)) return false;
+  }
+  return true;
+}
+
+/**
+ * Parse a `/api/search` body, or `null` if it cannot be read.
+ *
+ * Same contract as `museChannelList`/`museGuideEntries`: `null` means UNREADABLE, and an
+ * empty `results` array means exactly one thing — the server searched and found nothing.
+ * Collapsing the two would let the panel print "no matches for X" about a payload it never
+ * understood, which is the single failure this page exists to avoid.
+ *
+ * Note the primitive guard on the first line: `'query' in data` THROWS on a scalar 2xx body
+ * (`true`, `42`, `"x"`), and `useMuseSection` hands any 2xx body straight through as data.
+ */
+export function museSearchResponse(data: unknown): MuseSearchResponse | null {
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) return null;
+  const d = data as Record<string, unknown>;
+  if (typeof d.query !== 'string' || typeof d.complete !== 'boolean') return null;
+  if (!isStringArray(d.requested_kinds) || !isStringArray(d.uncovered_kinds)) return null;
+  // Element-level validation on BOTH lists. A `[null]` provider reached the catalog render
+  // path and threw on `p.name`; a `[null]` result threw on `r.title`. Neither array is empty
+  // and neither carries a provider/result, so the body is unreadable — not an empty search.
+  if (!Array.isArray(d.providers) || !d.providers.every(isSearchProvider)) return null;
+  if (!Array.isArray(d.results) || !d.results.every(isSearchResult)) return null;
+  return {
+    query: d.query,
+    requested_kinds: d.requested_kinds,
+    providers: d.providers,
+    complete: d.complete,
+    uncovered_kinds: d.uncovered_kinds,
+    // The ONE normalization in this parser: an absent `ambiguous_match` becomes an explicit
+    // `null` so the declared type is the truth rather than a near-truth. Nothing else is
+    // defaulted — a defaulted value is an invented one.
+    results: d.results.map(r => ({ ...r, ambiguous_match: r.ambiguous_match ?? null })),
+  };
+}
+
+/** The kind filter's vocabulary. This is the SEARCH endpoint's vocabulary (`series`), not the
+ *  library's (`show`) — an unknown `kind` is a 400, so it is a union type rather than a
+ *  string, and the two vocabularies are deliberately not unified behind this panel's back. */
+export type MuseSearchKind = 'all' | 'movie' | 'series';
+
+/**
+ * Run a provider search. `query` is the SUBMITTED term, never the live input value: an empty
+ * `q` is a 400, and firing per keystroke would hammer every upstream provider. A `null`/blank
+ * query passes a null path, which `useMuseSection` treats as idle — no request, no data, and
+ * therefore nothing the panel may say about results.
+ */
+export function useMuseSearch(query: string | null, kind: MuseSearchKind): MuseSection<unknown> {
+  const q = query === null ? '' : query.trim();
+  return useMuseSection<unknown>(
+    q === '' ? null : `/api/search?q=${encodeURIComponent(q)}&kind=${encodeURIComponent(kind)}`,
+  );
+}
+
+/** Body of `POST /api/muse/requests`.
+ *
+ *  `quality_profile_id` is REQUIRED even though it is nullable on the persisted row: Muse's
+ *  `has_matching_capability` check needs Prowlarr configured AND a profile id, and rejects the
+ *  request with 400 without one. Typed non-optional so a caller cannot omit it. */
+export interface MuseCreateRequestBody {
+  provider_ids: Record<string, unknown>;
+  kind: string;
+  title: string;
+  quality_profile_id: number;
+}
+
+/** `POST /requests` — Muse mounts request creation at the ROOT of its open router
+ *  (`http/requests.rs`), not under the `/api` prefix that carries the request READ routes.
+ *  That asymmetry is Muse's, not a typo: `/api/requests` is the list, `/requests` is the
+ *  create. The aggregation client adds the `/api/muse` proxy prefix, so this is
+ *  `POST /api/muse/requests` at the browser. */
+export function useMuseCreateRequest() {
+  const submit = useCallback(async (body: MuseCreateRequestBody) => {
+    return getAggregationClient().request<unknown>('muse', '/requests', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  }, []);
+  return { submit };
+}
+
 /** The acquisition-gate slice of `/api/settings`, read narrowly.
  *
  *  Deliberately NOT a general settings hook: this reads exactly the two booleans the
