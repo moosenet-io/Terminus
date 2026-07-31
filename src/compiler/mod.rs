@@ -1285,6 +1285,73 @@ fn effective_triple(module: &str) -> String {
     host::module_target(module).unwrap_or_else(target_triple)
 }
 
+/// The two target triples the fleet actually builds and publishes today:
+/// NATIVE glibc (the openssl-via-ssh2 modules — chord, terminus — which the musl
+/// default silently mis-builds) and musl-static (the portable-artifact default).
+const BASE_SUPPORTED_TARGETS: [&str; 2] =
+    ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"];
+
+/// Env var (comma-separated) extending [`BASE_SUPPORTED_TARGETS`], so a genuinely
+/// new target can be adopted by CONFIG without a code change — same discipline as
+/// `BUILD_TARGET_TRIPLE` / `BUILD_MODULE_TARGET_<MODULE>`.
+const BUILD_ALLOWED_TARGETS: &str = "BUILD_ALLOWED_TARGETS";
+
+/// Review finding 4 — validate an EXPLICIT caller-supplied `target` against the
+/// set this fleet can actually build AND publish for `module`.
+///
+/// `validate_segment` alone is NOT sufficient here, and the reason is a publish
+/// hazard rather than a mere build failure. `compiler_build` in `mode=build`
+/// publishes to `<sha>/<target>/<bin>` and then blesses `experimental/current`
+/// — and that `current` pointer is keyed by `(module, channel)` ONLY, with no
+/// target component (`publish::current_pointer_path`). So a caller-supplied
+/// off-contract target publishes an artifact under a path nothing else looks in,
+/// while STILL moving the module's live experimental pointer onto that sha. The
+/// downstream `compiler_release` promote/rollback defaults its target to
+/// `effective_triple(module)`, so it then fails to find the artifact — the
+/// disagreement the whole `effective_triple` "single resolution point" doc exists
+/// to prevent. Before this branch `compiler_build` had no `target` argument at
+/// all, so the target was ALWAYS the module's configured one and this could not
+/// arise; exposing the argument is what makes the check necessary.
+///
+/// Fleet fact this encodes: chord and terminus-primary are openssl-via-ssh2 and
+/// must be built native-glibc; the musl default silently blocks them. Both
+/// triples stay selectable (that is the point of the argument — a one-off native
+/// build of a musl-default module is exactly the TERM #564 use case), but only
+/// from a KNOWN set.
+///
+/// Always accepted, in addition to the allowlist: `module_default` — whatever
+/// this module's own `BUILD_MODULE_TARGET_<MODULE>` / `BUILD_TARGET_TRIPLE`
+/// config already resolves to. An explicit target equal to the default is a
+/// no-op, and config is trusted (it is how a new target is adopted).
+fn check_target_supported(
+    module: &str,
+    target: &str,
+    module_default: &str,
+) -> Result<(), ToolError> {
+    if target == module_default {
+        return Ok(());
+    }
+    if BASE_SUPPORTED_TARGETS.contains(&target) {
+        return Ok(());
+    }
+    let extra = env_nonempty(BUILD_ALLOWED_TARGETS).unwrap_or_default();
+    if extra.split(',').map(str::trim).any(|t| t == target) {
+        return Ok(());
+    }
+    let mut supported: Vec<String> = BASE_SUPPORTED_TARGETS.iter().map(|t| t.to_string()).collect();
+    if !supported.iter().any(|t| t == module_default) {
+        supported.push(module_default.to_string());
+    }
+    Err(ToolError::InvalidArgument(format!(
+        "target {target:?} is not a supported build target for module {module:?} (supported: \
+         {}). A build publishes to <sha>/<target>/<bin> but blesses a target-agnostic \
+         experimental/current pointer, so an off-contract target would move the live pointer \
+         onto a sha whose artifact compiler_release cannot find. Extend {BUILD_ALLOWED_TARGETS} \
+         (or this module's BUILD_MODULE_TARGET_* config) to adopt a new target.",
+        supported.join(", ")
+    )))
+}
+
 /// The per-channel retention count for the artifact store's pruning (BLD-07).
 /// Config-driven and floored at 2 — the store never keeps fewer than 2 shas nor
 /// prunes the current/previous pointer targets.
@@ -2859,7 +2926,7 @@ impl RustTool for CompilerBuild {
                 },
                 "target": {
                     "type": "string",
-                    "description": "TERM #564: Rust target triple to build/gate against (e.g. x86_64-unknown-linux-gnu for the NATIVE-glibc openssl-via-ssh2 modules chord/terminus, x86_64-unknown-linux-musl for a portable static artifact). Defaults to this MODULE's own configured target — its BUILD_MODULE_TARGET_<MODULE> override if set, else the fleet-wide BUILD_TARGET_TRIPLE — so per-module native/musl selection is automatic and needs NO caller flag; this argument only exists to override that default for a one-off build. Same default resolution compiler_release uses, so a build and its promote/rollback can never disagree on the target."
+                    "description": "TERM #564: Rust target triple to build/gate against (e.g. x86_64-unknown-linux-gnu for the NATIVE-glibc openssl-via-ssh2 modules chord/terminus, x86_64-unknown-linux-musl for a portable static artifact). Defaults to this MODULE's own configured target — its BUILD_MODULE_TARGET_<MODULE> override if set, else the fleet-wide BUILD_TARGET_TRIPLE — so per-module native/musl selection is automatic and needs NO caller flag; this argument only exists to override that default for a one-off build. Same default resolution compiler_release uses, so a build and its promote/rollback can never disagree on the target. An explicit value is ALLOWLIST-CHECKED: it must be a supported fleet target (native-glibc or musl-static), this module's own configured default, or listed in BUILD_ALLOWED_TARGETS — an unknown target is rejected rather than published under a path the release pointer cannot find."
                 },
                 "request_id": {
                     "type": "string",
@@ -3299,11 +3366,23 @@ impl CompilerBuild {
         // `compiler_build` never actually exposed — so a caller had no way at all
         // to request a different target through the single sanctioned build
         // door). Unset ⇒ the per-module default above ⇒ zero behavior change.
-        let triple = args
-            .get("target")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| effective_triple(&module));
+        //
+        // Review finding 4: an explicit caller target is ALLOWLIST-CHECKED against
+        // this module's supported set, not merely segment-validated — see
+        // `check_target_supported` for why a free-form target here is a real
+        // publish-contract hazard rather than a mere cargo failure.
+        let module_default = effective_triple(&module);
+        let triple = match args.get("target").and_then(Value::as_str) {
+            Some(t) => {
+                let t = t.to_string();
+                // Path-safety first (so a rejected target never reaches a log or
+                // path), then the semantic contract check.
+                validate_segment("target", &t)?;
+                check_target_supported(&module, &t, &module_default)?;
+                t
+            }
+            None => module_default,
+        };
         // `target` (the triple, caller-supplied, per-module override, or default)
         // is used as a `--target` value AND a path segment.
         validate_segment("target", &triple)?;
@@ -5731,6 +5810,63 @@ Source:
             .unwrap_or_default();
         assert!(!required.contains(&"target"));
         assert_eq!(required, vec!["module", "ref"]);
+    }
+
+    // ── Review finding 4: an explicit `target` is allowlisted, not free-form ──
+
+    /// Both fleet targets stay selectable — that IS the point of the argument
+    /// (a one-off native-glibc build of a musl-default module is the TERM #564
+    /// use case), as does the module's own configured default.
+    #[test]
+    fn supported_targets_are_accepted() {
+        let default = "x86_64-unknown-linux-musl";
+        assert!(check_target_supported("chord", "x86_64-unknown-linux-gnu", default).is_ok());
+        assert!(check_target_supported("chord", "x86_64-unknown-linux-musl", default).is_ok());
+        // A module whose configured default is something else still accepts it
+        // (config is trusted — it is how a new target gets adopted).
+        assert!(
+            check_target_supported("harmony", "aarch64-unknown-linux-gnu", "aarch64-unknown-linux-gnu")
+                .is_ok()
+        );
+    }
+
+    /// The hazard being closed: an unknown-but-segment-SAFE target would pass
+    /// `validate_segment` yet publish under `<sha>/<target>/<bin>` while blessing
+    /// the target-agnostic `experimental/current` pointer — leaving the live
+    /// pointer on a sha whose artifact `compiler_release` (which defaults to
+    /// `effective_triple`) cannot find. It must be REJECTED up front.
+    #[test]
+    fn unsupported_target_is_rejected_even_though_segment_safe() {
+        let default = "x86_64-unknown-linux-musl";
+        // Segment-safe: passes the path check, so only the contract check catches it.
+        assert!(validate_segment("target", "wasm32-wasi").is_ok());
+        let err = check_target_supported("chord", "wasm32-wasi", default).unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)), "{err:?}");
+        let msg = format!("{err:?}");
+        // The error names the supported set so the caller can act on it.
+        assert!(msg.contains("x86_64-unknown-linux-gnu"), "{msg}");
+        assert!(msg.contains("x86_64-unknown-linux-musl"), "{msg}");
+
+        // A plausible-looking typo of a real triple is rejected too.
+        assert!(check_target_supported("chord", "x86_64-unknown-linux-gnuu", default).is_err());
+    }
+
+    /// A new target is adoptable by CONFIG (no code change) — same discipline as
+    /// `BUILD_TARGET_TRIPLE` / `BUILD_MODULE_TARGET_<MODULE>`.
+    // `ScopedEnv` takes the process-wide `ENV_TEST_LOCK` itself, so this needs no
+    // extra `#[serial]` — same as the other env-toggling tests in this module.
+    #[test]
+    fn allowed_targets_env_extends_the_supported_set() {
+        let default = "x86_64-unknown-linux-musl";
+        let _env = ScopedEnv::new().set(
+            BUILD_ALLOWED_TARGETS,
+            "aarch64-unknown-linux-musl, riscv64gc-unknown-linux-gnu",
+        );
+        assert!(check_target_supported("m", "aarch64-unknown-linux-musl", default).is_ok());
+        // Whitespace around a comma-separated entry is tolerated.
+        assert!(check_target_supported("m", "riscv64gc-unknown-linux-gnu", default).is_ok());
+        // …but the env is an allowlist, not a bypass.
+        assert!(check_target_supported("m", "wasm32-wasi", default).is_err());
     }
 
     #[test]
