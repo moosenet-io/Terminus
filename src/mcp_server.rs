@@ -257,6 +257,105 @@ pub fn build_router(state: Arc<McpServerState>) -> Router {
 /// (this binary has no inference-proxy role configured), return a clean
 /// `503` rather than silently 404ing or hanging.
 impl McpServerState {
+    /// TRTR-02: the MERGED tool catalog the router selects from.
+    ///
+    /// Mirrors what `tools/list` advertises — compiled-in core, then broker worker
+    /// routes, then personal federation, then mesh upstreams — because a router that
+    /// only saw the CORE registry would be blind to exactly the tools the operator
+    /// asks about most: `pve__*` (Proxmox) is MESH-FEDERATED, not compiled in. Round-2
+    /// review caught this; without it the router would have answered "that tool does
+    /// not exist here" for the operator's Proxmox questions.
+    pub async fn router_catalog(&self) -> Vec<crate::registry::ToolInfo> {
+        // Built with the SAME merge helpers `tools/list` uses (they operate on
+        // `Vec<Value>`), then converted to `ToolInfo` for selection — so the router
+        // selects from exactly what the server advertises, never a narrower view.
+        let reg = self.registry.load();
+        let mut tools: Vec<Value> = reg
+            .list()
+            .into_iter()
+            .map(|t| json!({"name": t.name, "description": t.description, "inputSchema": t.parameters}))
+            .collect();
+
+        let broker_routes = self.broker_routes.load();
+        tools = crate::broker::routes::merge_catalog(tools, &broker_routes).await;
+
+        if self.personal_federation.is_some() {
+            let existing: std::collections::HashSet<String> = tools
+                .iter()
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                .map(str::to_string)
+                .collect();
+            tools.extend(
+                crate::registry::personal_only_tool_metadata()
+                    .into_iter()
+                    .filter(|t| !existing.contains(&t.name))
+                    .map(|t| json!({"name": t.name, "description": t.description, "inputSchema": t.parameters})),
+            );
+        }
+
+        if let Some(pool) = &self.mesh_pool {
+            tools = MergedCatalog::build(tools, pool).await.tools;
+        }
+
+        tools
+            .into_iter()
+            .filter_map(|t| {
+                Some(crate::registry::ToolInfo {
+                    name: t.get("name")?.as_str()?.to_string(),
+                    description: t
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    parameters: t.get("inputSchema").cloned().unwrap_or_else(|| json!({})),
+                })
+            })
+            .collect()
+    }
+
+    /// TRTR-02: dispatch ONE tool for the router, using the SAME precedence and
+    /// routing `tools/call` uses — mesh upstream, then core, then broker, then
+    /// personal federation. Returns the tool's text payload.
+    ///
+    /// Authorization, the model-block, and availability are enforced by the CALLER
+    /// (`agent_router::dispatch_tool`) before this runs; this function is the routing
+    /// half only, so the two concerns stay separable and testable.
+    pub async fn router_dispatch(&self, name: &str, args: Value) -> Result<String, String> {
+        // 1. Mesh upstream (a namespaced name is never coincidentally a local tool).
+        if let Some(pool) = &self.mesh_pool {
+            match crate::mesh::resolve_call_route(name, pool) {
+                CallRoute::Upstream { client, bare_name } => {
+                    return match client.call_tool(&bare_name, args).await {
+                        Ok(r) if r.is_error => Err(r.text),
+                        Ok(r) => Ok(r.text),
+                        Err(e) => Err(e.to_string()),
+                    };
+                }
+                CallRoute::Unavailable { namespace } => {
+                    return Err(format!(
+                        "the `{namespace}` upstream is currently unavailable"
+                    ));
+                }
+                CallRoute::Local => {}
+            }
+        }
+        // 2. Core registry.
+        let reg = self.registry.load();
+        if let Some(r) = reg.call(name, args.clone()).await {
+            return r.map_err(|e| e.to_string());
+        }
+        // 3. Broker worker routes.
+        let broker_routes = self.broker_routes.load();
+        if let Some(r) = crate::broker::routes::dispatch_call(&broker_routes, name, args.clone()).await {
+            return r.map(|o| o.text).map_err(|e| e.to_string());
+        }
+        // 4. Personal federation.
+        if let Some(pf) = &self.personal_federation {
+            return pf.call_tool(name, args).await.map_err(|e| e.to_string());
+        }
+        Err(format!("`{name}` is not a tool that exists here"))
+    }
+
     /// The process-wide tool result cache (TRTR-08).
     pub fn tool_cache(&self) -> &crate::tool_cache::ToolCache {
         &self.tool_cache

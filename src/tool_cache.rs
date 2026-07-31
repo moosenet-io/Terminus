@@ -179,7 +179,19 @@ impl ToolCache {
                     return Lookup::Fresh { value: e.value.clone(), fetched_at: e.fetched_at };
                 }
                 if age < policy.hard_ttl.as_secs() {
-                    // Stale but usable. Claim the refresh only if nobody else has.
+                    // Stale but usable. If a recent refresh FAILED we are backing off:
+                    // still SERVE the value (it is better than nothing), but do not let
+                    // anyone claim another refresh yet — otherwise every stale hit
+                    // re-hammers a down upstream, which is what the backoff exists to
+                    // prevent (round-2 review finding).
+                    if e.backoff_until > now {
+                        return Lookup::Stale {
+                            value: e.value.clone(),
+                            fetched_at: e.fetched_at,
+                            claim: false,
+                        };
+                    }
+                    // Claim the refresh only if nobody else has.
                     if e.refreshing {
                         return Lookup::Stale {
                             value: e.value.clone(),
@@ -204,6 +216,13 @@ impl ToolCache {
                 let age = now.saturating_sub(e.fetched_at);
                 if age >= policy.hard_ttl.as_secs() {
                     return Lookup::Miss;
+                }
+                if e.backoff_until > now {
+                    return Lookup::Stale {
+                        value: e.value.clone(),
+                        fetched_at: e.fetched_at,
+                        claim: false,
+                    };
                 }
                 let claim = !e.refreshing;
                 e.refreshing = true;
@@ -441,7 +460,11 @@ mod tests {
         match c.get("k", p).await {
             Lookup::Stale { value, claim, .. } => {
                 assert_eq!(value, "good", "last-good value must survive a failed refresh");
-                assert!(claim, "refresh flag must be cleared so a later caller can retry");
+                // Round-2 review: the ORIGINAL assertion here demanded an IMMEDIATE
+                // retry, which meant every stale hit re-hammered a failing upstream.
+                // During the backoff window the value is still SERVED but no refresh
+                // may be claimed.
+                assert!(!claim, "no refresh may be claimed while backing off");
             }
             other => panic!("expected Stale with the good value, got {other:?}"),
         }

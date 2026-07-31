@@ -87,7 +87,7 @@ pub enum Dispatch {
 /// user's data to another.
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_tool(
-    registry: &ToolRegistry,
+    state: Option<&crate::mcp_server::McpServerState>,
     cache: &ToolCache,
     gateway: Option<&crate::gateway_framework::GatewayFramework>,
     principal_obj: Option<&Principal>,
@@ -107,13 +107,31 @@ pub async fn dispatch_tool(
     // `guard()` (not the read-only `permits_tool`) is used deliberately: this IS an
     // attempt, so it must consume rate-limit budget and emit an audit entry exactly
     // like the `tools/call` path does.
+    // The GatewayContext returned on success MUST be recorded — the gateway contract
+    // is one audit write per request, and `guard()` only logs DENIALS. Dropping it (as
+    // the first cut did) left every allowed/failed/cached tool call with no terminal
+    // audit entry, which is precisely the trail an operator needs after an incident.
+    let mut gate_ctx = None;
     if let Some(gw) = gateway {
-        if let Err(_denial) = gw.guard(principal_obj, name, crate::gateway_framework::ActionKind::Tool).await {
-            return Dispatch::Denied(format!(
-                "`{name}` is not available to you. Do not call it again; answer with the \
-                 tools you were given."
-            ));
+        match gw.guard(principal_obj, name, crate::gateway_framework::ActionKind::Tool).await {
+            Ok(ctx) => gate_ctx = Some(ctx),
+            Err(_denial) => {
+                return Dispatch::Denied(format!(
+                    "`{name}` is not available to you. Do not call it again; answer with \
+                     the tools you were given."
+                ));
+            }
         }
+    }
+
+    /// Record the terminal audit outcome exactly once, whatever path we exit by.
+    macro_rules! finish {
+        ($ctx:expr, $ok:expr, $detail:expr, $ret:expr) => {{
+            if let Some(c) = $ctx.take() {
+                c.record_result($ok, $detail);
+            }
+            return $ret;
+        }};
     }
 
     // ── OPERATOR-GUARDED TOOLS ARE NEVER MODEL-INVOCABLE ─────────────────────
@@ -122,25 +140,19 @@ pub async fn dispatch_tool(
     // approve its own guarded requests and dissolve that gate entirely.
     let bare = crate::mesh::split_namespaced(name).map(|(_, b)| b).unwrap_or(name);
     if is_model_blocked(bare) {
-        return Dispatch::Denied(format!(
-            "`{name}` requires operator approval and cannot be invoked by an assistant. \
-             Ask the operator to run it."
-        ));
+        finish!(gate_ctx, false, Some("model-blocked (operator-guarded)"),
+            Dispatch::Denied(format!(
+                "`{name}` requires operator approval and cannot be invoked by an assistant. \
+                 Ask the operator to run it."
+            )));
     }
 
     // Availability is re-checked HERE, not just at selection: selection is a snapshot,
     // and a tool parked in between must still be refused.
     let avail = crate::availability::policy();
     if !avail.agent_usable(name) {
-        return Dispatch::Unavailable(avail.denial_message(name));
-    }
-    if !registry.contains(name) {
-        // Never invent a tool. Say plainly that it does not exist so the model stops
-        // trying, rather than the misleading "not found" that sent it hunting before.
-        return Dispatch::Unknown(format!(
-            "`{name}` is not a tool that exists here. Do not call it again; answer with \
-             the tools you were given."
-        ));
+        finish!(gate_ctx, false, Some("unavailable"),
+            Dispatch::Unavailable(avail.denial_message(name)));
     }
 
     let policy = tool_cache::policy_for(name);
@@ -152,7 +164,8 @@ pub async fn dispatch_tool(
     if let Some(p) = policy {
         match cache.get(&key, p).await {
             Lookup::Fresh { value, fetched_at } => {
-                return Dispatch::Ok { text: with_as_of(value, fetched_at), cached: true };
+                finish!(gate_ctx, true, Some("cache-hit"),
+                    Dispatch::Ok { text: with_as_of(value, fetched_at), cached: true });
             }
             Lookup::Stale { value, fetched_at, claim } => {
                 // Serve the stale value NOW; the caller never waits on a merely-stale
@@ -161,38 +174,43 @@ pub async fn dispatch_tool(
                 if claim {
                     spawn_refresh(cache, name, args.clone(), key.clone());
                 }
-                return Dispatch::Ok { text: with_as_of(value, fetched_at), cached: true };
+                finish!(gate_ctx, true, Some("cache-stale"),
+                    Dispatch::Ok { text: with_as_of(value, fetched_at), cached: true });
             }
             // A recent fetch FAILED and we are backing off. Falling through here would
             // hammer a down upstream on every turn — the exact thing the backoff
             // exists to prevent. Report the failure instead; there is no cached value
             // to serve (a usable one would have returned Fresh/Stale above).
             Lookup::Backoff => {
-                return Dispatch::Failed(format!(
-                    "`{name}` recently failed and is backing off; try again shortly."
-                ));
+                finish!(gate_ctx, false, Some("backoff"),
+                    Dispatch::Failed(format!(
+                        "`{name}` recently failed and is backing off; try again shortly."
+                    )));
             }
             Lookup::Miss => { /* fall through to a live fetch */ }
         }
     }
 
-    // Live fetch.
-    match registry.call(name, args).await {
-        Some(Ok(text)) => {
+    // Live fetch, routed exactly like `tools/call`: mesh -> core -> broker -> personal.
+    let Some(st) = state else {
+        finish!(gate_ctx, false, Some("no dispatch state"),
+            Dispatch::Unknown(format!("`{name}` cannot be dispatched here.")));
+    };
+    match st.router_dispatch(name, args).await {
+        Ok(text) => {
             if policy.is_some() {
                 cache.put(&key, text.clone()).await;
             }
-            Dispatch::Ok { text, cached: false }
+            finish!(gate_ctx, true, None, Dispatch::Ok { text, cached: false });
         }
-        Some(Err(e)) => {
+        Err(e) => {
             // An error is NEVER cached as a value — only a short backoff, and any
             // existing good value is preserved.
             if policy.is_some() {
                 cache.record_failure(&key).await;
             }
-            Dispatch::Failed(e.to_string())
+            finish!(gate_ctx, false, Some("tool error"), Dispatch::Failed(e));
         }
-        None => Dispatch::Unknown(format!("`{name}` is not registered.")),
     }
 }
 
@@ -365,7 +383,11 @@ pub fn tool_result_message(call_id: &str, text: &str) -> Value {
 
 /// Everything the router needs from its host, so the loop itself stays testable.
 pub struct RouterDeps<'a> {
-    pub registry: &'a ToolRegistry,
+    /// The server state — dispatch routes through `router_dispatch`, which uses the
+    /// SAME precedence as `tools/call` (mesh -> core -> broker -> personal). A
+    /// core-registry-only dispatch would be blind to `pve__*` (mesh-federated), i.e.
+    /// exactly the Proxmox tools the operator asks about.
+    pub state: &'a crate::mcp_server::McpServerState,
     pub cache: &'a ToolCache,
     pub chord: &'a InferenceProxyClient,
     pub gateway: Option<&'a crate::gateway_framework::GatewayFramework>,
@@ -446,7 +468,7 @@ pub async fn execute(
     let started = Instant::now();
     let mut steps: Vec<Step> = Vec::new();
 
-    let catalog = deps.registry.list();
+    let catalog = deps.state.router_catalog().await;
     let selected = select::select_tools(&catalog, user_message, deps.gateway, deps.principal);
     let principal_name = deps.principal.map(|p| p.name());
 
@@ -525,10 +547,24 @@ pub async fn execute(
             messages.push(msg.clone());
         }
 
-        for call in calls {
+        // A single completion can request MANY tool calls. Truncate to what the step
+        // budget still allows, or one over-eager completion would blow straight past
+        // the cap (round-2 review finding).
+        let remaining_steps = cfg.max_steps.saturating_sub(steps.len());
+        for call in calls.into_iter().take(remaining_steps) {
+            // Re-check the wall clock BETWEEN calls: the budget previously bounded only
+            // the inference hop, so a sequence of slow tools could overrun it entirely.
+            if started.elapsed() >= cfg.budget {
+                return RouterOutcome {
+                    response: partial_answer(&messages, "timeout"),
+                    steps,
+                    turns,
+                    status: "timeout",
+                };
+            }
             let t0 = Instant::now();
             let d = dispatch_tool(
-                deps.registry,
+                Some(deps.state),
                 deps.cache,
                 deps.gateway,
                 deps.principal,
@@ -670,9 +706,8 @@ mod tests {
 
     #[tokio::test]
     async fn dispatching_an_unknown_tool_says_so_plainly() {
-        let reg = ToolRegistry::new();
         let cache = ToolCache::default();
-        match dispatch_tool(&reg, &cache, None, None, "does_not_exist", json!({}), None).await {
+        match dispatch_tool(None, &cache, None, None, "does_not_exist", json!({}), None).await {
             Dispatch::Unknown(msg) => {
                 assert!(msg.contains("not a tool that exists"));
                 // Must not read like a transient failure the model should retry.
@@ -741,10 +776,9 @@ mod tests {
         // Ported from Chord's is_llm_blocked. A model that could call approval_grant
         // would approve its own guarded requests and dissolve the human-in-the-loop
         // gate entirely.
-        let reg = ToolRegistry::new();
         let cache = ToolCache::default();
         for guarded in ["approval_grant", "approval_deny", "infisical_get_secret", "pg_ddl", "ansible_run_playbook"] {
-            match dispatch_tool(&reg, &cache, None, None, guarded, json!({}), None).await {
+            match dispatch_tool(None, &cache, None, None, guarded, json!({}), None).await {
                 Dispatch::Denied(msg) => {
                     assert!(msg.contains("operator approval"), "got: {msg}");
                 }
@@ -774,9 +808,8 @@ mod tests {
     async fn a_namespaced_guarded_tool_is_also_blocked() {
         // A guarded tool re-exported through a mesh upstream must not become
         // invocable just because it arrived namespaced.
-        let reg = ToolRegistry::new();
         let cache = ToolCache::default();
-        match dispatch_tool(&reg, &cache, None, None, "ct322__approval_grant", json!({}), None).await {
+        match dispatch_tool(None, &cache, None, None, "ct322__approval_grant", json!({}), None).await {
             Dispatch::Denied(_) => {}
             other => panic!("namespaced guarded tool must be DENIED, got {other:?}"),
         }
@@ -789,8 +822,7 @@ mod tests {
         let cache = ToolCache::default();
         let key = ToolCache::key("news_headlines", &json!({}), None, false);
         cache.record_failure(&key).await;
-        let reg = ToolRegistry::new();
-        match dispatch_tool(&reg, &cache, None, None, "news_headlines", json!({}), None).await {
+        match dispatch_tool(None, &cache, None, None, "news_headlines", json!({}), None).await {
             Dispatch::Failed(m) => assert!(m.contains("backing off"), "got: {m}"),
             // If the registry lacks the tool the Unknown path is also acceptable here;
             // what must NOT happen is a silent live re-fetch.
