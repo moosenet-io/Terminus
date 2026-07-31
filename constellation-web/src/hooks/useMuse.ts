@@ -625,6 +625,21 @@ function isMuseGuideEntry(v: unknown): v is MuseGuideEntry {
  *  Only the Y-M-D triple is validated this way; it is the part `Date.parse` rolls over. An
  *  explicit UTC offset is left to `Date.parse`, since a legitimate offset can shift the UTC
  *  date and a naive comparison against the parsed value would reject valid timestamps. */
+/** Days in a month under the PROLEPTIC GREGORIAN calendar, computed arithmetically.
+ *
+ *  Deliberately not `new Date(Date.UTC(year, month, 0)).getUTCDate()`, the obvious trick: JS
+ *  maps years 0–99 onto 1900–1999, so year 0000 was measured as 1900 and its real February 29
+ *  (year zero IS a leap year) was rejected as nonexistent (codex, gpt56). The failure is in
+ *  the safe direction — a valid body marked unreadable rather than an invalid one accepted —
+ *  but it is still wrong, and the arithmetic form has no such edge. */
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) {
+    const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+    return leap ? 29 : 28;
+  }
+  return [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+}
+
 export function parseGuideInstant(value: string): number | null {
   const m = /^(\d{4})-(\d{2})-(\d{2})T/.exec(value);
   if (m === null) return null;
@@ -632,8 +647,7 @@ export function parseGuideInstant(value: string): number | null {
   const month = Number(m[2]);
   const day = Number(m[3]);
   if (month < 1 || month > 12 || day < 1) return null;
-  // Day 0 of the following month is the last day of this one — leap years included.
-  if (day > new Date(Date.UTC(year, month, 0)).getUTCDate()) return null;
+  if (day > daysInMonth(year, month)) return null;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : null;
 }

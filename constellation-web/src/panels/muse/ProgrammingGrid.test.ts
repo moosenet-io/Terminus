@@ -75,6 +75,15 @@ describe('calendar-strict timestamp parsing', () => {
     expect(parseGuideInstant('2026-02-29T00:00:00Z')).toBeNull();     // 2026 is not
   });
 
+  it('handles years 0-99, which JS Date maps onto 1900-1999', () => {
+    // Year zero IS a leap year in the proleptic Gregorian calendar, but Date.UTC(0,...)
+    // measures 1900, which is not — so this valid date was rejected.
+    expect(parseGuideInstant('0000-02-29T00:00:00Z')).not.toBeNull();
+    expect(parseGuideInstant('0001-02-29T00:00:00Z')).toBeNull();
+    expect(parseGuideInstant('0100-02-29T00:00:00Z')).toBeNull(); // century, not div by 400
+    expect(parseGuideInstant('0400-02-29T00:00:00Z')).not.toBeNull(); // div by 400
+  });
+
   it('accepts ordinary instants, including an explicit non-UTC offset', () => {
     expect(parseGuideInstant('2026-07-31T21:00:00Z')).not.toBeNull();
     expect(parseGuideInstant('2026-07-31T21:00:00+02:00')).not.toBeNull();
