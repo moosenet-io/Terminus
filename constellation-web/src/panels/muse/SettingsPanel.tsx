@@ -192,9 +192,16 @@ function AcquisitionSettings({ settings }: { settings: SettingsSection }) {
         <SettingRow
           label="Result"
           detail={
-            result
+            // THREE cases, not two. The previous copy said "gate 1 is on" whenever the
+            // result was indeterminate — but that is also true while settings are
+            // LOADING or DEGRADED, where gate1 is null and nothing is known. Asserting
+            // an unobserved gate state on a safety panel is the same defect as the
+            // original gate bug, just quieter (both reviewers caught it).
+            gate1 === false
               ? 'gate 1 is off, so a request is persisted for review and never actioned — this holds whatever gate 2 is'
-              : 'cannot be determined here: gate 1 is on and gate 2 is not visible to this surface'
+              : gate1 === true
+                ? 'cannot be determined here: gate 1 is on and gate 2 is not visible to this surface'
+                : 'gate state not available — settings could not be read, so nothing is claimed either way'
           }
           right={result ? <StatePill on={result.on} onLabel="grab armed" offLabel="safe" /> : <UnknownPill />}
         />
