@@ -451,3 +451,100 @@ export type MuseArtWidth = 160 | 320 | 640;
 export function museArtUrlAt(kind: string, id: string, width: MuseArtWidth): string {
   return `${museArtUrl(kind, id)}?w=${width}`;
 }
+
+// ── Request lifecycle (MGUI-08) ──────────────────────────────────────────────
+//
+// Shapes below are transcribed from Muse's own handlers
+// (`src/web/dashboard.rs::get_request_detail` / `get_requests_queue`), NOT from a
+// live capture: `GET /api/requests` returns `{requests: [], tiers: {}, total: 0}` on
+// this deployment, so there is no request id to sample a detail response from. That
+// is a statement about what the list endpoint returned, and nothing more — it does
+// not establish anything about whether any worker or request path has run.
+
+/** One stop on the lifecycle stepper. Muse emits the fixed happy-path order
+ *  `requested → approved → searching → grabbed → available`, each marked
+ *  `reached | current | pending` from the row's REAL `status`. An unrecognized
+ *  state string is rendered as-is, never coerced. */
+export interface MuseRequestStep {
+  label: string;
+  state: string;
+}
+
+/** The `media_requests` row, serialized wholesale by the handler (`"request": request`).
+ *  Every field here exists on the Rust `MediaRequest` struct — there is deliberately no
+ *  release/score/seeder field, because none is persisted on the row (see the panel). */
+export interface MuseRequestRow {
+  id: number;
+  provider_ids: Record<string, unknown> | null;
+  media_kind: string;
+  title: string;
+  requested_by: string | null;
+  status: string;
+  /** `NULL` on a row that was never classified. Renders as an absence, never as a tier. */
+  tier: string | null;
+  quality_profile_id: number | null;
+  note: string | null;
+  monitored_item_id: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `GET /api/requests/:id`. A miss returns `{found: false, request_id}` with NO
+ *  `request`/`steps` — every consumer must therefore treat those as optional rather
+ *  than dereferencing them. */
+export interface MuseRequestDetail {
+  found: boolean;
+  request_id?: number;
+  request?: MuseRequestRow;
+  status?: string;
+  steps?: MuseRequestStep[];
+  /** `"denied" | "failed"` when the request ended off the happy path, else `null`. */
+  terminal?: string | null;
+}
+
+export function useMuseRequestDetail(id: string | null): MuseSection<MuseRequestDetail> {
+  return useMuseSection<MuseRequestDetail>(id ? `/api/requests/${encodeURIComponent(id)}` : null);
+}
+
+/** A `download_queue` row as `GET /api/requests/queue` serializes it. `request_id` is
+ *  what lets a per-request view show the release that was ACTUALLY grabbed for it.
+ *
+ *  `progress` is hard-coded `null` by the handler — Muse documents it as a SEAM
+ *  (qBittorrent per-torrent progress is not persisted). It is typed nullable here so
+ *  no caller can default it into a 0% bar. */
+export interface MuseDownloadQueueRow {
+  id: number;
+  request_id: number | null;
+  monitored_item_id: number | null;
+  release_title: string;
+  indexer: string | null;
+  protocol: string | null;
+  status: string;
+  size_bytes: number | null;
+  added_at: string;
+  progress: number | null;
+}
+
+/** The wanted set + download queue. This panel only reads `queue` (filtered to one
+ *  `request_id`), so `wanted` is typed loosely on purpose — MGUI-09/14's own queue
+ *  surface is the place that renders it. */
+export function useMuseDownloadQueue(): MuseSection<{ wanted: unknown[]; queue: MuseDownloadQueueRow[] }> {
+  return useMuseSection<{ wanted: unknown[]; queue: MuseDownloadQueueRow[] }>('/api/requests/queue');
+}
+
+/** The acquisition-gate slice of `/api/settings`, read narrowly.
+ *
+ *  Deliberately NOT a general settings hook: this reads exactly the two booleans the
+ *  lifecycle panel is allowed to reason about, so it cannot accidentally grow into a
+ *  second, competing notion of "what the settings say". `master_enabled` is included
+ *  because Muse's own gate is `master_enabled && acquisition.enabled`
+ *  (`ExperienceSettings::is_acquisition_enabled`) — see the panel for how that is used
+ *  only to make the SAFE verdict stronger, never to manufacture an armed one. */
+export interface MuseAcquisitionGate {
+  master_enabled: boolean;
+  acquisition: { enabled: boolean };
+}
+
+export function useMuseAcquisitionGate(): MuseSection<MuseAcquisitionGate> {
+  return useMuseSection<MuseAcquisitionGate>('/api/settings');
+}
