@@ -109,6 +109,11 @@ pub struct McpServerState {
     /// `terminus_personal`, which has no inference-proxy role) means those
     /// routes are not mounted at all.
     pub inference_proxy: Option<InferenceProxyClient>,
+
+    /// TRTR-08: shared TTL cache for high-traffic tool results (news, weather).
+    /// Lives on the server state so it survives across requests — a per-request cache
+    /// would never hit, which is the whole point.
+    pub tool_cache: crate::tool_cache::ToolCache,
     /// TGW-04: when set, EVERY request through this server (tool calls —
     /// core and federated-personal — AND the four inference-proxy routes
     /// below) is gated by the shared identity → allowlist → rate-limit →
@@ -251,6 +256,121 @@ pub fn build_router(state: Arc<McpServerState>) -> Router {
 /// `handle_mcp`'s personal-tool federation branch already does. Otherwise
 /// (this binary has no inference-proxy role configured), return a clean
 /// `503` rather than silently 404ing or hanging.
+impl McpServerState {
+    /// TRTR-02: the MERGED tool catalog the router selects from.
+    ///
+    /// Mirrors what `tools/list` advertises — compiled-in core, then broker worker
+    /// routes, then personal federation, then mesh upstreams — because a router that
+    /// only saw the CORE registry would be blind to exactly the tools the operator
+    /// asks about most: `pve__*` (Proxmox) is MESH-FEDERATED, not compiled in. Round-2
+    /// review caught this; without it the router would have answered "that tool does
+    /// not exist here" for the operator's Proxmox questions.
+    pub async fn router_catalog(&self) -> Vec<crate::registry::ToolInfo> {
+        // Built with the SAME merge helpers `tools/list` uses (they operate on
+        // `Vec<Value>`), then converted to `ToolInfo` for selection — so the router
+        // selects from exactly what the server advertises, never a narrower view.
+        let reg = self.registry.load();
+        let mut tools: Vec<Value> = reg
+            .list()
+            .into_iter()
+            .map(|t| json!({"name": t.name, "description": t.description, "inputSchema": t.parameters}))
+            .collect();
+
+        let broker_routes = self.broker_routes.load();
+        tools = crate::broker::routes::merge_catalog(tools, &broker_routes).await;
+
+        if self.personal_federation.is_some() {
+            let existing: std::collections::HashSet<String> = tools
+                .iter()
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                .map(str::to_string)
+                .collect();
+            tools.extend(
+                crate::registry::personal_only_tool_metadata()
+                    .into_iter()
+                    .filter(|t| !existing.contains(&t.name))
+                    .map(|t| json!({"name": t.name, "description": t.description, "inputSchema": t.parameters})),
+            );
+        }
+
+        if let Some(pool) = &self.mesh_pool {
+            tools = MergedCatalog::build(tools, pool).await.tools;
+        }
+
+        tools
+            .into_iter()
+            .filter_map(|t| {
+                Some(crate::registry::ToolInfo {
+                    name: t.get("name")?.as_str()?.to_string(),
+                    description: t
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    parameters: t.get("inputSchema").cloned().unwrap_or_else(|| json!({})),
+                })
+            })
+            .collect()
+    }
+
+    /// TRTR-02: dispatch ONE tool for the router, using the SAME precedence and
+    /// routing `tools/call` uses — mesh upstream, then core, then broker, then
+    /// personal federation. Returns the tool's text payload.
+    ///
+    /// Authorization, the model-block, and availability are enforced by the CALLER
+    /// (`agent_router::dispatch_tool`) before this runs; this function is the routing
+    /// half only, so the two concerns stay separable and testable.
+    pub async fn router_dispatch(
+        &self,
+        name: &str,
+        args: Value,
+        principal: Option<&Principal>,
+    ) -> Result<String, String> {
+        // 1. Mesh upstream (a namespaced name is never coincidentally a local tool).
+        if let Some(pool) = &self.mesh_pool {
+            match crate::mesh::resolve_call_route(name, pool) {
+                CallRoute::Upstream { client, bare_name } => {
+                    return match client.call_tool(&bare_name, args).await {
+                        Ok(r) if r.is_error => Err(r.text),
+                        Ok(r) => Ok(r.text),
+                        Err(e) => Err(e.to_string()),
+                    };
+                }
+                CallRoute::Unavailable { namespace } => {
+                    return Err(format!(
+                        "the `{namespace}` upstream is currently unavailable"
+                    ));
+                }
+                CallRoute::Local => {}
+            }
+        }
+        // 2. Core registry.
+        let reg = self.registry.load();
+        if let Some(r) = reg.call(name, args.clone()).await {
+            return r.map_err(|e| e.to_string());
+        }
+        // 3. Broker worker routes.
+        let broker_routes = self.broker_routes.load();
+        if let Some(r) = crate::broker::routes::dispatch_call(&broker_routes, name, args.clone()).await {
+            return r.map(|o| o.text).map_err(|e| e.to_string());
+        }
+        // 4. Personal federation.
+        if let Some(pf) = &self.personal_federation {
+            return match pf.call_tool(name, args, principal).await {
+                Ok(r) if r.is_error => Err(r.text),
+                Ok(r) => Ok(r.text),
+                Err(e) => Err(e.to_string()),
+            };
+        }
+        Err(format!("`{name}` is not a tool that exists here"))
+    }
+
+    /// The process-wide tool result cache (TRTR-08).
+    pub fn tool_cache(&self) -> &crate::tool_cache::ToolCache {
+        &self.tool_cache
+    }
+}
+
 async fn handle_inference_proxy(
     state: Arc<McpServerState>,
     path: &'static str,
@@ -339,6 +459,18 @@ async fn handle_infer(
     handle_inference_proxy(state, INFER_PATH, identity, tailnet, headers, body).await
 }
 
+/// `/v1/agent/execute` — the agentic tool turn.
+///
+/// TRTR-02: this used to BLIND-FORWARD to Chord, which ran the tool loop against its
+/// own catalog. That catalog had no caller identity (so tool exposure could not be
+/// scoped per user) and pointed at a stale backend (so news/weather/Proxmox were
+/// invisible to the assistant). The loop now runs HERE, where the principal is already
+/// resolved and authorization already lives; Chord is called only for the
+/// tool-selecting sub-agent's inference.
+///
+/// Gated by `TERMINUS_ROUTER_LOCAL` (default ON once deployed). Setting it to `0`
+/// restores the exact previous blind-forward behaviour — a documented rollback that
+/// needs no redeploy.
 async fn handle_agent_execute(
     State(state): State<Arc<McpServerState>>,
     identity: Option<Extension<ClientIdentity>>,
@@ -346,7 +478,151 @@ async fn handle_agent_execute(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle_inference_proxy(state, AGENT_EXECUTE_PATH, identity, tailnet, headers, body).await
+    if !crate::config::router_local_enabled() {
+        return handle_inference_proxy(state, AGENT_EXECUTE_PATH, identity, tailnet, headers, body)
+            .await;
+    }
+
+    let principal = resolve_principal(
+        &state.principal_resolver,
+        identity.as_ref().map(|Extension(i)| i),
+        tailnet.as_ref().map(|Extension(t)| t),
+    );
+
+    // Same gate the forwarding path applies, on the same resolved principal — the
+    // router is a caller of the sanctioned path, never a way around it.
+    let gate_ctx = match &state.gateway {
+        Some(gateway) => {
+            match gateway
+                .guard(principal.as_ref(), AGENT_EXECUTE_PATH, ActionKind::Inference)
+                .await
+            {
+                Ok(ctx) => Some(ctx),
+                Err(denial) => return denial,
+            }
+        }
+        None => None,
+    };
+
+    let Some(chord) = state.inference_proxy.as_ref() else {
+        // No inference configured on this binary — the router cannot run.
+        let r = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("content-type", "application/json")],
+            json!({"error": "no inference backend configured"}).to_string(),
+        )
+            .into_response();
+        if let Some(ctx) = gate_ctx {
+            ctx.record_result(false, Some("no inference backend"));
+        }
+        return r;
+    };
+
+    let req: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            let r = (
+                StatusCode::BAD_REQUEST,
+                [("content-type", "application/json")],
+                json!({"error": format!("invalid request body: {e}")}).to_string(),
+            )
+                .into_response();
+            if let Some(ctx) = gate_ctx {
+                ctx.record_result(false, Some("invalid body"));
+            }
+            return r;
+        }
+    };
+
+    let system_prompt = req.get("system_prompt").and_then(|v| v.as_str()).unwrap_or("");
+
+    // CARRY THE WHOLE TRANSCRIPT. Round-4 review caught a real regression here: the
+    // first cut extracted only the newest user message and rebuilt a fresh transcript,
+    // which would have dropped conversation history on EVERY tool turn — the assistant
+    // would forget what was just being discussed. The caller's `messages` are the
+    // conversation; pass them through untouched.
+    let history: Vec<Value> = req
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // The newest user turn still drives tool SELECTION — that is what the request is
+    // about — but it no longer replaces the transcript.
+    let user_message = history
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let deps = crate::agent_router::RouterDeps {
+        state: &state,
+        cache: state.tool_cache(),
+        chord,
+        gateway: state.gateway.as_ref(),
+        principal: principal.as_ref(),
+    };
+
+    let outcome = crate::agent_router::execute(
+        deps,
+        system_prompt,
+        &user_message,
+        history,
+        crate::agent_router::RouterConfig::default(),
+    )
+    .await;
+
+    tracing::info!(
+        "agent_router: complete status={} turns={} tools={} identity={}",
+        outcome.status,
+        outcome.turns,
+        outcome.steps.len(),
+        principal.as_ref().map(|p| p.name()).unwrap_or("<none>")
+    );
+
+    if let Some(ctx) = gate_ctx {
+        ctx.record_result(true, None);
+    }
+
+    // TRTR-02/04: honour the caller's streaming preference with CHORD'S EXISTING
+    // frame vocabulary. lumina-core sets `stream: true` and parses
+    // `tool_call_started`/`tool_call_complete`/`complete` — emitting the same frames
+    // means the client needs NO change to talk to the relocated router, which is what
+    // makes TRTR-04 a verification step instead of a risky contract change on a live
+    // assistant. Its parser FAILS a turn that ends without `complete`, so
+    // `render_sse` always emits one, including on timeout.
+    let wants_stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    if wants_stream {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            crate::agent_router::render_sse(&outcome),
+        )
+            .into_response();
+    }
+
+    // Non-streaming callers get the same JSON shape Chord returned.
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        json!({
+            "response": outcome.response,
+            "status": outcome.status,
+            "turns": outcome.turns,
+            "tools_called": outcome.steps.len(),
+            "execution_log": outcome.steps.iter().map(|s| json!({
+                "tool": s.tool,
+                "status": s.status,
+                "cached": s.cached,
+                "duration_ms": s.duration_ms,
+            })).collect::<Vec<_>>(),
+        })
+        .to_string(),
+    )
+        .into_response()
 }
 
 async fn handle_coding_select(
@@ -1304,6 +1580,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
@@ -1462,6 +1739,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
@@ -1595,6 +1873,7 @@ mod tests {
                 auth_token: None,
                 personal_federation: None,
                 inference_proxy: None,
+                tool_cache: Default::default(),
                 gateway: None,
                 mesh_pool: None,
                 principal_resolver: PrincipalResolver::default(),
@@ -1656,6 +1935,7 @@ mod tests {
                     .with_timeout(std::time::Duration::from_millis(200)),
             ),
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
@@ -1732,6 +2012,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
@@ -1802,6 +2083,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
@@ -1851,6 +2133,7 @@ mod tests {
             auth_token: Some("secret-abc".to_string()),
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
@@ -1880,6 +2163,7 @@ mod tests {
             auth_token: Some("secret-abc".to_string()),
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
@@ -2065,6 +2349,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: Some(gateway),
             mesh_pool: None,
             principal_resolver,
@@ -2237,6 +2522,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: Some(gateway),
             mesh_pool: Some(Arc::new(mesh_pool)),
             principal_resolver: PrincipalResolver::default(),

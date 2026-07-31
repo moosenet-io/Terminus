@@ -135,6 +135,7 @@ pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig
         auth_token: config.auth_token.clone(),
         personal_federation: config.personal_federation.clone(),
         inference_proxy: config.inference_proxy.clone(),
+        tool_cache: Default::default(),
         gateway: config.gateway.clone(),
         // MESH-15: pass through whatever the caller provisioned --
         // `terminus_primary`'s `main()` builds a real pool from env when

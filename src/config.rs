@@ -654,6 +654,69 @@ pub fn mtls_primary_server_identity() -> String {
 // same "PKI/secret material gets its own section" convention this file
 // already uses for `crate::pki`).
 
+/// TRTR-02: the router's wall-clock budget, seconds.
+///
+/// MUST stay below the CALLER's egress timeout (lumina-core's is 120 s) so the
+/// router's own structured error surfaces instead of a dead socket. Configurable
+/// because that caller-side timeout is not ours to assume forever — a deployment that
+/// tunes one must be able to tune the other. Default 90 s.
+pub fn router_budget_secs() -> u64 {
+    let requested = env_nonempty("TERMINUS_ROUTER_BUDGET_SECS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(90);
+    clamp_router_budget(requested, caller_egress_timeout_secs())
+}
+
+/// Clamp a requested router budget STRICTLY below the caller's egress timeout.
+///
+/// Documenting the ordering is not enforcing it (round-4), and `saturating_sub` alone
+/// is not enough either: for a small caller timeout it can yield a budget EQUAL to the
+/// caller's, which still loses the race (round-5). Pure function so the invariant is
+/// testable across the whole range rather than asserted on one default.
+pub fn clamp_router_budget(requested: u64, caller_timeout: u64) -> u64 {
+    // Leave headroom for the response hop, but never at the cost of the strict bound.
+    let headroom = 15u64.min(caller_timeout.saturating_sub(1));
+    let ceiling = caller_timeout.saturating_sub(headroom).max(1);
+    let ceiling = ceiling.min(caller_timeout.saturating_sub(1).max(1));
+    requested.min(ceiling)
+}
+
+/// The CALLER's egress timeout in seconds (lumina-core's is 120). Configurable so a
+/// deployment that tunes the client can tune the router's ceiling with it, rather than
+/// the router assuming a constant that is not its to own.
+pub fn caller_egress_timeout_secs() -> u64 {
+    env_nonempty("TERMINUS_CALLER_EGRESS_TIMEOUT_SECS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(120)
+}
+
+/// TRTR-02: whether the tool router runs LOCALLY in Terminus (default) or blind-
+/// forwards `/v1/agent/execute` to Chord as before.
+///
+/// `TERMINUS_ROUTER_LOCAL=0` is the documented rollback: it restores the exact
+/// pre-TRTR-02 behaviour without a redeploy, which is what makes flipping this on
+/// safe for a live assistant.
+pub fn router_local_enabled() -> bool {
+    match std::env::var("TERMINUS_ROUTER_LOCAL") {
+        Ok(v) => !matches!(v.trim(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
+}
+
+/// TRTR-02: the Chord NAMED PROXY the tool-selecting sub-agent runs on.
+///
+/// A logical route, never a concrete model name — Chord owns model selection, tiering,
+/// GPU lifecycle, and fallback (north-star Module Contract clause 1). Reads
+/// `TERMINUS_ROUTER_MODEL`; the in-code default is the fast assistant ALIAS because
+/// tool selection is a routing decision, not the answer the user reads. (A default
+/// alias in source is not a hard-wired model: hard-wiring would be naming a concrete
+/// model such as a specific weights tag, which is precisely what Chord owns.)
+pub fn router_model_alias() -> String {
+    env_nonempty("TERMINUS_ROUTER_MODEL").unwrap_or_else(|| "lumina-fast".to_string())
+}
+
 /// Base URL `terminus-primary` calls to reach Chord's personal-tool relay
 /// (`{base}/v1/personal/tools/list`, `{base}/v1/personal/tools/call`). From
 /// `TERMINUS_PRIMARY_CHORD_URL`; defaults to Chord's loopback proxy port for

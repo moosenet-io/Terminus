@@ -405,6 +405,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            tool_cache: Default::default(),
             gateway: None,
             mesh_pool: None,
             principal_resolver: crate::mesh::PrincipalResolver::default(),
