@@ -279,7 +279,13 @@ export interface MuseDiscover {
     title: string;
     year?: number | null;
     kind?: string;
-  }[];
+  }[];  /** MUSE #111: true when a TMDb client exists but is KEY-LESS — it serves movie metadata and
+   *  has no trending endpoint, so Discover can never populate. Distinct from having no client
+   *  at all, because the operator action differs: add an API key, versus configure TMDb. */
+  metadata_provider_only?: boolean;
+  /** The server's own explanation of why trending is unavailable. Preferred over any sentence
+   *  written in the panel — the code that knows the fact should be the code that states it. */
+  reason?: string | null;
 }
 
 export function useMuseDiscover(): MuseSection<MuseDiscover> {
