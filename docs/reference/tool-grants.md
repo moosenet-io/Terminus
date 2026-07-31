@@ -128,7 +128,10 @@ names and each gets the baseline grant:
 TERMINUS_GATEWAY_GUEST_IDENTITIES=guest-alex,guest-sam
 ```
 
-Today's surface (`GUEST_BASELINE_ALLOW`, exact tool names):
+Today's surface (`GUEST_BASELINE_ALLOW`, exact names) — **ten entries: one
+inference route plus nine tools.** The route is not a tool and never appears in
+`tools/list`, so the two counts differ and both are given explicitly wherever
+they are quoted below.
 
 | Entry | Why it is safe for a non-operator |
 |---|---|
@@ -316,8 +319,11 @@ the household meal-planning tools.
    TERMINUS_GATEWAY_GUEST_IDENTITIES=guest-alex
    ```
 
-   At this point `guest-alex` can open an assistant turn and call the nine
-   baseline tools, and nothing else — `tools/list` shows exactly those nine.
+   At this point `guest-alex` holds all ten baseline entries: the
+   `/v1/agent/execute` route — which is what lets them open an assistant turn at
+   all — plus the nine baseline **tools**, and nothing else. `tools/list` shows
+   exactly those nine tools; the route is not a tool and never appears there, so
+   a catalog of nine is the expected result, not a missing entry.
 
 3. **Add the extra tools, if any — and note that this is where the ceiling
    bites.** While `guest-alex` is listed in `TERMINUS_GATEWAY_GUEST_IDENTITIES`,

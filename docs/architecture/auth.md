@@ -224,6 +224,24 @@ Each identity's grant (`Grant`) is one of two shapes:
   otherwise let either identity reach credentials like the primary's
   GitHub PAT or mirror-push creds "using Moose where available".
 
+Two qualifications on "an identity either has a grant naming the action or it
+has nothing", both documented in
+[tool-grants.md](../reference/tool-grants.md):
+
+- **Guest classification is a ceiling, not a default.** For an identity named in
+  `TERMINUS_GATEWAY_GUEST_IDENTITIES`, an explicit
+  `TERMINUS_GATEWAY_ALLOWLIST_JSON` entry is *intersected* with
+  `GUEST_BASELINE_ALLOW` (`clamp_to_guest_ceiling`) rather than applied in full,
+  so it may narrow a guest and can never widen one. The "the env JSON wins per
+  identity, in full" rule holds for every **non-guest** identity only.
+- **The grant map authorizes principals, not people.** Every person who talks to
+  Lumina reaches the gateway as `identity=lumina` — the mTLS principal names the
+  *service*, not the person, and `X-Lumina-User` is not forwarded through Chord
+  and never reaches `gateway_framework`. A guest grant therefore contains only a
+  **separately authenticated principal**; provisioning `guest-*` principals
+  without closing this gap gives a false sense of containment. Tracked as
+  **TERM #577**, a blocker for the `hearth` family sprint.
+
 This is covered in full, including the rate-limit and audit stages it sits
 between, in [federation.md](federation.md)'s "gateway pipeline" section.
 

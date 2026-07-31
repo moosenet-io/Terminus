@@ -153,11 +153,34 @@ Two grant shapes: a plain allow list (`["ledger_accounts", "*"]`) and an
 allow/deny object (`{"allow": ["*"], "deny": ["github_", "infisical_"]}`), where
 deny entries are literal **prefixes** that win even over an allow `"*"`.
 
+> #### ⚠ Before you provision a guest: what the guest baseline does **not** protect (TERM #577)
+>
+> The baseline constrains a caller that authenticates as its **own gateway
+> principal** — its own client cert / tailnet identity / named PAT, with its own
+> entry in this map. It does **not** yet distinguish two humans sharing one
+> identity, and today they do: **every person who talks to Lumina arrives at the
+> gateway as `identity=lumina`.** The mTLS principal names the *service*, not the
+> person; the human identity known at the web edge (`X-Lumina-User`,
+> `src/constellation/proxy.rs`) is not forwarded through Chord and never reaches
+> `gateway_framework`.
+>
+> So a houseguest conversing with the assistant today is authorized as `lumina`
+> — holding `google_calendar_today`, `commute_estimate` and full inference — and
+> **none of the guest narrowing below applies to them.** The same limit applies
+> to the per-principal tool cache: it isolates `lumina` from a guest principal,
+> not two humans who are both `lumina`.
+>
+> **Provisioning `guest-*` principals without closing TERM #577 gives a FALSE
+> sense of containment.** The guest surface is real only for a **separately
+> authenticated principal**. Closing the gap needs end-to-end human-identity
+> propagation — design work tracked as **TERM #577**, a blocker for the `hearth`
+> family sprint — not a wider or cleverer grant map.
+
 **Guest / family identities** get a deliberately different construction. Name
 them in `TERMINUS_GATEWAY_GUEST_IDENTITIES` (comma-separated) and each gets the
-baseline surface — the assistant route `/v1/agent/execute` (but not raw
-completions), `time_now`, `weather`, `news_*` (three tools), and the four media
-*discovery* tools — as an **exactly enumerated allowlist**, not a wildcard
+baseline surface — ten entries: the assistant route `/v1/agent/execute` (but not
+raw completions), plus **nine tools** (`time_now`, `weather`, the three `news_*`
+tools, and the four media *discovery* tools) — as an **exactly enumerated allowlist**, not a wildcard
 minus a denylist. That is the load-bearing choice: with a denylist every tool
 family added in future would be granted to houseguests the day it registers.
 With the allowlist a new family is invisible to a guest until someone

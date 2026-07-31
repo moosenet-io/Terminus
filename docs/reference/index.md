@@ -44,8 +44,8 @@ tools each; per-tool documentation lives under [docs/tools/](../tools/README.md)
 
 Cross-cutting pages that document a concern rather than a single module:
 [tool-grants](tool-grants.md) — the per-identity grant map enforced by
-`gateway_framework` (grant shapes, the guest/family baseline, fail-closed
-validation, adding a principal).
+`gateway_framework` (grant shapes, the guest/family baseline and the ceiling it
+imposes, its TERM #577 scope limit, fail-closed validation, adding a principal).
 
 Workspace members (not part of the KG rollup above): `terminus-client`
 (enrollment + mTLS transport + local forwarding daemon) and
