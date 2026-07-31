@@ -1,5 +1,6 @@
-// MGUI-16 (S130): muse.request — search the metadata providers, see WHICH providers this
-// deployment actually consulted, and file a request for something Muse does not hold.
+// MGUI-16 (S130): muse.request — search the metadata providers, see which providers this
+// deployment reported (and what each of them did with the query), and request something Muse
+// does not hold.
 //
 // Registered as "Search & request" so it cannot be confused with `muse.requests`, which is
 // the queue of requests that ALREADY EXIST. This page is the front of that pipeline.
@@ -18,6 +19,10 @@
 // request new content". The catalog here is the `providers` array of the LAST SEARCH: name,
 // mode, configured, which kinds it can search, its status, and its per-kind counts. It is a
 // description of the running deployment.
+//
+// The heading is "Providers REPORTED" (`CATALOG_TITLE`), not "consulted": the array
+// deliberately includes providers with `status: "not_consulted"`, because a kind-filtered
+// search excludes whole providers and that status exists to say so.
 //
 // A hardcoded roster (TMDb · TVDB · OMDb · Trakt · …) would look richer and be worthless: it
 // would list providers this server has never heard of, and would keep listing one after it
@@ -46,6 +51,17 @@
 // its own state (`providerCatalogState`) rather than reading `providers.length`, for the same
 // reason — an empty array after a failed search is not the same fact as an empty array before
 // one was run.
+//
+// ── FACTS THIS PAGE WAS TOLD ARE NOT FACTS IT OBSERVED ───────────────────────────────────
+//
+// One rendered claim on this page comes from the operator rather than from a response: that no
+// download client is configured here. It is almost certainly true, and it is still not a
+// measurement — no endpoint reports it, nothing re-checks it, and it would go on rendering
+// after someone configured one. It is therefore rendered as an attributed, dated, visually
+// separated build-time note (`BUILD_TIME_NOTE`), never folded into a sentence beside a live
+// reading. A page whose whole contract is "only say what you can support" cannot make a quiet
+// exception for a true fact, because a reader has no way to tell which claims got the
+// exception. Everything else on this page comes from a response.
 //
 // ── OWNERSHIP IS TRI-STATE, FOR THE SAME REASON ──────────────────────────────────────────
 //
@@ -88,6 +104,19 @@ import { gateResult } from './RequestLifecyclePanel';
 const RESULTS_HEIGHT = 620;
 const CATALOG_HEIGHT = 300;
 
+/** The catalog heading. A CONSTANT rather than an inline string so the rule can be pinned by a
+ *  test: the array deliberately includes providers with `status: "not_consulted"` (a
+ *  kind-filtered search excludes whole providers, and that status exists to say so), so a
+ *  heading claiming they were consulted is contradicted by the rows beneath it. */
+export const CATALOG_TITLE = 'Providers reported';
+
+/** What a successful POST is allowed to say. Extracted for the same reason `BUILD_TIME_NOTE`
+ *  is: the response body is deliberately never parsed, so a resolved promise establishes a
+ *  2xx and nothing else — not that a row persisted, not where it is visible, not what status
+ *  it landed in. The previous copy named a status AND a location, neither of which was read. */
+export const REQUEST_ACCEPTED_NOTE =
+  'Muse accepted the request. This page does not read the response, so it reports nothing about where the request went or what state it is in.';
+
 // ── The honest-state decision, extracted and pure ────────────────────────────────────────
 
 export type SearchState =
@@ -111,7 +140,10 @@ export type SearchCaveat =
   | { code: 'kind-partial'; provider: string; kind: string; message: string | null }
   | { code: 'unknown-status'; scope: 'provider' | 'kind'; provider: string; kind: string | null; status: string }
   | { code: 'truncated'; provider: string; kind: string; shown: number; providerReturned: number; limit: number }
-  | { code: 'contradictory-empty' };
+  /** The response contradicts itself about whether anything was found. `basis` says which
+   *  field disagrees with the empty result list — they are separate observations and a
+   *  response can carry both. */
+  | { code: 'contradictory-empty'; basis: 'truncated' | 'positive-count' };
 
 /** The status vocabulary this page has wording for. Deliberately NOT enforced by the parser —
  *  a sixth value must not break the page — but a status outside this set cannot be
@@ -151,26 +183,30 @@ export function searchCaveats(resp: MuseSearchResponse): SearchCaveat[] {
       }
     }
 
-    // The provider-level caveat is SUPPRESSED when the kind level already reported something
-    // for this provider: the kind-level entry names the kind and carries that kind's own
-    // message, so it is strictly more specific. Emitting both would print the same failure
-    // twice on every real error (today's server rolls a provider up to `partial` whenever a
-    // kind errors), which trains an operator to skim the banner — and a banner that gets
-    // skimmed is the one that fails to stop a false read.
+    out.push(...kindCaveats);
+
+    // The provider-level failure is SUPPRESSED only when the kind level REPORTS THE SAME
+    // FAILURE — i.e. when a kind-level caveat is itself an error/partial. The kind-level
+    // entry then names the kind and carries that kind's own message, so it is strictly more
+    // specific, and printing both would duplicate every real error (today's server rolls a
+    // provider up to `partial` whenever a kind errors).
+    //
+    // Suppressing on "any kind caveat exists" was wrong and swallowed real errors: a provider
+    // with `status: "error"` whose only kind caveat was an UNRECOGNIZED STATUS had its error
+    // silently dropped, because an uninterpretable status is not a report of that failure —
+    // it is the absence of one. A more specific sentence may replace a less specific one;
+    // nothing may replace a failure it does not itself state.
+    const kindReportsFailure = kindCaveats.some(c => c.code === 'kind-error' || c.code === 'kind-partial');
     const messages = p.kinds.map(k => k.error).filter((m): m is string => typeof m === 'string' && m !== '');
-    if (kindCaveats.length === 0) {
-      if (p.status === 'error') out.push({ code: 'provider-error', provider: p.name, messages });
-      else if (p.status === 'partial') out.push({ code: 'provider-partial', provider: p.name, messages });
-      else if (!KNOWN_STATUSES.has(p.status)) {
-        out.push({ code: 'unknown-status', scope: 'provider', provider: p.name, kind: null, status: p.status });
-      }
-    } else {
-      out.push(...kindCaveats);
-      // A provider-level status that is ALSO uninterpretable still gets said — it is a
-      // different fact from the kind-level one, not a rollup of it.
-      if (!KNOWN_STATUSES.has(p.status)) {
-        out.push({ code: 'unknown-status', scope: 'provider', provider: p.name, kind: null, status: p.status });
-      }
+    if (p.status === 'error' && !kindReportsFailure) {
+      out.push({ code: 'provider-error', provider: p.name, messages });
+    } else if (p.status === 'partial' && !kindReportsFailure) {
+      out.push({ code: 'provider-partial', provider: p.name, messages });
+    }
+    // A provider-level status that is uninterpretable is always said, whatever the kind level
+    // reported — it is a different fact, not a rollup of one.
+    if (!KNOWN_STATUSES.has(p.status)) {
+      out.push({ code: 'unknown-status', scope: 'provider', provider: p.name, kind: null, status: p.status });
     }
 
     for (const k of p.kinds) {
@@ -189,11 +225,26 @@ export function searchCaveats(resp: MuseSearchResponse): SearchCaveat[] {
     }
   }
 
-  // Truncation means the provider returned MORE than the limit, so a truncated search with an
-  // empty result list is self-contradictory. The page does not get to resolve that in favour
-  // of the confident reading — see `searchOutcome`.
-  if (resp.results.length === 0 && out.some(c => c.code === 'truncated')) {
-    out.push({ code: 'contradictory-empty' });
+  // ── A RESPONSE THAT DISAGREES WITH ITSELF ABOUT FINDING ANYTHING ─────────────────────────
+  //
+  // Both checks below compare the empty `results` list against a field that says something WAS
+  // found. Whatever produced such a payload, the page does not get to resolve the
+  // contradiction in favour of the confident reading — see `searchOutcome`.
+  if (resp.results.length === 0) {
+    // Truncation means the provider returned MORE than the limit, which cannot be true of a
+    // search that returned nothing.
+    if (out.some(c => c.code === 'truncated')) {
+      out.push({ code: 'contradictory-empty', basis: 'truncated' });
+    }
+    // A reported count above zero says a provider found something; an empty `results` says
+    // nothing came back. Checked at BOTH levels — the per-kind counts and the provider's own
+    // rollup are separate fields and either one disagreeing is enough. Previously neither was
+    // read, so `result_count: 12` alongside `results: []` rendered as the definitive "none of
+    // the providers had this title".
+    const positiveCount = resp.providers.some(p => p.result_count > 0 || p.kinds.some(k => k.result_count > 0));
+    if (positiveCount) {
+      out.push({ code: 'contradictory-empty', basis: 'positive-count' });
+    }
   }
   return out;
 }
@@ -488,7 +539,9 @@ function caveatText(c: SearchCaveat): string {
     case 'truncated':
       return `Truncated — ${c.provider} returned ${c.providerReturned} ${c.kind} hits and only ${c.shown} are shown (limit ${c.limit}). Narrow the search to see the rest.`;
     case 'contradictory-empty':
-      return 'This response reports a truncated result set but carries no results at all. Those cannot both be true, so the empty list is not treated as a finding either way.';
+      return c.basis === 'truncated'
+        ? 'This response reports a truncated result set but carries no results at all. Those cannot both be true, so the empty list is not treated as a finding either way.'
+        : 'This response reports a result count above zero but carries no results at all. Those cannot both be true, so the empty list is not treated as a finding either way.';
   }
 }
 
@@ -554,10 +607,13 @@ function ProviderCard({ p }: { p: MuseSearchProvider }) {
 
 /** Per-result outcome of a request POST. Kept per-result rather than page-wide so filing one
  *  title never labels another. */
+/** `accepted`, not `filed`: the POST response body is deliberately never read (its shape has
+ *  not been observed), so a resolved promise establishes a 2xx and NOTHING ELSE. It does not
+ *  establish that a row persisted, that it is visible anywhere, or what state it landed in. */
 type RequestState =
   | { phase: 'idle' }
   | { phase: 'submitting' }
-  | { phase: 'filed' }
+  | { phase: 'accepted' }
   | { phase: 'failed'; detail: string };
 
 function ResultTile({
@@ -692,14 +748,14 @@ function ResultTile({
             <Button
               variant="secondary"
               size="sm"
-              disabled={!requestable || requestState.phase === 'submitting' || requestState.phase === 'filed'}
+              disabled={!requestable || requestState.phase === 'submitting' || requestState.phase === 'accepted'}
               onClick={onRequest}
               aria-describedby="muse-request-profile-note"
             >
               {requestState.phase === 'submitting'
-                ? 'Filing…'
-                : requestState.phase === 'filed'
-                  ? 'Filed'
+                ? 'Sending…'
+                : requestState.phase === 'accepted'
+                  ? 'Accepted'
                   : 'Request'}
             </Button>
           </RoleGate>
@@ -707,7 +763,12 @@ function ResultTile({
               unstated reason is indistinguishable from a broken one. */}
           {!hasIds && <Note>No provider ids on this hit, so Muse could not identify what to request.</Note>}
           {hasIds && qualityProfileId === null && <Note>Enter a quality profile id above to enable this.</Note>}
-          {requestState.phase === 'filed' && <Note>Filed. It appears under Requests as `Requested`.</Note>}
+          {/* Says only what a 2xx supports. The earlier copy ("Filed. It appears under
+              Requests as `Requested`.") named a persisted STATUS and a LOCATION, neither of
+              which was read from anything — the response body is deliberately not parsed. */}
+          {requestState.phase === 'accepted' && (
+            <Note>{REQUEST_ACCEPTED_NOTE}</Note>
+          )}
           {requestState.phase === 'failed' && (
             <div style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--danger, #ff5a5a)', lineHeight: 1.5 }}>
               Request failed: {requestState.detail}
@@ -773,8 +834,8 @@ export function RequestPanel() {
         // The POST's RESPONSE BODY is deliberately not read: this branch was written against
         // an endpoint whose response shape has not been observed, and rendering a field from
         // it would be a guess. A resolved promise means a 2xx, which is the only thing being
-        // claimed here.
-        setRequestStates(s => ({ ...s, [key]: { phase: 'filed' } }));
+        // claimed here — hence `accepted`, not `filed`.
+        setRequestStates(s => ({ ...s, [key]: { phase: 'accepted' } }));
       } catch (err) {
         setRequestStates(s => ({
           ...s,
@@ -958,9 +1019,14 @@ export function RequestPanel() {
       </ChartCard>
 
       {/* The catalog sits BELOW the results because it describes the search that just ran —
-          it is a report on this deployment's providers, not a navigation surface. */}
+          it is a report on this deployment's providers, not a navigation surface.
+
+          "Providers REPORTED", not "consulted": the array deliberately includes providers with
+          `status: "not_consulted"` (a kind-filtered search excludes whole providers, and that
+          status exists precisely to say so). Titling the card "consulted" made a claim that
+          the rows underneath it contradict. */}
       <ChartCard
-        title="Providers consulted"
+        title={CATALOG_TITLE}
         subtitle={
           catalogSection === 'providers'
             ? `${providers.length} reported by the last search`
@@ -974,7 +1040,7 @@ export function RequestPanel() {
           {catalogSection === 'idle' ? (
             <EmptyBlock
               headline="No provider list yet."
-              body="The provider catalog is part of the search response, so it describes the providers this deployment actually consulted for a specific query. Until a search runs there is nothing observed to list, and a hardcoded roster of metadata APIs would describe no server in particular."
+              body="The provider catalog is part of the search response, so it describes the providers this deployment reported for a specific query — including any it did not consult for that query. Until a search runs there is nothing observed to list, and a hardcoded roster of metadata APIs would describe no server in particular."
             />
           ) : catalogSection === 'unrecognized' ? (
             <EmptyBlock
@@ -1038,38 +1104,78 @@ function resultsSubtitle(state: SearchState, submitted: string | null, count: nu
 }
 
 /**
- * Why filing a request from here is safe, split into what this surface can SEE and what it
- * can only cite.
+ * The acquisition-gate sentence, derived ONLY from the live `/api/settings` read.
  *
- * LIVE: gate 1 (`master_enabled && acquisition.enabled`) via the same `gateResult` the
- * lifecycle panel uses — imported rather than reimplemented so the two surfaces cannot drift
- * into disagreeing about what "safe" means.
- *
- * CITED, not read: no download client is configured on this deployment, so a filed request
- * cannot auto-grab and persists as `Requested` for operator review. That was verified when
- * this page was built (MGUI-16); NO endpoint reports download-client configuration, so this
- * page cannot re-check it at runtime and says so instead of presenting it as a live reading.
+ * Pure and exported so the one rule that matters here is testable: this string may contain
+ * nothing that was not read from that endpoint. Loading, unreadable, provably-safe and
+ * indeterminate are four different sentences; `null` gate is UNKNOWN, never a definite
+ * negative on a safety control.
  */
+export function acquisitionGateReadout(input: {
+  loading: boolean;
+  /** The degrade detail, or `null` when the read succeeded. */
+  degradedDetail: string | null;
+  /** `master_enabled && acquisition.enabled`, or `null` when it could not be read. */
+  gate1: boolean | null;
+}): string {
+  if (input.loading) return 'Reading the acquisition gate…';
+  if (input.degradedDetail !== null) {
+    return `The acquisition gate could not be read (${input.degradedDetail}), so this page cannot report its state.`;
+  }
+  // `gateResult` is imported rather than reimplemented so this surface and the lifecycle
+  // panel cannot drift into disagreeing about what "safe" means.
+  return gateResult(input.gate1) === 'safe'
+    ? 'Gate 1 (acquisition) is OFF, so a request is persisted for review and never actioned — whatever gate 2 is.'
+    : 'Gate 1 is not off and gate 2 (MUSE_ARR_REQUEST_AUTO_TIER_ENABLED) is not exposed to this surface, so the armed/safe verdict cannot be determined here.';
+}
+
+/**
+ * A fact this page did NOT measure, rendered as such.
+ *
+ * The operator stated, when MGUI-16 was built, that no download client is configured on this
+ * deployment. It is very probably true. It is still not an observation: no endpoint reports
+ * download-client configuration, nothing here re-checks it, and it would keep rendering
+ * unchanged after someone configured one.
+ *
+ * The previous copy folded it into the same sentence as the live gate reading, which made a
+ * fact handed over in a prompt look like something the page had measured. Attribution and
+ * date are part of the claim, not decoration around it — a page whose entire contract is
+ * "only say what you can support" cannot make an exception for a fact that happens to be
+ * true, because the reader has no way to tell which facts got the exception.
+ */
+export const BUILD_TIME_NOTE =
+  'Build-time note, not measured by this page: when this page was built (MGUI-16), the operator reported that no download client is configured on this deployment, so an accepted request cannot be auto-grabbed. Nothing here re-checks that — no endpoint reports it — so it may be out of date.';
+
 function SafetyNote() {
   const { data, loading, degraded } = useMuseAcquisitionGate();
   // `null` is UNKNOWN, not off — a loading or degraded settings read must never render as a
   // definite negative on a safety gate.
   const gate1 = data ? data.master_enabled && data.acquisition.enabled : null;
-  const safe = gateResult(gate1);
 
   return (
-    <Note>
-      Filing a request writes a <code style={MONO}>media_requests</code> row.{' '}
-      {loading
-        ? 'Reading the acquisition gate…'
-        : degraded
-          ? `The acquisition gate could not be read (${degraded.detail}), so this page cannot report its state.`
-          : safe
-            ? 'Gate 1 (acquisition) is OFF, so a request is persisted for review and never actioned — whatever gate 2 is.'
-            : 'Gate 1 is not off and gate 2 (MUSE_ARR_REQUEST_AUTO_TIER_ENABLED) is not exposed to this surface, so the armed/safe verdict cannot be determined here.'}{' '}
-      Separately, verified when this page was built: no download client is configured, so a
-      request cannot auto-grab and stays <code style={MONO}>Requested</code> for operator review.
-      No endpoint reports that, so it is a build-time observation, not a live reading.
-    </Note>
+    <>
+      <Note>
+        Requesting sends a write to Muse.{' '}
+        {acquisitionGateReadout({
+          loading,
+          degradedDetail: degraded === false ? null : degraded.detail,
+          gate1,
+        })}
+      </Note>
+      {/* Visually separated, not merely a clause later in the same sentence — the split is
+          the point. Everything above is read from /api/settings; this is not. */}
+      <div
+        style={{
+          fontSize: 'var(--fs-2xs, 10px)',
+          color: 'var(--text-400, var(--text-300))',
+          lineHeight: 1.5,
+          borderLeft: '2px solid var(--border)',
+          paddingLeft: 'var(--space-2)',
+          fontStyle: 'italic',
+        }}
+      >
+        {BUILD_TIME_NOTE}
+      </div>
+    </>
   );
 }

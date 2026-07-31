@@ -13,6 +13,10 @@ import {
   ownershipReason,
   isCheckedNegative,
   parseQualityProfileId,
+  acquisitionGateReadout,
+  BUILD_TIME_NOTE,
+  CATALOG_TITLE,
+  REQUEST_ACCEPTED_NOTE,
 } from './RequestPanel';
 
 const hit = (over: Partial<MuseSearchResponse['results'][number]> = {}) => ({
@@ -233,6 +237,19 @@ describe('searchOutcome — six states, never sharing a meaning', () => {
     expect(out.state).not.toBe('incomplete-empty');
   });
 
+  it('withholds the no-matches claim when a reported count contradicts the empty list', () => {
+    const contradictory = museSearchResponse(response({
+      results: [],
+      providers: [provider({ status: 'ok', result_count: 12, kinds: [providerKind({ status: 'ok', result_count: 12, provider_returned: 12 })] })],
+    }));
+    const out = searchOutcome({ ...base, parsed: contradictory });
+    expect(out.state).toBe('indeterminate-empty');
+    expect(out.state).not.toBe('no-matches');
+    // Not coverage loss: nothing here says titles were LOST, only that the response disagrees
+    // with itself about whether any were found.
+    expect(out.state).not.toBe('incomplete-empty');
+  });
+
   it('still reports caveats alongside a non-empty result list', () => {
     // The dangerous case is not the empty one — it is five results that LOOK like an answer
     // while a whole media kind is missing.
@@ -323,14 +340,77 @@ describe('searchCaveats', () => {
   it('flags a truncated response that carries no results as self-contradictory', () => {
     const c = searchCaveats(response({
       results: [],
-      providers: [provider({ kinds: [providerKind({ truncated: true, result_count: 0, provider_returned: 137 })] })],
+      providers: [provider({ result_count: 0, kinds: [providerKind({ truncated: true, result_count: 0, provider_returned: 137 })] })],
     }));
-    expect(c).toContainEqual({ code: 'contradictory-empty' });
+    expect(c).toContainEqual({ code: 'contradictory-empty', basis: 'truncated' });
     // Not raised when there ARE results — truncation is then an ordinary, consistent fact.
     const consistent = searchCaveats(response({
       providers: [provider({ kinds: [providerKind({ truncated: true, result_count: 40, provider_returned: 137 })] })],
     }));
     expect(consistent.some(x => x.code === 'contradictory-empty')).toBe(false);
+  });
+
+  it('flags a positive result_count alongside an empty results list', () => {
+    // The finding: `result_count: 12` with `results: []` produced NO caveat at all (unless
+    // also truncated), so the page rendered the definitive "none of the providers had this
+    // title" over a response that said one of them had twelve.
+    const perKind = searchCaveats(response({
+      results: [],
+      providers: [provider({ result_count: 0, kinds: [providerKind({ result_count: 12, provider_returned: 12 })] })],
+    }));
+    expect(perKind).toContainEqual({ code: 'contradictory-empty', basis: 'positive-count' });
+
+    // The provider's own rollup counts too — it is a separate field, and either one
+    // disagreeing with the empty list is enough.
+    const perProvider = searchCaveats(response({
+      results: [],
+      providers: [provider({ result_count: 3, kinds: [providerKind({ result_count: 0, provider_returned: 0 })] })],
+    }));
+    expect(perProvider).toContainEqual({ code: 'contradictory-empty', basis: 'positive-count' });
+  });
+
+  it('does not flag a consistent empty search', () => {
+    // Zero results, zero counts, nothing truncated — the one shape that supports the
+    // definitive claim.
+    const c = searchCaveats(response({
+      results: [],
+      providers: [provider({ result_count: 0, kinds: [providerKind({ result_count: 0, provider_returned: 0 })] })],
+    }));
+    expect(c).toEqual([]);
+  });
+
+  it('reports both contradictions separately when both are present', () => {
+    const c = searchCaveats(response({
+      results: [],
+      providers: [provider({ result_count: 40, kinds: [providerKind({ truncated: true, result_count: 40, provider_returned: 137 })] })],
+    }));
+    expect(c).toContainEqual({ code: 'contradictory-empty', basis: 'truncated' });
+    expect(c).toContainEqual({ code: 'contradictory-empty', basis: 'positive-count' });
+  });
+
+  it('does not swallow a provider error whose kind caveat is merely an unknown status', () => {
+    // The finding: suppression keyed on "any kind caveat exists", so a provider-level `error`
+    // vanished when its only kind-level caveat was an unrecognized status — which reports the
+    // absence of an interpretation, not the failure. A more specific sentence may replace a
+    // less specific one; nothing may replace a failure it does not itself state.
+    const c = searchCaveats(response({
+      providers: [provider({ status: 'error', kinds: [providerKind({ status: 'rate_limited' })] })],
+    }));
+    expect(c).toContainEqual({ code: 'provider-error', provider: 'tmdb', messages: [] });
+    expect(c).toContainEqual({ code: 'unknown-status', scope: 'kind', provider: 'tmdb', kind: 'movie', status: 'rate_limited' });
+  });
+
+  it('suppresses the provider rollup only when a kind reports the SAME failure', () => {
+    const suppressed = searchCaveats(response({
+      providers: [provider({ status: 'partial', kinds: [providerKind({ status: 'error', error: 'boom' })] })],
+    }));
+    expect(suppressed.filter(x => x.code === 'provider-partial' || x.code === 'provider-error')).toEqual([]);
+
+    // No kind-level failure at all -> the provider-level sentence is the only signal and is kept.
+    const kept = searchCaveats(response({
+      providers: [provider({ status: 'partial', kinds: [providerKind({ status: 'ok' })] })],
+    }));
+    expect(kept).toContainEqual({ code: 'provider-partial', provider: 'tmdb', messages: [] });
   });
 
   it('surfaces truncation with the numbers the response actually carried', () => {
@@ -358,7 +438,12 @@ describe('searchCaveats', () => {
       })],
     }));
     const out = searchOutcome({ submitted: true, loading: false, degraded: false, parsed: truncatedEmpty });
-    expect(out.caveats.map(c => c.code)).toEqual(['truncated', 'contradictory-empty']);
+    // Counts are zero at both levels in this fixture, so `truncated` is the ONLY basis for the
+    // contradiction — the positive-count basis is pinned separately.
+    expect(out.caveats).toEqual([
+      { code: 'truncated', provider: 'tmdb', kind: 'movie', shown: 0, providerReturned: 137, limit: 40 },
+      { code: 'contradictory-empty', basis: 'truncated' },
+    ]);
     // NOT coverage loss — that reasoning stands: truncation means there were MORE matches, so
     // it cannot have removed titles from the list.
     expect(out.state).not.toBe('incomplete-empty');
@@ -502,6 +587,73 @@ describe('isCheckedNegative — the two negatives that used to look identical', 
     expect(isCheckedNegative({ in_library: false, resolution: 'settled' })).toBe(false);
     expect(isCheckedNegative({ in_library: null, resolution: 'ambiguous_rows' })).toBe(false);
     expect(isCheckedNegative({ in_library: null, resolution: 'absent' })).toBe(false);
+  });
+});
+
+describe('rendered copy that makes a claim', () => {
+  it('does not title the catalog as "consulted"', () => {
+    // The array includes providers with `status: "not_consulted"` — a kind-filtered search
+    // excludes whole providers, and the mock produces exactly that. A provider that was not
+    // consulted is not a provider consulted, so the heading must not say it was.
+    expect(CATALOG_TITLE).not.toMatch(/consulted/i);
+    expect(CATALOG_TITLE).toMatch(/reported/i);
+  });
+
+  it('claims only acceptance for a successful request, not persistence or placement', () => {
+    // A resolved promise is a 2xx. It is not evidence that a row persisted, that it is
+    // visible under Requests, or what status it landed in — and the body is never parsed.
+    expect(REQUEST_ACCEPTED_NOTE).toMatch(/accepted/i);
+    expect(REQUEST_ACCEPTED_NOTE).not.toMatch(/Requested/);
+    expect(REQUEST_ACCEPTED_NOTE).not.toMatch(/appears under/i);
+    expect(REQUEST_ACCEPTED_NOTE).not.toMatch(/\bfiled\b/i);
+  });
+});
+
+describe('acquisitionGateReadout — only what /api/settings reported', () => {
+  const readouts = [
+    acquisitionGateReadout({ loading: true, degradedDetail: null, gate1: null }),
+    acquisitionGateReadout({ loading: false, degradedDetail: 'HTTP 500 for /api/muse/api/settings', gate1: null }),
+    acquisitionGateReadout({ loading: false, degradedDetail: null, gate1: false }),
+    acquisitionGateReadout({ loading: false, degradedDetail: null, gate1: true }),
+    acquisitionGateReadout({ loading: false, degradedDetail: null, gate1: null }),
+  ];
+
+  it('gives loading, unreadable, safe and indeterminate their own sentences', () => {
+    expect(readouts[0]).toMatch(/Reading the acquisition gate/i);
+    expect(readouts[1]).toContain('HTTP 500 for /api/muse/api/settings');
+    expect(readouts[2]).toMatch(/Gate 1 \(acquisition\) is OFF/);
+    expect(readouts[3]).toMatch(/cannot be determined/i);
+    // A gate that could not be read is NOT a definite negative — it must not claim safety.
+    expect(readouts[4]).toMatch(/cannot be determined/i);
+    expect(readouts[4]).not.toMatch(/is OFF/);
+  });
+
+  it('never states anything the settings endpoint does not report', () => {
+    // Specifically the download-client claim: it came from the operator, not from a response,
+    // and it must never appear inside the live reading. It lives in BUILD_TIME_NOTE, attributed.
+    for (const text of readouts) {
+      expect(text).not.toMatch(/download client/i);
+      expect(text).not.toMatch(/auto-?grab/i);
+      expect(text).not.toMatch(/Requested/);
+    }
+  });
+});
+
+describe('BUILD_TIME_NOTE — an asserted fact, rendered as an asserted fact', () => {
+  it('attributes the claim, dates it, and says it is not measured', () => {
+    // The rule this pins: a fact handed over in a prompt is not an observation, even when it
+    // is true. If it is rendered at all it must carry its provenance, or a reader cannot tell
+    // which of the page's claims were measured.
+    expect(BUILD_TIME_NOTE).toMatch(/not measured/i);
+    expect(BUILD_TIME_NOTE).toMatch(/operator reported/i);
+    expect(BUILD_TIME_NOTE).toMatch(/when this page was built/i);
+    expect(BUILD_TIME_NOTE).toMatch(/may be out of date/i);
+  });
+
+  it('does not present it as a live reading', () => {
+    // No present-tense measurement verbs that would imply the page checked.
+    expect(BUILD_TIME_NOTE).not.toMatch(/verified/i);
+    expect(BUILD_TIME_NOTE).not.toMatch(/currently/i);
   });
 });
 
