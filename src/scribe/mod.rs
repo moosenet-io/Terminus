@@ -1081,11 +1081,19 @@ mod tests {
     #[tokio::test]
     async fn dispatch_docs_generation_tries_agy_first_and_returns_on_success() {
         let server = httpmock::MockServer::start();
+        // TERM #569: derive the backstop from the same preset the code sends
+        // instead of hardcoding it. REVX-16 moved the routine backstop from a
+        // hard 120s to the operator-tunable `REVIEW_ROUTINE_TIMEOUT_SECS`
+        // (300s default), which left the old literal `120` matching nothing —
+        // every provider fell through as "unavailable" and this test was red on
+        // `main`. A literal would also make the test depend on an ambient env
+        // var; the preset tracks it.
+        let timeout_secs = crate::review::dispatch::DaemonOpts::routine().timeout_secs;
         let mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/dispatch")
                 .header("authorization", "Bearer testtoken")
-                .json_body(json!({"provider": "agy", "prompt": "doc this", "timeout_secs": 120}));
+                .json_body(json!({"provider": "agy", "prompt": "doc this", "timeout_secs": timeout_secs}));
             then.status(200).json_body(json!({"text": "# Generated README"}));
         });
         let cfg = crate::review::ReviewConfig {
@@ -1103,22 +1111,25 @@ mod tests {
         let server = httpmock::MockServer::start();
         // agy and codex both report unavailable; opus (last in the chain)
         // succeeds -- proves the fallback chain, not just the happy path.
+        // TERM #569: backstop derived from the preset, not a literal — see
+        // `dispatch_docs_generation_tries_agy_first_and_returns_on_success`.
+        let timeout_secs = crate::review::dispatch::DaemonOpts::routine().timeout_secs;
         let agy_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/dispatch")
-                .json_body(json!({"provider": "agy", "prompt": "doc this", "timeout_secs": 120}));
+                .json_body(json!({"provider": "agy", "prompt": "doc this", "timeout_secs": timeout_secs}));
             then.status(502).json_body(json!({"error": "binary_not_found", "detail": "agy not found"}));
         });
         let codex_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/dispatch")
-                .json_body(json!({"provider": "codex", "prompt": "doc this", "timeout_secs": 120}));
+                .json_body(json!({"provider": "codex", "prompt": "doc this", "timeout_secs": timeout_secs}));
             then.status(502).json_body(json!({"error": "timeout", "detail": "codex timed out"}));
         });
         let opus_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/dispatch")
-                .json_body(json!({"provider": "opus", "prompt": "doc this", "timeout_secs": 120}));
+                .json_body(json!({"provider": "opus", "prompt": "doc this", "timeout_secs": timeout_secs}));
             then.status(200).json_body(json!({"text": "# Fallback README"}));
         });
         let cfg = crate::review::ReviewConfig {

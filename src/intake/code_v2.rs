@@ -1702,13 +1702,21 @@ mod tests {
         std::env::remove_var("INTAKE_CORPUS_DIR");
         std::env::remove_var("INTAKE_CORPUS_V2_DIR");
 
+        // PCON-08: unique per-invocation paths (never a hardcoded `/tmp/...`),
+        // so two concurrent invocations can't clobber each other. These are pure
+        // string round-trips — `corpus_v2_dir` never touches the filesystem — so
+        // the dirs deliberately do not need to exist.
+        let base = std::env::temp_dir().join(format!("terminus-corpus-v2-{}", std::process::id()));
+        let alias_dir = base.join("alias");
+        let unified_dir = base.join("unified");
+
         // DR-02: the deprecated alias still resolves when it is the only one set.
-        std::env::set_var("INTAKE_CORPUS_V2_DIR", "/tmp/corpus-v2-x");
-        assert_eq!(corpus_v2_dir().unwrap(), PathBuf::from("/tmp/corpus-v2-x"));
+        std::env::set_var("INTAKE_CORPUS_V2_DIR", &alias_dir);
+        assert_eq!(corpus_v2_dir().unwrap(), alias_dir);
 
         // DR-02: the unified INTAKE_CORPUS_DIR takes precedence over the alias.
-        std::env::set_var("INTAKE_CORPUS_DIR", "/tmp/corpus-unified");
-        assert_eq!(corpus_v2_dir().unwrap(), PathBuf::from("/tmp/corpus-unified"));
+        std::env::set_var("INTAKE_CORPUS_DIR", &unified_dir);
+        assert_eq!(corpus_v2_dir().unwrap(), unified_dir);
         std::env::remove_var("INTAKE_CORPUS_DIR");
 
         std::env::remove_var("INTAKE_CORPUS_V2_DIR");
@@ -2064,6 +2072,9 @@ mod tests {
     /// `samples_per_case()` is opt-in: unset/blank/invalid/`< 1` ⇒ 1, so a
     /// production sweep never silently multiplies its runtime.
     #[test]
+    // PCON-08: mutates the process-global `INTAKE_SAMPLES_PER_CASE`; joins the
+    // same `intake_env` serial group as the other intake env-mutating tests.
+    #[serial_test::serial(intake_env)]
     fn samples_per_case_defaults_to_one_and_is_opt_in() {
         std::env::remove_var("INTAKE_SAMPLES_PER_CASE");
         assert_eq!(samples_per_case(), 1);

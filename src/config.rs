@@ -1460,7 +1460,7 @@ pub fn constellation_lumina_token() -> Option<String> {
 /// (unauthenticated passthrough), which keeps a token-less dev Muse working —
 /// the same fail-soft posture as the Lumina arm rather than a hard failure.
 ///
-/// The value is Muse's own `MUSE_API_TOKEN`, materialized from <secret-manager> into
+/// The value is Muse's own `MUSE_API_TOKEN`, materialized from <secret-manager> into // pii-test-fixture: public product name, sanctioned secrets manager (see infra_service_path_exempt rationale)
 /// this process's environment; never a literal in config or source (S7).
 ///
 /// Why this exists (TERM #549): the constellation GUI's Muse panels read

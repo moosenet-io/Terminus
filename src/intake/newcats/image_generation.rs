@@ -383,6 +383,9 @@ mod tests {
     /// `load_prompts` falls back to the in-source defaults when no corpus dir is
     /// configured (a runnable suite matters more than a configured corpus).
     #[test]
+    // PCON-08: mutates the process-global `INTAKE_CORPUS_DIR`; joins the same
+    // `intake_env` serial group as the other corpus-dir tests.
+    #[serial_test::serial(intake_env)]
     fn load_prompts_falls_back_to_defaults_without_corpus_dir() {
         let saved = std::env::var("INTAKE_CORPUS_DIR").ok();
         std::env::remove_var("INTAKE_CORPUS_DIR");
@@ -396,6 +399,9 @@ mod tests {
     /// `load_prompts` reads `image_generation.json` from `INTAKE_CORPUS_DIR` when
     /// present. Uses this crate's committed fixture dir.
     #[test]
+    // PCON-08: mutates the process-global `INTAKE_CORPUS_DIR`; joins the same
+    // `intake_env` serial group as the other corpus-dir tests.
+    #[serial_test::serial(intake_env)]
     fn load_prompts_reads_corpus_fixture() {
         let saved = std::env::var("INTAKE_CORPUS_DIR").ok();
         let fixture_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/intake-corpus-imagegen");

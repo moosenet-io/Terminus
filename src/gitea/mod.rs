@@ -7104,6 +7104,29 @@ mod tests {
         });
     }
 
+    /// PCON-06 tests: block until the branch-update POST has actually reached
+    /// the mock server, then (and only then) make the rebased head visible.
+    ///
+    /// TERM #569: these tests used a fixed `sleep(80ms)` as a stand-in for "the
+    /// guard fetch + branch update have happened by now". On a loaded box they
+    /// have NOT: advancing the head first makes the guard's pre-update read see
+    /// `f00dface`, so `prev_head_sha` is ALREADY the rebased SHA,
+    /// `resolve_confirmed_rebased_head`'s `advanced` check can never become
+    /// true, and the test fails after burning the full 15s visibility budget.
+    /// Observed live as an intermittent red on `main`
+    /// (`pcon06_stale_base_clean_rebase_green_regate_merges_the_rebased_head`).
+    /// Synchronising on the real event is deterministic AND faster than the
+    /// sleep it replaces.
+    async fn await_update_posted(update_mock: &httpmock::Mock<'_>) {
+        for _ in 0..2000 {
+            if update_mock.hits_async().await > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("PCON-06 test: the branch-update POST never reached the mock server");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn pcon06_stale_base_clean_rebase_green_regate_merges_the_rebased_head() {
@@ -7149,7 +7172,7 @@ mod tests {
         });
         // Let the guard fetch + branch-update happen against the stale head,
         // then make the rebase "become visible" (head advances to f00dface).
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        await_update_posted(&update_mock).await;
         advance_head(&server, get_stale, 71, "feature/g", "f00dface");
 
         let result = handle.await.expect("merge task must not panic");
@@ -7206,7 +7229,7 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        await_update_posted(&update_mock).await;
         advance_head(&server, get_stale, 72, "feature/h", "f00dface");
         let result = handle.await.expect("merge task must not panic");
 
@@ -7299,7 +7322,7 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        await_update_posted(&update_mock).await;
         advance_head(&server, get_stale, 75, "feature/k", "f00dface");
         let result = handle.await.expect("merge task must not panic");
 
@@ -7348,7 +7371,7 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        await_update_posted(&update_mock).await;
         advance_head(&server, get_stale, 77, "feature/m", "f00dface");
         let result = handle.await.expect("merge task must not panic");
 
@@ -7520,7 +7543,7 @@ mod tests {
                 )
                 .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        await_update_posted(&update79).await;
         advance_head(&server, get79_stale, 79, "feature/second", "f00dface");
         let result = handle.await.expect("merge task must not panic");
 
@@ -7576,7 +7599,7 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        await_update_posted(&update_rebase).await;
         advance_head(&server, get_stale, 81, "feature/n", "f00dface");
         let result = handle.await.expect("merge task must not panic");
 
@@ -7692,7 +7715,7 @@ mod tests {
 
         // Advance to the rebased head `f00dface`; resolve returns it and the
         // gate is entered on it.
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        await_update_posted(&update_mock).await;
         get_a.delete();
         let mut get_b = server.mock(|when, then| {
             when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/84");
@@ -7894,7 +7917,7 @@ mod tests {
 
         // Confirmed rebased head f00dface (advanced + mergeable) — resolve
         // confirms it and the gate enters on it.
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        await_update_posted(&update_mock).await;
         get_a.delete();
         let mut get_b = server.mock(|when, then| {
             when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/86");
@@ -7995,7 +8018,7 @@ mod tests {
 
         // Confirmed rebased head f00dface on base `base0000` (advanced +
         // mergeable). resolve confirms it; the gate enters on it.
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        await_update_posted(&update_mock).await;
         get_a.delete();
         let mut get_b = server.mock(|when, then| {
             when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/89");
@@ -8069,7 +8092,7 @@ mod tests {
             .await
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        await_update_posted(&update_mock).await;
         get_a.delete();
         let mut get_b = server.mock(|when, then| {
             when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/90");
@@ -8195,7 +8218,7 @@ mod tests {
 
         // Confirmed rebased head (advanced + mergeable); the gate enters on it
         // and stays parked until we release it.
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        await_update_posted(&update_mock).await;
         get_a.delete();
         server.mock(|when, then| {
             when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/93");

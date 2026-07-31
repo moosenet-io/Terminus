@@ -626,10 +626,19 @@ mod tests {
     }
 
     #[test]
+    // PCON-08: mutates the process-global `INTAKE_CORPUS_DIR`; joins the same
+    // `intake_env` serial group as the other corpus-dir tests (the comment below
+    // asserted a sequential env that nothing actually enforced).
+    #[serial_test::serial(intake_env)]
     fn load_cases_falls_back_to_default_without_corpus_dir() {
-        // Ensure the var is unset for this assertion (sequential test env).
+        // Ensure the var is unset for this assertion.
+        let saved = std::env::var("INTAKE_CORPUS_DIR").ok();
         std::env::remove_var("INTAKE_CORPUS_DIR");
         let cases = load_cases();
+        // Restore before asserting so a failure can't leak the unset var.
+        if let Some(v) = saved {
+            std::env::set_var("INTAKE_CORPUS_DIR", v);
+        }
         assert!(!cases.is_empty(), "must fall back to the in-source corpus");
     }
 }

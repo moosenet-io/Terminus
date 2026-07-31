@@ -1720,10 +1720,21 @@ fn metadata_reports_lib_target(metadata_json: &str, manifest_path: &std::path::P
     // --manifest-path <same>` will make, in every case — root or member,
     // virtual or not, explicit default-members or not. Nothing needs to be
     // re-derived on top of it.
-    let selected: Vec<&Value> = v
+    //
+    // TERM #569: the PRESENCE of `workspace_default_members` is what decides
+    // which branch applies — never the emptiness of the selection it produces.
+    // An earlier `.filter(|v| !v.is_empty())` treated "the field is there but
+    // matched no package" as "the field is absent" and fell through to the
+    // all-packages last resort, which then answered a confident "no lib" from a
+    // shape we do not understand — defeating the fail-safe below (and leaving
+    // `metadata_probe_fails_safe_on_an_empty_target_list_and_empty_selection`
+    // red on `main`). When cargo emits the field it is authoritative, including
+    // when nothing matches: that leaves `selected` empty and fails safe.
+    let selected: Vec<&Value> = match v
         .get("workspace_default_members")
         .and_then(Value::as_array)
-        .map(|ids| {
+    {
+        Some(ids) => {
             let want: std::collections::HashSet<&str> =
                 ids.iter().filter_map(Value::as_str).collect();
             packages
@@ -1734,9 +1745,8 @@ fn metadata_reports_lib_target(metadata_json: &str, manifest_path: &std::path::P
                         .is_some_and(|id| want.contains(id))
                 })
                 .collect::<Vec<_>>()
-        })
-        .filter(|v: &Vec<&Value>| !v.is_empty())
-        .or_else(|| {
+        }
+        None => {
             // Older cargo (< 1.71) omits the field: fall back to the package
             // this manifest defines.
             let hit: Vec<&Value> = packages
@@ -1747,11 +1757,15 @@ fn metadata_reports_lib_target(metadata_json: &str, manifest_path: &std::path::P
                         .is_some_and(|mp| std::path::Path::new(mp) == manifest_path)
                 })
                 .collect();
-            (!hit.is_empty()).then_some(hit)
-        })
-        // Last resort: everything cargo returned, which errs toward keeping
-        // `--lib`.
-        .unwrap_or_else(|| packages.iter().collect());
+            // Last resort: everything cargo returned, which errs toward keeping
+            // `--lib`.
+            if hit.is_empty() {
+                packages.iter().collect()
+            } else {
+                hit
+            }
+        }
+    };
 
     // Empty selection = we did not recognise the metadata (cargo always
     // reports at least one package for a buildable tree, and default-members

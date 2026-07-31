@@ -853,7 +853,7 @@ pub struct SttSuiteOutcome {
 /// SUITE-STT: run the speech-to-text suite end-to-end against `model_name`.
 ///
 /// Loads the STT corpus manifest from `INTAKE_CORPUS_DIR`
-/// (`[{ "audio_file", "reference" }, ...]`, e.g. the bundled <host> corpus at
+/// (`[{ "audio_file", "reference" }, ...]`, e.g. the bundled sweep-host corpus at
 /// `/opt/ollama-models/mint-corpora/stt/`), then for each clip: reads the audio
 /// bytes, derives the clip duration from its WAV header
 /// ([`crate::intake::newcats::voice_transcription::wav_duration_ms`]), transcribes
