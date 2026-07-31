@@ -26,6 +26,7 @@ import {
   type MuseTasteCluster,
   type MuseGroupDynamicsRow,
 } from '../../hooks/useMuse';
+import { TasteProfile } from './TasteProfile';
 
 const OTHER_LABEL = 'Other';
 
@@ -227,6 +228,11 @@ function GroupDynamicsSection() {
 export function TastePanel() {
   return (
     <div style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+      {/* MGUI-07: the taste PROFILE (guide screen 07) from /api/taste — the model's
+          own genre/decade lean and divergence. The three sections below bind
+          /api/graph/* instead, which is household analytics: a different question
+          about the same library, and the guide shows both. */}
+      <TasteProfile />
       <TasteClusterSection />
       <WatchHistorySection />
       <GroupDynamicsSection />

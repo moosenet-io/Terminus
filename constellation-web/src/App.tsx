@@ -268,10 +268,23 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
 
   const modules = useMemo(() => getAvailableModules(health), [health]);
   const availableModuleIds = useMemo(() => new Set(modules.map(m => m.id as string)), [modules]);
+  // Every routable panel. This list drives ROUTING and must stay complete — a
+  // parameterized panel still needs its <Route>, it just must not be offered as a
+  // navigation destination.
   const panels = useMemo(
     () => getAvailablePanels().filter(p => availableModuleIds.has(p.system)),
     [availableModuleIds],
   );
+
+  // The subset offered as NAV DESTINATIONS (command palette). `hideInRail` names the
+  // rail but means "not a nav destination": a palette entry for a parameterized route
+  // navigates to the literal `/muse/library/:id`, which is not a page.
+  //
+  // This is deliberately a SECOND list rather than a filter on `panels` — filtering
+  // `panels` itself removed the route entirely and the detail page 404'd to the module
+  // overview. Caught by re-running the live verification after the fix, which is
+  // exactly why the check is worth running twice.
+  const navigablePanels = useMemo(() => panels.filter(p => !p.hideInRail), [panels]);
 
   const location = useLocation();
   const navigate = useNavigate();
@@ -352,7 +365,7 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
       <CommandPalette
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}
-        panels={panels}
+        panels={navigablePanels}
         onNavigate={navigate}
         // CONST-27 merged: the real session role now gates operator-only commands (a
         // viewer session hides/disables them; server-side 403 remains the enforcement).

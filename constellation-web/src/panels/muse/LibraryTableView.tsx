@@ -10,6 +10,7 @@
 // row (no quality profiles configured). A null is NOT "meets cutoff" and it is NOT "needs
 // upgrade" — it is "unknown". Rendering it as either would invent a quality judgement about the
 // operator's files, so unknown renders as an em-dash and no badge.
+import { Link } from 'react-router-dom';
 import type { MuseLibraryTableRow } from '../../hooks/useMuse';
 
 /** Bytes → a compact mono figure. Returns an em-dash for null/0 rather than "0 B", which would
@@ -99,7 +100,10 @@ export function LibraryTableView({ rows }: { rows: MuseLibraryTableRow[] }) {
             return (
               <tr key={r.media_item_id}>
                 <td style={{ ...TD, maxWidth: 340, overflow: 'hidden', textOverflow: 'ellipsis' }} title={r.title}>
-                  {r.title}
+                  {/* MGUI-03: same route as the poster tile. */}
+                  <Link to={`/muse/library/${r.media_item_id}`} style={{ color: 'inherit', textDecoration: 'none' }}>
+                    {r.title}
+                  </Link>
                 </td>
                 {/* An absent year is an em-dash, never the string "null". */}
                 <td style={TD_NUM}>{r.year ?? '—'}</td>

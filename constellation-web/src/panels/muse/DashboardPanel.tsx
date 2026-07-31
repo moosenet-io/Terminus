@@ -12,6 +12,7 @@
 // reading through `useMuseSection`'s null-branch and each section below independently; the
 // other three sections' own `MOCK_GET` entries are untouched and keep resolving real data.
 import { ChartCard } from '../../viz/ChartCard';
+import { SubsystemHealth } from './SubsystemHealth';
 import { MetricCard } from '../../components/MetricCard';
 import { DataTable } from '../../components/DataTable';
 import type { DataTableColumn } from '../../components/DataTable';
@@ -206,6 +207,10 @@ export function DashboardPanel() {
         <PremieresSection />
         <GapsSection />
       </div>
+      {/* MGUI-06: guide screen 01's subsystem health grid. Placed BELOW the stat
+          tiles so the working /stats content stays above the fold, and rendered as
+          its own card so it degrades alone. */}
+      <SubsystemHealth />
     </div>
   );
 }

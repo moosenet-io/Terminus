@@ -51,6 +51,8 @@ import { OverviewPanel as LuminaOverviewPanel } from './lumina/OverviewPanel';
 import { RosterPanel as ModelsRosterPanel } from './models/RosterPanel';
 import { DashboardPanel as MuseDashboardPanel } from './muse/DashboardPanel';
 import { LibraryPanel as MuseLibraryPanel } from './muse/LibraryPanel';
+import { MediaDetailPanel as MuseMediaDetailPanel } from './muse/MediaDetailPanel';
+import { DiscoverPanel as MuseDiscoverPanel } from './muse/DiscoverPanel';
 import { TastePanel as MuseTastePanel } from './muse/TastePanel';
 import { ChannelsPanel as MuseChannelsPanel } from './muse/ChannelsPanel';
 import { OverviewPanel as MintOverviewPanel } from './mint/OverviewPanel';
@@ -275,6 +277,35 @@ registerPanel({
   icon: '▦',
   available: true,
   component: MuseLibraryPanel,
+});
+
+// MGUI-03: the inspection bench. A DETAIL route (`:id`) rather than a rail entry —
+// the guide reaches it from a poster tile or a table row, not from navigation.
+registerPanel({
+  id: 'muse.library.detail',
+  system: 'muse',
+  title: 'Media detail',
+  path: '/muse/library/:id',
+  icon: '◱',
+  available: true,
+  // CONST-22 `hideInRail`: this is a PARAMETERIZED route reached from a poster tile
+  // or a table row, exactly as the guide has it — never a bare nav destination. Live
+  // verification caught it appearing as a rail entry, which MGUI-05 explicitly says
+  // detail and table must not have (a rail link to `/muse/library/:id` would have no
+  // id to navigate to).
+  hideInRail: true,
+  component: MuseMediaDetailPanel,
+});
+
+// MGUI-04: guide screen 05.
+registerPanel({
+  id: 'muse.discover',
+  system: 'muse',
+  title: 'Discover',
+  path: '/muse/discover',
+  icon: '✦',
+  available: true,
+  component: MuseDiscoverPanel,
 });
 
 registerPanel({
