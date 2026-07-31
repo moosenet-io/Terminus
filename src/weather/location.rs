@@ -81,9 +81,20 @@ pub fn location_from_event(event: &Value) -> Option<String> {
         return None;
     }
     let l = loc.to_lowercase();
+    // Both the URL form AND the prose form. A calendar's `location` for a video call
+    // is usually written by a human or an add-in ("Microsoft Teams Meeting"), not as a
+    // bare URL — my first list only covered URLs and would have sent a Teams meeting
+    // to the weather API as though it were a city. Caught by this module's own test.
     let virtual_markers = [
-        "http://", "https://", "zoom.", "meet.google", "teams.microsoft", "webex",
-        "hangout", "phone", "dial-in", "conference call", "tbd", "n/a",
+        // URL / host forms
+        "http://", "https://", "zoom.", "meet.google", "teams.microsoft", "webex.",
+        "whereby.", "gotomeet", "bluejeans",
+        // prose forms an invite actually writes
+        "teams meeting", "microsoft teams", "google meet", "zoom meeting", "webex meeting",
+        "hangout", "video call", "virtual", "online", "remote",
+        // dial-in / placeholder forms
+        "phone", "dial-in", "dial in", "conference call", "call-in",
+        "tbd", "tba", "n/a", "none",
     ];
     if virtual_markers.iter().any(|m| l.contains(m)) {
         return None;
