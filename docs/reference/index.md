@@ -42,6 +42,11 @@ door — see the BLD pages linked from the [docs index](../index.md)), `constell
 `vector`, `vigil`, `vitals`, `weather`, `wizard`. Most register a handful of
 tools each; per-tool documentation lives under [docs/tools/](../tools/README.md).
 
+Cross-cutting pages that document a concern rather than a single module:
+[tool-grants](tool-grants.md) — the per-identity grant map enforced by
+`gateway_framework` (grant shapes, the guest/family baseline, fail-closed
+validation, adding a principal).
+
 Workspace members (not part of the KG rollup above): `terminus-client`
 (enrollment + mTLS transport + local forwarding daemon) and
 `terminus-worker-sdk` (worker authoring surface for [broker](broker.md) workers).

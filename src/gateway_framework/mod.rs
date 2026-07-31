@@ -200,6 +200,77 @@ pub const DEFAULT_SENSITIVE_DENY_PREFIXES: &[&str] = &[
     "tool_availability",
 ];
 
+/// TRTR-05: the GUEST/FAMILY baseline surface — the exact set of tool names a
+/// non-operator household identity (a family member, a houseguest) may call.
+///
+/// **This is an ALLOWLIST by construction, and that is the load-bearing
+/// property.** The scaffolded `lumina`/`harmony` posture is
+/// `allow: ["*"]` minus [`DEFAULT_SENSITIVE_DENY_PREFIXES`] — appropriate for
+/// two first-party service identities, but exactly backwards for a guest: with
+/// a denylist, EVERY tool family added to Terminus in the future is granted to
+/// guests the moment it registers, and stays granted until someone remembers to
+/// deny it. Guests get the inverse: nothing is reachable unless it is named
+/// here, so a new `foo_*` subsystem is invisible to a guest on the day it ships
+/// and becomes visible only by a deliberate edit to this list. (Same
+/// fail-closed-allowlist reasoning as the DSN guard lesson: allowlists beat
+/// denylists whenever the input space grows.)
+///
+/// Entries are EXACT tool names, not prefixes — a prefix like `"media_*"` would
+/// sweep in `media_request`/`media_delete`/`media_organize` (acquisition and
+/// library mutation) alongside the discovery tools, which is precisely the kind
+/// of accidental widening this list exists to prevent.
+///
+/// Why each of these is safe for someone who is not the operator:
+/// - `time_now` — the authoritative fleet clock (CLK-01). Reads no user data,
+///   takes no arguments that reach a backend, mutates nothing.
+/// - `weather` — a public third-party forecast lookup for a location the caller
+///   supplies. No fleet state, no household data.
+/// - `news_headlines`, `news_search`, `news_topic` — public news retrieval.
+///   Read-only, no fleet or household state.
+/// - `media_search`, `media_recommend`, `media_recently_added`, `media_on_deck`
+///   — media DISCOVERY (catalogue browsing) only. Deliberately EXCLUDED from
+///   this list: `media_request` (acquisition — spends the household's
+///   bandwidth/disk and reaches the *arr write path), `media_delete`,
+///   `media_cleanup`, `media_organize` (library mutation),
+///   `media_taste_feedback` (writes a personal taste profile),
+///   `media_status`/`media_domain_status` (operational plumbing).
+///
+/// What is NOT here, by construction rather than by exclusion: every
+/// infrastructure and secret-bearing family — `infisical_*`, `pg_*`,
+/// `gitea_*`/`github_*`/`git_*`, `plane_*`, `ansible_*`, `dev_*`, `compiler_*`,
+/// `soma_*`, `mint_*`, `review_*`, `mesh_*`, `broker_*`, `intake_*`,
+/// `tool_availability`, and anything else that exists now or later. None of
+/// them are named above, so none are reachable.
+pub const GUEST_BASELINE_ALLOW: &[&str] = &[
+    "time_now",
+    "weather",
+    "news_headlines",
+    "news_search",
+    "news_topic",
+    "media_search",
+    "media_recommend",
+    "media_recently_added",
+    "media_on_deck",
+];
+
+/// The guest/family grant itself: [`GUEST_BASELINE_ALLOW`] as the allow set,
+/// with [`DEFAULT_SENSITIVE_DENY_PREFIXES`] still layered underneath.
+///
+/// The deny layer is redundant TODAY — no entry in [`GUEST_BASELINE_ALLOW`]
+/// matches any sensitive deny prefix, and it is a closed list of exact names,
+/// so the deny set can never fire. It is kept deliberately as defence in depth
+/// for the predictable future edit: someone widening the guest allow set (or
+/// copying this grant as the starting point for a new household role) inherits
+/// the sensitive carve-outs instead of silently losing them. A redundant guard
+/// that costs one vector allocation at startup is worth keeping over one that
+/// has to be remembered.
+pub fn guest_baseline_grant() -> Grant {
+    Grant::AllowDeny {
+        allow: GUEST_BASELINE_ALLOW.iter().map(|s| (*s).to_string()).collect(),
+        deny: DEFAULT_SENSITIVE_DENY_PREFIXES.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
 /// A single identity's grant, in either of two shapes:
 ///
 /// - [`Grant::List`] — the original LHEG-02 form: a plain allow-list.
@@ -352,29 +423,134 @@ impl From<Vec<String>> for Grant {
     }
 }
 
-/// The `TERMINUS_GATEWAY_ALLOWLIST_JSON` shape for one identity, as parsed
-/// straight off the wire before being converted to a [`Grant`] — supports
-/// BOTH the legacy bare-array form (`["a", "b", "*"]`) and the new
-/// allow/deny object form (`{"allow": [...], "deny": [...]}`), so existing
-/// env configs keep working unmodified.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(untagged)]
-enum RawGrant {
-    List(Vec<String>),
-    AllowDeny {
-        #[serde(default)]
-        allow: Vec<String>,
-        #[serde(default)]
-        deny: Vec<String>,
-    },
+/// TRTR-05: validate ONE identity's raw `TERMINUS_GATEWAY_ALLOWLIST_JSON`
+/// value into a [`Grant`], FAIL-CLOSED.
+///
+/// This replaces a `#[serde(untagged)]` `RawGrant` enum whose permissiveness
+/// was itself the hazard: with `#[serde(default)]` on both object fields, an
+/// object was accepted whatever keys it carried, so a MISSPELLED deny key
+/// (`{"allow": ["*"], "denny": [...]}`) deserialized cleanly into
+/// `allow: ["*"], deny: []` — an unrestricted wildcard grant, produced by a
+/// typo, with no error anywhere. That is the exact "a malformed grant is
+/// treated as allow-all" failure this validation exists to make impossible.
+///
+/// Accepted shapes (unchanged from what valid configs already use — no
+/// working config's meaning changes):
+/// - `["a", "b", "*"]` — the legacy [`Grant::List`] form.
+/// - `{"allow": [...], "deny": [...]}` — [`Grant::AllowDeny`]; either key may
+///   be omitted (defaulting to empty), but NO other key may be present.
+///
+/// Rejected (each returns `Err` and the identity is DROPPED — see
+/// [`AllowlistPolicy::from_env`] — never silently coerced into something
+/// broader):
+/// - Any other JSON type (string/number/bool/null, array of non-strings).
+/// - An unknown key on the object form — the typo case above.
+/// - An empty entry, or one with leading/trailing/interior whitespace: it can
+///   never match any real tool name, so it is a config error, not a grant.
+/// - A `*` anywhere in a DENY entry. Deny entries are LITERAL prefixes
+///   ([`deny_matches`] does exact-or-`starts_with`, no globbing), so
+///   `deny: ["*"]` matches nothing at all and `deny: ["github_*"]` fails to
+///   block `github_push_repo` — both read as "deny everything"/"deny the
+///   family" and do the opposite. Silently accepting them is a fail-OPEN
+///   trap; rejecting them is fail-closed and tells the operator to drop the
+///   star.
+/// - A `*` anywhere but the LAST character of an allow entry (`"a*b"`,
+///   `"**"`): [`grant_entry_matches`] only understands a trailing `*`, so any
+///   other placement means something the matcher will not do.
+fn validate_grant(value: &Value) -> Result<Grant, String> {
+    match value {
+        Value::Array(items) => Ok(Grant::List(validate_entries(items, EntryKind::Allow)?)),
+        Value::Object(map) => {
+            if let Some(unknown) = map.keys().find(|k| k.as_str() != "allow" && k.as_str() != "deny") {
+                return Err(format!(
+                    "unknown key '{unknown}' in the allow/deny grant object (only 'allow' and \
+                     'deny' are recognised; a misspelled 'deny' key would otherwise silently \
+                     produce an unrestricted grant)"
+                ));
+            }
+            let allow = match map.get("allow") {
+                Some(Value::Array(items)) => validate_entries(items, EntryKind::Allow)?,
+                Some(other) => return Err(format!("'allow' must be an array of strings, got {other}")),
+                None => Vec::new(),
+            };
+            let deny = match map.get("deny") {
+                Some(Value::Array(items)) => validate_entries(items, EntryKind::Deny)?,
+                Some(other) => return Err(format!("'deny' must be an array of strings, got {other}")),
+                None => Vec::new(),
+            };
+            Ok(Grant::AllowDeny { allow, deny })
+        }
+        other => Err(format!(
+            "a grant must be an array of action names or an {{\"allow\":[..],\"deny\":[..]}} \
+             object, got {other}"
+        )),
+    }
 }
 
-impl From<RawGrant> for Grant {
-    fn from(raw: RawGrant) -> Self {
-        match raw {
-            RawGrant::List(actions) => Grant::List(actions),
-            RawGrant::AllowDeny { allow, deny } => Grant::AllowDeny { allow, deny },
-        }
+/// Which side of a grant an entry sits on — allow entries may carry a trailing
+/// `*` wildcard, deny entries are literal prefixes and may not (see
+/// [`validate_grant`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Allow,
+    Deny,
+}
+
+fn validate_entries(items: &[Value], kind: EntryKind) -> Result<Vec<String>, String> {
+    items
+        .iter()
+        .map(|item| {
+            let s = item
+                .as_str()
+                .ok_or_else(|| format!("every grant entry must be a string, got {item}"))?;
+            if s.is_empty() {
+                return Err("an empty grant entry matches nothing and is a config error".to_string());
+            }
+            if s.chars().any(char::is_whitespace) {
+                return Err(format!(
+                    "grant entry '{s}' contains whitespace; tool names and route paths never do, \
+                     so this entry could never match"
+                ));
+            }
+            match kind {
+                EntryKind::Deny => {
+                    if s.contains('*') {
+                        return Err(format!(
+                            "deny entry '{s}' contains '*', but deny entries are LITERAL prefixes \
+                             (matched exactly or by starts_with) — a '*' makes the entry match \
+                             NOTHING, the opposite of what it looks like. Drop the '*'"
+                        ));
+                    }
+                }
+                EntryKind::Allow => {
+                    if s.trim_end_matches('*').contains('*') || s.matches('*').count() > 1 {
+                        return Err(format!(
+                            "allow entry '{s}' uses '*' somewhere other than as a single trailing \
+                             wildcard; only \"*\" or \"<prefix>*\" are understood"
+                        ));
+                    }
+                }
+            }
+            Ok(s.to_string())
+        })
+        .collect()
+}
+
+/// TRTR-05: whether `grant` is an UNRESTRICTED wildcard — it permits every
+/// tool/inference action with no deny layer whatsoever. True for the legacy
+/// `Grant::List(["*"])` shape (which has no deny side at all) and for
+/// `AllowDeny { allow: ["*"], deny: [] }`.
+///
+/// This is not an error — `moose`/`claude` are the operator's own identities
+/// and are deliberately unrestricted; narrowing them silently could lock the
+/// operator out of their own fleet. It is logged loudly at startup so the
+/// posture is VISIBLE rather than implicit, and so the docs'
+/// recommendation (`docs/reference/tool-grants.md`) has something concrete to
+/// point at.
+fn is_unrestricted_wildcard(grant: &Grant) -> bool {
+    match grant {
+        Grant::List(actions) => actions.iter().any(|a| a == "*"),
+        Grant::AllowDeny { allow, deny } => deny.is_empty() && allow.iter().any(|a| a == "*"),
     }
 }
 
@@ -436,10 +612,35 @@ impl AllowlistPolicy {
     pub fn from_env() -> Self {
         let raw = crate::config::gateway_allowlist_json();
         let mut entries = scaffold_defaults();
-        match serde_json::from_str::<HashMap<String, RawGrant>>(&raw) {
+
+        // TRTR-05: guest/family identities, declared by the operator in
+        // `TERMINUS_GATEWAY_GUEST_IDENTITIES`, get the narrow allowlist-built
+        // baseline. Applied AFTER the scaffold and BEFORE the env JSON, so an
+        // explicit env entry still wins for any identity the operator wants to
+        // shape by hand.
+        for id in crate::config::gateway_guest_identities() {
+            entries.insert(id, guest_baseline_grant());
+        }
+
+        match serde_json::from_str::<HashMap<String, Value>>(&raw) {
             Ok(parsed) => {
-                entries.extend(parsed.into_iter().map(|(id, grant)| (id, Grant::from(grant))));
-                Self { entries }
+                for (id, value) in parsed {
+                    // Per-identity validation: one bad entry denies THAT
+                    // identity (it keeps its scaffold/guest default, or has no
+                    // entry at all and is default-denied), rather than either
+                    // being coerced into something broader OR nuking every
+                    // other identity's config.
+                    match validate_grant(&value) {
+                        Ok(grant) => {
+                            entries.insert(id, grant);
+                        }
+                        Err(e) => tracing::error!(
+                            "gateway_framework: TERMINUS_GATEWAY_ALLOWLIST_JSON entry for \
+                             identity '{id}' is invalid ({e}) -- that identity is DENIED (its \
+                             grant is dropped, never widened) until the config is fixed"
+                        ),
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!(
@@ -447,9 +648,20 @@ impl AllowlistPolicy {
                      ({e}) -- falling back to the scaffold-only allowlist policy (deny-all \
                      except the lumina/harmony safe default)"
                 );
-                Self { entries }
             }
         }
+
+        for (id, grant) in &entries {
+            if is_unrestricted_wildcard(grant) {
+                tracing::warn!(
+                    "gateway_framework: identity '{id}' holds an UNRESTRICTED wildcard grant -- \
+                     every tool and inference route, with no sensitive-deny layer. Intended for \
+                     operator identities only; see docs/reference/tool-grants.md"
+                );
+            }
+        }
+
+        Self { entries }
     }
 
     /// Whether `identity` is a known entry in the policy at all (distinct
@@ -1902,5 +2114,214 @@ mod tests {
 
         assert!(fw.guard(Some(&id), "ledger_accounts", ActionKind::Tool).await.is_ok());
         assert!(fw.guard(Some(&id), "other_tool", ActionKind::Tool).await.is_err());
+    }
+
+    // ── TRTR-05: the guest/family baseline ───────────────────────────────
+
+    fn guest_policy() -> AllowlistPolicy {
+        let mut map = HashMap::new();
+        map.insert("guest-relative".to_string(), guest_baseline_grant());
+        AllowlistPolicy::new(map)
+    }
+
+    /// The baseline actually grants the safe household surface it advertises.
+    #[test]
+    fn guest_baseline_allows_exactly_the_safe_surface() {
+        let policy = guest_policy();
+        for tool in GUEST_BASELINE_ALLOW {
+            assert!(
+                policy.is_allowed("guest-relative", tool),
+                "the guest baseline must allow its own entry '{tool}'"
+            );
+        }
+    }
+
+    /// AC: "guest baseline excludes infrastructure/secret tool families".
+    /// Representative names across every family a guest must never touch.
+    #[test]
+    fn guest_baseline_excludes_infrastructure_and_secret_families() {
+        let policy = guest_policy();
+        for tool in [
+            "infisical_get_secret",
+            "pg_query",
+            "pg_ddl",
+            "gitea_list_identities",
+            "github_list_repos",
+            "git_public_mirror_push",
+            "plane_list_projects",
+            "ansible_run_playbook",
+            "openhands_start",
+            "dev_run_command",
+            "dev_read_file",
+            "compiler_request",
+            "review_run",
+            "mesh_onboard_upstream",
+            "soma_status",
+            "tool_availability",
+            "approval_grant",
+            // Media WRITE/acquisition paths, adjacent to the allowed discovery
+            // tools — the reason the allow list is exact names, not "media_*".
+            "media_request",
+            "media_delete",
+            "media_organize",
+            "media_taste_feedback",
+        ] {
+            assert!(
+                !policy.is_allowed("guest-relative", tool),
+                "'{tool}' must not be reachable by a guest identity"
+            );
+        }
+    }
+
+    /// The LOAD-BEARING property, and the whole reason this is an allowlist:
+    /// a tool family that does not exist yet is denied to guests on the day it
+    /// ships, with no edit to any deny list. A denylist-shaped guest grant
+    /// would grant all three of these by default.
+    #[test]
+    fn guest_baseline_denies_tool_families_that_do_not_exist_yet() {
+        let policy = guest_policy();
+        for future_tool in ["thermostat_set", "doorlock_unlock", "banking_transfer"] {
+            assert!(
+                !policy.is_allowed("guest-relative", future_tool),
+                "a future tool family must be denied to guests by allowlist construction, not \
+                 by someone remembering to deny '{future_tool}'"
+            );
+        }
+    }
+
+    /// A guest holds no admin power, by the same kind-aware rule that stops a
+    /// broad tool identity escalating (TMOD-05) — nothing in the baseline is
+    /// admin-namespaced.
+    #[tokio::test]
+    async fn guest_baseline_grants_no_admin_action() {
+        let fw = framework_with(guest_policy(), 10);
+        let id = identity("guest-relative");
+        assert!(fw.guard(Some(&id), "weather", ActionKind::Tool).await.is_ok());
+        assert!(fw.guard(Some(&id), "admin:register_worker", ActionKind::Admin).await.is_err());
+    }
+
+    /// `tools/list` visibility matches callability: a guest is SHOWN only the
+    /// tools it could actually call — the operator's ask was that the router
+    /// not surface unauthorized tools at all.
+    #[test]
+    fn guest_catalog_is_filtered_to_the_baseline() {
+        let policy = guest_policy();
+        let visible = policy.filter_tools(
+            "guest-relative",
+            vec![
+                tool_json("weather"),
+                tool_json("news_headlines"),
+                tool_json("infisical_get_secret"),
+                tool_json("media_request"),
+                tool_json("media_search"),
+            ],
+        );
+        let mut names: Vec<&str> =
+            visible.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["media_search", "news_headlines", "weather"]);
+    }
+
+    // ── TRTR-05: fail-closed grant validation ────────────────────────────
+
+    /// AC: "malformed grants rejected fail-closed". The headline case: a
+    /// MISSPELLED `deny` key used to deserialize into `allow: ["*"], deny: []`
+    /// — an unrestricted grant produced by a typo. It must now be rejected,
+    /// and rejection must never mean "allow everything".
+    #[test]
+    fn misspelled_deny_key_is_rejected_not_silently_unrestricted() {
+        let raw = json!({"allow": ["*"], "denny": ["github_"]});
+        let err = validate_grant(&raw).unwrap_err();
+        assert!(err.contains("denny"), "the error should name the offending key: {err}");
+    }
+
+    #[test]
+    fn malformed_grant_shapes_are_all_rejected() {
+        for bad in [
+            json!("*"),
+            json!(42),
+            json!(null),
+            json!(true),
+            json!(["ledger_accounts", 7]),
+            json!({"allow": "*"}),
+            json!({"deny": {"github_": true}}),
+            json!({"allow": [""]}),
+            json!({"allow": ["ledger accounts"]}),
+            json!({"allow": ["a*b"]}),
+            json!({"allow": ["**"]}),
+        ] {
+            assert!(
+                validate_grant(&bad).is_err(),
+                "malformed grant {bad} must be rejected, never coerced into a grant"
+            );
+        }
+    }
+
+    /// A `*` in a DENY entry is a fail-OPEN trap: deny entries are literal
+    /// prefixes, so `deny: ["*"]` blocks nothing while reading as "block
+    /// everything". Rejected rather than silently accepted.
+    #[test]
+    fn wildcard_in_a_deny_entry_is_rejected() {
+        assert!(validate_grant(&json!({"allow": ["*"], "deny": ["*"]})).is_err());
+        assert!(validate_grant(&json!({"allow": ["*"], "deny": ["github_*"]})).is_err());
+        // The correct literal-prefix spelling still validates.
+        assert!(validate_grant(&json!({"allow": ["*"], "deny": ["github_"]})).is_ok());
+    }
+
+    /// Valid existing configs keep parsing to exactly what they parsed to
+    /// before — no working deployment's meaning changes.
+    #[test]
+    fn valid_legacy_and_allow_deny_shapes_still_parse() {
+        assert_eq!(validate_grant(&json!(["*"])).unwrap(), Grant::List(vec!["*".to_string()]));
+        assert_eq!(
+            validate_grant(&json!(["ledger_accounts", "ct322__*"])).unwrap(),
+            Grant::List(vec!["ledger_accounts".to_string(), "ct322__*".to_string()])
+        );
+        assert_eq!(
+            validate_grant(&json!({"allow": ["*"], "deny": ["github_"]})).unwrap(),
+            Grant::AllowDeny {
+                allow: vec!["*".to_string()],
+                deny: vec!["github_".to_string()]
+            }
+        );
+        // Omitted keys default to empty; an empty allow is deny-all, which is
+        // the fail-closed direction.
+        assert_eq!(
+            validate_grant(&json!({"deny": ["github_"]})).unwrap(),
+            Grant::AllowDeny { allow: Vec::new(), deny: vec!["github_".to_string()] }
+        );
+        let empty = validate_grant(&json!({})).unwrap();
+        assert!(!empty.permits("anything_at_all"), "an empty grant object must deny, not allow");
+    }
+
+    /// The guest baseline itself is a valid, and NOT unrestricted, grant.
+    #[test]
+    fn unrestricted_wildcard_detection() {
+        assert!(is_unrestricted_wildcard(&Grant::List(vec!["*".to_string()])));
+        assert!(is_unrestricted_wildcard(&Grant::AllowDeny {
+            allow: vec!["*".to_string()],
+            deny: Vec::new()
+        }));
+        // A wildcard WITH a deny layer is restricted (the scaffolded posture).
+        assert!(!is_unrestricted_wildcard(&Grant::AllowDeny {
+            allow: vec!["*".to_string()],
+            deny: vec!["github_".to_string()]
+        }));
+        assert!(!is_unrestricted_wildcard(&Grant::List(vec!["ledger_accounts".to_string()])));
+        assert!(!is_unrestricted_wildcard(&guest_baseline_grant()));
+    }
+
+    /// The guest baseline's redundant-today deny layer is real: it is carried
+    /// on the grant, so a future widening of the allow set inherits it.
+    #[test]
+    fn guest_baseline_carries_the_sensitive_deny_layer() {
+        let Grant::AllowDeny { deny, .. } = guest_baseline_grant() else {
+            panic!("the guest baseline must be an AllowDeny grant, not a bare list");
+        };
+        assert_eq!(deny.len(), DEFAULT_SENSITIVE_DENY_PREFIXES.len());
+        // Widening the allow set does NOT reopen a sensitive family.
+        let widened = Grant::AllowDeny { allow: vec!["*".to_string()], deny };
+        assert!(widened.permits("weather"));
+        assert!(!widened.permits("github_push_repo"));
     }
 }

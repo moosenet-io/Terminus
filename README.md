@@ -140,6 +140,44 @@ question does not pay a live upstream round-trip every time.
 - **User-scoped results are keyed by principal** and never shared between users.
 - Bounded with oldest-first eviction.
 
+### Tool grants — who may call what (and who is a guest)
+
+Every request is gated by a **per-identity grant map**: a principal (mTLS CN,
+tailnet identity, or named PAT) is looked up in `TERMINUS_GATEWAY_ALLOWLIST_JSON`
+and its grant decides whether the action — a tool name, an inference route, or an
+`admin:` op — is permitted. **Default-deny**: an identity with no entry is denied
+everything. The same decision drives `tools/list` visibility and the router's
+selection step, so a tool you cannot call is a tool you are never shown.
+
+Two grant shapes: a plain allow list (`["ledger_accounts", "*"]`) and an
+allow/deny object (`{"allow": ["*"], "deny": ["github_", "infisical_"]}`), where
+deny entries are literal **prefixes** that win even over an allow `"*"`.
+
+**Guest / family identities** get a deliberately different construction. Name
+them in `TERMINUS_GATEWAY_GUEST_IDENTITIES` (comma-separated) and each gets the
+baseline surface — `time_now`, `weather`, `news_*` (three tools), and the four
+media *discovery* tools — as an **exactly enumerated allowlist**, not a wildcard
+minus a denylist. That is the load-bearing choice: with a denylist every tool
+family added in future would be granted to houseguests the day it registers.
+With the allowlist a new family is invisible to a guest until someone
+deliberately adds it. Media acquisition/mutation (`media_request`,
+`media_delete`, `media_organize`, `media_taste_feedback`) is excluded for the
+same reason the entries are exact names rather than a `media_*` prefix.
+
+Grants are **validated fail-closed** at load: a malformed entry (wrong JSON
+type, an unknown key such as a misspelled `deny`, a whitespace/empty entry, a
+`*` in a deny prefix where it would silently match nothing) is **dropped and
+that identity denied**, never coerced into something broader — and one bad entry
+never discards the rest of the map.
+
+Full model, the guest surface with per-tool rationale, and a worked example for
+adding a principal: [docs/reference/tool-grants.md](docs/reference/tool-grants.md).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TERMINUS_GATEWAY_ALLOWLIST_JSON` | `{}` (deny all) | The grant map: `identity -> grant` |
+| `TERMINUS_GATEWAY_GUEST_IDENTITIES` | unset | Comma-separated identities that get the guest/family baseline |
+
 ### Tool availability — parking a tool without removing it
 
 A tool whose backend has been retired should stop being offered to agents, but it should

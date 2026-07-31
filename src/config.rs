@@ -847,6 +847,30 @@ pub fn gateway_allowlist_json() -> String {
     env_nonempty("TERMINUS_GATEWAY_ALLOWLIST_JSON").unwrap_or_else(|| "{}".to_string())
 }
 
+/// TRTR-05: identities that get the GUEST/FAMILY baseline grant
+/// (`crate::gateway_framework::guest_baseline_grant`) — a small, exactly
+/// enumerated safe surface, built as an allowlist so a tool family added to
+/// Terminus tomorrow is NOT automatically reachable by a houseguest.
+///
+/// From `TERMINUS_GATEWAY_GUEST_IDENTITIES`, a comma-separated list of
+/// identity names (the same `Principal` name space the allowlist keys on, e.g.
+/// the mTLS client-cert CN). Empty/unset means no guest identities — the
+/// default-deny posture is unchanged for every existing deployment. Blank
+/// segments and surrounding whitespace are ignored, since an identity name can
+/// contain neither; naming an identity here is a NARROWING act (it can only
+/// grant the fixed baseline), so a stray comma can never widen anything.
+pub fn gateway_guest_identities() -> Vec<String> {
+    env_nonempty("TERMINUS_GATEWAY_GUEST_IDENTITIES")
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The gateway's tailnet MagicDNS name (or any other operator-chosen
 /// reachable hostname), for display in a [`crate::mesh::client_onboarding`]
 /// (MESH-12) connection profile ONLY — never used to make a connection from
