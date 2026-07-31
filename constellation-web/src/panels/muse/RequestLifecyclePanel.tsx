@@ -40,9 +40,9 @@
 //
 // Surfacing that scoring properly needs Muse to persist the decision, which is a
 // backend change (Muse must write the `ReleaseChoice` alongside the queue row) and so
-// sits outside MGUI-08, whose scope is this read-only GUI panel. No Muse issue number
-// is cited here because none was filed from this branch and inventing one would be the
-// same class of fabrication this panel exists to avoid. Until that lands,
+// sits outside MGUI-08, whose scope is this read-only GUI panel. Tracked as MUSE #104
+// — filed after this panel was written, which is why the branch itself declined to
+// cite a number rather than invent one. Until that lands,
 // the panel states the absence in one line and shows what IS real instead: the
 // download-queue row for this request (release title, indexer, protocol, size), which
 // is the release that was genuinely grabbed.
