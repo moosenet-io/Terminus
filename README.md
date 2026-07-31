@@ -82,7 +82,63 @@ flowchart LR
 | `mesh` | Upstream Terminus federation registry, unified `Principal` identity, optional embedded tailnet | [reference/mesh](docs/reference/mesh.md) |
 | `broker` | Out-of-process tool workers: route table, three transport tiers, blue-green rollout | [reference/broker](docs/reference/broker.md) |
 | `pg` | The single sanctioned Postgres door: identity-scoped, approval-gated `pg_*` suite | [reference/pg](docs/reference/pg.md) |
+| `agent_router` | The agentic tool router: identity-scoped selection, local dispatch, Chord for inference only | see below |
 | `availability` | Tool availability state (`available`/`off`/`broken`) — park a dead tool without de-registering it; `tool_availability` is the admin view | see below |
+
+### Agent tool router — selection, dispatch, and caching
+
+`POST /v1/agent/execute` runs the assistant's tool turn **in Terminus**. It previously
+blind-forwarded to Chord, which ran the loop against its own catalog — but Chord has no
+caller identity, so tool exposure could not be scoped per user, and its catalog pointed
+at a stale backend. The loop now runs where the principal is already resolved and
+authorization already lives; Chord is called only for the tool-selecting sub-agent's
+inference, via a **named proxy** (never a hard-wired model).
+
+Per turn:
+
+1. **Select** — three filters compose, each of which can only *remove*:
+   authorization (per-principal allowlist) ∩ availability (is the tool alive at all) ∩
+   relevance (lexical match on the request). Authorization and availability run
+   **first**, so an unauthorized or parked tool is never even a candidate — the model
+   cannot be tempted into calling something it would then be refused.
+2. **Ask Chord** for a completion, offering only those tools.
+3. **Dispatch locally** through the registry, behind the result cache.
+4. Repeat until the model answers, or the bounds below are hit.
+
+Bounds: 8 tool calls and a 90 s wall clock, deliberately **under** the client's egress
+timeout so the router's own message surfaces rather than a dead socket. A turn that
+hits either bound still returns the data it did fetch instead of an error.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TERMINUS_ROUTER_LOCAL` | on | `0` restores the previous blind-forward to Chord — rollback with no redeploy |
+| `TERMINUS_ROUTER_MODEL` | `lumina-fast` | Chord **named proxy** the selection sub-agent runs on |
+
+Streaming callers (`"stream": true`) receive the same SSE progress-event frames Chord
+emitted — `tool_call_started`, `tool_call_complete`, `complete` — so existing clients
+need no change. A `complete` frame is **always** emitted, including on timeout, because
+a client that never sees one waits forever.
+
+### Tool result caching — the common path stays fast
+
+The assistant's highest-traffic tools (news, weather) are cached so a conversational
+question does not pay a live upstream round-trip every time.
+
+- **Opt-in per tool.** Anything without a policy is never cached; behaviour is unchanged.
+- **Stale-while-revalidate.** Past the soft TTL the cached value is returned
+  *immediately* and refreshed in the background — you wait on a slow upstream at most
+  once. Only one caller refreshes; the rest are served from cache.
+- **Seeded policy** — `news_*`: 15 min soft / 24 h hard (a daily pull that still moves
+  through the day). `weather`: 20 min soft / 6 h hard. The hard bound means stale data
+  can never be presented as current.
+- **Severe-weather alerts are never cached.** Freshness beats latency where safety is
+  involved; a stale all-clear is worse than a slow answer.
+- **Errors are never cached as data** — only a short failure backoff, and a failed
+  background refresh leaves the last-good value intact rather than poisoning it.
+- **Results carry `fetched_at`** so the assistant can say "as of …" instead of implying
+  cached data is live.
+- **User-scoped results are keyed by principal** and never shared between users.
+- Bounded with oldest-first eviction.
 
 ### Tool availability — parking a tool without removing it
 
