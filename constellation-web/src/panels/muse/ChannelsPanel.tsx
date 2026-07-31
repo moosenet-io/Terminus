@@ -2,9 +2,15 @@
 // operator-gated compose/maintenance mutations (spec §5.4). Same independent per-section
 // degrade boundary as the other two Muse panels (see DashboardPanel's top comment).
 //
-// Guide grid is rendered as a plain `DataTable` timeline (channel/title/start/end columns),
-// deliberately NOT an EPG-widget layout -- spec §5.4 is explicit about this ("rendered as a
-// DataTable timeline, not an EPG widget").
+// Guide: TWO views behind the standard chart|table toggle (MGUI-10, S129).
+//   - `chart` (default) is the design guide's screen 09 PROGRAMMING GRID -- channels × time,
+//     proportional programme blocks, now marker, tuner telemetry. See ProgrammingGrid.tsx's
+//     header for what it renders today (an empty state, honestly) and for every guide element
+//     deliberately omitted for want of a backing field.
+//   - `table` is the original plain `DataTable` timeline (channel/title/start/end columns) that
+//     CONST-20 shipped per spec §5.4 ("rendered as a DataTable timeline, not an EPG widget").
+//     It is KEPT, not replaced: it is the only view showing exact start/end timestamps, and it
+//     stays the accessible/dense twin of the grid per the module-wide table-view rule (§4.2/§4.4).
 //
 // Compose/maintenance: gated by merged CONST-27's canonical RoleGate (disabled + tooltip for
 // a viewer session; server-side 403 is the enforcement) + the local ConfirmDialog stand-in
@@ -21,11 +27,15 @@ import { Button } from '../../components/Button';
 import { Badge } from '../../components/Badge';
 import { RoleGate } from '../../components/RoleGate';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
+import { useTableView, TableViewControls } from '../../viz/TableViewToggle';
+import { ProgrammingGrid } from './ProgrammingGrid';
 import {
   useMuseChannels,
   useMuseLineup,
   useMuseGuide,
   useMuseChannelActions,
+  museChannelList,
+  museGuideEntries,
   type MuseChannel,
   type MuseLineupItem,
   type MuseGuideEntry,
@@ -43,7 +53,9 @@ function ChannelsListSection({
   onRequestAction: (kind: 'compose' | 'maintenance', channel: MuseChannel) => void;
 }) {
   const { data, loading, degraded } = useMuseChannels();
-  const channels = data?.channels ?? [];
+  // MGUI-10: normalized, because live `/api/channels` answers a bare array while the mock
+  // answers a `{channels:[…]}` envelope -- see `museChannelList`'s comment.
+  const channels = museChannelList(data);
   const empty = !loading && !degraded && channels.length === 0;
 
   // Auto-select the first channel once the list resolves (review fix): the spec requires
@@ -144,22 +156,46 @@ const GUIDE_COLUMNS: DataTableColumn<MuseGuideEntry>[] = [
   { key: 'end', header: 'End', render: r => new Date(r.end).toLocaleString() },
 ];
 
+/** The grid needs a stable body height (ChartCard fixes it) — tall enough for the axis, a
+ *  handful of channel rows and the telemetry footer, without the card growing unboundedly. */
+const GRID_HEIGHT = 320;
+
 function GuideSection() {
   const { data, loading, degraded } = useMuseGuide();
-  const entries = data?.entries ?? [];
-  const empty = !loading && !degraded && entries.length === 0;
+  const { entries, htmlOnly } = museGuideEntries(data);
+  const { view, setView } = useTableView('chart');
+
+  // MGUI-10: the grid also renders CHANNEL ROWS, so it is meaningful with zero programme
+  // entries (an existing channel with an empty schedule is real, reportable state). Only the
+  // TABLE view — which is entries-only — is empty when there are no entries. Handing
+  // `empty` to the card in grid view would replace an informative empty state (which names
+  // the missing route and the HTML `/guide`) with a generic "no data" card.
+  const empty = view === 'table' && !loading && !degraded && entries.length === 0;
+
+  // Never asserts a cause. `htmlOnly` is an observed response shape, not an inference.
+  const subtitle = htmlOnly
+    ? '/guide serves an HTML page, not a programme feed'
+    : view === 'chart'
+      ? 'Channels × time'
+      : 'Timeline (exact start/end)';
+
   return (
     <ChartCard
       title="Guide"
-      subtitle="Timeline (table view, not an EPG grid — spec §5.4)"
-      height={Math.min(60 + entries.length * 36, 280)}
+      subtitle={subtitle}
+      controls={<TableViewControls view={view} onChange={setView} />}
+      height={view === 'chart' ? GRID_HEIGHT : Math.min(60 + entries.length * 36, 280)}
       loading={loading}
       degraded={degraded}
       empty={empty}
       emptyMessage="No guide data yet"
       emptyHint="Scheduled programming will list here once channels have a lineup"
     >
-      <DataTable columns={GUIDE_COLUMNS} rows={entries} rowKey={(r, i) => `${r.channel_id}-${i}`} emptyMessage="No guide data yet" />
+      {view === 'chart' ? (
+        <ProgrammingGrid />
+      ) : (
+        <DataTable columns={GUIDE_COLUMNS} rows={entries} rowKey={(r, i) => `${r.channel_id}-${i}`} emptyMessage="No guide data yet" />
+      )}
     </ChartCard>
   );
 }
