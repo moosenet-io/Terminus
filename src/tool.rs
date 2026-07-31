@@ -34,61 +34,19 @@ impl ToolOutput {
     }
 }
 
-/// What the DISPATCH LAYER knows about the caller of ONE tool invocation.
+/// What the DISPATCH LAYER knows about the caller of ONE tool invocation
+/// (TRTR-05, privacy).
 ///
-/// TRTR-05 (privacy). Some tools can answer a question by reaching for context
-/// the OPERATOR owns — the operator's calendar, the operator's configured home
-/// and work addresses — even though the tool itself looks stateless. That is
-/// safe for the operator and a disclosure for anyone else, so a tool that does
-/// it must know who is asking. This struct is the ONLY channel by which it may
-/// find out: it is constructed by the gateway from the same server-verified
-/// `Principal` that `GatewayFramework::guard` authorizes, and it is never
-/// derived from tool arguments, a header, or an env var.
+/// Re-exported from [`crate::gateway_framework::caller_context`], where it is
+/// DEFINED so that its entitled constructor can be `pub(super)` — i.e. so the
+/// gateway module that owns the `AllowlistPolicy` decision is the only place in
+/// the crate that can mint an entitled context, checked by the compiler rather
+/// than asserted in a doc comment. From here (and everywhere else outside
+/// `gateway_framework`) the only reachable constructors are
+/// [`CallerContext::untrusted`] and `Default`, both fully unentitled.
 ///
-/// **Fail closed by construction.** `Default` (and `untrusted()`) is "we know
-/// nothing about this caller", with every capability `false`. Every existing
-/// dispatch path that does not thread a caller therefore gets the safe value,
-/// and a NEW dispatch path that forgets to thread one is safe by default rather
-/// than accidentally operator-privileged. A spurious "which location did you
-/// mean?" costs one conversational turn; a leaked home or appointment address
-/// cannot be taken back.
-///
-/// Each flag is a permission to USE ONE SOURCE of operator context, and the
-/// gateway grants it only when the caller is already authorized for the tool
-/// that exposes that source directly (`google_calendar_today`,
-/// `commute_estimate`) — so an inference can never disclose anything the caller
-/// could not have fetched for itself. See
-/// `crate::gateway_framework::GatewayFramework::caller_context`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CallerContext {
-    may_infer_from_calendar: bool,
-    may_infer_from_routine: bool,
-}
-
-impl CallerContext {
-    /// The fail-closed value: an unknown, unauthenticated or unrecognised
-    /// caller. No operator context may be used on its behalf.
-    pub const fn untrusted() -> Self {
-        Self { may_infer_from_calendar: false, may_infer_from_routine: false }
-    }
-
-    /// Build a context from an explicit per-source decision. Only the gateway
-    /// (and tests) should call this — see the struct doc.
-    pub const fn new(may_infer_from_calendar: bool, may_infer_from_routine: bool) -> Self {
-        Self { may_infer_from_calendar, may_infer_from_routine }
-    }
-
-    /// May a tool consult the OPERATOR's calendar on this caller's behalf?
-    pub const fn may_infer_from_calendar(&self) -> bool {
-        self.may_infer_from_calendar
-    }
-
-    /// May a tool consult the OPERATOR's configured home/work routine on this
-    /// caller's behalf?
-    pub const fn may_infer_from_routine(&self) -> bool {
-        self.may_infer_from_routine
-    }
-}
+/// See that module for the full contract.
+pub use crate::gateway_framework::caller_context::CallerContext;
 
 /// A Rust tool implementation that can be registered in the ToolRegistry
 /// and used as a fallback when the fleet-host MCP backend is unavailable.
@@ -235,5 +193,62 @@ mod tests {
         let out = ToolOutput::text_only("hello");
         assert_eq!(out.text, "hello");
         assert_eq!(out.structured, None);
+    }
+
+    // ── TRTR-05: the caller-entitlement boundary, seen from OUTSIDE the
+    //    gateway module (this module is `crate::tool`, not
+    //    `crate::gateway_framework`) ──────────────────────────────────────
+
+    /// The entitled constructor is not reachable from here — enforced by the
+    /// COMPILER, not by this assertion.
+    ///
+    /// `CallerContext::from_allowlist_decision` is `pub(super)` to
+    /// `crate::gateway_framework`, so a call to it from this module (or any
+    /// other module outside that tree, or any downstream crate) is a hard
+    /// `E0624`. That half of the invariant CANNOT be asserted at runtime — code
+    /// violating it does not build, and a test that tried would take the whole
+    /// test binary with it — so it is checked by a `compile_fail` DOCTEST on
+    /// `CallerContext::untrusted` instead (`cargo test --doc`; no `trybuild`
+    /// dependency, this repo has no compile-fail harness and TRTR-05 does not
+    /// add one). Note `cargo test --lib` alone does NOT run it.
+    ///
+    /// What THIS test asserts is the observable consequence available to
+    /// `--lib`: everything an out-of-gateway caller CAN construct is
+    /// unentitled, so no tool can obtain operator context without the gateway.
+    #[test]
+    fn trtr05_caller_context_reachable_from_outside_the_gateway_is_always_untrusted() {
+        for ctx in [CallerContext::untrusted(), CallerContext::default(), CallerContext::default()] {
+            assert!(
+                !ctx.may_infer_from_calendar(),
+                "a context built outside the gateway must never grant calendar inference"
+            );
+            assert!(
+                !ctx.may_infer_from_routine(),
+                "a context built outside the gateway must never grant routine inference"
+            );
+        }
+    }
+
+    /// TRTR-05 req: the ~400 tools that do not override `execute_with_caller`
+    /// keep answering exactly as before, for ANY caller — the default
+    /// delegation to `execute_structured` is untouched by the lockdown.
+    #[tokio::test]
+    async fn trtr05_default_execute_with_caller_still_delegates_unchanged() {
+        let plain = NoOpTool;
+        let out = plain
+            .execute_with_caller(serde_json::json!({}), CallerContext::untrusted())
+            .await
+            .unwrap();
+        assert_eq!(out.text, "ok");
+        assert_eq!(out.structured, None);
+
+        // ...including for a tool that overrides only `execute_structured`.
+        let structured = StructuredTool;
+        let out = structured
+            .execute_with_caller(serde_json::json!({}), CallerContext::default())
+            .await
+            .unwrap();
+        assert_eq!(out.text, "id: 42");
+        assert_eq!(out.structured, Some(serde_json::json!({"id": 42})));
     }
 }

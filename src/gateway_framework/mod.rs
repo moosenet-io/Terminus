@@ -70,6 +70,9 @@
 //! identity label (never fabricated as if it were real).
 
 pub mod audit;
+/// TRTR-05: `CallerContext` lives here so that only this module tree can mint
+/// an ENTITLED one — see the module doc.
+pub mod caller_context;
 pub mod rate_limit;
 
 use std::collections::{HashMap, HashSet};
@@ -1562,11 +1565,17 @@ impl GatewayFramework {
     /// Read-only, exactly like [`Self::permits_tool`]: this is not an attempt,
     /// so it consumes no rate-limit budget and writes no audit entry. The audit
     /// entry for the tool call itself is written by the caller as usual.
-    pub fn caller_context(&self, principal: Option<&Principal>) -> crate::tool::CallerContext {
+    ///
+    /// This is the ONLY production path that can produce an entitled
+    /// [`CallerContext`], and that is compiler-enforced rather than a
+    /// convention: the constructor it calls,
+    /// `CallerContext::from_allowlist_decision`, is `pub(super)` to this
+    /// module tree. See [`caller_context`] for the boundary's full rationale.
+    pub fn caller_context(&self, principal: Option<&Principal>) -> caller_context::CallerContext {
         let Some(p) = principal else {
-            return crate::tool::CallerContext::untrusted();
+            return caller_context::CallerContext::untrusted();
         };
-        crate::tool::CallerContext::new(
+        caller_context::CallerContext::from_allowlist_decision(
             self.permits_tool(p.name(), CALENDAR_CONTEXT_PROBE),
             self.permits_tool(p.name(), ROUTINE_CONTEXT_PROBE),
         )
@@ -2570,6 +2579,41 @@ mod tests {
         let stranger = identity("never-enrolled");
         assert_eq!(
             fw.caller_context(Some(&stranger)),
+            crate::tool::CallerContext::untrusted()
+        );
+    }
+
+    /// TRTR-05 boundary, POSITIVE CONTROL: making an entitled context
+    /// unforgeable outside this module must not have quietly turned the feature
+    /// off. A gateway-derived context for an ENTITLED principal is still
+    /// entitled — and is observably NOT the untrusted value, which is the exact
+    /// way a botched lockdown would present (everything silently fail-closed,
+    /// every negative test still green).
+    ///
+    /// Pairs with `a_guest_gets_no_operator_context_even_though_it_may_call_weather`
+    /// and `caller_context_is_fail_closed_for_absent_and_unknown_principals`
+    /// above: together they show the gate still discriminates rather than
+    /// denying uniformly.
+    #[test]
+    fn trtr05_a_gateway_derived_context_still_grants_an_entitled_principal() {
+        let fw = framework_with(AllowlistPolicy::new(scaffold_defaults()), 10);
+        let operator_side = identity("lumina");
+
+        let ctx = fw.caller_context(Some(&operator_side));
+
+        assert_ne!(
+            ctx,
+            crate::tool::CallerContext::untrusted(),
+            "the lockdown must not have collapsed every context to untrusted"
+        );
+        assert!(ctx.may_infer_from_calendar());
+        assert!(ctx.may_infer_from_routine());
+
+        // ...and it is genuinely derived from the allowlist, not a constant:
+        // the same call for a guest identity yields the fail-closed value.
+        let guest_fw = framework_with(guest_policy(), 10);
+        assert_eq!(
+            guest_fw.caller_context(Some(&identity("guest-relative"))),
             crate::tool::CallerContext::untrusted()
         );
     }

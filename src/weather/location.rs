@@ -304,8 +304,13 @@ mod tests {
     /// A caller entitled to BOTH sources of operator context — what the gateway
     /// derives for the operator's own identity (it is allowed
     /// `google_calendar_today` and `commute_estimate` directly).
+    ///
+    /// TRTR-05: an entitled `CallerContext` can only be minted inside
+    /// `crate::gateway_framework`, so tests reach it through the `cfg(test)`-only
+    /// `entitled_for_test_only` affordance rather than through any production
+    /// constructor — there is no longer a public one to widen.
     fn operator() -> CallerContext {
-        CallerContext::new(true, true)
+        CallerContext::entitled_for_test_only(true, true)
     }
 
     /// A household guest: allowed to call `weather`, entitled to neither source.
@@ -538,14 +543,14 @@ mod tests {
     fn the_two_sources_are_gated_independently() {
         // Entitled to the routine but not the calendar: the calendar event is
         // ignored, the routine still answers. (And the converse.)
-        let routine_only = CallerContext::new(false, true);
+        let routine_only = CallerContext::entitled_for_test_only(false, true);
         match resolve(None, &sensitive_events(), &routine(Some("Home St"), None), 10, true, routine_only) {
             Resolved::Found { location, source: LocationSource::Routine(_) } => {
                 assert_eq!(location, "Home St")
             }
             other => panic!("got {other:?}"),
         }
-        let calendar_only = CallerContext::new(true, false);
+        let calendar_only = CallerContext::entitled_for_test_only(true, false);
         match resolve(None, &[], &routine(Some("Home St"), None), 10, true, calendar_only) {
             Resolved::AskUser => {}
             other => panic!("no calendar hit and no routine entitlement must ASK, got {other:?}"),

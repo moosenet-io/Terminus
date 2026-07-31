@@ -908,8 +908,14 @@ mod tests {
     /// The caller context the gateway derives for the OPERATOR's own identity:
     /// entitled to both sources of operator context, because it is already
     /// allowed to call `google_calendar_today` and `commute_estimate` directly.
+    ///
+    /// TRTR-05: built via the `cfg(test)`-only `entitled_for_test_only`, since
+    /// the real entitled constructor is `pub(super)` to
+    /// `crate::gateway_framework` and unreachable from here. The end-to-end
+    /// "the gateway really does grant this" control lives in that module's
+    /// `trtr05_a_gateway_derived_context_still_grants_an_entitled_principal`.
     fn operator() -> CallerContext {
-        CallerContext::new(true, true)
+        CallerContext::entitled_for_test_only(true, true)
     }
 
     /// A household GUEST: allowed to call `weather` (it is in
