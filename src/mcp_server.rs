@@ -535,18 +535,28 @@ async fn handle_agent_execute(
     };
 
     let system_prompt = req.get("system_prompt").and_then(|v| v.as_str()).unwrap_or("");
-    // Newest user turn drives selection — that is what the request is actually about.
-    let user_message = req
+
+    // CARRY THE WHOLE TRANSCRIPT. Round-4 review caught a real regression here: the
+    // first cut extracted only the newest user message and rebuilt a fresh transcript,
+    // which would have dropped conversation history on EVERY tool turn — the assistant
+    // would forget what was just being discussed. The caller's `messages` are the
+    // conversation; pass them through untouched.
+    let history: Vec<Value> = req
         .get("messages")
         .and_then(|m| m.as_array())
-        .and_then(|a| {
-            a.iter()
-                .rev()
-                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-        })
+        .cloned()
+        .unwrap_or_default();
+
+    // The newest user turn still drives tool SELECTION — that is what the request is
+    // about — but it no longer replaces the transcript.
+    let user_message = history
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
 
     let deps = crate::agent_router::RouterDeps {
         state: &state,
@@ -559,7 +569,8 @@ async fn handle_agent_execute(
     let outcome = crate::agent_router::execute(
         deps,
         system_prompt,
-        user_message,
+        &user_message,
+        history,
         crate::agent_router::RouterConfig::default(),
     )
     .await;

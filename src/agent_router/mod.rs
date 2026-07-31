@@ -172,6 +172,11 @@ pub async fn dispatch_tool(
                 // upstream. Refresh off the critical path, and only the one caller
                 // that claimed it (no thundering herd).
                 if claim {
+                    // If we cannot refresh (no dispatch state), clear the claim rather
+                    // than leaving the entry marked refreshing until hard expiry.
+                    if state.is_none() {
+                        cache.clear_refreshing(&key).await;
+                    }
                     if let Some(st) = state {
                         spawn_refresh(
                             st,
@@ -276,7 +281,11 @@ fn with_as_of(value: String, fetched_at: u64) -> String {
             m.insert("_cached_at".to_string(), Value::from(fetched_at));
             Value::Object(m).to_string()
         }
-        Ok(_) => value,
+        // A JSON array/scalar has nowhere to put a field without RESHAPING it, which
+        // would break a consumer expecting an array. This payload is read by the MODEL,
+        // so the prose form is both safe and honest — silently omitting freshness let
+        // stale structured data be presented as current (round-4 review).
+        Ok(_) => format!("{value}\n\n(cached; fetched at {fetched_at} epoch-seconds)"),
         Err(_) => format!("{value}\n\n(cached; fetched at {fetched_at} epoch-seconds)"),
     }
 }
@@ -308,10 +317,34 @@ fn spawn_refresh(
         if !crate::availability::policy().agent_usable(&name) {
             return;
         }
+        // Re-authorize the REFRESH itself. router_dispatch is the routing half only and
+        // delegates authorization to its caller, so without this a refresh could fetch
+        // after the principal's permission was revoked, and would emit no audit entry —
+        // breaking the one-audit-per-request contract (round-4 review).
+        let mut ctx = None;
+        if let Some(gw) = state.gateway.as_ref() {
+            match gw
+                .guard(principal.as_ref(), &name, crate::gateway_framework::ActionKind::Tool)
+                .await
+            {
+                Ok(c) => ctx = Some(c),
+                Err(_) => return, // permission revoked since the foreground call
+            }
+        }
         match state.router_dispatch(&name, args, principal.as_ref()).await {
-            Ok(text) => cache.put(&key, text).await,
+            Ok(text) => {
+                cache.put(&key, text).await;
+                if let Some(c) = ctx {
+                    c.record_result(true, Some("cache-refresh"));
+                }
+            }
             // A failed refresh must leave the last-good value intact.
-            Err(_) => cache.record_failure(&key).await,
+            Err(_) => {
+                cache.record_failure(&key).await;
+                if let Some(c) = ctx {
+                    c.record_result(false, Some("cache-refresh failed"));
+                }
+            }
         }
     });
 }
@@ -405,6 +438,7 @@ impl Default for RouterConfig {
             model: crate::config::router_model_alias(),
             max_steps: MAX_STEPS,
             budget: Duration::from_secs(crate::config::router_budget_secs()),
+            // (clamped in router_budget_secs — see its doc)
         }
     }
 }
@@ -507,6 +541,7 @@ pub async fn execute(
     deps: RouterDeps<'_>,
     system_prompt: &str,
     user_message: &str,
+    history: Vec<Value>,
     cfg: RouterConfig,
 ) -> RouterOutcome {
     let started = Instant::now();
@@ -516,11 +551,18 @@ pub async fn execute(
     let selected = select::select_tools(&catalog, user_message, deps.gateway, deps.principal);
     let principal_name = deps.principal.map(|p| p.name());
 
+    // The caller's transcript IS the conversation — carried through so the assistant
+    // keeps its context across a tool turn. Only synthesise a user turn when the
+    // caller sent none at all (which would otherwise leave the model nothing to answer).
     let mut messages: Vec<Value> = Vec::new();
     if !system_prompt.is_empty() {
         messages.push(json!({"role": "system", "content": system_prompt}));
     }
-    messages.push(json!({"role": "user", "content": user_message}));
+    if history.is_empty() {
+        messages.push(json!({"role": "user", "content": user_message}));
+    } else {
+        messages.extend(history);
+    }
 
     let tools = tools_payload(&selected);
     let mut turns = 0usize;
@@ -896,6 +938,27 @@ mod tests {
         // Plain text gets the prose form.
         let t = "Current weather: 68F".to_string();
         assert!(with_as_of(t, 1_700_000_000).contains("cached"));
+    }
+
+    #[test]
+    fn every_cached_shape_carries_freshness() {
+        // Silently omitting the stamp let stale structured data be presented as
+        // current — the thing the module's own anti-fabrication rule forbids.
+        let obj = with_as_of(r#"{"count":0}"#.into(), 1_700_000_000);
+        assert!(serde_json::from_str::<Value>(&obj).unwrap()["_cached_at"] == 1_700_000_000u64);
+        for other in [r#"[1,2,3]"#, r#""a string""#, "plain text"] {
+            let out = with_as_of(other.to_string(), 1_700_000_000);
+            assert!(out.contains("cached"), "shape {other} lost its freshness note: {out}");
+        }
+    }
+
+    #[test]
+    fn the_budget_is_clamped_below_the_caller_egress_timeout() {
+        // Documenting the ordering is not enforcing it: an unclamped override would
+        // reintroduce the dead-socket failure the invariant exists to prevent.
+        let budget = crate::config::router_budget_secs();
+        let caller = crate::config::caller_egress_timeout_secs();
+        assert!(budget < caller, "router budget {budget}s must stay under caller {caller}s");
     }
 
     #[test]

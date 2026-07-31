@@ -679,10 +679,26 @@ pub fn mtls_primary_server_identity() -> String {
 /// because that caller-side timeout is not ours to assume forever — a deployment that
 /// tunes one must be able to tune the other. Default 90 s.
 pub fn router_budget_secs() -> u64 {
+    // CLAMPED below the caller's egress timeout. An unclamped override (e.g. 120) would
+    // reintroduce the exact dead-socket failure the invariant guards against: the client
+    // gives up before the router can return its own structured error. Round-4 review
+    // flagged that documenting the ordering was not the same as enforcing it.
+    let ceiling = caller_egress_timeout_secs().saturating_sub(15).max(5);
     env_nonempty("TERMINUS_ROUTER_BUDGET_SECS")
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(90)
+        .map(|n| n.min(ceiling))
+        .unwrap_or_else(|| 90u64.min(ceiling))
+}
+
+/// The CALLER's egress timeout in seconds (lumina-core's is 120). Configurable so a
+/// deployment that tunes the client can tune the router's ceiling with it, rather than
+/// the router assuming a constant that is not its to own.
+pub fn caller_egress_timeout_secs() -> u64 {
+    env_nonempty("TERMINUS_CALLER_EGRESS_TIMEOUT_SECS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(120)
 }
 
 pub fn router_local_enabled() -> bool {

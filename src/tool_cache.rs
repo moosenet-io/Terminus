@@ -273,6 +273,14 @@ impl ToolCache {
         Self::evict_if_needed(&mut map, self.capacity);
     }
 
+    /// Release a refresh claim that will not be acted on, so the entry is not stranded
+    /// as permanently "refreshing" until hard expiry.
+    pub async fn clear_refreshing(&self, key: &str) {
+        if let Some(e) = self.inner.write().await.get_mut(key) {
+            e.refreshing = false;
+        }
+    }
+
     /// Drop a single entry (operator-forced refresh).
     pub async fn invalidate(&self, key: &str) {
         self.inner.write().await.remove(key);
