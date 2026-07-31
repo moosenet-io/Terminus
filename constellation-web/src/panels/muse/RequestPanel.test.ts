@@ -9,6 +9,7 @@ import {
   searchOutcome,
   ownershipState,
   catalogState,
+  providerCatalogState,
   ownershipReason,
   isCheckedNegative,
   parseQualityProfileId,
@@ -209,6 +210,29 @@ describe('searchOutcome — six states, never sharing a meaning', () => {
     expect(searchOutcome({ ...base, parsed: partial }).state).toBe('incomplete-empty');
   });
 
+  it('withholds the no-matches claim when a per-kind status failed under a healthy rollup', () => {
+    // The definitive sentence ("every consulted provider answered successfully … none had
+    // this title") is exactly what this response contradicts.
+    const kindFailed = museSearchResponse(response({
+      results: [],
+      providers: [provider({ status: 'ok', result_count: 0, kinds: [providerKind({ status: 'error', result_count: 0, provider_returned: 0, error: 'timeout' })] })],
+    }));
+    expect(searchOutcome({ ...base, parsed: kindFailed }).state).toBe('incomplete-empty');
+  });
+
+  it('withholds the no-matches claim when a status cannot be interpreted', () => {
+    // An unknown status is not a success. It is also not a coverage loss — we have not
+    // observed that anything was lost — so it earns the weaker sentence, not the stronger one.
+    const unknown = museSearchResponse(response({
+      results: [],
+      providers: [provider({ status: 'rate_limited', result_count: 0, kinds: [providerKind({ status: 'ok', result_count: 0, provider_returned: 0 })] })],
+    }));
+    const out = searchOutcome({ ...base, parsed: unknown });
+    expect(out.state).toBe('indeterminate-empty');
+    expect(out.state).not.toBe('no-matches');
+    expect(out.state).not.toBe('incomplete-empty');
+  });
+
   it('still reports caveats alongside a non-empty result list', () => {
     // The dangerous case is not the empty one — it is five results that LOOK like an answer
     // while a whole media kind is missing.
@@ -229,15 +253,84 @@ describe('searchCaveats', () => {
   });
 
   it('collects the provider’s own error messages verbatim', () => {
+    // Provider-level error with nothing notable at the kind level — the provider-level
+    // sentence is the only signal, so it is the one reported.
     const c = searchCaveats(response({
-      providers: [provider({ status: 'error', kinds: [providerKind({ status: 'error', error: 'tmdb 401 unauthorized' })] })],
+      providers: [provider({ status: 'error', kinds: [providerKind({ status: 'ok', error: 'tmdb 401 unauthorized' })] })],
     }));
     expect(c).toContainEqual({ code: 'provider-error', provider: 'tmdb', messages: ['tmdb 401 unauthorized'] });
   });
 
   it('reports a failed provider that gave no message without inventing one', () => {
-    const c = searchCaveats(response({ providers: [provider({ status: 'error', kinds: [providerKind({ status: 'error' })] })] }));
+    const c = searchCaveats(response({ providers: [provider({ status: 'error', kinds: [providerKind({ status: 'ok' })] })] }));
     expect(c).toContainEqual({ code: 'provider-error', provider: 'tmdb', messages: [] });
+  });
+
+  it('reads the PER-KIND status, not just the provider rollup', () => {
+    // The finding this guards: a kind that errored under a provider-level `ok` rendered as
+    // "every consulted provider answered successfully", a definitive claim contradicted by
+    // the very response it came from. Today's server rolls a provider up to `partial` when a
+    // kind errors — the page must not DEPEND on that rollup being right.
+    const c = searchCaveats(response({
+      providers: [provider({ status: 'ok', kinds: [providerKind({ status: 'error', error: 'tvdb timeout' })] })],
+    }));
+    expect(c).toContainEqual({ code: 'kind-error', provider: 'tmdb', kind: 'movie', message: 'tvdb timeout' });
+  });
+
+  it('reports a per-kind partial under a healthy provider rollup', () => {
+    const c = searchCaveats(response({
+      providers: [provider({ status: 'ok', kinds: [providerKind({ status: 'partial', error: null })] })],
+    }));
+    expect(c).toContainEqual({ code: 'kind-partial', provider: 'tmdb', kind: 'movie', message: null });
+  });
+
+  it('does not print the same failure twice when the rollup agrees with the kind', () => {
+    // The realistic payload: provider rolled up to `partial` because its one kind errored.
+    // The kind-level sentence names the kind and carries its message, so it is strictly more
+    // specific — the provider-level one is suppressed rather than duplicated.
+    const c = searchCaveats(response({
+      providers: [provider({ status: 'partial', kinds: [providerKind({ status: 'error', error: 'boom' })] })],
+    }));
+    expect(c).toContainEqual({ code: 'kind-error', provider: 'tmdb', kind: 'movie', message: 'boom' });
+    expect(c.filter(x => x.code === 'provider-partial' || x.code === 'provider-error')).toEqual([]);
+  });
+
+  it('raises a caveat for a status it does not recognize, at either level', () => {
+    const kindLevel = searchCaveats(response({
+      providers: [provider({ status: 'ok', kinds: [providerKind({ status: 'rate_limited' })] })],
+    }));
+    expect(kindLevel).toContainEqual({ code: 'unknown-status', scope: 'kind', provider: 'tmdb', kind: 'movie', status: 'rate_limited' });
+
+    const providerLevel = searchCaveats(response({ providers: [provider({ status: 'degraded_upstream' })] }));
+    expect(providerLevel).toContainEqual({ code: 'unknown-status', scope: 'provider', provider: 'tmdb', kind: null, status: 'degraded_upstream' });
+  });
+
+  it('reports an unrecognized PROVIDER status even when a kind already reported one', () => {
+    // Two different facts, not a rollup of one another.
+    const c = searchCaveats(response({
+      providers: [provider({ status: 'weird_provider', kinds: [providerKind({ status: 'weird_kind' })] })],
+    }));
+    expect(c).toContainEqual({ code: 'unknown-status', scope: 'kind', provider: 'tmdb', kind: 'movie', status: 'weird_kind' });
+    expect(c).toContainEqual({ code: 'unknown-status', scope: 'provider', provider: 'tmdb', kind: null, status: 'weird_provider' });
+  });
+
+  it('raises no caveat for the four statuses it does understand', () => {
+    for (const status of ['ok', 'not_consulted']) {
+      expect(searchCaveats(response({ providers: [provider({ status, kinds: [providerKind({ status })] })] }))).toEqual([]);
+    }
+  });
+
+  it('flags a truncated response that carries no results as self-contradictory', () => {
+    const c = searchCaveats(response({
+      results: [],
+      providers: [provider({ kinds: [providerKind({ truncated: true, result_count: 0, provider_returned: 137 })] })],
+    }));
+    expect(c).toContainEqual({ code: 'contradictory-empty' });
+    // Not raised when there ARE results — truncation is then an ordinary, consistent fact.
+    const consistent = searchCaveats(response({
+      providers: [provider({ kinds: [providerKind({ truncated: true, result_count: 40, provider_returned: 137 })] })],
+    }));
+    expect(consistent.some(x => x.code === 'contradictory-empty')).toBe(false);
   });
 
   it('surfaces truncation with the numbers the response actually carried', () => {
@@ -265,10 +358,15 @@ describe('searchCaveats', () => {
       })],
     }));
     const out = searchOutcome({ submitted: true, loading: false, degraded: false, parsed: truncatedEmpty });
-    expect(out.caveats).toHaveLength(1);
-    expect(out.caveats[0].code).toBe('truncated');
-    expect(out.state).toBe('no-matches');
+    expect(out.caveats.map(c => c.code)).toEqual(['truncated', 'contradictory-empty']);
+    // NOT coverage loss — that reasoning stands: truncation means there were MORE matches, so
+    // it cannot have removed titles from the list.
     expect(out.state).not.toBe('incomplete-empty');
+    // But it must not produce a confident negative either: zero results plus truncation is
+    // contradictory, and the page does not resolve a contradiction in favour of the definitive
+    // reading.
+    expect(out.state).toBe('indeterminate-empty');
+    expect(out.state).not.toBe('no-matches');
 
     // And with real results present, truncation is reported without downgrading the state.
     const truncated = museSearchResponse(response({
@@ -307,6 +405,38 @@ describe('ownershipState — three answers, and null is not one of the other two
     expect(ownershipState({ in_library: undefined as never })).toBe('unknown');
     expect(ownershipState({ in_library: 'true' as never })).toBe('unknown');
     expect(ownershipState({ in_library: 0 as never })).toBe('unknown');
+  });
+});
+
+describe('providerCatalogState — an empty provider array means four different things', () => {
+  it('says not-yet-searched ONLY when nothing was searched', () => {
+    expect(providerCatalogState('idle', 0)).toBe('idle');
+    // The finding: all three of these previously rendered "until a search runs there is
+    // nothing to list", which asserts that no search had run. One had failed, one had
+    // returned a body we could not read, and one had completed.
+    expect(providerCatalogState('degraded', 0)).not.toBe('idle');
+    expect(providerCatalogState('unrecognized', 0)).not.toBe('idle');
+    expect(providerCatalogState('no-matches', 0)).not.toBe('idle');
+  });
+
+  it('routes a failed or unreadable search to its own state', () => {
+    expect(providerCatalogState('loading', 0)).toBe('loading');
+    expect(providerCatalogState('degraded', 0)).toBe('degraded');
+    expect(providerCatalogState('unrecognized', 0)).toBe('unrecognized');
+  });
+
+  it('treats an empty provider array from a COMPLETED search as its own, anomalous state', () => {
+    // The endpoint reports every provider it knows about on every search, so this is not a
+    // pending state and not a normal one.
+    for (const state of ['no-matches', 'incomplete-empty', 'indeterminate-empty', 'results'] as const) {
+      expect(providerCatalogState(state, 0)).toBe('no-providers-reported');
+    }
+  });
+
+  it('lists providers whenever a completed search reported any', () => {
+    for (const state of ['no-matches', 'incomplete-empty', 'indeterminate-empty', 'results'] as const) {
+      expect(providerCatalogState(state, 2)).toBe('providers');
+    }
   });
 });
 

@@ -32,13 +32,20 @@
 // answer and becomes half an answer — with nothing in `results` itself to say so. Six states
 // with six different sentences, decided by the pure `searchOutcome` below:
 //
-//   idle             nothing was searched               (never "no results")
-//   loading          a search is in flight
-//   degraded         the fetch failed                   (never "no results")
-//   unrecognized     2xx body we could not read         (never "no results")
-//   incomplete-empty zero results AND coverage was lost (never "no matches")
-//   no-matches       zero results, every provider healthy, every kind covered
-//   results          at least one hit (caveats still shown above them)
+//   idle                nothing was searched                  (never "no results")
+//   loading             a search is in flight
+//   degraded            the fetch failed                      (never "no results")
+//   unrecognized        2xx body we could not read            (never "no results")
+//   incomplete-empty    zero results AND coverage was lost    (never "no matches")
+//   indeterminate-empty zero results AND something in the response could not be interpreted
+//   no-matches          zero results, nothing notable in the response at all
+//   results             at least one hit (caveats still shown above them)
+//
+// `no-matches` is the ONLY definitive claim this page makes about an absence, so it is the one
+// state that must be EARNED: any caveat at all withholds it. The provider catalog card derives
+// its own state (`providerCatalogState`) rather than reading `providers.length`, for the same
+// reason — an empty array after a failed search is not the same fact as an empty array before
+// one was run.
 //
 // ── OWNERSHIP IS TRI-STATE, FOR THE SAME REASON ──────────────────────────────────────────
 //
@@ -89,6 +96,7 @@ export type SearchState =
   | 'degraded'
   | 'unrecognized'
   | 'incomplete-empty'
+  | 'indeterminate-empty'
   | 'no-matches'
   | 'results';
 
@@ -99,13 +107,31 @@ export type SearchCaveat =
   | { code: 'uncovered-kinds'; kinds: string[]; complete: boolean }
   | { code: 'provider-error'; provider: string; messages: string[] }
   | { code: 'provider-partial'; provider: string; messages: string[] }
-  | { code: 'truncated'; provider: string; kind: string; shown: number; providerReturned: number; limit: number };
+  | { code: 'kind-error'; provider: string; kind: string; message: string | null }
+  | { code: 'kind-partial'; provider: string; kind: string; message: string | null }
+  | { code: 'unknown-status'; scope: 'provider' | 'kind'; provider: string; kind: string | null; status: string }
+  | { code: 'truncated'; provider: string; kind: string; shown: number; providerReturned: number; limit: number }
+  | { code: 'contradictory-empty' };
+
+/** The status vocabulary this page has wording for. Deliberately NOT enforced by the parser —
+ *  a sixth value must not break the page — but a status outside this set cannot be
+ *  INTERPRETED either, and an uninterpretable status is not evidence of success. */
+const KNOWN_STATUSES = new Set(['ok', 'partial', 'error', 'not_consulted']);
 
 /** Everything the response reports about ITSELF that the result list cannot show.
  *
  *  Messages are the providers' own `error` strings, collected verbatim — never summarized
  *  into a cause. A `partial`/`error` provider that reported no message yields an empty
- *  `messages` array, and the UI says the message was absent rather than inventing one. */
+ *  `messages` array, and the UI says the message was absent rather than inventing one.
+ *
+ *  Read at BOTH levels. The provider-level `status` is a ROLLUP, and this page must not
+ *  depend on the rollup being right: a `kinds[].status` of `error`/`partial` under a
+ *  provider-level `ok` is either an internally inconsistent payload or a server that rolls up
+ *  differently than today's does. Either way the page was rendering "every consulted provider
+ *  answered successfully" over data that said otherwise — a definitive claim contradicted by
+ *  the very response it came from. Trusting one field to summarize another correctly is how a
+ *  false-green survives, so both are read.
+ */
 export function searchCaveats(resp: MuseSearchResponse): SearchCaveat[] {
   const out: SearchCaveat[] = [];
   // `complete: false` and a non-empty `uncovered_kinds` are one caveat, not two: they are the
@@ -115,9 +141,38 @@ export function searchCaveats(resp: MuseSearchResponse): SearchCaveat[] {
     out.push({ code: 'uncovered-kinds', kinds: resp.uncovered_kinds, complete: resp.complete });
   }
   for (const p of resp.providers) {
+    const kindCaveats: SearchCaveat[] = [];
+    for (const k of p.kinds) {
+      const message = typeof k.error === 'string' && k.error !== '' ? k.error : null;
+      if (k.status === 'error') kindCaveats.push({ code: 'kind-error', provider: p.name, kind: k.kind, message });
+      else if (k.status === 'partial') kindCaveats.push({ code: 'kind-partial', provider: p.name, kind: k.kind, message });
+      else if (!KNOWN_STATUSES.has(k.status)) {
+        kindCaveats.push({ code: 'unknown-status', scope: 'kind', provider: p.name, kind: k.kind, status: k.status });
+      }
+    }
+
+    // The provider-level caveat is SUPPRESSED when the kind level already reported something
+    // for this provider: the kind-level entry names the kind and carries that kind's own
+    // message, so it is strictly more specific. Emitting both would print the same failure
+    // twice on every real error (today's server rolls a provider up to `partial` whenever a
+    // kind errors), which trains an operator to skim the banner — and a banner that gets
+    // skimmed is the one that fails to stop a false read.
     const messages = p.kinds.map(k => k.error).filter((m): m is string => typeof m === 'string' && m !== '');
-    if (p.status === 'error') out.push({ code: 'provider-error', provider: p.name, messages });
-    else if (p.status === 'partial') out.push({ code: 'provider-partial', provider: p.name, messages });
+    if (kindCaveats.length === 0) {
+      if (p.status === 'error') out.push({ code: 'provider-error', provider: p.name, messages });
+      else if (p.status === 'partial') out.push({ code: 'provider-partial', provider: p.name, messages });
+      else if (!KNOWN_STATUSES.has(p.status)) {
+        out.push({ code: 'unknown-status', scope: 'provider', provider: p.name, kind: null, status: p.status });
+      }
+    } else {
+      out.push(...kindCaveats);
+      // A provider-level status that is ALSO uninterpretable still gets said — it is a
+      // different fact from the kind-level one, not a rollup of it.
+      if (!KNOWN_STATUSES.has(p.status)) {
+        out.push({ code: 'unknown-status', scope: 'provider', provider: p.name, kind: null, status: p.status });
+      }
+    }
+
     for (const k of p.kinds) {
       // `truncated` is the SERVER's verdict. Not re-derived from `provider_returned > limit`:
       // only the server knows whether the upstream had more to give than it handed over.
@@ -133,14 +188,33 @@ export function searchCaveats(resp: MuseSearchResponse): SearchCaveat[] {
       }
     }
   }
+
+  // Truncation means the provider returned MORE than the limit, so a truncated search with an
+  // empty result list is self-contradictory. The page does not get to resolve that in favour
+  // of the confident reading — see `searchOutcome`.
+  if (resp.results.length === 0 && out.some(c => c.code === 'truncated')) {
+    out.push({ code: 'contradictory-empty' });
+  }
   return out;
 }
 
-/** True when a caveat means the result set is missing titles it should have contained. A
- *  TRUNCATION is deliberately not in this set: truncation happens because there were MORE
- *  matches, so it can never turn an empty list into an incomplete one. */
+/** True when a caveat means the result set is MISSING titles it should have contained.
+ *
+ *  This is narrower than "blocks a no-matches claim" (see `searchOutcome`) and they are not
+ *  the same question. A TRUNCATION is deliberately not in this set: truncation happens because
+ *  there were MORE matches, so it can never turn an empty list into an incomplete one. Nor is
+ *  an UNKNOWN STATUS: a status the page cannot interpret is not evidence that anything was
+ *  lost — it is an absence of evidence either way, which earns the weaker sentence, not this
+ *  one. Both still withhold the definitive negative; they just do not get to assert coverage
+ *  loss they have not observed. */
 function isCoverageLoss(c: SearchCaveat): boolean {
-  return c.code === 'uncovered-kinds' || c.code === 'provider-error' || c.code === 'provider-partial';
+  return (
+    c.code === 'uncovered-kinds' ||
+    c.code === 'provider-error' ||
+    c.code === 'provider-partial' ||
+    c.code === 'kind-error' ||
+    c.code === 'kind-partial'
+  );
 }
 
 /**
@@ -174,11 +248,58 @@ export function searchOutcome(input: {
 
   const caveats = searchCaveats(input.parsed);
   if (input.parsed.results.length > 0) return { state: 'results', detail: null, caveats };
-  return {
-    state: caveats.some(isCoverageLoss) ? 'incomplete-empty' : 'no-matches',
-    detail: null,
-    caveats,
-  };
+  // Zero results. `no-matches` is the ONLY definitive claim this page ever makes about an
+  // absence, so it is the one that has to be earned: it requires a response with nothing
+  // notable about it at all. Coverage loss earns the strong sentence ("part of the search did
+  // not happen"); ANY other caveat earns the weak one ("this cannot be confirmed as empty").
+  //
+  // `caveats.length > 0` rather than a second predicate listing the blocking codes, and that
+  // is deliberate: a caveat added later by someone who never reads this comment then defaults
+  // to WITHHOLDING the confident negative rather than to permitting it. The failure direction
+  // of a forgotten update is the safe one.
+  if (caveats.some(isCoverageLoss)) return { state: 'incomplete-empty', detail: null, caveats };
+  if (caveats.length > 0) return { state: 'indeterminate-empty', detail: null, caveats };
+  return { state: 'no-matches', detail: null, caveats };
+}
+
+/** What the PROVIDER CATALOG card may say, which is not the same question as what the results
+ *  card may say. */
+export type CatalogSectionState =
+  | 'idle'
+  | 'loading'
+  | 'degraded'
+  | 'unrecognized'
+  | 'no-providers-reported'
+  | 'providers';
+
+/**
+ * The catalog's own state.
+ *
+ * This exists because the card previously showed "until a search runs there is nothing to
+ * list" for EVERY empty provider array — including after a failed search, after an unreadable
+ * body, and after a perfectly good 2xx that carried no providers. Three of those four are not
+ * "we have not searched yet", and the copy asserted that we had not.
+ *
+ * The last case is worth its own state rather than being folded into the idle one: the
+ * endpoint reports every provider it knows about on every search, so a completed search
+ * carrying an EMPTY provider list is anomalous. The card says that it is anomalous — and
+ * nothing about why, because nothing in the response reports why.
+ */
+export function providerCatalogState(searchState: SearchState, providerCount: number): CatalogSectionState {
+  switch (searchState) {
+    case 'idle':
+      return 'idle';
+    case 'loading':
+      return 'loading';
+    case 'degraded':
+      return 'degraded';
+    case 'unrecognized':
+      return 'unrecognized';
+    default:
+      // Every remaining state means a response was read successfully, so the provider array is
+      // an OBSERVATION — empty or not.
+      return providerCount === 0 ? 'no-providers-reported' : 'providers';
+  }
 }
 
 /** Three states, never two. See `ownershipState`. */
@@ -348,8 +469,26 @@ function caveatText(c: SearchCaveat): string {
       return c.messages.length > 0
         ? `Provider ${c.provider} answered PARTIALLY: ${c.messages.join('; ')}. Some of its titles may be missing.`
         : `Provider ${c.provider} answered PARTIALLY and reported no message. Some of its titles may be missing.`;
+    case 'kind-error':
+      // Names the KIND, which the provider-level sentence cannot. On this deployment a lost
+      // kind is a lost provider, so this is the specific version of the same danger.
+      return c.message !== null
+        ? `${c.provider} FAILED on ${c.kind}: ${c.message}. No ${c.kind} results from it are in this list — that is a failure, not an absence of matches.`
+        : `${c.provider} FAILED on ${c.kind} and reported no message. No ${c.kind} results from it are in this list — that is a failure, not an absence of matches.`;
+    case 'kind-partial':
+      return c.message !== null
+        ? `${c.provider} answered PARTIALLY for ${c.kind}: ${c.message}. Some of its ${c.kind} titles may be missing.`
+        : `${c.provider} answered PARTIALLY for ${c.kind} and reported no message. Some of its ${c.kind} titles may be missing.`;
+    case 'unknown-status':
+      // Shown verbatim and interpreted as NOTHING. An unrecognized status is not a success,
+      // and it is not a failure either — it is a word this build has no meaning for.
+      return c.scope === 'kind'
+        ? `${c.provider} reported an unrecognized status for ${c.kind} (“${c.status}”). This page cannot interpret it, so it draws no conclusion from that provider’s ${c.kind} outcome — including no conclusion that it searched successfully.`
+        : `Provider ${c.provider} reported an unrecognized status (“${c.status}”). This page cannot interpret it, so it draws no conclusion about whether that provider searched successfully.`;
     case 'truncated':
       return `Truncated — ${c.provider} returned ${c.providerReturned} ${c.kind} hits and only ${c.shown} are shown (limit ${c.limit}). Narrow the search to see the rest.`;
+    case 'contradictory-empty':
+      return 'This response reports a truncated result set but carries no results at all. Those cannot both be true, so the empty list is not treated as a finding either way.';
   }
 }
 
@@ -648,6 +787,10 @@ export function RequestPanel() {
 
   const results = parsed?.results ?? [];
   const providers = parsed?.providers ?? [];
+  // The catalog card's state is DERIVED SEPARATELY, not inferred from `providers.length`: an
+  // empty array means different things after an idle page, a failed fetch, an unreadable body
+  // and a completed search, and only one of those is "we have not searched yet".
+  const catalogSection = providerCatalogState(outcome.state, providers.length);
 
   const chip = (active: boolean): React.CSSProperties => ({
     padding: '3px 10px',
@@ -773,6 +916,12 @@ export function RequestPanel() {
               body="The problems listed above mean at least one provider or media kind contributed nothing it should have. This is NOT a finding that there are no matches; it is a finding that part of the search did not happen."
             />
           )}
+          {outcome.state === 'indeterminate-empty' && (
+            <EmptyBlock
+              headline="No results — and this page cannot confirm that means nothing matched."
+              body="The notes above describe something in the response that could not be interpreted cleanly. Reading an empty list as “nothing matched” would be a stronger claim than this response supports, so it is not made."
+            />
+          )}
           {outcome.state === 'no-matches' && (
             <EmptyBlock
               headline={`No matches for “${parsed?.query ?? submitted ?? ''}”.`}
@@ -813,7 +962,7 @@ export function RequestPanel() {
       <ChartCard
         title="Providers consulted"
         subtitle={
-          providers.length > 0
+          catalogSection === 'providers'
             ? `${providers.length} reported by the last search`
             : 'reported per search by /api/search'
         }
@@ -822,10 +971,20 @@ export function RequestPanel() {
         degraded={outcome.state === 'degraded' ? { detail: outcome.detail ?? 'unknown error' } : false}
       >
         <div style={{ height: '100%', overflowY: 'auto' }}>
-          {providers.length === 0 ? (
+          {catalogSection === 'idle' ? (
             <EmptyBlock
               headline="No provider list yet."
               body="The provider catalog is part of the search response, so it describes the providers this deployment actually consulted for a specific query. Until a search runs there is nothing observed to list, and a hardcoded roster of metadata APIs would describe no server in particular."
+            />
+          ) : catalogSection === 'unrecognized' ? (
+            <EmptyBlock
+              headline="Provider list could not be read."
+              body="The search returned a body this page could not parse, so the provider list it may or may not have contained was never read. This is not a statement that no providers are configured."
+            />
+          ) : catalogSection === 'no-providers-reported' ? (
+            <EmptyBlock
+              headline="The search reported no providers at all."
+              body="This is a completed search, not a pending one: the response was read successfully and its provider list was empty. The endpoint reports every provider it knows about on every search, so an empty list here is anomalous. Nothing is claimed about the cause — the response does not report one."
             />
           ) : (
             <div
@@ -869,6 +1028,8 @@ function resultsSubtitle(state: SearchState, submitted: string | null, count: nu
       return 'response not understood';
     case 'incomplete-empty':
       return 'search incomplete';
+    case 'indeterminate-empty':
+      return 'no results · not confirmed empty';
     case 'no-matches':
       return 'no matches';
     case 'results':
