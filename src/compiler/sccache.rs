@@ -430,6 +430,12 @@ fn redis_usable(parts: &RedisUrlParts, timeout: std::time::Duration) -> bool {
 /// `DEFAULT_PROBE_MS` (300 ms) budget, and utterly negligible against a build
 /// that this probe runs ONCE for. Do NOT extend this to the full probe timeout:
 /// that would slow every healthy build for no additional signal.
+///
+/// This value IS the bound of what the check can claim. Bytes arriving after it
+/// are not detected, and no larger value removes that — a bounded probe cannot
+/// prove a peer will never speak again, it can only move the boundary while
+/// charging every healthy build for the move. See
+/// [`no_unsolicited_trailing_bytes`] for the guaranteed/not-guaranteed split.
 const POST_SUCCESS_DRAIN_MS: u64 = 100;
 
 /// Bounded post-success check: `true` iff we can CONFIRM that nothing
@@ -438,8 +444,32 @@ const POST_SUCCESS_DRAIN_MS: u64 = 100;
 ///
 /// `evaluate_probe_reply` rejects trailing garbage that was already COALESCED
 /// into the read buffer, but it can only judge bytes it has been given. This
-/// closes the segmentation hole: the invariant is "trailing garbage is ALWAYS
-/// unhealthy", not "trailing garbage that happened to land in the first read".
+/// closes the segmentation hole: trailing garbage is unhealthy whether or not it
+/// happened to land in the first read.
+///
+/// ## The bound, stated honestly (round-6): what this DOES and does NOT prove
+///
+/// GUARANTEED — detected and reported UNHEALTHY: unsolicited bytes arriving
+/// within [`POST_SUCCESS_DRAIN_MS`] of a complete affirmative reply; a clean EOF
+/// that arrives with extra bytes; a connection reset; any other I/O error; and an
+/// inability to bound the read at all.
+///
+/// NOT guaranteed, and NOT achievable: bytes arriving AFTER that window. A server
+/// may answer `+PONG`, stay silent past the drain, and only then speak garbage,
+/// and this probe will have already returned healthy. That is not a bug to be
+/// fixed by waiting longer: **no bounded probe can prove a peer will never speak
+/// again**, so extending the window only buys build latency for a boundary that
+/// still exists. An earlier revision of this comment claimed the invariant was
+/// "trailing garbage is ALWAYS unhealthy" — that absolute is not satisfiable by
+/// any bounded check, and TERM #564 exists precisely because a documented-but-
+/// unenforced invariant is worse than an honest, narrower one.
+///
+/// Why the residual risk is acceptable HERE specifically: this probe answers one
+/// narrow question — "is this endpoint usable as an sccache backend right now?"
+/// A real Redis sends nothing after `+PONG`, so the window is decisive for every
+/// well-behaved and every chatty-on-loopback peer we can realistically meet. And
+/// if an endpoint misbehaves LATER, the failure surfaces as a slow or failing
+/// build — not as the silent empty gate that motivated this work.
 ///
 /// **The rule, stated once, with no list of exceptions to remember: the ONLY
 /// healthy outcomes of this check are a CLEAN EOF and BOUNDED SILENCE.
@@ -505,6 +535,11 @@ fn no_unsolicited_trailing_bytes(stream: &mut std::net::TcpStream) -> bool {
 ///
 /// Two healthy outcomes, everything else unhealthy. That rule is easier to keep
 /// true than the list of exceptions it replaced.
+///
+/// Scope note (round-6): this table is exhaustive over the OUTCOMES OF ONE
+/// BOUNDED READ, which is all this function is given. It is not a claim that a
+/// healthy verdict proves the peer stays silent forever — see the
+/// guaranteed/not-guaranteed split on [`no_unsolicited_trailing_bytes`].
 fn post_success_drain_is_healthy(read: Option<&std::io::Result<usize>>) -> bool {
     match read {
         // Could not bound the read ⇒ could not verify ⇒ not healthy.
@@ -1244,9 +1279,9 @@ mod tests {
         );
         assert!(
             !probe_against(addr, "redis://default:placeholder-password@127.0.0.1:{port}/1"),
-            "trailing garbage arriving in a LATER TCP segment must still be judged unusable — \
-             the invariant is that trailing garbage is always unhealthy, not merely garbage \
-             that happened to land in the first read"
+            "trailing garbage arriving in a LATER TCP segment — but still WITHIN the drain \
+             window — must be judged unusable: the bounded claim is that garbage inside the \
+             window is unhealthy, not merely garbage that happened to land in the first read"
         );
     }
 

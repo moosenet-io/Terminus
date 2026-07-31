@@ -612,6 +612,33 @@ pub async fn verify_sha_artifact(
 /// single resolution point `compiler_release` also uses. No production caller can
 /// pass its own target as its own "default" and defeat the guard; the only other
 /// constructor is `#[cfg(test)]`.
+///
+/// ## FOLLOW-UP — NOT closed by this guard: default-target MIGRATION
+///
+/// TODO(term-564-followup — default-target migration): this guard is a WRITE-TIME
+/// check on the flip. It stops a NEW off-default artifact from being blessed. It
+/// does NOT cover the pointer going stale UNDER an unchanged pointer: an operator
+/// edits `BUILD_MODULE_TARGET_<MODULE>` (or the fleet `BUILD_TARGET_TRIPLE`) from
+/// target A to target B while `current` still names a sha whose artifact was only
+/// ever built for A. No flip occurs, so nothing re-runs this guard — but
+/// `compiler_release` now resolves `effective_triple(module) = B` and the live
+/// pointer becomes unresolvable, which is the exact failure mode this type exists
+/// to prevent, reached by the config door instead of the write door.
+///
+/// This is PRE-EXISTING (the target-agnostic pointer predates TERM #564/#565; this
+/// branch neither introduced nor closed it) and deliberately OUT OF SCOPE here —
+/// it belongs to config-change handling, not to the flip path. Two plausible
+/// remedies for whoever picks it up:
+/// 1. **Validate at config-change time** — when a module's effective target
+///    changes, check that every channel's `current` still resolves under the new
+///    target and refuse / loudly alarm if it does not.
+/// 2. **Migrate the pointer** — rebuild the blessed sha for the new target and
+///    re-point `current` at it (or roll `current` back to a sha that does resolve)
+///    as part of the target change.
+///
+/// No Plane item exists for this yet (no reachable Plane tool at the time of
+/// writing, and improvising a raw API call would violate the single-sanctioned-door
+/// rule), so THIS COMMENT IS THE RECORD. File it when the tool is reachable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefaultTarget(String);
 
