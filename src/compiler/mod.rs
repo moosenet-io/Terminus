@@ -4646,7 +4646,17 @@ impl RustTool for CompilerRelease {
 
         match op.as_str() {
             "current" => {
-                let current = publish::read_current(&root, &module, &to_channel).await?;
+                // TERM #565 (round-7): this is the READ side — the point a live
+                // release pointer becomes an artifact path for a consumer. RESOLVE
+                // it under the effective target rather than handing back a bare
+                // sha, so a pointer stranded by an out-of-band default-target
+                // change (BUILD_MODULE_TARGET_<MODULE> / BUILD_TARGET_TRIPLE
+                // edited after the bless) is reported here, with its cause named,
+                // instead of surfacing as a confusing not-found in whichever
+                // consumer hit it first. Fail-closed: no fallback target is tried.
+                let resolved =
+                    publish::resolve_current(&root, &module, &to_channel, &target, &bin).await?;
+                let current = resolved.as_ref().map(|r| r.sha.clone());
                 let previous = publish::read_previous(&root, &module, &to_channel).await?;
                 let text = match &current {
                     Some(sha) => format!("{module}/{to_channel} current = {sha}"),
@@ -4658,6 +4668,10 @@ impl RustTool for CompilerRelease {
                     "channel": to_channel,
                     "current": current,
                     "previous": previous,
+                    "target": target,
+                    "artifact_path": resolved
+                        .as_ref()
+                        .map(|r| r.artifact_path.to_string_lossy().to_string()),
                 });
                 Ok(ToolOutput::with_structured(text, structured))
             }

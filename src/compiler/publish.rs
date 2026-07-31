@@ -613,28 +613,44 @@ pub async fn verify_sha_artifact(
 /// pass its own target as its own "default" and defeat the guard; the only other
 /// constructor is `#[cfg(test)]`.
 ///
-/// ## FOLLOW-UP — NOT closed by this guard: default-target MIGRATION
+/// ## default-target MIGRATION — now DETECTED, still not PREVENTED
 ///
-/// TODO(term-564-followup — default-target migration): this guard is a WRITE-TIME
-/// check on the flip. It stops a NEW off-default artifact from being blessed. It
-/// does NOT cover the pointer going stale UNDER an unchanged pointer: an operator
-/// edits `BUILD_MODULE_TARGET_<MODULE>` (or the fleet `BUILD_TARGET_TRIPLE`) from
-/// target A to target B while `current` still names a sha whose artifact was only
-/// ever built for A. No flip occurs, so nothing re-runs this guard — but
-/// `compiler_release` now resolves `effective_triple(module) = B` and the live
-/// pointer becomes unresolvable, which is the exact failure mode this type exists
-/// to prevent, reached by the config door instead of the write door.
+/// This guard is a WRITE-TIME check on the flip. It stops a NEW off-default
+/// artifact from being blessed. It does NOT cover the pointer going stale UNDER
+/// an unchanged pointer: an operator edits `BUILD_MODULE_TARGET_<MODULE>` (or the
+/// fleet `BUILD_TARGET_TRIPLE`) from target A to target B while `current` still
+/// names a sha whose artifact was only ever built for A. No flip occurs, so
+/// nothing re-runs this guard — but `compiler_release` now resolves
+/// `effective_triple(module) = B` and the live pointer becomes unresolvable,
+/// reached by the CONFIG door instead of the write door.
 ///
-/// This is PRE-EXISTING (the target-agnostic pointer predates TERM #564/#565; this
-/// branch neither introduced nor closed it) and deliberately OUT OF SCOPE here —
-/// it belongs to config-change handling, not to the flip path. Two plausible
-/// remedies for whoever picks it up:
+/// **What round-7 added (`resolve_pointer` / `resolve_current`):** the read side
+/// now DETECTS this. `compiler_release op=current` resolves the pointer to a
+/// concrete artifact path under the effective target, and `rollback` resolves
+/// `current.prev` the same way; either failing to resolve returns a diagnostic
+/// naming the sha, the resolved target, the exact path checked, and (when the sha
+/// dir holds other target subdirs) the target it WAS built for — pointing
+/// explicitly at a changed `BUILD_MODULE_TARGET_*` / `BUILD_TARGET_TRIPLE` as the
+/// likely cause. Nothing is guessed, repaired, or silently served from another
+/// target. So the hazard is no longer SILENT: it surfaces as an actionable error
+/// at the first read instead of a bare not-found inside whichever consumer
+/// happened to hit it.
+///
+/// TODO(term-564-followup — default-target migration, STILL OPEN): detection is
+/// not prevention. What remains is automatic handling at CONFIG-CHANGE time,
+/// which a build-time guard cannot own:
 /// 1. **Validate at config-change time** — when a module's effective target
 ///    changes, check that every channel's `current` still resolves under the new
-///    target and refuse / loudly alarm if it does not.
+///    target and refuse / loudly alarm if it does not (the check itself is now
+///    a one-line `resolve_current` call; what is missing is a hook that runs it
+///    when the config changes).
 /// 2. **Migrate the pointer** — rebuild the blessed sha for the new target and
-///    re-point `current` at it (or roll `current` back to a sha that does resolve)
-///    as part of the target change.
+///    re-point `current` at it (or roll `current` back to a sha that does
+///    resolve) as part of the target change.
+///
+/// The underlying target-agnostic pointer is PRE-EXISTING (it predates TERM
+/// #564/#565); this branch narrows the failure from silent-and-confusing to
+/// loud-and-named, and does not claim to close it.
 ///
 /// No Plane item exists for this yet (no reachable Plane tool at the time of
 /// writing, and improvising a raw API call would violate the single-sanctioned-door
@@ -684,6 +700,134 @@ fn guard_pointer_target(
          if {target:?} is meant to be its release target.",
         default = default.as_str()
     )))
+}
+
+/// A `current` / `current.prev` pointer RESOLVED to a concrete artifact path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPointer {
+    /// The sha the pointer names.
+    pub sha: String,
+    /// The target the pointer was resolved UNDER (the module's effective triple,
+    /// unless the caller overrode it).
+    pub target: String,
+    /// The artifact path that exists for `(sha, target, bin)`.
+    pub artifact_path: PathBuf,
+}
+
+/// List the target-triple subdirs actually present under a sha dir — i.e. the
+/// targets this sha WAS built for. Best-effort: a missing/unreadable sha dir is
+/// an empty list. Used ONLY to enrich a resolution diagnostic; it is NEVER a
+/// fallback (see [`resolve_pointer`]).
+async fn targets_present_for_sha(
+    dataset_root: &Path,
+    module: &str,
+    channel: &str,
+    sha: &str,
+) -> Vec<String> {
+    let dir = sha_dir(dataset_root, module, channel, sha);
+    let mut found = Vec::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                if let Some(name) = entry.file_name().to_str() {
+                    found.push(name.to_string());
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// TERM #565 (round-7) — the READ-SIDE detector for the default-target MIGRATION
+/// hazard documented on [`DefaultTarget`].
+///
+/// [`guard_pointer_target`] closes the WRITE door: no flip can aim a pointer at
+/// an off-default artifact. It cannot close the CONFIG door — an operator edits
+/// `BUILD_MODULE_TARGET_<MODULE>` (or the fleet `BUILD_TARGET_TRIPLE`) from A to
+/// B while `current` still names a sha only ever built for A. No flip occurs, so
+/// no write-time guard re-runs, and every consumer afterwards resolves under B
+/// and finds nothing. That cannot be PREVENTED from the build path (it would mean
+/// owning the config-change path), but it CAN be DETECTED here, at the one place
+/// a pointer becomes an artifact path, and reported as a named cause instead of a
+/// bare not-found from whichever consumer happened to hit it first.
+///
+/// Returns `Ok(None)` when the channel has no pointer of this kind yet (an
+/// unblessed channel is not an error). Returns `Ok(Some(..))` when the pointer's
+/// artifact exists under `target`. Otherwise returns a diagnostic naming the sha,
+/// the resolved target, the exact path checked, and — when the sha dir holds
+/// OTHER target subdirs — which targets it WAS built for.
+///
+/// It NEVER guesses, repairs, or falls back to another target: a wrong artifact
+/// silently promoted is far worse than a loud error. The remedy is always an
+/// operator action (rebuild the sha for the new target, or roll the channel back
+/// to a sha that resolves).
+pub async fn resolve_pointer(
+    dataset_root: &Path,
+    module: &str,
+    channel: &str,
+    pointer: &str,
+    sha: Option<String>,
+    target: &str,
+    bin: &str,
+) -> Result<Option<ResolvedPointer>, ToolError> {
+    let Some(sha) = sha else {
+        return Ok(None);
+    };
+    let artifact_path = artifact_abs_path(dataset_root, module, channel, &sha, target, bin);
+    if tokio::fs::try_exists(&artifact_path).await.unwrap_or(false) {
+        return Ok(Some(ResolvedPointer {
+            sha,
+            target: target.to_string(),
+            artifact_path,
+        }));
+    }
+    let built_for = targets_present_for_sha(dataset_root, module, channel, &sha).await;
+    let built_for_note = if built_for.is_empty() {
+        String::from(
+            " No target dir exists for this sha at all, so it was either never built into this \
+             channel or has been pruned.",
+        )
+    } else {
+        format!(
+            " This sha IS present for target(s) [{}] — i.e. it was built and blessed for a \
+             DIFFERENT target than the one now configured.",
+            built_for.join(", ")
+        )
+    };
+    Err(ToolError::NotFound(format!(
+        "{module}/{channel} {pointer} points at sha {sha}, but no artifact exists for target \
+         {target:?}: checked {path}. This usually means the module's configured target changed \
+         (BUILD_MODULE_TARGET_<MODULE> / BUILD_TARGET_TRIPLE) after this pointer was set.\
+         {built_for_note} The pointer is NOT repaired automatically and no other target is \
+         substituted: rebuild {sha} for {target:?} and re-bless it, or roll {module}/{channel} \
+         back to a sha that does resolve under {target:?}.",
+        path = artifact_path.display()
+    )))
+}
+
+/// Resolve a channel's live `current` pointer to its artifact under `target`.
+/// See [`resolve_pointer`] — this is the read-side entry point `compiler_release`
+/// uses so a query of the live release pointer surfaces the migration hazard
+/// rather than handing a consumer a sha nothing can find.
+pub async fn resolve_current(
+    dataset_root: &Path,
+    module: &str,
+    channel: &str,
+    target: &str,
+    bin: &str,
+) -> Result<Option<ResolvedPointer>, ToolError> {
+    let sha = read_current(dataset_root, module, channel).await?;
+    resolve_pointer(
+        dataset_root,
+        module,
+        channel,
+        CURRENT_POINTER,
+        sha,
+        target,
+        bin,
+    )
+    .await
 }
 
 /// The outcome of a `set_current` pointer flip.
@@ -798,6 +942,21 @@ pub async fn rollback_current(
                 "no previous blessed sha recorded for {module}/{channel}; nothing to roll back to"
             ))
         })?;
+    // TERM #565 (round-7): resolve the rollback target under the EFFECTIVE target
+    // BEFORE verifying it, so a pointer stranded by a default-target change
+    // reports that named cause instead of a bare missing-binary. Purely a better
+    // diagnostic on an already-failing path — the fail-closed verification below
+    // is unchanged, and nothing is repaired or substituted.
+    resolve_pointer(
+        dataset_root,
+        module,
+        channel,
+        PREVIOUS_POINTER,
+        Some(prev.clone()),
+        target,
+        bin,
+    )
+    .await?;
     // Explicit, clearly-attributed verification of the rollback target (in
     // addition to the check inside `set_current`), so the refusal names rollback.
     verify_sha_artifact(dataset_root, module, channel, &prev, target, bin)
@@ -1947,6 +2106,155 @@ mod tests {
         assert_eq!(
             DefaultTarget::for_module(m).as_str(),
             super::super::effective_triple(m)
+        );
+    }
+
+    // ── TERM #565 round-7: read-side detection of the config-door hazard ──────
+    //
+    // The write door is guarded (above). These cover the CONFIG door: a pointer
+    // blessed for target A while the module's effective target is later changed
+    // to B out of band. Nothing re-runs the write guard, so the read side must
+    // detect it and say WHY — without guessing or falling back to A.
+
+    /// Pointer set for target A; effective target is then B; no artifact exists
+    /// under B ⇒ resolving the live pointer returns a diagnostic that NAMES the
+    /// sha, the resolved target, the path checked, the target it was actually
+    /// built for, and the config knobs that are the likely cause.
+    #[tokio::test]
+    async fn resolve_current_diagnoses_a_pointer_stranded_by_a_default_target_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Blessed legitimately under target A (== the module default at the time).
+        let sha = seed_artifact(root, "m", "experimental", "m", b"built-for-A").await;
+        bless_build(root, "m", "experimental", &sha, T, &dt(), "m", 2)
+            .await
+            .unwrap();
+
+        // Config door: the module's effective target is now OFF (B). The pointer
+        // is untouched, so no write-time guard ran.
+        let err = resolve_current(root, "m", "experimental", OFF, "m")
+            .await
+            .expect_err("a pointer that resolves to nothing under B must be an error");
+        let msg = format!("{err:?}");
+        assert!(matches!(err, ToolError::NotFound(_)), "{msg}");
+        let checked = artifact_abs_path(root, "m", "experimental", &sha, OFF, "m")
+            .display()
+            .to_string();
+        assert!(
+            msg.contains(&checked),
+            "the diagnostic must name the path it checked: {msg}"
+        );
+        // The sha and the target must be named IN THEIR OWN RIGHT — the checked
+        // path happens to contain both as components, so assert against the
+        // message with that path elided, or a diagnostic that only echoed a path
+        // would pass.
+        let prose = msg.replace(&checked, "<CHECKED-PATH>");
+        assert!(
+            prose.contains(&sha),
+            "the diagnostic must name the sha, not only embed it in the path: {msg}"
+        );
+        assert!(
+            prose.contains(OFF),
+            "the diagnostic must name the RESOLVED target: {msg}"
+        );
+        assert!(
+            prose.contains(T),
+            "the diagnostic must name the target the sha WAS built for: {msg}"
+        );
+        assert!(
+            msg.contains("BUILD_MODULE_TARGET_") && msg.contains("BUILD_TARGET_TRIPLE"),
+            "the diagnostic must name the likely cause (the target config): {msg}"
+        );
+
+        // Detection only — nothing repaired, nothing substituted.
+        assert_eq!(
+            read_current(root, "m", "experimental").await.unwrap().as_deref(),
+            Some(sha.as_str()),
+            "the detector must not touch the pointer"
+        );
+    }
+
+    /// POSITIVE CONTROL — the normal case still resolves. Without this, a
+    /// detector hardwired to always error would pass the test above.
+    #[tokio::test]
+    async fn resolve_current_resolves_normally_under_the_effective_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let sha = seed_artifact(root, "m", "experimental", "m", b"built-for-A").await;
+        bless_build(root, "m", "experimental", &sha, T, &dt(), "m", 2)
+            .await
+            .unwrap();
+
+        let resolved = resolve_current(root, "m", "experimental", T, "m")
+            .await
+            .expect("the pointer resolves under the module's own default target")
+            .expect("a blessed channel resolves to Some");
+        assert_eq!(resolved.sha, sha);
+        assert_eq!(resolved.target, T);
+        assert_eq!(
+            resolved.artifact_path,
+            artifact_abs_path(root, "m", "experimental", &sha, T, "m")
+        );
+        assert!(tokio::fs::try_exists(&resolved.artifact_path).await.unwrap());
+
+        // And an unblessed channel is `None`, not an error.
+        assert!(resolve_current(root, "m", "stable", T, "m")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// The other read of a live release pointer: `rollback` resolves
+    /// `current.prev`. A prev stranded by the same config change reports the same
+    /// named cause instead of a bare missing-binary, and `current` is untouched.
+    #[tokio::test]
+    async fn rollback_diagnoses_a_prev_pointer_stranded_by_a_default_target_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Two blesses under target A, so `current.prev` names the first.
+        let one = seed_artifact(root, "m", "experimental", "m", b"one").await;
+        bless_build(root, "m", "experimental", &one, T, &dt(), "m", 2)
+            .await
+            .unwrap();
+        let two = seed_artifact(root, "m", "experimental", "m", b"two").await;
+        bless_build(root, "m", "experimental", &two, T, &dt(), "m", 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_previous(root, "m", "experimental").await.unwrap().as_deref(),
+            Some(one.as_str())
+        );
+
+        // Config door: the module's effective default is now OFF, so the guard
+        // is satisfied (target == default) but `current.prev` was built for A.
+        let off_default = DefaultTarget::from_raw_for_test(OFF);
+        let err = rollback_current(root, "m", "experimental", OFF, &off_default, "m")
+            .await
+            .expect_err("rolling back onto an unresolvable prev must be refused");
+        let msg = format!("{err:?}");
+        let checked = artifact_abs_path(root, "m", "experimental", &one, OFF, "m")
+            .display()
+            .to_string();
+        let prose = msg.replace(&checked, "<CHECKED-PATH>");
+        assert!(
+            prose.contains(&one),
+            "the diagnostic must name the prev sha in its own right: {msg}"
+        );
+        assert!(
+            prose.contains(OFF),
+            "the diagnostic must name the target: {msg}"
+        );
+        assert!(
+            msg.contains("BUILD_MODULE_TARGET_") && msg.contains("BUILD_TARGET_TRIPLE"),
+            "the diagnostic must name the likely cause: {msg}"
+        );
+        assert_eq!(
+            read_current(root, "m", "experimental").await.unwrap().as_deref(),
+            Some(two.as_str()),
+            "a refused rollback must leave current untouched"
         );
     }
 }
