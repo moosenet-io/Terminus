@@ -654,24 +654,6 @@ pub fn mtls_primary_server_identity() -> String {
 // same "PKI/secret material gets its own section" convention this file
 // already uses for `crate::pki`).
 
-/// Base URL `terminus-primary` calls to reach Chord's personal-tool relay
-/// (`{base}/v1/personal/tools/list`, `{base}/v1/personal/tools/call`). From
-/// `TERMINUS_PRIMARY_CHORD_URL`; defaults to Chord's loopback proxy port for
-/// a co-located deploy — a loopback default only, never a real non-loopback
-/// host baked in. An operator overrides this if Chord is not co-located with
-/// `terminus-primary`.
-/// TRTR-02: the Chord NAMED PROXY the tool-selecting sub-agent runs on.
-///
-/// A logical route, never a concrete model name — Chord owns model selection,
-/// tiering, GPU lifecycle, and fallback (north-star Module Contract clause 1). Reads
-/// `TERMINUS_ROUTER_MODEL`; defaults to the fast assistant tier because tool selection
-/// is a routing decision, not the answer the user reads.
-/// TRTR-02: whether the tool router runs LOCALLY in Terminus (default) or blind-
-/// forwards `/v1/agent/execute` to Chord as before.
-///
-/// `TERMINUS_ROUTER_LOCAL=0` is the documented rollback: it restores the exact
-/// pre-TRTR-02 behaviour without a redeploy, which is what makes flipping this on
-/// safe for a live assistant.
 /// TRTR-02: the router's wall-clock budget, seconds.
 ///
 /// MUST stay below the CALLER's egress timeout (lumina-core's is 120 s) so the
@@ -710,6 +692,12 @@ pub fn caller_egress_timeout_secs() -> u64 {
         .unwrap_or(120)
 }
 
+/// TRTR-02: whether the tool router runs LOCALLY in Terminus (default) or blind-
+/// forwards `/v1/agent/execute` to Chord as before.
+///
+/// `TERMINUS_ROUTER_LOCAL=0` is the documented rollback: it restores the exact
+/// pre-TRTR-02 behaviour without a redeploy, which is what makes flipping this on
+/// safe for a live assistant.
 pub fn router_local_enabled() -> bool {
     match std::env::var("TERMINUS_ROUTER_LOCAL") {
         Ok(v) => !matches!(v.trim(), "0" | "false" | "no" | "off"),
@@ -717,10 +705,24 @@ pub fn router_local_enabled() -> bool {
     }
 }
 
+/// TRTR-02: the Chord NAMED PROXY the tool-selecting sub-agent runs on.
+///
+/// A logical route, never a concrete model name — Chord owns model selection, tiering,
+/// GPU lifecycle, and fallback (north-star Module Contract clause 1). Reads
+/// `TERMINUS_ROUTER_MODEL`; the in-code default is the fast assistant ALIAS because
+/// tool selection is a routing decision, not the answer the user reads. (A default
+/// alias in source is not a hard-wired model: hard-wiring would be naming a concrete
+/// model such as a specific weights tag, which is precisely what Chord owns.)
 pub fn router_model_alias() -> String {
     env_nonempty("TERMINUS_ROUTER_MODEL").unwrap_or_else(|| "lumina-fast".to_string())
 }
 
+/// Base URL `terminus-primary` calls to reach Chord's personal-tool relay
+/// (`{base}/v1/personal/tools/list`, `{base}/v1/personal/tools/call`). From
+/// `TERMINUS_PRIMARY_CHORD_URL`; defaults to Chord's loopback proxy port for
+/// a co-located deploy — a loopback default only, never a real non-loopback
+/// host baked in. An operator overrides this if Chord is not co-located with
+/// `terminus-primary`.
 pub fn chord_personal_federation_url() -> String {
     // Loopback default (precedent: `crate::intake::gpu_authority`'s own
     // chord-base-url helper uses the same literal).
