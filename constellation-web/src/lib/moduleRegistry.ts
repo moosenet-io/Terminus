@@ -112,6 +112,12 @@ export interface PanelDescriptor {
    *  `RosterPanel.tsx` (`ModelDetailView`), so it needs no `hideInRail` entry of its own.
    *  Default false/absent — every other panel keeps rendering in the rail exactly as before. */
   hideInRail?: boolean;
+  /** MGUI-18: this panel is a CATALOG surface (a grid of media cards or a wide table), so the
+   *  shell canvas caps it at `--content-max-wide` instead of POL-03's `--content-max` reading
+   *  measure. Opt-in per panel, deliberately: POL-03's ~1280px cap is right for a column of
+   *  prose and charts and wrong for a 1892-tile poster wall on an ultrawide. Default
+   *  false/absent — every other panel keeps the standard cap exactly as before. */
+  wide?: boolean;
 }
 
 const registry = new Map<string, PanelDescriptor>();

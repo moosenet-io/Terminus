@@ -21,6 +21,7 @@
 //  2. NOTHING HERE CAN TRIGGER A GRAB. This is a read surface over the acquisition
 //     pipeline; the write path stays behind Muse's dual safety gate (MUSEM-05).
 import { ChartCard } from '../../viz/ChartCard';
+import { fluidBodyHeight } from '../../lib/catalogLayout';
 import {
   useMuseCuration,
   useMuseRequestsQueue,
@@ -65,7 +66,10 @@ function CurationSection() {
     <ChartCard
       title="Curation"
       subtitle="availability-aware · ranked"
-      height={260}
+      // MGUI-18: fluid. These are LISTS — extra viewport height buys visible rows, which is
+      // exactly what a tall/portrait monitor should get and what a 260px constant refused it.
+      // Two cards stack on this page, so each reserve accounts for the other's share.
+      height={fluidBodyHeight({ min: 220, max: 700, reserve: 700 })}
       loading={loading}
       degraded={degraded}
       empty={empty}
@@ -172,7 +176,7 @@ function WantedQueueSection() {
     <ChartCard
       title="Wanted & download queue"
       subtitle={data ? `${wanted.length} monitored · ${queue.length} downloading` : 'wanted worker · maintenance chain'}
-      height={300}
+      height={fluidBodyHeight({ min: 240, max: 800, reserve: 640 })}
       loading={loading}
       degraded={degraded}
       empty={empty}

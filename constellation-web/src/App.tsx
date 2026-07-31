@@ -23,6 +23,7 @@ import type { FeedItem } from './lib/activityFeed';
 import { getAvailableModules, getAvailablePanels } from './lib/moduleRegistry';
 import type { ModuleDescriptor, ModuleId } from './lib/moduleRegistry';
 import { setCurrentPath, REFRESH_HEALTH_EVENT } from './lib/shellBridge';
+import { contentMaxWidth } from './lib/catalogLayout';
 import { OverviewPanel } from './panels/overview/OverviewPanel';
 import { ModuleDetail } from './panels/overview/ModuleDetail';
 
@@ -340,6 +341,17 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
   const coreModules = useMemo(() => modulesInCore(effectiveCore, modules), [effectiveCore, modules]);
   const coreDescriptor = getCore(effectiveCore);
 
+  // MGUI-18: POL-03 centres the canvas and caps it at `--content-max` (~1280px). That reading
+  // measure is right for a column of prose and charts and wrong for a catalog — on an
+  // ultrawide it left the Muse poster wall as a 1280px strip with empty desk either side,
+  // which is the operator's "the card area does not resize with the window". Panels opt in
+  // via `PanelDescriptor.wide`; the decision itself is a pure, tested function so the
+  // fallback (any unmatched path keeps the standard cap) cannot drift.
+  const canvasMaxWidth = useMemo(
+    () => contentMaxWidth(location.pathname, panels),
+    [location.pathname, panels],
+  );
+
   return (
     <div style={{ position: 'relative', zIndex: 1, display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
       {/* CGUI-12 (§0): the fixed deep-space backdrop sits behind the whole shell (z-index:0);
@@ -402,7 +414,7 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
               anchored top-left in a huge canvas with a yawning void to the right; every panel
               now composes as a centered column. The wrapper is flex-column + min-height:0 so a
               panel's own PanelRoot scroll frame (height:100%) still fills and scrolls inside it. */}
-          <div style={{ width: '100%', maxWidth: 'var(--content-max)', margin: '0 auto', flex: 1, minHeight: 0, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+          <div style={{ width: '100%', maxWidth: canvasMaxWidth, margin: '0 auto', flex: 1, minHeight: 0, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
           {!healthLoaded ? (
             // First health poll hasn't settled yet — `modules`/`panels` are necessarily empty
             // right now (health starts as []). Render a loading placeholder WITHOUT mounting

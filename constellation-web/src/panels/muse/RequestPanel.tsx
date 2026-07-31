@@ -100,9 +100,17 @@ import {
   type MuseSearchResult,
 } from '../../hooks/useMuse';
 import { gateResult } from './RequestLifecyclePanel';
+import { CardSizeSlider, useCardSize } from './CardSizeSlider';
+import { cardGridTemplate, fluidBodyHeight, CATALOG_TRACK_BASE } from '../../lib/catalogLayout';
 
-const RESULTS_HEIGHT = 620;
-const CATALOG_HEIGHT = 300;
+/** MGUI-18: both bodies follow the viewport instead of being flat pixel constants.
+ *
+ *  This page stacks three things — the search form, the results, the provider catalog — so
+ *  its `reserve` is much larger than the single-card pages': the form above is ~230px of
+ *  chrome the results never get, and the catalog additionally sits below the results. The
+ *  numbers are approximate by design; `min`/`max` are the actual guarantees. */
+const RESULTS_HEIGHT = fluidBodyHeight({ min: 280, max: 1000, reserve: 380 });
+const CATALOG_HEIGHT = fluidBodyHeight({ min: 220, max: 560, reserve: 700 });
 
 /** The catalog heading. A CONSTANT rather than an inline string so the rule can be pinned by a
  *  test: the array deliberately includes providers with `status: "not_consulted"` (a
@@ -802,6 +810,7 @@ export function RequestPanel() {
   const [kind, setKind] = useState<MuseSearchKind>('all');
   const [profileRaw, setProfileRaw] = useState('');
   const [requestStates, setRequestStates] = useState<Record<string, RequestState>>({});
+  const [cardSize, setCardSize] = useCardSize();
 
   const { data, loading, degraded } = useMuseSearch(submitted, kind);
   const { submit } = useMuseCreateRequest();
@@ -950,6 +959,11 @@ export function RequestPanel() {
         title="Results"
         subtitle={resultsSubtitle(outcome.state, submitted, results.length, providers.length)}
         height={RESULTS_HEIGHT}
+        // Only when there ARE results. Every other `outcome.state` is one of the six honest
+        // non-result readings (idle / unrecognized / incomplete-empty / indeterminate-empty /
+        // no-matches / degraded), and a card-size control over any of them would suggest the
+        // absence of tiles is a presentation setting rather than what the response said.
+        controls={outcome.state === 'results' ? <CardSizeSlider value={cardSize} onChange={setCardSize} /> : undefined}
         loading={outcome.state === 'loading'}
         // `degraded` is the fetch failing. Deliberately NOT reused for the other non-result
         // states — the card's degraded copy ("Module unavailable") would be a false diagnosis
@@ -995,7 +1009,7 @@ export function RequestPanel() {
               <div
                 style={{
                   display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fill, minmax(132px, 1fr))',
+                  gridTemplateColumns: cardGridTemplate(cardSize, CATALOG_TRACK_BASE.searchResult),
                   gap: 'var(--space-3)',
                   paddingRight: 'var(--space-1)',
                 }}
@@ -1056,7 +1070,7 @@ export function RequestPanel() {
             <div
               style={{
                 display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
+                gridTemplateColumns: cardGridTemplate(cardSize, CATALOG_TRACK_BASE.provider),
                 gap: 'var(--space-3)',
               }}
             >

@@ -280,6 +280,9 @@ registerPanel({
   path: '/muse/library',
   icon: '▦',
   available: true,
+  // MGUI-18: a catalog surface — uses the wider canvas cap so an ultrawide shows more
+  // columns rather than a centred 1280px strip.
+  wide: true,
   component: MuseLibraryPanel,
 });
 
@@ -324,6 +327,9 @@ registerPanel({
   path: '/muse/discover',
   icon: '✦',
   available: true,
+  // MGUI-18: a catalog surface — uses the wider canvas cap so an ultrawide shows more
+  // columns rather than a centred 1280px strip.
+  wide: true,
   component: MuseDiscoverPanel,
 });
 
@@ -358,6 +364,9 @@ registerPanel({
   path: '/muse/request',
   icon: '⌕',
   available: true,
+  // MGUI-18: a catalog surface — uses the wider canvas cap so an ultrawide shows more
+  // columns rather than a centred 1280px strip.
+  wide: true,
   component: MuseRequestPanel,
 });
 

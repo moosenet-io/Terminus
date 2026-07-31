@@ -305,8 +305,12 @@ export interface WsConnection {
 
 /** The keys the prefs seam will store — all non-secret UI state. `core` (S127) is the operator's
  *  last-selected Overview core tab (Lumina/Chord/Terminus/Harmony/Muse), persisted so the shell
- *  reopens on the same core. */
-export type PrefsKey = 'layout' | 'density' | 'core';
+ *  reopens on the same core.
+ *
+ *  MGUI-18: `museCardSize` is the Muse catalog card-size slider's step (see lib/catalogLayout.ts) —
+ *  one preference shared by every catalog grid so a chosen size holds across Library / Discover /
+ *  Search & request rather than being re-set per page. */
+export type PrefsKey = 'layout' | 'density' | 'core' | 'museCardSize';
 
 export interface PrefsClient {
   /** Returns the stored value for an allowlisted key, or `null` if unset/unparsable. */
@@ -320,7 +324,7 @@ export interface PrefsClient {
 // Defined here (ahead of both adapters) since each adapter's object literal references
 // `prefsClient` directly.
 
-const PREFS_ALLOWLIST: readonly PrefsKey[] = ['layout', 'density', 'core'];
+const PREFS_ALLOWLIST: readonly PrefsKey[] = ['layout', 'density', 'core', 'museCardSize'];
 const PREFS_STORAGE_PREFIX = 'constellation.prefs.';
 
 function assertAllowedPrefsKey(key: string): asserts key is PrefsKey {
