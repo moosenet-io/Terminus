@@ -1225,13 +1225,130 @@ fn job_scratch_root() -> Result<PathBuf, ToolError> {
     )
 }
 
+/// Linux `sockaddr_un.sun_path` capacity, in bytes, including the NUL
+/// terminator. A bind/connect on a longer path fails — on glibc with
+/// `path must be shorter than SUN_LEN`.
+const SUN_PATH_MAX: usize = 108;
+
+/// Bytes reserved inside `TMPDIR` for the socket FILE NAME a child process
+/// appends (`sccache`'s server socket, a test's `uds_mtls`/`uds_peercred`
+/// fixture socket, and similar). 28 bytes covers every such name in the tree
+/// with room to spare.
+const SOCKET_NAME_BUDGET: usize = 28;
+
+/// The longest a per-job `TMPDIR` may be and still leave an AF_UNIX socket
+/// createable inside it.
+///
+/// A socket path is `TMPDIR + "/" + name`, and `sun_path` must hold that PLUS a
+/// NUL terminator — so the budget subtracts the separator and the NUL as well as
+/// the name. Getting this off by even one byte defeats the entire guard: it
+/// would accept a directory whose sockets still fail, which is precisely the
+/// silent failure this exists to prevent. `sun_path_budget_matches_the_kernel`
+/// pins it against a real bind rather than against these constants.
+const TMPDIR_MAX_BYTES: usize = SUN_PATH_MAX - 1 - SOCKET_NAME_BUDGET - 1;
+
+/// Longest per-job directory component we will place under the scratch root.
+///
+/// 32 = an 11-byte readable prefix + `-` + 20 hex chars (80 bits) of digest.
+/// 80 bits rather than a tighter 48: a collision would put two concurrent jobs
+/// in ONE directory, where either one's reclaim guard deletes the other's build
+/// tree. That failure is silent and data-destroying, so it is worth spending
+/// path budget on — and the budget is available (a ~38-byte scratch root leaves
+/// room to spare under [`TMPDIR_MAX_BYTES`]). An over-long root is still caught
+/// by [`check_tmpdir_socket_headroom`] rather than being silently truncated.
+const SCRATCH_UNIT_MAX: usize = 32;
+
+/// Hex characters of SHA-256 kept in a shortened unit (80 bits).
+const SCRATCH_HASH_HEX: usize = 20;
+
+/// Shorten a per-job `unit` into a bounded, still-unique directory component.
+///
+/// WHY (2026-08-01, hard-won): `unit` is the full job id
+/// (`<module>-<16 hex>-<32 hex>`, ~65 bytes). Joined onto a big-disk scratch
+/// root it pushed `TMPDIR` to ~107 bytes — at or past [`SUN_PATH_MAX`] BEFORE a
+/// socket name was appended. Every AF_UNIX bind under it then failed, which did
+/// NOT present as a path bug: `sccache` died with `path must be shorter than
+/// SUN_LEN` (taking out `mode=build` entirely) and a dozen socket-using tests
+/// failed only on the build host, so the whole test gate read as "main is red"
+/// for weeks while the same tests passed everywhere else.
+///
+/// Short units pass through unchanged. Longer ones keep a readable prefix and
+/// append a truncated SHA-256 of the FULL unit, so two jobs whose ids share a
+/// prefix still get disjoint dirs. The hash is SHA-256 rather than
+/// `DefaultHasher` because the name must be reproducible ACROSS processes — the
+/// GC and the reclaim path have to derive the same dir a build did.
+fn short_scratch_unit(unit: &str) -> String {
+    if unit.len() <= SCRATCH_UNIT_MAX {
+        return unit.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(unit.as_bytes());
+    let hash: String = format!("{digest:x}").chars().take(SCRATCH_HASH_HEX).collect();
+    // 11-byte prefix + '-' + 20-byte hash == SCRATCH_UNIT_MAX. Slice on a char
+    // boundary so a non-ASCII unit cannot panic.
+    let mut prefix_end = SCRATCH_UNIT_MAX - hash.len() - 1;
+    while prefix_end > 0 && !unit.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+    format!("{}-{}", &unit[..prefix_end], hash)
+}
+
 /// PCON-10: the per-job `(target, tmpdir)` under a scratch ROOT, keyed by the
 /// unique per-invocation `unit`. Disjoint across concurrent jobs; both live on
-/// the big disk (never the small `/tmp` tmpfs). The parent `root.join(unit)` is
-/// the single dir reclaimed on finalize.
+/// the big disk (never the small `/tmp` tmpfs). The parent dir is the single
+/// dir reclaimed on finalize.
+///
+/// The job component is length-bounded (see [`short_scratch_unit`]) so `TMPDIR`
+/// stays under [`TMPDIR_MAX_BYTES`] and AF_UNIX sockets remain createable inside
+/// it. Validate with [`check_tmpdir_socket_headroom`], which reports a root that
+/// is itself too long instead of letting it resurface as an unrelated-looking
+/// sccache or socket-test failure.
 fn job_scratch_dirs(root: &std::path::Path, unit: &str) -> (PathBuf, PathBuf) {
-    let base = root.join(unit);
+    let base = job_scratch_base(root, unit);
     (base.join("target"), base.join("tmp"))
+}
+
+/// The single per-job scratch dir that [`job_scratch_dirs`] nests `target/` and
+/// `tmp/` inside, and that the reclaim guard removes on finalize.
+///
+/// Every caller MUST derive the path through this helper rather than joining
+/// `unit` itself: the component is shortened, so a hand-rolled `root.join(unit)`
+/// names a directory that does not exist — the reclaim guard would then delete
+/// nothing and silently LEAK the real scratch dir on every build.
+fn job_scratch_base(root: &std::path::Path, unit: &str) -> PathBuf {
+    root.join(short_scratch_unit(unit))
+}
+
+/// Fail CLOSED when a per-job `TMPDIR` leaves no room for an AF_UNIX socket.
+///
+/// This can only happen when the configured scratch ROOT is itself very long,
+/// which [`short_scratch_unit`] cannot compensate for. Surfacing it here — by
+/// name, with the budget — is the whole point: the failure it replaces was
+/// silent, remote, and looked like broken code rather than misconfiguration.
+///
+/// `root_var` is the env var that actually CONTROLS the offending root, because
+/// the local and remote paths are rooted by different variables. Naming the
+/// wrong one sends an operator to edit a setting that cannot shorten the path —
+/// which is its own silent failure, and the reason this is a parameter rather
+/// than a hardcoded constant.
+fn check_tmpdir_socket_headroom(
+    tmp: &std::path::Path,
+    root_var: &str,
+) -> Result<(), ToolError> {
+    let len = tmp.as_os_str().as_encoded_bytes().len();
+    if len > TMPDIR_MAX_BYTES {
+        return Err(ToolError::NotConfigured(format!(
+            "per-job TMPDIR is {len} bytes, over the {TMPDIR_MAX_BYTES}-byte budget \
+             ({SUN_PATH_MAX}-byte AF_UNIX sun_path limit, minus {SOCKET_NAME_BUDGET} \
+             bytes reserved for a socket name, the '/' separator and the NUL \
+             terminator): {}. Sockets created inside it would fail with 'path must \
+             be shorter than SUN_LEN' — which presents as sccache dying and \
+             socket-using tests failing, NOT as a path error. Configure a SHORTER \
+             {root_var}.",
+            tmp.display()
+        )));
+    }
+    Ok(())
 }
 
 /// PCON-10: best-effort reclaim of a per-job build-scratch dir on drop — covers
@@ -3579,10 +3696,17 @@ impl CompilerBuild {
             // GUARD: both exec-safe local disk, never the file-level NFS dataset.
             scope::validate_target_dir(&target_dir, &root)?;
             scope::validate_target_dir(&tmp_dir, &root)?;
+            // GUARD: TMPDIR must leave room for an AF_UNIX socket, or sccache and
+            // every socket-using test inside the scope fail with an error that
+            // names neither the path nor this directory.
+            check_tmpdir_socket_headroom(&tmp_dir, BUILD_SCRATCH_ROOT)?;
             // FIX (PCON-10): arm the reclaim guard BEFORE creating anything, so a
             // PARTIAL create that then errors (or any later `?`) still removes
             // `<root>/<unit>` — the guard must own the dir before it can leak.
-            let _scratch_guard = ScratchReclaim::new(scratch_root.join(&unit));
+            // Derive via job_scratch_base — NOT `scratch_root.join(&unit)`. The
+            // job component is shortened, so joining the raw unit would name a
+            // dir that never existed and leak the real one on every build.
+            let _scratch_guard = ScratchReclaim::new(job_scratch_base(&scratch_root, &unit));
             // cargo creates CARGO_TARGET_DIR itself, but TMPDIR must pre-exist.
             std::fs::create_dir_all(&tmp_dir).map_err(|e| {
                 ToolError::Execution(format!(
@@ -3770,7 +3894,14 @@ impl CompilerBuild {
             // even two builds of the SAME sha get disjoint target dirs (the
             // unit name already carries a fresh uuid per invocation), so
             // there is never a shared mutable target on the remote either.
-            let remote_target = heavy_local_target_dir()?.join(format!("{module}-{unit}"));
+            // Length-bounded for the same AF_UNIX reason as the local path: this
+            // component used to be `<module>-<module>-<16hex>-<32hex>`, which is
+            // LONGER than the local one, so the remote `.tmpdir` blew SUN_LEN
+            // first. Derived through `job_scratch_base` — the SAME helper the
+            // local path uses — so there is exactly one construction rule for a
+            // per-job scratch base and the two paths cannot drift apart.
+            let remote_target =
+                job_scratch_base(&heavy_local_target_dir()?, &format!("{module}-{unit}"));
             // GUARD applies remotely too: the remote cargo target must be exec-safe,
             // never under the remote NFS dataset.
             scope::validate_target_dir(&remote_target, std::path::Path::new(&remote_root))?;
@@ -3779,6 +3910,10 @@ impl CompilerBuild {
             // per-job target, so it is reclaimed with it), never the remote /tmp
             // tmpfs — rustc/linker/tempfile spill would otherwise exhaust it.
             let remote_tmp_str = format!("{}/.tmpdir", remote_target_str.trim_end_matches('/'));
+            check_tmpdir_socket_headroom(
+                std::path::Path::new(&remote_tmp_str),
+                BUILD_HEAVY_LOCAL_TARGET_DIR,
+            )?;
             // PCON-03: content-addressed by `stage_key` (the resolved sha when
             // SHA-staging is active, else the legacy ref) — mirrors PCON-01's
             // local stage path. Two DIFFERENT shas of one module now relay to
@@ -6483,6 +6618,184 @@ Source:
         // Distinct roles within one job.
         assert!(t1.ends_with("target"));
         assert!(tmp1.ends_with("tmp"));
+    }
+
+    // ── SUN_LEN headroom: the per-job TMPDIR must stay socket-createable ──
+
+    /// The exact shape that caused the outage. A real unit is
+    /// `<module>-<16 hex>-<32 hex>`; joined onto a big-disk root the OLD
+    /// `root.join(unit)` pushed TMPDIR to ~107 bytes — over budget before a
+    /// socket name was even appended.
+    #[test]
+    fn real_world_job_tmpdir_leaves_room_for_a_unix_socket() {
+        let root = PathBuf::from("/mnt/<host>/tn-nvme-appdata/build-scratch"); // pii-test-fixture
+        let unit = "terminus-1382137422bf5d87-eb2cef4937034fa69065309b6bfaac26";
+        let (_t, tmp) = job_scratch_dirs(&root, unit);
+        let len = tmp.as_os_str().as_encoded_bytes().len();
+        assert!(
+            len <= TMPDIR_MAX_BYTES,
+            "TMPDIR {len} bytes exceeds the {TMPDIR_MAX_BYTES}-byte budget: {tmp:?}"
+        );
+        check_tmpdir_socket_headroom(&tmp, BUILD_SCRATCH_ROOT)
+            .expect("real-world path must pass the guard");
+
+        // And prove the pre-fix construction really was over the limit, so this
+        // test fails loudly if someone reverts to joining the raw unit.
+        let unshortened = root.join(unit).join("tmp");
+        assert!(
+            unshortened.as_os_str().as_encoded_bytes().len() > TMPDIR_MAX_BYTES,
+            "the un-shortened path should be over budget — otherwise this test proves nothing"
+        );
+    }
+
+    #[test]
+    fn short_scratch_unit_bounds_length_but_keeps_short_units_verbatim() {
+        assert_eq!(short_scratch_unit("chord-abc"), "chord-abc");
+        let long = "terminus-1382137422bf5d87-eb2cef4937034fa69065309b6bfaac26";
+        let short = short_scratch_unit(long);
+        assert!(short.len() <= SCRATCH_UNIT_MAX, "{short} too long");
+        assert!(short.starts_with("terminus"), "should stay readable: {short}");
+    }
+
+    /// Shortening must not create collisions: two units sharing a long prefix
+    /// still need disjoint scratch dirs, or concurrent builds clobber each other.
+    #[test]
+    fn short_scratch_unit_keeps_prefix_sharing_units_disjoint() {
+        let a = "terminus-1382137422bf5d87-eb2cef4937034fa69065309b6bfaac26";
+        let b = "terminus-1382137422bf5d87-eb2cef4937034fa69065309b6bfaac27";
+        assert_ne!(short_scratch_unit(a), short_scratch_unit(b));
+        assert!(short_scratch_unit(a).len() <= SCRATCH_UNIT_MAX);
+    }
+
+    /// Reproducible across processes AND across builds — the reclaim guard and
+    /// the PCON-05 GC must derive the same directory the build used, possibly
+    /// from a different process at a different time.
+    ///
+    /// Pinned to a GOLDEN VALUE, not `f(x) == f(x)`: comparing the function to
+    /// itself inside one process passes for any hasher, including a randomly
+    /// seeded per-process one like `DefaultHasher` — exactly the bug this is
+    /// meant to prevent. An independently computed
+    /// `sha256("<unit>")[..12]` is what actually proves cross-process stability.
+    /// If this value changes, in-flight scratch dirs become unreclaimable and
+    /// the GC will orphan them — treat a failure here as a migration, not a
+    /// test to update.
+    #[test]
+    fn short_scratch_unit_is_deterministic_across_processes() {
+        let u = "terminus-1382137422bf5d87-eb2cef4937034fa69065309b6bfaac26";
+        assert_eq!(
+            short_scratch_unit(u),
+            "terminus-13-baea2da02b49f30964b2",
+            "the derived name must match an independently computed \
+             sha256(unit)[..12] — a per-process-seeded hasher would break the \
+             reclaim guard and the GC"
+        );
+    }
+
+    /// The reclaim guard must target the SAME dir `job_scratch_dirs` nests under,
+    /// or it deletes nothing and leaks the real scratch dir on every build.
+    #[test]
+    fn reclaim_base_matches_the_dir_the_job_actually_uses() {
+        let root = PathBuf::from("/big/scratch");
+        let unit = "terminus-1382137422bf5d87-eb2cef4937034fa69065309b6bfaac26";
+        let (target, tmp) = job_scratch_dirs(&root, unit);
+        let base = job_scratch_base(&root, unit);
+        assert!(target.starts_with(&base), "{target:?} not under {base:?}");
+        assert!(tmp.starts_with(&base), "{tmp:?} not under {base:?}");
+        assert_ne!(base, root.join(unit), "raw-unit join is the bug this guards");
+    }
+
+    /// Pin [`TMPDIR_MAX_BYTES`] against the KERNEL, not against the constants it
+    /// is derived from. Binds a real AF_UNIX socket at a directory length of
+    /// exactly the budget (with a full-length [`SOCKET_NAME_BUDGET`] name) and
+    /// asserts it succeeds — then asserts one byte more fails.
+    ///
+    /// The previous version of this test only compared the constant to itself,
+    /// which is why an off-by-two survived it: the budget forgot the `/`
+    /// separator and the NUL terminator, so it accepted directories whose
+    /// sockets could not actually be created. A guard against a silent failure
+    /// has to be proven against the real thing.
+    #[test]
+    fn sun_path_budget_matches_the_kernel() {
+        use std::os::unix::net::UnixListener;
+
+        // Build a directory whose path length is exactly TMPDIR_MAX_BYTES.
+        let base = tempfile::tempdir().expect("tempdir");
+        let base_len = base.path().as_os_str().as_encoded_bytes().len();
+        assert!(
+            base_len + 2 <= TMPDIR_MAX_BYTES,
+            "tempdir {base_len} too long to build this fixture"
+        );
+        let pad = TMPDIR_MAX_BYTES - base_len - 1; // -1 for the joining '/'
+        let dir = base.path().join("d".repeat(pad));
+        std::fs::create_dir_all(&dir).expect("create padded dir");
+        assert_eq!(dir.as_os_str().as_encoded_bytes().len(), TMPDIR_MAX_BYTES);
+
+        // A socket name using the FULL reserved budget must bind here.
+        let name = "s".repeat(SOCKET_NAME_BUDGET);
+        let sock = dir.join(&name);
+        UnixListener::bind(&sock).unwrap_or_else(|e| {
+            panic!(
+                "TMPDIR_MAX_BYTES ({TMPDIR_MAX_BYTES}) claims a {SOCKET_NAME_BUDGET}-byte \
+                 socket name fits, but binding {} ({} bytes) failed: {e}",
+                sock.display(),
+                sock.as_os_str().as_encoded_bytes().len()
+            )
+        });
+        // And the guard agrees this directory is acceptable.
+        check_tmpdir_socket_headroom(&dir, BUILD_SCRATCH_ROOT)
+            .expect("budget-length dir must pass the guard");
+
+        // One byte over: the guard must reject it, and the kernel must agree.
+        let over = base.path().join("d".repeat(pad + 1));
+        std::fs::create_dir_all(&over).expect("create over-budget dir");
+        assert!(
+            check_tmpdir_socket_headroom(&over, BUILD_SCRATCH_ROOT).is_err(),
+            "a dir one byte over budget must be rejected"
+        );
+        assert!(
+            UnixListener::bind(over.join(&name)).is_err(),
+            "the kernel must also refuse the over-budget socket — otherwise the \
+             budget is too conservative and this test is wrong, not the code"
+        );
+    }
+
+    /// A root so long that shortening cannot save it must FAIL CLOSED with a
+    /// message naming SUN_LEN — not surface later as an unrelated sccache or
+    /// socket-test failure.
+    #[test]
+    fn an_over_long_root_fails_closed_naming_the_socket_limit() {
+        let root = PathBuf::from(format!("/{}", "x".repeat(120)));
+        let (_t, tmp) = job_scratch_dirs(&root, "terminus-abc");
+        let err = check_tmpdir_socket_headroom(&tmp, BUILD_SCRATCH_ROOT).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("SUN_LEN"), "should name the real limit: {msg}");
+        assert!(msg.contains(BUILD_SCRATCH_ROOT), "should say what to change: {msg}");
+    }
+
+    /// The REMOTE heavy path is rooted by a DIFFERENT env var than the local
+    /// one. A fail-closed message that names the local variable would send an
+    /// operator to edit a setting that cannot shorten the remote path — a
+    /// silent failure of its own, which is why the variable is a parameter.
+    #[test]
+    fn the_guard_names_the_variable_that_actually_controls_the_root() {
+        let root = PathBuf::from(format!("/{}", "x".repeat(120)));
+        let (_t, tmp) = job_scratch_dirs(&root, "terminus-abc");
+
+        let local = format!("{:?}", check_tmpdir_socket_headroom(&tmp, BUILD_SCRATCH_ROOT).unwrap_err());
+        assert!(local.contains(BUILD_SCRATCH_ROOT), "{local}");
+
+        let remote = format!(
+            "{:?}",
+            check_tmpdir_socket_headroom(&tmp, BUILD_HEAVY_LOCAL_TARGET_DIR).unwrap_err()
+        );
+        assert!(
+            remote.contains(BUILD_HEAVY_LOCAL_TARGET_DIR),
+            "the remote failure must name the remote variable: {remote}"
+        );
+        assert!(
+            !remote.contains(BUILD_SCRATCH_ROOT),
+            "and must NOT send the operator to the local one: {remote}"
+        );
     }
 
     #[test]
