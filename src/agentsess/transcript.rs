@@ -232,9 +232,12 @@ fn primary_arg(input: &Value) -> Option<String> {
             }
         }
     }
+    // Filter DURING the scan, not after it: `find_map(as_str).filter(..)`
+    // stops at the first string and only then checks it, so a blank value
+    // masks a later usable one and the call degrades to a name-only summary.
     obj.values()
-        .find_map(Value::as_str)
-        .filter(|v| !v.trim().is_empty())
+        .filter_map(Value::as_str)
+        .find(|v| !v.trim().is_empty())
         .map(str::to_string)
 }
 
@@ -712,11 +715,20 @@ mod tests {
             Some("value")
         );
         assert_eq!(primary_arg(&json!({})), None);
-        // Blank values are not informative and must not win.
+        // Blank values are not informative and must not win — in the
+        // preferred-key path...
         assert_eq!(
             primary_arg(&json!({"file_path": "   ", "command": "real"})).as_deref(),
             Some("real")
         );
+        // ...nor in the arbitrary-key fallback, where a blank first value must
+        // not mask a later usable one.
+        assert_eq!(
+            primary_arg(&json!({"a_blank": "   ", "z_useful": "value"})).as_deref(),
+            Some("value")
+        );
+        // All-blank yields nothing rather than an empty summary.
+        assert_eq!(primary_arg(&json!({"a": "  ", "b": ""})), None);
     }
 
     #[test]
