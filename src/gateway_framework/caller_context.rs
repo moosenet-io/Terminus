@@ -94,6 +94,9 @@ pub struct CallerContext {
     /// TERM #576: the household media account this caller IS, or `None` when
     /// the gateway could not determine one. Never read from tool arguments.
     media_account: Option<&'static str>,
+    /// TERM #595: which HUMAN this turn is for. Minted only from a verified,
+    /// principal-bound assertion; see [`PersonScope`].
+    person: PersonScope,
 }
 
 /// Compile-time assertion that [`CallerContext`] keeps its `Copy` contract.
@@ -107,6 +110,69 @@ const _: fn() = || {
     fn assert_copy<T: Copy>() {}
     assert_copy::<CallerContext>();
 };
+
+/// TERM #595: WHICH HUMAN, if any, this turn is being run for.
+///
+/// Three states, and the third is the whole reason this is not an
+/// `Option<&str>`. "Nobody asserted a person" and "somebody asserted a person
+/// and we could not trust it" must lead to different outcomes: the first is a
+/// legacy service-scoped caller and behaves exactly as it did before TERM #595;
+/// the second must get LESS than that caller, because the alternative is that a
+/// malformed or forged identity silently inherits the service's — which is to
+/// say the operator's — records and entitlements.
+///
+/// Collapsing the two is the specific bug this shape prevents. It is the same
+/// mistake as treating a failed lookup as an empty result: both read as
+/// "proceed", and only one of them should.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PersonScope {
+    /// No human identity was asserted on this request. The caller is the
+    /// SERVICE principal and nothing narrower — the pre-TERM #595 world, which
+    /// is still the correct answer for a background refresh, an internal
+    /// dispatch, or a client that predates the mechanism.
+    #[default]
+    Service,
+    /// A verified, roster-known human, cryptographically bound to this hop's
+    /// principal (see [`crate::mesh::person`]). Interned so this type stays
+    /// `Copy`; interning is bounded because the value can only come from the
+    /// operator's configured roster.
+    Person(&'static str),
+    /// A human identity was ASSERTED and REFUSED — absent signing key, bad
+    /// signature, expired, wrong issuer, blank/oversized/unknown person,
+    /// principal mismatch, or an asserting principal without the grant.
+    ///
+    /// This is strictly LESS privilege than [`Self::Service`]: no operator
+    /// context, no media account, and (once the per-caller record key is wired)
+    /// no records at all. A tool that finds this must decline and ask, never
+    /// answer as the operator.
+    Unidentified,
+}
+
+impl PersonScope {
+    /// The human identifier, when there is a trustworthy one.
+    ///
+    /// `None` for BOTH [`Self::Service`] and [`Self::Unidentified`] — a caller
+    /// that only needs "who is this" is served correctly, and a caller that
+    /// needs to distinguish "no person" from "a person we rejected" must match
+    /// on the variant, which makes the distinction impossible to overlook by
+    /// accident.
+    pub const fn person(&self) -> Option<&'static str> {
+        match self {
+            Self::Person(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Whether this scope names a specific human.
+    pub const fn is_person(&self) -> bool {
+        matches!(self, Self::Person(_))
+    }
+
+    /// Whether an assertion was attempted and refused.
+    pub const fn is_unidentified(&self) -> bool {
+        matches!(self, Self::Unidentified)
+    }
+}
 
 impl CallerContext {
     /// The fail-closed value: an unknown, unauthenticated or unrecognised
@@ -139,6 +205,23 @@ impl CallerContext {
     /// If someone widens `from_allowlist_decision` to `pub`, that block starts
     /// compiling and the doctest FAILS — which is exactly the alarm we want.
     ///
+    /// TERM #595 rides it too: no code outside `crate::gateway_framework` can
+    /// declare which HUMAN a caller is, so a tool holding a
+    /// [`PersonScope::Person`] knows the grant, the signature, the principal
+    /// binding and the roster were all checked.
+    ///
+    /// ```compile_fail
+    /// use terminus_rs::tool::{CallerContext, PersonScope};
+    /// // error[E0624]: `with_person_scope` is private
+    /// let _forged = CallerContext::untrusted().with_person_scope(PersonScope::Person("someone"));
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use terminus_rs::tool::CallerContext;
+    /// // error[E0624]: `person_scope_for` is private
+    /// let _forged = CallerContext::person_scope_for("someone");
+    /// ```
+    ///
     /// TERM #576 rides the same boundary, and gets the same executable proof:
     /// no code outside `crate::gateway_framework` can claim to BE a household
     /// media account, so a tool holding one knows the gateway put it there.
@@ -166,7 +249,41 @@ impl CallerContext {
     /// assert!(c.media_account().is_none());
     /// ```
     pub const fn untrusted() -> Self {
-        Self { may_infer_from_calendar: false, may_infer_from_routine: false, media_account: None }
+        Self {
+            may_infer_from_calendar: false,
+            may_infer_from_routine: false,
+            media_account: None,
+            person: PersonScope::Service,
+        }
+    }
+
+    /// TERM #595: the fail-closed value for "a human identity was ASSERTED and
+    /// we could not trust it".
+    ///
+    /// Public, unlike the entitled constructors, and safely so: it can only
+    /// ever REDUCE privilege. It is strictly below [`Self::untrusted`] — same
+    /// zero entitlements, plus a scope that tells a per-person consumer to
+    /// decline rather than reach for a shared record. A dispatch path that
+    /// cannot evaluate an assertion (no gateway configured, so no grant map to
+    /// check) needs to be able to say this, and the alternative — falling back
+    /// to `untrusted()`/`default()` — would quietly reinstate the service-scoped
+    /// path for exactly the requests that failed verification.
+    ///
+    /// ```
+    /// use terminus_rs::tool::{CallerContext, PersonScope};
+    /// let c = CallerContext::unidentified();
+    /// assert!(!c.may_infer_from_calendar() && !c.may_infer_from_routine());
+    /// assert!(c.media_account().is_none());
+    /// assert_eq!(c.person_scope(), PersonScope::Unidentified);
+    /// assert_ne!(c, CallerContext::untrusted());
+    /// ```
+    pub const fn unidentified() -> Self {
+        Self {
+            may_infer_from_calendar: false,
+            may_infer_from_routine: false,
+            media_account: None,
+            person: PersonScope::Unidentified,
+        }
     }
 
     /// Build a context from a real, per-source `AllowlistPolicy` decision.
@@ -179,7 +296,48 @@ impl CallerContext {
         may_infer_from_calendar: bool,
         may_infer_from_routine: bool,
     ) -> Self {
-        Self { may_infer_from_calendar, may_infer_from_routine, media_account: None }
+        Self {
+            may_infer_from_calendar,
+            may_infer_from_routine,
+            media_account: None,
+            person: PersonScope::Service,
+        }
+    }
+
+    /// TERM #595: attach the human-identity scope the gateway resolved for this
+    /// request.
+    ///
+    /// Same `pub(super)` boundary and same reason as
+    /// [`Self::from_allowlist_decision`]: only `crate::gateway_framework` may
+    /// say which HUMAN a caller is, because saying so requires having checked
+    /// the on-behalf-of grant, the signature, the principal binding and the
+    /// roster. A tool holding a [`PersonScope::Person`] therefore has proof all
+    /// four happened.
+    ///
+    /// [`PersonScope::Unidentified`] additionally CLEARS every entitlement and
+    /// the media account, in this one place, so that a refused assertion cannot
+    /// be less privileged in name only: there is no path where a caller carries
+    /// `Unidentified` and still holds operator context.
+    pub(super) fn with_person_scope(mut self, scope: PersonScope) -> Self {
+        if scope.is_unidentified() {
+            self.may_infer_from_calendar = false;
+            self.may_infer_from_routine = false;
+            self.media_account = None;
+        }
+        self.person = scope;
+        self
+    }
+
+    /// TERM #595: intern a roster-drawn person identifier into a
+    /// [`PersonScope::Person`].
+    ///
+    /// `pub(super)` for the same reason as the constructors above. The value
+    /// MUST already have been checked against the operator's roster by
+    /// [`crate::mesh::person::verify`] — that is what bounds the intern table
+    /// (see the type doc's interning note), and passing an unchecked,
+    /// caller-varying string here would turn it into an unbounded leak.
+    pub(super) fn person_scope_for(person: &str) -> PersonScope {
+        PersonScope::Person(account_intern::intern(person))
     }
 
     /// TERM #576: attach the household media account the gateway resolved for
@@ -212,7 +370,19 @@ impl CallerContext {
         may_infer_from_calendar: bool,
         may_infer_from_routine: bool,
     ) -> Self {
-        Self { may_infer_from_calendar, may_infer_from_routine, media_account: None }
+        Self {
+            may_infer_from_calendar,
+            may_infer_from_routine,
+            media_account: None,
+            person: PersonScope::Service,
+        }
+    }
+
+    /// TERM #595 TEST-ONLY: build a person-scoped context without standing up a
+    /// gateway, an allowlist and a signing key. `cfg(test)` only.
+    #[cfg(test)]
+    pub(crate) fn with_person_for_test_only(person: &str) -> Self {
+        Self::untrusted().with_person_scope(Self::person_scope_for(person))
     }
 
     /// TERM #576 TEST-ONLY counterpart of [`Self::entitled_for_test_only`] for
@@ -246,6 +416,22 @@ impl CallerContext {
     /// last rather than on who was asking.
     pub fn media_account(&self) -> Option<&str> {
         self.media_account
+    }
+
+    /// TERM #595: which human this turn is being run for.
+    ///
+    /// A consumer that scopes per-person data MUST match on the variant rather
+    /// than calling `.person()` and treating `None` as "use the shared record":
+    /// [`PersonScope::Unidentified`] also yields `None`, and it means the
+    /// opposite of "no person was involved".
+    pub const fn person_scope(&self) -> PersonScope {
+        self.person
+    }
+
+    /// Shorthand for [`PersonScope::person`] — the human identifier, when
+    /// there is a trustworthy one.
+    pub const fn person(&self) -> Option<&'static str> {
+        self.person.person()
     }
 }
 
@@ -316,6 +502,11 @@ mod tests {
             // TERM #576: the media account is part of the same fail-closed
             // surface — a caller nobody vouched for IS nobody.
             assert_eq!(ctx.media_account(), None);
+            // TERM #595: and it is not person-scoped either. Note this is
+            // `Service`, NOT `Unidentified` — nobody attempted an assertion, so
+            // the pre-#595 behaviour is the honest answer.
+            assert_eq!(ctx.person_scope(), PersonScope::Service);
+            assert_eq!(ctx.person(), None);
         }
         assert_eq!(CallerContext::default(), CallerContext::untrusted());
     }
@@ -365,6 +556,78 @@ mod tests {
         let again = CallerContext::untrusted().with_media_account(Some("acct-copy")); // pii-test-fixture: invented account id
         assert_eq!(again.media_account(), Some("acct-copy"));
         assert!(std::ptr::eq(again.media_account().unwrap(), ctx.media_account().unwrap()));
+    }
+
+    /// TERM #595 POSITIVE CONTROL: a person-scoped context really does carry
+    /// its own person, and two people are distinguishable. A build that
+    /// refused every assertion would fail here.
+    #[test]
+    fn a_person_scoped_context_carries_that_person() {
+        let alice = CallerContext::with_person_for_test_only("alice"); // pii-test-fixture: invented household name
+        let bob = CallerContext::with_person_for_test_only("bob"); // pii-test-fixture
+        assert_eq!(alice.person(), Some("alice"));
+        assert_eq!(bob.person(), Some("bob"));
+        assert_ne!(alice.person(), bob.person());
+        assert!(alice.person_scope().is_person());
+        assert!(!alice.person_scope().is_unidentified());
+    }
+
+    /// TERM #595: a REFUSED assertion is strictly less than the service
+    /// identity — the clearing happens in `with_person_scope`, in one place, so
+    /// there is no path that carries `Unidentified` alongside entitlements.
+    #[test]
+    fn an_unidentified_scope_clears_every_entitlement() {
+        let entitled = CallerContext::from_allowlist_decision(true, true)
+            .with_media_account(Some("acct-operator")); // pii-test-fixture: invented account id
+        assert!(entitled.may_infer_from_calendar() && entitled.may_infer_from_routine());
+        assert_eq!(entitled.media_account(), Some("acct-operator"));
+
+        let refused = entitled.with_person_scope(PersonScope::Unidentified);
+        assert!(!refused.may_infer_from_calendar(), "a refused identity keeps no calendar entitlement");
+        assert!(!refused.may_infer_from_routine(), "a refused identity keeps no routine entitlement");
+        assert_eq!(refused.media_account(), None, "a refused identity is nobody's account");
+        assert_eq!(refused.person(), None);
+        assert!(refused.person_scope().is_unidentified());
+    }
+
+    /// TERM #595: `Unidentified` and `Service` must never compare or read as
+    /// the same thing — collapsing them is the fail-open bug the tri-state
+    /// exists to prevent.
+    #[test]
+    fn unidentified_is_not_the_service_scope() {
+        let service = CallerContext::from_allowlist_decision(true, true);
+        let refused = service.with_person_scope(PersonScope::Unidentified);
+        assert_ne!(service.person_scope(), refused.person_scope());
+        assert_ne!(service, refused);
+        // Both yield `None` from `person()` — which is exactly why a consumer
+        // that scopes data must match on the variant, and why this test exists.
+        assert_eq!(service.person(), None);
+        assert_eq!(refused.person(), None);
+    }
+
+    /// TERM #595: the person rides the same unforgeable boundary as the weather
+    /// entitlements and the media account — `from_allowlist_decision` alone
+    /// never sets it, and the constructor that does is `pub(super)`.
+    #[test]
+    fn a_person_is_absent_unless_the_gateway_attaches_one() {
+        assert_eq!(
+            CallerContext::from_allowlist_decision(true, true).person_scope(),
+            PersonScope::Service
+        );
+    }
+
+    /// TERM #595: interning keeps the type `Copy` and is pointer-stable, so a
+    /// person identifier costs nothing to carry through dispatch.
+    #[test]
+    fn person_scope_is_copy_and_interned() {
+        fn by_value(c: CallerContext) -> Option<&'static str> {
+            c.person()
+        }
+        let ctx = CallerContext::with_person_for_test_only("copy-person"); // pii-test-fixture
+        assert_eq!(by_value(ctx), Some("copy-person"));
+        assert_eq!(by_value(ctx), Some("copy-person"));
+        let again = CallerContext::with_person_for_test_only("copy-person"); // pii-test-fixture
+        assert!(std::ptr::eq(again.person().unwrap(), ctx.person().unwrap()));
     }
 
     #[test]

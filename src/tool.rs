@@ -46,7 +46,7 @@ impl ToolOutput {
 /// [`CallerContext::untrusted`] and `Default`, both fully unentitled.
 ///
 /// See that module for the full contract.
-pub use crate::gateway_framework::caller_context::CallerContext;
+pub use crate::gateway_framework::caller_context::{CallerContext, PersonScope};
 
 /// A Rust tool implementation that can be registered in the ToolRegistry
 /// and used as a fallback when the fleet-host MCP backend is unavailable.

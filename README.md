@@ -235,6 +235,60 @@ adding a principal: [docs/reference/tool-grants.md](docs/reference/tool-grants.m
 | `TERMINUS_GATEWAY_ALLOWLIST_JSON` | `{}` (deny all) | The grant map: `identity -> grant` |
 | `TERMINUS_GATEWAY_GUEST_IDENTITIES` | unset | Comma-separated identities that get the guest/family baseline |
 
+#### Telling two humans apart behind one service identity (TERM #595)
+
+Every warning above about TERM #577 has the same root: a gateway `Principal`
+names a **service**, and every person who talks to the assistant arrives as
+`lumina`. TERM #595 is the mechanism that lets a turn say *which human it is
+for*, in a way no hop in between can invent or alter.
+
+A trusted front door — one that is mutually authenticated (mTLS/tailnet) **and**
+holds the `admin:assert_person` grant — sets `X-Terminus-On-Behalf-Of: <person>`
+on its request. Terminus translates that, at that door only, into a **signed,
+short-lived assertion bound to the asserting principal**, which downstream hops
+relay but cannot forge (they hold no signing key). At the tool-dispatch door the
+assertion is verified, re-bound to the principal on *that* hop, and turned into
+the caller's person scope.
+
+What the person scope changes today:
+
+* **Media personalisation** resolves from the *person* (`person:<id>` in
+  `TERMINUS_MEDIA_ACCOUNT_MAP`) with **no fallback** to the principal's account.
+* **Calendar/routine entitlements** become the *intersection* of the service's
+  grants and that person's own `person:<id>` grant — a person can only ever
+  **narrow** what the service could already do, never widen it.
+
+Fail-closed, in the one direction that matters: absent, blank, malformed,
+expired, mis-bound, or asserted by a principal without the grant all resolve to
+**less** privilege than the bare service identity — never a silent fallback to
+it. An `X-Terminus-On-Behalf-Of` request that cannot be honoured is **refused
+with `403`**, because quietly running it as the service would be a *widening*.
+A client-supplied copy of either header is stripped on every relay hop; the only
+value that ever reaches the next hop is the one the server set.
+
+Both settings default to unset, and an unconfigured deployment behaves exactly
+as it did before — the roster is a **closed list**, so an unlisted or misspelled
+person is refused rather than quietly given a fresh empty identity.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TERMINUS_PERSON_IDENTITIES` | unset (nobody assertable) | Comma-separated household person identifiers |
+| `TERMINUS_PERSON_ASSERTION_KEY` | unset (mechanism inert **and closed**) | HS256 key for signing/verifying person assertions; materialized from the secret store |
+
+Grant a front door the right to speak for people with an **admin-namespaced**
+entry — a tool wildcard (`"*"`) deliberately does **not** confer it:
+
+```json
+{"lumina": {"allow": ["*", "admin:assert_person"]},
+ "person:alex": ["weather", "media_recommend"]}
+```
+
+**Scope, stated plainly:** this ships the trusted transport, its authorization,
+and the threading into the caller context. Lumina does not yet *send*
+`X-Terminus-On-Behalf-Of`, and Chord does not yet relay the signed assertion, so
+end-to-end propagation is not live until those land. Until then every turn is
+still service-scoped — the same posture as before, not a weaker one.
+
 ### Severe-weather watch — acting before it matters
 
 `weather_severe_alerts` answers *"is something coming that I need to act on?"*, as

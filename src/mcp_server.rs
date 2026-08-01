@@ -429,6 +429,57 @@ async fn handle_inference_proxy(
         None => None,
     };
 
+    // TERM #595: this front door is the ONE place a human identity can enter the
+    // agent path with any authority behind it -- it is the only hop where the
+    // asserting caller is mutually authenticated (mTLS/tailnet) AND its right to
+    // speak for someone else is a grant-map decision. So the plaintext
+    // `X-Terminus-On-Behalf-Of` request is translated HERE into a signed,
+    // principal-bound assertion; downstream of this point the plaintext form has
+    // no meaning at all (it is stripped, see
+    // `crate::inference_proxy::is_unforwardable_request_header`).
+    //
+    // If the caller ASKED to act for a person and we cannot mint that assertion
+    // -- no gateway, no grant, no signing key, or a person who is not on the
+    // roster -- the request is REFUSED. It is deliberately not downgraded to an
+    // anonymous service-scoped turn: the caller asked for something NARROWER
+    // than the service identity, and quietly running it as the service would be
+    // a silent WIDENING, which is the one direction this whole item exists to
+    // rule out.
+    let person_assertion = match crate::mesh::person::on_behalf_of_header(&headers) {
+        None => None,
+        Some(requested) => {
+            let minted = state
+                .gateway
+                .as_ref()
+                .map(|gw| gw.mint_person_assertion(principal.as_ref(), requested));
+            match minted {
+                Some(Ok(token)) => Some(token),
+                other => {
+                    let reason = match other {
+                        Some(Err(e)) => e.to_string(),
+                        _ => "this process has no gateway to authorize an on-behalf-of assertion"
+                            .to_string(),
+                    };
+                    tracing::warn!(
+                        principal = principal.as_ref().map(Principal::name).unwrap_or("<none>"),
+                        reason = %reason,
+                        "TERM #595: refusing an on-behalf-of request rather than running it as the service"
+                    );
+                    if let Some(ctx) = gate_ctx {
+                        ctx.record_result(false, Some("on-behalf-of assertion refused"));
+                    }
+                    return (
+                        StatusCode::FORBIDDEN,
+                        [("content-type", "application/json")],
+                        json!({"error": "on-behalf-of assertion refused", "detail": reason})
+                            .to_string(),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
     let response = match &state.inference_proxy {
         Some(client) => {
             // MESH-07: the identity forwarded to Chord is now the resolved
@@ -436,7 +487,7 @@ async fn handle_inference_proxy(
             // configured), not the raw mTLS cert CN -- same source of truth
             // the gate above just used.
             let caller_identity = principal.as_ref().map(|p| p.name());
-            client.forward(path, headers, body, caller_identity).await
+            client.forward(path, headers, body, caller_identity, person_assertion.as_deref()).await
         }
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -764,6 +815,23 @@ async fn handle_mcp(
         identity.as_ref().map(|Extension(i)| i),
         tailnet.as_ref().map(|Extension(t)| t),
     );
+
+    // TERM #595: and WHICH HUMAN this turn is being run for, if a trusted
+    // principal said so. Resolved ONCE per request from the same server-verified
+    // principal above plus a SIGNED, principal-bound assertion -- never from a
+    // bare header value, which is why an intermediary that merely relays the
+    // token (Chord) cannot invent or alter one.
+    //
+    // The tri-state matters: `None` (no header) is the unchanged, service-scoped
+    // pre-#595 path; `Rejected` is strictly LESS privilege than that. A gateway
+    // that is not configured at all cannot check a grant, so a token presented
+    // to it is refused rather than honoured -- absence of a policy is never a
+    // reason to trust a claim.
+    let asserted = match (&state.gateway, crate::mesh::person::assertion_header(&headers)) {
+        (Some(gateway), token) => gateway.assert_person(principal.as_ref(), token),
+        (None, None) => crate::mesh::AssertedPerson::None,
+        (None, Some(_)) => crate::mesh::AssertedPerson::Rejected,
+    };
 
     let parsed: Result<Value, _> = serde_json::from_slice(&body);
     let req = match parsed {
@@ -1262,15 +1330,47 @@ async fn handle_mcp(
                     // authorized above decides what OPERATOR context a tool may
                     // use on this caller's behalf. No gateway = no verified
                     // identity = the fail-closed default.
-                    state
-                        .gateway
-                        .as_ref()
-                        .map(|gw| gw.caller_context(principal.as_ref()))
-                        .unwrap_or_default(),
-                    // LOCREG-01: and WHICH per-caller record is theirs, from that
-                    // same principal. `None` when there is none — a caller-keyed
-                    // tool declines rather than falling back to a shared record.
-                    principal.as_ref().and_then(crate::locations::CallerKey::for_principal),
+                    //
+                    // TERM #595: and, layered on top of that decision, WHICH
+                    // HUMAN the turn is for. A verified person NARROWS the
+                    // context (entitlements are intersected with that person's
+                    // own grants, and the media account resolves from the person
+                    // with no fallback to the principal); a refused assertion
+                    // strips it below the service identity. See
+                    // `GatewayFramework::caller_context_for_person`.
+                    match &state.gateway {
+                        Some(gw) => gw.caller_context_for_person(principal.as_ref(), &asserted),
+                        // No gateway: no grant map, so nothing could have been
+                        // verified. An unevaluated assertion must land BELOW the
+                        // service default, not on it.
+                        None if matches!(asserted, crate::mesh::AssertedPerson::None) => {
+                            crate::tool::CallerContext::default()
+                        }
+                        None => crate::tool::CallerContext::unidentified(),
+                    },
+                    // LOCREG-01 x TERM #595: and WHICH per-caller record is
+                    // theirs. The person, when one was verified, is part of the
+                    // key -- so two people behind the same service principal
+                    // file under different storage keys and neither can read the
+                    // other's saved home.
+                    //
+                    // A REJECTED assertion gets NO key at all. Falling back to
+                    // the service key here would hand the shared, pre-#577
+                    // record to exactly the caller whose identity we just
+                    // refused to believe -- the same inversion `for_person`
+                    // documents for a blank person, arrived at from the other
+                    // direction. No key means `Lookup::Denied`, which is the
+                    // only safe answer to "who is this?" when the answer failed
+                    // verification.
+                    match &asserted {
+                        crate::mesh::AssertedPerson::None => {
+                            principal.as_ref().and_then(crate::locations::CallerKey::for_principal)
+                        }
+                        crate::mesh::AssertedPerson::Verified(vp) => {
+                            crate::locations::CallerKey::for_person(vp.principal(), vp.person())
+                        }
+                        crate::mesh::AssertedPerson::Rejected => None,
+                    },
                 )
                 .await
             {

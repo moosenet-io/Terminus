@@ -83,6 +83,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::mesh::person::{self, AssertedPerson, PersonAssertionError, VerifiedPerson};
 use crate::mesh::Principal;
 use audit::{AuditDecision, AuditEntry, AuditResult};
 use rate_limit::{rate_limit_key, InProcessRateLimiter, RateLimitDecision, RateLimiter};
@@ -242,6 +243,44 @@ pub const CALENDAR_CONTEXT_PROBE: &str = "google_calendar_today";
 /// with the assistant is authorized as `lumina`, which holds this tool, so the
 /// gate does not contain them. See TERM #577.
 pub const ROUTINE_CONTEXT_PROBE: &str = "commute_estimate";
+
+/// TERM #595: the grant that lets a principal speak FOR someone else.
+///
+/// Deliberately [`ADMIN_ACTION_PREFIX`]-namespaced, which is not cosmetic: an
+/// admin-namespaced action is checked by [`AllowlistPolicy::is_allowed_admin`],
+/// and a generic tool wildcard (`"*"`) does NOT satisfy it. So the two
+/// scaffolded service identities, whose posture is `allow: ["*"]` minus the
+/// sensitive deny prefixes, do not silently acquire the ability to impersonate
+/// household members the moment this ships — the operator has to write it down.
+///
+/// Why this is an authorization decision and not a hardcoded "lumina may":
+/// which services front humans is deployment shape, not a law of the system.
+/// Today it is `lumina`; tomorrow it is a kiosk, a second assistant, a voice
+/// endpoint. Encoding it in the grant map means the answer lives in the one
+/// place an operator already edits, and changes without a rebuild.
+///
+/// Note what this grant does and does NOT confer. It confers the ability to
+/// NARROW a turn to a specific human. It never widens anything: a person-scoped
+/// caller's entitlements are the INTERSECTION of the service's and the person's
+/// (see [`GatewayFramework::caller_context_for_person`]), so the worst a
+/// mis-granted principal can do is impersonate a household member who, by
+/// construction, can reach no more than that principal already could.
+pub const PERSON_ASSERTION_ACTION: &str = "admin:assert_person";
+
+/// TERM #595: the grant-map key namespace for a HUMAN, as distinct from a
+/// service principal.
+///
+/// A person's grants are written as `"person:alice"`, so a household member can
+/// never be confused with — or accidentally inherit the entry of — a service of
+/// the same name. Default-deny still applies: a person with no entry at all is
+/// allowed nothing, which is why a person-scoped caller starts from zero
+/// operator context rather than from the service's.
+pub const PERSON_IDENTITY_PREFIX: &str = "person:";
+
+/// The grant-map / account-map key for a household person identifier.
+pub fn person_identity_key(person: &str) -> String {
+    format!("{PERSON_IDENTITY_PREFIX}{person}")
+}
 
 /// TRTR-05: the GUEST/FAMILY baseline surface — the exact set of tool names a
 /// non-operator household identity (a family member, a houseguest) may call.
@@ -1783,6 +1822,149 @@ impl GatewayFramework {
         // every guest unless the operator deliberately binds one — resolve to
         // `None`, the unentitled path. See `crate::media::account_map`.
         .with_media_account(crate::media::account_map::account_for_principal(p.name()).as_deref())
+    }
+
+    /// TERM #595: may this principal speak on behalf of a named human?
+    ///
+    /// The one authorization question the whole mechanism rests on, answered
+    /// from the same grant map every other decision comes from. Fail closed on
+    /// every ambiguity: no verified principal at all ⇒ `false`; a principal
+    /// with no entry ⇒ `false` by default-deny; a principal with a broad tool
+    /// wildcard ⇒ still `false`, because [`PERSON_ASSERTION_ACTION`] is
+    /// admin-namespaced and `"*"` does not reach it.
+    pub fn may_assert_person(&self, principal: Option<&Principal>) -> bool {
+        match principal {
+            None => false,
+            Some(p) => self.inner.allowlist.is_allowed_admin(p.name(), PERSON_ASSERTION_ACTION),
+        }
+    }
+
+    /// TERM #595: mint a signed, principal-bound person assertion — the ONLY
+    /// production path to [`crate::mesh::person::mint`].
+    ///
+    /// This is where "may you assert?" and "here is your assertion" are welded
+    /// together. `crate::mesh::person::mint` is `pub(crate)` and makes no
+    /// authorization decision of its own, so routing every mint through this
+    /// method is what guarantees a token can only exist for a principal that
+    /// actually held [`PERSON_ASSERTION_ACTION`] at mint time.
+    ///
+    /// Errors are returned, never swallowed into `None`: an ingress that cannot
+    /// mint must drop the request's identity claim loudly (and thereby send the
+    /// turn downstream as service-scoped or refused), not quietly pretend the
+    /// caller never asked.
+    pub fn mint_person_assertion(
+        &self,
+        principal: Option<&Principal>,
+        person: &str,
+    ) -> Result<String, PersonAssertionError> {
+        let Some(p) = principal else {
+            return Err(PersonAssertionError::BlankPrincipal);
+        };
+        if !self.may_assert_person(principal) {
+            // Same error as a principal-bound verification failure, on purpose:
+            // an un-granted asserter learns only that it may not, never whether
+            // the person it named exists.
+            return Err(PersonAssertionError::PrincipalMismatch);
+        }
+        person::mint(p.name(), person)
+    }
+
+    /// TERM #595: turn a presented assertion token into an
+    /// [`AssertedPerson`], applying the grant check and the signature check
+    /// together.
+    ///
+    /// `token`'s tri-state is load-bearing and mirrors
+    /// [`crate::mesh::person::assertion_header`]:
+    /// * `None` — no header at all ⇒ [`AssertedPerson::None`], the unchanged
+    ///   pre-#595 service-scoped path.
+    /// * `Some(_)` — an assertion was attempted. It resolves to
+    ///   [`AssertedPerson::Verified`] only if the presenting principal holds
+    ///   the grant AND the token verifies AND it is bound to that same
+    ///   principal. Anything else is [`AssertedPerson::Rejected`] — strictly
+    ///   less privilege, never a fallback to the service identity.
+    ///
+    /// The grant is checked BEFORE the signature, so a principal without it
+    /// cannot use this as an oracle for whether a captured token is still
+    /// valid.
+    pub fn assert_person(&self, principal: Option<&Principal>, token: Option<&str>) -> AssertedPerson {
+        let Some(token) = token else {
+            return AssertedPerson::None;
+        };
+        if !self.may_assert_person(principal) {
+            tracing::warn!(
+                principal = principal.map(Principal::name).unwrap_or("<none>"),
+                "TERM #595: a person assertion was presented by a principal without the \
+                 on-behalf-of grant; refusing (least privilege, NOT service identity)"
+            );
+            return AssertedPerson::Rejected;
+        }
+        match person::verify(token, principal.map(Principal::name)) {
+            Ok(v) => AssertedPerson::Verified(v),
+            Err(e) => {
+                tracing::warn!(
+                    principal = principal.map(Principal::name).unwrap_or("<none>"),
+                    error = %e,
+                    "TERM #595: refusing an unverifiable person assertion"
+                );
+                AssertedPerson::Rejected
+            }
+        }
+    }
+
+    /// TERM #595: the person-aware counterpart of [`Self::caller_context`], and
+    /// the only production path that can produce a person-scoped context.
+    ///
+    /// # The rule: a person NARROWS, it never widens
+    ///
+    /// For a verified person, each entitlement is the INTERSECTION of what the
+    /// SERVICE principal may do and what THAT PERSON may do — both read from
+    /// the same [`AllowlistPolicy`], the person under the
+    /// [`PERSON_IDENTITY_PREFIX`] key namespace. Since a person with no entry
+    /// is default-denied, the default outcome of identifying a human is LESS
+    /// operator context than the anonymous service call would have had, not
+    /// more. That is the correct direction for a change whose entire purpose is
+    /// to stop one household member being answered as another.
+    ///
+    /// The media account is resolved from the PERSON, not the principal, with
+    /// no fallback to the principal's account — which is the specific defect
+    /// this closes for `media_recommend`: one mapping was serving whoever was
+    /// in the room.
+    ///
+    /// [`AssertedPerson::Rejected`] yields the service context stripped to
+    /// [`PersonScope::Unidentified`](caller_context::PersonScope::Unidentified)
+    /// — see [`caller_context::CallerContext::with_person_scope`], which clears
+    /// every entitlement in one place so "less privilege" cannot be true in
+    /// name only.
+    pub fn caller_context_for_person(
+        &self,
+        principal: Option<&Principal>,
+        asserted: &AssertedPerson,
+    ) -> caller_context::CallerContext {
+        let base = self.caller_context(principal);
+        match asserted {
+            AssertedPerson::None => base,
+            AssertedPerson::Rejected => {
+                base.with_person_scope(caller_context::PersonScope::Unidentified)
+            }
+            AssertedPerson::Verified(v) => self.person_scoped_context(base, v),
+        }
+    }
+
+    /// The verified-person half of [`Self::caller_context_for_person`], split
+    /// out to keep the intersection rule readable in one screen.
+    fn person_scoped_context(
+        &self,
+        base: caller_context::CallerContext,
+        verified: &VerifiedPerson,
+    ) -> caller_context::CallerContext {
+        let key = person_identity_key(verified.person());
+        let calendar = base.may_infer_from_calendar() && self.permits_tool(&key, CALENDAR_CONTEXT_PROBE);
+        let routine = base.may_infer_from_routine() && self.permits_tool(&key, ROUTINE_CONTEXT_PROBE);
+        caller_context::CallerContext::from_allowlist_decision(calendar, routine)
+            // Resolved from the PERSON — never the principal, and with no
+            // fallback to it. An unmapped person is nobody's account.
+            .with_media_account(crate::media::account_map::account_for_principal(&key).as_deref())
+            .with_person_scope(caller_context::CallerContext::person_scope_for(verified.person()))
     }
 
     pub fn filter_catalog_for_principal(&self, principal: Option<&Principal>, tools: Vec<Value>) -> Vec<Value> {
@@ -3653,5 +3835,274 @@ mod tests {
         for good in ["moose", "lumina", "guest-alex", "ct322_relay", "harmony"] {
             assert!(validate_identity_key(good).is_ok(), "{good:?} is a valid principal name");
         }
+    }
+}
+
+/// TERM #595: end-to-end behaviour of the human-identity propagation, at the
+/// layer that actually makes the decisions.
+///
+/// These are the tests that answer the question the item was filed for: can two
+/// humans behind ONE service principal be told apart, and does everything fail
+/// in the safe direction when they cannot be?
+#[cfg(test)]
+mod person_scope_tests {
+    use super::*;
+    use crate::mesh::person::{self, AssertedPerson, SIGNING_KEY_ENV};
+    use crate::mesh::PrincipalSource;
+    use serial_test::serial;
+
+    const KEY: &str = "term595-gateway-test-key"; // pii-test-fixture: invented test key
+
+    fn principal(name: &str) -> Principal {
+        Principal::new(name, PrincipalSource::MtlsCert)
+    }
+
+    /// A gateway where `lumina` may assert on behalf of a person, `harmony`
+    /// may not, and each household member has whatever grants the test needs.
+    fn framework(entries: &[(&str, &[&str])]) -> GatewayFramework {
+        let mut map = HashMap::new();
+        for (id, actions) in entries {
+            map.insert(
+                (*id).to_string(),
+                Grant::List(actions.iter().map(|s| (*s).to_string()).collect()),
+            );
+        }
+        GatewayFramework::new(
+            AllowlistPolicy::new(map),
+            Arc::new(rate_limit::InProcessRateLimiter::new(1000, 1000.0)),
+        )
+    }
+
+    fn configure(roster: &str, account_map: &str) {
+        std::env::set_var(SIGNING_KEY_ENV, KEY);
+        std::env::set_var(person::ROSTER_ENV, roster);
+        std::env::set_var(crate::media::account_map::ACCOUNT_MAP_ENV, account_map);
+    }
+
+    fn unconfigure() {
+        std::env::remove_var(SIGNING_KEY_ENV);
+        std::env::remove_var(person::ROSTER_ENV);
+        std::env::remove_var(crate::media::account_map::ACCOUNT_MAP_ENV);
+    }
+
+    /// The grant-map posture used by most of these tests: `lumina` fronts
+    /// humans and holds every probe; alice may use the calendar probe, bob may
+    /// not; each has their own media account.
+    fn household() -> GatewayFramework {
+        configure(
+            "alice,bob", // pii-test-fixture: invented household names
+            r#"{"person:alice":"acct-alice","person:bob":"acct-bob","lumina":"acct-service"}"#, // pii-test-fixture: invented account ids
+        );
+        framework(&[
+            (
+                "lumina",
+                &[CALENDAR_CONTEXT_PROBE, ROUTINE_CONTEXT_PROBE, PERSON_ASSERTION_ACTION],
+            ),
+            ("person:alice", &[CALENDAR_CONTEXT_PROBE]), // pii-test-fixture
+            ("person:bob", &[]),                         // pii-test-fixture
+            ("harmony", &[CALENDAR_CONTEXT_PROBE, ROUTINE_CONTEXT_PROBE]),
+        ])
+    }
+
+    /// POSITIVE CONTROL — the test that must fail if this shipped as
+    /// deny-everyone. A properly asserted identity gets ITS OWN person scope,
+    /// ITS OWN media account, and ITS OWN entitlements.
+    #[test]
+    #[serial]
+    fn a_properly_asserted_identity_gets_its_own_records_and_entitlements() {
+        let fw = household();
+        let p = principal("lumina");
+
+        let token = fw.mint_person_assertion(Some(&p), "alice").expect("lumina may assert"); // pii-test-fixture
+        let asserted = fw.assert_person(Some(&p), Some(&token));
+        assert!(matches!(asserted, AssertedPerson::Verified(_)), "must verify: {asserted:?}");
+
+        let ctx = fw.caller_context_for_person(Some(&p), &asserted);
+        assert_eq!(ctx.person(), Some("alice")); // pii-test-fixture
+        assert_eq!(ctx.media_account(), Some("acct-alice")); // pii-test-fixture
+        assert!(ctx.may_infer_from_calendar(), "alice holds the calendar probe");
+        unconfigure();
+    }
+
+    /// THE ITEM, IN ONE TEST: two humans behind the SAME service principal get
+    /// different media personalisation and different weather-derived context.
+    /// Before TERM #595 both of these were identical, because both people were
+    /// `lumina`.
+    #[test]
+    #[serial]
+    fn two_people_behind_one_principal_cannot_read_each_others_context() {
+        let fw = household();
+        let p = principal("lumina");
+
+        let alice = fw.caller_context_for_person(
+            Some(&p),
+            &fw.assert_person(Some(&p), Some(&fw.mint_person_assertion(Some(&p), "alice").unwrap())), // pii-test-fixture
+        );
+        let bob = fw.caller_context_for_person(
+            Some(&p),
+            &fw.assert_person(Some(&p), Some(&fw.mint_person_assertion(Some(&p), "bob").unwrap())), // pii-test-fixture
+        );
+
+        // Media personalisation: each is their OWN account, and neither is the
+        // principal's. One mapping no longer serves whoever is in the room.
+        assert_eq!(alice.media_account(), Some("acct-alice")); // pii-test-fixture
+        assert_eq!(bob.media_account(), Some("acct-bob")); // pii-test-fixture
+        assert_ne!(alice.media_account(), bob.media_account());
+
+        // Weather-derived context: the entitlement gate now tells them apart.
+        assert!(alice.may_infer_from_calendar());
+        assert!(!bob.may_infer_from_calendar(), "bob was never granted the calendar probe");
+
+        // And the per-caller record key differs, which is what will keep one
+        // member's saved locations out of the other's answers once the registry
+        // consumes it.
+        assert_ne!(alice.person(), bob.person());
+        unconfigure();
+    }
+
+    /// A person NARROWS, never widens: the service holds both probes, but a
+    /// person only ever gets the intersection.
+    #[test]
+    #[serial]
+    fn a_person_can_only_narrow_what_the_service_could_already_do() {
+        let fw = household();
+        let p = principal("lumina");
+
+        let service = fw.caller_context(Some(&p));
+        assert!(service.may_infer_from_calendar() && service.may_infer_from_routine());
+
+        let alice = fw.caller_context_for_person(
+            Some(&p),
+            &fw.assert_person(Some(&p), Some(&fw.mint_person_assertion(Some(&p), "alice").unwrap())), // pii-test-fixture
+        );
+        assert!(alice.may_infer_from_calendar(), "granted to both service and person");
+        assert!(
+            !alice.may_infer_from_routine(),
+            "the service holds the routine probe but alice does not — intersection, not union"
+        );
+        unconfigure();
+    }
+
+    /// A principal WITHOUT the on-behalf-of grant cannot assert an identity,
+    /// even with a structurally perfect token.
+    #[test]
+    #[serial]
+    fn a_principal_without_the_grant_cannot_assert_an_identity() {
+        let fw = household();
+        let lumina = principal("lumina");
+        let harmony = principal("harmony");
+
+        assert!(fw.may_assert_person(Some(&lumina)));
+        assert!(!fw.may_assert_person(Some(&harmony)), "harmony fronts no humans");
+        assert!(!fw.may_assert_person(None), "no verified principal, no assertion");
+
+        // It cannot mint one...
+        assert!(fw.mint_person_assertion(Some(&harmony), "alice").is_err()); // pii-test-fixture
+        // ...and it cannot REPLAY one minted for a principal that could.
+        let token = fw.mint_person_assertion(Some(&lumina), "alice").unwrap(); // pii-test-fixture
+        assert_eq!(fw.assert_person(Some(&harmony), Some(&token)), AssertedPerson::Rejected);
+
+        let ctx = fw.caller_context_for_person(Some(&harmony), &AssertedPerson::Rejected);
+        assert!(!ctx.may_infer_from_calendar() && !ctx.may_infer_from_routine());
+        assert_eq!(ctx.media_account(), None);
+        assert!(ctx.person_scope().is_unidentified());
+        unconfigure();
+    }
+
+    /// A WILDCARD tool grant does not confer the right to impersonate. This is
+    /// what makes the scaffolded `lumina`/`harmony` posture (`allow: ["*"]`
+    /// minus deny prefixes) safe on the day this ships.
+    #[test]
+    #[serial]
+    fn a_tool_wildcard_does_not_confer_the_on_behalf_of_grant() {
+        configure("alice", "{}"); // pii-test-fixture
+        let fw = framework(&[("lumina", &["*"])]);
+        let p = principal("lumina");
+        assert!(fw.permits_tool("lumina", CALENDAR_CONTEXT_PROBE), "the wildcard grants tools");
+        assert!(
+            !fw.may_assert_person(Some(&p)),
+            "but not the admin-namespaced on-behalf-of action"
+        );
+        unconfigure();
+    }
+
+    /// Absent, blank, malformed and unknown identities all land BELOW the
+    /// service identity — never on it.
+    #[test]
+    #[serial]
+    fn a_broken_identity_is_least_privilege_never_the_service_identity() {
+        let fw = household();
+        let p = principal("lumina");
+        let service = fw.caller_context(Some(&p));
+
+        // Absent: unchanged, service-scoped. This is the control that proves
+        // the cases below are a genuine DOWNGRADE and not the status quo.
+        let absent = fw.caller_context_for_person(Some(&p), &fw.assert_person(Some(&p), None));
+        assert_eq!(absent, service);
+        assert_eq!(absent.person_scope(), caller_context::PersonScope::Service);
+
+        for bad in ["", "   ", "not-a-token", "a.b.c"] {
+            let asserted = fw.assert_person(Some(&p), Some(bad));
+            assert_eq!(asserted, AssertedPerson::Rejected, "{bad:?} must be refused");
+            let ctx = fw.caller_context_for_person(Some(&p), &asserted);
+            assert!(!ctx.may_infer_from_calendar(), "{bad:?} must not keep operator context");
+            assert!(!ctx.may_infer_from_routine());
+            assert_eq!(ctx.media_account(), None);
+            assert_ne!(ctx, service, "a refused identity must NOT collapse onto the service context");
+        }
+
+        // A person who is not on the roster cannot be minted for at all.
+        assert!(fw.mint_person_assertion(Some(&p), "mallory").is_err()); // pii-test-fixture
+        unconfigure();
+    }
+
+    /// No silent widening of pre-existing service-scoped state: a person-scoped
+    /// caller does not inherit the SERVICE principal's media account, and the
+    /// person's key is a different string from the principal's, so nothing
+    /// filed under the old key is reachable under the new one by accident.
+    #[test]
+    #[serial]
+    fn a_person_never_inherits_the_service_principals_records() {
+        // `lumina` has an account; `carol` is on the roster but is mapped to
+        // nothing. The fail-closed answer is "nobody", NOT "the service's".
+        configure("carol", r#"{"lumina":"acct-service"}"#); // pii-test-fixture
+        let fw = framework(&[
+            ("lumina", &[CALENDAR_CONTEXT_PROBE, PERSON_ASSERTION_ACTION]),
+            ("person:carol", &[CALENDAR_CONTEXT_PROBE]), // pii-test-fixture
+        ]);
+        let p = principal("lumina");
+
+        assert_eq!(fw.caller_context(Some(&p)).media_account(), Some("acct-service")); // pii-test-fixture
+
+        let carol = fw.caller_context_for_person(
+            Some(&p),
+            &fw.assert_person(Some(&p), Some(&fw.mint_person_assertion(Some(&p), "carol").unwrap())), // pii-test-fixture
+        );
+        assert_eq!(
+            carol.media_account(),
+            None,
+            "an unmapped person is nobody's account — never a fallback to the principal's"
+        );
+
+        // The key namespaces cannot collide, which is what keeps a record
+        // written under `lumina` from being matched by a person named `lumina`.
+        assert_ne!(person_identity_key("lumina"), "lumina");
+        assert!(person_identity_key("carol").starts_with(PERSON_IDENTITY_PREFIX)); // pii-test-fixture
+        unconfigure();
+    }
+
+    /// Without a signing key the mechanism is inert AND CLOSED: nothing can be
+    /// minted, and anything presented is refused rather than waved through.
+    #[test]
+    #[serial]
+    fn an_unconfigured_signing_key_denies_rather_than_permits() {
+        let fw = household();
+        let p = principal("lumina");
+        let token = fw.mint_person_assertion(Some(&p), "alice").unwrap(); // pii-test-fixture
+
+        std::env::remove_var(SIGNING_KEY_ENV);
+        assert!(fw.mint_person_assertion(Some(&p), "alice").is_err()); // pii-test-fixture
+        assert_eq!(fw.assert_person(Some(&p), Some(&token)), AssertedPerson::Rejected);
+        unconfigure();
     }
 }

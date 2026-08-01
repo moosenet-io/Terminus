@@ -79,6 +79,8 @@ pub mod client_onboarding;
 pub mod identity;
 pub mod merge;
 pub mod onboarding;
+/// TERM #595: the signed, principal-bound human-identity assertion.
+pub mod person;
 pub mod principal;
 pub mod registry;
 
@@ -97,6 +99,7 @@ pub use onboarding::{
     onboard_upstream, MeshOnboardUpstream, OnboardingError, OnboardingRequest, OnboardingReport,
     TrustStatus,
 };
+pub use person::{AssertedPerson, PersonAssertionError, VerifiedPerson};
 pub use principal::{AuthError, Principal, PrincipalMap, PrincipalResolver, PrincipalSource};
 pub use registry::{
     MeshConfigError, ResolvedSecret, UpstreamRegistry, UpstreamServer, UpstreamTransport,
