@@ -320,20 +320,34 @@ Two properties are load-bearing rather than incidental:
   `size` with no sessions attached, a count that disagrees with the list — is
   `malformed`. A broken read that claimed "nobody is watching" would be the worst
   failure this tool could have, because on a dashboard it looks like an answer.
-  Stated explicitly for consumers, because *absent* and *null* are not the same shape:
+  Stated explicitly for consumers, because *absent*, *null* and *not-a-count* are not
+  the same shape:
 
-  > `status` is `idle` only when `MediaContainer.size == 0` **and**
-  > `MediaContainer.Metadata` is either **absent** or an **empty array**. An explicitly
-  > `null` `Metadata` is **`malformed`**, never `idle`, at every `size` including `0` —
-  > Plex omits the key when nothing is playing (`{"MediaContainer":{"size":0}}`) and
-  > emits no JSON `null` on any endpoint, so a null means the response was rewritten in
-  > transit and neither it nor the `size` beside it can be trusted.
+  > `status` is `idle` only when `MediaContainer.size` is **present** and is the whole
+  > number `0`, **and** `MediaContainer.Metadata` is either **absent** or an **empty
+  > array**. Everything else is `malformed`, never `idle`:
+  >
+  > - an explicitly `null` `Metadata`, at every `size` including `0` — Plex omits the
+  >   key when nothing is playing (`{"MediaContainer":{"size":0}}`) and emits no JSON
+  >   `null` on any endpoint, so a null means the response was rewritten in transit and
+  >   neither it nor the `size` beside it can be trusted;
+  > - an **absent** `size`, whatever `Metadata` does — Plex states a size on every
+  >   container it emits, so a missing one is the same evidence of an altered response;
+  > - a `size` that is **fractional, negative, or not a number** — a count of things is
+  >   a whole non-negative number, so `0.5` is not an imprecise count but an impossible
+  >   one, and it is never floored to `0`.
 - **`transcode_reason` may be null for a non-direct-play session.** It is non-null *iff*
   `decision != "direct_play"` **and** Plex supplied a `TranscodeSession`. Plex sometimes
   states the decision on `Media[0].Part[0]` with no transcode session to explain it, and
   no reason is invented for that case — a field whose job is to state a reason must not
   carry a guess. Consumers read `decision` as the discriminant for playback mode and
   render a null reason as "no reason given".
+- **Numeric fields split by meaning.** `season`, `episode` and `year` are ordinals: a
+  fractional value is dropped to `null` rather than truncated, so a consumer is never
+  shown an episode number the payload did not state. `progress_ms`, `duration_ms` and
+  `bandwidth_kbps` are measurements: a fractional value is rounded to the nearest whole
+  unit, because a half-millisecond is not worth a blank progress bar. `session_key` is
+  an opaque string and is never read as a number.
 - **Private by default.** Now-playing reveals who is home and what they are doing, in
   real time, so it is gated on the caller's entitlement (the same `CallerContext`
   mechanism `weather` uses for operator-context inference). A guest, an unknown caller,

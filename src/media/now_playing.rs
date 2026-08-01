@@ -26,6 +26,10 @@
 //! is `malformed` — see [`session_items`]. That line is drawn finely enough to
 //! separate an ABSENT `Metadata` key (idle at `size: 0`) from an explicitly
 //! `null` one (always malformed), because Plex omits keys and never nulls them.
+//! By the same evidence `size` itself is REQUIRED and must be a non-negative
+//! whole number: Plex states a size on every container it emits, so an absent
+//! one means the response was altered, and `0.5` sessions is not an imprecise
+//! count but an impossible one — neither is ever floored into `idle`.
 //!
 //! ## Never cached
 //!
@@ -142,12 +146,75 @@ fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
 }
 
-/// Plex is inconsistent about numeric-vs-string JSON (`sessionKey` is a
-/// string, `duration` an int, `Genre[].count` a string). Accept both.
+/// A JSON number read as an INTEGER, and only when it genuinely is one.
+///
+/// `serde_json::Number::as_i64` already fails on a float, so the interesting
+/// case is the fallback: `2.0` is the integer 2 and is accepted, while `2.5`
+/// is not an integer at all and is rejected rather than floored. The bounds
+/// check exists because `f64 as i64` SATURATES in Rust, so an out-of-range
+/// float would otherwise silently become `i64::MAX`.
+fn integral(n: &serde_json::Number) -> Option<i64> {
+    if let Some(i) = n.as_i64() {
+        return Some(i);
+    }
+    let f = n.as_f64()?;
+    (f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64)
+        .then(|| f as i64)
+}
+
+/// A COUNT or an ORDINAL — a whole number of things. Plex is inconsistent
+/// about numeric-vs-string JSON (`sessionKey` is a string, `duration` an int,
+/// `Genre[].count` a string), so both forms are accepted.
+///
+/// **A fractional value is rejected, never floored.** This is the accessor for
+/// `MediaContainer.size`, `parentIndex` (season), `index` (episode) and `year`
+/// — fields where a fraction has no meaning at all, so a fraction is evidence
+/// the value is not what we think it is rather than a value to round off. The
+/// earlier `n.as_f64().map(|f| f as i64)` fallback truncated: `size: 0.5`
+/// became `0` and rendered a house full of viewers as `idle`, and `index: 12.7`
+/// would have rendered as episode 12 — a specific, wrong, confident claim.
+/// Rejecting yields `None`, which for `size` is [`container_size`]'s malformed
+/// (below) and for a season/episode ordinal simply drops that component from
+/// the title, so `full_title` says "Show - Title" instead of inventing an
+/// `S04E12` that the payload never stated.
+///
+/// Contrast [`quantity_at`], which rounds — see the justification there.
 fn num_at(v: &Value, key: &str) -> Option<i64> {
     match v.get(key) {
-        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        Some(Value::Number(n)) => integral(n),
         Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// A measured QUANTITY with a unit — milliseconds (`duration`, `viewOffset`)
+/// or kilobits per second (`Session.bandwidth`) — as opposed to a count.
+///
+/// **These ROUND rather than reject, and the asymmetry with [`num_at`] is the
+/// point.** A count of 0.5 sessions is not a slightly-imprecise count, it is a
+/// statement that cannot be true, and acting on it means claiming an empty
+/// house. A duration of `2400000.5` ms is an ordinary measurement carrying
+/// sub-millisecond precision that nothing downstream renders: `progress_ms` /
+/// `duration_ms` feed a percentage rounded to one decimal place, and
+/// `bandwidth_kbps` is summed for a dashboard total. Rejecting those would
+/// blank a progress bar and drop a stream out of the bandwidth total over a
+/// half-millisecond — trading a harmless rounding for a visible hole. So the
+/// rule is per-field and follows the meaning: fractional COUNT ⇒ malformed,
+/// fractional MEASUREMENT ⇒ rounded to its nearest whole unit.
+///
+/// (`sessionKey` needs no decision here: Plex sends it as a string and the
+/// payload carries it through as an opaque string via `str_at`, so it is never
+/// interpreted as a number in the first place.)
+fn quantity_at(v: &Value, key: &str) -> Option<i64> {
+    fn round_in_range(f: f64) -> Option<i64> {
+        (f.is_finite() && f >= i64::MIN as f64 && f <= i64::MAX as f64).then(|| f.round() as i64)
+    }
+    match v.get(key) {
+        Some(Value::Number(n)) => integral(n).or_else(|| round_in_range(n.as_f64()?)),
+        Some(Value::String(s)) => {
+            let s = s.trim();
+            s.parse::<i64>().ok().or_else(|| round_in_range(s.parse::<f64>().ok()?))
+        }
         _ => None,
     }
 }
@@ -208,16 +275,40 @@ fn bool_at(v: &Value, key: &str) -> Option<bool> {
 /// "nobody is watching" one. `idle` stays narrow: the absent key, or an empty
 /// array, each with `size == 0`.
 ///
+/// **`size` is REQUIRED, and must be a non-negative whole number.** Same
+/// evidence, same reasoning as the `null` rule, and re-verified read-only
+/// against the live server (Plex Media Server 1.42.2) rather than assumed:
+/// `size` was present, and an integer, on every endpoint probed —
+/// `/status/sessions` (`{"MediaContainer":{"size":0}}` at rest),
+/// `/transcode/sessions`, `/clients`, `/identity`, `/library/sections`,
+/// `/library/onDeck`, `/library/recentlyAdded` and
+/// `/status/sessions/history/all`. Plex states the count on every container it
+/// emits, including containers that carry nothing else. So an absent `size` is
+/// not a legitimate state we must tolerate — it means something altered the
+/// response, and the fields still standing next to it are no more trustworthy
+/// than the one that vanished. A missing `size` is therefore `malformed` at
+/// every shape, including alongside an empty `Metadata` list, which previously
+/// slipped through as `idle` because the cross-check below was skipped when
+/// there was no count to check against.
+///
 /// Cross-checks applied, each because it would otherwise become a silent
 /// UNDERCOUNT — a quiet lie about who is watching:
 /// - `Metadata` explicitly `null` ⇒ malformed, at ANY `size` (above).
-/// - `Metadata` absent but `size` nonzero (or absent) ⇒ malformed.
+/// - `size` absent ⇒ malformed, whatever `Metadata` does (above).
+/// - `size` fractional, negative, or not a number at all ⇒ malformed. A
+///   collection size is a count of things: `0.5` is not an imprecise count but
+///   an impossible one, and flooring it to `0` would render a full house as an
+///   empty one. See [`num_at`] for why counts reject and measurements round.
+/// - `Metadata` absent but `size` nonzero ⇒ malformed.
 /// - `Metadata` present but not a list ⇒ malformed.
 /// - a `Metadata` entry that is not an object ⇒ malformed (see below).
-/// - `size` present and disagreeing with the number of entries ⇒ malformed.
-///   `/status/sessions` is not a paginated collection (no `offset`/`totalSize`
-///   on it), so `size` and the list length are two statements of the same fact;
-///   when they disagree, one of them is wrong and we do not know which.
+/// - `size` disagreeing with the number of entries ⇒ malformed.
+///   `/status/sessions` is not a paginated collection as this client calls it
+///   (it grows `offset`/`totalSize` only when asked for a page, and
+///   [`super::clients::plex::PlexClient::sessions`] sends no pagination
+///   parameters — verified live), so `size` and the list length are two
+///   statements of the same fact; when they disagree, one of them is wrong and
+///   we do not know which.
 ///
 /// **An unparseable entry fails the WHOLE response rather than being dropped.**
 /// [`session_json`] is total over any JSON *object* — every field is optional
@@ -229,6 +320,34 @@ fn bool_at(v: &Value, key: &str) -> Option<bool> {
 /// the undercount to avoid. It would also need a fourth, partially-known state
 /// the contract deliberately does not have — today every non-`ok` status
 /// carries NO count, so a consumer either gets a complete count or none at all.
+/// `MediaContainer.size`, insisted upon as a non-negative whole number.
+///
+/// Absent, fractional, negative or non-numeric are all `Err` — see
+/// [`session_items`] for the live evidence that Plex always emits it, and
+/// [`num_at`] for why a count rejects a fraction instead of flooring it.
+/// Plex sends it as an integer on this endpoint; `num_at` also accepts the
+/// string form some other Plex endpoints use, so a stringly-typed server is
+/// read rather than declared broken.
+fn container_size(mc: &Value) -> Result<i64, String> {
+    let Some(raw) = mc.get("size") else {
+        return Err(
+            "MediaContainer carried no size, and Plex states a size on every container it \
+             emits (at rest /status/sessions is exactly {\"MediaContainer\":{\"size\":0}}), \
+             so the response was altered somewhere in the path"
+                .to_string(),
+        );
+    };
+    let n = num_at(mc, "size").ok_or_else(|| {
+        format!("MediaContainer.size was {raw}, which is not a whole number of sessions")
+    })?;
+    if n < 0 {
+        return Err(format!(
+            "MediaContainer.size was {n}, and a number of sessions cannot be negative"
+        ));
+    }
+    Ok(n)
+}
+
 fn session_items(raw: &Value) -> Result<Vec<&Value>, String> {
     let Some(mc) = raw.get("MediaContainer") else {
         return Err("the response from Plex had no MediaContainer".to_string());
@@ -236,41 +355,45 @@ fn session_items(raw: &Value) -> Result<Vec<&Value>, String> {
     if !mc.is_object() {
         return Err("MediaContainer was not an object".to_string());
     }
-    // Plex sends `size` as an integer here; `num_at` also accepts the string
-    // form some other Plex endpoints use, so a stringly-typed server is read
-    // rather than declared broken.
-    let size = num_at(mc, "size");
 
-    match mc.get("Metadata") {
-        // Explicit null is NOT absence. Plex omits keys rather than nulling
-        // them (verified live, see the doc comment), so a null is evidence the
-        // response was rewritten in transit — and a rewritten response makes
-        // the `size` beside it untrustworthy too, at 0 as much as at 3.
-        Some(Value::Null) => Err(
+    // Explicit null is NOT absence. Plex omits keys rather than nulling them
+    // (verified live, see the doc comment), so a null is evidence the response
+    // was rewritten in transit — and a rewritten response makes the `size`
+    // beside it untrustworthy too, at 0 as much as at 3. Checked BEFORE the
+    // size so the detail names the more specific fault when both are wrong.
+    if let Some(Value::Null) = mc.get("Metadata") {
+        return Err(
             "MediaContainer.Metadata was explicitly null, which is not a shape Plex emits \
              (it omits the key entirely when nothing is playing)"
                 .to_string(),
-        ),
-        None => match size {
-            Some(0) => Ok(Vec::new()),
-            Some(n) => Err(format!(
-                "MediaContainer reported {n} session(s) but carried no Metadata list"
-            )),
-            None => Err("MediaContainer had neither a size nor a Metadata list".to_string()),
-        },
+        );
+    }
+
+    // A missing/invalid size fails EVERY shape, including an empty Metadata
+    // list. Nothing below may fall back to "no size to check against".
+    let size = container_size(mc)?;
+
+    match mc.get("Metadata") {
+        None => {
+            if size == 0 {
+                Ok(Vec::new())
+            } else {
+                Err(format!(
+                    "MediaContainer reported {size} session(s) but carried no Metadata list"
+                ))
+            }
+        }
         Some(Value::Array(items)) => {
             if let Some(i) = items.iter().position(|item| !item.is_object()) {
                 return Err(format!(
                     "MediaContainer.Metadata entry {i} was not a session object"
                 ));
             }
-            if let Some(n) = size {
-                if n != items.len() as i64 {
-                    return Err(format!(
-                        "MediaContainer reported {n} session(s) but carried {}",
-                        items.len()
-                    ));
-                }
+            if size != items.len() as i64 {
+                return Err(format!(
+                    "MediaContainer reported {size} session(s) but carried {}",
+                    items.len()
+                ));
             }
             Ok(items.iter().collect())
         }
@@ -415,8 +538,10 @@ fn session_json(item: &Value) -> Value {
         .cloned()
         .unwrap_or(Value::Null);
 
-    let duration_ms = num_at(item, "duration");
-    let progress_ms = num_at(item, "viewOffset").unwrap_or(0);
+    // MEASUREMENTS, not counts: `quantity_at` rounds a fractional millisecond
+    // rather than dropping the field. See `quantity_at` for the split.
+    let duration_ms = quantity_at(item, "duration");
+    let progress_ms = quantity_at(item, "viewOffset").unwrap_or(0);
     let progress_percent = match duration_ms {
         Some(d) if d > 0 => Some(((progress_ms as f64 / d as f64) * 1000.0).round() / 10.0),
         _ => None,
@@ -450,7 +575,7 @@ fn session_json(item: &Value) -> Value {
         "transcode_progress_percent": f64_at(&ts, "progress"),
         "transcode_throttled": bool_at(&ts, "throttled"),
         "transcode_hw": bool_at(&ts, "transcodeHwRequested"),
-        "bandwidth_kbps": num_at(&session, "bandwidth"),
+        "bandwidth_kbps": quantity_at(&session, "bandwidth"),
         "stream_location": str_at(&session, "location"),
         "container": str_at(&media, "container"),
         "video_resolution": str_at(&media, "videoResolution"),
@@ -498,13 +623,22 @@ fn server_json(raw: &Value) -> Value {
 /// Stated here because it is the one place the shape is genuinely ambiguous to
 /// a consumer, and Phase 2 must not have to guess:
 ///
-/// > `status` is `idle` only when `MediaContainer.size == 0` **and**
-/// > `MediaContainer.Metadata` is either **absent** or an **empty array**. An
-/// > explicitly `null` `Metadata` is **`malformed`**, never `idle`, at every
-/// > `size` including `0` — Plex omits the key when nothing is playing
-/// > (`{"MediaContainer":{"size":0}}`) and emits no JSON `null` on any endpoint,
-/// > so a null means the response was rewritten in transit and neither it nor
-/// > the `size` beside it can be trusted.
+/// > `status` is `idle` only when `MediaContainer.size` is **present** and is
+/// > the whole number `0`, **and** `MediaContainer.Metadata` is either
+/// > **absent** or an **empty array**. Everything else is `malformed`, never
+/// > `idle`:
+/// >
+/// > - an explicitly `null` `Metadata`, at every `size` including `0` — Plex
+/// >   omits the key when nothing is playing (`{"MediaContainer":{"size":0}}`)
+/// >   and emits no JSON `null` on any endpoint, so a null means the response
+/// >   was rewritten in transit and neither it nor the `size` beside it can be
+/// >   trusted;
+/// > - an **absent** `size`, whatever `Metadata` does — Plex states a size on
+/// >   every container it emits, so a missing one is the same evidence of an
+/// >   altered response;
+/// > - a `size` that is **fractional, negative, or not a number** — a count of
+/// >   things is a whole non-negative number, so `0.5` is not an imprecise
+/// >   count but an impossible one and is never floored to `0`.
 ///
 /// ### Per-session field contract, where it is not self-evident
 ///
@@ -515,6 +649,15 @@ fn server_json(raw: &Value) -> Value {
 ///   null for `direct_stream` and `transcode` — a consumer must render a null
 ///   reason as "no reason given" and must NOT infer direct play from it. See
 ///   [`transcode_reason`] for why no reason is invented in that case.
+/// - Numeric fields split by MEANING, and the split is part of the contract.
+///   `season`, `episode` and `year` are ordinals: a fractional value is dropped
+///   to `null` rather than truncated, so a consumer never sees an episode
+///   number the payload did not state and `full_title` omits the `SxxEyy`
+///   component instead of inventing one. `progress_ms`, `duration_ms` and
+///   `bandwidth_kbps` are measurements: a fractional value is rounded to the
+///   nearest whole unit, because a half-millisecond is not worth a blank
+///   progress bar or a stream missing from the bandwidth total. `session_key`
+///   is carried through as an opaque string and never read as a number.
 fn build_response(status: &str, message: &str, extra: Value) -> Value {
     let mut out = json!({
         "status": status,
@@ -996,6 +1139,181 @@ mod tests {
         assert_eq!(p["ok"], false);
         assert!(p.get("session_count").is_none());
         assert!(p.get("sessions").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_absent_size_is_malformed_whatever_metadata_does() {
+        // DECISION, on evidence rather than defensiveness — re-probed
+        // READ-ONLY against the live server for this review round. `size` was
+        // present, and a JSON integer, on every endpoint checked:
+        // /status/sessions (exactly {"MediaContainer":{"size":0}} at rest),
+        // /transcode/sessions, /clients, /identity, /library/sections,
+        // /library/onDeck, /library/recentlyAdded, /status/sessions/history/all
+        // — and not one JSON null anywhere in any of them. Plex states a count
+        // on every container it emits, including containers carrying nothing
+        // else, so an ABSENT size is not a legitimate state to tolerate: it
+        // means the response was altered, and the fields still standing next to
+        // it are no more trustworthy than the one that vanished.
+        //
+        // The empty-list case is the one that used to slip through: with no
+        // size there was no count to cross-check against, so `{"Metadata": []}`
+        // rendered as a confident "nobody is watching".
+        for (label, raw) in [
+            ("no size, no Metadata", json!({ "MediaContainer": {} })),
+            (
+                "no size, empty Metadata",
+                json!({ "MediaContainer": { "Metadata": [] } }),
+            ),
+            (
+                "no size, populated Metadata",
+                json!({ "MediaContainer": { "Metadata": [transcoding_episode()] } }),
+            ),
+            (
+                "no size, other keys present",
+                json!({ "MediaContainer": { "identifier": "com.plexapp.plugins.library" } }),
+            ),
+        ] {
+            let err = session_items(&raw).expect_err(&format!("{label} must not parse as idle"));
+            assert!(err.contains("no size"), "{label}: the detail should name it: {err}");
+        }
+
+        // End to end: an absent size never reaches the GUI as an empty house,
+        // and carries no count that could be misread as one.
+        let p = MediaNowPlaying::with_source(CountingSource::ok(
+            json!({ "MediaContainer": { "Metadata": [] } }),
+        ))
+        .run(entitled())
+        .await;
+        assert_eq!(p["status"], "malformed");
+        assert_eq!(p["ok"], false);
+        assert!(p.get("session_count").is_none());
+        assert!(p.get("sessions").is_none());
+
+        // POSITIVE CONTROL — the live at-rest body is still idle. A rule that
+        // rejected a genuine idle response would be its own false alarm.
+        assert!(session_items(&json!({ "MediaContainer": { "size": 0 } }))
+            .expect("the live server's at-rest body is idle")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_size_that_is_not_a_whole_non_negative_count_is_malformed_never_floored() {
+        // A collection size counts things. `0.5` is not an imprecise count but
+        // an impossible one, and the old `as i64` fallback TRUNCATED it to 0 —
+        // rendering a house full of viewers as `idle`, the exact collapse this
+        // module exists to prevent. Negative and non-numeric are the same class.
+        for (label, raw) in [
+            ("fractional zero", json!({ "MediaContainer": { "size": 0.5 } })),
+            (
+                "fractional zero with an empty list",
+                json!({ "MediaContainer": { "size": 0.5, "Metadata": [] } }),
+            ),
+            (
+                "fractional count with sessions",
+                json!({ "MediaContainer": { "size": 1.5, "Metadata": [transcoding_episode()] } }),
+            ),
+            ("negative", json!({ "MediaContainer": { "size": -1 } })),
+            (
+                "negative with an empty list",
+                json!({ "MediaContainer": { "size": -1, "Metadata": [] } }),
+            ),
+            ("non-numeric string", json!({ "MediaContainer": { "size": "none" } })),
+            ("fractional string", json!({ "MediaContainer": { "size": "0.5" } })),
+            ("boolean", json!({ "MediaContainer": { "size": false } })),
+            ("a nested object", json!({ "MediaContainer": { "size": { "n": 0 } } })),
+        ] {
+            let err = session_items(&raw).expect_err(&format!("{label} must not parse as a list"));
+            assert!(!err.is_empty(), "{label}: malformed needs a detail");
+            assert!(
+                !err.contains("no size"),
+                "{label}: it HAS a size, it is just not a count: {err}"
+            );
+        }
+
+        // The NEGATIVE guard specifically. Recorded honestly: it has no unique
+        // kill on the VERDICT — mutating it away leaves every negative case
+        // still malformed, because `-1` also fails the size-vs-length
+        // cross-check (`-1 != 0`) and the "nonzero size with no Metadata"
+        // branch. What it uniquely contributes is the DIAGNOSIS, and that is
+        // worth keeping: without it an operator reads "reported -1 session(s)
+        // but carried 0", which describes the symptom as a miscount rather
+        // than naming the impossible value. So the assertion is on the detail,
+        // which is the thing the guard actually decides.
+        for raw in [
+            json!({ "MediaContainer": { "size": -1 } }),
+            json!({ "MediaContainer": { "size": -1, "Metadata": [] } }),
+            json!({ "MediaContainer": { "size": "-3" } }),
+        ] {
+            let err = session_items(&raw).expect_err("a negative size is not a count");
+            assert!(
+                err.contains("cannot be negative"),
+                "a negative count should be named as one, not reported as a miscount: {err}"
+            );
+        }
+
+        // Nothing is floored on the way to the GUI either.
+        let p = MediaNowPlaying::with_source(CountingSource::ok(
+            json!({ "MediaContainer": { "size": 0.5 } }),
+        ))
+        .run(entitled())
+        .await;
+        assert_eq!(p["status"], "malformed");
+        assert!(p.get("session_count").is_none());
+
+        // POSITIVE CONTROLS. An integral float IS the integer it spells, and
+        // the stringly-typed form other Plex endpoints use still reads.
+        assert!(session_items(&json!({ "MediaContainer": { "size": 0.0 } }))
+            .expect("0.0 is the whole number zero")
+            .is_empty());
+        assert!(session_items(&json!({ "MediaContainer": { "size": "0" } }))
+            .expect("a stringly-typed zero is still zero")
+            .is_empty());
+        assert_eq!(
+            session_items(&container(vec![transcoding_episode(), direct_play_movie()]))
+                .expect("a normal populated response parses")
+                .len(),
+            2,
+            "a populated container must still count its sessions"
+        );
+    }
+
+    #[test]
+    fn ordinals_reject_a_fraction_while_measurements_round_it() {
+        // The per-field split, asserted. A COUNT/ORDINAL that is fractional is
+        // dropped rather than truncated, so nothing is claimed that the payload
+        // did not state; a MEASUREMENT is rounded, because a half-millisecond
+        // is not worth blanking a progress bar.
+        let mut item = transcoding_episode();
+        item["parentIndex"] = json!(4.7);
+        item["index"] = json!(12.3);
+        item["year"] = json!(1996.5);
+        let p = session_json(&item);
+        assert_eq!(p["season"], Value::Null, "a fractional season is not season 4");
+        assert_eq!(p["episode"], Value::Null, "a fractional episode is not episode 12");
+        assert_eq!(p["year"], Value::Null);
+        assert_eq!(
+            p["full_title"], "Placeholder Show - The Placeholder Episode",
+            "no SxxEyy may be invented from a fraction"
+        );
+
+        // Measurements: rounded to the nearest whole unit, never dropped.
+        let mut item = transcoding_episode();
+        item["duration"] = json!(2_400_000.4);
+        item["viewOffset"] = json!(599_999.6);
+        item["Session"]["bandwidth"] = json!(8905.5);
+        let p = session_json(&item);
+        assert_eq!(p["duration_ms"], 2_400_000);
+        assert_eq!(p["progress_ms"], 600_000);
+        assert_eq!(p["bandwidth_kbps"], 8906);
+        assert_eq!(p["progress_percent"], 25.0);
+
+        // And an integral float is still just the integer, on both sides.
+        let mut item = transcoding_episode();
+        item["index"] = json!(12.0);
+        item["duration"] = json!(2_400_000.0);
+        let p = session_json(&item);
+        assert_eq!(p["episode"], 12);
+        assert_eq!(p["duration_ms"], 2_400_000);
     }
 
     #[test]
