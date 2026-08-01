@@ -274,6 +274,12 @@ registerPanel({
 // MGUI-01 (S129): the poster wall — guide screen 02. Registered directly after Dashboard
 // because the operator's reason for opening Muse is to look at media. Unlike the per-account
 // panels this binds a PUBLIC Muse route, so it populates with no upstream bearer.
+// MGUI-20: Library is the CATEGORY, not a list of its own.
+//
+// It previously rendered one combined poster wall while Movies and TV Shows sat beside it as
+// siblings — three nav entries over the same rows, two of which partition the third, with
+// nothing saying so. Library now heads the group and holds no list; `groupOnly` redirects its
+// path to the first child so an existing bookmark lands on Movies rather than 404ing.
 registerPanel({
   id: 'muse.library',
   system: 'muse',
@@ -281,8 +287,7 @@ registerPanel({
   path: '/muse/library',
   icon: '▦',
   available: true,
-  // MGUI-18: a catalog surface — uses the wider canvas cap so an ultrawide shows more
-  // columns rather than a centred 1280px strip.
+  groupOnly: true,
   wide: true,
   component: MuseLibraryPanel,
 });
@@ -304,6 +309,7 @@ registerPanel({
   path: '/muse/movies',
   icon: '⛭',
   available: true,
+  parentId: 'muse.library',
   wide: true,
   component: () => MuseLibraryPanel({ scope: 'movie', heading: 'Movies' } satisfies LibraryPanelProps),
 });
@@ -315,6 +321,7 @@ registerPanel({
   path: '/muse/shows',
   icon: '⛁',
   available: true,
+  parentId: 'muse.library',
   wide: true,
   component: () => MuseLibraryPanel({ scope: 'show', heading: 'TV Shows' } satisfies LibraryPanelProps),
 });

@@ -118,6 +118,20 @@ export interface PanelDescriptor {
    *  prose and charts and wrong for a 1892-tile poster wall on an ultrawide. Default
    *  false/absent — every other panel keeps the standard cap exactly as before. */
   wide?: boolean;
+  /** MGUI-20: the panel this one sits UNDER in the rail, by id.
+   *
+   *  Movies and TV Shows are not siblings of Library, they are what Library CONTAINS. Rendering
+   *  them flat produced one combined list plus two segments of the same library beside it —
+   *  three nav entries over the same rows, with no signal that two of them partition the third.
+   *
+   *  Purely presentational: routing, availability and `wide` are unchanged. A child whose
+   *  parent is absent or unavailable falls back to rendering flat, so a mis-typed id degrades to
+   *  the old layout rather than hiding the panel. */
+  parentId?: string;
+  /** MGUI-20: this panel is a NAV GROUPING, not a destination — it heads a set of children and
+   *  has no list of its own. `path` is still required (the router redirects it to the first
+   *  child, so an existing bookmark lands somewhere real rather than 404ing). */
+  groupOnly?: boolean;
 }
 
 const registry = new Map<string, PanelDescriptor>();
@@ -155,4 +169,31 @@ export function isPanelAvailable(id: string): boolean {
 export function clearRegistry(): void {
   registry.clear();
   clearModuleRegistry();
+}
+
+
+/** MGUI-20: rail order — each parent immediately followed by its children, at depth 1.
+ *
+ * Extracted from `CoreRail` so the rule is testable: the nesting exists to stop Movies and TV
+ * Shows reading as two more siblings over the same rows as Library, and "did the child end up
+ * under its parent" is exactly the kind of thing that silently regresses when someone reorders
+ * a registration block.
+ *
+ * A child whose parent is ABSENT from the list (unavailable, hidden in rail, or a mis-typed id)
+ * is emitted flat rather than dropped — a wrong id degrades to the old layout instead of making
+ * the panel unreachable from navigation.
+ */
+export function railOrder(
+  panels: PanelDescriptor[],
+): { panel: PanelDescriptor; depth: number }[] {
+  const byId = new Map(panels.map(p => [p.id, p]));
+  const out: { panel: PanelDescriptor; depth: number }[] = [];
+  for (const p of panels) {
+    if (p.parentId && byId.has(p.parentId)) continue;
+    out.push({ panel: p, depth: 0 });
+    for (const child of panels) {
+      if (child.parentId === p.id) out.push({ panel: child, depth: 1 });
+    }
+  }
+  return out;
 }
