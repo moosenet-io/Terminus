@@ -1777,6 +1777,12 @@ impl GatewayFramework {
             self.permits_tool(p.name(), CALENDAR_CONTEXT_PROBE),
             self.permits_tool(p.name(), ROUTINE_CONTEXT_PROBE),
         )
+        // TERM #576: WHICH household media account this principal is, for the
+        // media tools that must scope household watch history to the caller
+        // instead of to whoever watched last. Unmapped principals — which is
+        // every guest unless the operator deliberately binds one — resolve to
+        // `None`, the unentitled path. See `crate::media::account_map`.
+        .with_media_account(crate::media::account_map::account_for_principal(p.name()).as_deref())
     }
 
     pub fn filter_catalog_for_principal(&self, principal: Option<&Principal>, tools: Vec<Value>) -> Vec<Value> {

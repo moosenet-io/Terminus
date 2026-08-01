@@ -188,6 +188,25 @@ deliberately adds it. Media acquisition/mutation (`media_request`,
 `media_delete`, `media_organize`, `media_taste_feedback`) is excluded for the
 same reason the entries are exact names rather than a `media_*` prefix.
 
+**Media personalisation is scoped to the caller** (TERM #576). Two of the
+discovery tools reach household watch history, so a grant of the tool is not on
+its own enough: `media_recommend` builds its taste profile from the account the
+gateway resolved for the *caller*, and `media_on_deck` discloses the
+continue-watching row only to the account it belongs to. Bind a principal to a
+household media account with `TERMINUS_MEDIA_ACCOUNT_MAP` (a JSON object of
+principal → media account id) and name the account your `PLEX_TOKEN` speaks for
+in `PLEX_ACCOUNT_ID`. Both default to **unset = nobody**: an unmapped caller
+gets an unpersonalised library browse with no titles, rationales or curation
+notes drawn from anyone's history, and a caller-supplied `account_id` naming
+someone else's account is **refused, not silently ignored**. The same TERM #577
+scope limit applies — this constrains separately authenticated principals, not
+two humans sharing one assistant identity.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TERMINUS_MEDIA_ACCOUNT_MAP` | unset (nobody mapped) | `{"<principal>":"<media account id>"}` — whose media account each principal is |
+| `PLEX_ACCOUNT_ID` | unset (withheld from all) | The media account `PLEX_TOKEN` speaks for; gates `media_on_deck` |
+
 That baseline is a **ceiling, not a default**. For every other identity an
 explicit `TERMINUS_GATEWAY_ALLOWLIST_JSON` entry wins in full; for a guest it is
 *intersected* with the baseline, so an entry may **narrow** a guest and can never
