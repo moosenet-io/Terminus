@@ -22,6 +22,7 @@
 //! - [`exec`] — the host executor (local, or the existing dev SSH door)
 //! - [`discover`] — the probes and the correlation logic
 //! - [`transcript`] — the bounded, redacted activity-event reader
+//! - [`capture`] — read-only tmux pane capture
 //! - [`tools`] — the registered `agentsess_*` tools
 //!
 //! # Configuration (structural, non-secret — plain env per this crate's convention)
@@ -35,6 +36,8 @@
 //!   reported, never silent.
 //! - `AGENTSESS_TAIL_BYTES` — how much of a transcript tail to read (default
 //!   256 KiB). Transcripts reach tens of megabytes; none is ever read whole.
+//! - `AGENTSESS_CAPTURE_MAX_LINES` / `AGENTSESS_CAPTURE_MAX_BYTES` — pane
+//!   capture caps (default 2000 lines / 256 KiB). Both are reported when hit.
 //!
 //! This module reads NO credential and holds NO secret. The one place it
 //! touches a process environment narrows the read to a single non-secret
@@ -49,6 +52,7 @@
 // `host` enum and build every command themselves. `model` stays public: it is
 // inert data that Harmony deserializes.
 pub mod model;
+pub(crate) mod capture;
 pub(crate) mod discover;
 pub(crate) mod exec;
 pub(crate) mod transcript;
@@ -63,6 +67,7 @@ pub fn register(registry: &mut ToolRegistry) {
     let tools: Vec<Box<dyn RustTool>> = vec![
         Box::new(tools::AgentsessList),
         Box::new(tools::AgentsessTranscript),
+        Box::new(tools::AgentsessCapture),
     ];
     for tool in tools {
         if let Err(e) = registry.register(tool) {
