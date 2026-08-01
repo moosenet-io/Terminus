@@ -2882,6 +2882,26 @@ async fn run_test(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+
+    // TERM #588: the TEST scope starts from a CLEARED environment.
+    //
+    // `systemd-run --scope` runs its command as a direct child of `systemd-run`,
+    // which inherits the environment of whoever spawned it — here
+    // terminus-primary, whose env carries the fleet's materialised credentials
+    // and app config. Without this, `cargo test` sees all of it, and every test
+    // asserting "with nothing configured we degrade" fails on the build host
+    // while passing locally: a red verdict on a green tree.
+    //
+    // Deny-by-default: only compile-relevant variables are carried over from
+    // the parent, then the explicit build env is layered on top (it always
+    // wins). See `scope::is_build_relevant_env_key` for why that direction is
+    // the safe one.
+    cmd.env_clear();
+    for (k, v) in std::env::vars() {
+        if scope::is_build_relevant_env_key(&k) {
+            cmd.env(k, v);
+        }
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }

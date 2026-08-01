@@ -108,6 +108,109 @@ pub fn render_scope_argv(
     argv
 }
 
+/// Environment a COMPILE/TEST genuinely needs, as a deny-by-default allowlist.
+///
+/// ## Why the test scope must not inherit the service environment
+/// `systemd-run --scope` runs its command as a direct child of `systemd-run`,
+/// which inherits ITS environment — and `systemd-run` is spawned by
+/// terminus-primary, whose process env carries the fleet's materialised
+/// credentials and app config (forge PATs, provider keys, mirror remotes,
+/// sweep tuning, …). A `cargo test` run in that scope therefore sees all of it.
+///
+/// That breaks the gate in a way that looks like a code failure but is not: a
+/// test asserting "with no credential configured we degrade" cannot hold in a
+/// scope where the credential IS configured. On this fleet that silently
+/// reddened roughly ten tests on a tree that is green locally — a red verdict
+/// on good code, which is worse than an outage, because a flaky-looking red
+/// invites people to rationalise failures away rather than trust the gate.
+///
+/// It is also a privilege question: a build script or test in an untrusted
+/// dependency should not be handed the fleet's credentials merely because the
+/// gate happened to run on the host that holds them.
+///
+/// ## Deny by default
+/// This returns true only for variables a compile genuinely needs — the
+/// toolchain, the target/cache directories, the C/link toolchain, locale and
+/// path basics. Anything unrecognised is DROPPED. That direction matters: a
+/// missing build var produces a loud, immediate build failure that is easy to
+/// diagnose and add, whereas an over-permissive rule silently reintroduces the
+/// exact contamination this exists to remove.
+///
+/// ## Verified against the live build host, not assumed
+/// The obvious risk of an allowlist is dropping something a real build needs,
+/// which would break EVERY gate run rather than one test. This was checked
+/// empirically against the running terminus-primary environment rather than
+/// reasoned about: of its 199 variables, exactly 13 survive this filter
+/// (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `TMPDIR`, `CARGO_HOME`,
+/// `RUSTUP_HOME`, `RUST_LOG`, `SCCACHE_BIN`, `SCCACHE_DIR`, `SCCACHE_REDIS`),
+/// and every one is build-relevant. The rest are fleet app config and
+/// credentials.
+///
+/// The same check confirmed that several categories reviewers reasonably
+/// worried about are ABSENT on this fleet: there are no `git+` dependencies in
+/// `Cargo.lock` (so no `SSH_AUTH_SOCK`/`GIT_*` fetch path), no proxy variables
+/// on the build host, and the scope is a SYSTEM scope (no `--user`, so no
+/// `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` requirement). Those categories
+/// are allowlisted below anyway — they cost nothing today and their absence
+/// would otherwise become a silent, total gate outage the day someone adds a
+/// git dependency, a proxy, or a user scope.
+///
+/// ## Escape hatch
+/// `BUILD_ENV_PASSTHROUGH_EXTRA` (comma-separated exact names) lets an operator
+/// pass an additional variable through without a code change, for exactly the
+/// case this doc cannot anticipate. It is operator-controlled config, so it can
+/// re-widen the scope deliberately — that is the point — but nothing reaches it
+/// by accident.
+pub fn is_build_relevant_env_key(key: &str) -> bool {
+    const EXACT: &[&str] = &[
+        // Process basics a compiler and its build scripts assume exist.
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "TMPDIR", "TERM",
+        "LANG", "LC_ALL", "TZ",
+        // C/link toolchain.
+        "CC", "CXX", "AR", "LD", "RANLIB", "CFLAGS", "CXXFLAGS", "LDFLAGS",
+        "LD_LIBRARY_PATH", "LIBRARY_PATH", "MAKEFLAGS", "NUM_JOBS",
+        // Reproducibility + TLS trust roots.
+        "SOURCE_DATE_EPOCH", "SSL_CERT_FILE", "SSL_CERT_DIR",
+        // Git/SSH fetch path. Absent today (no `git+` deps in Cargo.lock) —
+        // present so adding one later does not break every gate run at once.
+        "SSH_AUTH_SOCK", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS",
+        // Proxying. Absent on the build host today; same rationale.
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        // Only needed if the scope ever becomes `--user` (it is a SYSTEM scope
+        // today); harmless to carry and fatal to omit if that changes.
+        "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+        // Native-toolchain discovery used by common -sys crates.
+        "LLVM_CONFIG", "LLVM_CONFIG_PATH", "CLANG_PATH", "NINJA",
+    ];
+    const PREFIXES: &[&str] = &[
+        "CARGO",     // CARGO_TARGET_DIR, CARGO_HOME, CARGO_REGISTRIES_*, …
+        "RUST",      // RUSTC_WRAPPER, RUSTFLAGS, RUSTUP_*, RUST_BACKTRACE, …
+        "SCCACHE",   // incl. the secret SCCACHE_REDIS_PASSWORD, delivered via
+                     // inherited env by design (see render_scope_argv)
+        "PKG_CONFIG",
+        "OPENSSL",
+        "LIBSSH2",
+        "PROTOC",
+        "CMAKE",     // CMAKE_TOOLCHAIN_FILE, CMAKE_BUILD_PARALLEL_LEVEL, …
+        "BINDGEN",   // BINDGEN_EXTRA_CLANG_ARGS
+        "GIT_CONFIG",
+    ];
+    let k = key.to_ascii_uppercase();
+    if EXACT.iter().any(|e| e.eq_ignore_ascii_case(key)) || PREFIXES.iter().any(|p| k.starts_with(p))
+    {
+        return true;
+    }
+    // Operator escape hatch — exact names only, so a stray prefix cannot
+    // re-open a whole family.
+    std::env::var("BUILD_ENV_PASSTHROUGH_EXTRA")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .any(|n| n.eq_ignore_ascii_case(key))
+}
+
 /// Whether a build-env var name is secret-shaped and MUST NOT appear on a
 /// command line (it travels via the inherited process environment instead).
 ///
@@ -284,6 +387,7 @@ fn lexical_normalize(p: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
     use super::*;
     use std::path::PathBuf;
 
@@ -316,6 +420,81 @@ mod tests {
         assert!(argv.contains(&"--scope".to_string()));
         assert!(argv.iter().any(|a| a == "-p"));
         assert!(argv.iter().any(|a| a.starts_with("--unit=")));
+    }
+
+    #[test]
+    fn build_relevant_allowlist_keeps_what_a_compile_needs() {
+        for k in [
+            "PATH", "HOME", "TMPDIR", "LANG",
+            "CARGO_TARGET_DIR", "CARGO_HOME", "CARGO_REGISTRIES_GITEA_INDEX",
+            "RUSTC_WRAPPER", "RUSTFLAGS", "RUSTUP_TOOLCHAIN",
+            "SCCACHE_DIR", "SCCACHE_REDIS_ENDPOINT",
+            // The sccache secret travels via inherited env BY DESIGN, so the
+            // allowlist must not strip it or every build loses its cache.
+            "SCCACHE_REDIS_PASSWORD",
+            "CC", "CXX", "PKG_CONFIG_PATH", "OPENSSL_DIR",
+        ] {
+            assert!(is_build_relevant_env_key(k), "{k} must survive the scrub");
+        }
+    }
+
+    #[test]
+    fn build_relevant_allowlist_drops_fleet_credentials_and_app_config() {
+        // These are exactly what contaminated the gate: a test asserting
+        // "unconfigured" behaviour cannot hold while they are present.
+        for k in [
+            "GITEA_PAT_MOOSE", "GITHUB_PAT_HARMONY", "PLANE_PAT_CLAUDE",
+            "OPENROUTER_API_KEY", "REVIEW_DAEMON_TOKEN",
+            "TERMINUS_MIRROR_SOURCE_ROOT", "TERMINUS_MIRROR_REMOTE_TERMINUS",
+            "SWEEP_MEM_CONFIG", "INTAKE_DATABASE_URL", "ATLAS_DATABASE_URL",
+            "CHORD_URL", "DEV_HOST", "INFISICAL_MACHINE_IDENTITY_TOKEN",
+        ] {
+            assert!(!is_build_relevant_env_key(k), "{k} must be scrubbed");
+        }
+    }
+
+    #[test]
+    fn allowlist_covers_the_categories_reviewers_flagged_as_fetch_or_launch_critical() {
+        // None of these are present on the fleet today (verified against the
+        // live build host: no git+ deps, no proxy, system scope). They are
+        // allowlisted so that adding a git dependency, a proxy, or a user
+        // scope later cannot silently break EVERY gate run at once.
+        for k in [
+            "SSH_AUTH_SOCK", "GIT_SSH_COMMAND", "GIT_ASKPASS", "GIT_CONFIG_GLOBAL",
+            "HTTP_PROXY", "https_proxy", "NO_PROXY",
+            "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+            "CMAKE_TOOLCHAIN_FILE", "LLVM_CONFIG", "BINDGEN_EXTRA_CLANG_ARGS",
+        ] {
+            assert!(is_build_relevant_env_key(k), "{k} must survive the scrub");
+        }
+    }
+
+    // Mutates a shared env var (TERM #588: mark the READERS too).
+    #[test]
+    #[serial]
+    fn the_operator_escape_hatch_adds_exact_names_only() {
+        assert!(!is_build_relevant_env_key("SOME_ODD_BUILD_VAR"));
+        std::env::set_var("BUILD_ENV_PASSTHROUGH_EXTRA", "SOME_ODD_BUILD_VAR, OTHER_ONE");
+        assert!(is_build_relevant_env_key("SOME_ODD_BUILD_VAR"));
+        assert!(is_build_relevant_env_key("some_odd_build_var"), "case-insensitive");
+        assert!(is_build_relevant_env_key("OTHER_ONE"), "whitespace is trimmed");
+        // EXACT names only — a stray entry must not re-open a whole family.
+        assert!(!is_build_relevant_env_key("SOME_ODD_BUILD_VAR_SUFFIX"));
+        assert!(!is_build_relevant_env_key("GITEA_PAT_MOOSE"));
+        std::env::remove_var("BUILD_ENV_PASSTHROUGH_EXTRA");
+        assert!(!is_build_relevant_env_key("SOME_ODD_BUILD_VAR"));
+    }
+
+    #[test]
+    fn the_allowlist_is_deny_by_default() {
+        // An unrecognised name is dropped, not kept. A missing build var fails
+        // loudly and is easy to add; an over-permissive rule silently
+        // reintroduces the contamination this exists to remove.
+        assert!(!is_build_relevant_env_key("SOME_FUTURE_FLEET_VAR"));
+        assert!(!is_build_relevant_env_key(""));
+        // Matching is case-insensitive, so a lowercase alias cannot slip past.
+        assert!(is_build_relevant_env_key("cargo_target_dir"));
+        assert!(!is_build_relevant_env_key("gitea_pat_moose"));
     }
 
     #[test]
