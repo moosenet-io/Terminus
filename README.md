@@ -294,6 +294,45 @@ Set `TERMINUS_TOOL_AVAILABILITY_JSON` to a map of tool name (or name **prefix**)
 
 Changing availability takes effect on service restart, like every other `Environment=` knob.
 
+### Agent sessions — seeing the coder CLIs at work
+
+Harmony can see a tracked repo's Plane status but nothing about the coder CLI agents
+(Claude Code, codex, aider) actually working that repo. The `agentsess_*` suite is the
+missing primitive: it enumerates live agent sessions on a host and correlates each to the
+repository, branch, and `PREFIX-NN` work item it is working on.
+
+- **`agentsess_list`** — live sessions with agent kind, pid, host, cwd, repo/branch, the
+  work-item hint parsed from the branch, the tmux pane the session can be watched through,
+  and its most recent activity time. Optional `host` (`local`, the default, or `dev` via the
+  existing dev SSH door) and `repo` name filter.
+
+Discovery is **process-first, not tmux-first**. Agents are not reliably launched
+one-per-named-tmux-session — a host may run several inside one pane, or none in tmux at all
+— so a tmux-driven enumerator would observe almost nothing. tmux is treated as an optional
+*attachment* (matched by pane pid or process ancestry), never as the unit of discovery.
+
+Each probe degrades independently: a host with no tmux, no readable transcript root, or no
+git still returns a useful list, with the shortfall named in `warnings`. Truncation at
+`AGENTSESS_MAX_SESSIONS` is likewise always reported — a silent cap would read as "that is
+all of them", which is exactly wrong for an observability tool.
+
+Session↔transcript matching is **exact** where it can be: Claude Code exports its session
+UUID into its own environment, so it is read directly rather than guessed. Only that single
+variable is ever extracted — a process environment routinely holds credentials, and nothing
+else from it is read, returned, or logged.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AGENTSESS_TRANSCRIPT_ROOT` | `$HOME/.claude/projects` (local only) | Where agent transcripts live. **Required** to observe a remote host — assuming the local `HOME` applies remotely would silently probe the wrong path and report "no activity" as if it were a fact. |
+| `AGENTSESS_AGENT_PATTERNS` | *(empty)* | Comma-separated extra program names to treat as agents, for a CLI this build predates. |
+| `AGENTSESS_MAX_SESSIONS` | `50` | Result cap. Truncation is always reported, never silent. |
+
+**This suite is read-only by design.** Nothing in it writes a file, sends a keystroke, or
+signals a process. Being able to *watch* an autonomous agent carries no risk; being able to
+*type into* one can alter a build mid-flight. A send capability is a separate, gated change
+needing a session allowlist, a control-character whitelist, rate limiting and an audit-log
+entry — do not add one here without that gate.
+
 The full inventory (17 subsystems, plus `compiler`, `constellation-web`, `compat`,
 and the crate-root modules) is in [docs/reference/index.md](docs/reference/index.md).
 
