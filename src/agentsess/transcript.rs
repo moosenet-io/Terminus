@@ -112,6 +112,19 @@ const BOOKKEEPING_TYPES: &[&str] = &[
     "attachment",
 ];
 
+/// Is this top-level type an error record?
+///
+/// A substring test is too loose: `"terror"` contains `"error"` and would be
+/// emitted as an error event AND counted as understood, hiding a genuinely
+/// unknown type. Match on segment boundaries instead.
+fn is_error_type(ty: &str) -> bool {
+    ty == "error"
+        || ty.ends_with("-error")
+        || ty.ends_with("_error")
+        || ty.starts_with("error-")
+        || ty.starts_with("error_")
+}
+
 fn truncate(s: &str, width: usize) -> String {
     let cleaned = s.replace(['\n', '\r', '\t'], " ");
     let trimmed = cleaned.trim();
@@ -174,6 +187,20 @@ fn redact(s: &str) -> String {
     env_assign_re()
         .replace_all(&first, "$1=<REDACTED-SECRET>")
         .into_owned()
+}
+
+/// Redact FIRST, then truncate.
+///
+/// The order is load-bearing and was originally wrong. Truncating first can
+/// cut a secret's value below the redaction pattern's `{8,}` length floor —
+/// `TOKEN=abcdefghijklmnop` becomes `TOKEN=abcdefg…`, which no longer matches,
+/// so the surviving prefix of a real credential is emitted in clear. Shortening
+/// a secret does not make it safe; it makes it invisible to the scrubber.
+///
+/// Redacting the full string first means the pattern sees the value at its
+/// true length, and the placeholder (not the secret) is what gets truncated.
+fn redact_then_truncate(s: &str, width: usize) -> String {
+    truncate(&redact(s), width)
 }
 
 /// Pick the argument that best identifies what a tool call was doing.
@@ -268,23 +295,28 @@ pub(crate) fn events_from_record(rec: &Value) -> Vec<ActivityEvent> {
 pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
     let at = timestamp_of(rec);
     let ty = rec.get("type").and_then(Value::as_str).unwrap_or("");
+    // A `timestamp` that is PRESENT but unparseable is a format change we
+    // should surface, not silently drop to None.
+    let timestamp_drifted = rec.get("timestamp").is_some() && at.is_none();
 
     if BOOKKEEPING_TYPES.contains(&ty) {
         // Understood and deliberately silent.
-        return RecordOutcome { events: Vec::new(), understood: true };
+        return RecordOutcome { events: Vec::new(), understood: !timestamp_drifted };
     }
 
     let mut out = Vec::new();
-    let mut understood = true;
+    let mut understood = !timestamp_drifted;
     match ty {
         "user" => {
             // A `user` record is either a real human turn or the delivery of a
             // tool's result back to the model. They read very differently to an
             // observer, so they are not conflated. A `user` record carrying
             // NEITHER is a shape we no longer recognise, not an empty turn.
-            if rec.get("toolUseResult").is_none()
-                && rec.get("message").and_then(|m| m.get("content")).is_none()
-            {
+            let content = rec.get("message").and_then(|m| m.get("content"));
+            // Presence is not recognition: a `content` that is a number or an
+            // object is a drifted shape, not a message we can read.
+            let usable_content = matches!(content, Some(Value::String(_)) | Some(Value::Array(_)));
+            if rec.get("toolUseResult").is_none() && !usable_content {
                 understood = false;
             }
             if let Some(result) = rec.get("toolUseResult") {
@@ -296,10 +328,10 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
                 out.push(ActivityEvent {
                     at,
                     kind: EventKind::ToolResult,
-                    summary: redact(&truncate(&text, SUMMARY_WIDTH)),
+                    summary: redact_then_truncate(&text, SUMMARY_WIDTH),
                     detail: None,
                 });
-            } else if let Some(content) = rec.get("message").and_then(|m| m.get("content")) {
+            } else if let (true, Some(content)) = (usable_content, content) {
                 let text = match content {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
@@ -307,7 +339,7 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
                 out.push(ActivityEvent {
                     at,
                     kind: EventKind::UserMessage,
-                    summary: redact(&truncate(&text, SUMMARY_WIDTH)),
+                    summary: redact_then_truncate(&text, SUMMARY_WIDTH),
                     detail: None,
                 });
             }
@@ -344,7 +376,7 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
                                 out.push(ActivityEvent {
                                     at,
                                     kind: EventKind::AssistantMessage,
-                                    summary: redact(&truncate(t, SUMMARY_WIDTH)),
+                                    summary: redact_then_truncate(t, SUMMARY_WIDTH),
                                     detail: None,
                                 });
                             }
@@ -376,9 +408,9 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
                         out.push(ActivityEvent {
                             at,
                             kind: EventKind::ToolCall,
-                            summary: redact(&truncate(&summary, SUMMARY_WIDTH)),
+                            summary: redact_then_truncate(&summary, SUMMARY_WIDTH),
                             detail: arg
-                                .map(|a| redact(&truncate(&a, DETAIL_WIDTH)))
+                                .map(|a| redact_then_truncate(&a, DETAIL_WIDTH))
                                 .filter(|d| !d.is_empty()),
                         });
                     }
@@ -389,12 +421,12 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
                 understood = false;
             }
         }
-        other if other.contains("error") => {
+        other if is_error_type(other) => {
             // An error record IS activity an observer wants to see.
             out.push(ActivityEvent {
                 at,
                 kind: EventKind::Error,
-                summary: redact(&truncate(other, SUMMARY_WIDTH)),
+                summary: redact_then_truncate(other, SUMMARY_WIDTH),
                 detail: None,
             });
         }
@@ -875,6 +907,61 @@ mod tests {
                 e[0].summary
             );
         }
+    }
+
+    #[test]
+    fn a_secret_straddling_the_truncation_boundary_still_redacts() {
+        // The order bug: truncating first could cut the value below the
+        // pattern's {8,} floor, so the surviving PREFIX of a real credential
+        // was emitted in clear. Shortening a secret does not make it safe.
+        let pad = "x".repeat(SUMMARY_WIDTH - 10);
+        let raw = format!("{pad} MY_API_TOKEN=abcdefghijklmnopqrstuvwxyz012345");
+        let e = ev(json!({"type": "user", "message": {"content": raw}}));
+        assert!(
+            !e[0].summary.contains("abcdefg"),
+            "a truncated secret prefix leaked: {}",
+            e[0].summary
+        );
+    }
+
+    #[test]
+    fn an_error_type_is_matched_on_boundaries_not_as_a_substring() {
+        // "terror" contains "error" — a substring test would emit it as an
+        // error event AND count it understood, hiding an unknown type.
+        assert!(is_error_type("error"));
+        assert!(is_error_type("api-error"));
+        assert!(is_error_type("api_error"));
+        assert!(!is_error_type("terror"));
+        assert!(!is_error_type("errors-summary"));
+        let outcome = classify_record(&json!({"type": "terror"}));
+        assert!(outcome.events.is_empty());
+        assert!(!outcome.understood, "an unknown type must be counted as drift");
+    }
+
+    #[test]
+    fn a_user_content_of_the_wrong_type_is_drift_not_a_message() {
+        let u = |v: serde_json::Value| classify_record(&v).understood;
+        assert!(u(json!({"type": "user", "message": {"content": "text"}})));
+        assert!(u(json!({"type": "user", "message": {"content": [{"type": "text"}]}})));
+        // Presence is not recognition.
+        assert!(!u(json!({"type": "user", "message": {"content": 42}})));
+        assert!(!u(json!({"type": "user", "message": {"content": {"nested": 1}}})));
+        assert!(!u(json!({"type": "user", "message": {"content": null}})));
+    }
+
+    #[test]
+    fn a_present_but_unparseable_timestamp_is_counted_as_drift() {
+        let ok = classify_record(&json!({"type": "user", "timestamp": "2026-08-01T05:51:43.357Z",
+            "message": {"content": "hi"}}));
+        assert!(ok.understood);
+        // Present but not a valid RFC3339 value — a format change worth seeing.
+        let bad = classify_record(&json!({"type": "user", "timestamp": "last tuesday",
+            "message": {"content": "hi"}}));
+        assert!(!bad.understood);
+        assert_eq!(bad.events.len(), 1, "the message is still reported");
+        // Absent entirely is fine — not every record carries one.
+        let none = classify_record(&json!({"type": "user", "message": {"content": "hi"}}));
+        assert!(none.understood);
     }
 
     #[test]
