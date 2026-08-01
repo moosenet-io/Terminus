@@ -14,7 +14,7 @@
 import type { ReactNode } from 'react';
 import { NavLink } from 'react-router-dom';
 import type { ModuleDescriptor } from '../lib/moduleRegistry';
-import { getPanelsByModule } from '../lib/moduleRegistry';
+import { getPanelsByModule, railOrder } from '../lib/moduleRegistry';
 import type { HealthStatus } from '../lib/aggregationClient';
 import type { CoreDescriptor } from '../lib/cores';
 import { MEMBER_LABEL } from '../lib/cores';
@@ -82,7 +82,13 @@ export function CoreRail({
         </div>
       );
     }
-    return panels.map(panel => (
+    // MGUI-20: order as PARENT then its children, so Movies/TV Shows read as what Library
+    // contains rather than as two more siblings over the same rows. A child whose parent is
+    // missing from this module's panel list falls back to rendering flat — a mis-typed
+    // parentId degrades to the old layout instead of hiding the panel entirely.
+    const ordered = railOrder(panels);
+
+    return ordered.map(({ panel, depth }) => (
       <NavLink
         key={panel.id}
         to={panel.path}
@@ -93,7 +99,9 @@ export function CoreRail({
           alignItems: 'center',
           gap: 'var(--space-2)',
           width: '100%',
-          padding: iconOnly ? 'var(--space-2) 0' : 'var(--space-2) var(--space-3)',
+          padding: iconOnly
+            ? 'var(--space-2) 0'
+            : `var(--space-2) var(--space-3) var(--space-2) calc(var(--space-3) + ${depth * 14}px)`,
           justifyContent: iconOnly ? 'center' : 'flex-start',
           color: isActive ? 'var(--text-accent)' : 'var(--text-secondary)',
           background: isActive ? 'var(--accent-primary-subtle)' : 'transparent',
@@ -108,7 +116,9 @@ export function CoreRail({
           aria-hidden
           style={{ width: 7, height: 7, borderRadius: '50%', background: dotColor, boxShadow: `0 0 7px ${dotColor}`, flexShrink: 0 }}
         />
-        {!iconOnly && <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{panel.title}</span>}
+        {!iconOnly && (
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{panel.title}</span>
+        )}
       </NavLink>
     ));
   };

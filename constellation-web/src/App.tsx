@@ -449,6 +449,22 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
                 }
               />
               {panels.map(panel => {
+                // MGUI-20: a `groupOnly` panel is a nav CATEGORY with no list of its own. Its
+                // path still routes — to the first child — so an existing bookmark or a stale
+                // link lands somewhere real instead of 404ing. If it somehow has no children,
+                // it falls back to rendering its own component rather than dead-ending.
+                if (panel.groupOnly) {
+                  const firstChild = panels.find(p => p.parentId === panel.id);
+                  if (firstChild) {
+                    return (
+                      <Route
+                        key={panel.id}
+                        path={panel.path}
+                        element={<Navigate to={firstChild.path} replace />}
+                      />
+                    );
+                  }
+                }
                 const Component = panel.component;
                 return <Route key={panel.id} path={panel.path} element={<Component />} />;
               })}
