@@ -19,6 +19,12 @@
 //! `unreachable` and `unauthorized` are not answers at all and carry no
 //! session data — not even a count.
 //!
+//! The same collapse can arrive through the PARSER rather than the transport,
+//! and that direction is the more dangerous one, because "nobody is watching"
+//! reads as a confident, correct answer. So `idle` is granted only to the one
+//! empty shape the live server actually emits, and every other unreadable body
+//! is `malformed` — see [`session_items`].
+//!
 //! ## Never cached
 //!
 //! Live session data is worthless stale, so `media_now_playing` is named in
@@ -165,14 +171,84 @@ fn bool_at(v: &Value, key: &str) -> Option<bool> {
     }
 }
 
-/// `MediaContainer.Metadata[]`, tolerating an absent key (Plex omits
-/// `Metadata` entirely when `size` is 0 — verified live).
-fn session_items(raw: &Value) -> Vec<&Value> {
-    raw.get("MediaContainer")
-        .and_then(|mc| mc.get("Metadata"))
-        .and_then(Value::as_array)
-        .map(|a| a.iter().collect())
-        .unwrap_or_default()
+/// `MediaContainer.Metadata[]` — or a description of why the payload could not
+/// be read at all.
+///
+/// **Why this returns a `Result` and not a `Vec`.** An earlier version returned
+/// an empty `Vec` for anything it could not walk, which meant `{}`, a missing
+/// `MediaContainer`, and a container claiming sessions it did not carry all
+/// rendered as `status: "idle"` — *"nobody is watching"*. That is the exact
+/// collapse this module exists to prevent, arriving through the parser instead
+/// of the transport, and it is the more dangerous direction: on a dashboard a
+/// broken read that says "nobody is watching" reads as a confident, correct
+/// answer, whereas `malformed` visibly says "ask again".
+///
+/// The one legitimately-empty shape is narrow and was verified against the
+/// live server (Plex Media Server 1.42.2): at rest `/status/sessions` returns
+/// exactly `{"MediaContainer":{"size":0}}` — `size` is an integer `0` and the
+/// `Metadata` key is absent entirely. So *absent `Metadata` with `size == 0`*
+/// is idle, and everything else that cannot be walked is malformed. Leaning on
+/// the observed shape rather than on defensiveness matters in both directions:
+/// calling a genuine idle response malformed would be its own false alarm.
+///
+/// Cross-checks applied, each because it would otherwise become a silent
+/// UNDERCOUNT — a quiet lie about who is watching:
+/// - `Metadata` absent but `size` nonzero (or absent) ⇒ malformed.
+/// - `Metadata` present but not a list ⇒ malformed.
+/// - a `Metadata` entry that is not an object ⇒ malformed (see below).
+/// - `size` present and disagreeing with the number of entries ⇒ malformed.
+///   `/status/sessions` is not a paginated collection (no `offset`/`totalSize`
+///   on it), so `size` and the list length are two statements of the same fact;
+///   when they disagree, one of them is wrong and we do not know which.
+///
+/// **An unparseable entry fails the WHOLE response rather than being dropped.**
+/// [`session_json`] is total over any JSON *object* — every field is optional
+/// and tolerates a missing/odd type — so the only way a single entry is
+/// genuinely unreadable is that it is not an object at all. That is not one bad
+/// viewer, it is evidence that the thing we are talking to does not speak this
+/// schema, which makes the rest of the list untrustworthy too. Dropping it
+/// would return a list that is short by one with a count to match: precisely
+/// the undercount to avoid. It would also need a fourth, partially-known state
+/// the contract deliberately does not have — today every non-`ok` status
+/// carries NO count, so a consumer either gets a complete count or none at all.
+fn session_items(raw: &Value) -> Result<Vec<&Value>, String> {
+    let Some(mc) = raw.get("MediaContainer") else {
+        return Err("the response from Plex had no MediaContainer".to_string());
+    };
+    if !mc.is_object() {
+        return Err("MediaContainer was not an object".to_string());
+    }
+    // Plex sends `size` as an integer here; `num_at` also accepts the string
+    // form some other Plex endpoints use, so a stringly-typed server is read
+    // rather than declared broken.
+    let size = num_at(mc, "size");
+
+    match mc.get("Metadata") {
+        None | Some(Value::Null) => match size {
+            Some(0) => Ok(Vec::new()),
+            Some(n) => Err(format!(
+                "MediaContainer reported {n} session(s) but carried no Metadata list"
+            )),
+            None => Err("MediaContainer had neither a size nor a Metadata list".to_string()),
+        },
+        Some(Value::Array(items)) => {
+            if let Some(i) = items.iter().position(|item| !item.is_object()) {
+                return Err(format!(
+                    "MediaContainer.Metadata entry {i} was not a session object"
+                ));
+            }
+            if let Some(n) = size {
+                if n != items.len() as i64 {
+                    return Err(format!(
+                        "MediaContainer reported {n} session(s) but carried {}",
+                        items.len()
+                    ));
+                }
+            }
+            Ok(items.iter().collect())
+        }
+        Some(_) => Err("MediaContainer.Metadata was not a list".to_string()),
+    }
 }
 
 /// `Media[0].Part[0].decision` — where Plex states the per-part decision
@@ -216,6 +292,31 @@ fn decide(item: &Value) -> PlaybackDecision {
 /// reason-or-nothing implementation would have shown nothing in practice.
 /// When it is missing we say which streams are being re-encoded and from what
 /// — the operationally useful part of the answer.
+///
+/// # When this is `None` (contract-relevant — read [`build_response`])
+///
+/// Every derived reason is derived FROM the `TranscodeSession` object: which
+/// streams are re-encoded, from what codec to what codec, which protocol the
+/// remux targets. So a reason exists only when Plex supplied that object.
+///
+/// The exact rule, and the one a consumer may rely on:
+///
+/// > `transcode_reason` is non-null **iff** `decision != "direct_play"` **and**
+/// > the session carried a `TranscodeSession` object.
+///
+/// So it is always `None` for `direct_play`, and it is also `None` for the two
+/// payloads where Plex states a non-direct-play decision on `Media[0].Part[0]`
+/// but supplies no `TranscodeSession` to explain it. `decision` — never the
+/// presence of a reason — is the discriminant for playback mode.
+///
+/// This is why the Phase 2 contract permits null for `direct_stream` and
+/// `transcode` instead of saying "null iff direct play". The alternative was to
+/// synthesise a reason for those cases, and that was rejected deliberately:
+/// with no `TranscodeSession` the server has told us *that* it is not direct
+/// playing and nothing at all about *why* or *into what*. A field whose entire
+/// job is to state a reason must not carry a guess — an invented "remuxed to a
+/// different container" is a claim about the server we did not observe, and it
+/// is worse than an honest blank because a dashboard renders it as fact.
 fn transcode_reason(item: &Value, decision: PlaybackDecision) -> Option<String> {
     if decision == PlaybackDecision::DirectPlay {
         return None;
@@ -358,6 +459,22 @@ fn server_json(raw: &Value) -> Value {
 /// The absence of `session_count` on every non-`ok` status is deliberate and
 /// load-bearing in two directions: a failed read must not be mistakable for an
 /// empty house, and an unentitled caller must not learn occupancy from a count.
+///
+/// `malformed` covers BOTH a body that was not JSON at all (raised in the
+/// client, [`PlexSessionsError::Malformed`]) and a well-formed JSON body whose
+/// session container could not be read ([`session_items`]). `idle` is reserved
+/// for the one shape the live server actually emits when nothing is playing —
+/// see [`session_items`] for exactly where that line falls and why.
+///
+/// ### Per-session field contract, where it is not self-evident
+///
+/// - `decision` is one of `direct_play` | `direct_stream` | `transcode`, and is
+///   the ONLY discriminant for playback mode.
+/// - `transcode_reason` is non-null **iff** `decision != "direct_play"` **and**
+///   the session carried a `TranscodeSession`. It is therefore permitted to be
+///   null for `direct_stream` and `transcode` — a consumer must render a null
+///   reason as "no reason given" and must NOT infer direct play from it. See
+///   [`transcode_reason`] for why no reason is invented in that case.
 fn build_response(status: &str, message: &str, extra: Value) -> Value {
     let mut out = json!({
         "status": status,
@@ -456,13 +573,18 @@ impl MediaNowPlaying {
         };
 
         match source.sessions().await {
-            Ok(raw) => {
-                let sessions: Vec<Value> = session_items(&raw).into_iter().map(session_json).collect();
-                // Best-effort only: the server header must never turn a good
-                // session read into a failure.
-                let server = source.identity().await.ok().map(|v| server_json(&v));
-                ok_response(sessions, server)
-            }
+            Ok(raw) => match session_items(&raw) {
+                Ok(items) => {
+                    let sessions: Vec<Value> = items.into_iter().map(session_json).collect();
+                    // Best-effort only: the server header must never turn a
+                    // good session read into a failure.
+                    let server = source.identity().await.ok().map(|v| server_json(&v));
+                    ok_response(sessions, server)
+                }
+                // A 200 whose BODY we cannot read is the same class of problem
+                // as a body that was not JSON — and must never become "idle".
+                Err(detail) => error_response(&PlexSessionsError::Malformed(detail)),
+            },
             Err(e) => error_response(&e),
         }
     }
@@ -649,7 +771,11 @@ mod tests {
     #[test]
     fn transcode_and_direct_play_are_both_parsed_from_one_container() {
         let raw = container(vec![transcoding_episode(), direct_play_movie()]);
-        let parsed: Vec<Value> = session_items(&raw).into_iter().map(session_json).collect();
+        let parsed: Vec<Value> = session_items(&raw)
+            .expect("a well-formed container parses")
+            .into_iter()
+            .map(session_json)
+            .collect();
         assert_eq!(parsed.len(), 2);
 
         assert_eq!(parsed[0]["decision"], "transcode");
@@ -696,6 +822,149 @@ mod tests {
         // The live server's session had videoDecision=copy WITH
         // audioDecision=transcode; that must stay a transcode.
         assert_eq!(session_json(&transcoding_episode())["decision"], "transcode");
+    }
+
+    #[test]
+    fn direct_stream_without_a_transcode_session_has_no_reason_and_that_is_the_contract() {
+        // Plex states `copy` on the Part but supplies no TranscodeSession, so
+        // it has told us THAT it is remuxing and nothing about why or into
+        // what. The contract permits null here; nothing is invented.
+        let mut item = direct_play_movie();
+        item["Media"][0]["Part"][0]["decision"] = json!("copy");
+        let parsed = session_json(&item);
+        assert_eq!(parsed["decision"], "direct_stream");
+        assert_eq!(parsed["transcode_reason"], Value::Null);
+
+        // Same for the transcode-by-Part case: no session object, no reason.
+        item["Media"][0]["Part"][0]["decision"] = json!("transcode");
+        let parsed = session_json(&item);
+        assert_eq!(parsed["decision"], "transcode");
+        assert_eq!(parsed["transcode_reason"], Value::Null);
+
+        // And the contract stated positively: a reason appears exactly when a
+        // TranscodeSession is present and the decision is not direct play.
+        for (item, expect_reason) in [
+            (transcoding_episode(), true),   // transcode, has TranscodeSession
+            (direct_stream_movie(), true),   // direct_stream, has TranscodeSession
+            (direct_play_movie(), false),    // direct_play
+        ] {
+            let has_ts = item.get("TranscodeSession").is_some();
+            let p = session_json(&item);
+            let non_direct_play = p["decision"] != "direct_play";
+            assert_eq!(
+                p["transcode_reason"].is_string(),
+                has_ts && non_direct_play,
+                "reason presence must follow the stated iff, payload was {p}"
+            );
+            assert_eq!(p["transcode_reason"].is_string(), expect_reason);
+        }
+    }
+
+    // ── malformed vs idle: a broken read must never read as an empty house ──
+
+    #[test]
+    fn structurally_invalid_payloads_are_malformed_and_never_empty() {
+        // Each of these previously produced an empty Vec, i.e. "idle".
+        for (label, raw) in [
+            ("an empty object", json!({})),
+            ("no MediaContainer", json!({ "size": 0, "Metadata": [] })),
+            ("a non-object response", json!("nothing is playing")),
+            ("a null response", Value::Null),
+            ("a MediaContainer that is not an object", json!({ "MediaContainer": 0 })),
+            (
+                "size nonzero with no Metadata",
+                json!({ "MediaContainer": { "size": 2 } }),
+            ),
+            (
+                "neither size nor Metadata",
+                json!({ "MediaContainer": { "identifier": "com.plexapp.plugins.library" } }),
+            ),
+            (
+                "Metadata that is not a list",
+                json!({ "MediaContainer": { "size": 1, "Metadata": { "title": "x" } } }),
+            ),
+        ] {
+            let err = session_items(&raw)
+                .expect_err(&format!("{label} must not parse as a session list"));
+            assert!(!err.is_empty(), "{label}: malformed needs a detail");
+        }
+    }
+
+    #[test]
+    fn the_live_servers_empty_shape_is_idle_not_malformed() {
+        // POSITIVE CONTROL, and the asymmetry that matters: calling a genuine
+        // idle response malformed would be its own false alarm. This is the
+        // exact body the live server returns at rest (Plex 1.42.2): size is an
+        // integer 0 and the Metadata key is absent entirely.
+        let raw = json!({ "MediaContainer": { "size": 0 } });
+        assert_eq!(session_items(&raw).expect("idle is a legitimate answer").len(), 0);
+
+        // An explicitly empty list, and the stringly-typed size some Plex
+        // endpoints use, are idle too.
+        assert!(session_items(&json!({ "MediaContainer": { "size": 0, "Metadata": [] } }))
+            .expect("an empty list is idle")
+            .is_empty());
+        assert!(session_items(&json!({ "MediaContainer": { "size": "0" } }))
+            .expect("a stringly-typed zero is still zero")
+            .is_empty());
+    }
+
+    #[test]
+    fn a_count_that_disagrees_with_the_list_is_malformed_never_an_undercount() {
+        let mut raw = container(vec![transcoding_episode()]);
+        raw["MediaContainer"]["size"] = json!(3);
+        assert!(
+            session_items(&raw).is_err(),
+            "reporting 1 of 3 sessions would be a quiet lie about who is watching"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_entry_fails_the_whole_response_rather_than_shortening_it() {
+        // DECISION (see `session_items`): the whole response is malformed. The
+        // entry cannot be dropped, because dropping it returns a list short by
+        // one WITH a matching count — an undercount that reads as authoritative.
+        let raw = json!({ "MediaContainer": { "size": 2, "Metadata": [
+            transcoding_episode(),
+            "not a session object"
+        ] } });
+        let err = session_items(&raw).expect_err("a non-object entry is not readable");
+        assert!(err.contains("entry 1"), "the detail should locate it: {err}");
+    }
+
+    #[tokio::test]
+    async fn malformed_and_idle_do_not_render_identically_end_to_end() {
+        let idle = MediaNowPlaying::with_source(CountingSource::ok(json!({
+            "MediaContainer": { "size": 0 }
+        })))
+        .run(entitled())
+        .await;
+
+        for broken in [
+            json!({}),
+            json!({ "MediaContainer": { "size": 2 } }),
+            json!({ "size": 0 }),
+        ] {
+            let p = MediaNowPlaying::with_source(CountingSource::ok(broken.clone()))
+                .run(entitled())
+                .await;
+
+            assert_eq!(p["status"], "malformed", "payload was {broken}");
+            assert_eq!(p["ok"], false, "payload was {broken}");
+            assert_ne!(p["status"], idle["status"]);
+            assert_ne!(p["message"], idle["message"]);
+            assert_ne!(p.to_string(), idle.to_string());
+
+            // The same invariant the transport failures carry: a read we could
+            // not complete reports NO count, so it can never be misread as an
+            // empty house.
+            assert!(p.get("session_count").is_none(), "payload was {broken}");
+            assert!(p.get("sessions").is_none(), "payload was {broken}");
+            assert!(p["detail"].is_string(), "payload was {broken}");
+        }
+
+        assert_eq!(idle["status"], "idle");
+        assert_eq!(idle["session_count"], 0);
     }
 
     // ── episode vs movie shapes ────────────────────────────────────────────

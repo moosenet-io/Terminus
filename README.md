@@ -265,11 +265,23 @@ the transcode reason — plus a session count and total bandwidth.
 
 Two properties are load-bearing rather than incidental:
 
-- **Three outcomes that never render identically.** *Plex unreachable*, *token rejected*
-  and *nobody is watching* are different facts and are kept apart at the type level from
-  the transport upward. Only the last one is an `ok` answer (`status: "idle"`, an empty
-  session list); a failed read carries **no session count at all**, so it can never be
-  misread as an empty house.
+- **Outcomes that never render identically.** *Plex unreachable*, *token rejected*,
+  *Plex answered something unreadable* and *nobody is watching* are different facts and
+  are kept apart at the type level from the transport upward. Only the last one is an
+  `ok` answer (`status: "idle"`, an empty session list); every failed read carries **no
+  session count at all**, so it can never be misread as an empty house. That holds for
+  the parser too, not just the transport: `idle` is granted only to the one empty shape
+  the live server actually emits (`MediaContainer` present, `size: 0`, no `Metadata`),
+  and any other body that cannot be walked — a missing `MediaContainer`, a nonzero
+  `size` with no sessions attached, a count that disagrees with the list — is
+  `malformed`. A broken read that claimed "nobody is watching" would be the worst
+  failure this tool could have, because on a dashboard it looks like an answer.
+- **`transcode_reason` may be null for a non-direct-play session.** It is non-null *iff*
+  `decision != "direct_play"` **and** Plex supplied a `TranscodeSession`. Plex sometimes
+  states the decision on `Media[0].Part[0]` with no transcode session to explain it, and
+  no reason is invented for that case — a field whose job is to state a reason must not
+  carry a guess. Consumers read `decision` as the discriminant for playback mode and
+  render a null reason as "no reason given".
 - **Private by default.** Now-playing reveals who is home and what they are doing, in
   real time, so it is gated on the caller's entitlement (the same `CallerContext`
   mechanism `weather` uses for operator-context inference). A guest, an unknown caller,
