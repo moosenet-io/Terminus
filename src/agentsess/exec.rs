@@ -237,8 +237,15 @@ mod tests {
 
     #[test]
     fn executor_for_rejects_unknown_host() {
-        let err = executor_for(Some("<host>")).unwrap_err();
-        assert!(matches!(err, ToolError::InvalidArgument(_)), "got {err:?}");
+        // `Box<dyn HostExecutor>` is not Debug, so `unwrap_err()` is unavailable
+        // here — match on the error directly instead.
+        match executor_for(Some("some-other-host")) {
+            Err(ToolError::InvalidArgument(msg)) => {
+                assert!(msg.contains("some-other-host"), "got {msg}")
+            }
+            Err(other) => panic!("wrong error variant: {other:?}"),
+            Ok(_) => panic!("an unknown host must not silently resolve to an executor"),
+        }
     }
 
     #[test]
@@ -260,12 +267,19 @@ mod tests {
     async fn local_executor_never_interprets_shell_syntax() {
         // Passing shell metacharacters as an ARGUMENT must not execute them:
         // `echo` receives them literally because there is no shell involved.
-        let out = LocalExecutor
-            .run(&["echo", "a; touch /tmp/agss-should-not-exist"])
-            .await
-            .unwrap();
+        // The canary lives in a unique temp dir, not a fixed `/tmp` path, so
+        // concurrent runs of this test cannot observe each other's state.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canary = dir.path().join("shell-was-interpreted");
+        let arg = format!("a; touch {}", canary.display());
+
+        let out = LocalExecutor.run(&["echo", &arg]).await.unwrap();
+
         assert!(out.ok());
         assert!(out.stdout.contains("; touch"), "got {:?}", out.stdout);
-        assert!(!std::path::Path::new("/tmp/agss-should-not-exist").exists());
+        assert!(
+            !canary.exists(),
+            "the argument reached a shell and was executed — argv form must prevent this"
+        );
     }
 }
