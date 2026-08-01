@@ -231,6 +231,50 @@ adding a principal: [docs/reference/tool-grants.md](docs/reference/tool-grants.m
 | `TERMINUS_GATEWAY_ALLOWLIST_JSON` | `{}` (deny all) | The grant map: `identity -> grant` |
 | `TERMINUS_GATEWAY_GUEST_IDENTITIES` | unset | Comma-separated identities that get the guest/family baseline |
 
+### Severe-weather watch — acting before it matters
+
+`weather_severe_alerts` answers *"is something coming that I need to act on?"*, as
+opposed to `weather`, which answers *"what's it like in X?"*. It watches exactly two
+things, both chosen because the operator actually acts on them:
+
+- **Storms that disrupt travel.** It reads real upcoming trips from the calendar and
+  checks the weather **at the destination on the travel day**, so a warning is about a
+  flight you actually have — not a generic "storms this week". Flight-shaped events are
+  called out separately, because there the useful action is *rebook now*.
+- **Heat waves as a home power / HVAC risk.** The trigger is *sustained* heat at the
+  home location: consecutive days at or above **32.2 °C / 90 °F** whose nights stay at
+  or above **21.1 °C / 70 °F**. The warm-night half is the point — a hot afternoon
+  followed by a cool night is not a power problem, because the building sheds its heat
+  and the AC rests. Heat becomes a *supply* problem when the nights stop helping.
+
+Travel thresholds, likewise deliberately conservative so the watch does not cry wolf:
+gale-force wind ≥ **17.2 m/s** (Beaufort 8), heavy rain ≥ **10 mm/3h**, any meaningful
+snow ≥ **2.5 mm/3h** water-equivalent, precipitation at or below freezing (icing), plus
+the thunderstorm, squall, freezing-rain and tornado condition groups. Light rain and a
+breeze are not disruption, and a plain warm day is not a heat wave.
+
+Three properties worth knowing:
+
+- **It is a pull-mode tool, not a push.** Terminus has no proactive delivery path to a
+  human — it holds no Matrix connection, and its only timed feature (`reminder`) is
+  deliberately built as poll-from-outside, with lumina-core owning delivery. So this
+  ships the assessment; scheduling and delivery belong where they already live.
+- **Derived, not official, by default.** The `/data/2.5/*` endpoints return no `alerts`
+  array; government alerts come only from One Call 3.0, a separate subscription. Set
+  `OPENWEATHER_ONECALL_ALERTS=1` to fetch them, in which case official alerts are
+  reported first and labelled as such. Otherwise every finding says it is derived.
+- **It degrades honestly.** *"Checked, nothing severe"* and *"could not check"* are
+  different answers and are worded differently — no calendar, no configured home
+  location, or a provider outage never renders as an all-clear. It never invents a
+  location.
+
+Reading the calendar and the home location is gated on the same per-source entitlement
+as location inference (`google_calendar_today` / `commute_estimate`), and the two are
+gated **independently**. An unentitled caller gets nothing *and causes no read of either
+source* — a guest cannot learn that the operator is travelling, where to, or where they
+live. Results are **never cached**; a stale all-clear is the one failure mode this tool
+must not have.
+
 ### Tool availability — parking a tool without removing it
 
 A tool whose backend has been retired should stop being offered to agents, but it should
@@ -313,6 +357,53 @@ for liveness). Full walkthrough: [docs/getting-started.md](docs/getting-started.
 - 12 binaries, including `terminus_primary` (gateway), `terminus_personal`, `review_daemon`, `mint`, `pii_gate`, `cortex_calibrate`, `house_style_check`.
 - 3 workspace crates: `terminus-rs`, `terminus-client` (enrollment + mTLS transport), `terminus-worker-sdk` (worker authoring).
 - Top call-graph hotspots: `mesh::principal::PrincipalResolver::map`, `registry::ToolRegistry::contains`, `mesh::tailnet::TailnetServer::start`.
+
+## The `pii_gate` binary
+
+The authoritative PII pre-push / pre-commit gate, replacing the legacy
+`.githooks/pii_gate.py`. It scans git *objects* (committed or staged blobs), not
+the working tree, so a secret that is committed but since deleted is still
+caught. It fails **closed**: a git error, a missing binary, or a malformed
+config is never reported as a clean push.
+
+```sh
+cargo build --release --bin pii_gate
+ln -sf ../../target/release/pii_gate .git/hooks/pre-push
+```
+
+| Flag | Effect |
+| --- | --- |
+| *(none)* | git pre-push protocol on stdin — scans the blobs being pushed |
+| `--staged` | git pre-commit — scans the staged index |
+| `--tree [PATH]` | sweeps a whole working tree (used by the mirror engine) |
+| `--json` | machine-readable report instead of the human summary |
+| `--visibility <internal\|public>` | override the repo's declared posture |
+| `--posture` | print the resolved posture and why, then exit 0 |
+
+### Posture: internal vs public
+
+The scan is always full-strength; posture decides only which categories are
+**reported**. A repo declares it via `[repository] visibility` in
+`.moosenet-repo.toml`.
+
+- **`internal`** — the fleet's own infrastructure *identifiers* are not reported:
+  container ids, internal hostnames and domains, operator paths, uuids, phone
+  numbers, the operator's name, and infra service names. An internal repo
+  legitimately documents these.
+- **`public`** — everything is reported. This is also the fail-closed default
+  when the declaration is absent, unparseable, or has an unrecognized value.
+
+**Real credentials are never posture-gated.** Private IPs, API keys, JWTs, PEM
+private keys, cloud provider keys, and quoted secrets fire at every posture, as
+do any operator-configured `extra_terms` / `extra_patterns`.
+
+This mirrors the `EXTENDED_PATTERNS` split of the Python gate it replaces. The
+filter lives in the binary only — the shared `ruleset_from_config` seam used by
+the runtime write gate and the git-public mirror engine stays unconditionally
+full-strength, so mirroring is never weakened by a repo's posture.
+
+Repo-specific terms, extra patterns, allowed emails, and exclusions come from a
+repo-root `pii-gate.toml` (or the path in `TERMINUS_PII_CONFIG`).
 
 ## Contributing
 
