@@ -367,10 +367,11 @@ export interface SessionDecision {
  *  as `"stale"`, never dropped and never coerced to `"playing"`. */
 export type SessionPlayState = 'playing' | 'paused' | 'stale';
 
-/** Mirrors Rust `LiveSessionOut`. See the module doc comment above for why this is NOT the same
- *  type as [`HistorySession`] despite the near-identical field list — `state`/`last_event_at`
- *  are the structural tell: a finished session has neither. */
-export interface LiveSession {
+/** Mirrors Rust `LiveSessionOut` EXACTLY — the wire shape, with no `source` key (Rust puts
+ *  `source` only on the envelope, `LiveSessionsResponse`). This is deliberately NOT the type
+ *  hooks/panels consume — see [`LiveSession`] below, which adds a client-side discriminant this
+ *  wire type does not carry. */
+interface LiveSessionOut {
   session_id: number;
   session_key: string | null;
   account: SessionAccount;
@@ -395,11 +396,9 @@ export interface LiveSession {
   decision: SessionDecision;
 }
 
-/** Mirrors Rust `HistorySessionOut` — identical to [`LiveSession`] minus `state`/
- *  `last_event_at`. Kept as its own interface rather than `Omit<LiveSession, ...>` so the two
- *  stay independently editable as their backing Rust structs diverge further (H2 is expected to
- *  do exactly that to `LiveSessionOut`, not to this one). */
-export interface HistorySession {
+/** Mirrors Rust `HistorySessionOut` EXACTLY — the wire shape, no `source` key. See
+ *  [`LiveSessionOut`]'s doc; [`HistorySession`] below is the type hooks/panels actually consume. */
+interface HistorySessionOut {
   session_id: number;
   session_key: string | null;
   account: SessionAccount;
@@ -408,7 +407,7 @@ export interface HistorySession {
   backdrop_url: string | null;
   view_offset_ms: number | null;
   duration_ms: number | null;
-  /** Same absent-when-unknown contract as `LiveSession.progress_pct` — see that field's doc. */
+  /** Same absent-when-unknown contract as `LiveSessionOut.progress_pct` — see that field's doc. */
   progress_pct?: number;
   player: string | null;
   platform: string | null;
@@ -417,6 +416,28 @@ export interface HistorySession {
   started_at: string;
   decision: SessionDecision;
 }
+
+/** The type hooks/panels actually consume — [`LiveSessionOut`] (the exact wire mirror) PLUS a
+ *  `source` literal every adapter stamps onto each row from the envelope's own `source` field
+ *  (see `muse.sessions.live()`'s implementation in both adapters). This field does not exist on
+ *  the wire per-item; it is a client-side addition, and a deliberate one:
+ *
+ *  A round of review caught that without it, `LiveSession` and `HistorySession` were only
+ *  distinguished by `state`/`last_event_at` being present-vs-absent — which TypeScript's
+ *  structural typing does NOT enforce both ways. A `HistorySession` (fewer fields) is correctly
+ *  rejected where a `LiveSession` is required (missing fields), but a `LiveSession` (a
+ *  strict superset) was silently ACCEPTED where a `HistorySession` was required — object
+ *  literals get an excess-property check, plain variables don't. That is exactly the wrong
+ *  direction: it let a live row masquerade as a history row with zero compile error, which is
+ *  the merge this whole item exists to forbid. Giving each type its OWN literal `source` value
+ *  (`'muse-derived'` vs `'muse-history'`) makes them mutually un-substitutable in BOTH
+ *  directions, regardless of which one is a structural superset of the other — see the
+ *  `@ts-expect-error` pair in `aggregationClient.sessions.test.ts` that pins both directions. */
+export type LiveSession = LiveSessionOut & { source: 'muse-derived' };
+
+/** [`HistorySessionOut`] (the exact wire mirror) plus the client-stamped `source` discriminant —
+ *  see [`LiveSession`]'s doc comment for why this field exists and why it's on both directions. */
+export type HistorySession = HistorySessionOut & { source: 'muse-history' };
 
 /** Mirrors Rust `LiveSessionsResponse`. `source` is always `"muse-derived"` in H1; MACT-04's
  *  panel renders it verbatim in the LIVE pane's header so the eventual H2 flip to
@@ -770,6 +791,7 @@ const MOCK_MUSE_GAPS = {
 const MOCK_MUSE_LIVE_SESSIONS: LiveSession[] = [
   {
     session_id: 501,
+    source: 'muse-derived',
     session_key: 'sess-mock-playing',
     account: { id: 1, display_name: 'Mock Viewer' },
     item: {
@@ -789,6 +811,7 @@ const MOCK_MUSE_LIVE_SESSIONS: LiveSession[] = [
   },
   {
     session_id: 502,
+    source: 'muse-derived',
     session_key: 'sess-mock-paused',
     account: { id: 2, display_name: 'Mock Guest' },
     item: {
@@ -811,6 +834,7 @@ const MOCK_MUSE_LIVE_SESSIONS: LiveSession[] = [
   },
   {
     session_id: 503,
+    source: 'muse-derived',
     session_key: 'sess-mock-stale',
     account: { id: 1, display_name: 'Mock Viewer' },
     item: {
@@ -842,6 +866,7 @@ const MOCK_MUSE_CONFLICT_SESSION_KEY = 'sess-mock-ambiguous';
 const MOCK_MUSE_HISTORY_SESSIONS: HistorySession[] = [
   {
     session_id: 401,
+    source: 'muse-history',
     session_key: 'sess-mock-hist-direct',
     account: { id: 1, display_name: 'Mock Viewer' },
     item: {
@@ -860,6 +885,7 @@ const MOCK_MUSE_HISTORY_SESSIONS: HistorySession[] = [
   },
   {
     session_id: 402,
+    source: 'muse-history',
     session_key: 'sess-mock-hist-remux',
     account: { id: 2, display_name: 'Mock Guest' },
     item: {
@@ -879,6 +905,7 @@ const MOCK_MUSE_HISTORY_SESSIONS: HistorySession[] = [
   },
   {
     session_id: 403,
+    source: 'muse-history',
     session_key: 'sess-mock-hist-transcode',
     account: { id: 3, display_name: 'Mock Third Account' },
     item: {
@@ -2387,9 +2414,16 @@ const httpAdapter: AggregationClient = {
         // bearer), a 404/501 on a pre-MACT-01 deploy, or any transport failure all become
         // `{available:false, detail}` — never a throw — so MACT-04's panel can name the cause.
         try {
-          const res = await httpJson<Omit<LiveSessionsResult, 'available' | 'detail'>>(
+          // The wire body has NO per-item `source` (Rust puts it only on the envelope) — stamp
+          // it onto every row here so the client-side `LiveSession` discriminant (see that
+          // type's doc comment) is actually populated, not just declared.
+          const res = await httpJson<{ source: 'muse-derived'; sessions: LiveSessionOut[] }>(
             '/api/muse/api/sessions/live');
-          return { ...res, available: true };
+          return {
+            available: true,
+            source: res.source,
+            sessions: res.sessions.map(s => ({ ...s, source: res.source })),
+          };
         } catch (e) {
           return {
             available: false,
@@ -2401,9 +2435,13 @@ const httpAdapter: AggregationClient = {
       },
       async history(limit?: number) {
         try {
-          const res = await httpJson<Omit<HistorySessionsResult, 'available' | 'detail'>>(
+          const res = await httpJson<{ source: 'muse-history'; sessions: HistorySessionOut[] }>(
             `/api/muse/api/sessions/history${buildQuery({ limit })}`);
-          return { ...res, available: true };
+          return {
+            available: true,
+            source: res.source,
+            sessions: res.sessions.map(s => ({ ...s, source: res.source })),
+          };
         } catch (e) {
           return {
             available: false,
@@ -2423,8 +2461,12 @@ const httpAdapter: AggregationClient = {
             });
             // Muse's `MuseError::into_response` always shapes a refusal body as `{"error":
             // "<message>"}` (`Muse/src/error.rs`) — prefer that real message when present,
-            // falling back to a generic one only if the body is missing/malformed.
-            const errorDetail = (body as { error?: string } | undefined)?.error;
+            // falling back to a generic one only if the body is missing/malformed OR (review
+            // finding) the `error` key isn't actually a string — `{"error": 42}` from a
+            // misbehaving proxy/backend must not leak a non-string `detail` past this type's own
+            // declared `detail: string`.
+            const rawError = (body as { error?: unknown } | undefined)?.error;
+            const errorDetail = typeof rawError === 'string' ? rawError : undefined;
             if (status === 403) {
               // 403 is enforced upstream by Terminus's `enforce_viewer_role_gate`, never by
               // Muse itself, so there's no `{"error": ...}` body to read here — see MACT-02's
@@ -2447,12 +2489,29 @@ const httpAdapter: AggregationClient = {
               return { kind: 'unavailable', detail: errorDetail ?? 'no stream controller configured' };
             }
             if (status >= 200 && status < 300) {
-              const b = (body ?? {}) as Partial<{ stopped: boolean; backend: string; reason_delivered: boolean }>;
+              // Review finding: `TerminateSessionResponse`'s three fields are ALL required in
+              // Rust (no `Option`, no `skip_serializing_if`) — treating a missing/malformed one
+              // as a default (`false`/`'unknown'`) would FABRICATE a typed 'ok' outcome from a
+              // response that never actually established it, the same class of defect MACT-02's
+              // own review caught in the Rust handler itself (never claim more than what was
+              // established). A 204, an empty body, or `{}` must resolve 'error', not 'ok'.
+              const b = body as Partial<Record<'stopped' | 'backend' | 'reason_delivered', unknown>> | undefined;
+              if (
+                b != null &&
+                typeof b.stopped === 'boolean' &&
+                typeof b.backend === 'string' &&
+                typeof b.reason_delivered === 'boolean'
+              ) {
+                return {
+                  kind: 'ok',
+                  stopped: b.stopped,
+                  backend: b.backend,
+                  reason_delivered: b.reason_delivered,
+                };
+              }
               return {
-                kind: 'ok',
-                stopped: b.stopped === true,
-                backend: b.backend ?? 'unknown',
-                reason_delivered: b.reason_delivered === true,
+                kind: 'error',
+                detail: `HTTP ${status} for ${path} — malformed success body (missing/invalid stopped/backend/reason_delivered)`,
               };
             }
             return { kind: 'error', detail: `HTTP ${status} for ${path}` };

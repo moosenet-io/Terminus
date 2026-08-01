@@ -23,14 +23,58 @@ import type { LiveSession, HistorySession } from './aggregationClient';
 const RAW_SOURCES: Record<string, string> = import.meta.glob('/src/**/*.{ts,tsx}', { query: '?raw', import: 'default', eager: true });
 const ALLOWED_FILES = new Set(['/src/lib/aggregationClient.ts']);
 
+// A call whose callee identifier is exactly `fetch`, optionally reached via a `window.`/
+// `globalThis.`/`self.` member prefix (all three are the same global in a browser) -- NOT merely
+// the substring "fetch" appearing inside a longer identifier. The leading `(?:^|[^.\w])` boundary
+// is what excludes `prefetch(`, `refetch(`, `doFetch(` (a word character immediately precedes
+// "fetch" there) while still allowing `window.fetch(` (the character before "window" is the
+// boundary, not the character before "fetch"). A prior version of this regex excluded ANY `fetch`
+// preceded by `.`, which wrongly passed `window.fetch(`/`globalThis.fetch(`/`self.fetch(` --
+// fixed here; see the self-test below that pins the member-form case.
+//
+// KNOWN LIMITATION (not solved by this regex, and not solved by any static text scan): an alias
+// assignment (`const request = fetch; request(...)`) evades this check entirely, same as it would
+// evade a real ESLint `no-restricted-globals` rule without additional scope analysis. This is a
+// best-effort textual guard, not a sandboxed guarantee -- code review is still the backstop for a
+// deliberately obfuscated bypass.
+const FETCH_CALL = /(?:^|[^.\w])(?:(?:window|globalThis|self)\s*\.\s*)?fetch\s*\(/;
+const WEBSOCKET_CTOR = /new\s+(?:(?:window|globalThis|self)\s*\.\s*)?WebSocket\s*\(/;
+
+function callsFetchOrConstructsWebSocket(text: string): boolean {
+  return FETCH_CALL.test(text) || WEBSOCKET_CTOR.test(text);
+}
+
+describe('MACT-03: the fetch/WebSocket-exclusivity guard actually fires (self-test)', () => {
+  it('detects a bare fetch( call', () => {
+    expect(callsFetchOrConstructsWebSocket('async function f() { return fetch("/x"); }')).toBe(true);
+  });
+
+  it('detects window.fetch( / globalThis.fetch( / self.fetch( -- the regression this fix closes', () => {
+    expect(callsFetchOrConstructsWebSocket('window.fetch("/x")')).toBe(true);
+    expect(callsFetchOrConstructsWebSocket('globalThis.fetch("/x")')).toBe(true);
+    expect(callsFetchOrConstructsWebSocket('self.fetch("/x")')).toBe(true);
+  });
+
+  it('detects new WebSocket( and new window.WebSocket(', () => {
+    expect(callsFetchOrConstructsWebSocket('const ws = new WebSocket(url);')).toBe(true);
+    expect(callsFetchOrConstructsWebSocket('const ws = new window.WebSocket(url);')).toBe(true);
+  });
+
+  it('does NOT flag identifiers that merely end in "fetch" (prefetch/refetch/doFetch/fetchOnce)', () => {
+    expect(callsFetchOrConstructsWebSocket('prefetch(url);')).toBe(false);
+    expect(callsFetchOrConstructsWebSocket('refetch();')).toBe(false);
+    expect(callsFetchOrConstructsWebSocket('doFetch(url);')).toBe(false);
+    expect(callsFetchOrConstructsWebSocket('const fetchOnce = useCallback(() => {}, []);')).toBe(false);
+    expect(callsFetchOrConstructsWebSocket('return { refetch: fetchOnce };')).toBe(false);
+  });
+});
+
 describe('MACT-03: aggregationClient.ts is the only module calling fetch/WebSocket', () => {
   it('no other .ts/.tsx source file under src/ calls fetch( or constructs new WebSocket(', () => {
     const offenders: string[] = [];
     for (const [path, text] of Object.entries(RAW_SOURCES)) {
       if (ALLOWED_FILES.has(path) || path.endsWith('.test.ts') || path.endsWith('.test.tsx')) continue;
-      // A bare `fetch(` call or a `new WebSocket(` construction -- not merely the word "fetch"
-      // appearing in prose/identifiers like `fetchOnce`/`refetch`.
-      if (/(?<![.\w])fetch\s*\(/.test(text) || /new\s+WebSocket\s*\(/.test(text)) {
+      if (callsFetchOrConstructsWebSocket(text)) {
         offenders.push(path);
       }
     }
@@ -42,18 +86,38 @@ describe('MACT-03: aggregationClient.ts is the only module calling fetch/WebSock
 // ── Type-level distinctness: LiveSession and HistorySession are NOT interchangeable ───────────
 
 describe('MACT-03: LiveSession and HistorySession are distinct types', () => {
-  it('a HistorySession is not assignable where a LiveSession is required (missing state/last_event_at)', () => {
-    const history: HistorySession = {
-      session_id: 1, session_key: 'k', account: { id: 1, display_name: 'x' },
-      item: { media_item_id: 1, title: 't', year: 2020, kind: 'movie', season_number: null, episode_number: null, episode_title: null },
-      poster_url: null, backdrop_url: null, view_offset_ms: 0, duration_ms: 1000, progress_pct: 0,
-      player: null, platform: null, product: null, device: null, started_at: '2026-01-01T00:00:00Z',
-      decision: { video_decision: null, audio_decision: null, transcode_decision: null, transcode_reason: null, container: null, video_codec: null, audio_codec: null, audio_channels: null, video_resolution: null, bitrate: null },
-    };
-    // @ts-expect-error -- HistorySession lacks `state`/`last_event_at`; assigning it where a
-    // LiveSession is expected must be a compile error, proving the two types are not merged.
+  const SHARED_DECISION = {
+    video_decision: null, audio_decision: null, transcode_decision: null, transcode_reason: null,
+    container: null, video_codec: null, audio_codec: null, audio_channels: null,
+    video_resolution: null, bitrate: null,
+  };
+  const SHARED_FIELDS = {
+    session_id: 1, session_key: 'k', account: { id: 1, display_name: 'x' },
+    item: { media_item_id: 1, title: 't', year: 2020, kind: 'movie' as const, season_number: null, episode_number: null, episode_title: null },
+    poster_url: null, backdrop_url: null, view_offset_ms: 0, duration_ms: 1000, progress_pct: 0,
+    player: null, platform: null, product: null, device: null, started_at: '2026-01-01T00:00:00Z',
+    decision: SHARED_DECISION,
+  };
+
+  it('a HistorySession is not assignable where a LiveSession is required (missing state/last_event_at/source)', () => {
+    const history: HistorySession = { ...SHARED_FIELDS, source: 'muse-history' };
+    // @ts-expect-error -- HistorySession lacks `state`/`last_event_at` AND carries the WRONG
+    // `source` literal ('muse-history', not 'muse-derived'); assigning it where a LiveSession is
+    // expected must be a compile error, proving the two types are not merged.
     const asLive: LiveSession = history;
     expect(asLive).toBeDefined();
+  });
+
+  it('a LiveSession is NOT assignable where a HistorySession is required, even though it is a structural SUPERSET (regression: this direction silently compiled before the `source` discriminant was added)', () => {
+    const live: LiveSession = {
+      ...SHARED_FIELDS, source: 'muse-derived', state: 'playing', last_event_at: null,
+    };
+    // @ts-expect-error -- LiveSession has every HistorySession field PLUS state/last_event_at,
+    // so TypeScript's structural typing would otherwise accept it here silently (excess
+    // properties are only checked on object LITERALS, not variables) -- exactly the drift this
+    // item exists to forbid, and exactly what `source`'s mismatched literal type now blocks.
+    const asHistory: HistorySession = live;
+    expect(asHistory).toBeDefined();
   });
 
   it('runtime: a live session carries state/last_event_at; a history session does not', async () => {
@@ -215,5 +279,44 @@ describe('MACT-03: httpAdapter.muse.sessions -- degrade-not-throw + typed termin
     );
     const res = await httpAdapter.muse.sessions.terminate('x', 'operator requested stop');
     expect(res).toEqual({ kind: 'ok', stopped: false, backend: 'plex', reason_delivered: false });
+  });
+
+  // Review finding: `TerminateSessionResponse`'s three fields are all REQUIRED in Rust (no
+  // `Option`, no `skip_serializing_if`) -- a 2xx with a missing/malformed field must never be
+  // upgraded into an invented 'ok' outcome (that would claim something the response never
+  // established, the same class of bug MACT-02's own review caught server-side).
+  it('terminate() a 204 (no body) on 2xx resolves kind: error, never a fabricated ok', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    const res = await httpAdapter.muse.sessions.terminate('x');
+    expect(res.kind).toBe('error');
+  });
+
+  it('terminate() an empty {} body on 200 resolves kind: error, never {stopped:false,backend:"unknown",...}', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({}), { status: 200 }));
+    const res = await httpAdapter.muse.sessions.terminate('x');
+    expect(res.kind).toBe('error');
+  });
+
+  it('terminate() a 200 with a wrong-typed field (stopped as a string) resolves kind: error', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ stopped: 'yes', backend: 'plex', reason_delivered: false }), { status: 200 }),
+    );
+    const res = await httpAdapter.muse.sessions.terminate('x');
+    expect(res.kind).toBe('error');
+  });
+
+  // Review finding: a non-string `error` field (a misbehaving proxy/backend sending
+  // `{"error": 42}`) must not leak a non-string value into `detail`, which the type declares as
+  // `string`.
+  it('terminate() a non-string error field falls back to a generic string detail, never a raw number', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: 42 }), { status: 404 }),
+    );
+    const res = await httpAdapter.muse.sessions.terminate('x');
+    expect(res.kind).toBe('not_found');
+    if (res.kind === 'not_found') {
+      expect(typeof res.detail).toBe('string');
+      expect(res.detail).toBe('session not in the live set');
+    }
   });
 });
