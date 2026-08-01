@@ -239,9 +239,16 @@ pub(crate) fn events_from_record(rec: &Value) -> Vec<ActivityEvent> {
 /// Turn one transcript record into zero or more activity events, and say
 /// whether its shape was recognised.
 ///
-/// Zero events is a legitimate outcome for an UNDERSTOOD record (bookkeeping,
-/// a turn containing only a `thinking` block); it is a drift signal for one we
-/// do not understand. The distinction is the whole point of this function.
+/// Zero events is a legitimate outcome for an UNDERSTOOD record. There are
+/// exactly four such deliberate silent cases, and no others:
+/// 1. a bookkeeping record,
+/// 2. an assistant turn with an empty content array,
+/// 3. an assistant turn whose only blocks are `thinking` (recognised, never
+///    republished),
+/// 4. a usable `text` block whose text is empty or whitespace.
+///
+/// Every other zero-event outcome is drift and is counted. The distinction is
+/// the whole point of this function.
 pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
     let at = timestamp_of(rec);
     let ty = rec.get("type").and_then(Value::as_str).unwrap_or("");
@@ -298,14 +305,18 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
                 // `content` absent or not an array — drifted shape.
                 return RecordOutcome { events: out, understood: false };
             };
-            // An assistant turn whose blocks are ALL unfamiliar has drifted.
-            // An EMPTY block list is legitimately empty, not drift.
-            let mut recognised_any = blocks.is_empty();
+            // EVERY block must be recognised and usable, not merely one of
+            // them. Under an "any" rule a single familiar block — a `thinking`
+            // block especially, which is always present — would MASK drifted
+            // siblings, which is the failure this counter exists to catch. An
+            // EMPTY block list has nothing to fail and is legitimately empty.
+            let mut all_recognised = true;
             for b in blocks {
                 match b.get("type").and_then(Value::as_str) {
-                    // Private reasoning — never republished (see module doc),
-                    // but a RECOGNISED block: its presence is not drift.
-                    Some("thinking") => recognised_any = true,
+                    // Private reasoning — recognised, and never republished
+                    // (see module doc). It cannot mask a drifted sibling
+                    // because recognition is now all-of, not any-of.
+                    Some("thinking") => {}
                     // A recognised block TYPE whose required field is missing
                     // or wrongly typed is still drift: `{"type":"text","text":42}`
                     // would otherwise count as understood while yielding
@@ -313,7 +324,6 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
                     // USABLE, not merely to carry a familiar type tag.
                     Some("text") => {
                         if let Some(t) = b.get("text").and_then(Value::as_str) {
-                            recognised_any = true;
                             if !t.trim().is_empty() {
                                 out.push(ActivityEvent {
                                     at,
@@ -322,16 +332,26 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
                                     detail: None,
                                 });
                             }
+                        } else {
+                            // `text` missing or not a string — familiar tag,
+                            // unusable payload.
+                            all_recognised = false;
                         }
                     }
                     Some("tool_use") => {
-                        let Some(name) = b.get("name").and_then(Value::as_str) else {
+                        let Some(name) = b
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|n| !n.is_empty())
+                        else {
                             // A tool call with no usable name tells an observer
-                            // nothing — treat as drift rather than emitting a
-                            // placeholder "tool" line.
+                            // nothing — an empty-summary line is worse than a
+                            // counted drift signal. Blank and whitespace-only
+                            // names are as unusable as a missing one.
+                            all_recognised = false;
                             continue;
                         };
-                        recognised_any = true;
                         let arg = b.get("input").and_then(primary_arg);
                         let summary = match &arg {
                             Some(a) => format!("{name}: {a}"),
@@ -346,10 +366,10 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
                                 .filter(|d| !d.is_empty()),
                         });
                     }
-                    _ => {}
+                    _ => all_recognised = false,
                 }
             }
-            if !recognised_any {
+            if !all_recognised {
                 understood = false;
             }
         }
@@ -644,9 +664,13 @@ mod tests {
         // `assistant` whose blocks are ALL a future block type.
         assert!(!u(json!({"type": "assistant", "message": {"content": [
             {"type": "future_block", "data": 1}]}})));
-        // But a MIX containing one recognised block is still understood.
-        assert!(u(json!({"type": "assistant", "message": {"content": [
+        // A MIX is drift: one familiar block must not MASK an unfamiliar
+        // sibling. Under an any-of rule a `thinking` block — present in nearly
+        // every turn — would hide every drifted block behind it.
+        assert!(!u(json!({"type": "assistant", "message": {"content": [
             {"type": "future_block"}, {"type": "text", "text": "hi"}]}})));
+        assert!(!u(json!({"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "x"}, {"type": "future_block"}]}})));
     }
 
     #[test]
@@ -668,6 +692,12 @@ mod tests {
             {"type": "tool_use", "input": {"file_path": "/x"}}]}})));
         assert!(!u(json!({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": 7}]}})));
+        // A blank or whitespace-only name is as unusable as a missing one —
+        // it would otherwise emit an empty-summary activity line.
+        assert!(!u(json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": ""}]}})));
+        assert!(!u(json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "   "}]}})));
 
         // An EMPTY string is a usable text block — recognised, just silent.
         assert!(u(json!({"type": "assistant", "message": {"content": [
