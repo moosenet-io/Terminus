@@ -25,6 +25,7 @@
 //! per-service configuration state without ever failing itself.
 
 pub mod clients;
+pub mod now_playing;
 pub mod organize;
 pub mod recommend;
 pub mod request;
@@ -98,13 +99,16 @@ impl RustTool for MediaDomainStatus {
 /// flag-gated no-op by default -- when `MEDIA_TASTE_MEMORY_ENABLED` is on,
 /// it REPLACES `media_recommend` with a taste-memory-aware decorator and
 /// adds the optional `media_taste_feedback` write-back tool. MEDIA-07 adds
-/// the remaining surface tools.
+/// the remaining surface tools. MUSEL-LIVE (MUSE #111) adds
+/// `media_now_playing` (`now_playing::register`) — the domain's only LIVE
+/// read, entitlement-gated and never cached.
 pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(MediaDomainStatus));
     search::register(registry);
     request::register(registry);
     organize::register(registry);
     recommend::register(registry);
+    now_playing::register(registry);
     taste_memory::register(registry);
 }
 

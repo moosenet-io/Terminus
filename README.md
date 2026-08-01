@@ -133,6 +133,10 @@ question does not pay a live upstream round-trip every time.
   can never be presented as current.
 - **Severe-weather alerts are never cached.** Freshness beats latency where safety is
   involved; a stale all-clear is worse than a slow answer.
+- **Live-state reads are never cached either** — `media_now_playing` is named in an
+  exact-name never-cache list, so it survives any future `media_*` prefix policy. A
+  cached "what is playing right now" is not stale data, it is a false statement — and a
+  cache hit would also bypass that tool's per-caller entitlement gate.
 - **Errors are never cached as data** — only a short failure backoff, and a failed
   background refresh leaves the last-good value intact rather than poisoning it.
 - **Results carry `fetched_at`** so the assistant can say "as of …" instead of implying
@@ -249,6 +253,31 @@ Set `TERMINUS_TOOL_AVAILABILITY_JSON` to a map of tool name (or name **prefix**)
   (optionally filtered by `prefix` or `state`).
 
 Changing availability takes effect on service restart, like every other `Environment=` knob.
+
+### Live viewing activity — `media_now_playing`
+
+Every other media read is historical (library, watch history, on-deck, recently added).
+`media_now_playing` is the one **live** read: Plex `/status/sessions`, direct — no
+Tautulli, no second client, no new credential. Per session it reports the title (with
+show/season/episode where applicable), who is watching, the player, progress and
+duration, and the playback decision — **direct play / direct stream / transcode** with
+the transcode reason — plus a session count and total bandwidth.
+
+Two properties are load-bearing rather than incidental:
+
+- **Three outcomes that never render identically.** *Plex unreachable*, *token rejected*
+  and *nobody is watching* are different facts and are kept apart at the type level from
+  the transport upward. Only the last one is an `ok` answer (`status: "idle"`, an empty
+  session list); a failed read carries **no session count at all**, so it can never be
+  misread as an empty house.
+- **Private by default.** Now-playing reveals who is home and what they are doing, in
+  real time, so it is gated on the caller's entitlement (the same `CallerContext`
+  mechanism `weather` uses for operator-context inference). A guest, an unknown caller,
+  a caller with no principal, or any un-threaded dispatch path receives `forbidden` and
+  nothing else — no titles, no usernames, no device names, and no count, because a count
+  alone discloses occupancy. The gate runs *before* the client is touched, so an
+  unentitled call issues no Plex request at all. It is deliberately **not** in the guest
+  baseline.
 
 The full inventory (17 subsystems, plus `compiler`, `constellation-web`, `compat`,
 and the crate-root modules) is in [docs/reference/index.md](docs/reference/index.md).
