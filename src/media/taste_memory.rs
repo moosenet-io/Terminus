@@ -42,7 +42,7 @@ use crate::error::ToolError;
 use crate::gateway_framework::audit::{AuditEntry, AuditResult};
 use crate::gateway_framework::ActionKind;
 use crate::registry::ToolRegistry;
-use crate::tool::RustTool;
+use crate::tool::{CallerContext, RustTool, ToolOutput};
 
 use super::recommend::MediaRecommend;
 
@@ -270,17 +270,41 @@ impl RustTool for TasteAwareMediaRecommend {
         self.inner.parameters()
     }
 
+    /// TERM #576: no caller identity => the unentitled path, so no curation
+    /// notes are fetched for anybody.
     #[instrument(skip(self, args), fields(tool = "media_recommend", taste_memory = true))]
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let base_str = self.inner.execute(args.clone()).await?;
+        self.run(args, CallerContext::untrusted()).await
+    }
+
+    async fn execute_with_caller(&self, args: Value, caller: CallerContext) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text_only(self.run(args, caller).await?))
+    }
+}
+
+impl TasteAwareMediaRecommend {
+    async fn run(&self, args: Value, caller: CallerContext) -> Result<String, ToolError> {
+        // Delegate WITH the caller: the inner tool owns the reject-vs-scope
+        // decision (TERM #576, `resolve_history_scope`), so a request for
+        // another member's account is refused here too, before any facade call.
+        let base_str = self.inner.run(args.clone(), caller.clone()).await?;
         let base: Value = serde_json::from_str(&base_str).map_err(|e| ToolError::Execution(format!("internal: base recommendation was not valid JSON: {e}")))?;
+
+        // TERM #576: curation notes are household data too -- a stored note is
+        // a person's own words about their own viewing, and the old code
+        // forwarded a caller-supplied `account_id` straight to the facade, so a
+        // guest could read another member's. The account now comes from the
+        // gateway-minted caller, and an unentitled caller's request never
+        // reaches the facade at all.
+        let Some(account_id) = caller.media_account() else {
+            return Ok(mark_taste_degraded(base, "not personalized for this caller").to_string());
+        };
 
         let Some(client) = &self.client else {
             return Ok(mark_taste_degraded(base, "taste memory not configured (MEDIA_TASTE_API_URL unset)").to_string());
         };
 
-        let account_id = args.get("account_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
-        match client.get_signals(account_id).await {
+        match client.get_signals(Some(account_id)).await {
             Ok(signals) => Ok(apply_taste_signals(base, &signals).to_string()),
             Err(e) => {
                 warn!("media taste-memory facade unreachable, degrading to stateless recommendations: {e}");
@@ -320,22 +344,49 @@ impl RustTool for MediaTasteFeedback {
                 "title": { "type": "string", "description": "Title of the movie/show the signal is about." },
                 "media_type": { "type": "string", "enum": ["movie", "tv"], "description": "Movie or TV series. Optional, defaults to \"movie\"." },
                 "signal": { "type": "string", "enum": ["requested", "watched", "dismissed"], "description": "The engagement signal to record." },
-                "account_id": { "type": "string", "description": "Optional Plex account/user id, for multi-user servers." },
+                "account_id": { "type": "string", "description": "Optional: your OWN media account id. It may not name another household member's account -- doing so is refused. Omit it and your own account is used." },
                 "note": { "type": "string", "description": "Optional free-text curation note, e.g. \"loved the slow pacing\"." }
             },
             "required": ["title", "signal"]
         })
     }
 
+    /// TERM #576: no caller identity => no account to write against => refused
+    /// rather than written to a guessed account.
     #[instrument(skip(self, args), fields(tool = "media_taste_feedback"))]
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        self.run(args, CallerContext::untrusted()).await
+    }
+
+    async fn execute_with_caller(&self, args: Value, caller: CallerContext) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text_only(self.run(args, caller).await?))
+    }
+}
+
+impl MediaTasteFeedback {
+    async fn run(&self, args: Value, caller: CallerContext) -> Result<String, ToolError> {
         let title = args.get("title").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| ToolError::InvalidArgument("title is required".into()))?;
         let media_type = args.get("media_type").and_then(|v| v.as_str()).unwrap_or("movie");
         let signal = args.get("signal").and_then(|v| v.as_str()).map(str::trim).ok_or_else(|| ToolError::InvalidArgument("signal is required".into()))?;
         if !VALID_SIGNALS.contains(&signal) {
             return Err(ToolError::InvalidArgument(format!("signal must be one of {VALID_SIGNALS:?}")));
         }
-        let account_id = args.get("account_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+        // TERM #576: the write path carries the same IDOR shape as the read
+        // path -- a caller-supplied `account_id` used to be forwarded to the
+        // facade verbatim, so one household member could write a taste signal
+        // (and a free-text note) into another's profile. Same guard, same
+        // single mechanism: the account comes from the gateway-minted caller,
+        // naming someone else's is refused, and a caller with no account of
+        // their own has nothing to write to.
+        let explicit = args.get("account_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+        let account_id = match super::recommend::resolve_history_scope(explicit, &caller)? {
+            super::recommend::HistoryScope::Account(id) => id,
+            super::recommend::HistoryScope::Unentitled => {
+                return Err(ToolError::InvalidArgument(
+                    "I can't record that -- I don't know whose taste profile it belongs to.".into(),
+                ))
+            }
+        };
         let note = args.get("note").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
 
         let Some(client) = &self.client else {
@@ -391,6 +442,17 @@ mod tests {
     use super::*;
     use httpmock::prelude::*;
     use serial_test::serial;
+
+    // TERM #576 fixtures -- placeholder account ids, not real accounts.
+    const OPERATOR_ACCOUNT: &str = "acct-operator";
+    const OTHER_MEMBER_ACCOUNT: &str = "acct-other";
+
+    fn caller_for(account: &str) -> CallerContext {
+        CallerContext::with_media_account_for_test_only(account)
+    }
+    fn guest() -> CallerContext {
+        CallerContext::untrusted()
+    }
 
     fn clear_flag_env() {
         std::env::remove_var("MEDIA_TASTE_MEMORY_ENABLED");
@@ -536,7 +598,7 @@ mod tests {
             when.method(GET).path("/status/sessions/history/all");
             then.status(200).json_body(json!({
                 "MediaContainer": { "Metadata": [
-                    { "title": "Arrival", "Genre": [{"tag": "Science Fiction"}], "viewedAt": 1000 }
+                    { "title": "Arrival", "Genre": [{"tag": "Science Fiction"}], "viewedAt": 1000, "accountID": OPERATOR_ACCOUNT }
                 ] }
             }));
         });
@@ -556,7 +618,7 @@ mod tests {
 
         let inner = build_test_media_recommend(&plex_server, &radarr_server);
         let decorator = TasteAwareMediaRecommend { inner, client: Some(TasteMemoryClient::new(taste_server.base_url(), reqwest::Client::new())) };
-        let result = decorator.execute(json!({})).await.unwrap();
+        let result = decorator.run(json!({}), caller_for(OPERATOR_ACCOUNT)).await.unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
 
         taste_mock.assert();
@@ -587,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn decorator_no_client_degrades_without_facade_call() {
         let decorator = TasteAwareMediaRecommend { inner: MediaRecommend::from_env(), client: None };
-        let result = decorator.execute(json!({})).await;
+        let result = decorator.run(json!({}), caller_for(OPERATOR_ACCOUNT)).await;
         assert!(result.is_ok());
         let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(parsed["structured"]["taste_memory"]["applied"], false);
@@ -605,7 +667,7 @@ mod tests {
             inner: MediaRecommend::from_env(),
             client: Some(TasteMemoryClient::new(taste_server.base_url(), reqwest::Client::new())),
         };
-        let result = decorator.execute(json!({})).await;
+        let result = decorator.run(json!({}), caller_for(OPERATOR_ACCOUNT)).await;
         assert!(result.is_ok(), "a facade error must degrade, never fail the tool");
         let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(parsed["structured"]["taste_memory"]["applied"], false);
@@ -660,7 +722,7 @@ mod tests {
             inner: MediaRecommend::from_env(),
             client: Some(TasteMemoryClient::new(taste_server.base_url(), reqwest::Client::new())),
         };
-        let result = decorator.execute(json!({})).await;
+        let result = decorator.run(json!({}), caller_for(OPERATOR_ACCOUNT)).await;
         assert!(result.is_ok(), "an unparseable facade response must degrade, never fail the tool");
         let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(parsed["structured"]["taste_memory"]["applied"], false);
@@ -676,7 +738,7 @@ mod tests {
             then.status(200).json_body(json!({ "ok": true }));
         });
         let tool = MediaTasteFeedback { client: Some(TasteMemoryClient::new(taste_server.base_url(), reqwest::Client::new())) };
-        let result = tool.execute(json!({"title": "Dune", "media_type": "movie", "signal": "watched"})).await.unwrap();
+        let result = tool.run(json!({"title": "Dune", "media_type": "movie", "signal": "watched"}), caller_for(OPERATOR_ACCOUNT)).await.unwrap();
         mock.assert();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["structured"]["recorded"], true);
@@ -685,7 +747,7 @@ mod tests {
     #[tokio::test]
     async fn write_back_not_configured_without_client() {
         let tool = MediaTasteFeedback { client: None };
-        let result = tool.execute(json!({"title": "Dune", "media_type": "movie", "signal": "watched"})).await;
+        let result = tool.run(json!({"title": "Dune", "media_type": "movie", "signal": "watched"}), caller_for(OPERATOR_ACCOUNT)).await;
         assert!(matches!(result, Err(ToolError::NotConfigured(_))));
     }
 
@@ -697,7 +759,7 @@ mod tests {
             then.status(500);
         });
         let tool = MediaTasteFeedback { client: Some(TasteMemoryClient::new(taste_server.base_url(), reqwest::Client::new())) };
-        let result = tool.execute(json!({"title": "Dune", "media_type": "movie", "signal": "watched"})).await;
+        let result = tool.run(json!({"title": "Dune", "media_type": "movie", "signal": "watched"}), caller_for(OPERATOR_ACCOUNT)).await;
         assert!(result.is_ok(), "a failed write-back must not surface as a tool error");
         let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(parsed["structured"]["recorded"], false);
@@ -706,8 +768,117 @@ mod tests {
     #[tokio::test]
     async fn write_back_rejects_invalid_signal() {
         let tool = MediaTasteFeedback { client: None };
-        let result = tool.execute(json!({"title": "Dune", "media_type": "movie", "signal": "bogus"})).await;
+        let result = tool.run(json!({"title": "Dune", "media_type": "movie", "signal": "bogus"}), caller_for(OPERATOR_ACCOUNT)).await;
         assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
+    }
+
+    // ── TERM #576: curation notes are household data too ────────────────────
+
+    /// GUEST: zero reads of the curation facade (counting source = the mock's
+    /// hit count), and no curation note in the response.
+    #[tokio::test]
+    #[serial]
+    async fn guest_gets_no_curation_notes_and_the_facade_is_never_called() {
+        let taste_server = MockServer::start();
+        let signals_mock = taste_server.mock(|when, then| {
+            when.method(GET).path("/media/taste/signals");
+            then.status(200).json_body(json!({
+                "liked_genres": ["Science Fiction"],
+                "notes": ["Placeholder Private Curation Note"]
+            }));
+        });
+        let decorator = TasteAwareMediaRecommend {
+            inner: MediaRecommend::from_env(),
+            client: Some(TasteMemoryClient::new(taste_server.base_url(), reqwest::Client::new())),
+        };
+        let result = decorator.run(json!({}), guest()).await.unwrap();
+
+        assert_eq!(signals_mock.hits(), 0, "an unentitled caller must not cause ANY curation-memory read");
+        assert!(!result.contains("Placeholder Private Curation Note"));
+        assert!(!result.contains("you told me"));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["structured"]["taste_memory"]["applied"], false);
+        assert_eq!(parsed["structured"]["personalized"], false);
+    }
+
+    /// GUEST naming another member's account: refused by the inner scope
+    /// guard, so the decorator never reaches the facade either.
+    #[tokio::test]
+    #[serial]
+    async fn guest_requesting_another_members_curation_notes_is_refused() {
+        let taste_server = MockServer::start();
+        let signals_mock = taste_server.mock(|when, then| {
+            when.method(GET).path("/media/taste/signals");
+            then.status(200).json_body(json!({ "notes": ["Placeholder Private Curation Note"] }));
+        });
+        let decorator = TasteAwareMediaRecommend {
+            inner: MediaRecommend::from_env(),
+            client: Some(TasteMemoryClient::new(taste_server.base_url(), reqwest::Client::new())),
+        };
+        let err = decorator
+            .run(json!({ "account_id": OTHER_MEMBER_ACCOUNT }), guest())
+            .await
+            .expect_err("naming another member's account must be refused");
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+        assert_eq!(signals_mock.hits(), 0);
+        assert!(!err.to_string().contains("Placeholder Private Curation Note"));
+    }
+
+    /// The account sent to the facade is the CALLER's, not the argument's --
+    /// asserted on the wire, since a forwarded argument was the original bug.
+    #[tokio::test]
+    #[serial]
+    async fn the_facade_is_queried_for_the_callers_own_account() {
+        let taste_server = MockServer::start();
+        let own = taste_server.mock(|when, then| {
+            when.method(GET).path("/media/taste/signals").query_param("account_id", OPERATOR_ACCOUNT);
+            then.status(200).json_body(json!({}));
+        });
+        let decorator = TasteAwareMediaRecommend {
+            inner: MediaRecommend::from_env(),
+            client: Some(TasteMemoryClient::new(taste_server.base_url(), reqwest::Client::new())),
+        };
+        decorator.run(json!({ "account_id": OPERATOR_ACCOUNT }), caller_for(OPERATOR_ACCOUNT)).await.unwrap();
+        own.assert();
+    }
+
+    /// Write-back carries the same guard: another member's profile, refused.
+    #[tokio::test]
+    #[serial]
+    async fn write_back_refuses_another_members_account_and_an_unmapped_caller() {
+        let taste_server = MockServer::start();
+        let post = taste_server.mock(|when, then| {
+            when.method(POST).path("/media/taste/engagement");
+            then.status(200).json_body(json!({ "ok": true }));
+        });
+        let tool = MediaTasteFeedback { client: Some(TasteMemoryClient::new(taste_server.base_url(), reqwest::Client::new())) };
+
+        let foreign = tool
+            .run(json!({"title": "Placeholder", "signal": "watched", "account_id": OTHER_MEMBER_ACCOUNT}), caller_for(OPERATOR_ACCOUNT))
+            .await;
+        assert!(matches!(foreign, Err(ToolError::InvalidArgument(_))));
+
+        let unmapped = tool.run(json!({"title": "Placeholder", "signal": "watched"}), guest()).await;
+        assert!(matches!(unmapped, Err(ToolError::InvalidArgument(_))));
+
+        assert_eq!(post.hits(), 0, "neither refusal may reach the facade");
+    }
+
+    /// Write-back positive control: the caller's OWN account id is what goes
+    /// on the wire, even when the argument is omitted entirely.
+    #[tokio::test]
+    #[serial]
+    async fn write_back_records_against_the_callers_own_account() {
+        let taste_server = MockServer::start();
+        let post = taste_server.mock(|when, then| {
+            when.method(POST)
+                .path("/media/taste/engagement")
+                .json_body_partial(format!(r#"{{"account_id":"{OPERATOR_ACCOUNT}"}}"#));
+            then.status(200).json_body(json!({ "ok": true }));
+        });
+        let tool = MediaTasteFeedback { client: Some(TasteMemoryClient::new(taste_server.base_url(), reqwest::Client::new())) };
+        tool.run(json!({"title": "Placeholder", "signal": "watched"}), caller_for(OPERATOR_ACCOUNT)).await.unwrap();
+        post.assert();
     }
 
     #[test]
