@@ -34,13 +34,21 @@
 //!   reported, never silent.
 //!
 //! This module reads NO credential and holds NO secret. The one place it
-//! touches a process environment ([`discover::session_id_from_environ`]) is
-//! narrowed to a single non-secret variable by construction.
+//! touches a process environment narrows the read to a single non-secret
+//! variable AT THE SOURCE (a NUL-delimited `grep`), so no other environment
+//! entry is ever materialised here or sent across the remote path.
 
-pub mod discover;
-pub mod exec;
+// `exec` and `discover` are crate-private ON PURPOSE. `HostExecutor::run`
+// takes an arbitrary argv, and the dev executor carries the fleet's dev-host
+// SSH credential — exposing either publicly would hand any consumer of this
+// crate a general-purpose remote-command primitive under those credentials.
+// The only public entry points are the registered tools, which accept a fixed
+// `host` enum and build every command themselves. `model` stays public: it is
+// inert data that Harmony deserializes.
 pub mod model;
-pub mod tools;
+pub(crate) mod discover;
+pub(crate) mod exec;
+pub(crate) mod tools;
 
 pub use model::{AgentKind, AgentSession, RepoContext, SessionAttachment, SessionsSnapshot};
 

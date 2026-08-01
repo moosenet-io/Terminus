@@ -24,9 +24,15 @@
 //! ## Session↔transcript matching, and its one heuristic
 //! Claude Code exports `CLAUDE_CODE_SESSION_ID` into its own environment, so
 //! the exact session UUID is read from `/proc/<pid>/environ` — an exact match,
-//! not a guess. **Only that single variable is ever extracted; no other
-//! environment content is read into the result, logged, or returned**, because
-//! a process environment routinely holds credentials.
+//! not a guess.
+//!
+//! **The filter is applied AT THE SOURCE, not after the fact.** The probe is a
+//! NUL-delimited `grep` for that one variable, so the other environment
+//! entries are never materialised into this process's memory — and, on the
+//! remote path, never cross the SSH connection at all. Reading the whole
+//! environ blob and discarding the rest afterwards would look equivalent and
+//! is not: a process environment routinely holds credentials, and "we threw
+//! them away after copying them over the network" is not a privacy property.
 //!
 //! When that is unavailable (a non-Claude agent, or an unreadable environ) we
 //! fall back to matching the transcript directory slug against the session's
@@ -79,9 +85,27 @@ fn extra_agent_programs() -> Vec<String> {
         .collect()
 }
 
+/// Validate a transcript root before it is ever handed to `find`.
+///
+/// argv form stops SHELL injection but not OPTION injection: `find` parses
+/// leading-dash arguments as options, and with no starting path GNU `find`
+/// silently defaults to `.` — so a root of `-delete` would be read as an
+/// action against the current directory rather than a path. Requiring an
+/// absolute path closes that off entirely, and is true of every real root.
+fn validate_transcript_root(root: &str) -> Result<(), String> {
+    if !root.starts_with('/') {
+        return Err(format!(
+            "AGENTSESS_TRANSCRIPT_ROOT must be an absolute path (got '{root}') — a relative or \
+             option-shaped value is refused because `find` would interpret it as an option"
+        ));
+    }
+    Ok(())
+}
+
 fn transcript_root(is_local: bool) -> Result<String, String> {
     if let Ok(v) = std::env::var("AGENTSESS_TRANSCRIPT_ROOT") {
         if !v.trim().is_empty() {
+            validate_transcript_root(&v)?;
             return Ok(v);
         }
     }
@@ -95,7 +119,11 @@ fn transcript_root(is_local: bool) -> Result<String, String> {
         );
     }
     match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => Ok(format!("{home}/.claude/projects")),
+        Ok(home) if !home.is_empty() => {
+            let root = format!("{home}/.claude/projects");
+            validate_transcript_root(&root)?;
+            Ok(root)
+        }
         _ => Err("neither AGENTSESS_TRANSCRIPT_ROOT nor HOME is set — transcript activity unavailable".into()),
     }
 }
@@ -125,9 +153,6 @@ fn parse_ps(stdout: &str) -> Vec<ProcRow> {
     let mut rows = Vec::new();
     for line in stdout.lines() {
         let line = line.trim_start();
-        let mut it = line.splitn(4, char::is_whitespace).filter(|s| !s.is_empty());
-        // `splitn` with a whitespace predicate can yield empty fragments when
-        // columns are space-padded, so re-split defensively.
         let mut fields = line.split_whitespace();
         let (pid, ppid, etimes) = match (fields.next(), fields.next(), fields.next()) {
             (Some(a), Some(b), Some(c)) => (a, b, c),
@@ -153,7 +178,6 @@ fn parse_ps(stdout: &str) -> Vec<ProcRow> {
             }
             line[idx..].trim().to_string()
         };
-        let _ = it.next();
         rows.push(ProcRow { pid, ppid, etimes, args });
     }
     rows
@@ -202,16 +226,37 @@ pub(crate) fn parse_tmux_panes(stdout: &str) -> Vec<(i32, SessionAttachment)> {
     out
 }
 
-/// Extract ONLY `CLAUDE_CODE_SESSION_ID` from a NUL-separated environ blob.
+/// Parse the session id out of the environ probe's output.
 ///
-/// Everything else in the blob is discarded unread — a process environment
-/// routinely carries credentials, so nothing but this one value may escape.
+/// The probe (see [`session_id_probe_argv`]) already filters to the single
+/// matching NUL-delimited entry at the source, so this normally sees exactly
+/// one record. It still splits on NUL and matches the prefix explicitly, so a
+/// grep that returned more than expected cannot smuggle another variable's
+/// value through — nothing but `CLAUDE_CODE_SESSION_ID` can ever be returned.
 pub(crate) fn session_id_from_environ(environ: &str) -> Option<String> {
     environ
         .split('\0')
         .find_map(|kv| kv.strip_prefix("CLAUDE_CODE_SESSION_ID="))
+        .map(|v| v.trim_end_matches('\n'))
         .filter(|v| !v.is_empty())
         .map(str::to_string)
+}
+
+/// The argv that reads ONLY the session-id entry out of a process environ.
+///
+/// `/proc/<pid>/environ` is NUL-delimited, so `grep -z` treats each `KEY=VALUE`
+/// as its own record and `-m1` stops at the first match. `-a` forces text mode
+/// on what grep would otherwise call a binary file. The result is that a single
+/// short record leaves the target host — not the whole environment.
+fn session_id_probe_argv(pid: i32) -> [String; 6] {
+    [
+        "grep".into(),
+        "-a".into(),
+        "-z".into(),
+        "-m1".into(),
+        "^CLAUDE_CODE_SESSION_ID=".into(),
+        format!("/proc/{pid}/environ"),
+    ]
 }
 
 /// Parse `find <root> -maxdepth 2 -name '*.jsonl' -printf '%T@ %p\n'` output
@@ -241,7 +286,7 @@ pub(crate) fn parse_transcripts(stdout: &str) -> Vec<(String, String, i64)> {
 }
 
 /// Run a full discovery pass on `exec`.
-pub async fn discover(
+pub(crate) async fn discover(
     exec: &dyn HostExecutor,
     repo_filter: Option<&str>,
 ) -> Result<SessionsSnapshot, ToolError> {
@@ -270,15 +315,11 @@ pub async fn discover(
         .collect();
     candidates.sort_by_key(|(r, _)| r.etimes);
 
-    let cap = max_sessions();
-    let truncated = candidates.len() > cap;
-    if truncated {
-        warnings.push(format!(
-            "result capped at AGENTSESS_MAX_SESSIONS={cap} ({} agent processes seen)",
-            candidates.len()
-        ));
-        candidates.truncate(cap);
-    }
+    // NOTE the ordering: the result cap is applied at the END, AFTER the repo
+    // filter. Capping the candidate list here instead would let
+    // `agentsess_list({repo: "X"})` return zero sessions while sessions in X
+    // were live, simply because they sorted beyond the cap — a filter that
+    // silently hides matches is worse than no filter.
 
     // ---- 2. tmux panes (optional) ----------------------------------------
     let panes = match exec
@@ -342,6 +383,7 @@ pub async fn discover(
     let mut git_cache: HashMap<String, Option<RepoContext>> = HashMap::new();
     let mut sessions = Vec::new();
     let mut ambiguous_cwds: Vec<String> = Vec::new();
+    let mut git_probe_failed = false;
 
     for (row, kind) in candidates {
         // cwd
@@ -361,7 +403,8 @@ pub async fn discover(
                 if let Some(hit) = git_cache.get(c) {
                     hit.clone()
                 } else {
-                    let ctx = git_context(exec, c).await;
+                    let (ctx, probe_ok) = git_context(exec, c).await;
+                    git_probe_failed |= !probe_ok;
                     git_cache.insert(c.clone(), ctx.clone());
                     ctx
                 }
@@ -380,11 +423,13 @@ pub async fn discover(
             }
         }
 
-        // transcript: exact via the exported session id, else the cwd-slug heuristic
-        let exact_id = match exec
-            .run(&["cat", &format!("/proc/{}/environ", row.pid)])
-            .await
-        {
+        // transcript: exact via the exported session id, else the cwd-slug
+        // heuristic. The probe greps for that ONE variable inside the target
+        // host, so the rest of the environment never reaches this process (and
+        // on the remote path never crosses the wire).
+        let probe = session_id_probe_argv(row.pid);
+        let probe_argv: Vec<&str> = probe.iter().map(String::as_str).collect();
+        let exact_id = match exec.run(&probe_argv).await {
             Ok(o) if o.ok() => session_id_from_environ(&o.stdout),
             _ => None,
         };
@@ -438,7 +483,29 @@ pub async fn discover(
         ));
     }
 
+    if git_probe_failed {
+        // "not a repository" and "the git probe could not run" both produce
+        // `repo: None`, which would otherwise be indistinguishable. Say which
+        // happened rather than letting a missing git read as "no repos here".
+        warnings.push(
+            "the git probe failed for at least one working directory — some sessions may show no \
+             repository/branch even though they are inside one"
+                .to_string(),
+        );
+    }
+
     sessions.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
+
+    // Cap LAST, so the repo filter above can never be starved by the cap.
+    let cap = max_sessions();
+    let truncated = sessions.len() > cap;
+    if truncated {
+        warnings.push(format!(
+            "result capped at AGENTSESS_MAX_SESSIONS={cap} ({} sessions matched)",
+            sessions.len()
+        ));
+        sessions.truncate(cap);
+    }
 
     Ok(SessionsSnapshot {
         sessions,
@@ -469,8 +536,14 @@ fn find_attachment(
 }
 
 /// Resolve the git toplevel + branch for a working directory.
-async fn git_context(exec: &dyn HostExecutor, cwd: &str) -> Option<RepoContext> {
-    let out = exec
+///
+/// Returns `(context, probe_ran)`. The second element distinguishes "this
+/// directory is not in a repository" (probe ran, answered no — `(None, true)`)
+/// from "the probe itself could not run" (`(None, false)`), which the caller
+/// surfaces as a warning. Collapsing both into a bare `None` would let a
+/// missing git binary read as "none of these sessions are in a repo".
+async fn git_context(exec: &dyn HostExecutor, cwd: &str) -> (Option<RepoContext>, bool) {
+    let out = match exec
         .run(&[
             "git",
             "-C",
@@ -481,32 +554,42 @@ async fn git_context(exec: &dyn HostExecutor, cwd: &str) -> Option<RepoContext> 
             "HEAD",
         ])
         .await
-        .ok()?;
+    {
+        Ok(o) => o,
+        // git missing / unrunnable — a probe failure, not an answer.
+        Err(_) => return (None, false),
+    };
     if !out.ok() {
-        return None;
+        // A non-zero exit here is git answering "not a repository", which is a
+        // legitimate result for a session running outside one.
+        return (None, true);
     }
     let mut lines = out.stdout.lines();
-    let root = lines.next()?.trim().to_string();
-    if root.is_empty() {
-        return None;
-    }
+    let root = match lines.next() {
+        Some(r) if !r.trim().is_empty() => r.trim().to_string(),
+        _ => return (None, true),
+    };
     let branch = lines
         .next()
         .map(str::trim)
         .filter(|b| !b.is_empty() && *b != "HEAD") // detached HEAD
         .map(str::to_string);
-    Some(RepoContext {
-        repo_name: Some(basename(&root).to_string()),
-        item_hint: branch.as_deref().and_then(parse_item_hint),
-        branch,
-        root,
-    })
+    (
+        Some(RepoContext {
+            repo_name: Some(basename(&root).to_string()),
+            item_hint: branch.as_deref().and_then(parse_item_hint),
+            branch,
+            root,
+        }),
+        true,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agentsess::exec::test_support::FakeExecutor;
+    use serial_test::serial;
 
     const PS_SAMPLE: &str = "\
    1402      1 185000 claude --dangerously-skip-permissions
@@ -629,7 +712,10 @@ mod tests {
         assert!(find_attachment(10, &ppid, &panes).is_none());
     }
 
+    // Reads AGENTSESS_MAX_SESSIONS, which a sibling test mutates — every
+    // test that observes that cap must be serialised with it (PCON-08).
     #[tokio::test]
+    #[serial]
     async fn discovery_degrades_when_tmux_and_transcripts_are_absent() {
         let exec = FakeExecutor::new()
             .with_stdout("ps", PS_SAMPLE)
@@ -644,13 +730,83 @@ mod tests {
         assert!(!snap.truncated);
     }
 
+    #[test]
+    fn transcript_root_refuses_option_shaped_and_relative_values() {
+        // argv form stops shell injection but NOT option injection: a root of
+        // `-delete` would be parsed by `find` as an action, and GNU find with
+        // no starting path defaults to `.`.
+        assert!(validate_transcript_root("-delete").is_err());
+        assert!(validate_transcript_root("--help").is_err());
+        assert!(validate_transcript_root("relative/path").is_err());
+        assert!(validate_transcript_root("").is_err());
+        assert!(validate_transcript_root("/home/u/.claude/projects").is_ok());
+    }
+
+    #[test]
+    fn session_id_probe_reads_only_the_one_variable() {
+        let argv = session_id_probe_argv(4242);
+        assert_eq!(argv[0], "grep");
+        // -z: NUL-delimited records (that is the environ format);
+        // -m1: stop at the first match, so nothing else is even scanned out.
+        assert!(argv.contains(&"-z".to_string()));
+        assert!(argv.contains(&"-m1".to_string()));
+        assert_eq!(argv[4], "^CLAUDE_CODE_SESSION_ID=");
+        assert_eq!(argv[5], "/proc/4242/environ");
+        // The whole-file read must NOT be how this is done.
+        assert!(!argv.iter().any(|a| a == "cat"));
+    }
+
+    // Reads AGENTSESS_MAX_SESSIONS, which a sibling test mutates — every
+    // test that observes that cap must be serialised with it (PCON-08).
     #[tokio::test]
+    #[serial]
+    async fn git_probe_failure_is_reported_not_silently_read_as_no_repo() {
+        // `git` unregistered on the fake executor => the probe cannot RUN,
+        // which must not look the same as "these sessions are not in a repo".
+        let exec = FakeExecutor::new()
+            .with_stdout("ps", PS_SAMPLE)
+            .with_stdout("readlink", "/work/thing\n");
+        let snap = discover(&exec, None).await.unwrap();
+        assert!(snap.sessions.iter().all(|s| s.repo.is_none()));
+        assert!(
+            snap.warnings.iter().any(|w| w.contains("git probe failed")),
+            "expected a git-probe warning, got {:?}",
+            snap.warnings
+        );
+    }
+
+    // Mutates a shared env var, so it must not race other tests (PCON-08).
+    #[tokio::test]
+    #[serial]
+    async fn the_repo_filter_is_applied_before_the_result_cap() {
+        // With a cap of 1, a filter matching 3 sessions must still return the
+        // capped count of MATCHING sessions — never zero because the matches
+        // sorted past the cap.
+        std::env::set_var("AGENTSESS_MAX_SESSIONS", "1");
+        let exec = FakeExecutor::new()
+            .with_stdout("ps", PS_SAMPLE)
+            .with_stdout("readlink", "/work/Terminus\n")
+            .with_stdout("git", "/work/Terminus\nAGSS-01-core\n");
+        let snap = discover(&exec, Some("Terminus")).await.unwrap();
+        std::env::remove_var("AGENTSESS_MAX_SESSIONS");
+        assert_eq!(snap.sessions.len(), 1, "{:?}", snap.sessions);
+        assert!(snap.truncated);
+        assert!(snap.warnings.iter().any(|w| w.contains("capped")));
+    }
+
+    // Reads AGENTSESS_MAX_SESSIONS, which a sibling test mutates — every
+    // test that observes that cap must be serialised with it (PCON-08).
+    #[tokio::test]
+    #[serial]
     async fn discovery_fails_only_when_the_process_probe_fails() {
         let exec = FakeExecutor::new().with_failure("ps", "boom");
         assert!(discover(&exec, None).await.is_err());
     }
 
+    // Reads AGENTSESS_MAX_SESSIONS, which a sibling test mutates — every
+    // test that observes that cap must be serialised with it (PCON-08).
     #[tokio::test]
+    #[serial]
     async fn repo_filter_excludes_non_matching_sessions() {
         let exec = FakeExecutor::new()
             .with_stdout("ps", PS_SAMPLE)
