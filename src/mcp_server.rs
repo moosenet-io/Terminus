@@ -81,6 +81,41 @@ use crate::pki::mtls::ClientIdentity;
 use crate::registry::ToolRegistry;
 
 /// Shared server state.
+/// Which per-caller location record belongs to this turn (LOCREG-01 x TERM #595).
+///
+/// Extracted from the dispatch call so the three arms can be tested directly:
+/// the arm that matters most is unreachable from a unit test while it is spelled
+/// inline inside the request handler, and an untested fail-closed branch is a
+/// fail-closed branch only by assertion.
+///
+/// - `None` — no assertion header: the legacy, service-scoped key. Unchanged
+///   behaviour for every pre-#595 caller.
+/// - `Verified` — the person is part of the key, so two people behind one
+///   service principal file under different storage keys and neither can read
+///   the other's saved home. The principal comes from the ASSERTION, not from
+///   the request: `verify` has already bound the two together, and using the
+///   bound copy means a future caller cannot pass a mismatched pair.
+/// - `Rejected` — NO key at all. Falling back to the service key here would hand
+///   the shared, pre-#577 record to exactly the caller whose identity we just
+///   refused to believe: the same inversion [`CallerKey::for_person`] documents
+///   for a blank person, reached from the other direction. No key means
+///   `Lookup::Denied`, which is the only safe answer to "who is this?" when the
+///   answer failed verification.
+fn caller_key_for(
+    principal: Option<&crate::mesh::Principal>,
+    asserted: &crate::mesh::AssertedPerson,
+) -> Option<crate::locations::CallerKey> {
+    match asserted {
+        crate::mesh::AssertedPerson::None => {
+            principal.and_then(crate::locations::CallerKey::for_principal)
+        }
+        crate::mesh::AssertedPerson::Verified(vp) => {
+            crate::locations::CallerKey::for_person(vp.principal(), vp.person())
+        }
+        crate::mesh::AssertedPerson::Rejected => None,
+    }
+}
+
 pub struct McpServerState {
     /// TMOD-01: the active tool-registry SNAPSHOT, swappable at runtime
     /// without a process restart. Every request handler takes exactly one
@@ -1362,15 +1397,7 @@ async fn handle_mcp(
                     // direction. No key means `Lookup::Denied`, which is the
                     // only safe answer to "who is this?" when the answer failed
                     // verification.
-                    match &asserted {
-                        crate::mesh::AssertedPerson::None => {
-                            principal.as_ref().and_then(crate::locations::CallerKey::for_principal)
-                        }
-                        crate::mesh::AssertedPerson::Verified(vp) => {
-                            crate::locations::CallerKey::for_person(vp.principal(), vp.person())
-                        }
-                        crate::mesh::AssertedPerson::Rejected => None,
-                    },
+                    caller_key_for(principal.as_ref(), &asserted),
                 )
                 .await
             {
@@ -1681,6 +1708,118 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    // ---- LOCREG-01 x TERM #595: which record belongs to this turn ----
+    //
+    // These cover `caller_key_for`, the join between the two items. The
+    // `Rejected` arm is the reason the function was extracted at all: it is the
+    // fail-closed branch, and a fail-closed branch nobody exercises is only
+    // fail-closed by assertion.
+    mod caller_key {
+        use crate::mcp_server::caller_key_for;
+        use crate::mesh::person::{mint, verify};
+        use crate::mesh::{AssertedPerson, Principal, PrincipalSource};
+        use serial_test::serial;
+
+        const KEY: &str = "term595-callerkey-test-key"; // pii-test-fixture: invented test key
+
+        fn configure() {
+            std::env::set_var(crate::mesh::person::SIGNING_KEY_ENV, KEY);
+            // pii-test-fixture: invented household names, not a real roster
+            std::env::set_var(crate::mesh::person::ROSTER_ENV, "alice,bob");
+        }
+
+        fn unconfigure() {
+            std::env::remove_var(crate::mesh::person::SIGNING_KEY_ENV);
+            std::env::remove_var(crate::mesh::person::ROSTER_ENV);
+        }
+
+        fn principal(name: &str) -> Principal {
+            Principal::new(name, PrincipalSource::MtlsCert)
+        }
+
+        fn verified(person: &str) -> AssertedPerson {
+            let token = mint("lumina", person).expect("minting must succeed");
+            AssertedPerson::Verified(verify(&token, Some("lumina")).expect("must verify"))
+        }
+
+        /// POSITIVE CONTROL. Without an assertion the legacy, service-scoped key
+        /// is still produced — a build that returned `None` everywhere would
+        /// pass the fail-closed tests below while breaking every existing
+        /// caller, and this is what catches that.
+        #[test]
+        fn no_assertion_still_yields_the_legacy_service_key() {
+            let p = principal("lumina");
+            let key = caller_key_for(Some(&p), &AssertedPerson::None)
+                .expect("a service-scoped caller must still get its key");
+            assert!(!key.is_person_scoped(), "no assertion means no person in the key");
+        }
+
+        /// The point of the item: two people behind ONE service principal file
+        /// under DIFFERENT storage keys, so neither can read the other's saved
+        /// home.
+        #[test]
+        #[serial]
+        fn two_verified_people_get_different_storage_keys() {
+            configure();
+            let p = principal("lumina");
+            let a = caller_key_for(Some(&p), &verified("alice")).expect("alice must key");
+            let b = caller_key_for(Some(&p), &verified("bob")).expect("bob must key");
+            assert!(a.is_person_scoped() && b.is_person_scoped());
+            assert_ne!(
+                a.storage_key(),
+                b.storage_key(),
+                "two people behind one principal must not share a record"
+            );
+            unconfigure();
+        }
+
+        /// A verified person's key is also distinct from the SERVICE key for the
+        /// same principal — otherwise "per-person" would collapse back onto the
+        /// shared pre-#577 record for whoever asserted first.
+        #[test]
+        #[serial]
+        fn a_person_key_is_not_the_service_key() {
+            configure();
+            let p = principal("lumina");
+            let person = caller_key_for(Some(&p), &verified("alice")).unwrap();
+            let service = caller_key_for(Some(&p), &AssertedPerson::None).unwrap();
+            assert_ne!(person.storage_key(), service.storage_key());
+            unconfigure();
+        }
+
+        /// THE FAIL-CLOSED CASE. A refused assertion gets NO key — it must not
+        /// fall back to the service key, which would hand the shared record to
+        /// exactly the caller whose identity verification just refused to
+        /// believe.
+        #[test]
+        fn a_rejected_assertion_gets_no_key_at_all() {
+            let p = principal("lumina");
+            assert!(
+                caller_key_for(Some(&p), &AssertedPerson::Rejected).is_none(),
+                "a refused identity must not be handed the shared service record"
+            );
+        }
+
+        /// And the refusal does not depend on there being no principal: even
+        /// with a perfectly good principal in hand, `Rejected` yields nothing.
+        /// (Guards against a future edit that reads the principal first and only
+        /// consults the assertion as a modifier.)
+        #[test]
+        fn rejection_outranks_a_usable_principal() {
+            let p = principal("lumina");
+            let would_have_been = caller_key_for(Some(&p), &AssertedPerson::None);
+            assert!(would_have_been.is_some(), "control: this principal does key");
+            assert!(caller_key_for(Some(&p), &AssertedPerson::Rejected).is_none());
+        }
+
+        /// No principal and no assertion: nothing to file under.
+        #[test]
+        fn no_principal_yields_no_key() {
+            assert!(caller_key_for(None, &AssertedPerson::None).is_none());
+            assert!(caller_key_for(None, &AssertedPerson::Rejected).is_none());
+        }
+    }
     use super::*;
     use crate::error::ToolError;
     use crate::tool::RustTool;
