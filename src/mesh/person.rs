@@ -14,7 +14,14 @@
 //! [`crate::tool::CallerContext`]); it was a way for "this turn is being run
 //! for Alice" to travel from the edge that actually authenticated Alice all
 //! the way to the authorization decision, WITHOUT any hop in between being
-//! able to invent or alter it.
+//! able to FORGE one.
+//!
+//! "Forge" is the precise word, and it is narrower than "invent or alter": an
+//! intermediary has no signing key, so it cannot mint a valid assertion, and
+//! each assertion is bound to the principal it was minted for, so it cannot be
+//! replayed under a different one. It is NOT proof against a hop that swaps in
+//! another captured, still-valid assertion for the SAME principal — see the
+//! replay limits below.
 //!
 //! # Why a signed assertion and not a forwarded header
 //!
@@ -77,12 +84,12 @@
 //! * **Claimed but blank, malformed, expired, mis-bound, unverifiable, or
 //!   presented on a hop that cannot honour it** ⇒ LESS privilege than the bare
 //!   service identity, never more, and never a silent fallback to it. That is
-//!   [`AssertedPerson::Rejected`], which
-//! [`crate::tool::CallerContext`] renders as
-//! [`PersonScope::Unidentified`](crate::tool::PersonScope::Unidentified): no
-//! operator context, no media account, and no per-caller record. The failure
-//! mode of a broken identity must be "the assistant asks who you are", never
-//! "the assistant answers as the operator".
+//!   [`AssertedPerson::Rejected`], which [`crate::tool::CallerContext`] renders
+//!   as [`PersonScope::Unidentified`](crate::tool::PersonScope::Unidentified):
+//!   no operator context, no media account, and no per-caller record.
+//!
+//! The failure mode of a broken identity must be "the assistant asks who you
+//! are", never "the assistant answers as the operator".
 //!
 //! # The roster, and why an unknown person is not a person
 //!
@@ -92,8 +99,15 @@
 //! * **Bounded cardinality.** The identifier ends up interned for the lifetime
 //!   of the process so [`crate::tool::CallerContext`] can stay `Copy`.
 //!   Interning something an upstream can vary per request would be an
-//!   unbounded leak; interning a value drawn from a closed operator-authored
-//!   list is bounded by the size of the household.
+//!   unbounded leak; drawing the value from a closed, operator-authored list
+//!   keeps growth driven by OPERATOR configuration rather than by callers.
+//!
+//!   That is not the same as being bounded by the household, and it would be
+//!   an overstatement to say so: the roster is re-read per request rather than
+//!   frozen at startup, so identifiers from rotated rosters accumulate. The
+//!   real bound is the hard cap in `CallerContext`'s intern table, past which
+//!   an unrecordable person is treated as unidentified rather than as the
+//!   service.
 //! * **Fail closed on typos.** A misspelled or renamed person resolves to
 //!   `Rejected` — the least-privilege path — rather than quietly minting a
 //!   fresh, empty identity that would then accumulate its own records.
