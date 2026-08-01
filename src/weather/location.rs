@@ -236,27 +236,169 @@ pub fn from_calendar(events: &[Value]) -> Option<(String, String)> {
     None
 }
 
-/// Routine locations from configuration. Non-secret addresses.
+/// Routine locations. Non-secret addresses, but sensitive ones.
+///
+/// LOCREG-01: this is now the WEATHER-SHAPED VIEW of the shared location
+/// registry ([`crate::locations`]), not a pair of env vars. Build it with
+/// [`Routine::resolve_for`] on the dispatch path; [`Routine::from_env`] survives
+/// only as the legacy input that feeds into it.
 #[derive(Debug, Clone, Default)]
 pub struct Routine {
     pub home: Option<String>,
     pub work: Option<String>,
+    /// Where the caller says they are RIGHT NOW — the registry's `current`
+    /// entry, typically temporary. Outranks home/work: a traveller's weather is
+    /// where they are, and because the entry expires, the override cannot
+    /// outlive the trip.
+    pub current: Option<String>,
+}
+
+/// A routine plus whether the registry could actually be read.
+///
+/// The flag is the whole reason this is a struct and not a bare `Routine`:
+/// "you have no home saved" and "I couldn't read your saved locations" must not
+/// collapse into one answer, and a `Routine` with `home: None` cannot tell them
+/// apart. See [`crate::locations::Lookup`].
+#[derive(Debug, Clone, Default)]
+pub struct RoutineResolution {
+    pub routine: Routine,
+    /// `true` when the registry exists but could not be read. NOT "empty".
+    pub degraded: bool,
+}
+
+/// Env var naming the ONE principal the legacy `COMMUTE_*` fallback applies to.
+///
+/// See [`Routine::resolve_for`] for why the fallback is scoped to a single
+/// principal rather than applied to everyone.
+pub const LEGACY_PRINCIPAL_ENV: &str = "TERMINUS_COMMUTE_LEGACY_PRINCIPAL";
+
+/// Default legacy principal: the assistant service. Today, per TERM #577, every
+/// human talking to Lumina arrives as that one identity — so this default
+/// reproduces exactly today's behaviour and widens nothing.
+pub const DEFAULT_LEGACY_PRINCIPAL: &str = "lumina";
+
+fn legacy_principal() -> String {
+    std::env::var(LEGACY_PRINCIPAL_ENV)
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_LEGACY_PRINCIPAL.to_string())
 }
 
 impl Routine {
+    /// The LEGACY input: `COMMUTE_HOME` / `COMMUTE_WORK`.
+    ///
+    /// Kept as a fallback so nothing regresses for the operator on the day this
+    /// ships, and deliberately NOT the primary source any more — see
+    /// [`Routine::resolve_for`].
     pub fn from_env() -> Self {
         let get = |k: &str| {
             std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
         };
-        Self { home: get("COMMUTE_HOME"), work: get("COMMUTE_WORK") }
+        Self { home: get("COMMUTE_HOME"), work: get("COMMUTE_WORK"), current: None }
     }
 
-    /// Pick home or work by time of day.
+    /// Build this caller's routine from the shared registry, with the legacy
+    /// env vars as a narrow fallback. **This is the LOCREG-01 wiring point.**
+    ///
+    /// ## Precedence, and why it is this way round
+    ///
+    /// 1. **The registry**, per caller. What the user told the assistant to
+    ///    remember beats what was configured on a host years ago — otherwise
+    ///    "I've moved" would appear to work and change nothing.
+    /// 2. **`COMMUTE_HOME` / `COMMUTE_WORK`**, but ONLY for the single principal
+    ///    named by [`LEGACY_PRINCIPAL_ENV`], and only for a slot the registry
+    ///    leaves empty.
+    ///
+    /// The scoping in (2) is the load-bearing part. Those env vars are
+    /// PROCESS-GLOBAL and hold the OPERATOR's own addresses; applying them to
+    /// every caller would hand one person's home address to whoever else is
+    /// entitled — the exact failure class fixed twice already this sprint. They
+    /// are a migration bridge for one identity, not a default for everyone, and
+    /// the moment that identity saves a `home` the registry wins and the bridge
+    /// stops mattering.
+    ///
+    /// Today, per TERM #577, that one identity is also the only one any human
+    /// reaches this code through, so this reproduces current behaviour exactly.
+    /// **When #577 closes this needs re-examining, not carrying forward**: a
+    /// per-person key will no longer match the legacy principal's record, and
+    /// the right answer is almost certainly to retire the env fallback rather
+    /// than re-point it.
+    ///
+    /// An unentitled caller gets an EMPTY routine and the store is never
+    /// touched — `crate::locations` makes that decision before any read.
+    pub fn resolve_for(
+        store: &dyn crate::locations::store::LocationStore,
+        key: Option<&crate::locations::CallerKey>,
+        caller: CallerContext,
+        legacy: &Routine,
+    ) -> RoutineResolution {
+        Self::resolve_for_legacy_principal(store, key, caller, legacy, &legacy_principal())
+    }
+
+    /// [`Routine::resolve_for`] with the legacy principal passed explicitly.
+    ///
+    /// Exists so the tests can exercise the fallback's SCOPING without mutating
+    /// process env — `std::env::set_var` from a parallel test is a race, and the
+    /// property under test here ("one principal, not everyone") is exactly the
+    /// kind that a flaky test would quietly stop enforcing.
+    pub fn resolve_for_legacy_principal(
+        store: &dyn crate::locations::store::LocationStore,
+        key: Option<&crate::locations::CallerKey>,
+        caller: CallerContext,
+        legacy: &Routine,
+        legacy_principal: &str,
+    ) -> RoutineResolution {
+        use crate::locations::{self, Listing};
+
+        let (mut home, mut work, mut current) = (None, None, None);
+        let mut degraded = false;
+
+        match locations::list(store, key, caller) {
+            Listing::Entries { live, .. } => {
+                for (name, entry) in live {
+                    match name.as_str() {
+                        locations::HOME => home = Some(entry.value),
+                        locations::WORK => work = Some(entry.value),
+                        locations::CURRENT => current = Some(entry.value),
+                        // A user-chosen name ("the cabin") is real registry data
+                        // and reachable by NAME through `locations::lookup`; it
+                        // just has no slot in the home/work routine, which is
+                        // what this view is for.
+                        _ => {}
+                    }
+                }
+            }
+            // No entitlement, or no identity: nothing was read and nothing is
+            // known. Not degraded — this is a correct, complete answer.
+            Listing::Denied => {
+                return RoutineResolution { routine: Routine::default(), degraded: false }
+            }
+            Listing::Unavailable(_) => degraded = true,
+        }
+
+        // The legacy bridge, for one principal, filling only empty slots.
+        let is_legacy = key.map(|k| k.principal() == legacy_principal).unwrap_or(false);
+        if is_legacy && !degraded {
+            home = home.or_else(|| legacy.home.clone());
+            work = work.or_else(|| legacy.work.clone());
+        }
+
+        RoutineResolution { routine: Routine { home, work, current }, degraded }
+    }
+
+    /// Pick the routine location: current, else work during working hours, else
+    /// home.
     ///
     /// `hour_local` is 0..=23. Work hours are a WEAKER signal than the calendar (which
     /// knows where you actually are), which is why this sits below it in the order.
     /// Falls back to whichever is configured when only one is.
     pub fn pick(&self, hour_local: u32, is_weekday: bool) -> Option<(String, &'static str)> {
+        // A live `current` entry is the user saying, in as many words, where
+        // they are — no inference beats that.
+        if let Some(c) = &self.current {
+            return Some((c.clone(), "current"));
+        }
         let at_work = is_weekday && (9..=17).contains(&hour_local);
         match (at_work, &self.work, &self.home) {
             (true, Some(w), _) => Some((w.clone(), "work")),
@@ -266,6 +408,18 @@ impl Routine {
         }
     }
 }
+
+/// What to say when the location could not be resolved AND the registry could
+/// not be read.
+///
+/// Distinct from [`ASK_MESSAGE`] on purpose: that one means "I don't know where
+/// you mean", this one means "I couldn't check what you've told me". Reporting
+/// a read failure as an empty registry would quietly teach the user that
+/// nothing is saved, and would invite exactly the confident guess this module
+/// exists to prevent.
+pub const REGISTRY_UNAVAILABLE_MESSAGE: &str =
+    "I couldn't read your saved locations just now, so I can't tell whether you have one set. \
+     Tell me the city and I'll check the weather for it.";
 
 /// The full chain, for a caller whose entitlement to each source of OPERATOR
 /// context is already decided (see this module's privacy note).
@@ -353,6 +507,7 @@ mod tests {
         Routine {
             home: home.map(str::to_string),
             work: work.map(str::to_string),
+            current: None,
         }
     }
 
@@ -609,6 +764,195 @@ mod tests {
         match resolve(None, &[], &routine(Some("Home St"), None), 10, true, calendar_only) {
             Resolved::AskUser => {}
             other => panic!("no calendar hit and no routine entitlement must ASK, got {other:?}"),
+        }
+    }
+
+    // ── LOCREG-01: the registry as the routine tier ─────────────────────────
+    //
+    // Fixtures are obvious placeholders. This repo publishes a PII-scrubbed
+    // public mirror and a "realistic" address in a test is indistinguishable
+    // from a real one to anyone reading it later.
+
+    mod registry {
+        use super::*;
+        use crate::locations::store::fake::{BrokenStore, CountingStore};
+        use crate::locations::store::LocationStore as _;
+        use crate::locations::{self, CallerKey};
+
+        const STORED_HOME: &str = "1 Placeholder Way, Examplecity"; // pii-test-fixture: obvious placeholder standing in for a saved home address
+        const LEGACY_HOME: &str = "9 Legacy Lane, Examplecity"; // pii-test-fixture: obvious placeholder standing in for the operator's COMMUTE_HOME
+        const OTHER_HOME: &str = "2 Otherplace Road, Examplecity"; // pii-test-fixture: obvious placeholder standing in for another caller's home address
+
+        fn key(name: &str) -> CallerKey {
+            CallerKey::for_principal_name(name).unwrap()
+        }
+
+        fn legacy() -> Routine {
+            Routine { home: Some(LEGACY_HOME.into()), work: None, current: None }
+        }
+
+        fn seed(store: &CountingStore, k: &CallerKey, name: &str, value: &str, hours: Option<i64>) {
+            match locations::set(store, Some(k), operator(), name, value, hours, true) {
+                locations::WriteOutcome::Stored { .. } => {}
+                other => panic!("seed failed: {other:?}"),
+            }
+        }
+
+        /// POSITIVE CONTROL for the whole wiring: a caller with a stored home
+        /// gets it back through the routine tier. An implementation that always
+        /// answered "not set" would pass every negative test below and fail this.
+        #[test]
+        fn a_stored_home_resolves_through_the_routine_tier() {
+            let s = CountingStore::new();
+            let k = key("alpha");
+            seed(&s, &k, locations::HOME, STORED_HOME, None);
+
+            let r = Routine::resolve_for(&s, Some(&k), operator(), &Routine::default());
+            assert!(!r.degraded);
+            match resolve(None, &[], &r.routine, 20, true, operator()) {
+                Resolved::Found { location, source: LocationSource::Routine(w) } => {
+                    assert_eq!(location, STORED_HOME);
+                    assert_eq!(w, "home");
+                }
+                other => panic!("expected the stored home, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn the_registry_beats_the_legacy_env_vars() {
+            let s = CountingStore::new();
+            let k = key("alpha");
+            seed(&s, &k, locations::HOME, STORED_HOME, None);
+
+            let r = Routine::resolve_for_legacy_principal(&s, Some(&k), operator(), &legacy(), "alpha");
+            assert_eq!(r.routine.home.as_deref(), Some(STORED_HOME), "'I've moved' must actually take effect");
+        }
+
+        #[test]
+        fn the_legacy_env_fallback_still_resolves_when_the_registry_is_empty() {
+            // The no-regression case: the operator has COMMUTE_HOME set and
+            // nothing saved yet. Weather must keep working exactly as before.
+            let s = CountingStore::new();
+            let r = Routine::resolve_for_legacy_principal(&s, Some(&key("alpha")), operator(), &legacy(), "alpha");
+            assert_eq!(r.routine.home.as_deref(), Some(LEGACY_HOME));
+            match resolve(None, &[], &r.routine, 20, true, operator()) {
+                Resolved::Found { location, .. } => assert_eq!(location, LEGACY_HOME),
+                other => panic!("got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn the_legacy_env_fallback_is_scoped_to_one_principal() {
+            // The operator's process-global COMMUTE_HOME must not become
+            // everybody else's home the moment they are entitled.
+            let s = CountingStore::new();
+            let r = Routine::resolve_for_legacy_principal(&s, Some(&key("bravo")), operator(), &legacy(), "alpha");
+            assert_eq!(r.routine.home, None, "another principal must not inherit COMMUTE_HOME");
+            assert!(!format!("{r:?}").contains("Legacy"));
+        }
+
+        #[test]
+        fn one_callers_registry_home_is_invisible_to_another() {
+            let s = CountingStore::new();
+            seed(&s, &key("bravo"), locations::HOME, OTHER_HOME, None);
+            let r = Routine::resolve_for(&s, Some(&key("alpha")), operator(), &Routine::default());
+            assert_eq!(r.routine.home, None);
+            assert!(!format!("{r:?}").contains("Otherplace"), "another caller's home leaked");
+        }
+
+        #[test]
+        fn an_unentitled_caller_causes_no_registry_read_and_gets_asked() {
+            let s = CountingStore::new();
+            let k = key("alpha");
+            seed(&s, &k, locations::HOME, STORED_HOME, None);
+            let reads_before = s.reads();
+
+            let r = Routine::resolve_for_legacy_principal(&s, Some(&k), guest(), &legacy(), "alpha");
+            assert_eq!(s.reads(), reads_before, "an unentitled caller must cause ZERO registry reads");
+            assert!(!r.degraded, "a refusal is not a degradation");
+            assert_eq!(r.routine.home, None);
+            assert_eq!(resolve(None, &[], &r.routine, 20, true, guest()), Resolved::AskUser);
+            assert!(!format!("{r:?}").contains("Placeholder"));
+        }
+
+        #[test]
+        fn a_live_current_location_outranks_home_and_work() {
+            let s = CountingStore::new();
+            let k = key("alpha");
+            seed(&s, &k, locations::HOME, STORED_HOME, None);
+            seed(&s, &k, locations::CURRENT, "Denver", Some(168));
+
+            let r = Routine::resolve_for(&s, Some(&k), operator(), &Routine::default());
+            match resolve(None, &[], &r.routine, 20, true, operator()) {
+                Resolved::Found { location, source: LocationSource::Routine(w) } => {
+                    assert_eq!(location, "Denver");
+                    assert_eq!(w, "current");
+                }
+                other => panic!("got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn an_expired_current_location_stops_outranking_home() {
+            // "I'm in Denver this week" must not still be true next month.
+            let s = CountingStore::new();
+            let k = key("alpha");
+            seed(&s, &k, locations::HOME, STORED_HOME, None);
+            seed(&s, &k, locations::CURRENT, "Denver", Some(1));
+
+            let mut doc = s.snapshot();
+            doc.caller_mut(&k.storage_key())
+                .locations
+                .get_mut(locations::CURRENT)
+                .unwrap()
+                .expires_at_unix = Some(chrono::Utc::now().timestamp() - 1);
+            s.save(&doc).unwrap();
+
+            let r = Routine::resolve_for(&s, Some(&k), operator(), &Routine::default());
+            assert_eq!(r.routine.current, None, "an expired travel location must not resolve");
+            match resolve(None, &[], &r.routine, 20, true, operator()) {
+                Resolved::Found { location, .. } => assert_eq!(location, STORED_HOME),
+                other => panic!("got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn an_empty_registry_and_an_unreadable_one_are_different_answers() {
+            let empty = CountingStore::new();
+            let e = Routine::resolve_for(&empty, Some(&key("alpha")), operator(), &Routine::default());
+            assert!(!e.degraded, "empty is NOT degraded — it is a complete, honest 'nothing set'");
+            assert_eq!(e.routine.home, None);
+
+            let broken = BrokenStore;
+            let b = Routine::resolve_for(&broken, Some(&key("alpha")), operator(), &Routine::default());
+            assert!(b.degraded, "a read failure must be reported as such, never as 'nothing set'");
+            assert_eq!(b.routine.home, None);
+        }
+
+        #[test]
+        fn a_degraded_registry_does_not_silently_fall_back_to_the_legacy_env() {
+            // Answering with COMMUTE_HOME when we could not read what the user
+            // actually saved would present a stale address as the current one.
+            let r = Routine::resolve_for_legacy_principal(&BrokenStore, Some(&key("alpha")), operator(), &legacy(), "alpha");
+            assert!(r.degraded);
+            assert_eq!(r.routine.home, None);
+        }
+
+        #[test]
+        fn the_unavailable_message_is_not_the_ask_message_and_names_no_city() {
+            assert_ne!(REGISTRY_UNAVAILABLE_MESSAGE, ASK_MESSAGE);
+            let m = REGISTRY_UNAVAILABLE_MESSAGE.to_lowercase();
+            for city in ["tampa", "paris", "omaha", "san francisco", "foster city", "new york"] {
+                assert!(!m.contains(city), "found {city:?}");
+            }
+            assert!(m.contains("couldn't read"));
+        }
+
+        #[test]
+        fn the_ask_message_offers_to_remember_rather_than_remembering() {
+            // The capture point: weather OFFERS, `location_set` stores. Storing
+            // as a side effect of answering a question is not consent.
+            assert!(ASK_MESSAGE.to_lowercase().contains("remember this is home"));
         }
     }
 

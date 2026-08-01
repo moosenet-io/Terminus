@@ -256,6 +256,54 @@ source* — a guest cannot learn that the operator is travelling, where to, or w
 live. Results are **never cached**; a stale all-clear is the one failure mode this tool
 must not have.
 
+### Saved locations — one registry, many consumers
+
+`location_set`, `location_list` and `location_clear` let the assistant remember
+places **conversationally** — *"I've moved"*, *"remember this is home"*, *"I'm in
+Denver this week"* — instead of someone editing config on a host. What they write
+is a **shared registry**, not a weather feature: `weather` is simply the first
+consumer wired to it, and commute/news/future modules read the same registry
+through the same contract (`crate::locations`). Adding a consumer needs no change
+to the registry.
+
+Entries are named. `home`, `work` and `current` are the well-known names other
+tools understand; anything else the user chooses ("the cabin") is stored and
+retrievable by name. An entry is permanent, or **temporary with an absolute
+expiry** — which is what makes a travel override safe: `current` outranks
+`home`/`work` while it lasts, and because it expires it cannot quietly become
+where you live.
+
+Four properties worth knowing:
+
+- **Per caller, and entitled.** Records are keyed on a caller identity derived
+  from the server-verified principal, and reading or writing needs the same
+  entitlement that governs home/work location inference (`commute_estimate`). A
+  caller cannot read or write another's record, and an unentitled caller causes
+  **zero reads** — not a read whose result is discarded. Note the standing gap:
+  every human talking to Lumina currently arrives as one service identity
+  (**TERM #577**), so this is per-*principal* today and becomes genuinely
+  per-person the moment that closes — with no rewrite, because the key already
+  has room for a person. Records written before then are **orphaned rather than
+  shared**: a re-entry prompt is cheap, a silently shared home address is not.
+- **Absence and failure stay distinct.** *"You have nothing saved"* and *"I
+  couldn't read what you've saved"* are different answers and are worded
+  differently, everywhere. A location is **never invented or inferred** to fill
+  either gap.
+- **Writes are deliberate.** Replacing an existing different value needs an
+  explicit confirmation; clearing everything needs `all=true`. `weather`'s
+  "or say *remember this is home*" is an **offer**, not an automatic save —
+  answering a question is not consent to store the answer.
+- **`COMMUTE_HOME` / `COMMUTE_WORK` still work.** They are a legacy fallback for
+  the single legacy principal only, filling a slot the registry leaves empty, so
+  nothing regresses on the day this ships. The registry wins as soon as it has
+  an answer, and the fallback is scoped to one identity because those variables
+  are process-global and hold one person's addresses.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TERMINUS_LOCATION_REGISTRY_PATH` | `~/.terminus/locations.json` | Where the registry document lives (owner-readable only, written atomically) |
+| `TERMINUS_COMMUTE_LEGACY_PRINCIPAL` | `lumina` | The one principal the legacy `COMMUTE_*` fallback applies to |
+
 ### Tool availability — parking a tool without removing it
 
 A tool whose backend has been retired should stop being offered to agents, but it should

@@ -56,6 +56,7 @@ pub mod openhands;
 pub mod google;
 pub mod <media-service>; // pii-test-fixture
 pub mod litellm;
+pub mod locations; // LOCREG-01: shared per-caller location registry (home/work/tracked/temporary)
 pub mod lumina_ext;
 /// S94 media domain — sovereign orchestration of the self-hosted media stack
 /// (Radarr/Sonarr/Prowlarr/qtor/Plex/<media-service>/TMDb). MEDIA-01 scaffold. // pii-test-fixture

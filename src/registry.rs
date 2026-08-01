@@ -106,6 +106,25 @@ impl ToolRegistry {
         Some(tool.execute_with_caller(args, caller).await)
     }
 
+    /// Execute a named tool carrying BOTH what the dispatch layer knows about
+    /// the caller (TRTR-05) and which caller-scoped record is theirs
+    /// (LOCREG-01, `crate::locations::CallerKey`).
+    ///
+    /// This is the fullest dispatch entry point and the one an authorized
+    /// request path should use. `call_with_caller` remains for paths that have
+    /// a context but no identity; a tool reached through it sees `key: None`
+    /// and must decline to touch per-caller data.
+    pub async fn call_with_caller_key(
+        &self,
+        name: &str,
+        args: Value,
+        caller: crate::tool::CallerContext,
+        key: Option<crate::locations::CallerKey>,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        let tool = self.tools.get(name)?;
+        Some(tool.execute_with_caller_key(args, caller, key).await)
+    }
+
     pub fn len(&self) -> usize {
         self.tools.len()
     }
@@ -178,6 +197,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::axon::register(registry);
     crate::commute::register(registry);
     crate::dgem::register(registry);
+    crate::locations::register(registry); // LOCREG-01: shared per-caller location registry
     crate::weather::register(registry);
     crate::dura::register(registry);
     crate::forge::register_public(registry); // S106/GITX-05: git-public, CORE only
