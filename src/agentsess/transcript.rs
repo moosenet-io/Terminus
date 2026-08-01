@@ -491,6 +491,12 @@ pub(crate) fn parse_tail(window: &str, started_mid_file: bool, limit: usize) -> 
 /// is rejected outright and the path must lie under the configured root. A
 /// leading-dash path is refused too — `tail` would read it as an option, the
 /// same class of hazard as the `find` root in AGSS-01.
+///
+/// This is the LEXICAL half of the jail. It is not sufficient on its own: a
+/// symlink beneath the root can point outside it, and `tail` follows symlinks,
+/// so a purely textual prefix check can be walked straight through. Callers
+/// must follow this with [`resolve_transcript_path_on_host`], which resolves
+/// the real path on the target host and re-checks it.
 pub(crate) fn resolve_transcript_path(root: &str, requested: &str) -> Result<String, ToolError> {
     if requested.contains("..") {
         return Err(ToolError::InvalidArgument(
@@ -509,6 +515,45 @@ pub(crate) fn resolve_transcript_path(root: &str, requested: &str) -> Result<Str
         )));
     }
     Ok(requested.to_string())
+}
+
+/// Resolve a transcript path to its REAL location on the target host and
+/// re-apply the jail.
+///
+/// The lexical check in [`resolve_transcript_path`] cannot see symlinks, and
+/// `tail` follows them — so a link under the root pointing at, say, a key file
+/// elsewhere would pass a textual prefix test and then be read. This resolves
+/// the path with `readlink -f` ON THE HOST THAT WILL READ IT (so the local
+/// filesystem's view is never mistaken for a remote one) and requires the
+/// canonical result to still be inside the root.
+///
+/// A TOCTOU window remains between resolving and reading — the link could be
+/// re-pointed in between. Closing it properly needs an openat/O_NOFOLLOW-style
+/// primitive that is not available through a shell probe, and the residual is
+/// small here because the root is an agent-owned directory rather than an
+/// attacker-writable one. It is recorded rather than silently accepted.
+pub(crate) async fn resolve_transcript_path_on_host(
+    exec: &dyn HostExecutor,
+    root: &str,
+    lexically_valid: &str,
+) -> Result<String, ToolError> {
+    let out = exec
+        .run(&["readlink", "-f", lexically_valid])
+        .await
+        .map_err(|e| ToolError::Execution(format!("could not resolve transcript path: {e}")))?;
+    let real = out.stdout.trim();
+    if !out.ok() || real.is_empty() {
+        return Err(ToolError::NotFound(
+            "transcript path could not be resolved on the target host".into(),
+        ));
+    }
+    // Re-apply the SAME jail to the resolved path.
+    resolve_transcript_path(root, real).map_err(|_| {
+        ToolError::InvalidArgument(
+            "transcript path resolves outside the configured transcript root (symlink escape)"
+                .into(),
+        )
+    })
 }
 
 /// Read the bounded tail of a transcript through `exec`.
@@ -914,12 +959,29 @@ mod tests {
         // The order bug: truncating first could cut the value below the
         // pattern's {8,} floor, so the surviving PREFIX of a real credential
         // was emitted in clear. Shortening a secret does not make it safe.
-        let pad = "x".repeat(SUMMARY_WIDTH - 10);
-        let raw = format!("{pad} MY_API_TOKEN=abcdefghijklmnopqrstuvwxyz012345");
+        // The name must END just before the cut so that only a FEW value
+        // characters survive it — under the old order those survivors fell
+        // below the pattern's {8,} floor, so nothing matched and they leaked.
+        // A secret positioned entirely past the cut would be removed by
+        // truncation alone and would pass even the buggy implementation.
+        const NAME: &str = "MY_API_TOKEN=";
+        let pad = "x".repeat(SUMMARY_WIDTH - NAME.len() - 5);
+        let raw = format!("{pad}{NAME}abcdefghijklmnopqrstuvwxyz012345");
+        // Exactly 5 value chars sit inside the truncation window.
+        assert_eq!(pad.len() + NAME.len(), SUMMARY_WIDTH - 5);
+
         let e = ev(json!({"type": "user", "message": {"content": raw}}));
         assert!(
-            !e[0].summary.contains("abcdefg"),
-            "a truncated secret prefix leaked: {}",
+            !e[0].summary.contains("abcde"),
+            "the surviving prefix of a straddling secret leaked: {}",
+            e[0].summary
+        );
+        // The placeholder itself is what gets truncated now — which is
+        // precisely the evidence we want: redaction ran on the full string
+        // first, so the cut lands in the placeholder rather than in a secret.
+        assert!(
+            e[0].summary.contains("<REDA"),
+            "expected a redaction placeholder at the cut: {}",
             e[0].summary
         );
     }
@@ -1019,6 +1081,29 @@ mod tests {
 
         assert!(t.truncated);
         assert_eq!(t.skipped_lines, 0, "the fragment was dropped, not counted");
+    }
+
+    #[tokio::test]
+    async fn the_jail_also_rejects_a_symlink_that_escapes_the_root() {
+        use crate::agentsess::exec::test_support::FakeExecutor;
+        let root = "/home/u/.claude/projects";
+
+        // A path that is lexically inside the root but RESOLVES outside it —
+        // `tail` would follow the link, so a textual prefix check alone is not
+        // a jail.
+        let escaping = FakeExecutor::new().with_stdout("readlink", "/etc/shadow\n");
+        let err = resolve_transcript_path_on_host(&escaping, root, "/home/u/.claude/projects/p/x.jsonl")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)), "got {err:?}");
+
+        // A path that resolves to a real location inside the root is accepted.
+        let ok = FakeExecutor::new()
+            .with_stdout("readlink", "/home/u/.claude/projects/p/real.jsonl\n");
+        let got = resolve_transcript_path_on_host(&ok, root, "/home/u/.claude/projects/p/x.jsonl")
+            .await
+            .unwrap();
+        assert_eq!(got, "/home/u/.claude/projects/p/real.jsonl");
     }
 
     #[test]

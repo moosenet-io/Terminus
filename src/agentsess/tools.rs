@@ -144,7 +144,7 @@ impl RustTool for AgentsessTranscript {
         let root = super::discover::transcript_root_for(exec.as_ref())
             .map_err(ToolError::NotConfigured)?;
 
-        let path = if let Some(p) = args.get("transcript_path").and_then(Value::as_str) {
+        let lexical = if let Some(p) = args.get("transcript_path").and_then(Value::as_str) {
             super::transcript::resolve_transcript_path(&root, p)?
         } else if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
             let snapshot = super::discover::discover(exec.as_ref(), None).await?;
@@ -164,6 +164,14 @@ impl RustTool for AgentsessTranscript {
                 "one of 'session_id' or 'transcript_path' is required".into(),
             ));
         };
+
+        // The lexical jail cannot see symlinks and `tail` follows them, so the
+        // path is resolved on the host that will read it and re-checked. Both
+        // halves are applied to a discovered path too — a transcript path that
+        // came from discovery is not automatically trustworthy.
+        let path =
+            super::transcript::resolve_transcript_path_on_host(exec.as_ref(), &root, &lexical)
+                .await?;
 
         let tail = super::transcript::read_tail(exec.as_ref(), &path, limit).await?;
         let structured = serde_json::to_value(&tail)
