@@ -240,7 +240,12 @@ adding a principal: [docs/reference/tool-grants.md](docs/reference/tool-grants.m
 Every warning above about TERM #577 has the same root: a gateway `Principal`
 names a **service**, and every person who talks to the assistant arrives as
 `lumina`. TERM #595 is the mechanism that lets a turn say *which human it is
-for*, in a way no hop in between can invent or alter.
+for*, in a way no hop in between can FORGE. That is the precise claim, and it is
+narrower than it first sounds: a hop cannot mint a valid assertion (it has no
+signing key) and cannot replay one under a different principal (each is bound to
+the principal it was minted for). It is *not* proof against a hop that replaces
+the header with another captured, still-valid assertion for the same principal —
+see the replay limits in `src/mesh/person.rs`.
 
 A trusted front door — one that is mutually authenticated (mTLS/tailnet) **and**
 holds the `admin:assert_person` grant — sets `X-Terminus-On-Behalf-Of: <person>`
@@ -296,8 +301,10 @@ entry — a tool wildcard (`"*"`) deliberately does **not** confer it:
 
 **Scope, stated plainly:** this ships the trusted transport, its authorization,
 and the threading into the caller context. Lumina does not yet *send*
-`X-Terminus-On-Behalf-Of`, and Chord does not yet relay the signed assertion, so
-end-to-end propagation is not live until those land. Until then every turn is
+`X-Terminus-On-Behalf-Of`. The proxy ingress DOES already mint the signed
+assertion and emit it on the upstream request to Chord; what is missing is Chord
+propagating it onward to MCP tool dispatch, so end-to-end propagation is not live
+until that and Lumina's side land. Until then every turn is
 still service-scoped — the same posture as before, not a weaker one.
 
 ### Severe-weather watch — acting before it matters
