@@ -77,13 +77,21 @@ export interface DecisionBadge {
   tooltip: string | null;
 }
 
-/** Classifies a session's stream-decision pair into the three UI buckets (Direct play / Remux /
+/** Classifies a session's stream-decision fields into the three UI buckets (Direct play / Remux /
  *  Transcode), or `unclassified` for a value this vocabulary doesn't recognise — rendered
  *  verbatim + "(unclassified)", never silently defaulted to "Direct play" (the failure mode this
- *  function exists to prevent; see the module doc's rule 2). */
+ *  function exists to prevent; see the module doc's rule 2).
+ *
+ *  Review fix (MUSE-124): the unknown-check MUST cover `transcode_decision`, not just
+ *  `video_decision`/`audio_decision` — a session with known direct-play video/audio but a
+ *  garbage `transcode_decision` was previously classified "Direct play" anyway, silently
+ *  dropping the one field that actually carries an unrecognised value. All three fields share
+ *  Muse's one `decision_kind_str` vocabulary (see `SessionDecision`'s doc comment), so all three
+ *  gate the unclassified check; only `video_decision`/`audio_decision` decide the DIRECT_PLAY vs
+ *  REMUX split once everything present is known. */
 export function classifyDecision(decision: SessionDecision): DecisionBadge {
-  const { video_decision, audio_decision, transcode_reason } = decision;
-  const values = [video_decision, audio_decision];
+  const { video_decision, audio_decision, transcode_decision, transcode_reason } = decision;
+  const values = [video_decision, audio_decision, transcode_decision];
   const allKnownOrNull = values.every(v => v === null || KNOWN_DECISION_VALUES.has(v));
 
   if (!allKnownOrNull) {
@@ -93,7 +101,7 @@ export function classifyDecision(decision: SessionDecision): DecisionBadge {
   if (video_decision === null && audio_decision === null) {
     return { kind: 'unclassified', label: 'unknown (unclassified)', tone: 'neutral', tooltip: transcode_reason };
   }
-  if (video_decision === 'transcode' || audio_decision === 'transcode') {
+  if (video_decision === 'transcode' || audio_decision === 'transcode' || transcode_decision === 'transcode') {
     return { kind: 'transcode', label: 'Transcode', tone: 'amber', tooltip: transcode_reason };
   }
   if (video_decision === 'direct_play' && audio_decision === 'direct_play') {

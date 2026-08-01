@@ -435,6 +435,18 @@ interface HistorySessionOut {
   decision: SessionDecision;
 }
 
+/** The two values `LiveSession.source`/`LiveSessionsResult.source` can carry: `'muse-derived'` is
+ *  the only one ANY code path actually produces today (H1 — Muse deriving live state from
+ *  `play_sessions` as a stand-in). `'maestro-live'` is reserved for H2's real Maestro push feed.
+ *  Widened from a single literal (review fix, MUSE-124): pinning the type to `'muse-derived'`
+ *  alone made MACT-04's "H2 is a one-line flip" claim false at the type level — every consumer,
+ *  including this file's own `live()` implementations, would have needed a type edit just to
+ *  accept the new value. With this union in place, `nowPlaying.ts`'s `liveSourceLabel` (which
+ *  already switches on the runtime string) and the panels that call it need ZERO changes for the
+ *  flip; only the PRODUCING side — `live()`'s implementation, its mock, and eventually a new
+ *  `maestro.*` proxy arm — has real work left to actually emit `'maestro-live'`. */
+export type LiveSessionSource = 'muse-derived' | 'maestro-live';
+
 /** The type hooks/panels actually consume — [`LiveSessionOut`] (the exact wire mirror) PLUS a
  *  `source` literal every adapter stamps onto each row from the envelope's own `source` field
  *  (see `muse.sessions.live()`'s implementation in both adapters). This field does not exist on
@@ -447,25 +459,28 @@ interface HistorySessionOut {
  *  strict superset) was silently ACCEPTED where a `HistorySession` was required — object
  *  literals get an excess-property check, plain variables don't. That is exactly the wrong
  *  direction: it let a live row masquerade as a history row with zero compile error, which is
- *  the merge this whole item exists to forbid. Giving each type its OWN literal `source` value
- *  (`'muse-derived'` vs `'muse-history'`) makes them mutually un-substitutable in BOTH
- *  directions, regardless of which one is a structural superset of the other — see the
- *  `@ts-expect-error` pair in `aggregationClient.sessions.test.ts` that pins both directions. */
-export type LiveSession = LiveSessionOut & { source: 'muse-derived' };
+ *  the merge this whole item exists to forbid. Giving each type its OWN `source` domain
+ *  (`LiveSessionSource` vs the single literal `'muse-history'`) makes them mutually
+ *  un-substitutable in BOTH directions, regardless of which one is a structural superset of the
+ *  other — see the `@ts-expect-error` pair in `aggregationClient.sessions.test.ts` that pins both
+ *  directions ('muse-history' is not a member of `LiveSessionSource` either way). */
+export type LiveSession = LiveSessionOut & { source: LiveSessionSource };
 
 /** [`HistorySessionOut`] (the exact wire mirror) plus the client-stamped `source` discriminant —
  *  see [`LiveSession`]'s doc comment for why this field exists and why it's on both directions. */
 export type HistorySession = HistorySessionOut & { source: 'muse-history' };
 
-/** Mirrors Rust `LiveSessionsResponse`. `source` is always `"muse-derived"` in H1; MACT-04's
- *  panel renders it verbatim in the LIVE pane's header so the eventual H2 flip to
- *  `"maestro-live"` is a visible, explained change. Extends the house degrade envelope
- *  (`available`/`detail`) the same way `TerminusActivityResponse` extends
- *  `ActivityFeedResponse` — never a throw, see `muse.sessions.live()` below. */
+/** Mirrors Rust `LiveSessionsResponse`. `source` is always `"muse-derived"` in H1 — nothing
+ *  produces `"maestro-live"` yet — but the FIELD'S TYPE is `LiveSessionSource` (not a single
+ *  literal) so H2's flip doesn't force a type change here or at any consumer; MACT-04's panel
+ *  renders it verbatim in the LIVE pane's header so the eventual flip is a visible, explained
+ *  change. Extends the house degrade envelope (`available`/`detail`) the same way
+ *  `TerminusActivityResponse` extends `ActivityFeedResponse` — never a throw, see
+ *  `muse.sessions.live()` below. */
 export interface LiveSessionsResult {
   available: boolean;
   detail?: string;
-  source: 'muse-derived';
+  source: LiveSessionSource;
   sessions: LiveSession[];
 }
 
@@ -2435,7 +2450,7 @@ const httpAdapter: AggregationClient = {
           // The wire body has NO per-item `source` (Rust puts it only on the envelope) — stamp
           // it onto every row here so the client-side `LiveSession` discriminant (see that
           // type's doc comment) is actually populated, not just declared.
-          const res = await httpJson<{ source: 'muse-derived'; sessions: LiveSessionOut[] }>(
+          const res = await httpJson<{ source: LiveSessionSource; sessions: LiveSessionOut[] }>(
             '/api/muse/api/sessions/live');
           return {
             available: true,

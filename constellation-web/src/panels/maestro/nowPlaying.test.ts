@@ -100,6 +100,25 @@ describe('classifyDecision', () => {
     expect(d.label).not.toContain('Direct play');
   });
 
+  // Review fix (MUSE-124, reported by codex): known direct-play video/audio plus an
+  // UNRECOGNISED `transcode_decision` was previously classified "Direct play" anyway, because
+  // the unknown-check only inspected video_decision/audio_decision. This is the regression test.
+  it('renders unclassified when video/audio are known direct_play but transcode_decision is not, never Direct play', () => {
+    const d = classifyDecision(decision({
+      video_decision: 'direct_play', audio_decision: 'direct_play', transcode_decision: 'quantum_leap',
+    }));
+    expect(d.kind).toBe('unclassified');
+    expect(d.label).toBe('quantum_leap (unclassified)');
+    expect(d.label).not.toBe('Direct play');
+  });
+
+  it('still classifies Direct play when transcode_decision is null (the normal no-transcode case)', () => {
+    const d = classifyDecision(decision({
+      video_decision: 'direct_play', audio_decision: 'direct_play', transcode_decision: null,
+    }));
+    expect(d.kind).toBe('direct_play');
+  });
+
   it('carries transcode_reason through as the badge tooltip', () => {
     const d = classifyDecision(decision({
       video_decision: 'transcode', audio_decision: 'transcode',
@@ -129,7 +148,15 @@ describe('statePillState / statePillLabel — stale is its own state', () => {
   });
 });
 
-describe('liveSourceLabel / historySourceLabel — rendered from the envelope, not hardcoded', () => {
+// NOTE (review fix, MUSE-124): this describe only exercises the pure FORMATTERS below — it
+// proves `liveSourceLabel`/`historySourceLabel` map a source string to the right copy, but it
+// does NOT prove either panel actually PASSES the live `source` value into these functions
+// instead of a hardcoded literal (the HISTORY pane did exactly that: hardcoded
+// `historySourceLabel('muse-history')` regardless of its `source` prop, and this describe block
+// passed anyway). The component-level proof — render `LivePane`/`HistoryPane` with a source that
+// is NOT the usual literal and assert the unusual value shows up — lives in
+// `ActivityPanel.test.tsx`, which fails if either pane goes back to hardcoding.
+describe('liveSourceLabel / historySourceLabel (formatters only — see ActivityPanel.test.tsx for the component-level proof)', () => {
   it('renders the H1 muse-derived source with its documented copy', () => {
     expect(liveSourceLabel('muse-derived')).toBe('live view derived from Muse watch history');
   });

@@ -9,7 +9,22 @@
 //     that `source` verbatim (`liveSourceLabel`, `nowPlaying.ts`) so H2's flip to a real Maestro
 //     push feed (`'maestro-live'`) is a visible, explained change — never a silent identity swap.
 //   - HISTORY — `useMuseSessionHistory()`, `source: 'muse-history'` PERMANENTLY (Muse's own
-//     ledger; unaffected by the H2 flip).
+//     ledger; unaffected by the H2 flip). BOTH panes read `source` off the resolved envelope
+//     (`live.data?.source` / `history.data?.source`) — a review round (MUSE-124) caught the
+//     HISTORY pane hardcoding the `'muse-history'` literal instead, which happened to render
+//     correctly today but would have silently gone stale under any future change to what the
+//     history endpoint actually reports. Fixed by threading `source` through as a prop, same as
+//     LIVE; `ActivityPanel.test.ts` renders both panes and asserts on an UNEXPECTED source value
+//     specifically so it fails if either hardcodes the literal again.
+//
+// H2 SWAP COST — corrected claim: `LiveSession.source` / `LiveSessionsResult.source` are typed
+// as `LiveSessionSource = 'muse-derived' | 'maestro-live'` (aggregationClient.ts), so THIS PANEL
+// needs zero changes for either value — `liveSourceLabel` already switches on the runtime string
+// (see nowPlaying.ts, unit-tested with both literals plus an unrecognised one). What is NOT a
+// one-line change is the PRODUCING side: `muse.sessions.live()`'s implementation, its mock, and
+// eventually a new `maestro.*` proxy arm all still need real work to actually emit
+// `'maestro-live'` from a real Maestro push feed. The type widening only guarantees the
+// consuming side (this panel) doesn't have to move when that lands.
 // `LiveSession` and `HistorySession` are branded, mutually non-substitutable types (see that
 // doc comment for why) — this panel never merges their rows into one shape, and each pane
 // degrades INDEPENDENTLY: a dead LIVE feed does not blank the HISTORY table and vice versa.
@@ -51,7 +66,7 @@ const HISTORY_FETCH_LIMIT = 200;
 
 // ── LIVE pane ─────────────────────────────────────────────────────────────
 
-function LiveSessionCard({ session }: { session: LiveSession }) {
+export function LiveSessionCard({ session }: { session: LiveSession }) {
   const progress = progressInfo(session.view_offset_ms, session.duration_ms, session.progress_pct);
   const decision = classifyDecision(session.decision);
   const resolved = isItemResolved(session.item);
@@ -103,7 +118,12 @@ function LiveSessionCard({ session }: { session: LiveSession }) {
           {accountLabel(session.account)} · {session.device ?? session.player ?? 'unknown device'}
         </div>
 
-        <ProgressBar pct={progress.pct ?? 0} style={{ marginTop: 2 }} />
+        {/* A `null` pct (unknown duration, MACT-01) is UNREPORTABLE, not zero — rendering
+            `<ProgressBar pct={0}>` here would draw a real, empty-looking track that reads as
+            "just started" to a viewer, indistinguishable from an actual 0% measurement. Review
+            finding (MUSE-124): omit the bar entirely rather than fabricate that reading; the
+            text label below already says so explicitly. */}
+        {progress.pct != null && <ProgressBar pct={progress.pct} style={{ marginTop: 2 }} />}
         <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-faint)' }}>
           {progress.combinedLabel}{progress.pct == null ? ' (progress not reported)' : ''}
         </div>
@@ -119,7 +139,7 @@ function LiveSessionCard({ session }: { session: LiveSession }) {
   );
 }
 
-function LivePane({ available, detail, sessions, source }: {
+export function LivePane({ available, detail, sessions, source }: {
   available: boolean | null;
   detail: string | undefined;
   sessions: LiveSession[];
@@ -181,10 +201,11 @@ function historyFilterValue(row: HistorySession, key: HistoryFilterKey): string 
   return classifyDecision(row.decision).label;
 }
 
-function HistoryPane({ available, detail, sessions }: {
+export function HistoryPane({ available, detail, sessions, source }: {
   available: boolean | null;
   detail: string | undefined;
   sessions: HistorySession[];
+  source: string | null;
 }) {
   const [accountFilter, setAccountFilter] = useState<string | null>(null);
   const [deviceFilter, setDeviceFilter] = useState<string | null>(null);
@@ -246,7 +267,9 @@ function HistoryPane({ available, detail, sessions }: {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
-      <CardTitle subtitle={historySourceLabel('muse-history')}>
+      {/* Read from the resolved envelope, not a hardcoded literal — see the module doc's
+          "BOTH panes read `source` off the resolved envelope" note (MUSE-124 review fix). */}
+      <CardTitle subtitle={source ? historySourceLabel(source) : 'watch history'}>
         History
       </CardTitle>
 
@@ -332,6 +355,7 @@ export function ActivityPanel() {
         available={historyAvailable}
         detail={history.degraded ? history.degraded.detail : undefined}
         sessions={history.data?.sessions ?? []}
+        source={history.data?.source ?? null}
       />
     </PanelRoot>
   );
