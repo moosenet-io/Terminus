@@ -133,6 +133,10 @@ question does not pay a live upstream round-trip every time.
   can never be presented as current.
 - **Severe-weather alerts are never cached.** Freshness beats latency where safety is
   involved; a stale all-clear is worse than a slow answer.
+- **Live-state reads are never cached either** — `media_now_playing` is named in an
+  exact-name never-cache list, so it survives any future `media_*` prefix policy. A
+  cached "what is playing right now" is not stale data, it is a false statement — and a
+  cache hit would also bypass that tool's per-caller entitlement gate.
 - **Errors are never cached as data** — only a short failure backoff, and a failed
   background refresh leaves the last-good value intact rather than poisoning it.
 - **Results carry `fetched_at`** so the assistant can say "as of …" instead of implying
@@ -466,6 +470,87 @@ signals a process. Being able to *watch* an autonomous agent carries no risk; be
 *type into* one can alter a build mid-flight. A send capability is a separate, gated change
 needing a session allowlist, a control-character whitelist, rate limiting and an audit-log
 entry — do not add one here without that gate.
+
+### Live viewing activity — `media_now_playing`
+
+Every other media read is historical (library, watch history, on-deck, recently added).
+`media_now_playing` is the one **live** read: Plex `/status/sessions`, direct — no
+Tautulli, no second client, no new credential. Per session it reports the title (with
+show/season/episode where applicable), who is watching, the player, progress and
+duration, and the playback decision — **direct play / direct stream / transcode** with
+the transcode reason — plus a session count and total bandwidth.
+
+Two properties are load-bearing rather than incidental:
+
+- **Outcomes that never render identically.** *Plex unreachable*, *token rejected*,
+  *Plex answered something unreadable* and *nobody is watching* are different facts and
+  are kept apart at the type level from the transport upward. Only the last one is an
+  `ok` answer (`status: "idle"`, an empty session list); every failed read carries **no
+  session count at all**, so it can never be misread as an empty house. That holds for
+  the parser too, not just the transport: `idle` is granted only to the one empty shape
+  the live server actually emits (`MediaContainer` present, `size: 0`, no `Metadata`),
+  and any other body that cannot be walked — a missing `MediaContainer`, a nonzero
+  `size` with no sessions attached, a count that disagrees with the list — is
+  `malformed`. A broken read that claimed "nobody is watching" would be the worst
+  failure this tool could have, because on a dashboard it looks like an answer.
+  Stated explicitly for consumers, because *absent*, *null* and *not-a-count* are not
+  the same shape:
+
+  > `status` is `idle` only when `MediaContainer.size` is **present** and is the whole
+  > number `0`, **and** `MediaContainer.Metadata` is either **absent** or an **empty
+  > array**. Everything else is `malformed`, never `idle`:
+  >
+  > - an explicitly `null` `Metadata`, at every `size` including `0` — Plex omits the
+  >   key when nothing is playing (`{"MediaContainer":{"size":0}}`) and emits no JSON
+  >   `null` on any endpoint, so a null means the response was rewritten in transit and
+  >   neither it nor the `size` beside it can be trusted;
+  > - an **absent** `size`, whatever `Metadata` does — Plex states a size on every
+  >   container it emits, so a missing one is the same evidence of an altered response;
+  > - a `size` that is **fractional, negative, or not a number** — a count of things is
+  >   a whole non-negative number, so `0.5` is not an imprecise count but an impossible
+  >   one, and it is never floored to `0`;
+  > - a session whose `TranscodeSession` is present but is **not an object** (`null`, a
+  >   scalar, a list) — the same evidence and the same verdict one level down, and the
+  >   whole response fails rather than that one session, because dropping it would be an
+  >   undercount and keeping it would state a playback decision derived from a payload
+  >   that was demonstrably rewritten.
+- **`transcode_reason` may be null for a non-direct-play session.** It is non-null *iff*
+  `decision != "direct_play"` **and** the session carried a `TranscodeSession` **object**.
+  Plex sometimes states the decision on `Media[0].Part[0]` with no transcode session to
+  explain it, and no reason is invented for that case — a field whose job is to state a
+  reason must not carry a guess. A `TranscodeSession` that is present but is not an
+  object is never read as one: it fails the whole response as `malformed` (above), so a
+  rewritten transcode block can never surface as a confident decision with a manufactured
+  reason. Consumers read `decision` as the discriminant for playback mode and render a
+  null reason as "no reason given".
+- **Numeric fields split by meaning.** `season`, `episode` and `year` are ordinals: a
+  fractional value is dropped to `null` rather than truncated, so a consumer is never
+  shown an episode number the payload did not state. `progress_ms`, `duration_ms` and
+  `bandwidth_kbps` are measurements: a fractional value is rounded to the nearest whole
+  unit, because a half-millisecond is not worth a blank progress bar. `session_key` is
+  an opaque string and is never read as a number.
+- **A `malformed` detail never quotes the payload back.** Every verdict above rests on
+  *this response was rewritten in transit, so nothing in it can be trusted* — which makes
+  echoing the offending value into our own error the one thing not to do: it hands whoever
+  rewrote the response a channel into the structured payload (a title, a username, an
+  address or a credential parked in `size` came straight back out, to a caller who may be
+  entitled to none of it) and lets an arbitrarily long value produce an arbitrarily long
+  error. So a detail names a **safe category** — the JSON type that arrived and the type
+  that was expected — and carries a value only when that value is a **number**, whose
+  rendering is hard-bounded and which cannot carry a name, an address or a secret. That
+  exception exists because `size: 0.5` is the one fault where the value *is* the
+  diagnosis. Every detail is additionally capped in length on the way out, as defence in
+  depth rather than as the mechanism. This matches what the rest of the path already
+  does: transport failures are **classified**, never `Display`ed, and the Plex base URL
+  and token are never echoed anywhere.
+- **Private by default.** Now-playing reveals who is home and what they are doing, in
+  real time, so it is gated on the caller's entitlement (the same `CallerContext`
+  mechanism `weather` uses for operator-context inference). A guest, an unknown caller,
+  a caller with no principal, or any un-threaded dispatch path receives `forbidden` and
+  nothing else — no titles, no usernames, no device names, and no count, because a count
+  alone discloses occupancy. The gate runs *before* the client is touched, so an
+  unentitled call issues no Plex request at all. It is deliberately **not** in the guest
+  baseline.
 
 The full inventory (17 subsystems, plus `compiler`, `constellation-web`, `compat`,
 and the crate-root modules) is in [docs/reference/index.md](docs/reference/index.md).

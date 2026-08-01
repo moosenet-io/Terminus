@@ -3,3 +3,12 @@
 Cargo.lock
 .DS_Store
 *.swp
+
+# Runtime artifact, not source. The constellation aggregation layer appends its
+# mutating-request audit log here whenever CONSTELLATION_AUDIT_LOG_PATH is unset
+# (src/config.rs::constellation_audit_log_path defaults to a relative path, i.e.
+# the process CWD) -- which includes `cargo test`, so the crate root collects the
+# auth/proxy tests' synthetic login records on every run. It was committed by
+# accident and has been dirtying worktrees ever since. Nothing reads it from the
+# repo: it is tail-read at runtime from the SERVICE working directory.
+/constellation-audit.jsonl
