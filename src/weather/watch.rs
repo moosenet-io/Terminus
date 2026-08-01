@@ -1337,8 +1337,10 @@ not fill in anything it says it could not check."
     /// Entitlement but no identity: the heat watch has no per-caller home to
     /// read, and there is nothing to substitute — the `COMMUTE_*` fallback is
     /// gone. It degrades to "no home location is configured", which is the
-    /// honest answer for a caller nobody can name, and is deliberately a
-    /// different sentence from "could not check".
+    /// honest answer for a caller nobody can name — and whose REASON is
+    /// deliberately distinct from "your saved locations could not be read"
+    /// (`Gap::Failed`), even though both correctly sit under the shared
+    /// "unknown, not clear" framing.
     async fn execute_with_caller(
         &self,
         args: Value,

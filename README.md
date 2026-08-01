@@ -326,8 +326,11 @@ Four properties worth knowing:
 
   The registry is the replacement, and the degradation is honest: with no saved
   home, `weather` asks *"which location do you mean?"* and
-  `weather_severe_alerts` reports *"no home location is configured"* — which is
-  deliberately a different sentence from *"could not check"*.
+  `weather_severe_alerts` reports *"no home location is configured, so there is
+  nowhere to watch"*. Both sit under the watch's standing *"this is unknown, not
+  clear"* framing — an unwatched home is never an all-clear — but the **reason**
+  stays distinct from *"your saved locations could not be read"*. Absence and
+  failure are different answers, and neither is ever filled in by a guess.
 - **Identities are opaque.** A caller key stores the authenticated principal (and,
   post-#577, person) **verbatim**, trimmed but never case-folded. `Alpha` and
   `alpha` are two callers with two records. Deciding that two differently-spelled
