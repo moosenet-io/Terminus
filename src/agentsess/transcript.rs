@@ -208,20 +208,24 @@ fn redact_then_truncate(s: &str, width: usize) -> String {
 /// Ordered by how much it tells an observer: an explicit path or command beats
 /// a pattern, which beats a free-text query. Falling back to "the first string
 /// value" keeps an unfamiliar tool informative rather than blank.
+/// Input keys that identify what a tool call was doing, best first. Shared by
+/// [`primary_arg`] and the block-shape check so the two cannot disagree about
+/// which fields are expected to be strings.
+pub(crate) const PREFERRED_INPUT_KEYS: &[&str] = &[
+    "file_path",
+    "path",
+    "notebook_path",
+    "command",
+    "pattern",
+    "query",
+    "url",
+    "prompt",
+    "description",
+];
+
 fn primary_arg(input: &Value) -> Option<String> {
-    const PREFERRED: &[&str] = &[
-        "file_path",
-        "path",
-        "notebook_path",
-        "command",
-        "pattern",
-        "query",
-        "url",
-        "prompt",
-        "description",
-    ];
     let obj = input.as_object()?;
-    for key in PREFERRED {
+    for key in PREFERRED_INPUT_KEYS {
         if let Some(v) = obj.get(*key).and_then(Value::as_str) {
             if !v.trim().is_empty() {
                 return Some(v.to_string());
@@ -325,8 +329,21 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
                     .all(|i| i.get("type").and_then(Value::as_str).is_some()),
                 _ => false,
             };
+            // `message` itself must be an object when present.
+            let message_shape_ok = match rec.get("message") {
+                None => true,
+                Some(Value::Object(_)) => true,
+                Some(_) => false,
+            };
             let tool_result = rec.get("toolUseResult");
-            if tool_result.is_none() && !usable_content {
+            // A malformed content is drift EVEN IF a usable tool result is
+            // also present — otherwise a healthy sibling field masks it, which
+            // is the same masking bug fixed at block level earlier.
+            if !message_shape_ok || (content.is_some() && !usable_content) {
+                understood = false;
+            }
+            // Neither field present at all: nothing to read.
+            if tool_result.is_none() && content.is_none() {
                 understood = false;
             }
             if let Some(result) = tool_result {
@@ -433,6 +450,17 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
                             None => {}
                             Some(Value::Object(_)) => {}
                             Some(_) => all_recognised = false,
+                        }
+                        // A PREFERRED key present with a non-string value is
+                        // drift: primary_arg silently skips it, so without this
+                        // the summary quietly degrades with nothing counted.
+                        if let Some(Value::Object(map)) = b.get("input") {
+                            if PREFERRED_INPUT_KEYS
+                                .iter()
+                                .any(|k| map.get(*k).is_some_and(|v| !v.is_string()))
+                            {
+                                all_recognised = false;
+                            }
                         }
                         let arg = b.get("input").and_then(primary_arg);
                         let summary = match &arg {
@@ -819,6 +847,27 @@ mod tests {
         assert!(c(json!({"type": "user", "message": {"content": [{"type": "text"}]}})).understood);
         assert!(!c(json!({"type": "user", "message": {"content": [42]}})).understood);
         assert!(!c(json!({"type": "user", "message": {"content": [{"no_type": 1}]}})).understood);
+
+        // A HEALTHY sibling field must not mask a malformed one: the same
+        // masking bug that was fixed at block level, at record level.
+        let masked = c(json!({"type": "user", "toolUseResult": {"stdout": "ok"},
+            "message": {"content": 42}}));
+        assert_eq!(masked.events.len(), 1, "the readable tool result is reported");
+        assert!(!masked.understood, "the malformed content must still be flagged");
+        // `message` itself must be an object when present.
+        assert!(!c(json!({"type": "user", "toolUseResult": {"stdout": "ok"}, "message": 7})).understood);
+        // A tool result with NO message field at all is fine.
+        assert!(c(json!({"type": "user", "toolUseResult": {"stdout": "ok"}})).understood);
+
+        // A PREFERRED tool-input key present with a non-string value is drift:
+        // primary_arg silently skips it, so the summary would quietly degrade.
+        let degraded = c(json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": 42}}]}}));
+        assert_eq!(degraded.events.len(), 1, "the tool name is still reported");
+        assert!(!degraded.understood, "a non-string command must be flagged");
+        // Non-preferred keys of any type are not our business.
+        assert!(c(json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"timeout": 30}}]}})).understood);
     }
 
     #[test]
