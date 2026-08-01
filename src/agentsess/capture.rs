@@ -48,8 +48,14 @@ pub struct PaneCapture {
     /// the consumer renders them; see the field note below.
     pub content: String,
     pub lines_requested: u32,
-    /// True when the LINE cap clamped the request.
+    /// True when the requested line count exceeded `AGENTSESS_CAPTURE_MAX_LINES`
+    /// and was clamped down to it.
     pub lines_clamped: bool,
+    /// True when the returned output was trimmed to the effective line bound
+    /// because the capture came back with more lines than were asked for. This
+    /// is separate from `lines_clamped`: one is about the REQUEST being too
+    /// large, the other about the RESULT being too large.
+    pub lines_trimmed: bool,
     /// True when the BYTE cap truncated the content. A wide pane can blow the
     /// byte budget well before the line budget, so both are reported.
     pub bytes_truncated: bool,
@@ -134,6 +140,19 @@ pub(crate) async fn capture(
     // the scrubber stops matching and the surviving prefix is emitted in clear.
     let redacted = super::transcript::redact(&out.stdout);
 
+    // Enforce the LINE bound ourselves rather than trusting `-S -N` to have
+    // done it. tmux is being asked for a starting offset, not a hard limit,
+    // and a bound we merely REQUESTED is not a bound we can promise a caller.
+    // Keep the NEWEST lines: the tail is what an observer is watching for.
+    let line_count = redacted.lines().count();
+    let (redacted, lines_dropped) = if line_count > effective as usize {
+        let keep = line_count - effective as usize;
+        let kept: Vec<&str> = redacted.lines().skip(keep).collect();
+        (kept.join("\n"), true)
+    } else {
+        (redacted, false)
+    };
+
     let byte_cap = max_bytes();
     let (content, bytes_truncated) = if redacted.len() > byte_cap {
         // Cut on a char boundary so the result is still valid UTF-8.
@@ -151,6 +170,7 @@ pub(crate) async fn capture(
         content,
         lines_requested: effective,
         lines_clamped,
+        lines_trimmed: lines_dropped,
         bytes_truncated,
     })
 }
@@ -227,6 +247,29 @@ mod tests {
 
     // Reads (or mutates) the shared cap env — see TERM #588: the READERS
     // must be serialised too, not only the writers.
+    // The line bound is enforced HERE, not merely requested of tmux.
+    #[tokio::test]
+    #[serial]
+    async fn more_lines_than_requested_are_trimmed_to_the_bound() {
+        let many = (0..50).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let exec = FakeExecutor::new().with_stdout("tmux", &many);
+        let c = capture(&exec, "build:0.1", Some(5)).await.unwrap();
+        assert_eq!(c.content.lines().count(), 5, "the bound is enforced, not assumed");
+        assert!(c.lines_trimmed, "and the trim is reported");
+        // The NEWEST lines are kept — the tail is what an observer watches.
+        assert!(c.content.contains("line49"), "got: {}", c.content);
+        assert!(!c.content.contains("line0\n"), "oldest lines dropped");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn output_within_the_bound_is_not_trimmed() {
+        let exec = FakeExecutor::new().with_stdout("tmux", "a\nb\nc");
+        let c = capture(&exec, "build:0.1", Some(10)).await.unwrap();
+        assert!(!c.lines_trimmed);
+        assert_eq!(c.content.lines().count(), 3);
+    }
+
     #[tokio::test]
     #[serial]
     async fn a_wide_pane_is_bounded_by_bytes_as_well_as_lines() {

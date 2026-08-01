@@ -228,7 +228,13 @@ impl RustTool for AgentsessCapture {
 
     async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let exec = executor_for(host_arg(&args))?;
-        let lines = args.get("lines").and_then(Value::as_u64).map(|n| n as u32);
+        // Clamp rather than `as u32`: a JSON integer is arbitrary, and a bare
+        // cast WRAPS — 4294967296 would silently become 0 and then be bumped to
+        // 1 line, quietly returning almost nothing instead of a big capture.
+        let lines = args
+            .get("lines")
+            .and_then(Value::as_u64)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
 
         let target = if let Some(t) = args.get("target").and_then(Value::as_str) {
             t.to_string()
