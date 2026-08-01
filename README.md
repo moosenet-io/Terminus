@@ -258,11 +258,22 @@ What the person scope changes today:
   grants and that person's own `person:<id>` grant — a person can only ever
   **narrow** what the service could already do, never widen it.
 
-Fail-closed, in the one direction that matters: absent, blank, malformed,
-expired, mis-bound, or asserted by a principal without the grant all resolve to
-**less** privilege than the bare service identity — never a silent fallback to
-it. An `X-Terminus-On-Behalf-Of` request that cannot be honoured is **refused
-with `403`**, because quietly running it as the service would be a *widening*.
+Fail-closed, in the one direction that matters — and the line falls between an
+identity that was never **claimed** and one that was claimed and cannot be
+**honoured**:
+
+* **No identity headers at all** → the unchanged, service-scoped path every
+  pre-#595 caller already took. This is the baseline, not a downgrade.
+* **Claimed but blank, malformed, expired, mis-bound, asserted by a principal
+  without the grant, or presented on a hop that cannot honour it** → **less**
+  privilege than the bare service identity, never a silent fallback to it.
+
+An `X-Terminus-On-Behalf-Of` request that cannot be honoured is **refused with
+`403`**, because quietly running it as the service would be a *widening*: the
+caller believes it is acting as one person while actually reading and writing
+the **shared** record. For the same reason, a client-supplied
+`X-Terminus-Person-Assertion` is refused rather than stripped — these headers are
+server-set on every hop, so an inbound copy is never authoritative.
 A client-supplied copy of either header is stripped on every relay hop; the only
 value that ever reaches the next hop is the one the server set.
 
