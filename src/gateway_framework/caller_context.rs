@@ -355,14 +355,14 @@ mod tests {
             c.media_account
         }
 
-        let ctx = CallerContext::from_allowlist_decision(true, false).with_media_account(Some("acct-copy"));
+        let ctx = CallerContext::from_allowlist_decision(true, false).with_media_account(Some("acct-copy")); // pii-test-fixture: invented account id
         assert_eq!(by_value(ctx), Some("acct-copy"));
         assert_eq!(by_value(ctx), Some("acct-copy"));
         assert!(ctx.may_infer_from_calendar());
 
         // Interning is transparent: equal ids compare equal (and, because they
         // are interned, are literally the same pointer).
-        let again = CallerContext::untrusted().with_media_account(Some("acct-copy"));
+        let again = CallerContext::untrusted().with_media_account(Some("acct-copy")); // pii-test-fixture: invented account id
         assert_eq!(again.media_account(), Some("acct-copy"));
         assert!(std::ptr::eq(again.media_account().unwrap(), ctx.media_account().unwrap()));
     }

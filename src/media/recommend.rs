@@ -1044,7 +1044,7 @@ mod tests {
         assert_eq!(requested_account(&json!({})).unwrap(), None);
         assert_eq!(requested_account(&json!({ "limit": 3 })).unwrap(), None);
         // And a well-formed one still comes through, trimmed.
-        assert_eq!(requested_account(&json!({ "account_id": "  acct-x  " })).unwrap(), Some("acct-x"));
+        assert_eq!(requested_account(&json!({ "account_id": "  acct-x  " })).unwrap(), Some("acct-x")); // pii-test-fixture: invented account id, no real household account appears in tests
     }
 
     /// NO PROBE ORACLE: every refusal is byte-identical, so a caller cannot
@@ -1059,11 +1059,11 @@ mod tests {
             // An account that EXISTS in this household but is not the caller's.
             msg(resolve_history_scope(Some(OTHER_MEMBER_ACCOUNT), &caller_for(OPERATOR_ACCOUNT))),
             // An account that exists nowhere at all.
-            msg(resolve_history_scope(Some("acct-does-not-exist"), &caller_for(OPERATOR_ACCOUNT))),
+            msg(resolve_history_scope(Some("acct-does-not-exist"), &caller_for(OPERATOR_ACCOUNT))), // pii-test-fixture: invented account id
             // An unmapped caller naming an existing account...
             msg(resolve_history_scope(Some(OTHER_MEMBER_ACCOUNT), &guest())),
             // ...and a nonexistent one.
-            msg(resolve_history_scope(Some("acct-does-not-exist"), &guest())),
+            msg(resolve_history_scope(Some("acct-does-not-exist"), &guest())), // pii-test-fixture: invented account id
             // And every malformed shape.
             arg_msg(json!({ "account_id": 12345 })),
             arg_msg(json!({ "account_id": null })),
