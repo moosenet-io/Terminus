@@ -812,6 +812,41 @@ pub(crate) mod fake {
         }
     }
 
+    /// A [`BrokenStore`] that also COUNTS the reads attempted against it.
+    ///
+    /// `BrokenStore` proves "could not read" is reachable; this proves an input
+    /// that must never be looked up was never looked up EVEN WHILE the store is
+    /// failing — a fact about the store rather than about the answer, which is
+    /// the only way to assert it without a live geocoder.
+    #[derive(Default)]
+    pub struct CountingBrokenStore {
+        reads: AtomicUsize,
+    }
+
+    impl CountingBrokenStore {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl LocationStore for CountingBrokenStore {
+        fn load(&self) -> Result<Registry, StoreError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Err(StoreError::Unreadable(std::io::ErrorKind::PermissionDenied))
+        }
+        fn save(&self, _registry: &Registry) -> Result<(), StoreError> {
+            Err(StoreError::WriteFailed(std::io::ErrorKind::PermissionDenied))
+        }
+        fn update(&self, _f: &mut dyn FnMut(&mut Registry) -> Commit) -> Result<(), StoreError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Err(StoreError::Unreadable(std::io::ErrorKind::PermissionDenied))
+        }
+    }
+
     /// A store that models a COMPETING WRITER, deterministically.
     ///
     /// Every `load()` hands back the current document and then — before the

@@ -13,8 +13,13 @@
 //! "home", "work"/"office", "family" and any name the user chose ("the cabin")
 //! resolve through the shared per-caller location registry
 //! ([`crate::locations`]) — the same call `weather` makes, on the same
-//! entitlement, against the same store. Anything the registry does not know is
-//! treated as a literal address (or "lat,lon", or an IATA code) and geocoded.
+//! entitlement, against the same store. A name the registry has READ and does
+//! not hold is then treated as a literal address (or "lat,lon", or an IATA
+//! code) and geocoded.
+//!
+//! When the registry cannot be read at all, only input that could not
+//! PLAUSIBLY be a saved name falls through to literal geocoding — see
+//! [`is_unambiguously_literal`].
 //!
 //! ## `COMMUTE_HOME` / `COMMUTE_WORK` / `COMMUTE_FAMILY` are not read (TERM #591)
 //!
@@ -135,26 +140,49 @@ impl CommuteConfig {
                 // For anything else the user typed a place, not a nickname:
                 // "Reno" is a city whether or not it is also a saved name.
                 //
-                // The same fall-through applies to the two failure arms below,
-                // which is a deliberate trade: a free-text string we could not
-                // look up is geocoded literally, so an unreadable registry turns
-                // "the cabin" into a "could not geocode 'the cabin'" rather than
-                // a "could not read your saved locations". The alternative is to
-                // fail every ordinary address lookup whenever the registry is
-                // sick, which is a much worse answer far more often. The
-                // well-known names — the ones that are DEFINITELY a saved place
-                // and the ones an omitted argument defaults to — take the strict
-                // path above and keep the distinction the user needs.
+                // This fall-through rests on a fact, not a guess: the registry
+                // ANSWERED, and the answer was "no such name". There is nothing
+                // left to be uncertain about, so geocoding the string the user
+                // typed is the only remaining reading of it. That is why this
+                // arm is broad and the `Unavailable` arm below is not.
                 Lookup::NotSet => {}
                 // Not entitled, or no identity: nothing was read. A literal
                 // address still routes — that discloses nothing and refusing it
                 // would be a refusal to do arithmetic on the user's own input —
                 // but a name we would have to LOOK UP cannot be answered.
+                //
+                // Deliberately still keyed on `alias`, not on
+                // `is_unambiguously_literal`: this arm is about an authorization
+                // decision made BEFORE any read, and its current shape is
+                // settled behaviour. Narrowing it the same way would refuse
+                // "Reno" to an unentitled caller for no privacy gain — nothing
+                // was read, so nothing can be disclosed or mis-reported. The
+                // absence-vs-failure collapse the arm below fixes does not
+                // arise here, because there is no failure to report.
                 Lookup::Denied if alias.is_some() => return Resolution::NoAccess,
                 Lookup::Denied => {}
                 // The registry exists and could not be read. Distinct from
                 // "nothing saved", and it must stay distinct in what we say.
-                Lookup::Unavailable(_) if alias.is_some() => {
+                //
+                // The fall-through here is NARROW on purpose. We do not know
+                // whether the user has a "the cabin" saved — that is precisely
+                // what failed — so geocoding the words "the cabin" would convert
+                // "I couldn't read your saved locations" into "I routed you
+                // somewhere", possibly somewhere real and wrong. A confident
+                // wrong route is worse than an error, so anything that could
+                // PLAUSIBLY be a saved name surfaces the read failure, and only
+                // input that could not plausibly be one (a coordinate pair, a
+                // house-numbered street address, a "City, ST"/postal shape, a
+                // known airport code) falls through. That keeps the property the
+                // broad version was protecting — an ordinary address still
+                // routes when the registry is sick — without keeping the
+                // collapse. See [`is_unambiguously_literal`] for the predicate
+                // and the residual it does not cover (a bare city name).
+                //
+                // A well-known alias is never unambiguously literal, so the
+                // strict answer it already gave is preserved by construction;
+                // `well_known_aliases_are_never_unambiguously_literal` pins it.
+                Lookup::Unavailable(_) if !is_unambiguously_literal(raw) => {
                     return Resolution::Unreadable(name.to_string())
                 }
                 Lookup::Unavailable(_) => {}
@@ -187,6 +215,123 @@ fn registry_name(input: &str) -> Option<&'static str> {
         // know, and geocoding the literal word "family" is nonsense.
         "family" | "family home" | "parents" => Some("family"),
         _ => None,
+    }
+}
+
+/// Could this input NOT plausibly be a name the user saved?
+///
+/// Used in exactly one place: deciding whether an unreadable registry may be
+/// stepped over. It is not "does this look like an address" — it is the much
+/// stricter "is there no reading of this string on which it is a nickname",
+/// because the two ways of being wrong are not symmetric:
+///
+/// * Wrongly calling a NAME literal → we geocode the words and confidently
+///   route somewhere that is not where the user meant, while the real answer
+///   ("I couldn't read your saved locations") is never said. That is the
+///   failure this predicate exists to prevent.
+/// * Wrongly calling a LITERAL a name → the user gets an accurate error and
+///   retries. Recoverable, and honest.
+///
+/// So every rule below is a shape a person does not give a place they saved.
+/// Anything else — including a bare city ("Reno") — is treated as a name.
+///
+/// The rules:
+/// 1. A coordinate pair. (Short-circuited before the lookup as well; kept here
+///    so the predicate is true on its own terms.)
+/// 2. A leading HOUSE NUMBER followed by at least one word — "1 Placeholder
+///    Way". A saved place is nicknamed "the cabin", never "1 Placeholder Way";
+///    a leading number is the single strongest signal available and it needs no
+///    gazetteer. This is the rule that keeps ordinary street addresses routing
+///    through a registry outage.
+/// 3. A standalone postal code ("00000", "00000-1234") — pure structure, no
+///    natural-language reading at all.
+/// 4. A trailing region token: the last comma-separated segment is a two-letter
+///    state/province code, optionally with a postal code ("San Jose, CA",
+///    "Examplecity, EX 00000"). Nobody saves a place under a string ending in a
+///    state abbreviation.
+/// 5. A known IATA airport code, from the CLOSED table in [`expand_iata`] —
+///    "SJC" is an airport because we can name it, not because it is three
+///    letters. "ZZZ" is not, and is treated as a name.
+///
+/// **What this predicate does NOT have to catch.** A string
+/// [`locations::canonical_name`] would reject — one with a comma, or over the
+/// name-length limit — could never have been SAVED under (it is the same
+/// function that gates writes), so [`locations::lookup`] answers `NotSet`
+/// without reading and such input never reaches the `Unavailable` arm at all.
+/// Rules 1 and 4 are therefore belt-and-braces in the current call path: a
+/// coordinate pair is short-circuited before the lookup, and every "City, ST"
+/// shape carries a comma. They are kept because they are true, cheap, and the
+/// predicate should not silently depend on an upstream charset to stay correct;
+/// `a_name_shaped_input_is_the_only_kind_that_can_reach_the_read_failure` pins
+/// the dependency so a change to it is visible.
+///
+/// **The residual, stated plainly:** a BARE CITY NAME ("Reno", "Boise") is not
+/// unambiguously literal and therefore does NOT route while the registry is
+/// unreadable — the user is told the registry could not be read and asked for
+/// an address. Deciding otherwise needs a gazetteer we do not have, and
+/// guessing would reopen exactly the collapse this closes: "Reno" is a real
+/// city AND a perfectly ordinary thing to have saved. This is the deliberate
+/// cost of erring toward "name"; it applies only while the store is failing.
+fn is_unambiguously_literal(input: &str) -> bool {
+    let s = input.trim();
+    if s.is_empty() {
+        return false;
+    }
+    is_coord_pair(s)
+        || starts_with_house_number(s)
+        || is_postal_code(s)
+        || ends_with_region_token(s)
+        || expand_iata(&s.to_lowercase()).is_some()
+}
+
+/// Rule 2: a house-number token, then at least one word.
+///
+/// The number must be a plain street number — digits, optionally with a letter
+/// suffix (`12A`) or a hyphen/slash range (`12-14`, `12/3`). A decimal point is
+/// excluded so a stray "37.75 something" is never mistaken for one.
+fn starts_with_house_number(s: &str) -> bool {
+    let mut tokens = s.split_whitespace();
+    let Some(first) = tokens.next() else { return false };
+    let head = first.trim_end_matches(',');
+    let numberish = head.len() <= 10
+        && head.starts_with(|c: char| c.is_ascii_digit())
+        && head
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '/');
+    // …and something for the number to be ON.
+    numberish && tokens.any(|t| t.chars().any(|c| c.is_alphabetic()))
+}
+
+/// Rule 3: the whole string is a postal code — `00000` or `00000-1234`.
+fn is_postal_code(s: &str) -> bool {
+    let s = s.trim();
+    match s.split_once('-') {
+        Some((head, tail)) => is_digits(head, 5) && is_digits(tail, 4),
+        None => is_digits(s, 5),
+    }
+}
+
+fn is_digits(s: &str, len: usize) -> bool {
+    s.len() == len && s.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Rule 4: the last comma-separated segment is a region token — a two-letter
+/// state/province code, alone or followed by a postal code, or a postal code
+/// on its own.
+fn ends_with_region_token(s: &str) -> bool {
+    let Some((_, last)) = s.rsplit_once(',') else { return false };
+    let last = last.trim();
+    if last.is_empty() {
+        return false;
+    }
+    let mut parts = last.split_whitespace();
+    let Some(head) = parts.next() else { return false };
+    let is_state_code = head.len() == 2 && head.chars().all(|c| c.is_ascii_alphabetic());
+    match parts.next() {
+        // "CA 00000" — a state code plus a postal code, nothing after it.
+        Some(zip) => is_state_code && is_postal_code(zip) && parts.next().is_none(),
+        // "CA", or a bare postal code as the final segment.
+        None => is_state_code || is_postal_code(head),
     }
 }
 
@@ -833,7 +978,7 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    use crate::locations::store::fake::{BrokenStore, CountingStore};
+    use crate::locations::store::fake::{BrokenStore, CountingBrokenStore, CountingStore};
     use crate::locations::{CallerKey, HOME, WORK};
 
     // ── Fixtures ────────────────────────────────────────────────────────────
@@ -971,6 +1116,223 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("couldn't read"), "{msg}");
         assert!(msg.contains("not an empty list"), "{msg}");
+    }
+
+    // ── The unreadable-registry fall-through, narrowed ──────────────────────
+    //
+    // `geocode()` is reached from exactly three places (`CommuteEstimate`,
+    // `RouteTraffic`, `TrafficIncidents`), each of them as
+    // `self.cfg.resolve(..).address()?` — so a resolution that is not
+    // `Place` cannot reach the geocoder at all. "Asserts no geocode call" and
+    // "asserts `address()` is `Err`" are therefore the same assertion, and the
+    // latter is checkable offline. Each test below states which it needs.
+
+    /// **The finding.** A free-text name the user might well have saved must
+    /// surface the READ FAILURE, not be geocoded as if it were a place.
+    ///
+    /// Geocoding "the cabin" while the registry is down is the worst available
+    /// answer: it can SUCCEED, routing the user somewhere real and wrong, and
+    /// the true answer — "I could not read your saved locations" — is never
+    /// said. That is the absence-vs-failure collapse this branch exists to
+    /// prevent, arrived at from the other side.
+    #[test]
+    fn a_free_text_name_surfaces_an_unreadable_registry_instead_of_geocoding() {
+        let c = cfg_with(Arc::new(BrokenStore));
+        let k = key("alpha");
+
+        assert_eq!(
+            c.resolve("the cabin", entitled(), Some(&k)),
+            Resolution::Unreadable("the cabin".into())
+        );
+
+        // No address is produced, so no geocode call is possible.
+        let err = c.resolve("the cabin", entitled(), Some(&k)).address().unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("couldn't read"), "{msg}");
+        assert!(msg.contains("the cabin"), "the answer must name what was asked for: {msg}");
+
+        // Other things a person plausibly saves, all of them names.
+        for name in ["the cabin", "mom's", "the lake house", "storage unit", "Reno"] {
+            assert!(
+                matches!(c.resolve(name, entitled(), Some(&k)), Resolution::Unreadable(_)),
+                "{name:?} could plausibly be a saved name and must surface the read failure"
+            );
+        }
+    }
+
+    /// **POSITIVE CONTROL — the property the broad fall-through was protecting.**
+    /// An ordinary street address still routes while the registry is unreadable.
+    /// An implementation that fixed the test above by failing EVERYTHING passes
+    /// it and fails this one.
+    #[test]
+    fn a_literal_street_address_still_routes_when_the_registry_is_unreadable() {
+        let c = cfg_with(Arc::new(BrokenStore));
+        let k = key("alpha");
+        assert_eq!(address(c.resolve(LITERAL, entitled(), Some(&k))), LITERAL);
+        // The comma-free forms, which reach the predicate rather than being
+        // short-circuited upstream (see
+        // `a_name_shaped_input_is_the_only_kind_that_can_reach_the_read_failure`).
+        // pii-test-fixture: obvious placeholder addresses in the shapes the predicate must clear
+        const NO_COMMA_STREET: &str = "1600 Placeholder Ave Examplecity"; // pii-test-fixture: obvious placeholder street address without a comma
+        assert_eq!(address(c.resolve(NO_COMMA_STREET, entitled(), Some(&k))), NO_COMMA_STREET);
+        assert_eq!(address(c.resolve("00000", entitled(), Some(&k))), "00000");
+        // A known airport code comes from a closed table, so it is a place, not
+        // a nickname — and it still expands.
+        assert_eq!(
+            address(c.resolve("SJC", entitled(), Some(&k))),
+            "San Jose International Airport, San Jose, CA"
+        );
+        // And the comma-bearing forms, whatever route they take to get there.
+        for literal in [
+            "1600 Placeholder Ave, Examplecity, EX 00000", // pii-test-fixture: obvious placeholder full address
+            "Examplecity, EX",                             // pii-test-fixture: obvious placeholder city/state
+        ] {
+            assert_eq!(address(c.resolve(literal, entitled(), Some(&k))), literal);
+        }
+    }
+
+    /// **Why the predicate only has to judge comma-free input.**
+    ///
+    /// [`locations::canonical_name`] is the SAME function that gates writes, so
+    /// a string it rejects could never have been saved under — which makes it an
+    /// authoritative "this is not a name" test applied upstream of the store.
+    /// `lookup` returns `NotSet` for such a string WITHOUT reading, so it can
+    /// never reach the `Unavailable` arm however sick the registry is.
+    ///
+    /// That is sound rather than lucky, and this test pins it: if the name
+    /// charset is ever widened, the assertions below change and the predicate
+    /// becomes load-bearing for these shapes too (which it already handles —
+    /// see `unambiguously_literal_predicate_boundaries`).
+    #[test]
+    fn a_name_shaped_input_is_the_only_kind_that_can_reach_the_read_failure() {
+        let store = Arc::new(CountingBrokenStore::new());
+        let c = cfg_with(store.clone());
+        let k = key("alpha");
+
+        // A comma is not a legal character in a location NAME, so this string
+        // cannot name a saved place and is not looked up at all.
+        assert!(locations::canonical_name("Examplecity, EX").is_err());
+        assert_eq!(address(c.resolve("Examplecity, EX", entitled(), Some(&k))), "Examplecity, EX");
+        assert_eq!(store.reads(), 0, "an unstorable name must not cause a read");
+
+        // A name-shaped string IS looked up, and the failure surfaces.
+        assert!(locations::canonical_name("the cabin").is_ok());
+        assert!(matches!(
+            c.resolve("the cabin", entitled(), Some(&k)),
+            Resolution::Unreadable(_)
+        ));
+        assert_eq!(store.reads(), 1);
+    }
+
+    /// A coordinate pair routes AND is never looked up — asserted against the
+    /// store, not the answer, and specifically while the store is failing.
+    #[test]
+    fn a_coordinate_pair_routes_and_causes_no_read_when_the_registry_is_unreadable() {
+        let store = Arc::new(CountingBrokenStore::new());
+        let c = cfg_with(store.clone());
+        let k = key("alpha");
+        assert_eq!(address(c.resolve("37.75,-122.41", entitled(), Some(&k))), "37.75,-122.41");
+        assert_eq!(store.reads(), 0, "a coordinate pair must never be looked up");
+
+        // And the store really is failing — otherwise the assertion above would
+        // pass for the wrong reason.
+        assert!(matches!(
+            c.resolve("the cabin", entitled(), Some(&k)),
+            Resolution::Unreadable(_)
+        ));
+        assert!(store.reads() > 0);
+    }
+
+    /// The well-known aliases are UNCHANGED by the narrowing: they were already
+    /// strict, and the predicate must never accidentally make one literal.
+    #[test]
+    fn well_known_aliases_are_never_unambiguously_literal() {
+        let c = cfg_with(Arc::new(BrokenStore));
+        let k = key("alpha");
+        for name in [
+            "home", "house", "work", "office", "the office", "current", "here",
+            "where i am", "family", "family home", "parents",
+        ] {
+            assert!(
+                !is_unambiguously_literal(name),
+                "{name:?} is a well-known alias and must never be treated as literal"
+            );
+            assert!(
+                matches!(c.resolve(name, entitled(), Some(&k)), Resolution::Unreadable(_)),
+                "{name:?} must still surface the read failure"
+            );
+        }
+    }
+
+    /// **The distinction, from the other direction.** A registry that WAS read
+    /// and holds nothing is not the failure above — same input, different
+    /// outcome, and the user is never told the registry broke when it did not.
+    ///
+    /// The `NotSet` fall-through is deliberately left broad: the registry
+    /// answered, so "no such name" is a fact and the string can only be a place.
+    /// The uncertainty that justifies the narrow `Unavailable` arm is absent.
+    #[test]
+    fn nothing_saved_is_not_reported_as_an_unreadable_registry() {
+        let empty = cfg_with(Arc::new(CountingStore::new()));
+        let k = key("alpha");
+
+        let r = empty.resolve("the cabin", entitled(), Some(&k));
+        assert!(!matches!(r, Resolution::Unreadable(_)), "got {r:?}");
+        // Whatever happens next, it must not claim a read failure.
+        let rendered = match empty.resolve("the cabin", entitled(), Some(&k)) {
+            Resolution::Place { address, .. } => address,
+            other => other.address().unwrap_err().to_string(),
+        };
+        assert!(!rendered.contains("couldn't read"), "{rendered}");
+
+        // The same name against a BROKEN store is the other answer entirely.
+        let broken = cfg_with(Arc::new(BrokenStore));
+        assert_ne!(
+            std::mem::discriminant(&empty.resolve("the cabin", entitled(), Some(&k))),
+            std::mem::discriminant(&broken.resolve("the cabin", entitled(), Some(&k))),
+            "an empty registry and an unreadable one must not produce the same outcome"
+        );
+
+        // And a well-known name against a read registry is still the ask.
+        assert_eq!(
+            empty.resolve("home", entitled(), Some(&k)),
+            Resolution::NotSaved("home".into())
+        );
+    }
+
+    /// The predicate itself, at the boundary. Written as a table because the
+    /// interesting content is WHICH shapes are on which side.
+    #[test]
+    fn unambiguously_literal_predicate_boundaries() {
+        for literal in [
+            "37.75,-122.41", // pii-test-fixture: obvious placeholder coordinates
+            " 37.75 , -122.41 ", // pii-test-fixture: obvious placeholder coordinates, spaced
+            "4 Literal Street, Examplecity", // pii-test-fixture: obvious placeholder address
+            "12A Placeholder Way", // pii-test-fixture: obvious placeholder address, lettered number
+            "12-14 Placeholder Way", // pii-test-fixture: obvious placeholder address, number range
+            "00000",         // pii-test-fixture: obvious placeholder postal code
+            "00000-1234",    // pii-test-fixture: obvious placeholder postal code, extended
+            "Examplecity, EX", // pii-test-fixture: obvious placeholder city and region
+            "Examplecity, EX 00000", // pii-test-fixture: obvious placeholder city, region and postal code
+            "SJC",           // a known airport, from the closed table above
+            "sfo",           // …case-insensitively
+        ] {
+            assert!(is_unambiguously_literal(literal), "{literal:?} should be literal");
+        }
+        for name in [
+            "",
+            "   ",
+            "the cabin",
+            "Reno",           // a real city AND an ordinary thing to save
+            "ZZZ",            // three letters, not a known airport
+            "mom's",
+            "the lake house",
+            "Examplecity",    // pii-test-fixture: a bare placeholder place word, no region token
+            "37.75",          // half a coordinate pair
+        ] {
+            assert!(!is_unambiguously_literal(name), "{name:?} should be treated as a name");
+        }
     }
 
     /// An unentitled caller discloses nothing AND causes no read — the stronger
