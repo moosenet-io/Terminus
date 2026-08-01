@@ -110,6 +110,17 @@ fn is_unforwardable_request_header(name: &HeaderName) -> bool {
     if name.as_str().eq_ignore_ascii_case(CLIENT_IDENTITY_HEADER) {
         return true;
     }
+    // TERM #595: same posture, same reason, for BOTH human-identity headers.
+    // The plaintext on-behalf-of request is CONSUMED here (translated into a
+    // signed assertion by the handler above) and must never ride onward as
+    // itself; an inbound copy of the SIGNED assertion is never authoritative
+    // either, because the only one that counts is the one this hop minted from
+    // a verified principal. `reqwest` APPENDS rather than replaces, so failing
+    // to strip would leave Chord relaying two values and the MCP door choosing
+    // between a real one and a smuggled one.
+    if crate::mesh::person::is_identity_header(name.as_str()) {
+        return true;
+    }
     matches!(
         name.as_str(),
         "host"
@@ -269,12 +280,18 @@ impl InferenceProxyClient {
         serde_json::from_str(&text).map_err(|e| format!("inference returned non-JSON: {e}"))
     }
 
+    /// TERM #595: `person_assertion` is a SIGNED, principal-bound human-identity
+    /// assertion minted by this process's gateway (never a value copied off the
+    /// inbound request — see [`is_unforwardable_request_header`]). It is set
+    /// server-side here and relayed onward opaquely by Chord, which holds no
+    /// signing key and therefore cannot forge or alter one.
     pub async fn forward(
         &self,
         path: &str,
         headers: HeaderMap,
         body: Bytes,
         caller_identity: Option<&str>,
+        person_assertion: Option<&str>,
     ) -> Response {
         let jwt = match mint_service_jwt() {
             Ok(jwt) => jwt,
@@ -299,6 +316,13 @@ impl InferenceProxyClient {
         if let Some(identity) = caller_identity {
             if let Ok(hv) = HeaderValue::from_str(identity) {
                 req = req.header(CLIENT_IDENTITY_HEADER, hv);
+            }
+        }
+        // TERM #595: server-set, after the inbound strip above, so this is the
+        // only value of this header on the outbound request.
+        if let Some(assertion) = person_assertion {
+            if let Ok(hv) = HeaderValue::from_str(assertion) {
+                req = req.header(crate::mesh::person::PERSON_ASSERTION_HEADER, hv);
             }
         }
 
@@ -366,6 +390,7 @@ mod tests {
                 HeaderMap::new(),
                 Bytes::from(r#"{"model":"test","messages":[]}"#),
                 Some("dev-box"),
+                None,
             )
             .await;
 
@@ -405,6 +430,7 @@ mod tests {
                 HeaderMap::new(),
                 Bytes::from("{}"),
                 Some("harmony-primary"),
+                None,
             )
             .await;
 
@@ -445,7 +471,7 @@ mod tests {
         );
         let client = InferenceProxyClient::with_base_url(server.base_url());
         let resp = client
-            .forward(CHAT_COMPLETIONS_PATH, headers, Bytes::from("{}"), None)
+            .forward(CHAT_COMPLETIONS_PATH, headers, Bytes::from("{}"), None, None)
             .await;
 
         mock.assert();
@@ -491,8 +517,100 @@ mod tests {
                 headers,
                 Bytes::from("{}"),
                 Some("real-mtls-identity"),
+                None,
             )
             .await;
+
+        mock.assert();
+        assert_eq!(resp.status(), StatusCode::OK);
+        clear_jwt_secret();
+    }
+
+    /// TERM #595: a CLIENT-supplied human-identity header cannot influence
+    /// anything downstream. Both forms are stripped on the relay hop, and the
+    /// only signed assertion the next hop sees is the one THIS process set from
+    /// a verified principal.
+    ///
+    /// Without the strip, `reqwest` would APPEND rather than replace and Chord
+    /// would relay two values — leaving the MCP door to choose between the real
+    /// assertion and a smuggled one.
+    #[tokio::test]
+    #[serial]
+    async fn forward_strips_client_supplied_identity_headers() {
+        set_jwt_secret();
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path(CHAT_COMPLETIONS_PATH).matches(|req| {
+                let hs = req.headers.as_ref().cloned().unwrap_or_default();
+                // The plaintext on-behalf-of request is consumed at the ingress
+                // and never travels onward, in any form.
+                let plaintext_gone = !hs
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case(crate::mesh::person::ON_BEHALF_OF_HEADER));
+                // Exactly ONE signed assertion, and it is the server-set value.
+                let assertions: Vec<&String> = hs
+                    .iter()
+                    .filter(|(k, _)| {
+                        k.eq_ignore_ascii_case(crate::mesh::person::PERSON_ASSERTION_HEADER)
+                    })
+                    .map(|(_, v)| v)
+                    .collect();
+                plaintext_gone && assertions == vec![&"server-minted".to_string()]
+            });
+            then.status(200).json_body(json!({"ok": true}));
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(crate::mesh::person::ON_BEHALF_OF_HEADER),
+            HeaderValue::from_static("smuggled-person"),
+        );
+        headers.insert(
+            HeaderName::from_static(crate::mesh::person::PERSON_ASSERTION_HEADER),
+            HeaderValue::from_static("smuggled-assertion"),
+        );
+        let client = InferenceProxyClient::with_base_url(server.base_url());
+        let resp = client
+            .forward(
+                CHAT_COMPLETIONS_PATH,
+                headers,
+                Bytes::from("{}"),
+                Some("real-mtls-identity"),
+                Some("server-minted"),
+            )
+            .await;
+
+        mock.assert();
+        assert_eq!(resp.status(), StatusCode::OK);
+        clear_jwt_secret();
+    }
+
+    /// The negative half of the test above: with nothing minted, NO assertion
+    /// header reaches the next hop at all — a client cannot conjure one by
+    /// supplying it itself.
+    #[tokio::test]
+    #[serial]
+    async fn forward_sends_no_assertion_when_none_was_minted() {
+        set_jwt_secret();
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path(CHAT_COMPLETIONS_PATH).matches(|req| {
+                !req.headers
+                    .as_ref()
+                    .map(|hs| hs.iter().any(|(k, _)| crate::mesh::person::is_identity_header(k)))
+                    .unwrap_or(false)
+            });
+            then.status(200).json_body(json!({"ok": true}));
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(crate::mesh::person::PERSON_ASSERTION_HEADER),
+            HeaderValue::from_static("smuggled-assertion"),
+        );
+        let client = InferenceProxyClient::with_base_url(server.base_url());
+        let resp =
+            client.forward(CHAT_COMPLETIONS_PATH, headers, Bytes::from("{}"), None, None).await;
 
         mock.assert();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -522,6 +640,7 @@ mod tests {
                 CHAT_COMPLETIONS_PATH,
                 HeaderMap::new(),
                 Bytes::from(r#"{"model":"test","stream":true}"#),
+                None,
                 None,
             )
             .await;
@@ -557,7 +676,7 @@ mod tests {
 
         let client = InferenceProxyClient::with_base_url(server.base_url());
         let resp = client
-            .forward(CHAT_COMPLETIONS_PATH, HeaderMap::new(), Bytes::from("{}"), None)
+            .forward(CHAT_COMPLETIONS_PATH, HeaderMap::new(), Bytes::from("{}"), None, None)
             .await;
 
         // Chord's own 503 is relayed verbatim -- not reinterpreted as a
@@ -581,7 +700,7 @@ mod tests {
         );
         let resp = tokio::time::timeout(
             Duration::from_secs(5),
-            client.forward(CHAT_COMPLETIONS_PATH, HeaderMap::new(), Bytes::from("{}"), None),
+            client.forward(CHAT_COMPLETIONS_PATH, HeaderMap::new(), Bytes::from("{}"), None, None),
         )
         .await
         .expect("an unreachable chord must fail fast, not hang");
@@ -600,7 +719,7 @@ mod tests {
         let server = MockServer::start();
         let client = InferenceProxyClient::with_base_url(server.base_url());
         let resp = client
-            .forward(CHAT_COMPLETIONS_PATH, HeaderMap::new(), Bytes::from("{}"), None)
+            .forward(CHAT_COMPLETIONS_PATH, HeaderMap::new(), Bytes::from("{}"), None, None)
             .await;
 
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
