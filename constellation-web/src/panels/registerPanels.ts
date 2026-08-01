@@ -32,7 +32,7 @@
 //             first one registers, `lumina` is a module with zero panels -- same pattern
 //             CONST-19 established for `muse` (a module tab can exist before it has any
 //             panels, per `getPanelsByModule`'s doc in moduleRegistry.ts).
-import { registerPanel, registerModule, getAllModules } from '../lib/moduleRegistry';
+import { registerPanel, registerModule, registerModuleIfAbsent } from '../lib/moduleRegistry';
 import { registerCommand } from '../lib/commandRegistry';
 import { getCurrentPath, requestHealthRefresh } from '../lib/shellBridge';
 import { TerminusPanel } from './terminus/TerminusPanel';
@@ -103,17 +103,20 @@ registerModule({ id: 'terminus', title: 'Terminus', icon: '⚙', healthSystem: '
 // same relationship Models/MINT have to Terminus — nested under the Muse core tab, not a
 // sibling top-level one (see cores.ts's CORE_MEMBERS).
 //
-// Review fix (MUSE-124): `registerModule` is a bare `Map.set` — calling it twice with the same
-// id does NOT no-op, it silently OVERWRITES the first descriptor with the second. If spec G's
-// Device Control item also calls `registerModule({id:'maestro',...})` (this file's own header
-// comment calls it "the Central import point" — every module registers here), an unguarded
-// second call would replace this descriptor with zero warning, which is the opposite of
-// idempotent. This explicit presence check makes first-registration-wins ACTUAL behaviour, not
-// just documented intent — whichever of the two build items' code runs first here keeps its
-// descriptor, and the loser's `registerModule` call becomes a genuine no-op.
-if (!getAllModules().some(m => m.id === 'maestro')) {
-  registerModule({ id: 'maestro', title: 'Maestro', icon: '▶', healthSystem: 'muse', order: 8 });
-}
+// Review fix (MUSE-124, round 2): a prior version of this guard was a local
+// `if (!getAllModules().some(...)) registerModule(...)` check written HERE — but
+// `registerModule` itself stays a bare `Map.set`, so that guard only protected this call site.
+// If spec G's Device Control item registers `maestro` with a plain `registerModule(...)` (no
+// matching guard of its own), its call would still silently overwrite this descriptor —
+// first-registration-wins was documented intent, not an actual property of the system. Fixed
+// at the source instead: `registerModuleIfAbsent` (moduleRegistry.ts) owns the "first wins,
+// later calls no-op" guarantee, so every caller gets it for free.
+//
+// NOTE FOR THE NEXT AUTHOR: any other spec item that also registers the `maestro` module
+// (spec G's player-control work is the known one) MUST call `registerModuleIfAbsent`, not
+// `registerModule`, for this exact reason — a plain `registerModule({id:'maestro',...})`
+// elsewhere would still silently replace whichever descriptor landed first.
+registerModuleIfAbsent({ id: 'maestro', title: 'Maestro', icon: '▶', healthSystem: 'muse', order: 8 });
 
 // ── Harmony ──────────────────────────────────────────────────────────────────
 

@@ -43,9 +43,32 @@ export interface ModuleDescriptor {
 const moduleRegistry = new Map<ModuleId, ModuleDescriptor>();
 
 /** Register (or replace) a module descriptor. Call once per module, at import time
- *  (`registerPanels.ts`), same convention as `registerPanel`. */
+ *  (`registerPanels.ts`), same convention as `registerPanel`. This is a bare `Map.set` — a
+ *  second call with the same `id` OVERWRITES the first, unconditionally. That is fine (and
+ *  intended) for the normal case of one module owned by one spec. It is NOT safe for a module
+ *  more than one spec may register — use `registerModuleIfAbsent` below for that case instead
+ *  of re-deriving a local guard at the call site (MUSE-124 review: a local
+ *  `if (!getAllModules().some(...))` guard only protects callers that remember to write it —
+ *  the actual first-registration-wins property has to live here, not at each call site). */
 export function registerModule(m: ModuleDescriptor): void {
   moduleRegistry.set(m.id, m);
+}
+
+/** Register a module descriptor ONLY IF no descriptor is registered for that id yet — first
+ *  registration wins, every later call is a no-op. Returns whether THIS call actually
+ *  registered (`true`) or found one already present and skipped (`false`).
+ *
+ *  Use this instead of `registerModule` for a module more than one spec item may register —
+ *  e.g. `maestro`, which both MACT-04 (this Activity panel) and spec G's player-control item
+ *  register independently, with no dependency ordering between them. Module init in this file
+ *  is synchronous, so there is no race to protect against; the risk `registerModule` alone
+ *  can't rule out is a FUTURE call site silently overwriting an earlier module's descriptor
+ *  because nobody wrote a guard. Putting the guard here means every caller gets the same
+ *  guarantee without having to remember to write it themselves. */
+export function registerModuleIfAbsent(m: ModuleDescriptor): boolean {
+  if (moduleRegistry.has(m.id)) return false;
+  moduleRegistry.set(m.id, m);
+  return true;
 }
 
 /** All registered modules regardless of availability (diagnostic use only), in `order`. */
