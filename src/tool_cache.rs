@@ -96,8 +96,34 @@ const SEED_POLICY: &[(&str, CachePolicy)] = &[
 /// Safety-relevant freshness beats latency every time. A severe-weather alert exists
 /// precisely to be timely; serving yesterday's "all clear" is a failure mode with real
 /// consequences for someone deciding whether to travel.
-fn is_never_cached(tool: &str) -> bool {
-    tool.contains("alert") || tool.contains("severe") || tool.contains("warning")
+/// Tools named EXACTLY here are never cached, whatever any prefix policy says.
+///
+/// MUSEL-LIVE: the name-shape rule below (`alert`/`severe`/`warning`) encodes
+/// one reason freshness is non-negotiable — safety. It is not the only one. A
+/// LIVE-STATE read is worthless stale for a different reason: it answers "what
+/// is true right now", and a cached "right now" is simply a lie. No honest name
+/// for `media_now_playing` contains "alert", and renaming it to smuggle it past
+/// a substring match would be a naming trick standing in for a decision — so
+/// the RULE is extended instead, deliberately and by exact name.
+///
+/// Being an exact-name list rather than another substring makes the guarantee
+/// survive an unrelated future edit: if somebody later adds a `("media_", ...)`
+/// prefix policy to [`SEED_POLICY`], this list still wins.
+pub const NEVER_CACHED_TOOLS: &[&str] = &[
+    // What is playing on Plex at this instant, and who is home to be watching
+    // it. A stale answer here is not merely unhelpful, it is wrong about the
+    // household — and it would also route around the per-caller entitlement
+    // gate in `crate::media::now_playing`, since a cache hit never reaches the
+    // tool (the same hazard already documented for `weather` above, except that
+    // no per-principal key can fix it: the data is live, not just private).
+    "media_now_playing",
+];
+
+pub fn is_never_cached(tool: &str) -> bool {
+    NEVER_CACHED_TOOLS.contains(&tool)
+        || tool.contains("alert")
+        || tool.contains("severe")
+        || tool.contains("warning")
 }
 
 /// Resolve the policy governing `tool`, if any.
