@@ -400,6 +400,17 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
                             all_recognised = false;
                             continue;
                         };
+                        // `input` is OPTIONAL — absent is fine. But present
+                        // and not an object is nested schema drift, the same
+                        // presence-is-not-recognition rule applied one level
+                        // down. The event is still emitted (the name is usable
+                        // and tells an observer something); only `understood`
+                        // is cleared, per the independent-axes contract.
+                        match b.get("input") {
+                            None => {}
+                            Some(Value::Object(_)) => {}
+                            Some(_) => all_recognised = false,
+                        }
                         let arg = b.get("input").and_then(primary_arg);
                         let summary = match &arg {
                             Some(a) => format!("{name}: {a}"),
@@ -764,6 +775,28 @@ mod tests {
             {"type": "future_block"}, {"type": "text", "text": "hi"}]}})));
         assert!(!u(json!({"type": "assistant", "message": {"content": [
             {"type": "thinking", "thinking": "x"}, {"type": "future_block"}]}})));
+    }
+
+    #[test]
+    fn a_tool_use_with_a_malformed_input_is_drift_but_still_reported() {
+        // Present-but-wrong-type, one level deeper. The event survives because
+        // the name is usable; only the understood flag is cleared.
+        let outcome = classify_record(&json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": 42}]}}));
+        assert_eq!(outcome.events.len(), 1, "a usable name is still worth reporting");
+        assert_eq!(outcome.events[0].summary, "Bash");
+        assert!(!outcome.understood, "a non-object input is nested schema drift");
+
+        // An ABSENT input is legitimately optional, not drift.
+        let absent = classify_record(&json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash"}]}}));
+        assert!(absent.understood);
+
+        // A well-formed object input is understood.
+        let ok = classify_record(&json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}}));
+        assert!(ok.understood);
+        assert_eq!(ok.events[0].summary, "Bash: ls");
     }
 
     #[test]
