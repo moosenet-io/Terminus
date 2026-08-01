@@ -216,6 +216,9 @@ export interface AggregationClient {
   /** CGUI-08: the MINT profiling read surface (`/api/terminus/mint/*`, CONST-21 +
    *  the CGUI-07 per-category endpoints). Consumed by CGUI-10 (MINT module). */
   mint: MintClient;
+  /** MACT-03: Maestro Activity's typed session surfaces (`/api/sessions/*` on Muse's protected
+   *  router, reached via `proxy_muse`). Consumed by MACT-04's Activity panel. */
+  muse: MuseClient;
   /**
    * Generic escape hatch for panel-specific reads that don't yet have a typed method above.
    * Still routed through this client so the "single path to the backend" rule holds even as
@@ -284,6 +287,194 @@ export interface MintClient {
   categoryMatrix(category: MintCategoryKey, epoch?: string): Promise<MintCategoryMatrixResponse>;
   categoryBox(category: MintCategoryKey, metric?: string, epoch?: string): Promise<MintCategoryBoxResponse>;
   categoryFailures(category: MintCategoryKey, epoch?: string): Promise<MintCategoryFailuresResponse>;
+}
+
+// ── Maestro Activity session surfaces (MACT-03, MUSE #123) ───────────────────
+//
+// `aggregationClient.ts` is the ONLY module allowed to call `fetch` (grep-enforced — see the
+// `no other file calls fetch` test in `aggregationClient.sessions.test.ts`), so every read for
+// the Activity panel (MACT-04) lands here first, same as every other typed method group above.
+//
+// TYPE SOURCE: a live authenticated probe against `/api/sessions/live|history` is NOT available
+// this session — `CONSTELLATION_MUSE_TOKEN` is unprovisioned (TERM #549), so the protected
+// routes 401 for us right now. Rather than guess from spec prose (S129 already recorded what
+// that costs), these interfaces are typed 1:1 from the AUTHORITATIVE source instead: the Rust
+// `#[derive(Serialize)]` structs Muse actually emits, `LiveSessionOut` / `HistorySessionOut` /
+// `LiveSessionsResponse` / `HistorySessionsResponse` in `Muse/src/web/dashboard.rs`. Field names,
+// nesting, and optionality below mirror those exactly — see the per-field comments for the exact
+// Rust type each one comes from. `TerminateSessionResponse` has no Rust counterpart yet (MACT-02,
+// this item's OTHER blocker, has not landed in Muse as of this write) — that one is typed from
+// MACT-02's spec-item prose (`{stopped, backend, reason_delivered}` plus its documented status
+// codes) instead, and is called out below as the one exception to "typed from a real struct".
+//
+// TWO-PROXY RULE: metadata/art (library, discover, taste, …) comes from `muse.*` via
+// `proxy_muse` — content Muse owns permanently. Session/transport state (this module) ALSO comes
+// from `muse.*` via `proxy_muse` in H1, because Muse is deriving it from `play_sessions` as a
+// stand-in for the real thing. It will move to a NEW `maestro.*` proxy arm once the epic's H2
+// Maestro service exists and owns live transport state directly — the `source` discriminator
+// below (`"muse-derived"` today, `"maestro-live"` once H2 lands) is what makes that flip visible
+// instead of a silent identity swap. HISTORY never moves: `source: "muse-history"` is permanent,
+// because Muse's play-session ledger stays the historical record even after H2.
+//
+// WHY LiveSession AND HistorySession ARE SEPARATE TYPES (read this before merging them):
+// Today the two payloads look almost identical — same account/item/decision shape, same field
+// names. It is tempting to fold them into one `Session` interface with an optional `state` field.
+// DO NOT. `LiveSession` carries `state`/`last_event_at` because it describes an ACTIVE stream;
+// `HistorySession` never will, because a finished session has neither a play-state nor a
+// staleness clock to report. More importantly: H2 (spec J) replaces the LIVE source with a real
+// Maestro push feed while HISTORY stays exactly as Muse serves it forever. If the two were one
+// type, that flip would force a shape change (and every panel consumer) to move together; kept
+// distinct, it is a one-line source swap behind `LiveSession` — the merge is the drift epic §4
+// forbids, and it is what would make H2 a rewrite instead of a swap.
+
+/** Mirrors Rust `SessionAccountOut`. */
+export interface SessionAccount {
+  id: number | null;
+  display_name: string | null;
+}
+
+/** Mirrors Rust `SessionItemOut`. `season_number`/`episode_number`/`episode_title` are present
+ *  only for an episode-level session (Muse resolved an `episode_id`). */
+export interface SessionItem {
+  media_item_id: number | null;
+  title: string | null;
+  year: number | null;
+  kind: 'movie' | 'show' | null;
+  season_number: number | null;
+  episode_number: number | null;
+  episode_title: string | null;
+}
+
+/** Mirrors Rust `SessionDecisionOut`. Decision strings are the backend's `decision_kind_str`
+ *  vocabulary (`direct_play` | `direct_stream` | `transcode` | `copy`) — an unrecognised value
+ *  should render verbatim + "(unclassified)" per the house vocabulary-discipline rule
+ *  (`SubsystemHealth.tsx`), never be coerced to a friendly default. That's MACT-04's job; this
+ *  type just carries the string through untouched. */
+export interface SessionDecision {
+  video_decision: string | null;
+  audio_decision: string | null;
+  transcode_decision: string | null;
+  transcode_reason: string | null;
+  container: string | null;
+  video_codec: string | null;
+  audio_codec: string | null;
+  audio_channels: number | null;
+  video_resolution: string | null;
+  bitrate: number | null;
+}
+
+/** Mirrors Rust `repo::play_session::SessionPlayState`. An open-but-stale session is reported
+ *  as `"stale"`, never dropped and never coerced to `"playing"`. */
+export type SessionPlayState = 'playing' | 'paused' | 'stale';
+
+/** Mirrors Rust `LiveSessionOut`. See the module doc comment above for why this is NOT the same
+ *  type as [`HistorySession`] despite the near-identical field list — `state`/`last_event_at`
+ *  are the structural tell: a finished session has neither. */
+export interface LiveSession {
+  session_id: number;
+  session_key: string | null;
+  account: SessionAccount;
+  item: SessionItem;
+  poster_url: string | null;
+  backdrop_url: string | null;
+  view_offset_ms: number | null;
+  duration_ms: number | null;
+  /** Rust: `#[serde(skip_serializing_if = "Option::is_none")]` — the KEY IS ABSENT from the
+   *  JSON (not `null`) when `duration_ms` is unknown, so progress is genuinely unreportable
+   *  (never fabricated as `0%`). Modelled as an optional property (`?`), not `| null`, to match
+   *  that absence exactly — a mock/test fixture covering the unknown-duration row must OMIT
+   *  this key entirely, not set it to `null`. Already scaled to 0..100; do not rescale. */
+  progress_pct?: number;
+  player: string | null;
+  platform: string | null;
+  product: string | null;
+  device: string | null;
+  state: SessionPlayState;
+  last_event_at: string | null;
+  started_at: string;
+  decision: SessionDecision;
+}
+
+/** Mirrors Rust `HistorySessionOut` — identical to [`LiveSession`] minus `state`/
+ *  `last_event_at`. Kept as its own interface rather than `Omit<LiveSession, ...>` so the two
+ *  stay independently editable as their backing Rust structs diverge further (H2 is expected to
+ *  do exactly that to `LiveSessionOut`, not to this one). */
+export interface HistorySession {
+  session_id: number;
+  session_key: string | null;
+  account: SessionAccount;
+  item: SessionItem;
+  poster_url: string | null;
+  backdrop_url: string | null;
+  view_offset_ms: number | null;
+  duration_ms: number | null;
+  /** Same absent-when-unknown contract as `LiveSession.progress_pct` — see that field's doc. */
+  progress_pct?: number;
+  player: string | null;
+  platform: string | null;
+  product: string | null;
+  device: string | null;
+  started_at: string;
+  decision: SessionDecision;
+}
+
+/** Mirrors Rust `LiveSessionsResponse`. `source` is always `"muse-derived"` in H1; MACT-04's
+ *  panel renders it verbatim in the LIVE pane's header so the eventual H2 flip to
+ *  `"maestro-live"` is a visible, explained change. Extends the house degrade envelope
+ *  (`available`/`detail`) the same way `TerminusActivityResponse` extends
+ *  `ActivityFeedResponse` — never a throw, see `muse.sessions.live()` below. */
+export interface LiveSessionsResult {
+  available: boolean;
+  detail?: string;
+  source: 'muse-derived';
+  sessions: LiveSession[];
+}
+
+/** Mirrors Rust `HistorySessionsResponse`. `source` is always `"muse-history"` — Muse's
+ *  PERMANENT role per MACT-01, unaffected by the H2 live-source flip. */
+export interface HistorySessionsResult {
+  available: boolean;
+  detail?: string;
+  source: 'muse-history';
+  sessions: HistorySession[];
+}
+
+/** `terminate()`'s outcome. `POST /api/sessions/:session_key/terminate` is this module's only
+ *  mutation and the only item in this spec with real-world blast radius (it interrupts a
+ *  person's stream), so its result is a discriminated union rather than a boolean/throw:
+ *   - `'ok'` — the backend actually attempted the stop; `stopped` reports what REALLY happened
+ *     (a player that ignored a best-effort stop is `stopped: false`, never an optimistic `true`).
+ *   - `'forbidden'` — a `403` from Terminus's `enforce_viewer_role_gate` (a viewer session tried
+ *     to mutate). Rendered "operator role required", not "failed" — see MACT-02's gate design.
+ *   - `'not_found'` — the `session_key` isn't in the live set; `404`, no relay was attempted.
+ *   - `'unavailable'` — `503`, no `CastController` configured; never a fabricated success.
+ *   - `'error'` — anything else: a real network/transport failure, or an unexpected status. This
+ *     is the case a `403` must NOT collapse into, per this item's acceptance criteria.
+ *  No Rust `#[derive(Serialize)]` struct exists for the success body yet — MACT-02 (this item's
+ *  other blocker) has not landed in Muse. The `'ok'` shape is typed from MACT-02's spec-item
+ *  prose (`{stopped, backend, reason_delivered}`) rather than a live capture; re-verify against
+ *  the real struct once MACT-02 merges. */
+export type MuseTerminateResult =
+  | { kind: 'ok'; stopped: boolean; backend: string; reason_delivered: boolean }
+  | { kind: 'forbidden'; detail: string }
+  | { kind: 'not_found'; detail: string }
+  | { kind: 'unavailable'; detail: string }
+  | { kind: 'error'; detail: string };
+
+export interface MuseClient {
+  sessions: {
+    /** `GET /api/sessions/live` — degrades to `{available:false, detail}` on any failure
+     *  (401 unprovisioned bearer, 404/501 not-yet-deployed, network error) — never throws, so
+     *  MACT-04's panel can name the cause instead of rendering an empty list. */
+    live(): Promise<LiveSessionsResult>;
+    /** `GET /api/sessions/history?limit=` — same degrade contract as `live()`. */
+    history(limit?: number): Promise<HistorySessionsResult>;
+    /** `POST /api/sessions/:session_key/terminate` — the one mutation, and the only method on
+     *  this client that mutates. Never throws: every outcome — success, `403`/`404`/`503`, or a
+     *  genuine transport failure — resolves as a typed [`MuseTerminateResult`] variant, so no
+     *  call site needs its own try/catch. */
+    terminate(sessionKey: string, reason?: string): Promise<MuseTerminateResult>;
+  };
 }
 
 export interface WsHandlers {
@@ -549,6 +740,144 @@ const MOCK_MUSE_GAPS = {
   ],
   total: 2,
 };
+
+// MACT-03 (MUSE #123): Activity panel session fixtures. Shape-faithful to `LiveSessionOut`/
+// `HistorySessionOut`/their envelopes (`Muse/src/web/dashboard.rs`) — see the doc comment on
+// `LiveSession`/`HistorySession` above for the exact field-by-field mirror. The MGUI-10 note two
+// screens up ("a mock that disagrees with its endpoint is a false-green generator") is exactly
+// the failure mode these are built to avoid: every row below is a value the REAL struct can
+// actually serialize, not an invented convenience shape.
+//
+// Coverage (per this item's acceptance criteria):
+//   LIVE:    playing/direct_play, paused/direct_stream ("remux"), stale/transcode with an
+//            UNKNOWN duration — `progress_pct` is OMITTED on that row (not `null`), matching
+//            Rust's `skip_serializing_if = "Option::is_none"`.
+//   HISTORY: direct_play, direct_stream ("remux"), transcode — all finished, no `state`/
+//            `last_event_at` (HistorySession doesn't carry them; see the type doc).
+const MOCK_MUSE_LIVE_SESSIONS: LiveSession[] = [
+  {
+    session_id: 501,
+    session_key: 'sess-mock-playing',
+    account: { id: 1, display_name: 'Mock Viewer' },
+    item: {
+      media_item_id: 6655, title: 'The Martian', year: 2015, kind: 'movie',
+      season_number: null, episode_number: null, episode_title: null,
+    },
+    poster_url: '/art/media_metadata/1225', backdrop_url: '/art/media_metadata/1225?variant=fanart',
+    view_offset_ms: 1_284_000, duration_ms: 8_520_000, progress_pct: 15.1,
+    player: 'Plex Web', platform: 'Chrome', product: 'Plex Web', device: 'Living Room TV',
+    state: 'playing', last_event_at: new Date().toISOString(),
+    started_at: new Date(Date.now() - 21 * 60000).toISOString(),
+    decision: {
+      video_decision: 'direct_play', audio_decision: 'direct_play', transcode_decision: null,
+      transcode_reason: null, container: 'mkv', video_codec: 'hevc', audio_codec: 'eac3',
+      audio_channels: 6, video_resolution: '1080', bitrate: 12000,
+    },
+  },
+  {
+    session_id: 502,
+    session_key: 'sess-mock-paused',
+    account: { id: 2, display_name: 'Mock Guest' },
+    item: {
+      media_item_id: 7001, title: 'Example Series', year: 2021, kind: 'show',
+      season_number: 1, episode_number: 4, episode_title: 'Example Episode Title',
+    },
+    poster_url: '/art/media_metadata/2200', backdrop_url: '/art/media_metadata/2200?variant=fanart',
+    view_offset_ms: 640_000, duration_ms: 2_640_000, progress_pct: 24.2,
+    player: 'Plex for Roku', platform: 'Roku', product: 'Plex for Roku', device: 'Bedroom Roku',
+    state: 'paused', last_event_at: new Date(Date.now() - 3 * 60000).toISOString(),
+    started_at: new Date(Date.now() - 15 * 60000).toISOString(),
+    decision: {
+      // "remux": audio doesn't fit the target's direct-play envelope, video does -- MACT-04
+      // renders this decision pair as its own "Remux" badge, distinct from full transcode.
+      video_decision: 'direct_play', audio_decision: 'direct_stream', transcode_decision: 'copy',
+      transcode_reason: 'audio channel layout not supported by the player',
+      container: 'mp4', video_codec: 'h264', audio_codec: 'aac',
+      audio_channels: 2, video_resolution: '720', bitrate: 4000,
+    },
+  },
+  {
+    session_id: 503,
+    session_key: 'sess-mock-stale',
+    account: { id: 1, display_name: 'Mock Viewer' },
+    item: {
+      media_item_id: 6812, title: 'Example Feature Film', year: 2019, kind: 'movie',
+      season_number: null, episode_number: null, episode_title: null,
+    },
+    poster_url: '/art/media_metadata/3310', backdrop_url: '/art/media_metadata/3310?variant=fanart',
+    // `duration_ms` unknown (Muse never resolved it for this session) -- `progress_pct` is
+    // therefore OMITTED entirely below, not set to `null`. See LiveSession's field doc.
+    view_offset_ms: 900_000, duration_ms: null,
+    player: 'Plex Media Player', platform: 'Linux', product: 'Plex HTPC', device: 'Office HTPC',
+    state: 'stale', last_event_at: new Date(Date.now() - 22 * 60000).toISOString(),
+    started_at: new Date(Date.now() - 40 * 60000).toISOString(),
+    decision: {
+      video_decision: 'transcode', audio_decision: 'transcode', transcode_decision: 'transcode',
+      transcode_reason: 'bitrate exceeds the client’s network ceiling',
+      container: 'mkv', video_codec: 'av1', audio_codec: 'truehd',
+      audio_channels: 8, video_resolution: '4k', bitrate: 45000,
+    },
+  },
+];
+
+const MOCK_MUSE_HISTORY_SESSIONS: HistorySession[] = [
+  {
+    session_id: 401,
+    session_key: 'sess-mock-hist-direct',
+    account: { id: 1, display_name: 'Mock Viewer' },
+    item: {
+      media_item_id: 6655, title: 'The Martian', year: 2015, kind: 'movie',
+      season_number: null, episode_number: null, episode_title: null,
+    },
+    poster_url: '/art/media_metadata/1225', backdrop_url: '/art/media_metadata/1225?variant=fanart',
+    view_offset_ms: 8_520_000, duration_ms: 8_520_000, progress_pct: 100,
+    player: 'Plex Web', platform: 'Chrome', product: 'Plex Web', device: 'Living Room TV',
+    started_at: new Date(Date.now() - 3 * 3600000).toISOString(),
+    decision: {
+      video_decision: 'direct_play', audio_decision: 'direct_play', transcode_decision: null,
+      transcode_reason: null, container: 'mkv', video_codec: 'hevc', audio_codec: 'eac3',
+      audio_channels: 6, video_resolution: '1080', bitrate: 12000,
+    },
+  },
+  {
+    session_id: 402,
+    session_key: 'sess-mock-hist-remux',
+    account: { id: 2, display_name: 'Mock Guest' },
+    item: {
+      media_item_id: 7001, title: 'Example Series', year: 2021, kind: 'show',
+      season_number: 1, episode_number: 3, episode_title: 'Earlier Example Episode',
+    },
+    poster_url: '/art/media_metadata/2200', backdrop_url: '/art/media_metadata/2200?variant=fanart',
+    view_offset_ms: 2_500_000, duration_ms: 2_640_000, progress_pct: 94.7,
+    player: 'Plex for Roku', platform: 'Roku', product: 'Plex for Roku', device: 'Bedroom Roku',
+    started_at: new Date(Date.now() - 26 * 3600000).toISOString(),
+    decision: {
+      video_decision: 'direct_play', audio_decision: 'direct_stream', transcode_decision: 'copy',
+      transcode_reason: 'audio channel layout not supported by the player',
+      container: 'mp4', video_codec: 'h264', audio_codec: 'aac',
+      audio_channels: 2, video_resolution: '720', bitrate: 4000,
+    },
+  },
+  {
+    session_id: 403,
+    session_key: 'sess-mock-hist-transcode',
+    account: { id: 3, display_name: 'Mock Third Account' },
+    item: {
+      media_item_id: 6812, title: 'Example Feature Film', year: 2019, kind: 'movie',
+      season_number: null, episode_number: null, episode_title: null,
+    },
+    poster_url: '/art/media_metadata/3310', backdrop_url: '/art/media_metadata/3310?variant=fanart',
+    view_offset_ms: 5_100_000, duration_ms: 6_000_000, progress_pct: 85,
+    player: 'Plex Mobile', platform: 'iOS', product: 'Plex iOS', device: 'Someone’s iPhone',
+    started_at: new Date(Date.now() - 50 * 3600000).toISOString(),
+    decision: {
+      video_decision: 'transcode', audio_decision: 'transcode', transcode_decision: 'transcode',
+      transcode_reason: 'bitrate exceeds the client’s network ceiling',
+      container: 'mkv', video_codec: 'av1', audio_codec: 'truehd',
+      audio_channels: 8, video_resolution: '4k', bitrate: 45000,
+    },
+  },
+];
 
 // CONST-20: dashboard MetricCards row (library size, active channels, pending items, last
 // ingest) has no dedicated endpoint in the §5.4 route list as written -- this mock/`GET
@@ -1717,6 +2046,26 @@ const mockAdapter: AggregationClient = {
       return delay(mockCategoryFailures(mockCategoryOr400(category)));
     },
   },
+  muse: {
+    sessions: {
+      async live() {
+        return delay({ available: true, source: 'muse-derived', sessions: MOCK_MUSE_LIVE_SESSIONS });
+      },
+      async history(limit?: number) {
+        const sessions = limit != null ? MOCK_MUSE_HISTORY_SESSIONS.slice(0, limit) : MOCK_MUSE_HISTORY_SESSIONS;
+        return delay({ available: true, source: 'muse-history', sessions });
+      },
+      async terminate(sessionKey: string): Promise<MuseTerminateResult> {
+        return withMutationResultEvent('muse', `/api/sessions/${sessionKey}/terminate`, { method: 'POST' }, async () => {
+          const known = MOCK_MUSE_LIVE_SESSIONS.some(s => s.session_key === sessionKey);
+          if (!known) {
+            return delay<MuseTerminateResult>({ kind: 'not_found', detail: 'session not in the live set' });
+          }
+          return delay<MuseTerminateResult>({ kind: 'ok', stopped: true, backend: 'mock', reason_delivered: true });
+        });
+      },
+    },
+  },
   async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
     return withMutationResultEvent(system, path, init, () => mockRequest<T>(system, path, init));
   },
@@ -1821,6 +2170,20 @@ function enforceHeaders(callerHeaders?: HeadersInit): Record<string, string> {
   return out;
 }
 
+/** Thrown by `httpJson`/`httpJsonStatus` for a non-2xx response. Carries the numeric `status`
+ *  so a caller that needs to branch on it (MACT-03's `classifyError`-style degrade logic, or
+ *  `muse.sessions.terminate()`'s typed-forbidden-vs-network-error split) doesn't have to
+ *  regex-parse `.message` — the message text is kept identical to the old plain `Error` for
+ *  backward compat with call sites that already match `/^HTTP (\d+) for/` against it. */
+export class HttpStatusError extends Error {
+  readonly status: number;
+  constructor(status: number, path: string) {
+    super(`HTTP ${status} for ${path}`);
+    this.name = 'HttpStatusError';
+    this.status = status;
+  }
+}
+
 async function httpJson<T>(path: string, init?: RequestInit): Promise<T> {
   // Enforce the aggregation-client invariants so a caller can NEVER override them:
   //  - credentials:'include' — the session cookie is the only auth the browser holds.
@@ -1833,10 +2196,25 @@ async function httpJson<T>(path: string, init?: RequestInit): Promise<T> {
     headers: enforceHeaders(init?.headers),
   });
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status} for ${path}`);
+    throw new HttpStatusError(res.status, path);
   }
   if (res.status === 204) return undefined as unknown as T;
   return (await res.json()) as T;
+}
+
+/** Like `httpJson`, but a non-2xx response is returned as `{status, body}` instead of thrown —
+ *  for callers (MACT-03's `terminate()`) that need to distinguish SEVERAL non-2xx outcomes
+ *  (403 vs 404 vs 503) from each other and from a genuine transport failure, rather than
+ *  collapsing them all into one catch block. A thrown exception here means the request never
+ *  got a response at all (network down, CORS, etc.) — the one case that's a real `'error'`. */
+async function httpJsonStatus(path: string, init?: RequestInit): Promise<{ status: number; body: unknown }> {
+  const res = await fetch(`${baseUrl()}${path}`, {
+    ...init,
+    credentials: 'include',
+    headers: enforceHeaders(init?.headers),
+  });
+  const body = res.status === 204 ? undefined : await res.json().catch(() => undefined);
+  return { status: res.status, body };
 }
 
 /** Build a `?a=1&b=2` query string from a params object, dropping `undefined`/`null`/`''`
@@ -1968,6 +2346,79 @@ const httpAdapter: AggregationClient = {
     async categoryFailures(category: MintCategoryKey, epoch?: string) {
       return httpJson<MintCategoryFailuresResponse>(
         `/api/terminus/mint/category/${encodeURIComponent(category)}/failures${buildQuery({ epoch })}`);
+    },
+  },
+  muse: {
+    sessions: {
+      // Reached through `proxy_muse`, hence the doubled `/api`: `/api/muse` (the system arm) +
+      // Muse's own `/api/sessions/...` route — same convention as every other `muse /api/...`
+      // path in this file (see the MGUI-16 comment above `MOCK_MUSE_SEARCH_HITS`).
+      async live() {
+        // Degrade-not-throw (MACT-03 non-negotiable #3): a 401 (TERM #549's unprovisioned
+        // bearer), a 404/501 on a pre-MACT-01 deploy, or any transport failure all become
+        // `{available:false, detail}` — never a throw — so MACT-04's panel can name the cause.
+        try {
+          const res = await httpJson<Omit<LiveSessionsResult, 'available' | 'detail'>>(
+            '/api/muse/api/sessions/live');
+          return { ...res, available: true };
+        } catch (e) {
+          return {
+            available: false,
+            source: 'muse-derived',
+            sessions: [],
+            detail: e instanceof Error ? e.message : 'unavailable',
+          };
+        }
+      },
+      async history(limit?: number) {
+        try {
+          const res = await httpJson<Omit<HistorySessionsResult, 'available' | 'detail'>>(
+            `/api/muse/api/sessions/history${buildQuery({ limit })}`);
+          return { ...res, available: true };
+        } catch (e) {
+          return {
+            available: false,
+            source: 'muse-history',
+            sessions: [],
+            detail: e instanceof Error ? e.message : 'unavailable',
+          };
+        }
+      },
+      async terminate(sessionKey: string, reason?: string): Promise<MuseTerminateResult> {
+        const path = `/api/muse/api/sessions/${encodeURIComponent(sessionKey)}/terminate`;
+        return withMutationResultEvent('muse', path, { method: 'POST' }, async () => {
+          try {
+            const { status, body } = await httpJsonStatus(path, {
+              method: 'POST',
+              body: JSON.stringify(reason != null ? { reason } : {}),
+            });
+            if (status === 403) {
+              return { kind: 'forbidden', detail: 'operator role required' };
+            }
+            if (status === 404) {
+              return { kind: 'not_found', detail: 'session not in the live set' };
+            }
+            if (status === 503) {
+              return { kind: 'unavailable', detail: 'no stream controller configured' };
+            }
+            if (status >= 200 && status < 300) {
+              const b = (body ?? {}) as Partial<{ stopped: boolean; backend: string; reason_delivered: boolean }>;
+              return {
+                kind: 'ok',
+                stopped: b.stopped === true,
+                backend: b.backend ?? 'unknown',
+                reason_delivered: b.reason_delivered === true,
+              };
+            }
+            return { kind: 'error', detail: `HTTP ${status} for ${path}` };
+          } catch (e) {
+            // A thrown exception from `httpJsonStatus` means no response was received at all
+            // (network failure) — the one case that is genuinely, distinctly, a transport error
+            // rather than a typed HTTP outcome. This is what must NOT be conflated with 'forbidden'.
+            return { kind: 'error', detail: e instanceof Error ? e.message : 'network error' };
+          }
+        });
+      },
     },
   },
   async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {

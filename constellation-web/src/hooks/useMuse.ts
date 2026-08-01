@@ -18,6 +18,7 @@
 //     one dead endpoint collapses only its own section -- see the panel files' top comments.
 import { useCallback, useEffect, useState } from 'react';
 import { getAggregationClient } from '../lib/aggregationClient';
+import type { LiveSessionsResult, HistorySessionsResult, MuseTerminateResult } from '../lib/aggregationClient';
 
 export interface MuseSection<T> {
   data: T | null;
@@ -1151,4 +1152,97 @@ export interface MuseAcquisitionGate {
 
 export function useMuseAcquisitionGate(): MuseSection<MuseAcquisitionGate> {
   return useMuseSection<MuseAcquisitionGate>('/api/settings');
+}
+
+// ── Maestro Activity sessions (MACT-03, MUSE #123) ───────────────────────────
+//
+// `client.muse.sessions.live()`/`.history()` are typed methods on the aggregation client (see
+// their doc comments in `aggregationClient.ts`), not paths fed through the generic
+// `useMuseSection(path)` above. That mirrors the CONST-21/CGUI-08 precedent already in this
+// file's sibling module (`client.mint.*` / `client.models.*`, see the NOTE above `MOCK_GET` in
+// `aggregationClient.ts`): once a typed client method exists, panels/hooks call IT directly
+// rather than re-deriving the same fetch through the untyped path-dispatch table — a second
+// implementation of the same request is exactly the kind of drift this spec's epic forbids.
+// `useMuseTypedSection` below reproduces `useMuseSection`'s exact `{data, loading, degraded,
+// refetch}` contract and polling shape (same three-state UX every Muse panel already expects)
+// so MACT-04 gets identical behaviour regardless of which path a hook takes underneath —
+// "inheriting per-endpoint degradation unchanged" holds either way, because both typed methods
+// already degrade to `{available:false, detail}` themselves (never throw), same as
+// `terminus.activity()`.
+
+/** Generic per-endpoint Muse fetch, sourced from an already-degrading typed client method
+ *  (`{available, detail?, ...data}`) instead of a raw path. Same shape/contract as
+ *  `useMuseSection` above — see that function's doc and the module note just above this one for
+ *  why sessions hooks use this instead of `useMuseSection(path)` directly. */
+function useMuseTypedSection<T extends { available: boolean; detail?: string }>(
+  fetcher: () => Promise<T>,
+  deps: readonly unknown[],
+): MuseSection<T> {
+  const [data, setData] = useState<T | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [degraded, setDegraded] = useState<{ detail: string } | false>(false);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- `fetcher` is rebuilt by callers
+  // every render from `deps`; keying the effect on `deps` (not `fetcher`) avoids a fetch loop.
+  const fetchOnce = useCallback(() => {
+    setLoading(true);
+    fetcher()
+      .then(res => {
+        if (!res.available) {
+          setDegraded({ detail: res.detail ?? 'unavailable' });
+          setData(null);
+        } else {
+          setDegraded(false);
+          setData(res);
+        }
+        setLoading(false);
+      })
+      .catch(err => {
+        // Defensive only -- the typed client methods this feeds never throw (they resolve
+        // `available:false` on every failure mode instead), but a hook that could still throw
+        // past its own `.catch` would break the "never crashes the panel" contract silently.
+        setDegraded({ detail: err instanceof Error ? err.message : 'unknown error' });
+        setData(null);
+        setLoading(false);
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps);
+
+  useEffect(() => {
+    fetchOnce();
+  }, [fetchOnce]);
+
+  return { data, loading, degraded, refetch: fetchOnce };
+}
+
+/** LIVE pane data (`GET /api/sessions/live` via `proxy_muse`). `source` on the resolved envelope
+ *  is always `"muse-derived"` in H1 -- see `LiveSessionsResult`'s doc comment for the H2 flip
+ *  this is designed to make visible rather than silent. */
+export function useMuseLiveSessions(): MuseSection<LiveSessionsResult> {
+  return useMuseTypedSection<LiveSessionsResult>(() => getAggregationClient().muse.sessions.live(), []);
+}
+
+/** HISTORY pane data (`GET /api/sessions/history?limit=`). `source` is always `"muse-history"` --
+ *  Muse's permanent role, unaffected by the H2 live-source flip. */
+export function useMuseSessionHistory(limit?: number): MuseSection<HistorySessionsResult> {
+  return useMuseTypedSection<HistorySessionsResult>(
+    () => getAggregationClient().muse.sessions.history(limit),
+    [limit],
+  );
+}
+
+/** The terminate mutation. Returns a typed [`MuseTerminateResult`] (never throws) plus an
+ *  `inFlight` flag for the confirm-dialog button — MACT-04's concern, not this hook's, is
+ *  turning `kind` into copy/toasts. */
+export function useMuseTerminateSession() {
+  const [inFlight, setInFlight] = useState(false);
+  const terminate = useCallback(async (sessionKey: string, reason?: string): Promise<MuseTerminateResult> => {
+    setInFlight(true);
+    try {
+      return await getAggregationClient().muse.sessions.terminate(sessionKey, reason);
+    } finally {
+      setInFlight(false);
+    }
+  }, []);
+  return { terminate, inFlight };
 }
