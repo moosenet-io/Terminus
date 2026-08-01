@@ -295,6 +295,53 @@ for liveness). Full walkthrough: [docs/getting-started.md](docs/getting-started.
 - 3 workspace crates: `terminus-rs`, `terminus-client` (enrollment + mTLS transport), `terminus-worker-sdk` (worker authoring).
 - Top call-graph hotspots: `mesh::principal::PrincipalResolver::map`, `registry::ToolRegistry::contains`, `mesh::tailnet::TailnetServer::start`.
 
+## The `pii_gate` binary
+
+The authoritative PII pre-push / pre-commit gate, replacing the legacy
+`.githooks/pii_gate.py`. It scans git *objects* (committed or staged blobs), not
+the working tree, so a secret that is committed but since deleted is still
+caught. It fails **closed**: a git error, a missing binary, or a malformed
+config is never reported as a clean push.
+
+```sh
+cargo build --release --bin pii_gate
+ln -sf ../../target/release/pii_gate .git/hooks/pre-push
+```
+
+| Flag | Effect |
+| --- | --- |
+| *(none)* | git pre-push protocol on stdin — scans the blobs being pushed |
+| `--staged` | git pre-commit — scans the staged index |
+| `--tree [PATH]` | sweeps a whole working tree (used by the mirror engine) |
+| `--json` | machine-readable report instead of the human summary |
+| `--visibility <internal\|public>` | override the repo's declared posture |
+| `--posture` | print the resolved posture and why, then exit 0 |
+
+### Posture: internal vs public
+
+The scan is always full-strength; posture decides only which categories are
+**reported**. A repo declares it via `[repository] visibility` in
+`.moosenet-repo.toml`.
+
+- **`internal`** — the fleet's own infrastructure *identifiers* are not reported:
+  container ids, internal hostnames and domains, operator paths, uuids, phone
+  numbers, the operator's name, and infra service names. An internal repo
+  legitimately documents these.
+- **`public`** — everything is reported. This is also the fail-closed default
+  when the declaration is absent, unparseable, or has an unrecognized value.
+
+**Real credentials are never posture-gated.** Private IPs, API keys, JWTs, PEM
+private keys, cloud provider keys, and quoted secrets fire at every posture, as
+do any operator-configured `extra_terms` / `extra_patterns`.
+
+This mirrors the `EXTENDED_PATTERNS` split of the Python gate it replaces. The
+filter lives in the binary only — the shared `ruleset_from_config` seam used by
+the runtime write gate and the git-public mirror engine stays unconditionally
+full-strength, so mirroring is never weakened by a repo's posture.
+
+Repo-specific terms, extra patterns, allowed emails, and exclusions come from a
+repo-root `pii-gate.toml` (or the path in `TERMINUS_PII_CONFIG`).
+
 ## Contributing
 
 Every code change goes through the constellation build pipeline: spec item →
