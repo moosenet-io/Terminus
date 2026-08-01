@@ -178,65 +178,106 @@ fn format_values(items: &[&Value], max: usize) -> String {
     out
 }
 
+/// How much of the requested window we were actually able to apply.
+///
+/// Three outcomes, deliberately distinct, because collapsing them is how a tool
+/// ends up making a confident wrong claim:
+///
+/// * `Filtered` — every entry carried a readable date and the window applied.
+/// * `Unreadable` — NO entry carried a readable date, so nothing was filtered
+///   and everything is returned.
+/// * `Partial(n)` — some entries were readable and `n` were not. The unreadable
+///   ones are RETAINED, because "I could not read its date" is not evidence that
+///   an entry falls outside the window.
+#[derive(Debug, PartialEq, Eq)]
+enum Window {
+    Filtered,
+    Unreadable,
+    Partial(usize),
+}
+
+/// Grocy's documented column for this entity is `day`; the others are tolerated
+/// so a schema rename degrades to a hedged answer rather than a wrong one.
+const DATE_FIELDS: [&str; 3] = ["day", "date", "meal_plan_day"];
+
+/// Read a date off an entry, trying every candidate field until one PARSES.
+///
+/// Deliberately not "first field that holds a string, then parse that": a
+/// malformed `day` alongside a valid `date` must fall through to the valid one.
+/// Selecting on presence and then parsing would report the whole entry
+/// unreadable while a readable field sat right there.
+fn entry_date(entry: &Value) -> Option<chrono::NaiveDate> {
+    DATE_FIELDS.iter().find_map(|f| {
+        let raw = entry.get(*f)?.as_str()?;
+        // Grocy dates are `YYYY-MM-DD`, sometimes with a time suffix. Truncate
+        // by CHARACTERS, not bytes — `&raw[..10]` panics if a multibyte
+        // character starts before byte 10, and this string comes off the wire.
+        let prefix: String = raw.chars().take(10).collect();
+        chrono::NaiveDate::parse_from_str(&prefix, "%Y-%m-%d").ok()
+    })
+}
+
 /// Select meal-plan entries falling within the next `days` days.
 ///
-/// Returns `(entries, filtered)`. `filtered` is FALSE when no entry carried a
-/// date we could read, in which case every entry is returned unfiltered and the
-/// caller says so.
+/// The window is `days` CALENDAR DAYS COUNTING TODAY: `days = 1` is today alone,
+/// `days = 7` is today plus the next six. The caller reports "next {days}
+/// day(s)", so the two must agree — an inclusive `today ..= today + days` would
+/// quietly show `days + 1` days while claiming `days`.
 ///
-/// That fallback is the whole point. Grocy's `meal_plan` entity was empty on the
-/// instance this was written against, so the date field name could not be
-/// confirmed live — only inferred. If the inference is wrong, this shows MORE
-/// than was asked and admits it. The alternative failure, silently returning
-/// nothing because the field lookup missed, would be indistinguishable from "you
-/// have no meals planned" — a confident wrong answer instead of a hedged right
-/// one.
-fn within_days(data: &Value, days: i64) -> (Vec<&Value>, bool) {
+/// The hedged paths exist because Grocy's `meal_plan` entity was empty on the
+/// instance this was written against, so the date field name could be inferred
+/// but not confirmed live. Every ambiguity therefore resolves toward showing
+/// MORE than was asked and SAYING so. The opposite failure — dropping an entry
+/// we could not read — is indistinguishable from "you have nothing planned",
+/// which is a confident wrong answer rather than a hedged right one.
+fn within_days(data: &Value, days: i64) -> (Vec<&Value>, Window) {
     let Some(arr) = data.as_array() else {
-        return (Vec::new(), false);
+        return (Vec::new(), Window::Unreadable);
     };
     let all: Vec<&Value> = arr.iter().collect();
     if all.is_empty() {
         // Nothing to filter, and — importantly — nothing FAILED to parse. An
         // empty plan must report as "no meals in the window", not as "I could
         // not read your dates": the second says the tool is degraded when it is
-        // simply telling the truth.
-        return (all, true);
+        // simply being accurate.
+        return (all, Window::Filtered);
     }
 
     let today = chrono::Local::now().date_naive();
-    let Some(end) = today.checked_add_days(chrono::Days::new(days.max(0) as u64)) else {
-        return (all, false);
+    // `days - 1` so the count includes today. `days` is already clamped to >= 1
+    // by the caller; `saturating_sub` keeps this total even if that changes.
+    let span = (days.max(1) as u64).saturating_sub(1);
+    let Some(end) = today.checked_add_days(chrono::Days::new(span)) else {
+        return (all, Window::Unreadable);
     };
 
-    // `day` is Grocy's documented column for this entity; the others are
-    // tolerated so a schema rename degrades to the unfiltered path rather than
-    // to an empty answer.
-    const DATE_FIELDS: [&str; 3] = ["day", "date", "meal_plan_day"];
-
-    let mut any_date_seen = false;
+    let mut readable = 0usize;
+    let mut unreadable = 0usize;
     let mut kept = Vec::new();
     for entry in &all {
-        let parsed = DATE_FIELDS
-            .iter()
-            .find_map(|f| entry.get(*f).and_then(Value::as_str))
-            .and_then(|raw| {
-                // Grocy dates arrive as `YYYY-MM-DD`, sometimes with a time
-                // suffix; take the date half and ignore the rest.
-                chrono::NaiveDate::parse_from_str(&raw[..raw.len().min(10)], "%Y-%m-%d").ok()
-            });
-        if let Some(d) = parsed {
-            any_date_seen = true;
-            if d >= today && d <= end {
+        match entry_date(entry) {
+            Some(d) => {
+                readable += 1;
+                if d >= today && d <= end {
+                    kept.push(*entry);
+                }
+            }
+            None => {
+                unreadable += 1;
+                // Retained on purpose: an unreadable date is not evidence of
+                // being outside the window, and silently dropping it would lose
+                // a meal the user really has planned.
                 kept.push(*entry);
             }
         }
     }
 
-    if any_date_seen {
-        (kept, true)
+    if readable == 0 {
+        (all, Window::Unreadable)
+    } else if unreadable > 0 {
+        (kept, Window::Partial(unreadable))
     } else {
-        (all, false)
+        (kept, Window::Filtered)
     }
 }
 
@@ -398,17 +439,20 @@ impl RustTool for HearthMealPlan {
         // was not a route Grocy serves at all and returned 405 every time.
         // Verified live: `/api/meal_plan` 405, `/api/objects/meal_plan` 200.
         let data = client.get("/api/objects/meal_plan").await?;
-        let (entries, filtered) = within_days(&data, days);
+        let (entries, window) = within_days(&data, days);
         let body = format_values(&entries, 30);
-        Ok(if filtered {
-            format!("Meal plan (next {days} day(s)):\n{body}")
-        } else {
-            // We could not read a usable date off these entries, so we are
-            // showing everything rather than pretending the window applied.
-            // Erring toward MORE than asked is recoverable; silently returning
-            // an empty plan because a field name guess was wrong would read as
-            // "you have nothing planned", which is a different claim entirely.
-            format!("Meal plan (showing all entries — could not read a date to filter on):\n{body}")
+        Ok(match window {
+            Window::Filtered => format!("Meal plan (next {days} day(s)):\n{body}"),
+            // Showing everything rather than pretending the window applied.
+            Window::Unreadable => format!(
+                "Meal plan (showing all entries — could not read a date to filter on):\n{body}"
+            ),
+            // The unreadable entries are INCLUDED, and said so, because not
+            // being able to read a date is not a reason to hide a meal.
+            Window::Partial(n) => format!(
+                "Meal plan (next {days} day(s), plus {n} entr{} with no readable date):\n{body}",
+                if n == 1 { "y" } else { "ies" }
+            ),
         })
     }
 }
@@ -926,10 +970,93 @@ mod tests {
             {"id": 1, "day": inside.to_string()},
             {"id": 2, "day": outside.to_string()},
         ]);
-        let (kept, filtered) = within_days(&data, 7);
-        assert!(filtered, "a readable date means the window really applied");
+        let (kept, window) = within_days(&data, 7);
+        assert_eq!(window, Window::Filtered, "a readable date means the window really applied");
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0]["id"], 1);
+    }
+
+    /// The window counts TODAY. `days = 7` must span today plus six more, not
+    /// today plus seven — the message says "next 7 day(s)", and showing eight
+    /// while claiming seven is the off-by-one this pins down.
+    #[test]
+    fn the_window_spans_exactly_the_days_it_claims() {
+        let today = chrono::Local::now().date_naive();
+        let last_in = today + chrono::Duration::days(6);
+        let first_out = today + chrono::Duration::days(7);
+        let data = json!([
+            {"id": 1, "day": today.to_string()},
+            {"id": 2, "day": last_in.to_string()},
+            {"id": 3, "day": first_out.to_string()},
+        ]);
+        let (kept, window) = within_days(&data, 7);
+        assert_eq!(window, Window::Filtered);
+        let ids: Vec<i64> = kept.iter().map(|e| e["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![1, 2], "day 7 counting from today is out of a 7-day window");
+    }
+
+    /// `days = 1` is today alone.
+    #[test]
+    fn a_one_day_window_is_today_only() {
+        let today = chrono::Local::now().date_naive();
+        let tomorrow = today + chrono::Duration::days(1);
+        let data = json!([
+            {"id": 1, "day": today.to_string()},
+            {"id": 2, "day": tomorrow.to_string()},
+        ]);
+        let (kept, _) = within_days(&data, 1);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["id"], 1);
+    }
+
+    /// An entry whose date we cannot read is KEPT, not dropped, and the caller
+    /// is told how many. Not being able to read a date is not evidence that a
+    /// meal falls outside the window, and silently hiding it loses something the
+    /// user really has planned.
+    #[test]
+    fn unreadable_entries_are_retained_and_counted_not_silently_dropped() {
+        let today = chrono::Local::now().date_naive();
+        let data = json!([
+            {"id": 1, "day": today.to_string()},
+            {"id": 2, "recipe": "mystery"},
+        ]);
+        let (kept, window) = within_days(&data, 7);
+        assert_eq!(window, Window::Partial(1));
+        let ids: Vec<i64> = kept.iter().map(|e| e["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![1, 2], "the undated meal must survive");
+    }
+
+    /// A malformed `day` must fall through to a VALID later field. Selecting the
+    /// first field that merely holds a string and then parsing only that would
+    /// report the entry unreadable while a readable field sat right there.
+    #[test]
+    fn a_malformed_first_field_falls_through_to_a_readable_one() {
+        let today = chrono::Local::now().date_naive();
+        let data = json!([{"id": 1, "day": "not-a-date", "date": today.to_string()}]);
+        let (kept, window) = within_days(&data, 7);
+        assert_eq!(window, Window::Filtered, "the valid `date` field should have been used");
+        assert_eq!(kept.len(), 1);
+    }
+
+    /// Grocy dates sometimes carry a time suffix; the date half still parses.
+    #[test]
+    fn a_date_with_a_time_suffix_still_parses() {
+        let today = chrono::Local::now().date_naive();
+        let data = json!([{"id": 1, "day": format!("{today} 18:30:00")}]);
+        let (kept, window) = within_days(&data, 7);
+        assert_eq!(window, Window::Filtered);
+        assert_eq!(kept.len(), 1);
+    }
+
+    /// Truncating by BYTES would panic here: the multibyte character starts
+    /// before byte 10, so `&raw[..10]` splits it. This string comes off the
+    /// wire, so a panic would be remotely triggerable.
+    #[test]
+    fn a_multibyte_date_value_does_not_panic() {
+        let data = json!([{"id": 1, "day": "2026-08-0\u{1F600}extra"}]);
+        let (kept, window) = within_days(&data, 7);
+        assert_eq!(window, Window::Unreadable, "unparseable, but it must not panic");
+        assert_eq!(kept.len(), 1, "and the entry is still shown");
     }
 
     /// An EMPTY plan is not a parse failure. It must read as "nothing planned
@@ -938,9 +1065,9 @@ mod tests {
     #[test]
     fn within_days_treats_an_empty_plan_as_filtered_not_as_unreadable() {
         let empty = json!([]);
-        let (kept, filtered) = within_days(&empty, 7);
+        let (kept, window) = within_days(&empty, 7);
         assert!(kept.is_empty());
-        assert!(filtered, "no entries means nothing failed to parse");
+        assert_eq!(window, Window::Filtered, "no entries means nothing failed to parse");
     }
 
     /// POSITIVE CONTROL for the fallback: entries with NO readable date come
@@ -953,8 +1080,8 @@ mod tests {
     #[test]
     fn within_days_shows_everything_when_no_date_is_readable() {
         let data = json!([{"id": 1, "recipe": "stew"}, {"id": 2, "recipe": "pie"}]);
-        let (kept, filtered) = within_days(&data, 7);
-        assert!(!filtered, "nothing was filtered, and the caller must be able to tell");
+        let (kept, window) = within_days(&data, 7);
+        assert_eq!(window, Window::Unreadable, "the caller must be able to tell");
         assert_eq!(kept.len(), 2, "an unreadable date must never silently empty the plan");
     }
 
@@ -963,8 +1090,8 @@ mod tests {
     fn within_days_excludes_yesterday() {
         let yesterday = chrono::Local::now().date_naive() - chrono::Duration::days(1);
         let data = json!([{"id": 1, "day": yesterday.to_string()}]);
-        let (kept, filtered) = within_days(&data, 7);
-        assert!(filtered);
+        let (kept, window) = within_days(&data, 7);
+        assert_eq!(window, Window::Filtered);
         assert!(kept.is_empty());
     }
 
