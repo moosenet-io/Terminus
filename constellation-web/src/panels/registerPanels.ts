@@ -32,7 +32,7 @@
 //             first one registers, `lumina` is a module with zero panels -- same pattern
 //             CONST-19 established for `muse` (a module tab can exist before it has any
 //             panels, per `getPanelsByModule`'s doc in moduleRegistry.ts).
-import { registerPanel, registerModule } from '../lib/moduleRegistry';
+import { registerPanel, registerModule, registerModuleIfAbsent } from '../lib/moduleRegistry';
 import { registerCommand } from '../lib/commandRegistry';
 import { getCurrentPath, requestHealthRefresh } from '../lib/shellBridge';
 import { TerminusPanel } from './terminus/TerminusPanel';
@@ -60,6 +60,7 @@ import { RequestPanel as MuseRequestPanel } from './muse/RequestPanel';
 import { SettingsPanel as MuseSettingsPanel } from './muse/SettingsPanel';
 import { TastePanel as MuseTastePanel } from './muse/TastePanel';
 import { ChannelsPanel as MuseChannelsPanel } from './muse/ChannelsPanel';
+import { ActivityPanel as MaestroActivityPanel } from './maestro/ActivityPanel';
 import { OverviewPanel as MintOverviewPanel } from './mint/OverviewPanel';
 import { CategoryReportPanel as MintCategoryReportPanel } from './mint/CategoryReportPanel';
 import { Tasks } from '../pages/Tasks';
@@ -98,6 +99,24 @@ registerModule({ id: 'models', title: 'Models', icon: '◆', healthSystem: 'term
 // always-available terminus health entry.
 registerModule({ id: 'mint', title: 'MINT', icon: '◈', healthSystem: 'terminus', order: 6 });
 registerModule({ id: 'terminus', title: 'Terminus', icon: '⚙', healthSystem: 'terminus', order: 7 });
+// MACT-04 (MUSE-124): Maestro is a Muse subsystem (live activity / playback control), the
+// same relationship Models/MINT have to Terminus — nested under the Muse core tab, not a
+// sibling top-level one (see cores.ts's CORE_MEMBERS).
+//
+// Review fix (MUSE-124, round 2): a prior version of this guard was a local
+// `if (!getAllModules().some(...)) registerModule(...)` check written HERE — but
+// `registerModule` itself stays a bare `Map.set`, so that guard only protected this call site.
+// If spec G's Device Control item registers `maestro` with a plain `registerModule(...)` (no
+// matching guard of its own), its call would still silently overwrite this descriptor —
+// first-registration-wins was documented intent, not an actual property of the system. Fixed
+// at the source instead: `registerModuleIfAbsent` (moduleRegistry.ts) owns the "first wins,
+// later calls no-op" guarantee, so every caller gets it for free.
+//
+// NOTE FOR THE NEXT AUTHOR: any other spec item that also registers the `maestro` module
+// (spec G's player-control work is the known one) MUST call `registerModuleIfAbsent`, not
+// `registerModule`, for this exact reason — a plain `registerModule({id:'maestro',...})`
+// elsewhere would still silently replace whichever descriptor landed first.
+registerModuleIfAbsent({ id: 'maestro', title: 'Maestro', icon: '▶', healthSystem: 'muse', order: 8 });
 
 // ── Harmony ──────────────────────────────────────────────────────────────────
 
@@ -430,6 +449,20 @@ registerPanel({
   icon: '⚙',
   available: true,
   component: MuseSettingsPanel,
+});
+
+// ── Maestro (MACT-04, MUSE-124) ──────────────────────────────────────────────
+// LIVE + HISTORY activity panes over `muse.sessions.live()`/`.history()` (MACT-03's typed
+// client). See ActivityPanel.tsx's module doc for the two-pane/two-source contract.
+
+registerPanel({
+  id: 'maestro.activity',
+  system: 'maestro',
+  title: 'Activity',
+  path: '/maestro/activity',
+  icon: '▶',
+  available: true,
+  component: MaestroActivityPanel,
 });
 
 // ── Models (CGUI-09) ─────────────────────────────────────────────────────────

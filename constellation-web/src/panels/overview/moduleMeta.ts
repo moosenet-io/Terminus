@@ -33,6 +33,7 @@ export const MODULE_META: Record<ModuleId, ModuleMeta> = {
   muse:     { kind: 'endpoint', role: 'CORE',      desc: 'media library + acquisition',   free: true },
   models:   { kind: 'source',   role: 'SUBSYSTEM', desc: 'model library',                 free: true },
   mint:     { kind: 'source',   role: 'SUBSYSTEM', desc: 'model benchmarks',              free: true },
+  maestro:  { kind: 'source',   role: 'SUBSYSTEM', desc: 'live activity + playback',      free: true },
 };
 
 /** The canonical route for a module's detail view (§4). Kept here so the Overview card's
