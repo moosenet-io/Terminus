@@ -263,7 +263,7 @@ impl RustTool for TasteAwareMediaRecommend {
     }
 
     fn description(&self) -> &str {
-        "Suggest movies/shows already in the library that haven't been watched yet, ranked by a taste profile built from recent Plex watch history AND (when configured) longer-term taste memory of liked/disliked genres and curation notes -- rationale reflects both, e.g. \"because you watched Dune (sci-fi) -- and you told me you're into that\". Degrades to the plain watch-history-only ranking if taste memory is unset or unreachable; never fails because of it." // pii-test-fixture
+        "Suggest movies/shows already in the library that haven't been watched yet, ranked by a taste profile built from recent Plex watch history AND (when configured) longer-term taste memory of liked/disliked genres and curation notes -- rationale reflects both, e.g. \"because you watched Nebula Drift (sci-fi) -- and you told me you're into that\". Degrades to the plain watch-history-only ranking if taste memory is unset or unreachable; never fails because of it." // pii-test-fixture
     }
 
     fn parameters(&self) -> Value {
@@ -453,6 +453,10 @@ mod tests {
     use serial_test::serial;
 
     // TERM #576 fixtures -- placeholder account ids, not real accounts.
+    //
+    // Round 3: the TITLE fixtures are invented too -- "Nebula Drift" and "The
+    // Quiet Signal" are fictional works, not entries from anyone's library.
+    // This repo publishes to a PII-scrubbed public mirror. // pii-test-fixture
     const OPERATOR_ACCOUNT: &str = "acct-operator";
     const OTHER_MEMBER_ACCOUNT: &str = "acct-other";
 
@@ -576,12 +580,12 @@ mod tests {
         });
 
         let base = json!({
-            "summary": "You might like \"Dune\" -- because you watched Arrival (Science Fiction).",
+            "summary": "You might like \"Nebula Drift\" -- because you watched The Quiet Signal (Science Fiction).",
             "structured": {
                 "thin_signal": false,
                 "degraded": null,
                 "recommendations": [
-                    { "title": "Dune", "media_type": "movie", "score": 1.0, "matched_genres": ["Science Fiction"], "rationale": "because you watched Arrival (Science Fiction)" }
+                    { "title": "Nebula Drift", "media_type": "movie", "score": 1.0, "matched_genres": ["Science Fiction"], "rationale": "because you watched The Quiet Signal (Science Fiction)" }
                 ]
             }
         });
@@ -607,7 +611,7 @@ mod tests {
             when.method(GET).path("/status/sessions/history/all");
             then.status(200).json_body(json!({
                 "MediaContainer": { "Metadata": [
-                    { "title": "Arrival", "Genre": [{"tag": "Science Fiction"}], "viewedAt": 1000, "accountID": OPERATOR_ACCOUNT }
+                    { "title": "The Quiet Signal", "Genre": [{"tag": "Science Fiction"}], "viewedAt": 1000, "accountID": OPERATOR_ACCOUNT }
                 ] }
             }));
         });
@@ -615,7 +619,7 @@ mod tests {
         radarr_server.mock(|when, then| {
             when.method(GET).path("/api/v3/movie");
             then.status(200).json_body(json!([
-                { "title": "Dune", "genres": ["Science Fiction"] },
+                { "title": "Nebula Drift", "genres": ["Science Fiction"] },
                 { "title": "Cooking Show", "genres": ["Food"] }
             ]));
         });
@@ -632,7 +636,7 @@ mod tests {
 
         taste_mock.assert();
         assert!(parsed["structured"]["taste_memory"]["applied"].as_bool().unwrap());
-        assert_eq!(parsed["structured"]["recommendations"][0]["title"], "Dune");
+        assert_eq!(parsed["structured"]["recommendations"][0]["title"], "Nebula Drift");
     }
 
     fn build_test_media_recommend(plex_server: &MockServer, radarr_server: &MockServer) -> MediaRecommend {
@@ -689,16 +693,16 @@ mod tests {
     #[test]
     fn cold_start_empty_signals_applies_without_changing_ranking() {
         let base = json!({
-            "summary": "You might like \"Dune\".",
+            "summary": "You might like \"Nebula Drift\".",
             "structured": { "recommendations": [
-                { "title": "Dune", "media_type": "movie", "score": 1.0, "matched_genres": ["Science Fiction"], "rationale": "because you watched Arrival" }
+                { "title": "Nebula Drift", "media_type": "movie", "score": 1.0, "matched_genres": ["Science Fiction"], "rationale": "because you watched The Quiet Signal" }
             ] }
         });
         let before_score = base["structured"]["recommendations"][0]["score"].clone();
         let enriched = apply_taste_signals(base, &json!({}));
         assert_eq!(enriched["structured"]["taste_memory"]["applied"], true, "module active even on cold start");
         assert_eq!(enriched["structured"]["recommendations"][0]["score"], before_score, "no signal must not move the ranking");
-        assert_eq!(enriched["structured"]["recommendations"][0]["title"], "Dune");
+        assert_eq!(enriched["structured"]["recommendations"][0]["title"], "Nebula Drift");
     }
 
     // Conflicting signals: the same genre both liked AND disliked must resolve
@@ -709,7 +713,7 @@ mod tests {
         let base = json!({
             "summary": "s",
             "structured": { "recommendations": [
-                { "title": "Dune", "media_type": "movie", "score": 1.0, "matched_genres": ["Science Fiction"], "rationale": "r" }
+                { "title": "Nebula Drift", "media_type": "movie", "score": 1.0, "matched_genres": ["Science Fiction"], "rationale": "r" }
             ] }
         });
         let signals = json!({ "liked_genres": ["Science Fiction"], "disliked_genres": ["Science Fiction"] });
@@ -747,7 +751,7 @@ mod tests {
             then.status(200).json_body(json!({ "ok": true }));
         });
         let tool = MediaTasteFeedback { client: Some(TasteMemoryClient::new(taste_server.base_url(), reqwest::Client::new())) };
-        let result = tool.run(json!({"title": "Dune", "media_type": "movie", "signal": "watched"}), caller_for(OPERATOR_ACCOUNT)).await.unwrap();
+        let result = tool.run(json!({"title": "Nebula Drift", "media_type": "movie", "signal": "watched"}), caller_for(OPERATOR_ACCOUNT)).await.unwrap();
         mock.assert();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["structured"]["recorded"], true);
@@ -756,7 +760,7 @@ mod tests {
     #[tokio::test]
     async fn write_back_not_configured_without_client() {
         let tool = MediaTasteFeedback { client: None };
-        let result = tool.run(json!({"title": "Dune", "media_type": "movie", "signal": "watched"}), caller_for(OPERATOR_ACCOUNT)).await;
+        let result = tool.run(json!({"title": "Nebula Drift", "media_type": "movie", "signal": "watched"}), caller_for(OPERATOR_ACCOUNT)).await;
         assert!(matches!(result, Err(ToolError::NotConfigured(_))));
     }
 
@@ -768,7 +772,7 @@ mod tests {
             then.status(500);
         });
         let tool = MediaTasteFeedback { client: Some(TasteMemoryClient::new(taste_server.base_url(), reqwest::Client::new())) };
-        let result = tool.run(json!({"title": "Dune", "media_type": "movie", "signal": "watched"}), caller_for(OPERATOR_ACCOUNT)).await;
+        let result = tool.run(json!({"title": "Nebula Drift", "media_type": "movie", "signal": "watched"}), caller_for(OPERATOR_ACCOUNT)).await;
         assert!(result.is_ok(), "a failed write-back must not surface as a tool error");
         let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(parsed["structured"]["recorded"], false);
@@ -777,7 +781,7 @@ mod tests {
     #[tokio::test]
     async fn write_back_rejects_invalid_signal() {
         let tool = MediaTasteFeedback { client: None };
-        let result = tool.run(json!({"title": "Dune", "media_type": "movie", "signal": "bogus"}), caller_for(OPERATOR_ACCOUNT)).await;
+        let result = tool.run(json!({"title": "Nebula Drift", "media_type": "movie", "signal": "bogus"}), caller_for(OPERATOR_ACCOUNT)).await;
         assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
     }
 

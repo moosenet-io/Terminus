@@ -6,7 +6,7 @@
 //!   user hasn't watched yet, ranked against a taste profile built purely
 //!   from recent Plex watch history (genre/director recency-weighted
 //!   overlap), with a narration-friendly rationale ("because you watched
-//!   Dune and Blade Runner 2049 -- sci-fi").
+//!   Nebula Drift and Chromeglass Nocturne -- sci-fi").
 //! - `media_on_deck` — Plex's own continue-watching / on-deck surface.
 //! - `media_recently_added` — recently-added library items (engagement
 //!   surface, not personalized).
@@ -416,7 +416,7 @@ impl RustTool for MediaRecommend {
     }
 
     fn description(&self) -> &str {
-        "Suggest movies/shows already in the library that haven't been watched yet, ranked by a taste profile built fresh from recent Plex watch history (genre/director overlap, recency-weighted). Each suggestion carries a narration-friendly rationale, e.g. \"because you watched Dune (sci-fi)\". Stateless -- computed newly each call from this call's own Plex history, no persisted taste memory. Falls back to a plain library browse (noting thin signal) for a new/sparse-history user, and degrades to arr-only library picks (noting Plex is unreachable) rather than failing." // pii-test-fixture
+        "Suggest movies/shows already in the library that haven't been watched yet, ranked by a taste profile built fresh from recent Plex watch history (genre/director overlap, recency-weighted). Each suggestion carries a narration-friendly rationale, e.g. \"because you watched Nebula Drift (sci-fi)\". Stateless -- computed newly each call from this call's own Plex history, no persisted taste memory. Falls back to a plain library browse (noting thin signal) for a new/sparse-history user, and degrades to arr-only library picks (noting Plex is unreachable) rather than failing." // pii-test-fixture
     }
 
     fn parameters(&self) -> Value {
@@ -573,6 +573,39 @@ fn build_engagement_response(kind: &str, items: &[Value]) -> Value {
 /// answer, whereas an error invites the model to retry with arguments.
 const ON_DECK_WITHHELD: &str = "Continue-watching is personal to each household member, and I can't tell which one you are, so I'm not showing it.";
 
+/// TERM #576 (review round 3): the ENTIRE withheld payload — the refusal status
+/// and its constant message, and nothing else.
+///
+/// The first cut of this carried `"count": 0, "titles": []` alongside the
+/// message. Both are removed, and the reasoning is worth keeping because a
+/// constant zero looks harmless:
+///
+/// - **A count is household state even when it is zero.** "How many things are
+///   in progress right now" discloses occupancy and activity; a caller who may
+///   not see the row may not see its size either. The criterion for this path
+///   was that an unentitled caller learns nothing that fingerprints a profile,
+///   *including counts*.
+/// - **A CONSTANT zero is its own signal.** The entitled response's
+///   `structured` carries `count`/`titles` that track the real row, so a
+///   permanently-zero count is a differently-shaped answer — the shape itself
+///   says "you were refused" in a channel that is supposed to be indistinguishable
+///   from an empty-but-entitled read. Absent is the only value that cannot be
+///   compared against a real one.
+/// - **`personalized: false` stays.** It is the refusal STATUS, fixed for every
+///   unentitled caller and derived from nothing about the household — the one
+///   field whose value cannot vary with what anyone is watching.
+///
+/// So: no length, no count, no empty-array-versus-absent-key difference. The
+/// bytes are identical for every unentitled caller at every moment, which is
+/// what [`withheld_on_deck_is_byte_identical_whatever_the_household_is_watching`]
+/// and [`withheld_on_deck_carries_no_count_or_length_field`] pin down.
+fn withheld_on_deck_response() -> Value {
+    json!({
+        "summary": ON_DECK_WITHHELD,
+        "structured": { "personalized": false }
+    })
+}
+
 pub struct MediaOnDeck {
     plex: Option<PlexClient>,
 }
@@ -637,11 +670,7 @@ impl MediaOnDeck {
             // Withheld BEFORE `require_client`, so an unentitled caller cannot
             // even distinguish "Plex isn't configured" from "not for you", and
             // before any network call, so no household read happens for them.
-            return Ok(json!({
-                "summary": ON_DECK_WITHHELD,
-                "structured": { "personalized": false, "count": 0, "titles": [] }
-            })
-            .to_string());
+            return Ok(withheld_on_deck_response().to_string());
         }
         let client = self.require_client()?;
         let raw = client.on_deck().await?;
@@ -706,6 +735,15 @@ mod tests {
     // ── TERM #576 caller fixtures ───────────────────────────────────────────
     //
     // Placeholder account ids only -- these are not real household accounts.
+    //
+    // TERM #576 (review round 3): the TITLE fixtures below are invented too.
+    // "Nebula Drift", "Chromeglass Nocturne", "The Quiet Signal", "Zephyr
+    // Protocol", the "Placeholder ... On Deck Title" family and the director
+    // "Rowan Alderiss" are all fictional -- no real film, series or person.
+    // This repo publishes to a PII-scrubbed public mirror, so a real title in a
+    // fixture reads as a sample of the operator's actual library. They stay
+    // clearly distinguishable from one another so the ranking assertions
+    // remain readable. // pii-test-fixture
 
     /// The household member doing the asking in the positive-control tests.
     const OPERATOR_ACCOUNT: &str = "acct-operator";
@@ -783,8 +821,8 @@ mod tests {
             when.method(GET).path("/status/sessions/history/all");
             then.status(200).json_body(json!({
                 "MediaContainer": { "Metadata": [
-                    { "title": "Dune", "Genre": [{"tag": "Science Fiction"}], "viewedAt": 2000, "accountID": OPERATOR_ACCOUNT },
-                    { "title": "Blade Runner 2049", "Genre": [{"tag": "Science Fiction"}], "viewedAt": 1000, "accountID": OPERATOR_ACCOUNT }
+                    { "title": "Nebula Drift", "Genre": [{"tag": "Science Fiction"}], "viewedAt": 2000, "accountID": OPERATOR_ACCOUNT },
+                    { "title": "Chromeglass Nocturne", "Genre": [{"tag": "Science Fiction"}], "viewedAt": 1000, "accountID": OPERATOR_ACCOUNT }
                 ] }
             }));
         });
@@ -792,7 +830,7 @@ mod tests {
         radarr_server.mock(|when, then| {
             when.method(GET).path("/api/v3/movie");
             then.status(200).json_body(json!([
-                { "title": "Arrival", "genres": ["Science Fiction"] },
+                { "title": "The Quiet Signal", "genres": ["Science Fiction"] },
                 { "title": "The Great British Bake Off Movie", "genres": ["Comedy"] }
             ]));
         });
@@ -807,8 +845,8 @@ mod tests {
         assert_eq!(parsed["structured"]["thin_signal"], false);
         let recs = parsed["structured"]["recommendations"].as_array().unwrap();
         assert!(!recs.is_empty());
-        assert_eq!(recs[0]["title"], "Arrival");
-        assert!(recs[0]["rationale"].as_str().unwrap().contains("Dune"));
+        assert_eq!(recs[0]["title"], "The Quiet Signal");
+        assert!(recs[0]["rationale"].as_str().unwrap().contains("Nebula Drift"));
     }
 
     // ── taste profile / scoring pure-logic tests ────────────────────────────
@@ -825,23 +863,23 @@ mod tests {
 
     #[test]
     fn build_taste_profile_tracks_watched_titles() {
-        let history = json!([{ "title": "Dune", "Genre": [] }]);
+        let history = json!([{ "title": "Nebula Drift", "Genre": [] }]);
         let profile = build_taste_profile(history.as_array().unwrap());
-        assert!(profile.watched_titles.contains("dune"));
+        assert!(profile.watched_titles.contains("nebula drift"));
     }
 
     #[test]
     fn score_recommendations_excludes_already_watched() {
         let mut profile = TasteProfile::default();
-        profile.watched_titles.insert("arrival".to_string());
+        profile.watched_titles.insert("the quiet signal".to_string());
         profile.genre_weight.insert("Science Fiction".to_string(), 1.0);
         let candidates = vec![
-            LibraryCandidate { title: "Arrival".into(), media_type: "movie".into(), genres: vec!["Science Fiction".into()], directors: vec![] },
-            LibraryCandidate { title: "Dune".into(), media_type: "movie".into(), genres: vec!["Science Fiction".into()], directors: vec![] },
+            LibraryCandidate { title: "The Quiet Signal".into(), media_type: "movie".into(), genres: vec!["Science Fiction".into()], directors: vec![] },
+            LibraryCandidate { title: "Nebula Drift".into(), media_type: "movie".into(), genres: vec!["Science Fiction".into()], directors: vec![] },
         ];
         let recs = score_recommendations(&profile, &candidates, 10);
         assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].title, "Dune");
+        assert_eq!(recs[0].title, "Nebula Drift");
     }
 
     #[test]
@@ -850,10 +888,10 @@ mod tests {
         profile.genre_weight.insert("Science Fiction".to_string(), 2.0);
         let candidates = vec![
             LibraryCandidate { title: "Cooking Show".into(), media_type: "tv".into(), genres: vec!["Food".into()], directors: vec![] },
-            LibraryCandidate { title: "Dune".into(), media_type: "movie".into(), genres: vec!["Science Fiction".into()], directors: vec![] },
+            LibraryCandidate { title: "Nebula Drift".into(), media_type: "movie".into(), genres: vec!["Science Fiction".into()], directors: vec![] },
         ];
         let recs = score_recommendations(&profile, &candidates, 10);
-        assert_eq!(recs[0].title, "Dune");
+        assert_eq!(recs[0].title, "Nebula Drift");
         assert!(recs[0].score > recs[1].score);
     }
 
@@ -861,18 +899,18 @@ mod tests {
     fn score_recommendations_director_match_outweighs_genre_only() {
         let mut profile = TasteProfile::default();
         profile.genre_weight.insert("Science Fiction".to_string(), 1.0);
-        profile.director_weight.insert("Denis Villeneuve".to_string(), 1.0);
+        profile.director_weight.insert("Rowan Alderiss".to_string(), 1.0);
         let candidates = vec![
             LibraryCandidate { title: "Generic Sci-Fi".into(), media_type: "movie".into(), genres: vec!["Science Fiction".into()], directors: vec![] },
             LibraryCandidate {
-                title: "Dune".into(),
+                title: "Nebula Drift".into(),
                 media_type: "movie".into(),
                 genres: vec!["Science Fiction".into()],
-                directors: vec!["Denis Villeneuve".into()],
+                directors: vec!["Rowan Alderiss".into()],
             },
         ];
         let recs = score_recommendations(&profile, &candidates, 10);
-        assert_eq!(recs[0].title, "Dune");
+        assert_eq!(recs[0].title, "Nebula Drift");
     }
 
     // ── edge cases ───────────────────────────────────────────────────────────
@@ -887,7 +925,7 @@ mod tests {
         let radarr_server = MockServer::start();
         radarr_server.mock(|when, then| {
             when.method(GET).path("/api/v3/movie");
-            then.status(200).json_body(json!([{ "title": "Arrival", "genres": ["Science Fiction"] }]));
+            then.status(200).json_body(json!([{ "title": "The Quiet Signal", "genres": ["Science Fiction"] }]));
         });
 
         let tool = MediaRecommend {
@@ -912,7 +950,7 @@ mod tests {
         let radarr_server = MockServer::start();
         radarr_server.mock(|when, then| {
             when.method(GET).path("/api/v3/movie");
-            then.status(200).json_body(json!([{ "title": "Arrival", "genres": ["Science Fiction"] }]));
+            then.status(200).json_body(json!([{ "title": "The Quiet Signal", "genres": ["Science Fiction"] }]));
         });
 
         let tool = MediaRecommend {
@@ -941,7 +979,7 @@ mod tests {
     fn multi_user_history_is_scoped_to_one_account_not_blended() {
         let history = json!([
             { "title": "Kids Show", "Genre": [{"tag": "Animation"}], "accountID": OTHER_MEMBER_ACCOUNT, "viewedAt": 500 },
-            { "title": "Dune", "Genre": [{"tag": "Science Fiction"}], "accountID": OPERATOR_ACCOUNT, "viewedAt": 1000 }
+            { "title": "Nebula Drift", "Genre": [{"tag": "Science Fiction"}], "accountID": OPERATOR_ACCOUNT, "viewedAt": 1000 }
         ]);
         let items: Vec<Value> = history.as_array().unwrap().to_vec();
         let scoped = filter_to_account(&items, OPERATOR_ACCOUNT);
@@ -957,13 +995,13 @@ mod tests {
     #[test]
     fn history_without_an_account_signal_is_dropped_when_scoping() {
         let history = json!([
-            { "title": "Dune", "Genre": [{"tag": "Science Fiction"}], "accountID": OPERATOR_ACCOUNT },
+            { "title": "Nebula Drift", "Genre": [{"tag": "Science Fiction"}], "accountID": OPERATOR_ACCOUNT },
             { "title": "Unattributed", "Genre": [{"tag": "Animation"}] }
         ]);
         let items: Vec<Value> = history.as_array().unwrap().to_vec();
         let scoped = filter_to_account(&items, OPERATOR_ACCOUNT);
         assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0]["title"], "Dune");
+        assert_eq!(scoped[0]["title"], "Nebula Drift");
     }
 
     // ── TERM #576: scope resolution (pure) ──────────────────────────────────
@@ -1301,8 +1339,115 @@ mod tests {
         assert!(!result.contains("Placeholder On Deck Title"));
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["structured"]["personalized"], false);
-        assert_eq!(parsed["structured"]["count"], 0);
-        assert!(parsed["structured"]["titles"].as_array().unwrap().is_empty());
+        set_token_account(None);
+    }
+
+    /// TERM #576 (review round 3): the withheld payload carries NO count and no
+    /// length — not a zero, not an empty array, not a present-but-empty key.
+    ///
+    /// A count is household state even at zero (it discloses occupancy), and a
+    /// CONSTANT zero is additionally a shape difference from the entitled
+    /// response, which is itself the signal "you were refused". Absent is the
+    /// only value that cannot be compared against a real one.
+    ///
+    /// Written as a whole-object equality rather than a list of
+    /// `assert!(...is_null())` checks so that ANY future field — a count, a
+    /// length, a `"titles": []`, a debug breadcrumb — fails this test the
+    /// moment it is added, instead of only the field names someone remembered
+    /// to enumerate.
+    #[tokio::test]
+    #[serial]
+    async fn withheld_on_deck_carries_no_count_or_length_field() {
+        set_token_account(Some(OPERATOR_ACCOUNT));
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/library/onDeck");
+            then.status(200).json_body(json!({ "MediaContainer": { "Metadata": [
+                { "title": "Placeholder On Deck Title" }
+            ] } }));
+        });
+        let tool = MediaOnDeck { plex: Some(plex_client(&server.base_url())) };
+        let parsed: Value = serde_json::from_str(&tool.run(json!({}), guest()).await.unwrap()).unwrap();
+
+        assert_eq!(
+            parsed,
+            json!({ "summary": ON_DECK_WITHHELD, "structured": { "personalized": false } }),
+            "the withheld payload must be exactly the refusal status and its constant message"
+        );
+        // Spelled out too, so a failure names the specific leak rather than
+        // just "objects differ".
+        let structured = parsed["structured"].as_object().unwrap();
+        assert!(!structured.contains_key("count"), "a count discloses occupancy even at zero");
+        assert!(!structured.contains_key("titles"), "an empty array still has an observable length");
+        assert_eq!(structured.len(), 1, "refusal status only: {structured:?}");
+        set_token_account(None);
+    }
+
+    /// The other half of the same criterion: the withheld bytes must not move
+    /// with what the household is actually watching. Three very different
+    /// on-deck rows — a busy one, a single item, an empty one — plus a caller
+    /// whose Plex isn't configured at all, must all produce the IDENTICAL
+    /// string.
+    ///
+    /// This is what makes the count's removal load-bearing rather than
+    /// cosmetic: with a real count present this test fails on the first pair.
+    #[tokio::test]
+    #[serial]
+    async fn withheld_on_deck_is_byte_identical_whatever_the_household_is_watching() {
+        set_token_account(Some(OPERATOR_ACCOUNT));
+
+        async fn withheld_bytes_for(rows: Value) -> String {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.method(GET).path("/library/onDeck");
+                then.status(200).json_body(json!({ "MediaContainer": { "Metadata": rows } }));
+            });
+            let tool = MediaOnDeck { plex: Some(plex_client(&server.base_url())) };
+            tool.run(json!({}), guest()).await.unwrap()
+        }
+
+        let busy = withheld_bytes_for(json!([
+            { "title": "Placeholder On Deck Title" },
+            { "title": "Second Placeholder On Deck Title" },
+            { "title": "Third Placeholder On Deck Title" },
+        ]))
+        .await;
+        let single = withheld_bytes_for(json!([{ "title": "Placeholder On Deck Title" }])).await;
+        let empty = withheld_bytes_for(json!([])).await;
+        let unconfigured = MediaOnDeck { plex: None }.run(json!({}), guest()).await.unwrap();
+
+        assert_eq!(busy, single, "the withheld answer moved with how much is in progress");
+        assert_eq!(single, empty, "the withheld answer distinguished 'something' from 'nothing'");
+        assert_eq!(empty, unconfigured, "the withheld answer leaked whether Plex is configured");
+        set_token_account(None);
+    }
+
+    /// POSITIVE CONTROL for the two tests above. They only prove the withheld
+    /// path says nothing; a `run` that withheld from EVERYONE would satisfy
+    /// them perfectly. This pins the other side: the ENTITLED caller still gets
+    /// the full row — real titles, a real count, `personalized: true` — and it
+    /// tracks the household, so a blanket-withhold regression fails HERE.
+    #[tokio::test]
+    #[serial]
+    async fn entitled_on_deck_still_carries_full_detail() {
+        set_token_account(Some(OPERATOR_ACCOUNT));
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/library/onDeck");
+            then.status(200).json_body(json!({ "MediaContainer": { "Metadata": [
+                { "title": "Placeholder On Deck Title" },
+                { "title": "Second Placeholder On Deck Title" },
+            ] } }));
+        });
+        let tool = MediaOnDeck { plex: Some(plex_client(&server.base_url())) };
+        let parsed: Value = serde_json::from_str(&tool.run(json!({}), caller_for(OPERATOR_ACCOUNT)).await.unwrap()).unwrap();
+
+        assert_eq!(parsed["structured"]["personalized"], true);
+        assert_eq!(parsed["structured"]["count"], 2, "the entitled response still reports the real count");
+        assert_eq!(parsed["structured"]["titles"][0], "Placeholder On Deck Title");
+        assert_eq!(parsed["structured"]["titles"][1], "Second Placeholder On Deck Title");
+        assert!(parsed["summary"].as_str().unwrap().contains("Placeholder On Deck Title"));
+        assert_ne!(parsed["summary"], json!(ON_DECK_WITHHELD));
         set_token_account(None);
     }
 
@@ -1377,12 +1522,12 @@ mod tests {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET).path("/library/recentlyAdded");
-            then.status(200).json_body(json!({ "MediaContainer": { "Metadata": [{ "title": "New Arrival" }] } }));
+            then.status(200).json_body(json!({ "MediaContainer": { "Metadata": [{ "title": "Zephyr Protocol" }] } }));
         });
         let tool = MediaRecentlyAdded { plex: Some(plex_client(&server.base_url())) };
         let result = tool.execute(json!({})).await.unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["structured"]["titles"][0], "New Arrival");
+        assert_eq!(parsed["structured"]["titles"][0], "Zephyr Protocol");
     }
 
     #[tokio::test]
