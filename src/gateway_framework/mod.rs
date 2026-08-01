@@ -2265,8 +2265,6 @@ mod tests {
     // ── record_result / audit shape (no panics, sanitizes detail) ───────
 
     #[tokio::test]
-    // Reads process-wide env that a sibling test mutates — see TERM #588.
-    #[serial]
     async fn record_result_success_and_failure_do_not_panic() {
         let fw = framework_with(policy_allowing("dev-box", &["*"]), 10);
         let id = identity("dev-box");
@@ -2341,8 +2339,6 @@ mod tests {
     }
 
     #[test]
-    // Reads process-wide env that a sibling test mutates — see TERM #588.
-    #[serial]
     fn legacy_list_grant_has_no_deny_layer() {
         // `Grant::List` (the pre-LHEG-07 shape) has no deny concept at all
         // -- `"*"` really does mean everything, back-compat with existing
@@ -2993,8 +2989,6 @@ mod tests {
     /// The guest baseline's redundant-today deny layer is real: it is carried
     /// on the grant, so a future widening of the allow set inherits it.
     #[test]
-    // Reads process-wide env that a sibling test mutates — see TERM #588.
-    #[serial]
     fn guest_baseline_carries_the_sensitive_deny_layer() {
         let Grant::AllowDeny { deny, .. } = guest_baseline_grant() else {
             panic!("the guest baseline must be an AllowDeny grant, not a bare list");

@@ -672,8 +672,6 @@ mod tests {
     }
 
     #[tokio::test]
-    // Reads process-wide env that a sibling test mutates — see TERM #588.
-    #[serial]
     async fn verify_public_remote_rejects_unparseable_url() {
         let ops = StubExists::ok(true);
         let res = verify_public_remote(&ops, "not-a-real-url").await;
