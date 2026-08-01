@@ -49,11 +49,29 @@
 //!    An assertion captured from one principal's traffic is inert when replayed
 //!    by another.
 //!
+//!    Stated precisely, because the weaker property is easy to mistake for the
+//!    stronger one: principal binding prevents replay under a DIFFERENT
+//!    principal. It does not prevent replay under the SAME one. An assertion is
+//!    a bearer token, so whoever obtains it can reuse it until it expires —
+//!    expiry bounds that window (~15 minutes), it does not close it. The
+//!    defence against same-principal replay is the transport: these tokens only
+//!    ever travel over a mutually authenticated hop, and are stripped rather
+//!    than forwarded ([`is_identity_header`]).
+//!
 //! # Fail closed, in the specific direction that matters
 //!
-//! Absent, blank, malformed, expired, mis-bound or unverifiable ⇒ LESS
-//! privilege than the bare service identity, never more, and never a silent
-//! fallback to it. That is [`AssertedPerson::Rejected`], which
+//! The distinction is between an identity that was never CLAIMED and one that
+//! was claimed and could not be honoured — they are deliberately not the same
+//! thing:
+//!
+//! * **No identity headers at all** ⇒ [`AssertedPerson::None`]: the unchanged,
+//!   service-scoped pre-#595 path. Every caller that predates this item keeps
+//!   working exactly as it did. This is NOT "less privilege" — it is the
+//!   baseline, and saying otherwise would overstate what the ladder does.
+//! * **Claimed but blank, malformed, expired, mis-bound, unverifiable, or
+//!   presented on a hop that cannot honour it** ⇒ LESS privilege than the bare
+//!   service identity, never more, and never a silent fallback to it. That is
+//!   [`AssertedPerson::Rejected`], which
 //! [`crate::tool::CallerContext`] renders as
 //! [`PersonScope::Unidentified`](crate::tool::PersonScope::Unidentified): no
 //! operator context, no media account, and no per-caller record. The failure

@@ -81,6 +81,40 @@ use crate::pki::mtls::ClientIdentity;
 use crate::registry::ToolRegistry;
 
 /// Shared server state.
+/// Which human, if any, this MCP request is for (TERM #595).
+///
+/// Extracted from `handle_mcp` so the refusal arms are reachable from a test.
+///
+/// The PLAINTEXT `X-Terminus-On-Behalf-Of` header is never authoritative here.
+/// It is meaningful at exactly one hop -- the inference-proxy ingress, where the
+/// caller is mutually authenticated and its right to speak for someone else is a
+/// grant-map decision -- and is translated there into a signed assertion.
+/// Arriving on this endpoint it is a claim this handler cannot honour, so it is
+/// REFUSED rather than ignored.
+///
+/// Ignoring it would be a silent WIDENING: a caller that believes it is acting
+/// as one person would transparently read and write the SHARED, service-scoped
+/// record instead of that person's -- exactly the data-mixing LOCREG-01 and this
+/// item exist to rule out. An attempted identity that cannot be honoured must
+/// never be indistinguishable from no identity.
+fn asserted_person_for_mcp(
+    gateway: Option<&crate::gateway_framework::GatewayFramework>,
+    principal: Option<&crate::mesh::Principal>,
+    headers: &HeaderMap,
+) -> crate::mesh::AssertedPerson {
+    if crate::mesh::person::on_behalf_of_header(headers).is_some() {
+        return crate::mesh::AssertedPerson::Rejected;
+    }
+    match (gateway, crate::mesh::person::assertion_header(headers)) {
+        (Some(gateway), token) => gateway.assert_person(principal, token),
+        (None, None) => crate::mesh::AssertedPerson::None,
+        // A gateway that is not configured cannot check a grant, so a token
+        // presented to it is refused rather than honoured: absence of a policy
+        // is never a reason to trust a claim.
+        (None, Some(_)) => crate::mesh::AssertedPerson::Rejected,
+    }
+}
+
 /// Which per-caller location record belongs to this turn (LOCREG-01 x TERM #595).
 ///
 /// Extracted from the dispatch call so the three arms can be tested directly:
@@ -480,6 +514,37 @@ async fn handle_inference_proxy(
     // than the service identity, and quietly running it as the service would be
     // a silent WIDENING, which is the one direction this whole item exists to
     // rule out.
+    //
+    // A request that carries only the SIGNED header and no plaintext request is
+    // the same situation reached from the other side: an inbound signed
+    // assertion is never authoritative at an ingress (it is stripped as
+    // unforwardable, precisely because a client could have minted or replayed
+    // it), so honouring it is not an option -- but neither is dropping it, which
+    // would silently run an attempted-person turn as the shared service. Treat
+    // it as an unhonourable claim and refuse, exactly as for an on-behalf-of we
+    // cannot mint.
+    if crate::mesh::person::on_behalf_of_header(&headers).is_none()
+        && crate::mesh::person::assertion_header(&headers).is_some()
+    {
+        tracing::warn!(
+            principal = principal.as_ref().map(Principal::name).unwrap_or("<none>"),
+            "TERM #595: refusing an inbound signed person-assertion at the proxy ingress"
+        );
+        if let Some(ctx) = gate_ctx {
+            ctx.record_result(false, Some("inbound person-assertion refused"));
+        }
+        return (
+            StatusCode::FORBIDDEN,
+            [("content-type", "application/json")],
+            json!({
+                "error": "on-behalf-of assertion refused",
+                "detail": "a signed person-assertion is server-set on each hop and is never accepted                            from a client; ask to act for someone with the on-behalf-of header instead"
+            })
+            .to_string(),
+        )
+            .into_response();
+    }
+
     let person_assertion = match crate::mesh::person::on_behalf_of_header(&headers) {
         None => None,
         Some(requested) => {
@@ -862,11 +927,21 @@ async fn handle_mcp(
     // that is not configured at all cannot check a grant, so a token presented
     // to it is refused rather than honoured -- absence of a policy is never a
     // reason to trust a claim.
-    let asserted = match (&state.gateway, crate::mesh::person::assertion_header(&headers)) {
-        (Some(gateway), token) => gateway.assert_person(principal.as_ref(), token),
-        (None, None) => crate::mesh::AssertedPerson::None,
-        (None, Some(_)) => crate::mesh::AssertedPerson::Rejected,
-    };
+    //
+    // The PLAINTEXT `X-Terminus-On-Behalf-Of` header is never authoritative
+    // HERE. It is meaningful at exactly one hop -- the inference-proxy ingress,
+    // where the caller is mutually authenticated and its right to speak for
+    // someone else is a grant-map decision -- and is translated there into a
+    // signed assertion. Arriving on this endpoint it is an identity claim this
+    // handler cannot honour, so it is REFUSED rather than ignored.
+    //
+    // Ignoring it would be a silent WIDENING: a caller that believes it is
+    // acting as one person would transparently read and write the SHARED,
+    // service-scoped record instead of that person's -- exactly the data-mixing
+    // LOCREG-01 and this item exist to rule out. An attempted identity that
+    // cannot be honoured must never be indistinguishable from no identity.
+    let asserted =
+        asserted_person_for_mcp(state.gateway.as_ref(), principal.as_ref(), &headers);
 
     let parsed: Result<Value, _> = serde_json::from_slice(&body);
     let req = match parsed {
@@ -1715,6 +1790,94 @@ mod tests {
     // `Rejected` arm is the reason the function was extracted at all: it is the
     // fail-closed branch, and a fail-closed branch nobody exercises is only
     // fail-closed by assertion.
+    // ---- TERM #595: an attempted identity that cannot be honoured ----
+    //
+    // The failure these cover is a SILENT WIDENING, not an escalation: a caller
+    // that thinks it is acting as one person, whose claim is quietly dropped,
+    // reads and writes the SHARED service-scoped record. That is the exact
+    // data-mixing LOCREG-01 exists to prevent, so "ignored" is not an acceptable
+    // way to handle a claim we cannot honour.
+    mod unhonourable_claims {
+        use crate::mcp_server::asserted_person_for_mcp;
+        use crate::mesh::person::{ON_BEHALF_OF_HEADER, PERSON_ASSERTION_HEADER};
+        use crate::mesh::{AssertedPerson, Principal, PrincipalSource};
+        use axum::http::{HeaderMap, HeaderValue};
+
+        fn principal() -> Principal {
+            Principal::new("lumina", PrincipalSource::MtlsCert)
+        }
+
+        /// POSITIVE CONTROL: with no identity headers at all, an ungatewayed
+        /// process still takes the unchanged pre-#595 service-scoped path. A
+        /// build that refused everything would fail here.
+        #[test]
+        fn no_headers_is_the_unchanged_service_path() {
+            let p = principal();
+            assert!(matches!(
+                asserted_person_for_mcp(None, Some(&p), &HeaderMap::new()),
+                AssertedPerson::None
+            ));
+        }
+
+        /// The plaintext on-behalf-of header is only honourable at the proxy
+        /// ingress. Presented to the MCP endpoint it must be REFUSED, not
+        /// ignored -- ignoring it silently runs the turn as the shared service.
+        #[test]
+        fn a_plaintext_on_behalf_of_is_refused_here_not_ignored() {
+            let p = principal();
+            let mut h = HeaderMap::new();
+            // pii-test-fixture: invented household name
+            h.insert(ON_BEHALF_OF_HEADER, HeaderValue::from_static("alice"));
+            assert!(
+                matches!(asserted_person_for_mcp(None, Some(&p), &h), AssertedPerson::Rejected),
+                "an identity claim this endpoint cannot honour must not read as no claim"
+            );
+        }
+
+        /// And it outranks the signed header: a request carrying both must not
+        /// be able to launder an unhonourable plaintext claim past the check by
+        /// also presenting a token.
+        #[test]
+        fn the_plaintext_claim_is_refused_even_alongside_a_token() {
+            let p = principal();
+            let mut h = HeaderMap::new();
+            h.insert(ON_BEHALF_OF_HEADER, HeaderValue::from_static("alice")); // pii-test-fixture
+            h.insert(PERSON_ASSERTION_HEADER, HeaderValue::from_static("any.token.here"));
+            assert!(matches!(
+                asserted_person_for_mcp(None, Some(&p), &h),
+                AssertedPerson::Rejected
+            ));
+        }
+
+        /// A blank on-behalf-of is still an ATTEMPT (`Some("")` per
+        /// `on_behalf_of_header`'s tri-state contract), so it is refused rather
+        /// than treated as absent.
+        #[test]
+        fn a_blank_on_behalf_of_is_an_attempt_not_an_absence() {
+            let p = principal();
+            let mut h = HeaderMap::new();
+            h.insert(ON_BEHALF_OF_HEADER, HeaderValue::from_static("   "));
+            assert!(matches!(
+                asserted_person_for_mcp(None, Some(&p), &h),
+                AssertedPerson::Rejected
+            ));
+        }
+
+        /// A token presented to a process with no gateway cannot have its grant
+        /// checked, so it is refused. Absence of a policy is never a reason to
+        /// trust a claim.
+        #[test]
+        fn a_token_without_a_gateway_to_check_it_is_refused() {
+            let p = principal();
+            let mut h = HeaderMap::new();
+            h.insert(PERSON_ASSERTION_HEADER, HeaderValue::from_static("any.token.here"));
+            assert!(matches!(
+                asserted_person_for_mcp(None, Some(&p), &h),
+                AssertedPerson::Rejected
+            ));
+        }
+    }
+
     mod caller_key {
         use crate::mcp_server::caller_key_for;
         use crate::mesh::person::{mint, verify};
