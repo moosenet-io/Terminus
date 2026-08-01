@@ -214,24 +214,56 @@ fn timestamp_of(rec: &Value) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
-/// Turn one transcript record into zero or more activity events.
+/// What one transcript record yielded, and whether we understood its shape.
 ///
-/// Zero is a legitimate outcome (bookkeeping records, `thinking` blocks); an
-/// assistant turn with several tool calls legitimately yields several.
+/// These two answers MUST come from one place. An earlier version computed
+/// them in two parallel functions that both switched on the top-level `type`,
+/// which looked equivalent and was not: a record of a KNOWN type whose NESTED
+/// shape had drifted (a `user` whose content field was renamed, an `assistant`
+/// whose content blocks are all a future type) produced no events and was
+/// still counted as understood — silently shortening the feed, which is
+/// exactly the failure `unknown_records` exists to make visible.
+pub(crate) struct RecordOutcome {
+    pub events: Vec<ActivityEvent>,
+    /// False when the record's shape — at ANY level — is one we do not
+    /// recognise. Counted into `unknown_records`.
+    pub understood: bool,
+}
+
+/// Convenience for callers that only want the events.
+#[cfg(test)]
 pub(crate) fn events_from_record(rec: &Value) -> Vec<ActivityEvent> {
+    classify_record(rec).events
+}
+
+/// Turn one transcript record into zero or more activity events, and say
+/// whether its shape was recognised.
+///
+/// Zero events is a legitimate outcome for an UNDERSTOOD record (bookkeeping,
+/// a turn containing only a `thinking` block); it is a drift signal for one we
+/// do not understand. The distinction is the whole point of this function.
+pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
     let at = timestamp_of(rec);
     let ty = rec.get("type").and_then(Value::as_str).unwrap_or("");
 
     if BOOKKEEPING_TYPES.contains(&ty) {
-        return Vec::new();
+        // Understood and deliberately silent.
+        return RecordOutcome { events: Vec::new(), understood: true };
     }
 
     let mut out = Vec::new();
+    let mut understood = true;
     match ty {
         "user" => {
             // A `user` record is either a real human turn or the delivery of a
             // tool's result back to the model. They read very differently to an
-            // observer, so they are not conflated.
+            // observer, so they are not conflated. A `user` record carrying
+            // NEITHER is a shape we no longer recognise, not an empty turn.
+            if rec.get("toolUseResult").is_none()
+                && rec.get("message").and_then(|m| m.get("content")).is_none()
+            {
+                understood = false;
+            }
             if let Some(result) = rec.get("toolUseResult") {
                 let text = result
                     .get("stdout")
@@ -263,13 +295,19 @@ pub(crate) fn events_from_record(rec: &Value) -> Vec<ActivityEvent> {
                 .and_then(|m| m.get("content"))
                 .and_then(Value::as_array);
             let Some(blocks) = blocks else {
-                return out;
+                // `content` absent or not an array — drifted shape.
+                return RecordOutcome { events: out, understood: false };
             };
+            // An assistant turn whose blocks are ALL unfamiliar has drifted.
+            // An EMPTY block list is legitimately empty, not drift.
+            let mut recognised_any = blocks.is_empty();
             for b in blocks {
                 match b.get("type").and_then(Value::as_str) {
-                    // Private reasoning — never republished. See module doc.
-                    Some("thinking") => {}
+                    // Private reasoning — never republished (see module doc),
+                    // but a RECOGNISED block: its presence is not drift.
+                    Some("thinking") => recognised_any = true,
                     Some("text") => {
+                        recognised_any = true;
                         if let Some(t) = b.get("text").and_then(Value::as_str) {
                             if !t.trim().is_empty() {
                                 out.push(ActivityEvent {
@@ -282,6 +320,7 @@ pub(crate) fn events_from_record(rec: &Value) -> Vec<ActivityEvent> {
                         }
                     }
                     Some("tool_use") => {
+                        recognised_any = true;
                         let name = b.get("name").and_then(Value::as_str).unwrap_or("tool");
                         let arg = b.get("input").and_then(primary_arg);
                         let summary = match &arg {
@@ -300,6 +339,9 @@ pub(crate) fn events_from_record(rec: &Value) -> Vec<ActivityEvent> {
                     _ => {}
                 }
             }
+            if !recognised_any {
+                understood = false;
+            }
         }
         other if other.contains("error") => {
             // An error record IS activity an observer wants to see.
@@ -315,25 +357,9 @@ pub(crate) fn events_from_record(rec: &Value) -> Vec<ActivityEvent> {
         // padded with "unrecognised record" lines is noise that crowds out the
         // real work. The caller learns about it through `unknown_records`
         // instead, which is a number that can be alerted on.
-        _ => {}
+        _ => understood = false,
     }
-    out
-}
-
-/// Does this record parse as JSON but present a shape we do not recognise?
-///
-/// Distinct from "did it produce events": a bookkeeping record is UNDERSTOOD
-/// and deliberately produces none, so counting it as unknown would make the
-/// drift signal meaningless.
-pub(crate) fn is_unknown_shape(rec: &Value) -> bool {
-    match rec.get("type").and_then(Value::as_str) {
-        Some(t) => {
-            !BOOKKEEPING_TYPES.contains(&t)
-                && !matches!(t, "user" | "assistant")
-                && !t.contains("error")
-        }
-        None => true,
-    }
+    RecordOutcome { events: out, understood }
 }
 
 /// Parse a raw tail window into events.
@@ -356,10 +382,11 @@ pub(crate) fn parse_tail(window: &str, started_mid_file: bool, limit: usize) -> 
         }
         match serde_json::from_str::<Value>(line) {
             Ok(rec) => {
-                if is_unknown_shape(&rec) {
+                let outcome = classify_record(&rec);
+                if !outcome.understood {
                     unknown += 1;
                 }
-                events.extend(events_from_record(&rec));
+                events.extend(outcome.events);
             }
             // A truncated final line is normal on a file being appended to.
             Err(_) => skipped += 1,
@@ -569,16 +596,60 @@ mod tests {
     }
 
     #[test]
-    fn a_known_bookkeeping_record_is_not_counted_as_unknown() {
-        // Bookkeeping is UNDERSTOOD and deliberately silent; counting it as
-        // drift would make the signal meaningless.
+    fn understood_and_unknown_are_decided_in_one_place() {
+        let u = |v: serde_json::Value| classify_record(&v).understood;
+
+        // Understood and deliberately silent.
         for ty in ["agent-setting", "mode", "permission-mode", "attachment"] {
-            assert!(!is_unknown_shape(&json!({"type": ty})), "{ty}");
+            assert!(u(json!({"type": ty})), "{ty} is understood bookkeeping");
         }
-        assert!(!is_unknown_shape(&json!({"type": "user"})));
-        assert!(!is_unknown_shape(&json!({"type": "assistant"})));
-        assert!(is_unknown_shape(&json!({"type": "brand-new"})));
-        assert!(is_unknown_shape(&json!({"no_type": 1})));
+        // Understood activity.
+        assert!(u(json!({"type": "user", "message": {"content": "hi"}})));
+        assert!(u(json!({"type": "user", "toolUseResult": {"stdout": "x"}})));
+        assert!(u(json!({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "hello"}]}})));
+        // A turn carrying ONLY private reasoning is understood, not drift.
+        assert!(u(json!({"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "x"}]}})));
+        // An empty block list is legitimately empty.
+        assert!(u(json!({"type": "assistant", "message": {"content": []}})));
+
+        // Unknown top-level shapes.
+        assert!(!u(json!({"type": "brand-new"})));
+        assert!(!u(json!({"no_type": 1})));
+    }
+
+    #[test]
+    fn nested_drift_inside_a_known_type_is_counted_not_silently_dropped() {
+        // The failure this guards: a record of a type we recognise whose INNER
+        // shape has changed produces no events. Counting it as understood
+        // would silently shorten the feed — precisely what unknown_records
+        // exists to expose.
+        let u = |v: serde_json::Value| classify_record(&v).understood;
+
+        // `user` carrying neither a message body nor a tool result.
+        assert!(!u(json!({"type": "user", "renamed_message": {"content": "hi"}})));
+        // `assistant` whose content is not an array.
+        assert!(!u(json!({"type": "assistant", "message": {"content": "a string now"}})));
+        // `assistant` whose blocks are ALL a future block type.
+        assert!(!u(json!({"type": "assistant", "message": {"content": [
+            {"type": "future_block", "data": 1}]}})));
+        // But a MIX containing one recognised block is still understood.
+        assert!(u(json!({"type": "assistant", "message": {"content": [
+            {"type": "future_block"}, {"type": "text", "text": "hi"}]}})));
+    }
+
+    #[test]
+    fn nested_drift_shows_up_in_the_unknown_count() {
+        let window = concat!(
+            "{\"type\":\"user\",\"message\":{\"content\":\"real\"}}\n",
+            "{\"type\":\"user\",\"renamed_message\":{\"content\":\"drifted\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"future_block\"}]}}\n"
+        );
+        let t = parse_tail(window, false, 100);
+        assert_eq!(t.events.len(), 1, "only the intact record is activity");
+        assert_eq!(t.unknown_records, 2, "both drifted records are counted");
+        assert_eq!(t.skipped_lines, 0, "they parsed fine as JSON");
     }
 
     #[test]
