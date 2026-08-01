@@ -106,7 +106,9 @@
 //! confidently named a city the operator had no connection to; that bug came in
 //! through exactly this door and must not come back through it.
 //!
-//! `weather` is the proving consumer ([`crate::weather::location::Routine`]).
+//! `weather` is the proving consumer ([`crate::weather::location::Routine`]);
+//! `commute` ([`crate::commute`]) is the second, wired in TERM #591 with no
+//! change in here — which is the claim this contract was making, now tested.
 
 pub mod store;
 

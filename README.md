@@ -280,9 +280,11 @@ must not have.
 `location_set`, `location_list` and `location_clear` let the assistant remember
 places **conversationally** — *"I've moved"*, *"remember this is home"*, *"I'm in
 Denver this week"* — instead of someone editing config on a host. What they write
-is a **shared registry**, not a weather feature: `weather` is simply the first
-consumer wired to it, and commute/news/future modules read the same registry
-through the same contract (`crate::locations`). Adding a consumer needs no change
+is a **shared registry**, not a weather feature: `weather` was the first
+consumer wired to it and `commute_estimate` / `route_traffic` /
+`traffic_incidents` are the second, reading the same registry through the same
+contract (`crate::locations`) — which is what wiring commute needed: the same
+call, no registry change. News and future modules read it the same way. Adding a consumer needs no change
 to the registry.
 
 Entries are named. `home`, `work` and `current` are the well-known names other
@@ -294,14 +296,17 @@ where you live.
 
 Four properties worth knowing:
 
-- **Per caller, and entitled.** Records are keyed on a caller identity derived
-  from the server-verified principal, and reading or writing needs the same
-  entitlement that governs home/work location inference (`commute_estimate`). A
-  caller cannot read or write another's record, and an unentitled caller causes
-  **zero reads** — not a read whose result is discarded. Note the standing gap:
-  every human talking to Lumina currently arrives as one service identity
-  (**TERM #577**), so this is per-*principal* today and becomes genuinely
-  per-person the moment that closes — with no rewrite, because the key already
+- **Per authenticated principal — NOT per person today.** Records are keyed on a
+  caller identity derived from the server-verified principal, and reading or
+  writing needs the same entitlement that governs home/work location inference
+  (`commute_estimate`). Two separately-authenticated *principals* cannot read or
+  write each other's records, and an unentitled caller causes **zero reads** —
+  not a read whose result is discarded. But read the gap plainly rather than the
+  optimistic version: **every human talking to Lumina currently arrives as one
+  service identity (TERM #577), so everyone behind it shares a single record and
+  sees the same saved home.** This is per-*principal* isolation, and nothing
+  here should be read as per-*person* isolation until #577 closes — at which
+  point it becomes genuinely per-person with no rewrite, because the key already
   has room for a person. Records written before then are **orphaned rather than
   shared**: a re-entry prompt is cheap, a silently shared home address is not.
 - **Absence and failure stay distinct.** *"You have nothing saved"* and *"I
@@ -312,7 +317,12 @@ Four properties worth knowing:
   explicit confirmation; clearing everything needs `all=true`. `weather`'s
   "or say *remember this is home*" is an **offer**, not an automatic save —
   answering a question is not consent to store the answer.
-- **`COMMUTE_HOME` / `COMMUTE_WORK` are no longer read at all.** They were kept
+- **`COMMUTE_HOME` / `COMMUTE_WORK` / `COMMUTE_FAMILY` are no longer read at
+  all — by weather *or* by commute.** Weather stopped first; commute kept
+  reading all three directly out of the process environment until **TERM #591**,
+  which is the same disclosure in the module the variables are named after, and
+  removing it from one consumer while leaving it in the other closed half a
+  hole. In weather they were also kept
   briefly as a migration fallback, scoped to one service principal. That does
   not work and cannot be made to: until **TERM #577** lands, every human reaches
   Lumina as the *same* service principal, so "the configured principal" names
@@ -320,7 +330,7 @@ Four properties worth knowing:
   hand the operator's home and work addresses to anyone entitled. Narrowing the
   gate does not help, because any gate keyed on a shared principal has the same
   defect. So the fallback is **deleted**, along with
-  `TERMINUS_COMMUTE_LEGACY_PRINCIPAL`. Both variables are unset on the live
+  `TERMINUS_COMMUTE_LEGACY_PRINCIPAL`. All three variables are unset on the live
   host, so nothing working was lost; what was removed is a latent disclosure
   that would have activated the moment someone set them.
 
@@ -331,6 +341,17 @@ Four properties worth knowing:
   clear"* framing — an unwatched home is never an all-clear — but the **reason**
   stays distinct from *"your saved locations could not be read"*. Absence and
   failure are different answers, and neither is ever filled in by a guess.
+
+  Commute degrades the same way. An omitted `origin` still **means** "home" —
+  that is the tool's contract and the user's own saved place — but "home" is now
+  the caller's registry entry, and with none saved the tool **asks** for a
+  starting point rather than routing from somewhere else. *"Nothing saved under
+  that name"*, *"saved locations aren't available on this connection"* and *"I
+  couldn't read your saved locations"* are three different answers with three
+  different wordings, and the last carries a different error type from the
+  first — an absent value and a broken read are not the same class of problem.
+  A literal address still routes for any caller, entitled or not: that discloses
+  nothing.
 - **Identities are opaque.** A caller key stores the authenticated principal (and,
   post-#577, person) **verbatim**, trimmed but never case-folded. `Alpha` and
   `alpha` are two callers with two records. Deciding that two differently-spelled
