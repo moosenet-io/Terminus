@@ -12,17 +12,16 @@ import {
 } from './cores';
 import type { ModuleDescriptor, ModuleId } from './moduleRegistry';
 
-const ALL_MODULE_IDS: ModuleId[] = ['harmony', 'chord', 'lumina', 'muse', 'terminus', 'models', 'mint'];
+const ALL_MODULE_IDS: ModuleId[] = ['harmony', 'chord', 'lumina', 'muse', 'terminus', 'models', 'mint', 'maestro'];
 
 function fakeModule(id: ModuleId): ModuleDescriptor {
-  return {
-    id,
-    title: id,
-    icon: '',
-    healthSystem: (['harmony', 'chord', 'lumina', 'muse'].includes(id) ? id : 'terminus') as
-      ModuleDescriptor['healthSystem'],
-    order: 0,
-  };
+  const healthSystem: ModuleDescriptor['healthSystem'] =
+    (['harmony', 'chord', 'lumina', 'muse'] as ModuleId[]).includes(id)
+      ? (id as 'harmony' | 'chord' | 'lumina' | 'muse')
+      : id === 'maestro'
+        ? 'muse' // Maestro is a Muse subsystem — see moduleRegistry.ts's ModuleId doc.
+        : 'terminus'; // models/mint
+  return { id, title: id, icon: '', healthSystem, order: 0 };
 }
 
 describe('core model', () => {
@@ -63,10 +62,13 @@ describe('core model', () => {
     }
   });
 
-  it('Terminus is the only multi-member core and owns terminus + models + mint in that order', () => {
+  it('Terminus and Muse are the only multi-member cores, each owning its subsystems in order', () => {
+    // Terminus owns its intake subsystems (Models, MINT).
     expect(getCore('terminus').moduleIds).toEqual(['terminus', 'models', 'mint']);
+    // MACT-04 (MUSE-124): Muse owns Maestro (live activity / playback control) the same way.
+    expect(getCore('muse').moduleIds).toEqual(['muse', 'maestro']);
     for (const c of CORES) {
-      if (c.id !== 'terminus') expect(c.moduleIds).toEqual([c.id]);
+      if (c.id !== 'terminus' && c.id !== 'muse') expect(c.moduleIds).toEqual([c.id]);
     }
   });
 

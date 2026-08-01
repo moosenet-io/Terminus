@@ -14,7 +14,13 @@ import type { HealthStatus } from './aggregationClient';
  * landing panels against them — the id is stable from day one even though no module/panel is
  * registered for them yet in this item.
  */
-export type ModuleId = 'harmony' | 'chord' | 'lumina' | 'muse' | 'terminus' | 'models' | 'mint';
+/** MACT-04 (MUSE-124): `maestro` is a Muse subsystem — the live-activity/playback-control
+ *  surface, same relationship Models/MINT have to Terminus (its own registered module with
+ *  panels/routes/health, nested under the Muse core tab rather than a sibling top-level tab).
+ *  `healthSystem: 'muse'` because in H1 the live pane is still muse-derived data (see
+ *  `aggregationClient.ts`'s `LiveSession.source` doc); it stays bound to `muse` even once H2's
+ *  real Maestro service lands, since Muse's own health remains the meaningful gate either way. */
+export type ModuleId = 'harmony' | 'chord' | 'lumina' | 'muse' | 'terminus' | 'models' | 'mint' | 'maestro';
 
 export interface ModuleDescriptor {
   /** Stable id and data namespace (see `ModuleId`). For proxied systems this doubles as the

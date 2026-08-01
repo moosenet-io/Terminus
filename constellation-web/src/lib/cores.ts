@@ -28,14 +28,16 @@ export interface CoreDescriptor {
   moduleIds: ModuleId[];
 }
 
-/** Core → member modules. Terminus is the only multi-member core: it owns its intake subsystems
- *  (Models + MINT). Every other core is exactly itself. */
+/** Core → member modules. Terminus owns its intake subsystems (Models + MINT); MACT-04
+ *  (MUSE-124) adds Muse's second subsystem, Maestro (live activity / playback control), the same
+ *  "own module, nested under the parent core's rail" relationship. Every other core is exactly
+ *  itself. */
 const CORE_MEMBERS: Record<CoreId, ModuleId[]> = {
   lumina: ['lumina'],
   chord: ['chord'],
   terminus: ['terminus', 'models', 'mint'],
   harmony: ['harmony'],
-  muse: ['muse'],
+  muse: ['muse', 'maestro'],
 };
 
 /** Display titles for the core tabs (proper-case constellation names). */
@@ -57,6 +59,7 @@ export const MEMBER_LABEL: Record<ModuleId, string> = {
   muse: 'MUSE',
   models: 'MODELS',
   mint: 'MINT',
+  maestro: 'MAESTRO',
 };
 
 export const CORES: readonly CoreDescriptor[] = CORE_ORDER.map(id => ({

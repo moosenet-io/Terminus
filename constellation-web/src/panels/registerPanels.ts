@@ -60,6 +60,7 @@ import { RequestPanel as MuseRequestPanel } from './muse/RequestPanel';
 import { SettingsPanel as MuseSettingsPanel } from './muse/SettingsPanel';
 import { TastePanel as MuseTastePanel } from './muse/TastePanel';
 import { ChannelsPanel as MuseChannelsPanel } from './muse/ChannelsPanel';
+import { ActivityPanel as MaestroActivityPanel } from './maestro/ActivityPanel';
 import { OverviewPanel as MintOverviewPanel } from './mint/OverviewPanel';
 import { CategoryReportPanel as MintCategoryReportPanel } from './mint/CategoryReportPanel';
 import { Tasks } from '../pages/Tasks';
@@ -98,6 +99,13 @@ registerModule({ id: 'models', title: 'Models', icon: '◆', healthSystem: 'term
 // always-available terminus health entry.
 registerModule({ id: 'mint', title: 'MINT', icon: '◈', healthSystem: 'terminus', order: 6 });
 registerModule({ id: 'terminus', title: 'Terminus', icon: '⚙', healthSystem: 'terminus', order: 7 });
+// MACT-04 (MUSE-124): Maestro is a Muse subsystem (live activity / playback control), the
+// same relationship Models/MINT have to Terminus — nested under the Muse core tab, not a
+// sibling top-level one (see cores.ts's CORE_MEMBERS). `registerModule` is a `Map.set` keyed
+// on id, so this call is naturally idempotent: if spec G's Device Control item also registers
+// `maestro` (same id, same descriptor shape), whichever runs first is simply overwritten by an
+// equivalent second call rather than erroring or double-registering a tab.
+registerModule({ id: 'maestro', title: 'Maestro', icon: '▶', healthSystem: 'muse', order: 8 });
 
 // ── Harmony ──────────────────────────────────────────────────────────────────
 
@@ -430,6 +438,20 @@ registerPanel({
   icon: '⚙',
   available: true,
   component: MuseSettingsPanel,
+});
+
+// ── Maestro (MACT-04, MUSE-124) ──────────────────────────────────────────────
+// LIVE + HISTORY activity panes over `muse.sessions.live()`/`.history()` (MACT-03's typed
+// client). See ActivityPanel.tsx's module doc for the two-pane/two-source contract.
+
+registerPanel({
+  id: 'maestro.activity',
+  system: 'maestro',
+  title: 'Activity',
+  path: '/maestro/activity',
+  icon: '▶',
+  available: true,
+  component: MaestroActivityPanel,
 });
 
 // ── Models (CGUI-09) ─────────────────────────────────────────────────────────
