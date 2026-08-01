@@ -1074,6 +1074,19 @@ async fn assess_heat(
         })
         .collect();
 
+    // An empty window is NOT a clean check. The provider answered, but about
+    // days outside the horizon we were asked about — so nothing in the
+    // requested window was actually assessed, and saying "no sustained heat
+    // build-up" would be an all-clear for a period we never looked at. (This
+    // case only became reachable when the horizon filter above was added; the
+    // filter and this guard belong together.)
+    if in_horizon.is_empty() {
+        gaps.push(Gap::Failed(
+            "the forecast does not reach the days you asked about".into(),
+        ));
+        return SubjectReport { findings: Vec::new(), checked: Vec::new(), gaps };
+    }
+
     let run = heat_run(&in_horizon);
     let checked = vec!["your home area".to_string()];
 
@@ -2087,6 +2100,37 @@ mod tests {
         let quiet = FakeForecast::ok(vec![mild("2026-08-01"), mild("2026-08-02")]);
         let r2 = run_watch(2, operator(), &cal, &loc, &quiet, today()).await;
         assert!(r2.heat.findings.is_empty() && r2.heat.is_clear());
+    }
+
+    /// REVIEW FINDING (gpt56, round 3): a regression introduced by the round-2
+    /// horizon fix itself. Once the forecast is filtered to the horizon, that
+    /// filter can leave NOTHING — and the code still marked the home area
+    /// "checked" and rendered an all-clear for a window it never looked at.
+    #[tokio::test]
+    async fn a_horizon_the_forecast_does_not_cover_is_not_an_all_clear() {
+        let (cal, _) = CountingCalendar::with(vec![]);
+        let (loc, _) = CountingLocations::with(Some("Homeplace"));
+        // The provider answers, but only about days BEFORE the horizon.
+        let fc = FakeForecast::ok(vec![mild("2026-07-20"), mild("2026-07-21")]);
+
+        let r = run_watch(3, operator(), &cal, &loc, &fc, today()).await;
+
+        assert!(r.heat.findings.is_empty());
+        assert!(!r.heat.is_clear(), "an uncovered window is unknown, not clear");
+        assert!(r.heat.checked_nothing(), "nothing in the window was assessed");
+        assert!(matches!(r.heat.gaps.as_slice(), [Gap::Failed(_)]));
+
+        let text = r.render();
+        assert!(text.contains("does not reach the days you asked about"), "{text}");
+        assert!(text.contains("unknown, not clear"), "{text}");
+        assert!(!text.contains("no sustained heat build-up"), "must not read as all-clear: {text}");
+
+        // The control: the same shape of request WITH covering days is clear —
+        // so this is the coverage gap doing the work, not the fixture.
+        let covered = FakeForecast::ok(vec![mild("2026-08-01"), mild("2026-08-02")]);
+        let r2 = run_watch(3, operator(), &cal, &loc, &covered, today()).await;
+        assert!(r2.heat.is_clear());
+        assert!(r2.render().contains("no sustained heat build-up"));
     }
 
     #[tokio::test]
