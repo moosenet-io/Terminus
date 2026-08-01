@@ -53,10 +53,16 @@
 //!    stronger one: principal binding prevents replay under a DIFFERENT
 //!    principal. It does not prevent replay under the SAME one. An assertion is
 //!    a bearer token, so whoever obtains it can reuse it until it expires —
-//!    expiry bounds that window (~15 minutes), it does not close it. The
-//!    defence against same-principal replay is the transport: these tokens only
-//!    ever travel over a mutually authenticated hop, and are stripped rather
-//!    than forwarded ([`is_identity_header`]).
+//!    expiry bounds that window (~15 minutes), it does not close it.
+//!
+//!    Nothing here CLOSES same-principal replay, and it would be wrong to imply
+//!    the transport does: the live path runs through Chord, which authenticates
+//!    with a shared bearer token and presents no client certificate. What the
+//!    design actually rests on is narrower — a short TTL, the fact that these
+//!    headers are stripped rather than forwarded ([`is_identity_header`]) so a
+//!    token does not accumulate hops, and the assumed trust of the relay itself.
+//!    An attacker who obtains a live assertion CAN replay it under the same
+//!    principal until it expires. That is a known limit, not a solved problem.
 //!
 //! # Fail closed, in the specific direction that matters
 //!
