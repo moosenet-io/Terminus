@@ -196,8 +196,15 @@ export interface MuseLibrary {
 
 /** The poster wall's data. `limit` bounds the page Muse returns — the panel reports the
  *  untruncated `counts.owned` separately so a capped page never reads as the whole library. */
-export function useMuseLibrary(limit = 120): MuseSection<MuseLibrary> {
-  return useMuseSection<MuseLibrary>(`/api/library?limit=${encodeURIComponent(String(limit))}`);
+/** MUSE #112: `kind` scopes the fetch SERVER-SIDE.
+ *
+ *  Filtering in the browser would still ship every row over the wire and still be bounded by
+ *  the same limit — so on a library larger than the cap, "all your movies" would mean "the
+ *  movies among the first N of everything", which is a confident label over the wrong set.
+ *  `undefined` keeps the mixed view. */
+export function useMuseLibrary(limit = 120, kind?: 'movie' | 'show'): MuseSection<MuseLibrary> {
+  const k = kind ? `&kind=${encodeURIComponent(kind)}` : '';
+  return useMuseSection<MuseLibrary>(`/api/library?limit=${encodeURIComponent(String(limit))}${k}`);
 }
 
 /** One row of the management table (guide screen 03). `GET /api/library/table` returns a BARE
