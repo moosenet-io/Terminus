@@ -441,6 +441,20 @@ Two properties are load-bearing rather than incidental:
   `bandwidth_kbps` are measurements: a fractional value is rounded to the nearest whole
   unit, because a half-millisecond is not worth a blank progress bar. `session_key` is
   an opaque string and is never read as a number.
+- **A `malformed` detail never quotes the payload back.** Every verdict above rests on
+  *this response was rewritten in transit, so nothing in it can be trusted* — which makes
+  echoing the offending value into our own error the one thing not to do: it hands whoever
+  rewrote the response a channel into the structured payload (a title, a username, an
+  address or a credential parked in `size` came straight back out, to a caller who may be
+  entitled to none of it) and lets an arbitrarily long value produce an arbitrarily long
+  error. So a detail names a **safe category** — the JSON type that arrived and the type
+  that was expected — and carries a value only when that value is a **number**, whose
+  rendering is hard-bounded and which cannot carry a name, an address or a secret. That
+  exception exists because `size: 0.5` is the one fault where the value *is* the
+  diagnosis. Every detail is additionally capped in length on the way out, as defence in
+  depth rather than as the mechanism. This matches what the rest of the path already
+  does: transport failures are **classified**, never `Display`ed, and the Plex base URL
+  and token are never echoed anywhere.
 - **Private by default.** Now-playing reveals who is home and what they are doing, in
   real time, so it is gated on the caller's entitlement (the same `CallerContext`
   mechanism `weather` uses for operator-context inference). A guest, an unknown caller,

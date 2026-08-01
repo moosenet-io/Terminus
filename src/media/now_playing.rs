@@ -37,6 +37,38 @@
 //! `"TranscodeSession": null` rendered as a confident `direct_stream` with an
 //! invented "remuxed" reason rather than as an unreadable answer.
 //!
+//! ## The malformed detail never quotes the payload back
+//!
+//! Every `malformed` verdict above rests on one premise: *this response was
+//! rewritten in transit, so nothing in it can be trusted*. Echoing the
+//! offending value into our own `detail` contradicts that premise — it hands
+//! whoever rewrote the response a channel straight into our structured
+//! payload, and a caller who is not entitled to see a title or a username can
+//! be handed one anyway if it arrives in a field we quote verbatim. It is also
+//! an unbounded-output hazard: a `size` holding a megabyte-long string would
+//! have become a megabyte-long error.
+//!
+//! So the rule, and it matches what the rest of this path already does
+//! (transport failures are CLASSIFIED rather than `Display`ed, and the base URL
+//! and token are never echoed — see [`super::clients::plex`]):
+//!
+//! > A detail may name a **safe category** — the JSON type that arrived and the
+//! > type that was expected — and may carry a value only when that value is a
+//! > NUMBER, whose rendering is hard-bounded and which cannot carry a title, a
+//! > username, an address or a credential. Strings, objects and arrays are
+//! > described by TYPE ONLY and are never rendered.
+//!
+//! A number is admitted because `size: 0.5` is the one fault where the value
+//! *is* the diagnosis, and `0.5` is both safe and immediately actionable. It is
+//! rendered via `{:?}` (shortest round-trip, so `1e300` stays five characters)
+//! and falls back to the bare type if it somehow exceeds
+//! [`MAX_NUMBER_CHARS`].
+//!
+//! [`bounded_detail`] then caps every detail — including ones raised in the
+//! client — at [`MAX_DETAIL_CHARS`] on the way into the payload. That cap is
+//! defence in depth, not the mechanism: it bounds the size of a leak, it does
+//! not prevent one, so it must never be read as licence to echo.
+//!
 //! ## Never cached
 //!
 //! Live session data is worthless stale, so `media_now_playing` is named in
@@ -357,6 +389,13 @@ fn bool_at(v: &Value, key: &str) -> Option<bool> {
 /// Plex sends it as an integer on this endpoint; `num_at` also accepts the
 /// string form some other Plex endpoints use, so a stringly-typed server is
 /// read rather than declared broken.
+///
+/// **The detail names a category, never the value** — see [`size_shape`] and
+/// the module docs. The one exception is the negative branch, which reports
+/// `n`: by then the value has been PARSED as an `i64`, so it is a bounded
+/// numeric (at most 20 characters) that cannot carry anything but digits and a
+/// sign, and naming it is what distinguishes "an impossible count" from a
+/// miscount for whoever reads the dashboard.
 fn container_size(mc: &Value) -> Result<i64, String> {
     let Some(raw) = mc.get("size") else {
         return Err(
@@ -367,7 +406,10 @@ fn container_size(mc: &Value) -> Result<i64, String> {
         );
     };
     let n = num_at(mc, "size").ok_or_else(|| {
-        format!("MediaContainer.size was {raw}, which is not a whole number of sessions")
+        format!(
+            "MediaContainer.size was {}, which is not a whole number of sessions",
+            size_shape(raw)
+        )
     })?;
     if n < 0 {
         return Err(format!(
@@ -379,7 +421,8 @@ fn container_size(mc: &Value) -> Result<i64, String> {
 
 /// The NAME of a JSON shape, for a malformed detail that says what arrived
 /// without quoting the payload back (a rewritten body is not something to echo,
-/// and a large array would swamp the message).
+/// and a large array would swamp the message). The whole-module statement of
+/// that rule, and the one number-shaped exception to it, is [`size_shape`].
 fn json_kind(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -389,6 +432,77 @@ fn json_kind(v: &Value) -> &'static str {
         Value::Array(_) => "a list",
         Value::Object(_) => "an object",
     }
+}
+
+/// The widest rendering of a number a detail will carry. A `{:?}`-formatted
+/// `f64` is at most ~24 characters (`-1.7976931348623157e308`), so this bounds
+/// the real cases without ever truncating one; anything wider is reported as
+/// the bare type rather than as a truncated — and therefore WRONG — numeral.
+const MAX_NUMBER_CHARS: usize = 24;
+
+/// A SAFE description of whatever arrived where a session count was expected.
+///
+/// **This exists because `format!("{raw}")` did not.** The previous detail
+/// interpolated the whole JSON value, so a rewritten response whose `size` was
+/// an object or a string carrying a title, a username, an address or a
+/// credential had that content echoed straight back in the structured payload —
+/// and an arbitrarily long one produced an arbitrarily long error. Both are
+/// squarely against this module's own premise (see the module docs): the value
+/// is only ever seen because we have just concluded the response was rewritten
+/// by someone, so it is exactly the thing not to repeat.
+///
+/// The type is enough to diagnose the fault in every case: "a string" /
+/// "an object" / "a list" / "a boolean" / "null" each say precisely what went
+/// wrong with a field that must be a whole number. A NUMBER additionally
+/// carries its value, and only a number: `size: 0.5` is the one fault where the
+/// value IS the diagnosis, and a JSON number cannot carry a name, an address or
+/// a secret — only digits, a sign and an exponent, in a bounded width.
+/// `{:?}` is the shortest round-trip form, so `1e300` renders as `1e300` rather
+/// than as three hundred digits.
+fn size_shape(v: &Value) -> String {
+    match v {
+        Value::Number(n) => match n.as_f64() {
+            Some(f) => {
+                let rendered = format!("{f:?}");
+                if rendered.chars().count() <= MAX_NUMBER_CHARS {
+                    format!("the number {rendered}")
+                } else {
+                    "a number".to_string()
+                }
+            }
+            // Unreachable for a `serde_json` number today; the bare type is the
+            // fail-safe answer rather than a fallback to `Display`.
+            None => "a number".to_string(),
+        },
+        other => json_kind(other).to_string(),
+    }
+}
+
+/// The hard ceiling on any `detail` reaching a caller. The longest detail this
+/// module raises is ~200 characters, so this never truncates a legitimate one —
+/// it exists so that no future detail, and nothing raised in the client, can
+/// make the payload grow without bound.
+const MAX_DETAIL_CHARS: usize = 320;
+
+/// Cap a detail on its way into the payload.
+///
+/// DEFENCE IN DEPTH ONLY. The real guarantee is [`size_shape`] and the
+/// classified (never `Display`ed) transport errors upstream: nothing untrusted
+/// is put into a detail in the first place. This bounds the blast radius if
+/// that is ever violated again — it limits the SIZE of a leak, not the fact of
+/// one, and must not be mistaken for permission to echo.
+fn bounded_detail(detail: &str) -> String {
+    /// Counted against the cap, so the emitted detail is `<= MAX_DETAIL_CHARS`
+    /// INCLUDING the marker — a bound that a caller has to measure the suffix
+    /// to satisfy is not a bound.
+    const MARK: &str = " [truncated]";
+    if detail.chars().count() <= MAX_DETAIL_CHARS {
+        return detail.to_string();
+    }
+    let mut out: String =
+        detail.chars().take(MAX_DETAIL_CHARS - MARK.chars().count()).collect();
+    out.push_str(MARK);
+    out
 }
 
 fn session_items(raw: &Value) -> Result<Vec<&Value>, String> {
@@ -800,7 +914,11 @@ fn error_response(err: &PlexSessionsError) -> Value {
             "Plex answered with something this client could not read, so live activity is unknown."
         }
     };
-    build_response(err.kind(), message, json!({ "detail": err.detail() }))
+    // `bounded_detail`, not the raw detail: this is the single place a detail
+    // becomes caller-visible, so it is the one place worth capping. The details
+    // themselves are already free of untrusted content (see the module docs) —
+    // this only bounds what a future regression could cost.
+    build_response(err.kind(), message, json!({ "detail": bounded_detail(err.detail()) }))
 }
 
 // ── the tool ────────────────────────────────────────────────────────────────
@@ -1357,6 +1475,205 @@ mod tests {
             2,
             "a populated container must still count its sessions"
         );
+    }
+
+    // ── the malformed detail must not echo the payload it distrusts ────────
+
+    /// An obviously synthetic canary. It is not a title, a username, an
+    /// address or a credential — it stands in for one, so the assertion is
+    /// "nothing from the rewritten body came back", which is the property, not
+    /// "this particular kind of secret did not".
+    const CANARY: &str = "SYNTHETIC-CANARY-Zq7x-NOT-A-REAL-VALUE"; // pii-test-fixture: invented marker, never a real title/user/host
+
+    #[tokio::test]
+    async fn a_rewritten_size_is_never_echoed_back_to_the_caller() {
+        // The premise of every `malformed` verdict is that this response was
+        // REWRITTEN in transit. Quoting the offending value into our own detail
+        // hands whoever rewrote it a channel into our structured payload — a
+        // title, a username, an address or a credential parked in `size` came
+        // straight back out, to a caller who may be entitled to none of it.
+        //
+        // Asserted on the WHOLE serialised payload, not just `detail`: the
+        // property is that it is nowhere in the response, and a future change
+        // that moved the echo into another field would otherwise pass.
+        for (label, size) in [
+            // An OBJECT — canary in both a key and a value, since a key is
+            // just as much attacker-chosen content as a value is.
+            ("an object", json!({ CANARY: CANARY })),
+            // A long STRING, canary FIRST. Deliberate: a canary at the end
+            // would be removed by the length cap even if the raw echo were
+            // still there, and the test would pass for the wrong reason.
+            ("a string", json!(format!("{CANARY}{}", "y".repeat(4_000)))),
+            ("a list", json!([CANARY, 0])),
+        ] {
+            let raw = json!({ "MediaContainer": { "size": size } });
+            let payload = MediaNowPlaying::with_source(CountingSource::ok(raw))
+                .run(entitled())
+                .await;
+
+            assert_eq!(payload["status"], "malformed", "{label}");
+            assert!(payload.get("session_count").is_none(), "{label}");
+
+            let serialised = payload.to_string();
+            assert!(
+                !serialised.contains(CANARY),
+                "{label}: the rewritten value came back in the response: {serialised}"
+            );
+
+            // POSITIVE CONTROL: redacting must not leave a detail that says
+            // nothing. It still names the field, the type that arrived, and
+            // what was expected — enough to diagnose a real fault.
+            let detail = payload["detail"].as_str().unwrap_or_else(|| {
+                panic!("{label}: a malformed response must carry a detail: {serialised}")
+            });
+            assert!(detail.contains("MediaContainer.size"), "{label}: {detail}");
+            assert!(detail.contains("whole number of sessions"), "{label}: {detail}");
+            assert!(
+                detail.contains(label),
+                "{label}: the detail should name the type that arrived: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_type_that_arrived_is_named_but_never_rendered() {
+        // Per-arm, so each kind of value has its own reason to fail: a mutation
+        // that starts rendering ONLY strings, or ONLY objects, is caught by the
+        // matching row rather than by the whole set collapsing together.
+        for (value, expected) in [
+            (json!({ CANARY: 1 }), "an object"),
+            (json!([CANARY]), "a list"),
+            (json!(CANARY), "a string"),
+            (json!(true), "a boolean"),
+            (Value::Null, "null"),
+        ] {
+            let shape = size_shape(&value);
+            assert_eq!(shape, expected, "the category is the whole answer for {value}");
+            assert!(!shape.contains(CANARY), "the value leaked into its own category: {shape}");
+        }
+    }
+
+    #[test]
+    fn a_number_keeps_its_value_because_a_number_cannot_carry_a_secret() {
+        // The one deliberate exception, and the case where the value IS the
+        // diagnosis: `size: 0.5` says "fractional count" far more directly than
+        // "a number" does. A JSON number carries digits, a sign and an exponent
+        // and nothing else, in a bounded width.
+        assert_eq!(size_shape(&json!(0.5)), "the number 0.5");
+        assert_eq!(size_shape(&json!(-2.75)), "the number -2.75");
+
+        // Shortest round-trip, so a huge magnitude is five characters, not
+        // three hundred digits.
+        assert_eq!(size_shape(&json!(1e300)), "the number 1e300");
+
+        // And every rendering is bounded, whatever the magnitude.
+        for v in [json!(0.5), json!(1e300), json!(-1e-300), json!(f64::MAX)] {
+            assert!(
+                size_shape(&v).chars().count() <= "the number ".len() + MAX_NUMBER_CHARS,
+                "a number rendering must stay bounded: {}",
+                size_shape(&v)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fractional_size_is_still_diagnosed_by_its_value() {
+        // End to end: the redaction must not have cost the diagnosis that
+        // motivated the fractional-size rule in the first place.
+        let payload = MediaNowPlaying::with_source(CountingSource::ok(
+            json!({ "MediaContainer": { "size": 0.5 } }),
+        ))
+        .run(entitled())
+        .await;
+        assert_eq!(payload["status"], "malformed");
+        let detail = payload["detail"].as_str().expect("malformed carries a detail");
+        assert!(detail.contains("0.5"), "a fractional count should name itself: {detail}");
+        assert!(detail.contains("whole number of sessions"), "{detail}");
+    }
+
+    #[test]
+    fn every_detail_that_reaches_a_caller_is_length_bounded() {
+        // DEFENCE IN DEPTH. `size_shape` is what stops untrusted content
+        // entering a detail; this is what stops any detail — including one
+        // raised in the client, which this module does not own — from growing
+        // the payload without bound.
+        let payload = error_response(&PlexSessionsError::Malformed("y".repeat(50_000)));
+        let detail = payload["detail"].as_str().expect("a detail is present");
+        assert!(
+            detail.chars().count() <= MAX_DETAIL_CHARS,
+            "detail was {} chars, over the {MAX_DETAIL_CHARS} cap",
+            detail.chars().count()
+        );
+        assert!(detail.ends_with(" [truncated]"), "truncation should be visible: {detail}");
+
+        // POSITIVE CONTROL: the cap is above every detail this module actually
+        // raises, so no real diagnosis is ever clipped.
+        for raw in [
+            json!({}),
+            json!({ "MediaContainer": 0 }),
+            json!({ "MediaContainer": {} }),
+            json!({ "MediaContainer": { "size": 0, "Metadata": null } }),
+            json!({ "MediaContainer": { "size": 0.5 } }),
+            json!({ "MediaContainer": { "size": -1 } }),
+            json!({ "MediaContainer": { "size": 2 } }),
+            json!({ "MediaContainer": { "size": 1, "Metadata": {} } }),
+            json!({ "MediaContainer": { "size": 1, "Metadata": [transcoding_episode()] },
+                    "extra": 0 }),
+            json!({ "MediaContainer": { "size": 1, "Metadata": [ { "TranscodeSession": null } ] } }),
+        ] {
+            if let Err(detail) = session_items(&raw) {
+                assert_eq!(
+                    bounded_detail(&detail),
+                    detail,
+                    "a real diagnosis must survive the cap intact: {detail}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn redaction_left_the_other_outcomes_exactly_as_they_were() {
+        // POSITIVE CONTROLS for the whole round: the four statuses, unchanged.
+        let playing = MediaNowPlaying::with_source(CountingSource::ok(container(vec![
+            transcoding_episode(),
+            direct_play_movie(),
+        ])))
+        .run(entitled())
+        .await;
+        assert_eq!(playing["status"], "playing");
+        assert_eq!(playing["ok"], true);
+        assert_eq!(playing["session_count"], 2);
+        assert_eq!(playing["sessions"][0]["decision"], "transcode");
+
+        let idle = MediaNowPlaying::with_source(CountingSource::ok(
+            json!({ "MediaContainer": { "size": 0 } }),
+        ))
+        .run(entitled())
+        .await;
+        assert_eq!(idle["status"], "idle");
+        assert_eq!(idle["ok"], true);
+        assert_eq!(idle["session_count"], 0);
+
+        // A transport failure still classifies, and its detail still arrives.
+        let unreachable = MediaNowPlaying::with_source(CountingSource::failing(
+            PlexSessionsError::Unreachable("could not connect to Plex".into()),
+        ))
+        .run(entitled())
+        .await;
+        assert_eq!(unreachable["status"], "unreachable");
+        assert_eq!(unreachable["detail"], "could not connect to Plex");
+        assert!(unreachable.get("session_count").is_none());
+
+        // And the malformed detail is still a real diagnosis, not a shrug.
+        let malformed = MediaNowPlaying::with_source(CountingSource::ok(
+            json!({ "MediaContainer": { "size": 3 } }),
+        ))
+        .run(entitled())
+        .await;
+        assert_eq!(malformed["status"], "malformed");
+        let detail = malformed["detail"].as_str().expect("a detail");
+        assert!(detail.contains("3 session(s)"), "{detail}");
+        assert!(detail.contains("no Metadata list"), "{detail}");
     }
 
     #[test]
