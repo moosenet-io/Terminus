@@ -287,7 +287,9 @@ impl TasteAwareMediaRecommend {
         // Delegate WITH the caller: the inner tool owns the reject-vs-scope
         // decision (TERM #576, `resolve_history_scope`), so a request for
         // another member's account is refused here too, before any facade call.
-        let base_str = self.inner.run(args.clone(), caller.clone()).await?;
+        // `caller` is passed by value and still used below -- `CallerContext`
+        // is `Copy` (TERM #576 round 2), so no clone is needed.
+        let base_str = self.inner.run(args.clone(), caller).await?;
         let base: Value = serde_json::from_str(&base_str).map_err(|e| ToolError::Execution(format!("internal: base recommendation was not valid JSON: {e}")))?;
 
         // TERM #576: curation notes are household data too -- a stored note is
@@ -344,7 +346,7 @@ impl RustTool for MediaTasteFeedback {
                 "title": { "type": "string", "description": "Title of the movie/show the signal is about." },
                 "media_type": { "type": "string", "enum": ["movie", "tv"], "description": "Movie or TV series. Optional, defaults to \"movie\"." },
                 "signal": { "type": "string", "enum": ["requested", "watched", "dismissed"], "description": "The engagement signal to record." },
-                "account_id": { "type": "string", "description": "Optional: your OWN media account id. It may not name another household member's account -- doing so is refused. Omit it and your own account is used." },
+                "account_id": { "type": "string", "description": "Optional: your OWN media account id, as a non-empty string. It may not name another household member's account, and anything that is not a usable string (a number, null, an object) is refused too -- never silently ignored. Omit it and your own account is used." },
                 "note": { "type": "string", "description": "Optional free-text curation note, e.g. \"loved the slow pacing\"." }
             },
             "required": ["title", "signal"]
@@ -378,7 +380,14 @@ impl MediaTasteFeedback {
         // single mechanism: the account comes from the gateway-minted caller,
         // naming someone else's is refused, and a caller with no account of
         // their own has nothing to write to.
-        let explicit = args.get("account_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+        //
+        // Round 2: and it uses the SAME argument reader as the read path, so a
+        // present-but-malformed `account_id` (a number, an object, `null`, a
+        // blank string) is refused here too rather than silently degrading to
+        // "no account named" and writing to the caller's own profile. This is
+        // the write path, so a discarded argument would mean a signal — and a
+        // free-text note — landing somewhere the caller did not ask for.
+        let explicit = super::recommend::requested_account(&args)?;
         let account_id = match super::recommend::resolve_history_scope(explicit, &caller)? {
             super::recommend::HistoryScope::Account(id) => id,
             super::recommend::HistoryScope::Unentitled => {
@@ -862,6 +871,40 @@ mod tests {
         assert!(matches!(unmapped, Err(ToolError::InvalidArgument(_))));
 
         assert_eq!(post.hits(), 0, "neither refusal may reach the facade");
+    }
+
+    /// TERM #576 round 2, WRITE path: a present-but-malformed `account_id` is
+    /// refused, not degraded to "none supplied". On a write, a silently
+    /// discarded argument means the signal (and any free-text note) lands on a
+    /// profile the caller did not name, with a `200 OK` saying it worked.
+    #[tokio::test]
+    #[serial]
+    async fn write_back_refuses_a_malformed_account_id_instead_of_ignoring_it() {
+        let taste_server = MockServer::start();
+        let post = taste_server.mock(|when, then| {
+            when.method(POST).path("/media/taste/engagement");
+            then.status(200).json_body(json!({ "ok": true }));
+        });
+        let tool = MediaTasteFeedback { client: Some(TasteMemoryClient::new(taste_server.base_url(), reqwest::Client::new())) };
+
+        for malformed in [
+            json!({"title": "Placeholder", "signal": "watched", "account_id": 12345}),
+            json!({"title": "Placeholder", "signal": "watched", "account_id": null}),
+            json!({"title": "Placeholder", "signal": "watched", "account_id": {"id": OTHER_MEMBER_ACCOUNT}}),
+            json!({"title": "Placeholder", "signal": "watched", "account_id": [OTHER_MEMBER_ACCOUNT]}),
+            json!({"title": "Placeholder", "signal": "watched", "account_id": ""}),
+            json!({"title": "Placeholder", "signal": "watched", "account_id": "   "}),
+        ] {
+            let err = tool
+                .run(malformed.clone(), caller_for(OPERATOR_ACCOUNT))
+                .await
+                .expect_err("a malformed account_id on the write path must be refused");
+            assert!(matches!(err, ToolError::InvalidArgument(_)), "input: {malformed}");
+            // Same message as every other refusal -- no probe oracle here either.
+            assert!(!err.to_string().contains(OTHER_MEMBER_ACCOUNT) && !err.to_string().contains(OPERATOR_ACCOUNT));
+        }
+
+        assert_eq!(post.hits(), 0, "a refused write must never reach the facade");
     }
 
     /// Write-back positive control: the caller's OWN account id is what goes

@@ -56,8 +56,6 @@
 //! pretend to close the shared-identity case. Do not read a populated map as
 //! household-level privacy until TERM #577 propagates human identity.
 
-use std::sync::Arc;
-
 use tracing::warn;
 
 /// Env var holding the principal → media-account map. Read at lookup time
@@ -84,7 +82,7 @@ pub const TOKEN_ACCOUNT_ENV: &str = "PLEX_ACCOUNT_ID";
 /// non-string or blank value. A malformed map yields `None` for EVERY
 /// principal rather than a partial map, because a partially-parsed
 /// authorization input is how a typo turns into a silent grant.
-fn lookup(raw: Option<&str>, principal: &str) -> Option<Arc<str>> {
+fn lookup(raw: Option<&str>, principal: &str) -> Option<String> {
     let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
     let parsed: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
@@ -101,7 +99,7 @@ fn lookup(raw: Option<&str>, principal: &str) -> Option<Arc<str>> {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(Arc::from)
+        .map(str::to_string)
 }
 
 /// The household media account `principal` IS, or `None` when the operator has
@@ -109,7 +107,7 @@ fn lookup(raw: Option<&str>, principal: &str) -> Option<Arc<str>> {
 ///
 /// Called by [`crate::gateway_framework::GatewayFramework::caller_context`] and
 /// nowhere else in production — this is a lookup, not a decision point.
-pub fn account_for_principal(principal: &str) -> Option<Arc<str>> {
+pub fn account_for_principal(principal: &str) -> Option<String> {
     lookup(std::env::var(ACCOUNT_MAP_ENV).ok().as_deref(), principal)
 }
 

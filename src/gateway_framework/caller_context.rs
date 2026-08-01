@@ -66,15 +66,47 @@
 /// and a tool that finds it there must fall back to a response with no
 /// household-derived content at all.
 ///
-/// This is why the type is `Clone` but no longer `Copy`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// # The type stays `Copy` — deliberately (TERM #576, review round 2)
+///
+/// An earlier revision of TERM #576 carried the account as an
+/// `Option<Arc<str>>`, which silently downgraded this PUBLIC type from `Copy`
+/// to `Clone`-only. Nothing in-crate broke, so the break was invisible here and
+/// would only have surfaced in a downstream consumer — an API break as an
+/// incidental side effect of a media change, which is not a decision anyone
+/// made. It is now `Copy` again, and that is asserted (see
+/// [`Self::untrusted`]'s doctest and `caller_context_is_copy`).
+///
+/// `Copy` is preserved by carrying the account as an INTERNED `&'static str`
+/// rather than a refcounted handle. Interning is sound here precisely because
+/// the value is NOT caller-controlled: an account id can only enter through
+/// [`Self::with_media_account`], which only `crate::gateway_framework` can
+/// call, and it only ever passes a value read out of the operator's
+/// [`ACCOUNT_MAP_ENV`](crate::media::account_map::ACCOUNT_MAP_ENV)
+/// configuration. The intern table is therefore bounded by the number of
+/// household accounts the operator configured — a handful — and never by
+/// request volume or by anything a caller can type. (A tool argument never
+/// reaches this constructor; see `crate::media::recommend::resolve_history_scope`,
+/// which COMPARES an argument against this value and refuses on mismatch.)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CallerContext {
     may_infer_from_calendar: bool,
     may_infer_from_routine: bool,
     /// TERM #576: the household media account this caller IS, or `None` when
     /// the gateway could not determine one. Never read from tool arguments.
-    media_account: Option<std::sync::Arc<str>>,
+    media_account: Option<&'static str>,
 }
+
+/// Compile-time assertion that [`CallerContext`] keeps its `Copy` contract.
+///
+/// This is not decoration: dropping `Copy` from a public shared type is a
+/// semver break, and the previous round dropped it by accident. If someone adds
+/// a non-`Copy` field, THIS line fails to compile — before any test runs, and
+/// with a message that points at the contract rather than at some distant
+/// consumer's move error.
+const _: fn() = || {
+    fn assert_copy<T: Copy>() {}
+    assert_copy::<CallerContext>();
+};
 
 impl CallerContext {
     /// The fail-closed value: an unknown, unauthenticated or unrecognised
@@ -113,9 +145,25 @@ impl CallerContext {
     ///
     /// ```compile_fail
     /// use terminus_rs::tool::CallerContext;
-    /// use std::sync::Arc;
     /// // error[E0624]: `with_media_account` is private
-    /// let _forged = CallerContext::untrusted().with_media_account(Some(Arc::from("acct-operator")));
+    /// let _forged = CallerContext::untrusted().with_media_account(Some("acct-operator"));
+    /// ```
+    ///
+    /// # The public `Copy` contract (TERM #576, review round 2)
+    ///
+    /// Asserted from OUTSIDE the crate, which is the only place the break would
+    /// ever have been felt: this doctest passes the value by value twice, which
+    /// compiles only while `CallerContext: Copy`. If the type is downgraded to
+    /// `Clone`-only again, this FAILS with "use of moved value" under
+    /// `cargo test --doc` — the alarm that was missing last round.
+    ///
+    /// ```
+    /// use terminus_rs::tool::CallerContext;
+    /// fn takes_by_value(_c: CallerContext) {}
+    /// let c = CallerContext::untrusted();
+    /// takes_by_value(c);
+    /// takes_by_value(c); // still usable: Copy, not moved
+    /// assert!(c.media_account().is_none());
     /// ```
     pub const fn untrusted() -> Self {
         Self { may_infer_from_calendar: false, may_infer_from_routine: false, media_account: None }
@@ -145,8 +193,10 @@ impl CallerContext {
     /// signature: the two entitlements are independent, and keeping the
     /// existing constructor untouched means every caller that does not care
     /// about media keeps the fail-closed `None`.
-    pub(super) fn with_media_account(mut self, account: Option<std::sync::Arc<str>>) -> Self {
-        self.media_account = account;
+    /// Takes a plain `&str` and interns it, so the field can stay `Copy` (see
+    /// the type doc) without the caller having to know that.
+    pub(super) fn with_media_account(mut self, account: Option<&str>) -> Self {
+        self.media_account = account.map(account_intern::intern);
         self
     }
 
@@ -171,7 +221,7 @@ impl CallerContext {
     /// it does not exist in any shipped binary.
     #[cfg(test)]
     pub(crate) fn with_media_account_for_test_only(account: &str) -> Self {
-        Self::untrusted().with_media_account(Some(std::sync::Arc::from(account)))
+        Self::untrusted().with_media_account(Some(account))
     }
 
     /// May a tool consult the OPERATOR's calendar on this caller's behalf?
@@ -195,7 +245,44 @@ impl CallerContext {
     /// member watched most recently, so the answer depended on who watched
     /// last rather than on who was asking.
     pub fn media_account(&self) -> Option<&str> {
-        self.media_account.as_deref()
+        self.media_account
+    }
+}
+
+/// TERM #576 (review round 2): the interning that lets [`CallerContext`] stay
+/// `Copy` while still carrying a variable-length account id.
+///
+/// Deliberately tiny and deliberately private. The safety argument is entirely
+/// about WHAT gets interned, not about the table: only
+/// [`CallerContext::with_media_account`] calls this, only
+/// `crate::gateway_framework` can call that, and the value it passes always
+/// comes from the operator's configured account map — so the set of interned
+/// strings is bounded by the operator's configuration (a handful of household
+/// accounts), not by traffic. A caller-supplied `account_id` never reaches
+/// here; it is only ever COMPARED against an already-interned value.
+mod account_intern {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    fn table() -> &'static Mutex<HashSet<&'static str>> {
+        static TABLE: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+        TABLE.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    /// Return the one `'static` copy of `s`, allocating it on first sight.
+    ///
+    /// A poisoned lock is recovered rather than propagated: this table holds no
+    /// invariant that a panic elsewhere could have broken (it is a set of
+    /// immutable strings), and panicking here would turn an unrelated failure
+    /// into a fail-OPEN gateway outage.
+    pub(super) fn intern(s: &str) -> &'static str {
+        let mut table = table().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = table.get(s) {
+            return existing;
+        }
+        let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+        table.insert(leaked);
+        leaked
     }
 }
 
@@ -240,8 +327,7 @@ mod tests {
     fn media_account_is_absent_unless_the_gateway_attaches_one() {
         assert_eq!(CallerContext::from_allowlist_decision(true, true).media_account(), None);
 
-        let scoped = CallerContext::from_allowlist_decision(false, false)
-            .with_media_account(Some(std::sync::Arc::from("acct-1")));
+        let scoped = CallerContext::from_allowlist_decision(false, false).with_media_account(Some("acct-1"));
         assert_eq!(scoped.media_account(), Some("acct-1"));
         // Orthogonal to the weather entitlements in both directions.
         assert!(!scoped.may_infer_from_calendar() && !scoped.may_infer_from_routine());
@@ -250,6 +336,35 @@ mod tests {
             CallerContext::from_allowlist_decision(false, false).with_media_account(None),
             CallerContext::untrusted()
         );
+    }
+
+    /// TERM #576 (review round 2): the public `Copy` contract, asserted in a
+    /// form that FAILS TO COMPILE if it is ever dropped again.
+    ///
+    /// `ctx` is used after being passed by value twice; that is only legal
+    /// while the type is `Copy`. Note what the failure looks like: `cargo test
+    /// --lib` goes RED at COMPILE time, not with an assertion message. That is
+    /// the honest shape of this property — it is a type-system fact, so a
+    /// runtime `assert!` could never observe it. (The `const _` assertion at
+    /// the top of this file catches the same regression even earlier, and the
+    /// doctest on `untrusted()` catches it from OUTSIDE the crate, which is
+    /// where a consumer would feel it.)
+    #[test]
+    fn caller_context_is_copy() {
+        fn by_value(c: CallerContext) -> Option<&'static str> {
+            c.media_account
+        }
+
+        let ctx = CallerContext::from_allowlist_decision(true, false).with_media_account(Some("acct-copy"));
+        assert_eq!(by_value(ctx), Some("acct-copy"));
+        assert_eq!(by_value(ctx), Some("acct-copy"));
+        assert!(ctx.may_infer_from_calendar());
+
+        // Interning is transparent: equal ids compare equal (and, because they
+        // are interned, are literally the same pointer).
+        let again = CallerContext::untrusted().with_media_account(Some("acct-copy"));
+        assert_eq!(again.media_account(), Some("acct-copy"));
+        assert!(std::ptr::eq(again.media_account().unwrap(), ctx.media_account().unwrap()));
     }
 
     #[test]

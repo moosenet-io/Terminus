@@ -150,14 +150,24 @@ pub(super) enum HistoryScope {
     Unentitled,
 }
 
-/// The refusal message for a caller asking for an account that is not theirs.
+/// The ONE refusal message for every unusable `account_id`, whatever is wrong
+/// with it.
 ///
 /// Deliberately names NEITHER the requested account nor the caller's own: a
 /// refusal that echoes ids back is a probe oracle ("is 7 a real account?" /
 /// "which account am I?"). It says only that the request was refused and what
 /// the caller may do instead.
-const FOREIGN_ACCOUNT_REFUSAL: &str =
-    "account_id may only be your own media account. Omit it and I'll use yours.";
+///
+/// **One message for every rejection is itself the property** (TERM #576,
+/// review round 2). "Not yours", "no such account", "you are nobody" and
+/// "that isn't even a string" are byte-identical here, so the refusal
+/// distinguishes nothing about the household: a caller cannot learn whether an
+/// id they guessed exists, whether it differs from their own, or whether they
+/// are mapped at all. Splitting this into per-cause messages would be friendlier
+/// and would reintroduce exactly the oracle the constant exists to close — so
+/// if you are tempted, add the detail to a LOG line, not to the response.
+const ACCOUNT_ID_REFUSAL: &str =
+    "account_id may only be your own media account, given as a non-empty string. Omit it and I'll use yours.";
 
 /// TERM #576 — the whole fix, in one pure, unit-testable function.
 ///
@@ -184,8 +194,38 @@ pub(super) fn resolve_history_scope(explicit: Option<&str>, caller: &CallerConte
     match (caller.media_account(), explicit) {
         (Some(own), None) => Ok(HistoryScope::Account(own.to_string())),
         (Some(own), Some(asked)) if asked == own => Ok(HistoryScope::Account(own.to_string())),
-        (_, Some(_)) => Err(ToolError::InvalidArgument(FOREIGN_ACCOUNT_REFUSAL.into())),
+        (_, Some(_)) => Err(ToolError::InvalidArgument(ACCOUNT_ID_REFUSAL.into())),
         (None, None) => Ok(HistoryScope::Unentitled),
+    }
+}
+
+/// TERM #576 (review round 2) — read the caller-supplied `account_id` argument,
+/// REFUSING every present-but-unusable shape instead of quietly discarding it.
+///
+/// This is the type-level half of the same "reject, don't ignore" decision
+/// [`resolve_history_scope`] documents, and it closes the hole that decision
+/// still had. The extraction used to be
+/// `args.get("account_id").and_then(|v| v.as_str()).filter(non-empty)`, so a
+/// `{"account_id": 12345}` — a number, an object, an array, `null`, a bool, or
+/// a blank string — collapsed to `None`, which is INDISTINGUISHABLE from
+/// omitting the argument. The call then proceeded happily against the caller's
+/// OWN account and returned `200 OK`, with nothing anywhere saying the argument
+/// had been thrown away. That is the same defect one type-check up: a parameter
+/// that looks honoured and is not is exactly how this class of bug hides.
+///
+/// So: key ABSENT ⇒ `Ok(None)`, the omitted path (the caller asked for no
+/// particular account and gets their own). Key PRESENT but not a usable
+/// non-blank string ⇒ refused, with the same [`ACCOUNT_ID_REFUSAL`] every other
+/// rejection uses, so a malformed argument is not a probe for anything either.
+pub(super) fn requested_account(args: &Value) -> Result<Option<&str>, ToolError> {
+    let Some(raw) = args.get("account_id") else {
+        return Ok(None);
+    };
+    match raw.as_str().map(str::trim) {
+        Some(trimmed) if !trimmed.is_empty() => Ok(Some(trimmed)),
+        // Covers number / object / array / bool / null (present-but-null is a
+        // supplied value, not an omission) and blank-or-whitespace strings.
+        _ => Err(ToolError::InvalidArgument(ACCOUNT_ID_REFUSAL.into())),
     }
 }
 
@@ -389,7 +429,7 @@ impl RustTool for MediaRecommend {
                 },
                 "account_id": {
                     "type": "string",
-                    "description": "Optional: your OWN media account id. It may not name another household member's account -- doing so is refused, not silently ignored. Omit it and your own account is used."
+                    "description": "Optional: your OWN media account id, as a non-empty string. It may not name another household member's account, and anything that is not a usable string (a number, null, an object) is refused too -- never silently ignored. Omit it and your own account is used."
                 }
             }
         })
@@ -416,7 +456,9 @@ impl RustTool for MediaRecommend {
 impl MediaRecommend {
     pub(super) async fn run(&self, args: Value, caller: CallerContext) -> Result<String, ToolError> {
         let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(Self::DEFAULT_LIMIT).max(1);
-        let account_id = args.get("account_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+        // TERM #576 (round 2): a present-but-malformed `account_id` is refused
+        // HERE, before it can masquerade as an omitted one.
+        let account_id = requested_account(&args)?;
 
         // TERM #576: decide WHOSE history (if anyone's) before touching Plex.
         // A refusal short-circuits here, so a request for another member's
@@ -962,6 +1004,99 @@ mod tests {
         // ...including an id that happens to be nobody's: an unmapped caller
         // owns no account, so no account_id can be theirs.
         assert!(matches!(resolve_history_scope(Some("acct-anything"), &guest()), Err(ToolError::InvalidArgument(_))));
+    }
+
+    // ── TERM #576 round 2: a MALFORMED account_id is refused, not dropped ───
+
+    /// A present-but-non-string `account_id` used to collapse to `None` and be
+    /// indistinguishable from omitting it, so the call succeeded against the
+    /// caller's own account with no sign the argument had been discarded.
+    #[test]
+    fn a_present_but_non_string_account_id_is_refused() {
+        for malformed in [
+            json!({ "account_id": 12345 }),
+            json!({ "account_id": 1.5 }),
+            json!({ "account_id": true }),
+            json!({ "account_id": null }),
+            json!({ "account_id": { "id": OTHER_MEMBER_ACCOUNT } }),
+            json!({ "account_id": [OTHER_MEMBER_ACCOUNT] }),
+        ] {
+            let err = requested_account(&malformed)
+                .expect_err("a supplied-but-unusable account_id must be refused, never treated as omitted");
+            assert!(matches!(err, ToolError::InvalidArgument(_)), "malformed input: {malformed}");
+        }
+    }
+
+    #[test]
+    fn an_empty_or_whitespace_account_id_is_refused() {
+        for blank in [json!({ "account_id": "" }), json!({ "account_id": "   " }), json!({ "account_id": "\t\n" })] {
+            assert!(
+                matches!(requested_account(&blank), Err(ToolError::InvalidArgument(_))),
+                "blank input: {blank}"
+            );
+        }
+    }
+
+    /// POSITIVE CONTROL for the guard above: an ABSENT key is still the omitted
+    /// path. Without this, "refuse everything" would pass every other test here.
+    #[test]
+    fn an_absent_account_id_is_the_omitted_path_not_a_refusal() {
+        assert_eq!(requested_account(&json!({})).unwrap(), None);
+        assert_eq!(requested_account(&json!({ "limit": 3 })).unwrap(), None);
+        // And a well-formed one still comes through, trimmed.
+        assert_eq!(requested_account(&json!({ "account_id": "  acct-x  " })).unwrap(), Some("acct-x"));
+    }
+
+    /// NO PROBE ORACLE: every refusal is byte-identical, so a caller cannot
+    /// use the message to learn whether an account exists, whether it is
+    /// theirs, or whether they are mapped at all.
+    #[test]
+    fn every_account_id_refusal_is_the_same_message() {
+        let msg = |r: Result<HistoryScope, ToolError>| r.unwrap_err().to_string();
+        let arg_msg = |v: Value| requested_account(&v).unwrap_err().to_string();
+
+        let refusals = [
+            // An account that EXISTS in this household but is not the caller's.
+            msg(resolve_history_scope(Some(OTHER_MEMBER_ACCOUNT), &caller_for(OPERATOR_ACCOUNT))),
+            // An account that exists nowhere at all.
+            msg(resolve_history_scope(Some("acct-does-not-exist"), &caller_for(OPERATOR_ACCOUNT))),
+            // An unmapped caller naming an existing account...
+            msg(resolve_history_scope(Some(OTHER_MEMBER_ACCOUNT), &guest())),
+            // ...and a nonexistent one.
+            msg(resolve_history_scope(Some("acct-does-not-exist"), &guest())),
+            // And every malformed shape.
+            arg_msg(json!({ "account_id": 12345 })),
+            arg_msg(json!({ "account_id": null })),
+            arg_msg(json!({ "account_id": "" })),
+        ];
+
+        for r in &refusals {
+            assert_eq!(r, &refusals[0], "refusals must not vary with the cause -- that variation IS the oracle");
+            assert!(!r.contains(OTHER_MEMBER_ACCOUNT) && !r.contains(OPERATOR_ACCOUNT));
+            assert!(!r.contains("does-not-exist"));
+        }
+    }
+
+    /// END-TO-END on the READ path: a malformed argument is refused before
+    /// Plex is touched, so it cannot be answered from the caller's own history
+    /// as if it had been omitted.
+    #[tokio::test]
+    async fn media_recommend_refuses_a_malformed_account_id_without_reading_history() {
+        let plex_server = MockServer::start();
+        let history_mock = plex_server.mock(|when, then| {
+            when.method(GET).path("/status/sessions/history/all");
+            then.status(200).json_body(json!({ "MediaContainer": { "Metadata": [] } }));
+        });
+        let tool = MediaRecommend { plex: Some(plex_client(&plex_server.base_url())), radarr: None, sonarr: None };
+
+        for malformed in [json!({ "account_id": 12345 }), json!({ "account_id": null }), json!({ "account_id": "  " })] {
+            let err = tool
+                .run(malformed.clone(), caller_for(OPERATOR_ACCOUNT))
+                .await
+                .expect_err("a malformed account_id must not be silently honoured as the caller's own");
+            assert!(matches!(err, ToolError::InvalidArgument(_)), "input: {malformed}");
+        }
+        assert_eq!(history_mock.hits(), 0, "a refused request must not read history");
     }
 
     // ── TERM #576: end-to-end content assertions ────────────────────────────

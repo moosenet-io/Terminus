@@ -1782,7 +1782,7 @@ impl GatewayFramework {
         // instead of to whoever watched last. Unmapped principals — which is
         // every guest unless the operator deliberately binds one — resolve to
         // `None`, the unentitled path. See `crate::media::account_map`.
-        .with_media_account(crate::media::account_map::account_for_principal(p.name()))
+        .with_media_account(crate::media::account_map::account_for_principal(p.name()).as_deref())
     }
 
     pub fn filter_catalog_for_principal(&self, principal: Option<&Principal>, tools: Vec<Value>) -> Vec<Value> {
