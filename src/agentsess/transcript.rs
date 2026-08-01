@@ -306,9 +306,14 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
                     // Private reasoning — never republished (see module doc),
                     // but a RECOGNISED block: its presence is not drift.
                     Some("thinking") => recognised_any = true,
+                    // A recognised block TYPE whose required field is missing
+                    // or wrongly typed is still drift: `{"type":"text","text":42}`
+                    // would otherwise count as understood while yielding
+                    // nothing. Recognition therefore requires the block to be
+                    // USABLE, not merely to carry a familiar type tag.
                     Some("text") => {
-                        recognised_any = true;
                         if let Some(t) = b.get("text").and_then(Value::as_str) {
+                            recognised_any = true;
                             if !t.trim().is_empty() {
                                 out.push(ActivityEvent {
                                     at,
@@ -320,8 +325,13 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
                         }
                     }
                     Some("tool_use") => {
+                        let Some(name) = b.get("name").and_then(Value::as_str) else {
+                            // A tool call with no usable name tells an observer
+                            // nothing — treat as drift rather than emitting a
+                            // placeholder "tool" line.
+                            continue;
+                        };
                         recognised_any = true;
-                        let name = b.get("name").and_then(Value::as_str).unwrap_or("tool");
                         let arg = b.get("input").and_then(primary_arg);
                         let summary = match &arg {
                             Some(a) => format!("{name}: {a}"),
@@ -637,6 +647,34 @@ mod tests {
         // But a MIX containing one recognised block is still understood.
         assert!(u(json!({"type": "assistant", "message": {"content": [
             {"type": "future_block"}, {"type": "text", "text": "hi"}]}})));
+    }
+
+    #[test]
+    fn a_familiar_block_type_with_an_unusable_field_is_drift_not_understood() {
+        // Recognition requires the block to be USABLE, not merely to carry a
+        // familiar type tag: these yield nothing, so counting them understood
+        // would silently shorten the feed.
+        let u = |v: serde_json::Value| classify_record(&v).understood;
+
+        // `text` present but not a string.
+        assert!(!u(json!({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": 42}]}})));
+        // `text` missing entirely.
+        assert!(!u(json!({"type": "assistant", "message": {"content": [
+            {"type": "text"}]}})));
+        // `tool_use` with no usable name — a placeholder line would tell an
+        // observer nothing, so it is drift rather than a "tool" event.
+        assert!(!u(json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "input": {"file_path": "/x"}}]}})));
+        assert!(!u(json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": 7}]}})));
+
+        // An EMPTY string is a usable text block — recognised, just silent.
+        assert!(u(json!({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "   "}]}})));
+        // A well-formed tool_use with no input is still usable.
+        assert!(u(json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash"}]}})));
     }
 
     #[test]
