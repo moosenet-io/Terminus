@@ -333,11 +333,25 @@ impl CallerContext {
     ///
     /// `pub(super)` for the same reason as the constructors above. The value
     /// MUST already have been checked against the operator's roster by
-    /// [`crate::mesh::person::verify`] — that is what bounds the intern table
-    /// (see the type doc's interning note), and passing an unchecked,
-    /// caller-varying string here would turn it into an unbounded leak.
+    /// [`crate::mesh::person::verify`]: that is what keeps the intern table
+    /// driven by OPERATOR configuration rather than by callers, and passing an
+    /// unchecked, caller-varying string here would hand an attacker the ability
+    /// to fill it.
+    ///
+    /// Note what that check does and does not buy. The roster is re-read per
+    /// request, not frozen at startup, so the table is bounded by every
+    /// identifier ever accepted in this process's lifetime — NOT by the roster
+    /// as currently configured. Rotating the roster repeatedly would grow it.
+    /// The hard bound is `account_intern::MAX_INTERNED`; past it, a person who
+    /// cannot be recorded is treated as unidentified rather than as the service.
     pub(super) fn person_scope_for(person: &str) -> PersonScope {
-        PersonScope::Person(account_intern::intern(person))
+        match account_intern::intern(person) {
+            Some(interned) => PersonScope::Person(interned),
+            // The table is full, so this identity cannot be recorded. Answering
+            // as the shared service would be the one direction this item exists
+            // to rule out, so an unrecordable person is an UNidentified one.
+            None => PersonScope::Unidentified,
+        }
     }
 
     /// TERM #576: attach the household media account the gateway resolved for
@@ -354,7 +368,9 @@ impl CallerContext {
     /// Takes a plain `&str` and interns it, so the field can stay `Copy` (see
     /// the type doc) without the caller having to know that.
     pub(super) fn with_media_account(mut self, account: Option<&str>) -> Self {
-        self.media_account = account.map(account_intern::intern);
+        // `and_then`, not `map`: an account we cannot intern resolves to NO
+        // account rather than to someone else's.
+        self.media_account = account.and_then(account_intern::intern);
         self
     }
 
@@ -455,20 +471,107 @@ mod account_intern {
         TABLE.get_or_init(|| Mutex::new(HashSet::new()))
     }
 
-    /// Return the one `'static` copy of `s`, allocating it on first sight.
+    /// The most distinct identifiers this process will ever intern.
+    ///
+    /// Interning leaks by construction (`Box::leak` is what buys the `'static`
+    /// that keeps [`CallerContext`] `Copy`), so the table can only grow. Every
+    /// value that reaches here has already been checked against operator
+    /// configuration — the roster for a person, the account map for a media
+    /// account — so growth is driven by an operator editing config, never by a
+    /// caller. But config is re-read per request rather than frozen at startup,
+    /// so repeated roster rotation over a long-lived process WOULD otherwise
+    /// grow this without bound. The cap turns "unbounded" into "bounded", which
+    /// is the honest guarantee.
+    ///
+    /// Sized for a household with room for years of churn: the real roster is a
+    /// handful of names, so anything approaching this means something is wrong.
+    pub(super) const MAX_INTERNED: usize = 1024;
+
+    /// Return the one `'static` copy of `s`, allocating it on first sight, or
+    /// `None` when the table is full.
+    ///
+    /// `None` is deliberately NOT "carry on without the identifier": every
+    /// caller maps it to LESS privilege (an unidentified person, no media
+    /// account), because failing to record who someone is must never resolve to
+    /// treating them as the shared service. An already-interned value is always
+    /// returned even at the cap, so a full table degrades new identities rather
+    /// than breaking every existing one.
     ///
     /// A poisoned lock is recovered rather than propagated: this table holds no
     /// invariant that a panic elsewhere could have broken (it is a set of
     /// immutable strings), and panicking here would turn an unrelated failure
-    /// into a fail-OPEN gateway outage.
-    pub(super) fn intern(s: &str) -> &'static str {
+    /// into a gateway outage.
+    pub(super) fn intern(s: &str) -> Option<&'static str> {
         let mut table = table().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        intern_into(&mut table, s, MAX_INTERNED)
+    }
+
+    /// The cap logic itself, against a CALLER-SUPPLIED table.
+    ///
+    /// Split out purely so a test can prove the bound binds without filling the
+    /// process-wide table: interning leaks by construction, so a test that
+    /// exhausted the real one would permanently degrade every later test in the
+    /// same binary to `Unidentified` — a test that breaks its neighbours is
+    /// worse than the leak it was checking for.
+    fn intern_into(
+        table: &mut HashSet<&'static str>,
+        s: &str,
+        max: usize,
+    ) -> Option<&'static str> {
         if let Some(existing) = table.get(s) {
-            return existing;
+            return Some(existing);
+        }
+        if table.len() >= max {
+            return None;
         }
         let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
         table.insert(leaked);
-        leaked
+        Some(leaked)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The cap binds, and it fails in the SAFE direction: a value that
+        /// cannot be recorded yields `None`, which every caller maps to LESS
+        /// privilege (unidentified person, no media account) rather than to the
+        /// shared service identity.
+        #[test]
+        fn the_cap_binds_and_already_interned_values_still_resolve() {
+            let mut table = HashSet::new();
+            for i in 0..4 {
+                assert!(intern_into(&mut table, &format!("person-{i}"), 4).is_some());
+            }
+            assert_eq!(table.len(), 4);
+
+            // Full: a NEW identifier can no longer be recorded.
+            assert!(
+                intern_into(&mut table, "one-too-many", 4).is_none(),
+                "the cap must actually bind, or the leak is still unbounded"
+            );
+            assert_eq!(table.len(), 4, "a refused intern must not grow the table");
+
+            // POSITIVE CONTROL: an ALREADY-interned value still resolves even at
+            // the cap, so a full table degrades NEW identities rather than
+            // breaking every existing one. Without this, an implementation that
+            // simply returned `None` always would pass the assertion above.
+            assert!(
+                intern_into(&mut table, "person-0", 4).is_some(),
+                "an already-interned value must keep working at the cap"
+            );
+        }
+
+        /// Interning is idempotent: the same string always yields the same
+        /// pointer, which is what makes `PersonScope` comparable by identity.
+        #[test]
+        fn interning_the_same_value_twice_returns_the_same_pointer() {
+            let mut table = HashSet::new();
+            let a = intern_into(&mut table, "alice", 8).unwrap(); // pii-test-fixture
+            let b = intern_into(&mut table, "alice", 8).unwrap(); // pii-test-fixture
+            assert!(std::ptr::eq(a, b));
+            assert_eq!(table.len(), 1);
+        }
     }
 }
 
