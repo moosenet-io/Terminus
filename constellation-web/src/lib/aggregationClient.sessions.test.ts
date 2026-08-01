@@ -115,6 +115,11 @@ describe('MACT-03: mockAdapter.muse.sessions.terminate()', () => {
     const res = await mockAdapter.muse.sessions.terminate('does-not-exist');
     expect(res.kind).toBe('not_found');
   });
+
+  it('the reserved ambiguous-session sentinel resolves kind: conflict, never throws', async () => {
+    const res = await mockAdapter.muse.sessions.terminate('sess-mock-ambiguous');
+    expect(res.kind).toBe('conflict');
+  });
 });
 
 // ── httpAdapter: degrade-not-throw + typed 403 vs transport failure ──────────────────────────
@@ -178,6 +183,30 @@ describe('MACT-03: httpAdapter.muse.sessions -- degrade-not-throw + typed termin
 
     globalThis.fetch = vi.fn().mockResolvedValue(new Response(null, { status: 503 }));
     expect((await httpAdapter.muse.sessions.terminate('x')).kind).toBe('unavailable');
+  });
+
+  it('terminate() 409 resolves kind: conflict, distinct from not_found and error (MACT-02 AmbiguousSession/AmbiguousTarget)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ error: 'more than one live session currently matches session_key x; refusing to guess which one to stop' }),
+        { status: 409 },
+      ),
+    );
+    const res = await httpAdapter.muse.sessions.terminate('x');
+    expect(res.kind).toBe('conflict');
+    expect(res.kind).not.toBe('not_found');
+    expect(res.kind).not.toBe('error');
+    if (res.kind === 'conflict') {
+      expect(res.detail).toMatch(/refusing to guess/);
+    }
+  });
+
+  it("terminate() reads the real Muse error body ({\"error\": ...}) as the typed result's detail", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: 'no live session for session_key x' }), { status: 404 }),
+    );
+    const res = await httpAdapter.muse.sessions.terminate('x');
+    expect(res).toMatchObject({ kind: 'not_found', detail: 'no live session for session_key x' });
   });
 
   it('terminate() success reports the real outcome fields, never fabricating success', async () => {

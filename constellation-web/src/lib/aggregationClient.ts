@@ -441,23 +441,36 @@ export interface HistorySessionsResult {
 
 /** `terminate()`'s outcome. `POST /api/sessions/:session_key/terminate` is this module's only
  *  mutation and the only item in this spec with real-world blast radius (it interrupts a
- *  person's stream), so its result is a discriminated union rather than a boolean/throw:
+ *  person's stream), so its result is a discriminated union rather than a boolean/throw. The
+ *  `'ok'` variant mirrors Rust `TerminateSessionResponse` (`Muse/src/web/dashboard.rs`) field for
+ *  field — `stopped`/`backend`/`reason_delivered`, none optional, no `skip_serializing_if` on any
+ *  of the three (unlike `progress_pct` above, this struct has no absent-key case to model). The
+ *  refusal variants mirror the handler's own `MuseError` → status mapping
+ *  (`terminate_session`/`plex_control::resolve_live_target`'s `ResolveOutcome` arms):
  *   - `'ok'` — the backend actually attempted the stop; `stopped` reports what REALLY happened
  *     (a player that ignored a best-effort stop is `stopped: false`, never an optimistic `true`).
  *   - `'forbidden'` — a `403` from Terminus's `enforce_viewer_role_gate` (a viewer session tried
- *     to mutate). Rendered "operator role required", not "failed" — see MACT-02's gate design.
- *   - `'not_found'` — the `session_key` isn't in the live set; `404`, no relay was attempted.
- *   - `'unavailable'` — `503`, no `CastController` configured; never a fabricated success.
+ *     to mutate; enforced upstream of Muse, not by this struct). Rendered "operator role
+ *     required", not "failed".
+ *   - `'not_found'` — `404`: `ResolveOutcome::NotFound` (no live session for this key) OR
+ *     `ResolveOutcome::StaleSession` (MACT-01's `stale` state — deliberately never resolves a
+ *     terminate target, so an old stale session can't stop a newer one sharing the same device).
+ *     Both collapse to the same caller-facing "no session Muse currently vouches for as live".
+ *   - `'conflict'` — `409`: `ResolveOutcome::AmbiguousSession` (a non-unique `session_key`) OR
+ *     `ResolveOutcome::AmbiguousTarget` (a non-unique `plex_clients` display name). Muse refuses
+ *     to guess which of several candidates to stop — this is NOT the same failure as
+ *     `'not_found'` (a target exists, just not a safely-unique one) and must render distinctly,
+ *     not collapse into a generic error.
+ *   - `'unavailable'` — `503`: no `CastController` configured (`ResolveOutcome` never reached),
+ *     `ResolveOutcome::NoTarget` (live but no resolvable target), or `ResolveOutcome::StaleTarget`
+ *     (a unique `plex_clients` match that's too old to trust) — never a fabricated success.
  *   - `'error'` — anything else: a real network/transport failure, or an unexpected status. This
- *     is the case a `403` must NOT collapse into, per this item's acceptance criteria.
- *  No Rust `#[derive(Serialize)]` struct exists for the success body yet — MACT-02 (this item's
- *  other blocker) has not landed in Muse. The `'ok'` shape is typed from MACT-02's spec-item
- *  prose (`{stopped, backend, reason_delivered}`) rather than a live capture; re-verify against
- *  the real struct once MACT-02 merges. */
+ *     is the case a `403`/`409` must NOT collapse into, per this item's acceptance criteria. */
 export type MuseTerminateResult =
   | { kind: 'ok'; stopped: boolean; backend: string; reason_delivered: boolean }
   | { kind: 'forbidden'; detail: string }
   | { kind: 'not_found'; detail: string }
+  | { kind: 'conflict'; detail: string }
   | { kind: 'unavailable'; detail: string }
   | { kind: 'error'; detail: string };
 
@@ -819,6 +832,12 @@ const MOCK_MUSE_LIVE_SESSIONS: LiveSession[] = [
     },
   },
 ];
+
+/** A session_key that never appears in `MOCK_MUSE_LIVE_SESSIONS`, reserved as the mock world's
+ *  trigger for `terminate()`'s `'conflict'` (409) outcome — mirrors Rust
+ *  `ResolveOutcome::AmbiguousSession`/`::AmbiguousTarget` (a non-unique `session_key` or
+ *  `plex_clients` display name; see `MuseTerminateResult`'s doc comment). */
+const MOCK_MUSE_CONFLICT_SESSION_KEY = 'sess-mock-ambiguous';
 
 const MOCK_MUSE_HISTORY_SESSIONS: HistorySession[] = [
   {
@@ -2057,6 +2076,16 @@ const mockAdapter: AggregationClient = {
       },
       async terminate(sessionKey: string): Promise<MuseTerminateResult> {
         return withMutationResultEvent('muse', `/api/sessions/${sessionKey}/terminate`, { method: 'POST' }, async () => {
+          // A dedicated sentinel key exercises the 409 path in mock mode -- `MOCK_MUSE_CONFLICT_SESSION_KEY`
+          // is not present in `MOCK_MUSE_LIVE_SESSIONS` (a real `AmbiguousSession`/`AmbiguousTarget`
+          // still resolves to a live row; the mock just needs a reachable trigger, not a faithful
+          // ambiguity), so it must be checked BEFORE the "known" lookup below.
+          if (sessionKey === MOCK_MUSE_CONFLICT_SESSION_KEY) {
+            return delay<MuseTerminateResult>({
+              kind: 'conflict',
+              detail: 'more than one live session currently matches this session_key; refusing to guess which one to stop',
+            });
+          }
           const known = MOCK_MUSE_LIVE_SESSIONS.some(s => s.session_key === sessionKey);
           if (!known) {
             return delay<MuseTerminateResult>({ kind: 'not_found', detail: 'session not in the live set' });
@@ -2392,14 +2421,30 @@ const httpAdapter: AggregationClient = {
               method: 'POST',
               body: JSON.stringify(reason != null ? { reason } : {}),
             });
+            // Muse's `MuseError::into_response` always shapes a refusal body as `{"error":
+            // "<message>"}` (`Muse/src/error.rs`) — prefer that real message when present,
+            // falling back to a generic one only if the body is missing/malformed.
+            const errorDetail = (body as { error?: string } | undefined)?.error;
             if (status === 403) {
-              return { kind: 'forbidden', detail: 'operator role required' };
+              // 403 is enforced upstream by Terminus's `enforce_viewer_role_gate`, never by
+              // Muse itself, so there's no `{"error": ...}` body to read here — see MACT-02's
+              // module doc's "Auth is layered" note.
+              return { kind: 'forbidden', detail: errorDetail ?? 'operator role required' };
             }
             if (status === 404) {
-              return { kind: 'not_found', detail: 'session not in the live set' };
+              // `ResolveOutcome::NotFound` (no live session) or `::StaleSession` (MACT-01's
+              // `stale` state never resolves a terminate target) both land here.
+              return { kind: 'not_found', detail: errorDetail ?? 'session not in the live set' };
+            }
+            if (status === 409) {
+              // `ResolveOutcome::AmbiguousSession`/`::AmbiguousTarget` — a non-unique
+              // `session_key`/`plex_clients` name match. Distinct from `not_found`: a target
+              // exists, just not a safely-unique one to relay a stop to.
+              return { kind: 'conflict', detail: errorDetail ?? 'more than one session matches; refusing to guess' };
             }
             if (status === 503) {
-              return { kind: 'unavailable', detail: 'no stream controller configured' };
+              // No `CastController` configured, `::NoTarget`, or `::StaleTarget`.
+              return { kind: 'unavailable', detail: errorDetail ?? 'no stream controller configured' };
             }
             if (status >= 200 && status < 300) {
               const b = (body ?? {}) as Partial<{ stopped: boolean; backend: string; reason_delivered: boolean }>;
