@@ -180,3 +180,87 @@ impl RustTool for AgentsessTranscript {
         Ok(ToolOutput::with_structured(text, structured))
     }
 }
+
+pub struct AgentsessCapture;
+
+#[async_trait]
+impl RustTool for AgentsessCapture {
+    fn name(&self) -> &str {
+        "agentsess_capture"
+    }
+
+    fn description(&self) -> &str {
+        "Capture the recent scrollback of the tmux pane a coder CLI agent session is attached \
+         to, so it can be rendered as a read-only terminal view. Bounded and redacted. This \
+         tool captures only — it cannot send input to a session."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Session id from agentsess_list; its attached pane is captured."
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Explicit tmux pane target 'session:window.pane' instead of a session id."
+                },
+                "lines": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Scrollback lines to capture (default 200, capped by AGENTSESS_CAPTURE_MAX_LINES)."
+                },
+                "host": {
+                    "type": "string",
+                    "enum": ["local", "dev"],
+                    "description": "Which host the session is on. Default 'local'."
+                }
+            },
+            "required": []
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let exec = executor_for(host_arg(&args))?;
+        let lines = args.get("lines").and_then(Value::as_u64).map(|n| n as u32);
+
+        let target = if let Some(t) = args.get("target").and_then(Value::as_str) {
+            t.to_string()
+        } else if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
+            let snapshot = super::discover::discover(exec.as_ref(), None).await?;
+            let session = snapshot
+                .sessions
+                .iter()
+                .find(|s| s.id == sid)
+                .ok_or_else(|| ToolError::NotFound(format!("no live session with id '{sid}'")))?;
+            // A session with no pane is a clear error, not an empty capture:
+            // "nothing to show" and "not attached to a terminal" are different
+            // answers and an operator needs to tell them apart.
+            session
+                .attachment
+                .as_ref()
+                .map(|a| a.target.clone())
+                .ok_or_else(|| {
+                    ToolError::NotFound(format!(
+                        "session '{sid}' is not attached to a tmux pane, so there is nothing to capture"
+                    ))
+                })?
+        } else {
+            return Err(ToolError::InvalidArgument(
+                "one of 'session_id' or 'target' is required".into(),
+            ));
+        };
+
+        let cap = super::capture::capture(exec.as_ref(), &target, lines).await?;
+        let structured = serde_json::to_value(&cap)
+            .map_err(|e| ToolError::Execution(format!("failed to serialize capture: {e}")))?;
+        let text = serde_json::to_string_pretty(&structured).unwrap_or_else(|_| "{}".to_string());
+        Ok(ToolOutput::with_structured(text, structured))
+    }
+}

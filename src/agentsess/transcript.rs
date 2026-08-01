@@ -182,7 +182,7 @@ fn env_assign_re() -> &'static regex::Regex {
 /// summarised rather than echoed in full, and `thinking` blocks are never
 /// surfaced at all. Redaction reduces what slips through the remainder; do not
 /// treat it as a promise that a transcript is safe to publish.
-fn redact(s: &str) -> String {
+pub(crate) fn redact(s: &str) -> String {
     let first = DeterministicCleaner::scrub_text(s);
     env_assign_re()
         .replace_all(&first, "$1=<REDACTED-SECRET>")

@@ -373,6 +373,26 @@ are summarised rather than echoed, and private reasoning is never surfaced.
 |---|---|---|
 | `AGENTSESS_TAIL_BYTES` | `262144` | How much of a transcript tail to read. |
 
+- **`agentsess_capture`** — the recent scrollback of the tmux pane a session is attached to,
+  so it can be rendered as a read-only terminal view. Takes a `session_id` (whose pane target
+  is *constructed*, not parsed) or an explicit `target`, plus `lines` and `host`.
+
+The pane target is the security boundary: argv form stops shell injection but not **option**
+injection, since `tmux` reads a leading-dash argument as a flag. The target is validated
+fail-closed against a deliberately narrow `session:window.pane` shape — narrower than tmux's
+own rules, because a permissive validator is where a separator or an option would hide.
+
+Output is bounded by **both** line count and total bytes (a wide pane blows the byte budget
+long before the line budget), cut on a character boundary, and redacted through the same path
+as the transcript reader — a terminal displays credentials as readily as a transcript does.
+Both caps report when they fire. A session with no pane is a clear error rather than an empty
+capture: "nothing to show" and "not attached to a terminal" are different answers.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AGENTSESS_CAPTURE_MAX_LINES` | `2000` | Scrollback line cap. |
+| `AGENTSESS_CAPTURE_MAX_BYTES` | `262144` | Total byte cap. |
+
 **This suite is read-only by design.** Nothing in it writes a file, sends a keystroke, or
 signals a process. Being able to *watch* an autonomous agent carries no risk; being able to
 *type into* one can alter a build mid-flight. A send capability is a separate, gated change
