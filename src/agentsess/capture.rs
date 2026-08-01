@@ -27,18 +27,31 @@ use super::exec::HostExecutor;
 /// Default lines of scrollback — about a screenful and a half.
 const DEFAULT_LINES: u32 = 200;
 
+/// Line cap, floored at 1.
+///
+/// A configured `0` would otherwise make every capture return nothing at all —
+/// a silent empty result that reads as "the pane is blank" rather than "the
+/// cap is misconfigured". A cap of zero is never a meaningful request, so it is
+/// treated as the minimum rather than honoured literally.
 fn max_lines() -> u32 {
     std::env::var("AGENTSESS_CAPTURE_MAX_LINES")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(2000)
+        .max(1)
 }
 
+/// Byte cap, floored at 1 for the same reason as [`max_lines`]: a configured
+/// `0` would return an empty string on every capture. The floor is deliberately
+/// the minimum rather than something "sensible" — picking a larger floor would
+/// silently override an operator who really did want a tiny cap, and would make
+/// small caps untestable.
 fn max_bytes() -> usize {
     std::env::var("AGENTSESS_CAPTURE_MAX_BYTES")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(256 * 1024)
+        .max(1)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -180,6 +193,34 @@ mod tests {
     use super::*;
     use crate::agentsess::exec::test_support::FakeExecutor;
     use serial_test::serial;
+
+    // Mutates the shared cap env (TERM #588).
+    #[tokio::test]
+    #[serial]
+    async fn a_misconfigured_zero_cap_does_not_silently_return_nothing() {
+        // A cap of 0 is never a meaningful request. Honouring it literally
+        // would return an empty capture that reads as "the pane is blank"
+        // rather than "the cap is misconfigured".
+        std::env::set_var("AGENTSESS_CAPTURE_MAX_LINES", "0");
+        std::env::set_var("AGENTSESS_CAPTURE_MAX_BYTES", "0");
+        let exec = FakeExecutor::new().with_stdout("tmux", "visible line\n");
+        let c = capture(&exec, "build:0.1", Some(10)).await.unwrap();
+        std::env::remove_var("AGENTSESS_CAPTURE_MAX_LINES");
+        std::env::remove_var("AGENTSESS_CAPTURE_MAX_BYTES");
+        assert!(!c.content.is_empty(), "a zero cap must not blank the capture");
+        assert_eq!(c.lines_requested, 1, "floored to the minimum, not zero");
+    }
+
+    // A non-numeric cap falls back to the default rather than to zero.
+    #[tokio::test]
+    #[serial]
+    async fn a_malformed_cap_falls_back_to_the_default() {
+        std::env::set_var("AGENTSESS_CAPTURE_MAX_LINES", "not-a-number");
+        let exec = FakeExecutor::new().with_stdout("tmux", "x\n");
+        let c = capture(&exec, "build:0.1", Some(50)).await.unwrap();
+        std::env::remove_var("AGENTSESS_CAPTURE_MAX_LINES");
+        assert_eq!(c.lines_requested, 50, "default cap 2000 leaves 50 untouched");
+    }
 
     #[test]
     fn valid_targets_are_accepted() {
