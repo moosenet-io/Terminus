@@ -406,6 +406,33 @@ else from it is read, returned, or logged.
 | `AGENTSESS_AGENT_PATTERNS` | *(empty)* | Comma-separated extra program names to treat as agents, for a CLI this build predates. |
 | `AGENTSESS_MAX_SESSIONS` | `50` | Result cap. Truncation is always reported, never silent. |
 
+- **`agentsess_transcript`** — recent activity for one session: a summarised, redacted stream
+  of what it has been *doing* (tool calls with their primary argument, messages), read from the
+  tail of the session's transcript. Takes a `session_id` from `agentsess_list`, or an explicit
+  `transcript_path` (jailed to the transcript root), plus `limit` and `host`.
+
+Activity is **summarised, not streamed raw**: a transcript record carries a whole message, a
+whole tool input, or a whole command's stdout, so each collapses to one short line. Only the
+last `AGENTSESS_TAIL_BYTES` are read — transcripts reach tens of megabytes and none is ever read
+whole. A line that is not JSON is skipped and counted into `skipped_lines`; a record that IS JSON but
+whose shape is unrecognised is skipped and counted into `unknown_records`. The two are kept
+apart because they have different causes — a truncated write versus a CLI format change — and
+either being non-zero turns a format drift into a visible number rather than a silently shorter
+list. Neither pads the feed with "unrecognised record" noise, and assistant `thinking` blocks
+are never surfaced at all.
+
+Strings are scrubbed through the same `DeterministicCleaner` the public mirror uses, plus one
+transcript-specific layer for **unquoted** `NAME=VALUE` shell assignments (including this
+fleet's `*_PAT_*` convention) — a shape the mirror cleaner does not target, because in source
+files such values are quoted. Treat this as best-effort defence in depth, **not a guarantee**: a
+transcript can contain arbitrary text and no pattern set recognises every secret shape. What
+actually bounds exposure is structural — summaries are truncated to one short line, tool results
+are summarised rather than echoed, and private reasoning is never surfaced.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AGENTSESS_TAIL_BYTES` | `262144` | How much of a transcript tail to read. |
+
 **This suite is read-only by design.** Nothing in it writes a file, sends a keystroke, or
 signals a process. Being able to *watch* an autonomous agent carries no risk; being able to
 *type into* one can alter a build mid-flight. A send capability is a separate, gated change
