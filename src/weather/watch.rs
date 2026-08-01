@@ -508,15 +508,35 @@ fn qualifies_as_heat_day(d: &DayWeather) -> bool {
     d.temp_max_c >= HEAT_DAY_MAX_C && d.temp_min_c >= HEAT_NIGHT_MIN_C
 }
 
-/// Longest run of qualifying consecutive days, if it reaches [`HEAT_RUN_DAYS`].
+/// Longest run of qualifying CALENDAR-CONSECUTIVE days, if it reaches
+/// [`HEAT_RUN_DAYS`].
 ///
-/// `days` must be chronological and contiguous, which is what
-/// [`days_from_forecast`] produces.
+/// **Adjacency is verified against the dates, not assumed from the slice order.**
+/// It is tempting to rely on [`days_from_forecast`] producing a
+/// contiguous chronological list — but the provider can omit a date, and then two
+/// qualifying entries that are days apart would sit next to each other in the
+/// slice and be reported as a "sustained" run. That is a false heat-wave warning
+/// built out of a gap in the data, which is precisely the crying-wolf failure the
+/// thresholds exist to avoid. A day whose date cannot be parsed also breaks the
+/// run rather than extending it — fail safe, since "sustained" is the entire
+/// claim being made.
 pub fn heat_run(days: &[DayWeather]) -> Option<HeatRun> {
     let mut best: Vec<DayWeather> = Vec::new();
     let mut cur: Vec<DayWeather> = Vec::new();
+    let mut prev_date: Option<NaiveDate> = None;
     for d in days {
-        if qualifies_as_heat_day(d) {
+        let parsed = NaiveDate::parse_from_str(&d.date, "%Y-%m-%d").ok();
+        let adjacent = match (prev_date, parsed) {
+            (Some(p), Some(c)) => c == p + chrono::Duration::days(1),
+            // No previous day yet: a run may start here.
+            (None, Some(_)) => true,
+            // Unparseable date: cannot prove adjacency, so do not claim it.
+            _ => false,
+        };
+        if qualifies_as_heat_day(d) && parsed.is_some() {
+            if !adjacent {
+                cur.clear();
+            }
             cur.push(d.clone());
             if cur.len() > best.len() {
                 best = cur.clone();
@@ -524,6 +544,7 @@ pub fn heat_run(days: &[DayWeather]) -> Option<HeatRun> {
         } else {
             cur.clear();
         }
+        prev_date = parsed;
     }
     if best.len() < HEAT_RUN_DAYS {
         return None;
@@ -673,9 +694,16 @@ impl WatchReport {
 
         // ── Travel ──
         out.push_str("\nTravel:\n");
-        if self.travel.findings.is_empty() && self.travel.gaps.is_empty() {
+        // The "checked" line is printed whenever something WAS checked and came
+        // back clean, even alongside a gap — it is scoped to the named items, so
+        // it cannot be read as a blanket all-clear, and the gap lines follow it.
+        // Suppressing it whenever any gap existed would throw away the honest
+        // half of a partial answer.
+        if self.travel.findings.is_empty() {
             if self.travel.checked_nothing() {
-                out.push_str("- Nothing checked.\n");
+                if self.travel.gaps.is_empty() {
+                    out.push_str("- Nothing checked.\n");
+                }
             } else {
                 out.push_str(&format!(
                     "- Checked {}: nothing disruptive expected.\n",
@@ -708,9 +736,11 @@ impl WatchReport {
 
         // ── Heat / home power ──
         out.push_str("\nHome heat load:\n");
-        if self.heat.findings.is_empty() && self.heat.gaps.is_empty() {
+        if self.heat.findings.is_empty() {
             if self.heat.checked_nothing() {
-                out.push_str("- Nothing checked.\n");
+                if self.heat.gaps.is_empty() {
+                    out.push_str("- Nothing checked.\n");
+                }
             } else {
                 out.push_str(&format!(
                     "- Checked {}: no sustained heat build-up.\n",
@@ -927,19 +957,28 @@ async fn assess_travel(
             continue;
         };
 
-        let official = forecast
-            .official_alerts(&plan.destination)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        // An ENABLED official feed that FAILS is a gap, not "no alerts in
+        // force" — discarding the error here would let an unavailable
+        // authoritative source render as a clean check, which is the exact
+        // dishonest-degradation this module exists to avoid. (`Ok(None)` is
+        // different: it means no feed is configured, and the derived thresholds
+        // are then the whole answer, already labelled as derived.)
+        let official = match forecast.official_alerts(&plan.destination).await {
+            Ok(o) => o.unwrap_or_default(),
+            Err(e) => {
+                report.gaps.push(Gap::Failed(format!(
+                    "the official alert feed for {label} could not be reached ({e}); \
+                     only derived thresholds were applied"
+                )));
+                Vec::new()
+            }
+        };
         let hazards = travel_hazards(day);
 
         if hazards.is_empty() && official.is_empty() {
             report.checked.push(label);
             continue;
         }
-        report.checked.push(label);
         report.findings.push(TravelFinding {
             plan,
             // An official alert with no derived hazard still deserves reporting,
@@ -980,7 +1019,21 @@ async fn assess_heat(
             )));
         }
     };
-    let official = forecast.official_alerts(&home).await.ok().flatten().unwrap_or_default();
+
+    // Same rule as travel: an ENABLED official feed that fails is a gap, never
+    // a silent "no alerts". The derived thresholds still run, so this degrades
+    // to a partial answer that SAYS it is partial.
+    let mut gaps = Vec::new();
+    let official = match forecast.official_alerts(&home).await {
+        Ok(o) => o.unwrap_or_default(),
+        Err(e) => {
+            gaps.push(Gap::Failed(format!(
+                "the official alert feed for your home area could not be reached ({e}); \
+                 only derived thresholds were applied"
+            )));
+            Vec::new()
+        }
+    };
 
     match heat_run(&days) {
         Some(run) => SubjectReport {
@@ -995,12 +1048,12 @@ async fn assess_heat(
                 official,
             }],
             checked: vec!["your home area".to_string()],
-            gaps: Vec::new(),
+            gaps,
         },
         None => SubjectReport {
             findings: Vec::new(),
             checked: vec!["your home area".to_string()],
-            gaps: Vec::new(),
+            gaps,
         },
     }
 }
@@ -1303,22 +1356,36 @@ mod tests {
         days: Vec<DayWeather>,
         fail: Option<String>,
         official: Option<Vec<String>>,
+        /// The ENABLED-but-broken official feed (distinct from `official: None`,
+        /// which means no feed is configured at all).
+        official_fail: Option<String>,
         calls: Arc<AtomicUsize>,
     }
     impl FakeForecast {
         fn ok(days: Vec<DayWeather>) -> Self {
-            Self { days, fail: None, official: None, calls: Arc::new(AtomicUsize::new(0)) }
+            Self {
+                days,
+                fail: None,
+                official: None,
+                official_fail: None,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
         }
         fn failing() -> Self {
             Self {
                 days: Vec::new(),
                 fail: Some("provider unreachable".into()),
                 official: None,
+                official_fail: None,
                 calls: Arc::new(AtomicUsize::new(0)),
             }
         }
         fn with_official(mut self, a: Vec<&str>) -> Self {
             self.official = Some(a.into_iter().map(str::to_string).collect());
+            self
+        }
+        fn with_broken_official_feed(mut self) -> Self {
+            self.official_fail = Some("official feed HTTP 503".into());
             self
         }
     }
@@ -1332,7 +1399,10 @@ mod tests {
             }
         }
         async fn official_alerts(&self, _place: &str) -> Result<Option<Vec<String>>, String> {
-            Ok(self.official.clone())
+            match &self.official_fail {
+                Some(e) => Err(e.clone()),
+                None => Ok(self.official.clone()),
+            }
         }
     }
 
@@ -1483,6 +1553,85 @@ mod tests {
             hot("2026-08-02", HEAT_SEVERE_MAX_C + 0.5, 24.0),
         ];
         assert_eq!(heat_run(&spike).unwrap().severity, Severity::Severe);
+    }
+
+    /// REVIEW FINDING (gpt56, round 1): `heat_run` used to treat SLICE
+    /// adjacency as CALENDAR adjacency. A provider that omits a date would then
+    /// let two days that are actually days apart be reported as a "sustained"
+    /// run — a false heat-wave warning manufactured out of a gap in the data.
+    #[test]
+    fn a_heat_run_must_be_consecutive_by_date_not_merely_adjacent_in_the_slice() {
+        // 08-01 and 08-03 both qualify, but 08-02 is MISSING from the forecast.
+        let with_a_hole = vec![hot("2026-08-01", 35.0, 24.0), hot("2026-08-03", 35.0, 24.0)];
+        assert!(
+            heat_run(&with_a_hole).is_none(),
+            "a missing intermediate day must break the run, not be papered over"
+        );
+
+        // The control: the same two readings on genuinely consecutive dates DO
+        // qualify — so the assertion above is about adjacency, not the values.
+        let contiguous = vec![hot("2026-08-01", 35.0, 24.0), hot("2026-08-02", 35.0, 24.0)];
+        assert!(heat_run(&contiguous).is_some());
+
+        // A run may still be found AFTER a hole, as long as it is itself contiguous.
+        let hole_then_run = vec![
+            hot("2026-08-01", 35.0, 24.0),
+            hot("2026-08-05", 35.0, 24.0),
+            hot("2026-08-06", 35.0, 24.0),
+        ];
+        let r = heat_run(&hole_then_run).expect("the contiguous tail still qualifies");
+        assert_eq!(r.days.len(), 2);
+        assert_eq!(r.days[0].date, "2026-08-05");
+
+        // An unparseable date cannot prove adjacency, so it must not extend a run.
+        let bad_date = vec![
+            hot("2026-08-01", 35.0, 24.0),
+            hot("not-a-date", 35.0, 24.0),
+            hot("2026-08-02", 35.0, 24.0),
+        ];
+        assert!(heat_run(&bad_date).is_none(), "fail safe on an unparseable date");
+    }
+
+    /// REVIEW FINDING (gpt56, round 1): an ENABLED official alert feed that
+    /// FAILS was being discarded via `.ok().flatten().unwrap_or_default()`, so
+    /// an unavailable authoritative source could render as a clean check. That
+    /// is the dishonest degradation this module exists to prevent — and it
+    /// contradicted `OwmForecast::official_alerts`'s own doc comment.
+    #[tokio::test]
+    async fn a_broken_official_feed_is_a_gap_not_a_silent_no_alerts() {
+        let (cal, _) = CountingCalendar::with(vec![flight_event("20260802", "Examplecity")]);
+        let (loc, _) = CountingLocations::with(Some("Homeplace"));
+        // Derived thresholds find NOTHING, so without this fix the whole report
+        // would read as a clean all-clear despite an unreachable official feed.
+        let fc = FakeForecast::ok(vec![mild("2026-08-01"), mild("2026-08-02"), mild("2026-08-03")])
+            .with_broken_official_feed();
+
+        let r = run_watch(3, operator(), &cal, &loc, &fc, today()).await;
+
+        assert!(!r.travel.is_clear(), "an unreachable official feed is not a clean travel check");
+        assert!(!r.heat.is_clear(), "...nor a clean heat check");
+        assert!(r.travel.gaps.iter().any(|g| matches!(g, Gap::Failed(_))));
+        assert!(r.heat.gaps.iter().any(|g| matches!(g, Gap::Failed(_))));
+
+        let text = r.render();
+        assert!(text.contains("official alert feed"), "{text}");
+        assert!(text.contains("unknown, not clear"), "{text}");
+        // The honest half of a partial answer survives: the derived check that
+        // DID succeed is still reported, scoped to what it covered.
+        assert!(text.contains("nothing disruptive expected"), "{text}");
+        assert!(!text.contains("Homeplace"), "the home location is never echoed: {text}");
+    }
+
+    /// `Ok(None)` — no official feed CONFIGURED — is not a failure and must not
+    /// produce a gap. This is the boundary the fix above must not overshoot.
+    #[tokio::test]
+    async fn no_official_feed_configured_is_not_a_gap() {
+        let (cal, _) = CountingCalendar::with(vec![]);
+        let (loc, _) = CountingLocations::with(Some("Homeplace"));
+        let fc = FakeForecast::ok(vec![mild("2026-08-01")]);
+        let r = run_watch(1, operator(), &cal, &loc, &fc, today()).await;
+        assert!(r.heat.gaps.is_empty(), "an absent feed is not an error");
+        assert!(r.heat.is_clear());
     }
 
     // ── ENTITLEMENT: the non-negotiable one ─────────────────────────────────
