@@ -73,7 +73,7 @@ absent. Returns `"Added {amount} units of product {product_id} to pantry."`.
 
 ## hearth_meal_plan
 
-`GET /api/meal_plan?days={days}` — the upcoming meal plan (`src/hearth/mod.rs:287-325`).
+`GET /api/objects/meal_plan`, windowed client-side — the upcoming meal plan (`src/hearth/mod.rs:287-325`).
 
 **Input schema**
 
@@ -85,7 +85,7 @@ Output: `"Meal plan (next {days} day(s)):\n"` followed by up to 30 formatted ent
 
 ## hearth_shopping_list
 
-`GET /api/shopping_list` — the current grocery list (`src/hearth/mod.rs:331-359`). No
+`GET /api/objects/shopping_list` — the current grocery list (`src/hearth/mod.rs:331-359`). No
 arguments. The tool description explicitly steers the model to use it for "groceries, what to
 buy, what they need, the shopping list, or what's needed from the store" — worded that way so
 a loosely-phrased user request routes here rather than to `hearth_pantry_list`. Output caps at
@@ -102,7 +102,7 @@ is embedded directly in the output string rather than reformatted.
 
 ## hearth_recipe_search
 
-`GET /api/recipes`, filtered client-side by name (`src/hearth/mod.rs:399-470`).
+`GET /api/objects/recipes`, filtered client-side by name (`src/hearth/mod.rs:399-470`).
 
 **Input schema**
 
@@ -110,7 +110,7 @@ is embedded directly in the output string rather than reformatted.
 |---|---|---|---|
 | `query` | string (≤200 chars, no shell metacharacters) | yes | — |
 
-**Behavior.** Grocy CE does not expose a reliable server-side search filter on `/api/recipes`
+**Behavior.** Grocy CE does not expose a reliable server-side search filter on `/api/objects/recipes`
 across versions, so the tool fetches the full recipe list and filters case-insensitively by
 substring match on `name` client-side, returning up to 20 matches as `[{id}] {name}` lines. A
 no-match result returns `"No recipes found matching '{query}'."` rather than an error.
