@@ -1881,6 +1881,7 @@ fn rate_limit_response(status: StatusCode, message: &str, feedback: RateLimitFee
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
     use super::*;
     use std::collections::HashMap;
 
@@ -2264,6 +2265,8 @@ mod tests {
     // ── record_result / audit shape (no panics, sanitizes detail) ───────
 
     #[tokio::test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     async fn record_result_success_and_failure_do_not_panic() {
         let fw = framework_with(policy_allowing("dev-box", &["*"]), 10);
         let id = identity("dev-box");
@@ -2277,6 +2280,8 @@ mod tests {
     // ── AllowlistPolicy::from_env malformed JSON -> empty, not a panic ──
 
     #[test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     fn allowlist_from_env_malformed_json_degrades_to_deny_all() {
         std::env::set_var("TERMINUS_GATEWAY_ALLOWLIST_JSON", "not valid json");
         let policy = AllowlistPolicy::from_env();
@@ -2285,6 +2290,8 @@ mod tests {
     }
 
     #[test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     fn allowlist_from_env_parses_configured_policy() {
         std::env::set_var(
             "TERMINUS_GATEWAY_ALLOWLIST_JSON",
@@ -2334,6 +2341,8 @@ mod tests {
     }
 
     #[test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     fn legacy_list_grant_has_no_deny_layer() {
         // `Grant::List` (the pre-LHEG-07 shape) has no deny concept at all
         // -- `"*"` really does mean everything, back-compat with existing
@@ -2347,6 +2356,8 @@ mod tests {
     //    the new allow/deny object form (LHEG-07) ───────────────────────
 
     #[test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     fn from_env_legacy_array_form_still_works() {
         std::env::set_var(
             "TERMINUS_GATEWAY_ALLOWLIST_JSON",
@@ -2358,6 +2369,8 @@ mod tests {
     }
 
     #[test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     fn from_env_allow_deny_object_form_parses_and_enforces_deny() {
         std::env::set_var(
             "TERMINUS_GATEWAY_ALLOWLIST_JSON",
@@ -2373,6 +2386,8 @@ mod tests {
     // ── moose keeps full, unrestricted access ────────────────────────────
 
     #[test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     fn moose_with_a_plain_wildcard_grant_reaches_every_route_including_sensitive_ones() {
         std::env::set_var("TERMINUS_GATEWAY_ALLOWLIST_JSON", r#"{"moose": ["*"]}"#);
         let policy = AllowlistPolicy::from_env();
@@ -2388,6 +2403,8 @@ mod tests {
     /// `lumina` and `harmony` are recognized by the allowlist with a
     /// defined default grant when no env override mentions them at all.
     #[test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     fn lumina_and_harmony_are_scaffolded_by_default() {
         std::env::remove_var("TERMINUS_GATEWAY_ALLOWLIST_JSON");
         let policy = AllowlistPolicy::from_env();
@@ -2399,6 +2416,8 @@ mod tests {
     /// identities broad, ordinary tool/route access (not requiring a
     /// hand-maintained allow-list of ~300 names) ...
     #[tokio::test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     async fn lumina_and_harmony_default_scaffold_allows_ordinary_routes() {
         std::env::remove_var("TERMINUS_GATEWAY_ALLOWLIST_JSON");
         let fw = framework_with(AllowlistPolicy::from_env(), 10);
@@ -2416,6 +2435,8 @@ mod tests {
     /// where a bare `"*"` grant would let lumina/harmony reach
     /// `GITHUB_PAT_MOOSE`/mirror creds "using Moose where available".
     #[tokio::test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     async fn lumina_and_harmony_default_scaffold_denies_sensitive_routes() {
         std::env::remove_var("TERMINUS_GATEWAY_ALLOWLIST_JSON");
         let fw = framework_with(AllowlistPolicy::from_env(), 10);
@@ -2456,6 +2477,8 @@ mod tests {
     /// secrets-manager get-secret) -- proving the deny layer, not just the
     /// absence of a grant, is what's blocking these.
     #[tokio::test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     async fn deny_wins_over_allow_lumina_cannot_reach_github_mirror_or_secrets_manager() {
         std::env::remove_var("TERMINUS_GATEWAY_ALLOWLIST_JSON");
         let fw = framework_with(AllowlistPolicy::from_env(), 10);
@@ -2475,6 +2498,8 @@ mod tests {
     /// narrower allow/deny object, that grant is honored in full rather
     /// than being shadowed by the scaffold default.
     #[test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     fn env_override_for_a_scaffolded_identity_still_wins() {
         std::env::set_var(
             "TERMINUS_GATEWAY_ALLOWLIST_JSON",
@@ -2499,6 +2524,8 @@ mod tests {
     /// should not also strip the two enrolled identities of the deny-set
     /// that protects moose-only routes.
     #[test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     fn malformed_env_json_still_scaffolds_lumina_and_harmony_safely() {
         std::env::set_var("TERMINUS_GATEWAY_ALLOWLIST_JSON", "not valid json");
         let policy = AllowlistPolicy::from_env();
@@ -2966,6 +2993,8 @@ mod tests {
     /// The guest baseline's redundant-today deny layer is real: it is carried
     /// on the grant, so a future widening of the allow set inherits it.
     #[test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     fn guest_baseline_carries_the_sensitive_deny_layer() {
         let Grant::AllowDeny { deny, .. } = guest_baseline_grant() else {
             panic!("the guest baseline must be an AllowDeny grant, not a bare list");
