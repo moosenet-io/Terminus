@@ -247,8 +247,24 @@ pub(crate) fn events_from_record(rec: &Value) -> Vec<ActivityEvent> {
 ///    republished),
 /// 4. a usable `text` block whose text is empty or whitespace.
 ///
-/// Every other zero-event outcome is drift and is counted. The distinction is
-/// the whole point of this function.
+/// Every other zero-event outcome is drift and is counted.
+///
+/// ## `events` and `understood` are INDEPENDENT axes, on purpose
+/// They answer different questions — "what could we read?" and "did we
+/// understand all of it?" — so a record may legitimately do BOTH: an assistant
+/// turn carrying one valid `text` block and one block of a future type emits
+/// the text event AND reports `understood: false`.
+///
+/// That is deliberate, and the alternatives are both worse. Suppressing the
+/// valid event would discard real activity an observer needs, to satisfy a
+/// tidier partition. Reporting `understood: true` because *something* parsed
+/// would hide the drift, which is the entire failure this counter exists to
+/// expose. Emitting what we could read while flagging that we could not read
+/// all of it is the only option that loses no information.
+///
+/// A reviewer has now raised this twice as a partition violation; it is not a
+/// bug, and this note exists so the next reader sees the choice was made
+/// knowingly.
 pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
     let at = timestamp_of(rec);
     let ty = rec.get("type").and_then(Value::as_str).unwrap_or("");
@@ -705,6 +721,20 @@ mod tests {
         // A well-formed tool_use with no input is still usable.
         assert!(u(json!({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Bash"}]}})));
+    }
+
+    #[test]
+    fn a_record_can_both_emit_activity_and_be_flagged_as_drifted() {
+        // events and understood answer different questions, so a mixed record
+        // does BOTH — see the classify_record doc. Suppressing the valid event
+        // would discard real activity; reporting understood would hide drift.
+        let outcome = classify_record(&json!({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "visible work"},
+            {"type": "future_block"}
+        ]}}));
+        assert_eq!(outcome.events.len(), 1, "the readable block is still reported");
+        assert_eq!(outcome.events[0].summary, "visible work");
+        assert!(!outcome.understood, "and the unreadable sibling is still flagged");
     }
 
     #[test]
