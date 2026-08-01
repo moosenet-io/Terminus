@@ -88,6 +88,8 @@ impl CallerContext {
     /// use terminus_rs::tool::CallerContext;
     /// let c = CallerContext::untrusted();
     /// assert!(!c.may_infer_from_calendar() && !c.may_infer_from_routine());
+    /// // TERM #576: and it is nobody in particular.
+    /// assert!(c.media_account().is_none());
     /// ```
     ///
     /// **The TRTR-05 boundary check.** The entitled constructor is NOT
@@ -104,6 +106,17 @@ impl CallerContext {
     ///
     /// If someone widens `from_allowlist_decision` to `pub`, that block starts
     /// compiling and the doctest FAILS — which is exactly the alarm we want.
+    ///
+    /// TERM #576 rides the same boundary, and gets the same executable proof:
+    /// no code outside `crate::gateway_framework` can claim to BE a household
+    /// media account, so a tool holding one knows the gateway put it there.
+    ///
+    /// ```compile_fail
+    /// use terminus_rs::tool::CallerContext;
+    /// use std::sync::Arc;
+    /// // error[E0624]: `with_media_account` is private
+    /// let _forged = CallerContext::untrusted().with_media_account(Some(Arc::from("acct-operator")));
+    /// ```
     pub const fn untrusted() -> Self {
         Self { may_infer_from_calendar: false, may_infer_from_routine: false, media_account: None }
     }
