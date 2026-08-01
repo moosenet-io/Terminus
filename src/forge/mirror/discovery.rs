@@ -331,6 +331,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     async fn some_only_when_public_repo_exists() {
         let ops = StubExists::ok(true);
         let remote = discover_public_remote_with(&ops, "Terminus").await;
@@ -339,6 +341,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     async fn none_when_public_repo_absent() {
         let ops = StubExists::ok(false);
         let remote = discover_public_remote_with(&ops, "SecretInternalThing").await;
@@ -346,6 +350,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // Reads process-wide env that a sibling test mutates — see TERM #588.
+    #[serial]
     async fn none_and_no_crash_when_existence_check_errors() {
         let ops = StubExists::err("network timeout");
         let remote = discover_public_remote_with(&ops, "Terminus").await;
