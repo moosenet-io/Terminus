@@ -53,6 +53,7 @@
 //! OPENWEATHER_UNITS is no longer consulted (canonical fetch is always metric).
 
 pub mod location;
+pub mod watch; // WXLOC-04: severe-weather watch (travel disruption + heat/power risk)
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -73,20 +74,20 @@ const CANONICAL_UNITS: &str = "metric";
 // ── Config ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-struct WeatherConfig {
-    api_key: String,
-    base_url: String,
+pub(crate) struct WeatherConfig {
+    pub(crate) api_key: String,
+    pub(crate) base_url: String,
     units: String,
     /// Home/work addresses (COMMUTE_HOME / COMMUTE_WORK, shared with the commute
     /// tools) — the THIRD step of the resolution chain, below the calendar.
-    routine: Routine,
+    pub(crate) routine: Routine,
     /// Today's calendar, behind a trait object so this tool never reaches Google
     /// directly. `NoCalendar` when Google is unconfigured (degrade to routine→ask).
-    calendar: Arc<dyn CalendarSource>,
+    pub(crate) calendar: Arc<dyn CalendarSource>,
 }
 
 impl WeatherConfig {
-    fn from_env() -> Result<Self, ToolError> {
+    pub(crate) fn from_env() -> Result<Self, ToolError> {
         let api_key = std::env::var("OPENWEATHER_API_KEY")
             .ok()
             .filter(|s| !s.is_empty())
@@ -117,7 +118,23 @@ impl WeatherConfig {
         })
     }
 
-    fn client() -> Result<reqwest::Client, ToolError> {
+    /// TEST-ONLY config: no key, no network, `NoCalendar`, no routine.
+    ///
+    /// Exists so a test can construct a tool struct to inspect its DESCRIPTION
+    /// and SCHEMA (which must name no city) without an API key or a gateway.
+    /// `cfg(test)` so it cannot appear in a shipped binary.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            api_key: String::new(),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            units: CANONICAL_UNITS.to_string(),
+            routine: Routine::default(),
+            calendar: Arc::new(NoCalendar),
+        }
+    }
+
+    pub(crate) fn client() -> Result<reqwest::Client, ToolError> {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .user_agent("MooseNet-MCP/1.0")
@@ -234,7 +251,7 @@ fn what_to_wear(feels_c: f64, desc: &str, wind_ms: Option<f64>) -> String {
 /// progressively coarser variants (dropping leading street components). e.g.
 /// "123 Main St, San Jose, CA 95123" falls back to "San Jose, CA 95123" →
 /// "CA 95123"; the first variant that resolves wins.
-async fn geocode(
+pub(crate) async fn geocode(
     client: &reqwest::Client,
     cfg: &WeatherConfig,
     location: &str,
@@ -387,7 +404,7 @@ async fn fetch_current(
     resp.json().await.map_err(|e| ToolError::Http(e.to_string()))
 }
 
-async fn fetch_forecast(
+pub(crate) async fn fetch_forecast(
     client: &reqwest::Client,
     cfg: &WeatherConfig,
     lat: f64,
@@ -853,6 +870,11 @@ fn forecast_list(body: &Value) -> Result<&Vec<Value>, ToolError> {
 pub fn register(registry: &mut ToolRegistry) {
     match WeatherConfig::from_env() {
         Ok(cfg) => {
+            // WXLOC-04: the severe-weather watch shares this config — one API
+            // key, one calendar seam, one routine — and is registered only when
+            // the provider is configured. A watch that cannot reach a provider
+            // should not be advertised as one.
+            watch::register(registry, &cfg);
             registry.register_or_replace(Box::new(Weather { cfg }));
         }
         Err(e) => {

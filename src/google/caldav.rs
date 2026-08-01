@@ -746,6 +746,29 @@ impl crate::weather::location::CalendarSource for GoogleCalendarSource {
         };
         to_location_events(events)
     }
+
+    /// WXLOC-04: the forward-looking window the severe-weather travel watch needs.
+    ///
+    /// Same CalDAV read path, wider window, and — unlike `events_now` — it does
+    /// NOT fail soft. A watch that cannot read the calendar must report that it
+    /// could not check, never an all-clear; see
+    /// [`crate::weather::location::CalendarSource::events_between`].
+    async fn events_between(
+        &self,
+        start: chrono::NaiveDate,
+        end: chrono::NaiveDate,
+    ) -> crate::weather::location::CalendarWindow {
+        use crate::weather::location::CalendarWindow;
+        let start_s = format!("{}T000000Z", start.format("%Y%m%d"));
+        let end_s = format!("{}T235959Z", end.format("%Y%m%d"));
+        match collect_events(&self.http, &self.cfg, &start_s, &end_s).await {
+            Ok(e) => CalendarWindow::Events(to_location_events(e)),
+            Err(e) => {
+                tracing::warn!("weather watch: calendar unavailable — {e}");
+                CalendarWindow::Unavailable(e.to_string())
+            }
+        }
+    }
 }
 
 /// The exact JSON shape `events_now` hands to the weather tool's resolver.

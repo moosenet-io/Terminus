@@ -69,6 +69,51 @@ pub trait CalendarSource: Send + Sync {
     /// Events relevant to "now", each a JSON object with (optionally) `summary`,
     /// `location` and `status` — the shape [`from_calendar`] consumes.
     async fn events_now(&self) -> Vec<Value>;
+
+    /// Events overlapping the inclusive date window `[start, end]`, for a
+    /// consumer that must look FORWARD rather than at today (WXLOC-04's
+    /// severe-weather travel watch).
+    ///
+    /// ## Why this returns [`CalendarWindow`] rather than `Vec<Value>`
+    ///
+    /// [`events_now`](CalendarSource::events_now) fails SOFT — an unreachable
+    /// calendar yields an empty list — and that is exactly right for location
+    /// resolution, where the fallback is another honest step (routine→ask).
+    ///
+    /// It is exactly WRONG for a watch. "Your calendar shows no travel in the
+    /// next three days" and "I could not read your calendar" are different
+    /// answers, and collapsing them produces the one failure mode a severe
+    /// weather feature must never have: a confident all-clear that was never
+    /// checked. So this window is a three-way answer — events, configured but
+    /// unavailable, or not configured at all — and the caller is forced to
+    /// decide what each means.
+    ///
+    /// The DEFAULT is [`CalendarWindow::NotConfigured`], not an empty event
+    /// list, so an implementation that only knows about today (or a future one
+    /// that forgets to override this) degrades to "could not check" rather than
+    /// to a silent all-clear.
+    async fn events_between(
+        &self,
+        start: chrono::NaiveDate,
+        end: chrono::NaiveDate,
+    ) -> CalendarWindow {
+        let _ = (start, end);
+        CalendarWindow::NotConfigured
+    }
+}
+
+/// The answer to a forward-looking calendar query — see
+/// [`CalendarSource::events_between`] for why this is not just a `Vec`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalendarWindow {
+    /// The calendar was read. An EMPTY vec here genuinely means "nothing
+    /// scheduled", and only here.
+    Events(Vec<Value>),
+    /// A calendar is configured but could not be read (network, auth, parse).
+    /// Carries a short reason for the user-facing "could not check" line.
+    Unavailable(String),
+    /// No calendar is configured at all.
+    NotConfigured,
 }
 
 /// The no-calendar implementation: used when Google is not configured.
@@ -81,6 +126,16 @@ pub struct NoCalendar;
 impl CalendarSource for NoCalendar {
     async fn events_now(&self) -> Vec<Value> {
         Vec::new()
+    }
+
+    /// Explicit rather than inherited: with no calendar configured a watch has
+    /// not checked anything, and must say so.
+    async fn events_between(
+        &self,
+        _start: chrono::NaiveDate,
+        _end: chrono::NaiveDate,
+    ) -> CalendarWindow {
+        CalendarWindow::NotConfigured
     }
 }
 
