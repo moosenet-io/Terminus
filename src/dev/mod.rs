@@ -122,7 +122,7 @@ impl DevConfig {
 /// Escape embedded single quotes the same way the Python source does:
 /// `s.replace("'", "'\\''")` — i.e. a literal `'\''` sequence. The caller is
 /// responsible for wrapping the result in single quotes.
-fn escape_single_quotes(s: &str) -> String {
+pub(crate) fn escape_single_quotes(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
@@ -132,10 +132,10 @@ fn escape_single_quotes(s: &str) -> String {
 
 /// Mirror of the Python `_ssh_cmd` return dict.
 #[derive(Debug, Clone)]
-struct SshResult {
-    returncode: i32,
-    stdout: String,
-    stderr: String,
+pub(crate) struct SshResult {
+    pub(crate) returncode: i32,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +273,7 @@ fn ssh_cmd_with_input(
 }
 
 /// Run an SSH command on a blocking thread (ssh2 is synchronous).
-async fn run_ssh(config: Arc<DevConfig>, command: String, timeout_secs: u64) -> Result<SshResult, ToolError> {
+pub(crate) async fn run_ssh(config: Arc<DevConfig>, command: String, timeout_secs: u64) -> Result<SshResult, ToolError> {
     tokio::task::spawn_blocking(move || ssh_cmd(&config, &command, timeout_secs))
         .await
         .map_err(|e| ToolError::Execution(format!("Task join error: {e}")))?

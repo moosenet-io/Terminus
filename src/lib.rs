@@ -5,6 +5,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod ansible;
 pub mod approval;
+pub mod agentsess; // AGSS-01: coder CLI agent session observability (read-only)
 pub mod agent_router; // TRTR-02: the agentic tool router, relocated from Chord to the egress
 pub mod availability; // TAVAIL-01: tool availability state (registry-visible, agent-unavailable)
 pub mod tool_cache; // TRTR-08: TTL result cache for high-traffic assistant tools

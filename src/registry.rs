@@ -184,6 +184,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::cortex::register(registry);
     crate::council::register(registry);
     crate::crucible::register(registry);
+    crate::agentsess::register(registry); // AGSS-01
     crate::dev::register(registry);
     crate::gateway::register(registry);
     crate::<secret-manager>::register(registry); // pii-test-fixture
@@ -280,6 +281,7 @@ pub fn register_personal(registry: &mut ToolRegistry) {
     crate::council::register(registry);
     crate::network::register(registry);
     crate::ansible::register(registry);
+    crate::agentsess::register(registry); // AGSS-01
     crate::dev::register(registry);
     crate::plane::register(registry);
     crate::forge::register_private(registry); // S106/GITX-05: git-private, PERSONAL only

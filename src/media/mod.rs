@@ -24,6 +24,7 @@
 //! tools; the domain always loads, and `media_domain_status` reports
 //! per-service configuration state without ever failing itself.
 
+pub mod account_map;
 pub mod clients;
 pub mod organize;
 pub mod recommend;
