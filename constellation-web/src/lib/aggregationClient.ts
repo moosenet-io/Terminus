@@ -160,6 +160,14 @@ async function withMutationResultEvent<T>(
   path: string,
   init: RequestInit | undefined,
   run: () => Promise<T>,
+  // Review finding (MACT-03): a mutating method that DEGRADES instead of throwing (like
+  // `muse.sessions.terminate()`'s discriminated-union result) used to resolve here as an
+  // unconditional `ok: true` -- a refused/forbidden/conflicted termination would emit a SUCCESS
+  // activity event, the same "reports something stronger than what happened" defect MACT-02 was
+  // corrected for server-side. `isOk` lets a caller whose result type can itself be a typed
+  // failure classify it; the default (`() => true`) preserves every existing call site's
+  // behaviour unchanged -- only a caller that opts in by passing its own classifier is affected.
+  isOk: (result: T) => boolean = () => true,
 ): Promise<T> {
   const method = (init?.method ?? 'GET').toUpperCase();
   if (!MUTATING_METHODS.has(method)) {
@@ -167,13 +175,23 @@ async function withMutationResultEvent<T>(
   }
   try {
     const result = await run();
-    emitMutationResult({ system, method, path, ok: true });
+    if (isOk(result)) {
+      emitMutationResult({ system, method, path, ok: true });
+    } else {
+      // A non-throwing typed failure (e.g. `{kind:'forbidden'|'not_found'|'conflict'|
+      // 'unavailable'|'error', detail}`) -- surface its own `detail` on the activity entry so
+      // the toast says WHY, not just that something didn't work.
+      const detail = (result as { detail?: unknown } | null)?.detail;
+      emitMutationResult({
+        system, method, path, ok: false,
+        error: typeof detail === 'string' ? detail : 'mutation did not succeed',
+      });
+    }
     return result;
   } catch (e) {
     emitMutationResult({ system, method, path, ok: false, error: e instanceof Error ? e.message : String(e) });
     throw e;
   }
-
 }
 
 // ── CONST-28 compat layer over the CONST-26 activity contract ───────────────
@@ -2118,7 +2136,7 @@ const mockAdapter: AggregationClient = {
             return delay<MuseTerminateResult>({ kind: 'not_found', detail: 'session not in the live set' });
           }
           return delay<MuseTerminateResult>({ kind: 'ok', stopped: true, backend: 'mock', reason_delivered: true });
-        });
+        }, (r) => r.kind === 'ok');
       },
     },
   },
@@ -2521,7 +2539,7 @@ const httpAdapter: AggregationClient = {
             // rather than a typed HTTP outcome. This is what must NOT be conflated with 'forbidden'.
             return { kind: 'error', detail: e instanceof Error ? e.message : 'network error' };
           }
-        });
+        }, (r) => r.kind === 'ok');
       },
     },
   },

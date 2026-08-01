@@ -3,8 +3,8 @@
 // "only aggregationClient.ts calls fetch/WebSocket" rule, and the LiveSession/HistorySession
 // type-level distinctness this item's whole design turns on.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mockAdapter, httpAdapter } from './aggregationClient';
-import type { LiveSession, HistorySession } from './aggregationClient';
+import { mockAdapter, httpAdapter, onMutationResult } from './aggregationClient';
+import type { LiveSession, HistorySession, MutationResultEvent } from './aggregationClient';
 
 // ── Grep assertion: aggregationClient.ts is the ONLY module calling fetch/WebSocket ──────────
 //
@@ -318,5 +318,100 @@ describe('MACT-03: httpAdapter.muse.sessions -- degrade-not-throw + typed termin
       expect(typeof res.detail).toBe('string');
       expect(res.detail).toBe('session not in the live set');
     }
+  });
+});
+
+// ── Mutation-result activity event reflects the REAL outcome, not just resolution ────────────
+//
+// Review finding: `terminate()` never throws (it resolves a discriminated union), but
+// `withMutationResultEvent` used to infer `ok: true` from bare resolution -- so a refused
+// termination (403/404/409/503) emitted a SUCCESS activity event/toast, the same "reports
+// something stronger than what happened" defect MACT-02 was corrected for server-side. These
+// assert on the EMITTED EVENT itself, not just the returned union -- that gap is what let the
+// defect through undetected in the prior round.
+
+/** Subscribes to exactly the next `MutationResultEvent`, resolving once one fires. */
+function nextMutationResult(): Promise<MutationResultEvent> {
+  return new Promise(resolve => {
+    const unsubscribe = onMutationResult(event => {
+      unsubscribe();
+      resolve(event);
+    });
+  });
+}
+
+describe('MACT-03: mutation-result activity event classifies terminate() outcomes correctly', () => {
+  const originalWindow = (globalThis as { window?: unknown }).window;
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    (globalThis as unknown as { window: unknown }).window = { location: { origin: 'http://localhost:5174' } };
+  });
+
+  afterEach(() => {
+    (globalThis as unknown as { window: unknown }).window = originalWindow;
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it('httpAdapter: a 403 (forbidden) result emits ok:false, not a false success toast', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: 'forbidden' }), { status: 403 }),
+    );
+    const eventPromise = nextMutationResult();
+    const res = await httpAdapter.muse.sessions.terminate('sess-1');
+    const event = await eventPromise;
+    expect(res.kind).toBe('forbidden');
+    expect(event.ok).toBe(false);
+    expect(event.error).toBeTruthy();
+  });
+
+  it('httpAdapter: a 409 (conflict) result emits ok:false', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: 'more than one live session matches; refusing to guess' }), { status: 409 }),
+    );
+    const eventPromise = nextMutationResult();
+    const res = await httpAdapter.muse.sessions.terminate('sess-1');
+    const event = await eventPromise;
+    expect(res.kind).toBe('conflict');
+    expect(event.ok).toBe(false);
+    expect(event.error).toMatch(/refusing to guess/);
+  });
+
+  it('httpAdapter: a genuine ok result emits ok:true', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ stopped: true, backend: 'plex', reason_delivered: false }), { status: 200 }),
+    );
+    const eventPromise = nextMutationResult();
+    const res = await httpAdapter.muse.sessions.terminate('sess-1');
+    const event = await eventPromise;
+    expect(res.kind).toBe('ok');
+    expect(event.ok).toBe(true);
+  });
+
+  it('mockAdapter: the reserved ambiguous-session sentinel (conflict) emits ok:false', async () => {
+    const eventPromise = nextMutationResult();
+    const res = await mockAdapter.muse.sessions.terminate('sess-mock-ambiguous');
+    const event = await eventPromise;
+    expect(res.kind).toBe('conflict');
+    expect(event.ok).toBe(false);
+  });
+
+  it('mockAdapter: an unknown session_key (not_found) emits ok:false', async () => {
+    const eventPromise = nextMutationResult();
+    const res = await mockAdapter.muse.sessions.terminate('does-not-exist');
+    const event = await eventPromise;
+    expect(res.kind).toBe('not_found');
+    expect(event.ok).toBe(false);
+  });
+
+  it('mockAdapter: a known live session (ok) emits ok:true', async () => {
+    const live = await mockAdapter.muse.sessions.live();
+    const key = live.sessions[0].session_key!;
+    const eventPromise = nextMutationResult();
+    const res = await mockAdapter.muse.sessions.terminate(key);
+    const event = await eventPromise;
+    expect(res.kind).toBe('ok');
+    expect(event.ok).toBe(true);
   });
 });
