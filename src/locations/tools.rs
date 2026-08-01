@@ -30,8 +30,8 @@ use serde_json::{json, Value};
 
 use super::store::{FileLocationStore, LocationStore, StoredLocation};
 use super::{
-    clear, list, set, CallerKey, ClearOutcome, Listing, WriteOutcome, MAX_TEMPORARY_HOURS,
-    WELL_KNOWN,
+    clear, list, set, CallerKey, ClearOutcome, EntryChange, Listing, WriteOutcome,
+    MAX_TEMPORARY_HOURS, WELL_KNOWN,
 };
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
@@ -83,8 +83,10 @@ impl RustTool for LocationSet {
          are right now), or any name they choose ('the cabin', 'mum's house'). Use this when the \
          user asks to remember a place ('I've moved', 'remember this is home', 'I'm in Denver this \
          week'). Never call it to record a place the user merely mentioned in passing — saving is \
-         something they ask for. Replacing an existing, different value requires confirm=true; call \
-         once without it, tell the user what will be replaced, and call again once they agree."
+         something they ask for. Changing an existing saved location requires confirm=true — that \
+         includes leaving the place the same but changing how long it lasts (dropping \
+         expires_in_hours would make a temporary location permanent). Call once without confirm, \
+         tell the user exactly what would change, and call again once they agree."
     }
 
     fn parameters(&self) -> Value {
@@ -112,7 +114,7 @@ impl RustTool for LocationSet {
                 },
                 "confirm": {
                     "type": "boolean",
-                    "description": "Set true only after the user has confirmed replacing an existing different value for this name.",
+                    "description": "Set true only after the user has confirmed the change this call would make to an existing saved location — a different place, or the same place with a different lifetime (permanent vs temporary, or a different expiry).",
                 }
             }
         })
@@ -148,11 +150,30 @@ impl RustTool for LocationSet {
                     ),
                 }
             }
-            WriteOutcome::NeedsConfirmation { name, existing_is_temporary } => format!(
-                "You already have a {}{name} saved and it's different from that. Want me to replace it? \
-                 (I won't change anything until you say so.)",
-                if existing_is_temporary { "temporary " } else { "" }
-            ),
+            WriteOutcome::NeedsConfirmation { name, existing_is_temporary, change } => {
+                // What would change, never what it currently IS. The prompt has
+                // to be specific enough that "yes" is informed consent — "want
+                // me to replace it?" is not an adequate question when the answer
+                // turns a week-long travel location into a permanent home.
+                let what = match change {
+                    EntryChange::Value => "and it's a different place from that",
+                    EntryChange::BecomesPermanent => {
+                        "as a TEMPORARY location — saving it like this makes it permanent, \
+                         so I'd keep using it after the trip you set it for"
+                    }
+                    EntryChange::BecomesTemporary => {
+                        "as a permanent location — saving it like this gives it an expiry, \
+                         so I'd stop using it after that"
+                    }
+                    EntryChange::Expiry => "as a temporary location, and that changes when it expires",
+                    EntryChange::Other => "and that's different from what you asked me to save",
+                };
+                format!(
+                    "You already have a {}{name} saved {what}. Want me to replace it? \
+                     (I won't change anything until you say so.)",
+                    if existing_is_temporary { "temporary " } else { "" }
+                )
+            }
             WriteOutcome::Rejected(why) => format!("I can't save that — {why}."),
             WriteOutcome::Denied => UNAVAILABLE.to_string(),
             WriteOutcome::Unavailable(e) => could_not_read(&e.to_string()),

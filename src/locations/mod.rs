@@ -111,7 +111,9 @@
 pub mod store;
 
 use crate::tool::CallerContext;
-use store::{CallerRecord, LocationStore, Registry, StoreError, StoredLocation};
+use store::{CallerRecord, Change, LocationStore, Registry, StoreError, StoredLocation};
+
+pub use store::{Change as EntryChange, EntryIdentity};
 
 /// The well-known name for where the caller lives.
 pub const HOME: &str = "home";
@@ -187,11 +189,27 @@ impl CallerKey {
     /// and every consumer are already written against the final key shape. When
     /// #577 lands, the ONLY change needed is that the dispatch layer builds the
     /// key with this constructor instead of [`CallerKey::for_principal`].
+    ///
+    /// `None` for a blank principal OR a blank person — and the second half is
+    /// the one that was wrong. This used to FALL BACK to the service-scoped key
+    /// when `person` was empty, which quietly inverted the whole point of
+    /// [`CallerKey::storage_key`]: a post-#577 caller whose person identity went
+    /// missing or arrived malformed would have been handed the pre-#577 SERVICE
+    /// record — i.e. read the operator's saved home address and attributed it to
+    /// whoever the blank was. The orphaning guarantee has to hold from both
+    /// directions or it holds from neither.
+    ///
+    /// A blank person is a bug in the CALLER. Returning `None` makes that
+    /// caller's mistake unphraseable at the type level, exactly as
+    /// [`CallerKey::as_service_scoped`] did for the legacy bridge: there is no
+    /// key to pass on, so the fail-closed path (`Lookup::Denied`, no read) is
+    /// the only one left. Widening scope to make a malformed identity "work" is
+    /// the worst available response.
     pub fn for_person(principal: &str, person: &str) -> Option<Self> {
         let mut key = Self::for_principal_name(principal)?;
         let person = person.trim();
         if person.is_empty() {
-            return Some(key);
+            return None;
         }
         key.person = Some(person.to_ascii_lowercase());
         Some(key)
@@ -292,12 +310,13 @@ pub enum Listing {
 pub enum WriteOutcome {
     /// Stored. `replaced` is the previous entry, when there was one.
     Stored { name: String, entry: StoredLocation, replaced: Option<StoredLocation> },
-    /// There is already a DIFFERENT value under this name and the caller did
-    /// not confirm. Nothing was written. The existing value is NOT returned —
-    /// the caller already knows it if they are entitled to it, and echoing it
-    /// into a confirmation prompt is a needless extra place for an address to
-    /// appear.
-    NeedsConfirmation { name: String, existing_is_temporary: bool },
+    /// There is already a live entry under this name that this write would
+    /// CHANGE — a different place, or the same place with a different lifetime —
+    /// and the caller did not confirm. Nothing was written. The existing value is
+    /// NOT returned: the caller already knows it if they are entitled to it, and
+    /// echoing it into a confirmation prompt is a needless extra place for an
+    /// address to appear.
+    NeedsConfirmation { name: String, existing_is_temporary: bool, change: Change },
     /// The name or the value was not acceptable. Carries a reason that never
     /// quotes the value.
     Rejected(String),
@@ -443,10 +462,21 @@ pub fn list(store: &dyn LocationStore, key: Option<&CallerKey>, caller: CallerCo
 ///
 /// * `expires_in_hours` `None` = permanent; `Some(h)` = temporary, expiring
 ///   `h` hours from now (`1..=`[`MAX_TEMPORARY_HOURS`]).
-/// * `confirm` must be `true` to replace an existing entry whose value differs.
-///   Writes are USER DATA: overwriting one silently is how a stored home
-///   quietly becomes last week's hotel. Re-storing an IDENTICAL value is a
-///   no-op-shaped write and needs no confirmation — asking there is noise.
+/// * `confirm` must be `true` to replace an existing live entry that this write
+///   would CHANGE IN ANY WAY — a different place, or the same place with a
+///   different lifetime. Writes are USER DATA: overwriting one silently is how a
+///   stored home quietly becomes last week's hotel. Re-storing a byte-identical
+///   entry is a no-op-shaped write and needs no confirmation — asking there is
+///   noise.
+///
+///   "In any way" is load-bearing and was got wrong once. Comparing only the
+///   VALUE meant re-saving a live TEMPORARY entry with the same value and no
+///   `expires_in_hours` replaced it with a PERMANENT one, unprompted — the user
+///   deliberately time-boxed "I'm in Denver this week" and it silently became
+///   where they live. Changing one expiry to another had the same hole. The
+///   comparison is now [`StoredLocation::identity`] equality: a single
+///   struct-level check over the whole entry, so no future field can slip
+///   through the gap that field-by-field checks left open.
 pub fn set(
     store: &dyn LocationStore,
     key: Option<&CallerKey>,
@@ -485,6 +515,15 @@ pub fn set(
     // later save would silently drop the earlier entry — a saved location
     // disappearing with no error, which is the failure a user reports as "it
     // forgot where I live".
+    // The entry this call WOULD store, built up front so the confirmation
+    // decision can compare two whole entries rather than a value against a
+    // value. Comparing the candidate is what makes permanence and expiry part of
+    // the decision without anyone having to remember to check them.
+    let candidate = match expires_at {
+        Some(t) => StoredLocation::temporary(value.clone(), t, now),
+        None => StoredLocation::permanent(value.clone(), now),
+    };
+
     let mut outcome = None;
     let tx = store.update(&mut |registry| {
         let existing =
@@ -493,19 +532,18 @@ pub fn set(
             // An EXPIRED entry is not a value the user still stands behind, so
             // replacing it is not an overwrite worth interrupting for.
             let live = !prev.is_expired(now);
-            if live && prev.value != value && !confirm {
+            let change = prev.identity().difference(&candidate.identity());
+            if let (true, Some(change), false) = (live, change, confirm) {
                 outcome = Some(WriteOutcome::NeedsConfirmation {
                     name: name.clone(),
                     existing_is_temporary: prev.is_temporary(),
+                    change,
                 });
                 return store::Commit::Abort;
             }
         }
 
-        let entry = match expires_at {
-            Some(t) => StoredLocation::temporary(value.clone(), t, now),
-            None => StoredLocation::permanent(value.clone(), now),
-        };
+        let entry = candidate.clone();
         registry.caller_mut(&storage_key).locations.insert(name.clone(), entry.clone());
         prune_expired(registry, now);
         outcome = Some(WriteOutcome::Stored { name: name.clone(), entry, replaced: existing });
@@ -638,6 +676,9 @@ mod tests {
     /// Stands in for a home address. Never a real one.
     const A_HOME: &str = "1 Placeholder Way, Examplecity"; // pii-test-fixture: obvious placeholder standing in for caller A's home address
     const B_HOME: &str = "2 Otherplace Road, Examplecity"; // pii-test-fixture: obvious placeholder standing in for caller B's home address
+    /// Stands in for somewhere the user is travelling to. Never a real place.
+    const A_CITY: &str = "Somewhereville"; // pii-test-fixture: obviously-invented place name standing in for a travel destination
+    const ANOTHER_CITY: &str = "Elsewhereville"; // pii-test-fixture: obviously-invented place name standing in for a different destination
 
     // ── round trip ──────────────────────────────────────────────────────────
 
@@ -692,8 +733,12 @@ mod tests {
         assert_eq!(clear(&s, Some(&k), entitled(), Some("the cabin"), false), ClearOutcome::NotSet);
     }
 
+    /// POSITIVE CONTROL for the whole-entry confirmation rule below: a
+    /// byte-identical re-save is still a no-op-shaped write that needs no
+    /// confirmation. Without this, "make everything need confirming" would pass
+    /// every negative test on this page.
     #[test]
-    fn re_storing_the_same_value_needs_no_confirmation() {
+    fn re_storing_an_identical_entry_needs_no_confirmation() {
         let s = CountingStore::new();
         let k = key_a();
         set(&s, Some(&k), entitled(), "home", A_HOME, None, false);
@@ -701,6 +746,136 @@ mod tests {
             set(&s, Some(&k), entitled(), "home", &format!("  {A_HOME} "), None, false),
             WriteOutcome::Stored { .. },
         ));
+    }
+
+    /// The same positive control at the comparison level, and deterministically
+    /// for a TEMPORARY entry.
+    ///
+    /// It cannot be expressed end-to-end through `set`, because `set` derives the
+    /// absolute expiry from `expires_in_hours` at the moment of the call: passing
+    /// the same `expires_in_hours` a second later is genuinely a LATER expiry —
+    /// an extension, which by design confirms. "Identical expiry" therefore means
+    /// the same absolute instant, and that is what this asserts.
+    #[test]
+    fn positive_control_two_identical_temporary_entries_are_not_a_change() {
+        let a = StoredLocation::temporary(A_HOME, 5_000, 100);
+        // Different `updated_at_unix` on purpose: bookkeeping is not a change
+        // the user made, so it must not trigger a confirmation.
+        let b = StoredLocation::temporary(A_HOME, 5_000, 900);
+        assert_eq!(a.identity().difference(&b.identity()), None);
+    }
+
+    // ── FINDING 1: a temporary location must never silently become permanent ──
+
+    #[test]
+    fn a_live_temporary_entry_does_not_become_permanent_without_confirmation() {
+        // The exact hole: same name, same VALUE, no `expires_in_hours`. The old
+        // check compared only the value, saw no difference, and replaced a
+        // deliberately time-boxed entry with a permanent one — the trip ends and
+        // the assistant still thinks the user lives there.
+        let s = CountingStore::new();
+        let k = key_a();
+        assert!(matches!(
+            set(&s, Some(&k), entitled(), CURRENT, A_CITY, Some(168), false),
+            WriteOutcome::Stored { .. }
+        ));
+
+        match set(&s, Some(&k), entitled(), CURRENT, A_CITY, None, false) {
+            WriteOutcome::NeedsConfirmation { change, existing_is_temporary, .. } => {
+                assert_eq!(change, EntryChange::BecomesPermanent);
+                assert!(existing_is_temporary);
+            }
+            other => panic!("dropping the expiry must ask first, got {other:?}"),
+        }
+
+        // And the entry is still TEMPORARY — an unconfirmed write changes nothing.
+        match lookup(&s, Some(&k), entitled(), CURRENT) {
+            Lookup::Found(e) => {
+                assert!(e.is_temporary(), "the entry silently became permanent");
+                assert!(e.expires_at_unix.is_some());
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        // With confirmation it lands, because the user asked for it in as many words.
+        match set(&s, Some(&k), entitled(), CURRENT, A_CITY, None, true) {
+            WriteOutcome::Stored { entry, .. } => assert!(!entry.is_temporary()),
+            other => panic!("a CONFIRMED change must land, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn changing_one_expiry_to_another_needs_confirmation() {
+        let s = CountingStore::new();
+        let k = key_a();
+        set(&s, Some(&k), entitled(), CURRENT, A_CITY, Some(24), false);
+
+        for hours in [1, 720] {
+            match set(&s, Some(&k), entitled(), CURRENT, A_CITY, Some(hours), false) {
+                WriteOutcome::NeedsConfirmation { change, .. } => {
+                    assert_eq!(change, EntryChange::Expiry, "expires_in_hours={hours}")
+                }
+                other => panic!("expires_in_hours={hours} must ask first, got {other:?}"),
+            }
+        }
+        // Shortening and extending are both refused without confirmation, and
+        // the original expiry is untouched.
+        match lookup(&s, Some(&k), entitled(), CURRENT) {
+            Lookup::Found(e) => assert!(e.is_temporary()),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn giving_a_permanent_entry_an_expiry_needs_confirmation() {
+        // The mirror image: a saved home must not silently acquire a deletion
+        // date either.
+        let s = CountingStore::new();
+        let k = key_a();
+        set(&s, Some(&k), entitled(), HOME, A_HOME, None, false);
+        match set(&s, Some(&k), entitled(), HOME, A_HOME, Some(24), false) {
+            WriteOutcome::NeedsConfirmation { change, existing_is_temporary, .. } => {
+                assert_eq!(change, EntryChange::BecomesTemporary);
+                assert!(!existing_is_temporary);
+            }
+            other => panic!("got {other:?}"),
+        }
+        match lookup(&s, Some(&k), entitled(), HOME) {
+            Lookup::Found(e) => assert!(!e.is_temporary(), "the entry silently gained an expiry"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_expired_entry_is_replaced_without_interrupting_the_user() {
+        // The deliberate exception, restated so a future tightening does not
+        // take it away by accident: an entry the user has already let lapse is
+        // not something they still stand behind.
+        let s = CountingStore::new();
+        let k = key_a();
+        set(&s, Some(&k), entitled(), CURRENT, A_CITY, Some(24), false);
+        let mut reg = s.snapshot();
+        reg.caller_mut(&k.storage_key()).locations.get_mut(CURRENT).unwrap().expires_at_unix =
+            Some(now_unix() - 1);
+        s.save(&reg).unwrap();
+
+        assert!(matches!(
+            set(&s, Some(&k), entitled(), CURRENT, ANOTHER_CITY, None, false),
+            WriteOutcome::Stored { .. }
+        ));
+    }
+
+    #[test]
+    fn a_confirmation_prompt_never_carries_the_stored_value() {
+        let s = CountingStore::new();
+        let k = key_a();
+        set(&s, Some(&k), entitled(), HOME, A_HOME, None, false);
+        let out = set(&s, Some(&k), entitled(), HOME, "9 Elsewhere St", None, false); // pii-test-fixture: obvious placeholder standing in for a different home address
+        assert!(matches!(out, WriteOutcome::NeedsConfirmation { .. }));
+        assert!(
+            !format!("{out:?}").contains("Placeholder"),
+            "the confirmation prompt echoed the stored address back"
+        );
     }
 
     #[test]
@@ -931,6 +1106,108 @@ mod tests {
         assert!(CallerKey::for_principal_name("   ").is_none());
         assert!(CallerKey::for_principal_name("").is_none());
         assert!(CallerKey::for_person("", "someone").is_none());
+    }
+
+    // ── FINDING 2: a blank person identity yields no key at all ─────────────
+
+    #[test]
+    fn a_blank_person_identity_produces_no_usable_key() {
+        // It used to fall back to the SERVICE key, which is the orphaning
+        // guarantee defeated from the other side: a post-#577 caller whose person
+        // identity went missing would have read the pre-#577 service record and
+        // been handed whoever-that-was's home address.
+        for blank in ["", " ", "\t", "\n", "   \t \n "] {
+            assert!(
+                CallerKey::for_person("lumina", blank).is_none(),
+                "a blank person identity ({blank:?}) must not produce a key"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_person_identity_cannot_reach_the_service_scoped_record() {
+        // The property that actually matters, asserted against the store rather
+        // than the constructor: seed the SERVICE record, then try to read it the
+        // way a malformed post-#577 caller would.
+        let s = CountingStore::new();
+        let svc = CallerKey::for_principal_name("lumina").unwrap();
+        set(&s, Some(&svc), entitled(), HOME, A_HOME, None, false);
+        let reads_before = s.reads();
+
+        let blank = CallerKey::for_person("lumina", "  ");
+        assert!(blank.is_none());
+        // No key ⇒ the fail-closed path, and specifically NOT a read of the
+        // service record.
+        assert_eq!(lookup(&s, blank.as_ref(), entitled(), HOME), Lookup::Denied);
+        assert!(matches!(list(&s, blank.as_ref(), entitled()), Listing::Denied));
+        assert_eq!(s.reads(), reads_before, "a blank identity must cause ZERO reads");
+        assert!(
+            !format!("{:?}", list(&s, blank.as_ref(), entitled())).contains("Placeholder"),
+            "the operator's address reached a caller with no person identity"
+        );
+    }
+
+    #[test]
+    fn positive_control_a_valid_person_identity_still_works() {
+        // Without this, "always return None" would satisfy the two tests above.
+        let s = CountingStore::new();
+        let k = CallerKey::for_person("lumina", "Someone").expect("a real person identity must work");
+        assert!(k.is_person_scoped());
+        assert_eq!(k.storage_key(), "svc:lumina#person:someone");
+        set(&s, Some(&k), entitled(), HOME, A_HOME, None, false);
+        match lookup(&s, Some(&k), entitled(), HOME) {
+            Lookup::Found(e) => assert_eq!(e.value, A_HOME),
+            other => panic!("a person-scoped caller must get their own home back, got {other:?}"),
+        }
+    }
+
+    // ── FINDING 3: a lock failure is Unavailable, never "nothing set" ───────
+
+    #[cfg(unix)]
+    #[test]
+    fn a_registry_locked_by_another_process_reads_as_unavailable_not_unset() {
+        // The user-visible stake: "I couldn't check" and "you have nothing
+        // saved" must never be the same answer, and a contended lock is the
+        // former.
+        use std::time::Duration;
+
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("locations.json");
+        let s = store::FileLocationStore::at(&path).with_lock_wait(Duration::from_millis(50));
+        let k = key_a();
+        set(&s, Some(&k), entitled(), HOME, A_HOME, None, false);
+
+        // Hold the lock the way another PROCESS would — a separate open file
+        // description, which `flock` treats independently of ours.
+        let _held = store::tests_support::hold_lock_exclusively(&s.lock_path());
+
+        assert!(
+            matches!(
+                lookup(&s, Some(&k), entitled(), HOME),
+                Lookup::Unavailable(StoreError::LockUnavailable)
+            ),
+            "a locked registry must report a read failure, never 'not set'"
+        );
+        assert!(matches!(
+            list(&s, Some(&k), entitled()),
+            Listing::Unavailable(StoreError::LockUnavailable)
+        ));
+        assert!(matches!(
+            set(&s, Some(&k), entitled(), WORK, A_CITY, None, true),
+            WriteOutcome::Unavailable(StoreError::LockUnavailable)
+        ));
+        assert!(matches!(
+            clear(&s, Some(&k), entitled(), Some(HOME), false),
+            ClearOutcome::Unavailable(StoreError::LockUnavailable)
+        ));
+
+        // And it is a BOUNDED failure, not a hang: releasing the lock restores
+        // normal service with no cleanup step.
+        drop(_held);
+        match lookup(&s, Some(&k), entitled(), HOME) {
+            Lookup::Found(e) => assert_eq!(e.value, A_HOME),
+            other => panic!("the lock released, so the read must succeed again; got {other:?}"),
+        }
     }
 
     // ── concurrency: no lost updates ────────────────────────────────────────
