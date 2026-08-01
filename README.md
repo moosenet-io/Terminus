@@ -293,11 +293,23 @@ Four properties worth knowing:
   explicit confirmation; clearing everything needs `all=true`. `weather`'s
   "or say *remember this is home*" is an **offer**, not an automatic save —
   answering a question is not consent to store the answer.
-- **`COMMUTE_HOME` / `COMMUTE_WORK` still work.** They are a legacy fallback for
-  the single legacy principal only, filling a slot the registry leaves empty, so
-  nothing regresses on the day this ships. The registry wins as soon as it has
-  an answer, and the fallback is scoped to one identity because those variables
-  are process-global and hold one person's addresses.
+- **`COMMUTE_HOME` / `COMMUTE_WORK` still work — for exactly one service
+  identity.** They are a legacy fallback filling a slot the registry leaves
+  empty, so nothing regresses on the day this ships; the registry wins as soon
+  as it has an answer. The scoping is narrow on purpose, because those variables
+  are process-global and hold one person's addresses:
+  - the fallback requires a **service-scoped** caller key matching
+    `TERMINUS_COMMUTE_LEGACY_PRINCIPAL`. A *person*-scoped key (the shape that
+    arrives once TERM #577 lands) shares that principal but gets **no**
+    fallback — otherwise every person behind one service identity would inherit
+    one person's home address. This is enforced by the key type, which will not
+    hand out a principal for a person-scoped key at all;
+  - a request that carries **no identity** gets no fallback and no registry
+    record — it resolves nothing and the answer degrades to *"which location do
+    you mean?"*. Missing identity is "nobody in particular", not "probably the
+    owner";
+  - so the bridge retires itself the day per-person identity arrives, which is
+    when it should.
 
 | Variable | Default | Purpose |
 |---|---|---|

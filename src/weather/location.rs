@@ -275,6 +275,25 @@ pub const LEGACY_PRINCIPAL_ENV: &str = "TERMINUS_COMMUTE_LEGACY_PRINCIPAL";
 /// Default legacy principal: the assistant service. Today, per TERM #577, every
 /// human talking to Lumina arrives as that one identity — so this default
 /// reproduces exactly today's behaviour and widens nothing.
+///
+/// **Why this KEEPS a default rather than becoming config-only.** The
+/// alternative — no default, so the bridge is inert unless
+/// [`LEGACY_PRINCIPAL_ENV`] is set — reads cleaner but fails in the wrong
+/// direction: on the deploy that ships this, the operator's already-configured
+/// `COMMUTE_HOME` would stop resolving, and the symptom is the assistant asking
+/// "which location do you mean?" for a question it answered yesterday, with no
+/// error and nothing in a log to explain it. A default that is load-bearing for
+/// exactly one migration is worth more than the tidiness.
+///
+/// It is also self-limiting in a way a bare default usually is not: the bridge
+/// now requires a SERVICE-scoped key (see
+/// [`Routine::resolve_for_legacy_principal`]), so the day TERM #577 attaches a
+/// person to the key this default stops applying to any human — the value can
+/// then be deleted along with the whole fallback rather than re-pointed.
+///
+/// `lumina` is a service principal name, not a secret or a personal detail: it
+/// is the identity the assistant authenticates as, it appears throughout this
+/// crate and its README, and it discloses nothing about anyone.
 pub const DEFAULT_LEGACY_PRINCIPAL: &str = "lumina";
 
 fn legacy_principal() -> String {
@@ -377,8 +396,21 @@ impl Routine {
             Listing::Unavailable(_) => degraded = true,
         }
 
-        // The legacy bridge, for one principal, filling only empty slots.
-        let is_legacy = key.map(|k| k.principal() == legacy_principal).unwrap_or(false);
+        // The legacy bridge: one SERVICE principal, filling only empty slots.
+        //
+        // `as_service_scoped()` is what makes this safe, and it is a type
+        // constraint rather than a comment. The check used to be
+        // `key.principal() == legacy_principal`, which is also true of
+        // `svc:lumina#person:someone` — so once TERM #577 attaches a person to
+        // the key, EVERY person behind the `lumina` service principal would have
+        // been handed the operator's `COMMUTE_HOME`. A person-scoped key cannot
+        // produce a `ServiceScoped` at all, so it cannot reach this bridge; it
+        // gets the registry and nothing else. That is also the bridge retiring
+        // itself the day #577 lands, which is the outcome this module's doc
+        // already said was almost certainly right.
+        let is_legacy = key
+            .and_then(crate::locations::CallerKey::as_service_scoped)
+            .is_some_and(|svc| svc.principal() == legacy_principal);
         if is_legacy && !degraded {
             home = home.or_else(|| legacy.home.clone());
             work = work.or_else(|| legacy.work.clone());
@@ -849,6 +881,58 @@ mod tests {
             let r = Routine::resolve_for_legacy_principal(&s, Some(&key("bravo")), operator(), &legacy(), "alpha");
             assert_eq!(r.routine.home, None, "another principal must not inherit COMMUTE_HOME");
             assert!(!format!("{r:?}").contains("Legacy"));
+        }
+
+        /// The TERM #577 hazard the second review round caught. A person-scoped
+        /// key `svc:lumina#person:someone` shares the legacy PRINCIPAL, so a
+        /// check written as `key.principal() == legacy_principal` handed the
+        /// operator's `COMMUTE_HOME` to every person behind that service
+        /// identity — the exact opposite of the orphaning-safety property the
+        /// design claims.
+        #[test]
+        fn a_person_scoped_key_gets_no_legacy_fallback_even_on_the_legacy_principal() {
+            let s = CountingStore::new();
+            let person = CallerKey::for_person("alpha", "someone").unwrap();
+
+            let r = Routine::resolve_for_legacy_principal(
+                &s,
+                Some(&person),
+                operator(),
+                &legacy(),
+                "alpha",
+            );
+            assert_eq!(
+                r.routine.home, None,
+                "a person behind the legacy service principal must NOT inherit COMMUTE_HOME"
+            );
+            assert!(!format!("{r:?}").contains("Legacy"), "the operator's legacy home leaked");
+            // ...and downstream that is an honest "ask", not a wrong address.
+            assert_eq!(resolve(None, &[], &r.routine, 20, true, operator()), Resolved::AskUser);
+        }
+
+        /// POSITIVE CONTROL for the guard above: the same principal, WITHOUT a
+        /// person component, still gets the bridge. Without this, deleting the
+        /// fallback outright would pass every negative test.
+        #[test]
+        fn a_service_scoped_key_on_the_legacy_principal_still_gets_the_fallback() {
+            let s = CountingStore::new();
+            let svc = CallerKey::for_principal_name("alpha").unwrap();
+            let r =
+                Routine::resolve_for_legacy_principal(&s, Some(&svc), operator(), &legacy(), "alpha");
+            assert_eq!(r.routine.home.as_deref(), Some(LEGACY_HOME));
+        }
+
+        /// The type, not the caller, is what enforces it: there is no way to ask
+        /// a person-scoped key for its principal.
+        #[test]
+        fn a_person_scoped_key_cannot_be_viewed_as_service_scoped() {
+            let svc = CallerKey::for_principal_name("alpha").unwrap();
+            let person = CallerKey::for_person("alpha", "someone").unwrap();
+            assert_eq!(svc.as_service_scoped().map(|s| s.principal().to_string()), Some("alpha".into()));
+            assert!(
+                person.as_service_scoped().is_none(),
+                "a person-scoped key must not be able to present itself as its service"
+            );
         }
 
         #[test]

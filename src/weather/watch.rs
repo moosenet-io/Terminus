@@ -874,11 +874,44 @@ fn render_gap(g: &Gap) -> String {
 pub trait WatchLocations: Send + Sync {
     /// The place whose power/HVAC risk matters. `None` ⇒ not configured.
     fn home(&self) -> Option<String>;
+
+    /// `true` when the location source EXISTS but could not be read.
+    ///
+    /// Without this, an unreadable registry and an empty one both arrive as
+    /// `home() == None` and get rendered as "no home location is configured" —
+    /// the same absence/failure collapse `crate::locations` refuses to make.
+    /// Defaults to `false` so a source that cannot fail (a fixture, a plain
+    /// `Routine`) says nothing about it.
+    fn unavailable(&self) -> bool {
+        false
+    }
 }
 
 impl WatchLocations for Routine {
     fn home(&self) -> Option<String> {
         self.home.clone()
+    }
+}
+
+/// A [`Routine`] resolved from the shared registry for ONE caller, carrying
+/// whether that read succeeded.
+///
+/// LOCREG-01 + the un-keyed-path fix: the watch used to read
+/// `WeatherConfig::routine` — the process-global `COMMUTE_*` pair holding the
+/// OPERATOR's addresses — for anyone entitled to the routine. This is the
+/// per-caller replacement, and a caller with no identity gets an EMPTY one.
+pub(crate) struct ResolvedLocations {
+    routine: Routine,
+    degraded: bool,
+}
+
+impl WatchLocations for ResolvedLocations {
+    fn home(&self) -> Option<String> {
+        self.routine.home.clone()
+    }
+
+    fn unavailable(&self) -> bool {
+        self.degraded
     }
 }
 
@@ -1031,6 +1064,13 @@ async fn assess_heat(
     // GATE FIRST — same reasoning as travel; the home address is not read.
     if !caller.may_infer_from_routine() {
         return SubjectReport::gap(Gap::NotEntitled);
+    }
+    // "Could not read what you saved" is not "you saved nothing" — see
+    // `WatchLocations::unavailable`.
+    if locations.unavailable() {
+        return SubjectReport::gap(Gap::Failed(
+            "your saved locations could not be read, so I don't know where to watch".into(),
+        ));
     }
     let Some(home) = locations.home() else {
         return SubjectReport::gap(Gap::NotConfigured(
@@ -1217,7 +1257,12 @@ struct SevereWeatherWatch {
 }
 
 impl SevereWeatherWatch {
-    async fn run(&self, args: Value, caller: CallerContext) -> Result<String, ToolError> {
+    async fn run(
+        &self,
+        args: Value,
+        caller: CallerContext,
+        key: Option<&crate::locations::CallerKey>,
+    ) -> Result<String, ToolError> {
         let days = match args.get("days").filter(|v| !v.is_null()) {
             Some(v) => v
                 .as_i64()
@@ -1226,11 +1271,27 @@ impl SevereWeatherWatch {
             None => DEFAULT_HORIZON_DAYS,
         };
         let calendar: Arc<dyn CalendarSource> = self.cfg.calendar.clone();
-        let routine = self.cfg.routine.clone();
+        // The home location comes from THIS CALLER's registry record. With no
+        // identity it is empty — never `self.cfg.routine`, which is the
+        // process-global `COMMUTE_*` pair holding the operator's own address.
+        // See `WeatherConfig::resolve_location_for` for why an un-keyed path
+        // must not reach it.
+        let locations = match key {
+            None => ResolvedLocations { routine: Routine::default(), degraded: false },
+            Some(k) => {
+                let r = Routine::resolve_for(
+                    self.cfg.locations.as_ref(),
+                    Some(k),
+                    caller,
+                    &self.cfg.routine,
+                );
+                ResolvedLocations { routine: r.routine, degraded: r.degraded }
+            }
+        };
         let forecast = OwmForecast { cfg: self.cfg.clone() };
         let today = chrono::Local::now().date_naive();
         let report =
-            run_watch(days, caller, calendar.as_ref(), &routine, &forecast, today).await;
+            run_watch(days, caller, calendar.as_ref(), &locations, &forecast, today).await;
         Ok(report.render())
     }
 }
@@ -1275,15 +1336,29 @@ not fill in anything it says it could not check."
     /// [`CallerContext::untrusted`] ⇒ neither the calendar nor the home location
     /// is read, and the answer discloses nothing.
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        self.run(args, CallerContext::untrusted()).await
+        self.run(args, CallerContext::untrusted(), None).await
     }
 
+    /// Entitlement but no identity: the heat watch has no per-caller home to
+    /// read, and must NOT substitute the operator's `COMMUTE_HOME`. It degrades
+    /// to "no home location is configured", which is the honest answer for a
+    /// caller nobody can name.
     async fn execute_with_caller(
         &self,
         args: Value,
         caller: CallerContext,
     ) -> Result<crate::tool::ToolOutput, ToolError> {
-        Ok(crate::tool::ToolOutput::text_only(self.run(args, caller).await?))
+        Ok(crate::tool::ToolOutput::text_only(self.run(args, caller, None).await?))
+    }
+
+    /// The full path: entitlement AND whose record to read.
+    async fn execute_with_caller_key(
+        &self,
+        args: Value,
+        caller: CallerContext,
+        key: Option<crate::locations::CallerKey>,
+    ) -> Result<crate::tool::ToolOutput, ToolError> {
+        Ok(crate::tool::ToolOutput::text_only(self.run(args, caller, key.as_ref()).await?))
     }
 }
 
@@ -1784,6 +1859,84 @@ mod tests {
         let c = CallerContext::untrusted();
         assert!(!c.may_infer_from_calendar() && !c.may_infer_from_routine());
         assert_eq!(CallerContext::default(), c);
+    }
+
+    // ── LOCREG-01: the home location is per-caller, and un-keyed fails closed ─
+
+    /// The same disclosure `WeatherConfig::resolve_location_for` was fixed for,
+    /// in the OTHER weather tool. The heat watch used to read
+    /// `WeatherConfig::routine` — the process-global `COMMUTE_*` pair holding
+    /// the OPERATOR's own address — for anyone entitled to the routine, with no
+    /// identity involved. `weather_severe_alerts` overrides
+    /// `execute_with_caller` and is reached through the default
+    /// `execute_with_caller_key`, so this WAS live on the production path.
+    #[tokio::test]
+    async fn an_unkeyed_watch_cannot_reach_the_legacy_home() {
+        const LEGACY_HOME: &str = "9 Legacy Lane, Examplecity"; // pii-test-fixture: obvious placeholder standing in for the operator's COMMUTE_HOME
+
+        let cfg = crate::weather::WeatherConfig {
+            api_key: String::new(),
+            base_url: "http://127.0.0.1:1".into(),
+            units: "metric".into(),
+            routine: Routine { home: Some(LEGACY_HOME.into()), work: None, current: None },
+            calendar: Arc::new(crate::weather::location::NoCalendar),
+            locations: Arc::new(crate::locations::store::fake::CountingStore::new()),
+        };
+        let tool = SevereWeatherWatch { cfg };
+
+        // Entitled AND un-keyed — the combination that used to disclose.
+        let out = tool.run(json!({"days": 2}), operator(), None).await.unwrap();
+        assert!(!out.contains("Legacy"), "the operator's COMMUTE_HOME leaked: {out}");
+        assert!(
+            out.to_lowercase().contains("no home location is configured"),
+            "with no identity the honest answer is 'nothing configured': {out}"
+        );
+    }
+
+    /// POSITIVE CONTROL: a KEYED caller with a saved home is still watched, so
+    /// the test above cannot be satisfied by disabling the heat watch.
+    #[tokio::test]
+    async fn a_keyed_watch_uses_that_callers_saved_home() {
+        use crate::locations::{self, CallerKey};
+
+        const SAVED_HOME: &str = "1 Placeholder Way, Examplecity"; // pii-test-fixture: obvious placeholder standing in for a saved home address
+        let store = Arc::new(crate::locations::store::fake::CountingStore::new());
+        let key = CallerKey::for_principal_name("alpha").unwrap();
+        match locations::set(store.as_ref(), Some(&key), operator(), locations::HOME, SAVED_HOME, None, true) {
+            locations::WriteOutcome::Stored { .. } => {}
+            other => panic!("seed failed: {other:?}"),
+        }
+
+        let r = Routine::resolve_for(store.as_ref(), Some(&key), operator(), &Routine::default());
+        let locs = ResolvedLocations { routine: r.routine, degraded: r.degraded };
+        assert_eq!(locs.home().as_deref(), Some(SAVED_HOME));
+        assert!(!locs.unavailable());
+
+        let (cal, _) = CountingCalendar::with(vec![]);
+        let fc = FakeForecast::failing();
+        let report = run_watch(3, operator(), &cal, &locs, &fc, today()).await;
+        // The forecast fails, but the point is that it was ATTEMPTED for the
+        // caller's own home rather than skipped as "nothing configured".
+        assert!(
+            !matches!(report.heat.gaps.first(), Some(Gap::NotConfigured(_))),
+            "the caller's saved home must be watched, got {:?}",
+            report.heat.gaps
+        );
+    }
+
+    /// "Could not read your saved locations" must not render as "you have no
+    /// home configured" — the absence/failure collapse `crate::locations`
+    /// refuses to make.
+    #[tokio::test]
+    async fn an_unreadable_registry_is_a_could_not_check_not_a_nothing_configured() {
+        let locs = ResolvedLocations { routine: Routine::default(), degraded: true };
+        let (cal, _) = CountingCalendar::with(vec![]);
+        let fc = FakeForecast::failing();
+        let r = run_watch(3, operator(), &cal, &locs, &fc, today()).await;
+        match r.heat.gaps.first() {
+            Some(Gap::Failed(why)) => assert!(why.contains("could not be read"), "{why}"),
+            other => panic!("expected a could-not-check gap, got {other:?}"),
+        }
     }
 
     // ── DEGRADE HONESTLY ────────────────────────────────────────────────────

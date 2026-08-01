@@ -149,13 +149,50 @@ impl WeatherConfig {
             .map_err(|e| ToolError::Http(e.to_string()))
     }
 
+    /// Test-only: this config's legacy `routine` re-expressed as one keyed
+    /// caller's SAVED registry entries, with the identity that owns them.
+    ///
+    /// The tests that predate LOCREG-01 configure a [`Routine`] and expect the
+    /// routine tier to resolve. The UN-KEYED path now fails closed (see
+    /// [`WeatherConfig::resolve_location_for`]) because those values are the
+    /// operator's and an un-keyed path cannot establish who is asking — so the
+    /// modern spelling of "this caller has a home configured" is "this caller
+    /// has a home SAVED". Same chain, same assertions, an identity attached.
+    ///
+    /// The un-keyed path keeps its own dedicated tests; this helper exists so
+    /// the OTHER tests keep testing what they were written to test.
+    #[cfg(test)]
+    fn keyed_for_test(&self) -> (Self, crate::locations::CallerKey) {
+        use crate::locations::{self, CallerKey};
+        let key = CallerKey::for_principal_name("test-caller").unwrap();
+        let store = Arc::new(crate::locations::store::fake::CountingStore::new());
+        let seeder = CallerContext::entitled_for_test_only(false, true);
+        for (name, value) in [
+            (locations::HOME, self.routine.home.as_deref()),
+            (locations::WORK, self.routine.work.as_deref()),
+            (locations::CURRENT, self.routine.current.as_deref()),
+        ] {
+            if let Some(v) = value {
+                match locations::set(store.as_ref(), Some(&key), seeder, name, v, None, true) {
+                    locations::WriteOutcome::Stored { .. } => {}
+                    other => panic!("fixture seed failed: {other:?}"),
+                }
+            }
+        }
+        let mut cfg = self.clone();
+        cfg.locations = store;
+        (cfg, key)
+    }
+
     /// Test-only shim carrying the pre-LOCREG-01 signature (no caller key), so
     /// the resolution tests that predate the registry keep testing what they
-    /// tested. Production dispatch goes through
-    /// [`WeatherConfig::resolve_location_for`].
+    /// tested — now via [`WeatherConfig::keyed_for_test`], since a genuinely
+    /// un-keyed path no longer resolves a routine at all. Production dispatch
+    /// goes through [`WeatherConfig::resolve_location_for`].
     #[cfg(test)]
     async fn resolve_location(&self, input: Option<&str>, caller: CallerContext) -> Resolved {
-        self.resolve_location_for(input, caller, None).await.0
+        let (cfg, key) = self.keyed_for_test();
+        cfg.resolve_location_for(input, caller, Some(&key)).await.0
     }
 
     /// Resolve the caller-supplied location through the full chain:
@@ -179,10 +216,32 @@ impl WeatherConfig {
     /// "nothing saved" and "couldn't read what's saved" must reach the user as
     /// different sentences (see [`location::REGISTRY_UNAVAILABLE_MESSAGE`]).
     ///
-    /// `key: None` means the dispatch path carried no identity. That is not a
-    /// registry failure and must not degrade the tool: it falls back to the
-    /// legacy `COMMUTE_*` routine, still gated by `caller` exactly as before, so
-    /// every un-keyed path behaves precisely as it did pre-LOCREG-01.
+    /// `key: None` means the dispatch path carried no identity, and it FAILS
+    /// CLOSED: no registry record, and no legacy `COMMUTE_*` routine either.
+    ///
+    /// The first cut kept the legacy routine here, reasoning that it preserved
+    /// pre-LOCREG-01 behaviour. That reasoning was wrong, and the review that
+    /// caught it was right: preserving the old behaviour on this path preserves
+    /// the leak. `COMMUTE_HOME`/`COMMUTE_WORK` are PROCESS-GLOBAL and hold the
+    /// OPERATOR's own addresses; a path that does not know who is asking cannot
+    /// establish that the asker is the operator, so handing them over is a
+    /// disclosure to an unknown caller. Missing identity is not "probably the
+    /// owner" — it is "nobody in particular", and the requirement is absolute:
+    /// the operator's legacy locations must not reach another caller.
+    ///
+    /// The consequence is that an un-keyed path can no longer resolve a routine
+    /// location at all. That is the correct outcome and it costs nothing real:
+    /// the un-keyed paths are `execute` (which already carries
+    /// [`CallerContext::untrusted`], so the routine tier was gated off anyway)
+    /// and `execute_with_caller` (reachable only via
+    /// `ToolRegistry::call_with_caller`, which no production path uses — the MCP
+    /// dispatch in `crate::mcp_server` calls `call_with_caller_key`). And the
+    /// chain degrades honestly: with no routine it lands on ASK, which is this
+    /// module's whole design.
+    ///
+    /// Not `degraded`: nothing failed to be read. "I don't know which location
+    /// you mean" is the truthful answer, and reporting it as "I couldn't read
+    /// your saved locations" would be a different lie.
     async fn resolve_location_for(
         &self,
         input: Option<&str>,
@@ -191,7 +250,7 @@ impl WeatherConfig {
     ) -> (Resolved, bool) {
         let resolution = match key {
             None => location::RoutineResolution {
-                routine: self.routine.clone(),
+                routine: Routine::default(),
                 degraded: false,
             },
             Some(k) => Routine::resolve_for(
@@ -1023,7 +1082,14 @@ mod tests {
         /// below read as the deliberate contrast they are, rather than as the
         /// odd one out.
         async fn execute_as_operator(&self, args: Value) -> Result<String, ToolError> {
-            self.execute_with_caller(args, operator()).await.map(|o| o.text)
+            // Keyed, for the reason `WeatherConfig::keyed_for_test` documents:
+            // the routine tier is per-caller now, and an un-keyed path
+            // deliberately resolves nothing.
+            let (cfg, key) = self.cfg.keyed_for_test();
+            Weather { cfg }
+                .execute_with_caller_key(args, operator(), Some(key))
+                .await
+                .map(|o| o.text)
         }
     }
 
@@ -1246,23 +1312,82 @@ mod tests {
     }
 
     /// The un-keyed dispatch path (`execute`, `execute_with_caller`, internal
-    /// helpers) must behave exactly as it did before LOCREG-01: the legacy
-    /// `COMMUTE_*` routine still resolves, still gated by the caller.
+    /// helpers) must FAIL CLOSED: with no identity there is no per-caller record
+    /// AND no legacy `COMMUTE_*` routine, even for a caller the gateway
+    /// otherwise trusts. Preserving the old behaviour here preserved the leak.
     #[tokio::test]
-    async fn locreg_an_unkeyed_path_still_uses_the_legacy_routine_unchanged() {
+    async fn locreg_an_unkeyed_path_cannot_reach_the_legacy_routine() {
         use crate::locations::store::fake::CountingStore;
 
+        // The operator's own `COMMUTE_HOME`/`COMMUTE_WORK`, as the process
+        // holds them.
+        const LEGACY_HOME: &str = "123 Legacy St, Examplecity"; // pii-test-fixture: obvious placeholder standing in for the operator's COMMUTE_HOME
+        const LEGACY_WORK: &str = "456 Legacy Ave, Examplecity"; // pii-test-fixture: obvious placeholder standing in for the operator's COMMUTE_WORK
+
         let store = Arc::new(CountingStore::new());
-        let mut cfg = offline_cfg(routine_of(Some("123 Legacy St"), None), Arc::new(NoCalendar)); // pii-test-fixture: obvious placeholder standing in for COMMUTE_HOME
+        let mut cfg = offline_cfg(
+            Routine {
+                home: Some(LEGACY_HOME.into()),
+                work: Some(LEGACY_WORK.into()),
+                current: None,
+            },
+            Arc::new(NoCalendar),
+        );
         cfg.locations = store.clone();
 
-        match cfg.resolve_location_for(None, operator(), None).await.0 {
-            Resolved::Found { location, source: LocationSource::Routine(_) } => {
-                assert_eq!(location, "123 Legacy St")
-            }
-            other => panic!("the un-keyed path must not regress, got {other:?}"),
-        }
+        // Entitled AND un-keyed is the dangerous combination: entitlement alone
+        // used to be enough to be handed the operator's addresses.
+        let (resolved, degraded) = cfg.resolve_location_for(None, operator(), None).await;
+        assert_eq!(resolved, Resolved::AskUser, "no identity ⇒ no routine ⇒ ask");
+        assert!(!degraded, "nothing failed to be read; this is not a degradation");
         assert_eq!(store.reads(), 0, "no identity means no per-caller record to read");
+
+        // And the addresses appear nowhere in what the caller can observe.
+        let seen = format!("{resolved:?}");
+        assert!(!seen.contains("Legacy"), "the operator's legacy location leaked: {seen}");
+
+        // Same through the real un-keyed entry points, end to end.
+        let tool = Weather { cfg };
+        for out in [
+            tool.execute(json!({"when": "current"})).await.unwrap(),
+            tool.execute_with_caller(json!({"when": "current"}), operator()).await.unwrap().text,
+        ] {
+            assert_eq!(out, location::ASK_MESSAGE);
+            assert!(!out.contains("Legacy"));
+        }
+    }
+
+    /// The counterpart that stops the test above from passing on a build where
+    /// the legacy bridge was simply deleted: a KEYED caller whose principal IS
+    /// the legacy one still gets `COMMUTE_HOME`.
+    #[tokio::test]
+    async fn locreg_the_legacy_routine_still_reaches_the_legacy_principal_when_keyed() {
+        use crate::locations::store::fake::CountingStore;
+        use crate::locations::CallerKey;
+
+        const LEGACY_HOME: &str = "123 Legacy St, Examplecity"; // pii-test-fixture: obvious placeholder standing in for the operator's COMMUTE_HOME
+
+        let mut cfg = offline_cfg(
+            Routine { home: Some(LEGACY_HOME.into()), work: None, current: None },
+            Arc::new(NoCalendar),
+        );
+        cfg.locations = Arc::new(CountingStore::new());
+
+        // Read the configured principal rather than assuming the default, so a
+        // host that sets `TERMINUS_COMMUTE_LEGACY_PRINCIPAL` does not turn this
+        // control into a flake (and, worse, a silently-disabled one).
+        let principal = std::env::var(location::LEGACY_PRINCIPAL_ENV)
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| location::DEFAULT_LEGACY_PRINCIPAL.to_string());
+        let key = CallerKey::for_principal_name(&principal).unwrap();
+        match cfg.resolve_location_for(None, operator(), Some(&key)).await.0 {
+            Resolved::Found { location, source: LocationSource::Routine(_) } => {
+                assert_eq!(location, LEGACY_HOME)
+            }
+            other => panic!("the legacy bridge must still work when keyed, got {other:?}"),
+        }
     }
 
     #[test]

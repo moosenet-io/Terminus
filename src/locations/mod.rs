@@ -197,11 +197,28 @@ impl CallerKey {
         Some(key)
     }
 
-    /// The principal this key is scoped to — used by the legacy `COMMUTE_*`
-    /// fallback, which applies to exactly one principal (see
-    /// [`crate::weather::location::Routine::resolve_for`]).
-    pub fn principal(&self) -> &str {
-        &self.principal
+    /// This key VIEWED AS a service-only identity — `None` the moment it names
+    /// a person.
+    ///
+    /// This is the ONLY way to get at the principal string, and that is the
+    /// point. The legacy `COMMUTE_*` bridge (see
+    /// [`crate::weather::location::Routine::resolve_for`]) hands out the
+    /// OPERATOR's own addresses to whoever matches "the legacy principal". A
+    /// bare `principal()` accessor made that check `key.principal() == legacy`,
+    /// which is TRUE for `svc:lumina#person:someone` — so after TERM #577 every
+    /// person behind the `lumina` service principal would have inherited the
+    /// operator's home address. That is precisely the orphaning-safety property
+    /// [`CallerKey::storage_key`] claims, defeated by an accessor.
+    ///
+    /// So the accessor is gone and this replaces it: a person-scoped key cannot
+    /// produce a [`ServiceScoped`] at all, and the bridge takes a
+    /// [`ServiceScoped`], not a `&CallerKey`. The check is not "remember to also
+    /// test `is_person_scoped`" — there is no way to phrase the unsafe version.
+    pub fn as_service_scoped(&self) -> Option<ServiceScoped<'_>> {
+        match self.person {
+            None => Some(ServiceScoped(self)),
+            Some(_) => None,
+        }
     }
 
     /// Whether this key names a person, or only a service.
@@ -224,6 +241,24 @@ impl CallerKey {
             None => format!("svc:{}", self.principal),
             Some(p) => format!("svc:{}#person:{p}", self.principal),
         }
+    }
+}
+
+/// A [`CallerKey`] PROVEN to name a service and no person.
+///
+/// Constructible only through [`CallerKey::as_service_scoped`], which refuses a
+/// person-scoped key. A function that takes one of these has the "no person
+/// component" guarantee from the TYPE and cannot be called wrongly; a function
+/// that takes `&CallerKey` would have to remember to check, and the review that
+/// produced this type found exactly that check missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceScoped<'a>(&'a CallerKey);
+
+impl ServiceScoped<'_> {
+    /// The service principal. Safe to compare against a configured principal
+    /// name precisely because no person can be hiding behind it.
+    pub fn principal(&self) -> &str {
+        &self.0.principal
     }
 }
 
@@ -444,33 +479,47 @@ pub fn set(
         }
     };
 
-    let mut registry = match store.load() {
-        Ok(r) => r,
-        Err(e) => return WriteOutcome::Unavailable(e),
-    };
-
-    let existing = registry.caller(&storage_key).and_then(|c| c.locations.get(&name)).cloned();
-    if let Some(prev) = &existing {
-        // An EXPIRED entry is not a value the user still stands behind, so
-        // replacing it is not an overwrite worth interrupting for.
-        let live = !prev.is_expired(now);
-        if live && prev.value != value && !confirm {
-            return WriteOutcome::NeedsConfirmation {
-                name,
-                existing_is_temporary: prev.is_temporary(),
-            };
+    // ONE transaction: the read, the overwrite decision and the write all
+    // happen under the store's lock. Done as a load then a save, a concurrent
+    // `location_set` for a different name would read the same pre-state and the
+    // later save would silently drop the earlier entry — a saved location
+    // disappearing with no error, which is the failure a user reports as "it
+    // forgot where I live".
+    let mut outcome = None;
+    let tx = store.update(&mut |registry| {
+        let existing =
+            registry.caller(&storage_key).and_then(|c| c.locations.get(&name)).cloned();
+        if let Some(prev) = &existing {
+            // An EXPIRED entry is not a value the user still stands behind, so
+            // replacing it is not an overwrite worth interrupting for.
+            let live = !prev.is_expired(now);
+            if live && prev.value != value && !confirm {
+                outcome = Some(WriteOutcome::NeedsConfirmation {
+                    name: name.clone(),
+                    existing_is_temporary: prev.is_temporary(),
+                });
+                return store::Commit::Abort;
+            }
         }
-    }
 
-    let entry = match expires_at {
-        Some(t) => StoredLocation::temporary(value, t, now),
-        None => StoredLocation::permanent(value, now),
-    };
-    registry.caller_mut(&storage_key).locations.insert(name.clone(), entry.clone());
-    prune_expired(&mut registry, now);
+        let entry = match expires_at {
+            Some(t) => StoredLocation::temporary(value.clone(), t, now),
+            None => StoredLocation::permanent(value.clone(), now),
+        };
+        registry.caller_mut(&storage_key).locations.insert(name.clone(), entry.clone());
+        prune_expired(registry, now);
+        outcome = Some(WriteOutcome::Stored { name: name.clone(), entry, replaced: existing });
+        store::Commit::Save
+    });
 
-    match store.save(&registry) {
-        Ok(()) => WriteOutcome::Stored { name, entry, replaced: existing },
+    match tx {
+        Ok(()) => outcome.unwrap_or_else(|| {
+            // Unreachable: `Ok` means the closure ran and always sets `outcome`.
+            // Reported as a write failure rather than panicking — this path
+            // holds a home address and a panic here would be the worst possible
+            // way to find out.
+            WriteOutcome::Unavailable(StoreError::WriteFailed(std::io::ErrorKind::Other))
+        }),
         Err(e) => WriteOutcome::Unavailable(e),
     }
 }
@@ -501,29 +550,39 @@ pub fn clear(
         None => return ClearOutcome::NeedsConfirmation,
     };
 
-    let mut registry = match store.load() {
-        Ok(r) => r,
-        Err(e) => return ClearOutcome::Unavailable(e),
-    };
-    let record = registry.caller_mut(&storage_key);
-    let count = match &target {
-        Some(n) => {
-            if record.locations.remove(n).is_none() {
-                return ClearOutcome::NotSet;
+    // One transaction, same reasoning as `set`: a clear that read the document,
+    // removed one name and wrote the whole thing back would also write back its
+    // stale copy of every OTHER name, undoing a concurrent `location_set`.
+    let mut outcome = None;
+    let tx = store.update(&mut |registry| {
+        let record = registry.caller_mut(&storage_key);
+        let count = match &target {
+            Some(n) => {
+                if record.locations.remove(n).is_none() {
+                    outcome = Some(ClearOutcome::NotSet);
+                    return store::Commit::Abort;
+                }
+                1
             }
-            1
-        }
-        None => {
-            let n = record.locations.len();
-            if n == 0 {
-                return ClearOutcome::NotSet;
+            None => {
+                let n = record.locations.len();
+                if n == 0 {
+                    outcome = Some(ClearOutcome::NotSet);
+                    return store::Commit::Abort;
+                }
+                record.locations.clear();
+                n
             }
-            record.locations.clear();
-            n
-        }
-    };
-    match store.save(&registry) {
-        Ok(()) => ClearOutcome::Cleared { count },
+        };
+        outcome = Some(ClearOutcome::Cleared { count });
+        store::Commit::Save
+    });
+
+    match tx {
+        Ok(()) => outcome.unwrap_or_else(|| {
+            // Unreachable, for the same reason as in `set`.
+            ClearOutcome::Unavailable(StoreError::WriteFailed(std::io::ErrorKind::Other))
+        }),
         Err(e) => ClearOutcome::Unavailable(e),
     }
 }
@@ -848,7 +907,11 @@ mod tests {
         let person = CallerKey::for_person("lumina", "someone").unwrap();
         assert_ne!(svc.storage_key(), person.storage_key());
         assert!(!svc.is_person_scoped() && person.is_person_scoped());
-        assert_eq!(svc.principal(), person.principal());
+        // Same underlying principal — which is exactly why the legacy bridge
+        // must not be allowed to compare principals directly. Only the
+        // service-scoped VIEW exposes one, and a person-scoped key has none.
+        assert_eq!(svc.as_service_scoped().unwrap().principal(), "lumina");
+        assert!(person.as_service_scoped().is_none());
 
         let s = CountingStore::new();
         set(&s, Some(&svc), entitled(), HOME, A_HOME, None, false);
@@ -868,6 +931,75 @@ mod tests {
         assert!(CallerKey::for_principal_name("   ").is_none());
         assert!(CallerKey::for_principal_name("").is_none());
         assert!(CallerKey::for_person("", "someone").is_none());
+    }
+
+    // ── concurrency: no lost updates ────────────────────────────────────────
+    //
+    // `ContendedStore` models another caller committing a write between our read
+    // and our write, deterministically and without threads or sleeps: any
+    // operation built from `load()` + `save()` writes back a snapshot that
+    // predates the rival and erases it, EVERY run. An operation built on
+    // `LocationStore::update` reads inside the same lock it writes under and
+    // cannot. "A saved location silently disappeared" is what a user reports as
+    // "it forgot where I live", so this is a correctness guard, not hygiene.
+
+    use super::store::fake::ContendedStore;
+
+    fn rival_entry() -> (String, String, StoredLocation) {
+        (
+            key_b().storage_key(),
+            "home".to_string(),
+            StoredLocation::permanent(B_HOME, now_unix()),
+        )
+    }
+
+    #[test]
+    fn a_set_does_not_lose_a_concurrent_writers_entry() {
+        let s = ContendedStore::new(Registry::default(), rival_entry());
+        let k = key_a();
+
+        assert!(matches!(
+            set(&s, Some(&k), entitled(), "home", A_HOME, None, true),
+            WriteOutcome::Stored { .. }
+        ));
+
+        let doc = s.snapshot();
+        assert_eq!(
+            doc.caller(&key_b().storage_key()).and_then(|c| c.locations.get("home")).map(|e| e.value.as_str()),
+            Some(B_HOME),
+            "a concurrent caller's saved home was silently overwritten"
+        );
+        assert_eq!(
+            doc.caller(&k.storage_key()).and_then(|c| c.locations.get("home")).map(|e| e.value.as_str()),
+            Some(A_HOME),
+            "and our own write must still have landed"
+        );
+    }
+
+    #[test]
+    fn a_clear_does_not_lose_a_concurrent_writers_entry() {
+        // Seed A's entry, then clear it while B is writing.
+        let mut seed = Registry::default();
+        seed.caller_mut(&key_a().storage_key())
+            .locations
+            .insert("home".into(), StoredLocation::permanent(A_HOME, now_unix()));
+        let s = ContendedStore::new(seed, rival_entry());
+
+        assert_eq!(
+            clear(&s, Some(&key_a()), entitled(), Some("home"), false),
+            ClearOutcome::Cleared { count: 1 }
+        );
+
+        let doc = s.snapshot();
+        assert_eq!(
+            doc.caller(&key_b().storage_key()).and_then(|c| c.locations.get("home")).map(|e| e.value.as_str()),
+            Some(B_HOME),
+            "clearing one caller's entry resurrected a stale copy of another's"
+        );
+        assert!(
+            doc.caller(&key_a().storage_key()).map(|c| c.locations.is_empty()).unwrap_or(true),
+            "and our own clear must still have landed"
+        );
     }
 
     // ── validation ──────────────────────────────────────────────────────────

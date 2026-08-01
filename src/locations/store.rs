@@ -219,6 +219,33 @@ pub trait LocationStore: Send + Sync {
 
     /// Replace the whole document, atomically.
     fn save(&self, registry: &Registry) -> Result<(), StoreError>;
+
+    /// Read, modify and write back as ONE serialized transaction.
+    ///
+    /// This exists because `load()` then `save()` is not a transaction: each
+    /// takes the lock separately, so two concurrent `location_set` calls both
+    /// read the pre-state, both write their own copy, and the later write
+    /// silently discards the earlier one. A user would report that as "it forgot
+    /// where I live" — a stored location vanishing with no error is exactly the
+    /// data-loss-looks-like-absence failure this module was built to prevent.
+    ///
+    /// The closure sees the CURRENT document and returns [`Commit::Save`] to
+    /// persist its mutations or [`Commit::Abort`] to leave the document
+    /// untouched (the needs-confirmation and nothing-to-clear paths). It runs
+    /// with the store's lock HELD, so it must not block or re-enter the store.
+    ///
+    /// Ordinary `load`/`save` remain for the read-only paths (`lookup`, `list`),
+    /// which need no transaction — one consistent snapshot is the whole job.
+    fn update(&self, f: &mut dyn FnMut(&mut Registry) -> Commit) -> Result<(), StoreError>;
+}
+
+/// What [`LocationStore::update`]'s closure decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Commit {
+    /// Persist the mutated document.
+    Save,
+    /// Persist nothing — the operation declined to write.
+    Abort,
 }
 
 /// The production store: one JSON file, mutex-guarded, atomically replaced.
@@ -254,18 +281,22 @@ impl FileLocationStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
-}
 
-fn default_path() -> PathBuf {
-    match dirs::home_dir() {
-        Some(h) => h.join(".terminus").join("locations.json"),
-        None => std::env::temp_dir().join("terminus-locations.json"),
+    /// Where this store stages a write before renaming it into place.
+    ///
+    /// Deterministic and PROCESS-scoped: two processes get different names
+    /// (different pids) and two threads in one process cannot both be here at
+    /// once (every write path holds [`STATE_LOCK`]). So the only way this name
+    /// is ever already occupied is a previous run of this pid that died between
+    /// create and rename — a STALE file, possibly with permissions we did not
+    /// choose. [`create_private`] therefore removes it rather than truncating
+    /// it. Exposed to the tests so the stale-file case can be set up exactly.
+    pub(crate) fn temp_path(&self) -> PathBuf {
+        self.path.with_extension(format!("tmp-{}", std::process::id()))
     }
-}
 
-impl LocationStore for FileLocationStore {
-    fn load(&self) -> Result<Registry, StoreError> {
-        let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    /// `load` without the lock — for use inside an already-locked section.
+    fn load_locked(&self) -> Result<Registry, StoreError> {
         match std::fs::read_to_string(&self.path) {
             Ok(raw) => {
                 // An empty file is what a crashed/truncated write leaves behind.
@@ -274,8 +305,7 @@ impl LocationStore for FileLocationStore {
                 if raw.trim().is_empty() {
                     return Err(StoreError::Corrupt);
                 }
-                let reg: Registry =
-                    serde_json::from_str(&raw).map_err(|_| StoreError::Corrupt)?;
+                let reg: Registry = serde_json::from_str(&raw).map_err(|_| StoreError::Corrupt)?;
                 reg.check_version()?;
                 Ok(reg)
             }
@@ -284,18 +314,17 @@ impl LocationStore for FileLocationStore {
         }
     }
 
-    fn save(&self, registry: &Registry) -> Result<(), StoreError> {
-        let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    /// `save` without the lock — for use inside an already-locked section.
+    fn save_locked(&self, registry: &Registry) -> Result<(), StoreError> {
         let json = serde_json::to_string_pretty(registry).map_err(|_| StoreError::Corrupt)?;
 
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| StoreError::WriteFailed(e.kind()))?;
+                std::fs::create_dir_all(parent).map_err(|e| StoreError::WriteFailed(e.kind()))?;
             }
         }
 
-        let tmp = self.path.with_extension(format!("tmp-{}", std::process::id()));
+        let tmp = self.temp_path();
         {
             let mut f = create_private(&tmp).map_err(|e| StoreError::WriteFailed(e.kind()))?;
             f.write_all(json.as_bytes()).map_err(|e| StoreError::WriteFailed(e.kind()))?;
@@ -308,26 +337,77 @@ impl LocationStore for FileLocationStore {
     }
 }
 
-/// Create the temp file owner-readable ONLY.
+fn default_path() -> PathBuf {
+    match dirs::home_dir() {
+        Some(h) => h.join(".terminus").join("locations.json"),
+        None => std::env::temp_dir().join("terminus-locations.json"),
+    }
+}
+
+impl LocationStore for FileLocationStore {
+    fn load(&self) -> Result<Registry, StoreError> {
+        let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        self.load_locked()
+    }
+
+    fn save(&self, registry: &Registry) -> Result<(), StoreError> {
+        let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        self.save_locked(registry)
+    }
+
+    /// ONE lock acquisition spanning the read, the mutation and the write — so
+    /// a concurrent writer cannot slip between them and have its entry
+    /// overwritten by our stale copy.
+    fn update(&self, f: &mut dyn FnMut(&mut Registry) -> Commit) -> Result<(), StoreError> {
+        let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut registry = self.load_locked()?;
+        match f(&mut registry) {
+            Commit::Save => self.save_locked(&registry),
+            Commit::Abort => Ok(()),
+        }
+    }
+}
+
+/// Create the temp file fresh and owner-readable ONLY.
 ///
-/// The registry holds home addresses. Creating it `0600` before a single byte
-/// is written (rather than chmod-ing afterwards) means there is no window in
-/// which a world-readable file contains one — and because the file is finalised
-/// by `rename`, the destination inherits these bits.
+/// The registry holds home addresses, so the file must be `0600` before a
+/// single byte is written rather than chmod-ed afterwards — there must be no
+/// window in which a world-readable file contains one. Because the file is
+/// finalised by `rename`, the destination inherits these bits.
+///
+/// `mode()` alone does NOT achieve that: it applies only when the open CREATES
+/// the file. An existing [`FileLocationStore::temp_path`] left behind by a
+/// crashed run with the same pid — created by anything, with any permissions —
+/// would have been TRUNCATED and its looser mode kept, and then written full of
+/// addresses. So: remove any stale file first and open with `create_new`, which
+/// fails rather than reusing someone else's inode. A stale file that cannot be
+/// removed is a write FAILURE, never a "well, write into it anyway".
 #[cfg(unix)]
 fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
+    remove_stale(path)?;
     std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)
 }
 
 #[cfg(not(unix))]
 fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::create(path)
+    remove_stale(path)?;
+    std::fs::OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+/// Delete a leftover temp file. "Already gone" is success; anything else is a
+/// real failure and must propagate, because the alternative is writing a home
+/// address into a file whose permissions we did not choose.
+fn remove_stale(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -381,6 +461,20 @@ pub(crate) mod fake {
             *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = registry.clone();
             Ok(())
         }
+
+        /// Atomic like the real store: the lock is held across the whole
+        /// closure. Counted as one read and (when it commits) one write, so the
+        /// zero-reads entitlement assertions keep meaning what they meant.
+        fn update(&self, f: &mut dyn FnMut(&mut Registry) -> Commit) -> Result<(), StoreError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut working = guard.clone();
+            if f(&mut working) == Commit::Save {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                *guard = working;
+            }
+            Ok(())
+        }
     }
 
     /// A store whose every operation fails — the "could not read" fixture.
@@ -392,6 +486,76 @@ pub(crate) mod fake {
         }
         fn save(&self, _registry: &Registry) -> Result<(), StoreError> {
             Err(StoreError::WriteFailed(std::io::ErrorKind::PermissionDenied))
+        }
+        /// Fails at the READ, before the closure runs — the caller must see
+        /// "could not read", not "wrote nothing".
+        fn update(&self, _f: &mut dyn FnMut(&mut Registry) -> Commit) -> Result<(), StoreError> {
+            Err(StoreError::Unreadable(std::io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    /// A store that models a COMPETING WRITER, deterministically.
+    ///
+    /// Every `load()` hands back the current document and then — before the
+    /// caller can possibly have written anything back — applies somebody else's
+    /// write to the stored document. That is the read-modify-write hazard with
+    /// the timing taken out: any operation built from `load()` + `save()`
+    /// necessarily saves a snapshot that predates the competing write and
+    /// erases it, every single run, with no threads and no sleeps.
+    ///
+    /// `update()` is atomic (the lock spans the closure), so an operation built
+    /// on it never observes the interleaving at all. The competing write
+    /// therefore survives IFF the operation is a real transaction.
+    pub struct ContendedStore {
+        inner: Mutex<Registry>,
+        /// The write the "other caller" performs, once, on the first `load`.
+        rival: Mutex<Option<(String, String, StoredLocation)>>,
+    }
+
+    impl ContendedStore {
+        /// `rival` is `(storage_key, name, entry)` — the entry another caller
+        /// commits between our read and our write.
+        pub fn new(seed: Registry, rival: (String, String, StoredLocation)) -> Self {
+            Self { inner: Mutex::new(seed), rival: Mutex::new(Some(rival)) }
+        }
+
+        pub fn snapshot(&self) -> Registry {
+            self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+
+        fn let_the_rival_write(&self, reg: &mut Registry) {
+            let mut slot = self.rival.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((key, name, entry)) = slot.take() {
+                reg.caller_mut(&key).locations.insert(name, entry);
+            }
+        }
+    }
+
+    impl LocationStore for ContendedStore {
+        fn load(&self) -> Result<Registry, StoreError> {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let seen = guard.clone();
+            self.let_the_rival_write(&mut guard);
+            Ok(seen)
+        }
+
+        fn save(&self, registry: &Registry) -> Result<(), StoreError> {
+            *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = registry.clone();
+            Ok(())
+        }
+
+        fn update(&self, f: &mut dyn FnMut(&mut Registry) -> Commit) -> Result<(), StoreError> {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // The rival commits here too — it is a real concurrent write, not a
+            // property of the `load` path. The difference is that a transaction
+            // sees it, because the read happens INSIDE the lock we then write
+            // under.
+            self.let_the_rival_write(&mut guard);
+            let mut working = guard.clone();
+            if f(&mut working) == Commit::Save {
+                *guard = working;
+            }
+            Ok(())
         }
     }
 }
@@ -453,6 +617,170 @@ mod tests {
         s.save(&Registry::default()).expect("save");
         let mode = std::fs::metadata(s.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "a file holding home addresses must not be group/world readable");
+    }
+
+    /// FINDING 4. `OpenOptions::mode` applies only when the open CREATES the
+    /// file. A stale temp file left by a crashed run with the same pid — with
+    /// whatever permissions it happened to have — used to be TRUNCATED and then
+    /// filled with home addresses, keeping its loose mode all the way through
+    /// the rename into the destination.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_world_readable_temp_file_does_not_loosen_the_written_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let s = FileLocationStore::at(d.path().join("locations.json"));
+
+        // Exactly the path the next save will stage through.
+        let stale = s.temp_path();
+        std::fs::write(&stale, "leftover from a crashed run").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let mut reg = Registry::default();
+        reg.caller_mut("svc:alpha")
+            .locations
+            .insert("home".into(), StoredLocation::permanent("1 Placeholder Way", 100)); // pii-test-fixture: obvious placeholder standing in for a home address
+        s.save(&reg).expect("save over a stale temp file");
+
+        let mode = std::fs::metadata(s.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a file holding home addresses must not be group/world readable");
+        assert_eq!(s.load().expect("load"), reg, "and the stale bytes must not survive");
+        assert!(!stale.exists(), "the temp file must not be left behind");
+    }
+
+    /// The write must also not INHERIT a loose mode from an existing
+    /// destination — `rename` replaces the destination, so the 0600 temp file's
+    /// bits are what remain.
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_destination_is_replaced_by_an_owner_only_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("locations.json");
+        std::fs::write(&p, r#"{"version":1,"callers":{}}"#).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let s = FileLocationStore::at(&p);
+        s.save(&Registry::default()).expect("save");
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    /// FINDING 3, at the store level: `update` must span the read and the write.
+    /// A `Save` lands; an `Abort` leaves the document byte-identical.
+    #[test]
+    fn update_is_a_transaction_and_abort_writes_nothing() {
+        let (_d, s) = tmp();
+        let mut seeded = Registry::default();
+        seeded
+            .caller_mut("svc:alpha")
+            .locations
+            .insert("home".into(), StoredLocation::permanent("1 Placeholder Way", 100)); // pii-test-fixture: obvious placeholder standing in for a home address
+        s.save(&seeded).unwrap();
+
+        // Abort: the closure sees the current document and declines.
+        let mut saw = None;
+        s.update(&mut |reg| {
+            saw = reg.caller("svc:alpha").map(|c| c.locations.len());
+            reg.caller_mut("svc:alpha").locations.clear();
+            Commit::Abort
+        })
+        .expect("update");
+        assert_eq!(saw, Some(1), "the closure must see the CURRENT document");
+        assert_eq!(s.load().unwrap(), seeded, "an aborted transaction must write nothing");
+
+        // Save: the mutation lands.
+        s.update(&mut |reg| {
+            reg.caller_mut("svc:bravo")
+                .locations
+                .insert("home".into(), StoredLocation::permanent("2 Otherplace Road", 100)); // pii-test-fixture: obvious placeholder standing in for another caller's home address
+            Commit::Save
+        })
+        .expect("update");
+        assert!(s.load().unwrap().caller("svc:bravo").is_some());
+        assert!(s.load().unwrap().caller("svc:alpha").is_some(), "and must not drop the rest");
+    }
+
+    /// The other half of FINDING 3: `update` must hold the REAL lock across the
+    /// closure, not merely sequence a `load` and a `save`.
+    ///
+    /// A transaction and a load-then-save are indistinguishable single-threaded,
+    /// so this uses a second thread — but the ASSERTION is deterministic, not a
+    /// race. Thread A enters its closure and waits (bounded) for thread B to
+    /// finish a whole `save`. Under a real transaction B cannot start, A's wait
+    /// expires, A commits, and B's later save preserves A's entry — both survive.
+    /// Under load-then-save B completes immediately, A then writes back the
+    /// snapshot it read before B existed, and B's entry is gone. The outcome is
+    /// fixed in both cases; only the wall-clock cost of the bounded wait varies.
+    #[test]
+    fn update_holds_the_lock_across_the_whole_read_modify_write() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("locations.json");
+        FileLocationStore::at(&path).save(&Registry::default()).unwrap();
+
+        let b_done = Arc::new(AtomicBool::new(false));
+        let a_entered = Arc::new(AtomicBool::new(false));
+
+        let (bp, bd, ae) = (path.clone(), b_done.clone(), a_entered.clone());
+        let b = std::thread::spawn(move || {
+            // Wait for A to be INSIDE its transaction before competing.
+            while !ae.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            let s = FileLocationStore::at(&bp);
+            let mut reg = s.load().expect("B load");
+            reg.caller_mut("svc:bravo")
+                .locations
+                .insert("home".into(), StoredLocation::permanent("2 Otherplace Road", 100)); // pii-test-fixture: obvious placeholder standing in for another caller's home address
+            s.save(&reg).expect("B save");
+            bd.store(true, Ordering::SeqCst);
+        });
+
+        let s = FileLocationStore::at(&path);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(750);
+        s.update(&mut |reg| {
+            reg.caller_mut("svc:alpha")
+                .locations
+                .insert("home".into(), StoredLocation::permanent("1 Placeholder Way", 100)); // pii-test-fixture: obvious placeholder standing in for a home address
+            a_entered.store(true, Ordering::SeqCst);
+            // Give B every chance to slip in. It can only do so if this
+            // closure is NOT running under the store's lock.
+            while !b_done.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            Commit::Save
+        })
+        .expect("A update");
+        b.join().expect("B thread");
+
+        let doc = FileLocationStore::at(&path).load().expect("final load");
+        assert!(doc.caller("svc:alpha").is_some(), "A's write must have landed");
+        assert!(
+            doc.caller("svc:bravo").is_some(),
+            "a concurrent writer's entry was lost — the read-modify-write is not serialized"
+        );
+    }
+
+    /// A read failure aborts the transaction BEFORE the closure runs — a
+    /// read-modify-write on an unreadable document would write a registry
+    /// invented from nothing over whatever is actually there.
+    #[test]
+    fn update_refuses_to_run_on_an_unreadable_document() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("locations.json");
+        std::fs::write(&p, "{ not json").unwrap();
+        let s = FileLocationStore::at(&p);
+
+        let mut ran = false;
+        let r = s.update(&mut |_| {
+            ran = true;
+            Commit::Save
+        });
+        assert_eq!(r, Err(StoreError::Corrupt));
+        assert!(!ran, "the closure must not run when the document could not be read");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{ not json", "and nothing was written");
     }
 
     #[test]
