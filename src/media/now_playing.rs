@@ -23,7 +23,9 @@
 //! and that direction is the more dangerous one, because "nobody is watching"
 //! reads as a confident, correct answer. So `idle` is granted only to the one
 //! empty shape the live server actually emits, and every other unreadable body
-//! is `malformed` — see [`session_items`].
+//! is `malformed` — see [`session_items`]. That line is drawn finely enough to
+//! separate an ABSENT `Metadata` key (idle at `size: 0`) from an explicitly
+//! `null` one (always malformed), because Plex omits keys and never nulls them.
 //!
 //! ## Never cached
 //!
@@ -191,8 +193,24 @@ fn bool_at(v: &Value, key: &str) -> Option<bool> {
 /// the observed shape rather than on defensiveness matters in both directions:
 /// calling a genuine idle response malformed would be its own false alarm.
 ///
+/// **Absent and explicitly `null` are NOT the same thing here.** An explicit
+/// `"Metadata": null` is malformed at any `size`, including `size: 0`. That is
+/// a decision made on evidence, not on defensiveness: Plex's JSON serializer
+/// OMITS keys it has no value for, and emits no JSON `null` anywhere — re-probed
+/// read-only against the live server (1.42.2) across `/status/sessions`,
+/// `/identity`, `/library/sections`, `/library/onDeck` and
+/// `/status/sessions/history/all`, none of which contains a single `null`. The
+/// client between here and the wire is a plain `serde_json::from_str` of the
+/// response body ([`super::clients::plex::PlexClient::sessions`]), so it cannot
+/// introduce one either. A null therefore means something in the path REWROTE
+/// the response, which makes the `size` sitting next to it no more trustworthy
+/// than the key it replaced — exactly the "we cannot read this" case, not the
+/// "nobody is watching" one. `idle` stays narrow: the absent key, or an empty
+/// array, each with `size == 0`.
+///
 /// Cross-checks applied, each because it would otherwise become a silent
 /// UNDERCOUNT — a quiet lie about who is watching:
+/// - `Metadata` explicitly `null` ⇒ malformed, at ANY `size` (above).
 /// - `Metadata` absent but `size` nonzero (or absent) ⇒ malformed.
 /// - `Metadata` present but not a list ⇒ malformed.
 /// - a `Metadata` entry that is not an object ⇒ malformed (see below).
@@ -224,7 +242,16 @@ fn session_items(raw: &Value) -> Result<Vec<&Value>, String> {
     let size = num_at(mc, "size");
 
     match mc.get("Metadata") {
-        None | Some(Value::Null) => match size {
+        // Explicit null is NOT absence. Plex omits keys rather than nulling
+        // them (verified live, see the doc comment), so a null is evidence the
+        // response was rewritten in transit — and a rewritten response makes
+        // the `size` beside it untrustworthy too, at 0 as much as at 3.
+        Some(Value::Null) => Err(
+            "MediaContainer.Metadata was explicitly null, which is not a shape Plex emits \
+             (it omits the key entirely when nothing is playing)"
+                .to_string(),
+        ),
+        None => match size {
             Some(0) => Ok(Vec::new()),
             Some(n) => Err(format!(
                 "MediaContainer reported {n} session(s) but carried no Metadata list"
@@ -465,6 +492,19 @@ fn server_json(raw: &Value) -> Value {
 /// session container could not be read ([`session_items`]). `idle` is reserved
 /// for the one shape the live server actually emits when nothing is playing —
 /// see [`session_items`] for exactly where that line falls and why.
+///
+/// ### `idle` vs `malformed`: absent `Metadata` vs explicit `null`
+///
+/// Stated here because it is the one place the shape is genuinely ambiguous to
+/// a consumer, and Phase 2 must not have to guess:
+///
+/// > `status` is `idle` only when `MediaContainer.size == 0` **and**
+/// > `MediaContainer.Metadata` is either **absent** or an **empty array**. An
+/// > explicitly `null` `Metadata` is **`malformed`**, never `idle`, at every
+/// > `size` including `0` — Plex omits the key when nothing is playing
+/// > (`{"MediaContainer":{"size":0}}`) and emits no JSON `null` on any endpoint,
+/// > so a null means the response was rewritten in transit and neither it nor
+/// > the `size` beside it can be trusted.
 ///
 /// ### Per-session field contract, where it is not self-evident
 ///
@@ -907,6 +947,55 @@ mod tests {
         assert!(session_items(&json!({ "MediaContainer": { "size": "0" } }))
             .expect("a stringly-typed zero is still zero")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_null_metadata_is_malformed_while_absent_and_empty_stay_idle() {
+        // DECISION, on evidence rather than on which option is more defensive:
+        // an explicit `"Metadata": null` is MALFORMED at every size, including
+        // 0. Plex's serializer omits keys instead of nulling them — re-probed
+        // read-only against the live server across /status/sessions,
+        // /identity, /library/sections, /library/onDeck and
+        // /status/sessions/history/all, none of which contains a single JSON
+        // null — and the client is a plain from_str of the body, so it cannot
+        // introduce one. A null means the response was rewritten in transit,
+        // which makes the size beside it no more trustworthy than the key it
+        // replaced. Without this, `{"size":0,"Metadata":null}` rendered as
+        // idle: the malformed/idle collapse this module exists to prevent.
+        for (label, raw) in [
+            ("null Metadata at size 0", json!({ "MediaContainer": { "size": 0, "Metadata": null } })),
+            ("null Metadata at size 3", json!({ "MediaContainer": { "size": 3, "Metadata": null } })),
+            ("null Metadata with no size", json!({ "MediaContainer": { "Metadata": null } })),
+        ] {
+            let err = session_items(&raw).expect_err(&format!("{label} must not parse as idle"));
+            assert!(err.contains("null"), "{label}: the detail should name it: {err}");
+        }
+
+        // POSITIVE CONTROLS — the asymmetry that shaped this module: calling a
+        // LEGITIMATE idle response malformed would be its own false alarm.
+        // Absent and empty-array must both still be idle at size 0.
+        assert!(
+            session_items(&json!({ "MediaContainer": { "size": 0 } }))
+                .expect("an ABSENT Metadata key at size 0 is the live server's idle shape")
+                .is_empty()
+        );
+        assert!(
+            session_items(&json!({ "MediaContainer": { "size": 0, "Metadata": [] } }))
+                .expect("an EMPTY Metadata list at size 0 is idle")
+                .is_empty()
+        );
+
+        // And end to end, the shape Phase 2 renders: a null never reaches the
+        // GUI as an empty house, and carries no count to be misread as one.
+        let p = MediaNowPlaying::with_source(CountingSource::ok(
+            json!({ "MediaContainer": { "size": 0, "Metadata": null } }),
+        ))
+        .run(entitled())
+        .await;
+        assert_eq!(p["status"], "malformed");
+        assert_eq!(p["ok"], false);
+        assert!(p.get("session_count").is_none());
+        assert!(p.get("sessions").is_none());
     }
 
     #[test]

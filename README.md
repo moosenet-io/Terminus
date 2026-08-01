@@ -320,6 +320,14 @@ Two properties are load-bearing rather than incidental:
   `size` with no sessions attached, a count that disagrees with the list — is
   `malformed`. A broken read that claimed "nobody is watching" would be the worst
   failure this tool could have, because on a dashboard it looks like an answer.
+  Stated explicitly for consumers, because *absent* and *null* are not the same shape:
+
+  > `status` is `idle` only when `MediaContainer.size == 0` **and**
+  > `MediaContainer.Metadata` is either **absent** or an **empty array**. An explicitly
+  > `null` `Metadata` is **`malformed`**, never `idle`, at every `size` including `0` —
+  > Plex omits the key when nothing is playing (`{"MediaContainer":{"size":0}}`) and
+  > emits no JSON `null` on any endpoint, so a null means the response was rewritten in
+  > transit and neither it nor the `size` beside it can be trusted.
 - **`transcode_reason` may be null for a non-direct-play session.** It is non-null *iff*
   `decision != "direct_play"` **and** Plex supplied a `TranscodeSession`. Plex sometimes
   states the decision on `Media[0].Part[0]` with no transcode session to explain it, and
