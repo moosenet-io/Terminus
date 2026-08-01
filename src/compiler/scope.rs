@@ -108,6 +108,58 @@ pub fn render_scope_argv(
     argv
 }
 
+/// Environment a COMPILE/TEST genuinely needs, as a deny-by-default allowlist.
+///
+/// ## Why the test scope must not inherit the service environment
+/// `systemd-run --scope` runs its command as a direct child of `systemd-run`,
+/// which inherits ITS environment — and `systemd-run` is spawned by
+/// terminus-primary, whose process env carries the fleet's materialised
+/// credentials and app config (forge PATs, provider keys, mirror remotes,
+/// sweep tuning, …). A `cargo test` run in that scope therefore sees all of it.
+///
+/// That breaks the gate in a way that looks like a code failure but is not: a
+/// test asserting "with no credential configured we degrade" cannot hold in a
+/// scope where the credential IS configured. On this fleet that silently
+/// reddened roughly ten tests on a tree that is green locally — a red verdict
+/// on good code, which is worse than an outage, because a flaky-looking red
+/// invites people to rationalise failures away rather than trust the gate.
+///
+/// It is also a privilege question: a build script or test in an untrusted
+/// dependency should not be handed the fleet's credentials merely because the
+/// gate happened to run on the host that holds them.
+///
+/// ## Deny by default
+/// This returns true only for variables a compile genuinely needs — the
+/// toolchain, the target/cache directories, the C/link toolchain, locale and
+/// path basics. Anything unrecognised is DROPPED. That direction matters: a
+/// missing build var produces a loud, immediate build failure that is easy to
+/// diagnose and add, whereas an over-permissive rule silently reintroduces the
+/// exact contamination this exists to remove.
+pub fn is_build_relevant_env_key(key: &str) -> bool {
+    const EXACT: &[&str] = &[
+        // Process basics a compiler and its build scripts assume exist.
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "TMPDIR", "TERM",
+        "LANG", "LC_ALL", "TZ",
+        // C/link toolchain.
+        "CC", "CXX", "AR", "LD", "RANLIB", "CFLAGS", "CXXFLAGS", "LDFLAGS",
+        "LD_LIBRARY_PATH", "LIBRARY_PATH", "MAKEFLAGS", "NUM_JOBS",
+        // Reproducibility + TLS trust roots.
+        "SOURCE_DATE_EPOCH", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    ];
+    const PREFIXES: &[&str] = &[
+        "CARGO",     // CARGO_TARGET_DIR, CARGO_HOME, CARGO_REGISTRIES_*, …
+        "RUST",      // RUSTC_WRAPPER, RUSTFLAGS, RUSTUP_*, RUST_BACKTRACE, …
+        "SCCACHE",   // incl. the secret SCCACHE_REDIS_PASSWORD, delivered via
+                     // inherited env by design (see render_scope_argv)
+        "PKG_CONFIG",
+        "OPENSSL",
+        "LIBSSH2",
+        "PROTOC",
+    ];
+    let k = key.to_ascii_uppercase();
+    EXACT.contains(&k.as_str()) || PREFIXES.iter().any(|p| k.starts_with(p))
+}
+
 /// Whether a build-env var name is secret-shaped and MUST NOT appear on a
 /// command line (it travels via the inherited process environment instead).
 ///
@@ -316,6 +368,49 @@ mod tests {
         assert!(argv.contains(&"--scope".to_string()));
         assert!(argv.iter().any(|a| a == "-p"));
         assert!(argv.iter().any(|a| a.starts_with("--unit=")));
+    }
+
+    #[test]
+    fn build_relevant_allowlist_keeps_what_a_compile_needs() {
+        for k in [
+            "PATH", "HOME", "TMPDIR", "LANG",
+            "CARGO_TARGET_DIR", "CARGO_HOME", "CARGO_REGISTRIES_GITEA_INDEX",
+            "RUSTC_WRAPPER", "RUSTFLAGS", "RUSTUP_TOOLCHAIN",
+            "SCCACHE_DIR", "SCCACHE_REDIS_ENDPOINT",
+            // The sccache secret travels via inherited env BY DESIGN, so the
+            // allowlist must not strip it or every build loses its cache.
+            "SCCACHE_REDIS_PASSWORD",
+            "CC", "CXX", "PKG_CONFIG_PATH", "OPENSSL_DIR",
+        ] {
+            assert!(is_build_relevant_env_key(k), "{k} must survive the scrub");
+        }
+    }
+
+    #[test]
+    fn build_relevant_allowlist_drops_fleet_credentials_and_app_config() {
+        // These are exactly what contaminated the gate: a test asserting
+        // "unconfigured" behaviour cannot hold while they are present.
+        for k in [
+            "GITEA_PAT_MOOSE", "GITHUB_PAT_HARMONY", "PLANE_PAT_CLAUDE",
+            "OPENROUTER_API_KEY", "REVIEW_DAEMON_TOKEN",
+            "TERMINUS_MIRROR_SOURCE_ROOT", "TERMINUS_MIRROR_REMOTE_TERMINUS",
+            "SWEEP_MEM_CONFIG", "INTAKE_DATABASE_URL", "ATLAS_DATABASE_URL",
+            "CHORD_URL", "DEV_HOST", "INFISICAL_MACHINE_IDENTITY_TOKEN",
+        ] {
+            assert!(!is_build_relevant_env_key(k), "{k} must be scrubbed");
+        }
+    }
+
+    #[test]
+    fn the_allowlist_is_deny_by_default() {
+        // An unrecognised name is dropped, not kept. A missing build var fails
+        // loudly and is easy to add; an over-permissive rule silently
+        // reintroduces the contamination this exists to remove.
+        assert!(!is_build_relevant_env_key("SOME_FUTURE_FLEET_VAR"));
+        assert!(!is_build_relevant_env_key(""));
+        // Matching is case-insensitive, so a lowercase alias cannot slip past.
+        assert!(is_build_relevant_env_key("cargo_target_dir"));
+        assert!(!is_build_relevant_env_key("gitea_pat_moose"));
     }
 
     #[test]
