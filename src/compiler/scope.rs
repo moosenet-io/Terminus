@@ -135,6 +135,32 @@ pub fn render_scope_argv(
 /// missing build var produces a loud, immediate build failure that is easy to
 /// diagnose and add, whereas an over-permissive rule silently reintroduces the
 /// exact contamination this exists to remove.
+///
+/// ## Verified against the live build host, not assumed
+/// The obvious risk of an allowlist is dropping something a real build needs,
+/// which would break EVERY gate run rather than one test. This was checked
+/// empirically against the running terminus-primary environment rather than
+/// reasoned about: of its 199 variables, exactly 13 survive this filter
+/// (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `TMPDIR`, `CARGO_HOME`,
+/// `RUSTUP_HOME`, `RUST_LOG`, `SCCACHE_BIN`, `SCCACHE_DIR`, `SCCACHE_REDIS`),
+/// and every one is build-relevant. The rest are fleet app config and
+/// credentials.
+///
+/// The same check confirmed that several categories reviewers reasonably
+/// worried about are ABSENT on this fleet: there are no `git+` dependencies in
+/// `Cargo.lock` (so no `SSH_AUTH_SOCK`/`GIT_*` fetch path), no proxy variables
+/// on the build host, and the scope is a SYSTEM scope (no `--user`, so no
+/// `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` requirement). Those categories
+/// are allowlisted below anyway — they cost nothing today and their absence
+/// would otherwise become a silent, total gate outage the day someone adds a
+/// git dependency, a proxy, or a user scope.
+///
+/// ## Escape hatch
+/// `BUILD_ENV_PASSTHROUGH_EXTRA` (comma-separated exact names) lets an operator
+/// pass an additional variable through without a code change, for exactly the
+/// case this doc cannot anticipate. It is operator-controlled config, so it can
+/// re-widen the scope deliberately — that is the point — but nothing reaches it
+/// by accident.
 pub fn is_build_relevant_env_key(key: &str) -> bool {
     const EXACT: &[&str] = &[
         // Process basics a compiler and its build scripts assume exist.
@@ -145,6 +171,17 @@ pub fn is_build_relevant_env_key(key: &str) -> bool {
         "LD_LIBRARY_PATH", "LIBRARY_PATH", "MAKEFLAGS", "NUM_JOBS",
         // Reproducibility + TLS trust roots.
         "SOURCE_DATE_EPOCH", "SSL_CERT_FILE", "SSL_CERT_DIR",
+        // Git/SSH fetch path. Absent today (no `git+` deps in Cargo.lock) —
+        // present so adding one later does not break every gate run at once.
+        "SSH_AUTH_SOCK", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS",
+        // Proxying. Absent on the build host today; same rationale.
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        // Only needed if the scope ever becomes `--user` (it is a SYSTEM scope
+        // today); harmless to carry and fatal to omit if that changes.
+        "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+        // Native-toolchain discovery used by common -sys crates.
+        "LLVM_CONFIG", "LLVM_CONFIG_PATH", "CLANG_PATH", "NINJA",
     ];
     const PREFIXES: &[&str] = &[
         "CARGO",     // CARGO_TARGET_DIR, CARGO_HOME, CARGO_REGISTRIES_*, …
@@ -155,9 +192,23 @@ pub fn is_build_relevant_env_key(key: &str) -> bool {
         "OPENSSL",
         "LIBSSH2",
         "PROTOC",
+        "CMAKE",     // CMAKE_TOOLCHAIN_FILE, CMAKE_BUILD_PARALLEL_LEVEL, …
+        "BINDGEN",   // BINDGEN_EXTRA_CLANG_ARGS
+        "GIT_CONFIG",
     ];
     let k = key.to_ascii_uppercase();
-    EXACT.contains(&k.as_str()) || PREFIXES.iter().any(|p| k.starts_with(p))
+    if EXACT.iter().any(|e| e.eq_ignore_ascii_case(key)) || PREFIXES.iter().any(|p| k.starts_with(p))
+    {
+        return true;
+    }
+    // Operator escape hatch — exact names only, so a stray prefix cannot
+    // re-open a whole family.
+    std::env::var("BUILD_ENV_PASSTHROUGH_EXTRA")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .any(|n| n.eq_ignore_ascii_case(key))
 }
 
 /// Whether a build-env var name is secret-shaped and MUST NOT appear on a
@@ -336,6 +387,7 @@ fn lexical_normalize(p: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
     use super::*;
     use std::path::PathBuf;
 
@@ -399,6 +451,38 @@ mod tests {
         ] {
             assert!(!is_build_relevant_env_key(k), "{k} must be scrubbed");
         }
+    }
+
+    #[test]
+    fn allowlist_covers_the_categories_reviewers_flagged_as_fetch_or_launch_critical() {
+        // None of these are present on the fleet today (verified against the
+        // live build host: no git+ deps, no proxy, system scope). They are
+        // allowlisted so that adding a git dependency, a proxy, or a user
+        // scope later cannot silently break EVERY gate run at once.
+        for k in [
+            "SSH_AUTH_SOCK", "GIT_SSH_COMMAND", "GIT_ASKPASS", "GIT_CONFIG_GLOBAL",
+            "HTTP_PROXY", "https_proxy", "NO_PROXY",
+            "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+            "CMAKE_TOOLCHAIN_FILE", "LLVM_CONFIG", "BINDGEN_EXTRA_CLANG_ARGS",
+        ] {
+            assert!(is_build_relevant_env_key(k), "{k} must survive the scrub");
+        }
+    }
+
+    // Mutates a shared env var (TERM #588: mark the READERS too).
+    #[test]
+    #[serial]
+    fn the_operator_escape_hatch_adds_exact_names_only() {
+        assert!(!is_build_relevant_env_key("SOME_ODD_BUILD_VAR"));
+        std::env::set_var("BUILD_ENV_PASSTHROUGH_EXTRA", "SOME_ODD_BUILD_VAR, OTHER_ONE");
+        assert!(is_build_relevant_env_key("SOME_ODD_BUILD_VAR"));
+        assert!(is_build_relevant_env_key("some_odd_build_var"), "case-insensitive");
+        assert!(is_build_relevant_env_key("OTHER_ONE"), "whitespace is trimmed");
+        // EXACT names only — a stray entry must not re-open a whole family.
+        assert!(!is_build_relevant_env_key("SOME_ODD_BUILD_VAR_SUFFIX"));
+        assert!(!is_build_relevant_env_key("GITEA_PAT_MOOSE"));
+        std::env::remove_var("BUILD_ENV_PASSTHROUGH_EXTRA");
+        assert!(!is_build_relevant_env_key("SOME_ODD_BUILD_VAR"));
     }
 
     #[test]
