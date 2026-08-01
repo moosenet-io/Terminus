@@ -179,6 +179,8 @@ pub(crate) mod test_support {
     /// discovery/capture test runs with no processes, no tmux, and no network.
     pub struct FakeExecutor {
         responses: Mutex<HashMap<String, Result<CmdOutput, String>>>,
+        /// (argv-substring, stdout) pairs, checked before the program map.
+        argv_responses: Mutex<Vec<(String, String)>>,
         pub calls: Mutex<Vec<Vec<String>>>,
     }
 
@@ -186,6 +188,7 @@ pub(crate) mod test_support {
         pub fn new() -> Self {
             Self {
                 responses: Mutex::new(HashMap::new()),
+                argv_responses: Mutex::new(Vec::new()),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -209,6 +212,32 @@ pub(crate) mod test_support {
                 .insert(program.to_string(), Err(message.to_string()));
             self
         }
+
+        /// Respond differently depending on the FULL argv, not just the
+        /// program — needed to give different pids different working
+        /// directories, which is what makes an ordering/cap test able to
+        /// reproduce a real starvation case rather than pass vacuously.
+        pub fn with_stdout_matching(self, argv_contains: &str, stdout: &str) -> Self {
+            self.argv_responses
+                .lock()
+                .unwrap()
+                .push((argv_contains.to_string(), stdout.to_string()));
+            self
+        }
+
+        /// A non-zero exit with a chosen stderr, for probes that FAIL rather
+        /// than answer (a missing remote binary shows up this way, not as Err).
+        pub fn with_exit(self, program: &str, status: i32, stderr: &str) -> Self {
+            self.responses.lock().unwrap().insert(
+                program.to_string(),
+                Ok(CmdOutput {
+                    status,
+                    stdout: String::new(),
+                    stderr: stderr.to_string(),
+                }),
+            );
+            self
+        }
     }
 
     #[async_trait]
@@ -218,6 +247,20 @@ pub(crate) mod test_support {
                 .lock()
                 .unwrap()
                 .push(argv.iter().map(|s| s.to_string()).collect());
+            let joined = argv.join(" ");
+            if let Some((_, out)) = self
+                .argv_responses
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(needle, _)| joined.contains(needle.as_str()))
+            {
+                return Ok(CmdOutput {
+                    status: 0,
+                    stdout: out.clone(),
+                    stderr: String::new(),
+                });
+            }
             match self.responses.lock().unwrap().get(argv[0]) {
                 Some(Ok(o)) => Ok(o.clone()),
                 Some(Err(m)) => Err(ToolError::Execution(m.clone())),

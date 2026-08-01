@@ -560,9 +560,14 @@ async fn git_context(exec: &dyn HostExecutor, cwd: &str) -> (Option<RepoContext>
         Err(_) => return (None, false),
     };
     if !out.ok() {
-        // A non-zero exit here is git answering "not a repository", which is a
-        // legitimate result for a session running outside one.
-        return (None, true);
+        // Only ONE non-zero outcome is git actually ANSWERING: "not a git
+        // repository". Everything else — a missing binary (which the SSH path
+        // surfaces as exit 127 rather than an Err), permission denied, dubious
+        // ownership, a corrupt repo — means the probe could not answer, and
+        // must be reported rather than silently rendered as "not in a repo".
+        let stderr = out.stderr.to_ascii_lowercase();
+        let answered_not_a_repo = stderr.contains("not a git repository");
+        return (None, answered_not_a_repo);
     }
     let mut lines = out.stdout.lines();
     let root = match lines.next() {
@@ -779,19 +784,73 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn the_repo_filter_is_applied_before_the_result_cap() {
-        // With a cap of 1, a filter matching 3 sessions must still return the
-        // capped count of MATCHING sessions — never zero because the matches
-        // sorted past the cap.
+        // The starvation case this guards: candidates are enriched in ascending
+        // etimes order, so the two NON-matching sessions (pids 2200 @5000s and
+        // 2100 @10000s) come first and the only MATCHING one (pid 1402 @185000s)
+        // comes last. With a cap of 1 applied BEFORE filtering, the matching
+        // session is truncated away and the caller sees zero — even though it is
+        // live. The fixture must therefore give different pids different repos;
+        // a fixture where everything matches would pass either way.
         std::env::set_var("AGENTSESS_MAX_SESSIONS", "1");
         let exec = FakeExecutor::new()
             .with_stdout("ps", PS_SAMPLE)
-            .with_stdout("readlink", "/work/Terminus\n")
-            .with_stdout("git", "/work/Terminus\nAGSS-01-core\n");
+            .with_stdout_matching("/proc/1402/cwd", "/work/Terminus\n")
+            .with_stdout_matching("/proc/2100/cwd", "/work/Other\n")
+            .with_stdout_matching("/proc/2200/cwd", "/work/Other\n")
+            .with_stdout_matching("git -C /work/Terminus", "/work/Terminus\nAGSS-01-core\n")
+            .with_stdout_matching("git -C /work/Other", "/work/Other\nmain\n");
         let snap = discover(&exec, Some("Terminus")).await.unwrap();
         std::env::remove_var("AGENTSESS_MAX_SESSIONS");
-        assert_eq!(snap.sessions.len(), 1, "{:?}", snap.sessions);
-        assert!(snap.truncated);
-        assert!(snap.warnings.iter().any(|w| w.contains("capped")));
+
+        assert_eq!(
+            snap.sessions.len(),
+            1,
+            "the matching session sorted last and must survive the cap: {:?}",
+            snap.sessions
+        );
+        assert_eq!(snap.sessions[0].pid, 1402);
+        assert_eq!(
+            snap.sessions[0].repo.as_ref().unwrap().repo_name.as_deref(),
+            Some("Terminus")
+        );
+        assert!(!snap.truncated, "one match, cap 1 — nothing was dropped");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_git_that_cannot_run_remotely_is_a_probe_failure_not_a_verdict() {
+        // The remote path surfaces a missing binary as exit 127, NOT as an Err,
+        // so an exit-code-agnostic "non-zero means not a repo" would hide it —
+        // along with permission denied, dubious ownership and corrupt repos.
+        let exec = FakeExecutor::new()
+            .with_stdout("ps", PS_SAMPLE)
+            .with_stdout("readlink", "/work/thing\n")
+            .with_exit("git", 127, "bash: git: command not found");
+        let snap = discover(&exec, None).await.unwrap();
+        assert!(snap.sessions.iter().all(|s| s.repo.is_none()));
+        assert!(
+            snap.warnings.iter().any(|w| w.contains("git probe failed")),
+            "exit 127 must be reported, got {:?}",
+            snap.warnings
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn git_answering_not_a_repository_is_a_verdict_not_a_failure() {
+        // The one non-zero outcome that IS an answer must stay silent — a
+        // session legitimately running outside a repo is not a shortfall.
+        let exec = FakeExecutor::new()
+            .with_stdout("ps", PS_SAMPLE)
+            .with_stdout("readlink", "/work/outside-any-repo\n")
+            .with_exit("git", 128, "fatal: not a git repository (or any parent up to /)");
+        let snap = discover(&exec, None).await.unwrap();
+        assert!(snap.sessions.iter().all(|s| s.repo.is_none()));
+        assert!(
+            !snap.warnings.iter().any(|w| w.contains("git probe failed")),
+            "a genuine not-a-repo answer must not raise a probe warning: {:?}",
+            snap.warnings
+        );
     }
 
     // Reads AGENTSESS_MAX_SESSIONS, which a sibling test mutates — every
