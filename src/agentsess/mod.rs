@@ -21,6 +21,7 @@
 //! - [`model`] — the session types every tool returns
 //! - [`exec`] — the host executor (local, or the existing dev SSH door)
 //! - [`discover`] — the probes and the correlation logic
+//! - [`transcript`] — the bounded, redacted activity-event reader
 //! - [`tools`] — the registered `agentsess_*` tools
 //!
 //! # Configuration (structural, non-secret — plain env per this crate's convention)
@@ -32,6 +33,8 @@
 //!   as agents, for a CLI this build predates.
 //! - `AGENTSESS_MAX_SESSIONS` — result cap (default 50). Truncation is always
 //!   reported, never silent.
+//! - `AGENTSESS_TAIL_BYTES` — how much of a transcript tail to read (default
+//!   256 KiB). Transcripts reach tens of megabytes; none is ever read whole.
 //!
 //! This module reads NO credential and holds NO secret. The one place it
 //! touches a process environment narrows the read to a single non-secret
@@ -48,6 +51,7 @@
 pub mod model;
 pub(crate) mod discover;
 pub(crate) mod exec;
+pub(crate) mod transcript;
 pub(crate) mod tools;
 
 pub use model::{AgentKind, AgentSession, RepoContext, SessionAttachment, SessionsSnapshot};
@@ -56,7 +60,10 @@ use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
 pub fn register(registry: &mut ToolRegistry) {
-    let tools: Vec<Box<dyn RustTool>> = vec![Box::new(tools::AgentsessList)];
+    let tools: Vec<Box<dyn RustTool>> = vec![
+        Box::new(tools::AgentsessList),
+        Box::new(tools::AgentsessTranscript),
+    ];
     for tool in tools {
         if let Err(e) = registry.register(tool) {
             tracing::error!("agentsess: failed to register tool: {e}");

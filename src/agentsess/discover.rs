@@ -102,6 +102,14 @@ fn validate_transcript_root(root: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The transcript root for whichever host `exec` observes — the same
+/// resolution [`discover`] uses, exposed so the transcript tool jails an
+/// explicit caller-supplied path against the SAME root rather than deriving
+/// its own (two roots would mean two jails, and the weaker one would win).
+pub(crate) fn transcript_root_for(exec: &dyn HostExecutor) -> Result<String, String> {
+    transcript_root(exec.host_label() == "local")
+}
+
 fn transcript_root(is_local: bool) -> Result<String, String> {
     if let Ok(v) = std::env::var("AGENTSESS_TRANSCRIPT_ROOT") {
         if !v.trim().is_empty() {

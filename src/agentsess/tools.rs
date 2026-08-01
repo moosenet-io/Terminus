@@ -83,3 +83,100 @@ mod tests {
         assert!(p["properties"]["host"].is_object());
     }
 }
+
+pub struct AgentsessTranscript;
+
+#[async_trait]
+impl RustTool for AgentsessTranscript {
+    fn name(&self) -> &str {
+        "agentsess_transcript"
+    }
+
+    fn description(&self) -> &str {
+        "Recent activity for one coder CLI agent session: a summarised, redacted stream of \
+         what it has been doing (tool calls with their primary argument, messages), read from \
+         the tail of the session's transcript. Read-only."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Session id from agentsess_list. Resolves that session's transcript."
+                },
+                "transcript_path": {
+                    "type": "string",
+                    "description": "Explicit transcript path instead of a session id. Must be inside the configured transcript root."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum events to return, newest first (default 50)."
+                },
+                "host": {
+                    "type": "string",
+                    "enum": ["local", "dev"],
+                    "description": "Which host the session is on. Default 'local'."
+                }
+            },
+            "required": []
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let exec = executor_for(host_arg(&args))?;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(50)
+            .clamp(1, 500) as usize;
+
+        // Resolve the transcript path either from an explicit argument (jailed
+        // to the configured root) or by looking the session up. An explicit
+        // path is NOT trusted just because it came from a caller — it goes
+        // through the same jail either way.
+        let root = super::discover::transcript_root_for(exec.as_ref())
+            .map_err(ToolError::NotConfigured)?;
+
+        let lexical = if let Some(p) = args.get("transcript_path").and_then(Value::as_str) {
+            super::transcript::resolve_transcript_path(&root, p)?
+        } else if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
+            let snapshot = super::discover::discover(exec.as_ref(), None).await?;
+            let session = snapshot
+                .sessions
+                .iter()
+                .find(|s| s.id == sid)
+                .ok_or_else(|| ToolError::NotFound(format!("no live session with id '{sid}'")))?;
+            let p = session.transcript_path.clone().ok_or_else(|| {
+                ToolError::NotFound(format!(
+                    "session '{sid}' has no transcript (its agent may not write one)"
+                ))
+            })?;
+            super::transcript::resolve_transcript_path(&root, &p)?
+        } else {
+            return Err(ToolError::InvalidArgument(
+                "one of 'session_id' or 'transcript_path' is required".into(),
+            ));
+        };
+
+        // The lexical jail cannot see symlinks and `tail` follows them, so the
+        // path is resolved on the host that will read it and re-checked. Both
+        // halves are applied to a discovered path too — a transcript path that
+        // came from discovery is not automatically trustworthy.
+        let path =
+            super::transcript::resolve_transcript_path_on_host(exec.as_ref(), &root, &lexical)
+                .await?;
+
+        let tail = super::transcript::read_tail(exec.as_ref(), &path, limit).await?;
+        let structured = serde_json::to_value(&tail)
+            .map_err(|e| ToolError::Execution(format!("failed to serialize transcript: {e}")))?;
+        let text = serde_json::to_string_pretty(&structured).unwrap_or_else(|_| "{}".to_string());
+        Ok(ToolOutput::with_structured(text, structured))
+    }
+}
