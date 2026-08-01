@@ -313,13 +313,36 @@ pub(crate) fn classify_record(rec: &Value) -> RecordOutcome {
             // observer, so they are not conflated. A `user` record carrying
             // NEITHER is a shape we no longer recognise, not an empty turn.
             let content = rec.get("message").and_then(|m| m.get("content"));
-            // Presence is not recognition: a `content` that is a number or an
-            // object is a drifted shape, not a message we can read.
-            let usable_content = matches!(content, Some(Value::String(_)) | Some(Value::Array(_)));
-            if rec.get("toolUseResult").is_none() && !usable_content {
+            // Presence is not recognition, applied to EVERY nested read below —
+            // a field that exists but carries the wrong type is drift, while a
+            // genuinely optional field that is absent is not.
+            let usable_content = match content {
+                Some(Value::String(_)) => true,
+                // A content array carries blocks; each must at least be an
+                // object with a string `type`, or we cannot claim to have read it.
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .all(|i| i.get("type").and_then(Value::as_str).is_some()),
+                _ => false,
+            };
+            let tool_result = rec.get("toolUseResult");
+            if tool_result.is_none() && !usable_content {
                 understood = false;
             }
-            if let Some(result) = rec.get("toolUseResult") {
+            if let Some(result) = tool_result {
+                // `toolUseResult` must be an object; `stdout`, when present,
+                // must be a string. Either being otherwise is drift — but the
+                // event is still emitted, per the independent-axes contract.
+                match result {
+                    Value::Object(_) => {
+                        if result.get("stdout").is_some()
+                            && result.get("stdout").and_then(Value::as_str).is_none()
+                        {
+                            understood = false;
+                        }
+                    }
+                    _ => understood = false,
+                }
                 let text = result
                     .get("stdout")
                     .and_then(Value::as_str)
@@ -775,6 +798,27 @@ mod tests {
             {"type": "future_block"}, {"type": "text", "text": "hi"}]}})));
         assert!(!u(json!({"type": "assistant", "message": {"content": [
             {"type": "thinking", "thinking": "x"}, {"type": "future_block"}]}})));
+    }
+
+    #[test]
+    fn every_nested_read_applies_presence_is_not_recognition() {
+        // A systematic sweep of each nested field the parser reads, so this
+        // rule stops being rediscovered one layer at a time.
+        let c = |v: serde_json::Value| classify_record(&v);
+
+        // toolUseResult must be an object.
+        let bad = c(json!({"type": "user", "toolUseResult": 42}));
+        assert_eq!(bad.events.len(), 1, "still reported");
+        assert!(!bad.understood, "a non-object toolUseResult is drift");
+        assert!(c(json!({"type": "user", "toolUseResult": {"stdout": "ok"}})).understood);
+        // stdout, when present, must be a string; absent is fine.
+        assert!(!c(json!({"type": "user", "toolUseResult": {"stdout": 7}})).understood);
+        assert!(c(json!({"type": "user", "toolUseResult": {"exit": 0}})).understood);
+
+        // A user content ARRAY must carry blocks that are at least typed objects.
+        assert!(c(json!({"type": "user", "message": {"content": [{"type": "text"}]}})).understood);
+        assert!(!c(json!({"type": "user", "message": {"content": [42]}})).understood);
+        assert!(!c(json!({"type": "user", "message": {"content": [{"no_type": 1}]}})).understood);
     }
 
     #[test]
