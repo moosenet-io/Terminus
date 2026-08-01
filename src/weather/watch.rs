@@ -600,7 +600,16 @@ impl TravelFinding {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeatFinding {
     pub location: String,
-    pub run: HeatRun,
+    /// The derived sustained-load run, when the thresholds found one.
+    ///
+    /// `None` means this finding exists ONLY because an official alert is in
+    /// force. An authoritative alert outranks anything derived, so it must be
+    /// reported even when this module's own thresholds did not independently
+    /// fire — otherwise the tool would quietly suppress a met-office heat
+    /// warning because its own numbers disagreed. (The travel path always
+    /// behaved this way; heat did not, which is the inconsistency this
+    /// `Option` fixes.)
+    pub run: Option<HeatRun>,
     pub provenance: Provenance,
     pub official: Vec<String>,
 }
@@ -749,7 +758,21 @@ impl WatchReport {
             }
         }
         for f in &self.heat.findings {
-            let r = &f.run;
+            let Some(r) = &f.run else {
+                // Official-alert-only: the met service has issued a heat warning
+                // that this module's own thresholds did not independently
+                // reproduce. Report it plainly; do not manufacture derived
+                // numbers to justify it.
+                out.push_str(
+                    "- [!!] SEVERE — an official heat alert is in force for your home area. \
+                     Treat it as a power and cooling-load risk: pre-cool, ease other load, \
+                     and have a plan for an outage.\n",
+                );
+                for a in &f.official {
+                    out.push_str(&format!("    Official alert: {a}\n"));
+                }
+                continue;
+            };
             out.push_str(&format!(
                 "- {} {} — {} consecutive days at or above {:.0}°C/{:.0}°F with nights \
                  staying at or above {:.0}°C/{:.0}°F ({} to {}, peaking {:.0}°C/{:.0}°F, \
@@ -902,7 +925,10 @@ pub async fn run_watch(
     let end = today + chrono::Duration::days(horizon as i64 - 1);
 
     let travel = assess_travel(caller, calendar, forecast, today, end).await;
-    let heat = assess_heat(caller, locations, forecast).await;
+    // The horizon binds BOTH subjects. Passing it only to travel would let the
+    // heat watch report a run that falls outside the "next N days" the report
+    // says it covered — an answer that contradicts its own header.
+    let heat = assess_heat(caller, locations, forecast, today, end).await;
 
     WatchReport { horizon_days: horizon, travel, heat }
 }
@@ -999,6 +1025,8 @@ async fn assess_heat(
     caller: CallerContext,
     locations: &dyn WatchLocations,
     forecast: &dyn ForecastSource,
+    start: NaiveDate,
+    end: NaiveDate,
 ) -> SubjectReport<HeatFinding> {
     // GATE FIRST — same reasoning as travel; the home address is not read.
     if !caller.may_infer_from_routine() {
@@ -1035,26 +1063,35 @@ async fn assess_heat(
         }
     };
 
-    match heat_run(&days) {
-        Some(run) => SubjectReport {
-            findings: vec![HeatFinding {
-                location: home,
-                run,
-                provenance: if official.is_empty() {
-                    Provenance::Derived
-                } else {
-                    Provenance::Official
-                },
-                official,
-            }],
-            checked: vec!["your home area".to_string()],
-            gaps,
-        },
-        None => SubjectReport {
-            findings: Vec::new(),
-            checked: vec!["your home area".to_string()],
-            gaps,
-        },
+    // Only days INSIDE the requested horizon count, so the answer cannot report
+    // a run the header says it did not look at.
+    let in_horizon: Vec<DayWeather> = days
+        .into_iter()
+        .filter(|d| {
+            NaiveDate::parse_from_str(&d.date, "%Y-%m-%d")
+                .map(|dt| dt >= start && dt <= end)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    let run = heat_run(&in_horizon);
+    let checked = vec!["your home area".to_string()];
+
+    // A finding is warranted when EITHER the derived thresholds fired OR an
+    // official alert is in force. An authoritative alert is never suppressed
+    // just because this module's own numbers disagreed with it.
+    if run.is_none() && official.is_empty() {
+        return SubjectReport { findings: Vec::new(), checked, gaps };
+    }
+    SubjectReport {
+        findings: vec![HeatFinding {
+            location: home,
+            run,
+            provenance: if official.is_empty() { Provenance::Derived } else { Provenance::Official },
+            official,
+        }],
+        checked,
+        gaps,
     }
 }
 
@@ -1497,8 +1534,9 @@ mod tests {
         assert_eq!(loc_calls.load(Ordering::SeqCst), 1);
         assert_eq!(r.heat.findings.len(), 1);
         let f = &r.heat.findings[0];
-        assert_eq!(f.run.days.len(), 3);
-        assert_eq!(f.run.severity, Severity::Severe, "3 consecutive days is severe");
+        let run = f.run.as_ref().expect("a derived run");
+        assert_eq!(run.days.len(), 3);
+        assert_eq!(run.severity, Severity::Severe, "3 consecutive days is severe");
 
         let text = r.render();
         // The FRAMING is the requirement: power/HVAC, not "it will be hot".
@@ -1985,6 +2023,70 @@ mod tests {
         let text = r.render();
         assert!(text.contains("Official alert: Excessive Heat Warning"), "{text}");
         assert!(!text.contains("DERIVED"), "an official finding is not labelled derived: {text}");
+    }
+
+    /// REVIEW FINDING (gpt56, round 2): the requested horizon bound TRAVEL but
+    /// not HEAT, so `days=1` could report a heat run occurring days outside the
+    /// "next 1 day" the report claimed to cover — an answer contradicting its
+    /// own header.
+    #[tokio::test]
+    async fn the_horizon_bounds_the_heat_watch_too_not_just_travel() {
+        let (cal, _) = CountingCalendar::with(vec![]);
+        let (loc, _) = CountingLocations::with(Some("Homeplace"));
+        // The heat wave is on 08-04/08-05 — real, but OUTSIDE a 2-day horizon.
+        let fc = FakeForecast::ok(vec![
+            mild("2026-08-01"),
+            mild("2026-08-02"),
+            mild("2026-08-03"),
+            hot("2026-08-04", 36.0, 24.0),
+            hot("2026-08-05", 36.0, 24.0),
+        ]);
+
+        let short = run_watch(2, operator(), &cal, &loc, &fc, today()).await;
+        assert!(
+            short.heat.findings.is_empty(),
+            "a heat run beyond the requested horizon must not be reported as within it"
+        );
+        assert!(short.heat.is_clear());
+
+        // The control: widen the horizon to cover it and it IS reported — so the
+        // assertion above is about the horizon, not about the fixture.
+        let wide = run_watch(5, operator(), &cal, &loc, &fc, today()).await;
+        assert_eq!(wide.heat.findings.len(), 1, "within a 5-day horizon it is real");
+        assert_eq!(wide.heat.findings[0].run.as_ref().unwrap().days.len(), 2);
+    }
+
+    /// REVIEW FINDING (gpt56, round 2): an official heat alert was DROPPED
+    /// whenever the derived thresholds did not independently fire — so a real
+    /// met-office heat warning could be silently suppressed because this
+    /// module's own numbers disagreed with it. The travel path never did this.
+    #[tokio::test]
+    async fn an_official_heat_alert_is_reported_even_when_derived_thresholds_do_not_fire() {
+        let (cal, _) = CountingCalendar::with(vec![]);
+        let (loc, _) = CountingLocations::with(Some("Homeplace"));
+        // Deliberately mild: nothing here trips HEAT_DAY_MAX_C/HEAT_NIGHT_MIN_C.
+        let fc = FakeForecast::ok(vec![mild("2026-08-01"), mild("2026-08-02")])
+            .with_official(vec!["Excessive Heat Warning (met service)"]);
+
+        let r = run_watch(2, operator(), &cal, &loc, &fc, today()).await;
+
+        assert_eq!(r.heat.findings.len(), 1, "an authoritative alert is never suppressed");
+        let f = &r.heat.findings[0];
+        assert!(f.run.is_none(), "there is no derived run — the alert is the whole basis");
+        assert_eq!(f.provenance, Provenance::Official);
+
+        let text = r.render();
+        assert!(text.contains("official heat alert is in force"), "{text}");
+        assert!(text.contains("Official alert: Excessive Heat Warning"), "{text}");
+        assert!(!text.contains("DERIVED"), "an official-only finding is not derived: {text}");
+        assert!(!text.contains("no sustained heat build-up"), "must not also claim clear: {text}");
+        assert!(!text.contains("Homeplace"), "{text}");
+
+        // The control: with no official alert the same mild forecast is clear —
+        // so this is the alert doing the work, not the fixture.
+        let quiet = FakeForecast::ok(vec![mild("2026-08-01"), mild("2026-08-02")]);
+        let r2 = run_watch(2, operator(), &cal, &loc, &quiet, today()).await;
+        assert!(r2.heat.findings.is_empty() && r2.heat.is_clear());
     }
 
     #[tokio::test]
