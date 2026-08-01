@@ -31,6 +31,12 @@
 //! one means the response was altered, and `0.5` sessions is not an imprecise
 //! count but an impossible one — neither is ever floored into `idle`.
 //!
+//! The same `null` rule reaches one level down: a `TranscodeSession` that is
+//! present but is not an OBJECT fails the whole response, because that block is
+//! the only thing a playback decision is derived from — left unchecked a
+//! `"TranscodeSession": null` rendered as a confident `direct_stream` with an
+//! invented "remuxed" reason rather than as an unreadable answer.
+//!
 //! ## Never cached
 //!
 //! Live session data is worthless stale, so `media_now_playing` is named in
@@ -302,6 +308,8 @@ fn bool_at(v: &Value, key: &str) -> Option<bool> {
 /// - `Metadata` absent but `size` nonzero ⇒ malformed.
 /// - `Metadata` present but not a list ⇒ malformed.
 /// - a `Metadata` entry that is not an object ⇒ malformed (see below).
+/// - an entry whose `TranscodeSession` is present but is **not an object** ⇒
+///   malformed, whole response (see below).
 /// - `size` disagreeing with the number of entries ⇒ malformed.
 ///   `/status/sessions` is not a paginated collection as this client calls it
 ///   (it grows `offset`/`totalSize` only when asked for a page, and
@@ -320,6 +328,27 @@ fn bool_at(v: &Value, key: &str) -> Option<bool> {
 /// the undercount to avoid. It would also need a fourth, partially-known state
 /// the contract deliberately does not have — today every non-`ok` status
 /// carries NO count, so a consumer either gets a complete count or none at all.
+///
+/// **A non-object `TranscodeSession` fails the whole response too — the
+/// `Metadata: null` fault one level down.** `TranscodeSession` is the ONLY
+/// nested block a playback decision is derived from: [`decide`] reads
+/// `videoDecision`/`audioDecision` off it and every derived
+/// [`transcode_reason`] comes out of it. A `"TranscodeSession": null` is the
+/// same evidence as a null `Metadata` — Plex omits keys rather than nulling
+/// them and emits no JSON `null` on any of the eight endpoints probed
+/// read-only against the live server (1.42.2) — so it means something rewrote
+/// the response. Left unchecked that null did not degrade to "unknown": it read
+/// as a session with nothing re-encoded, i.e. `decision: "direct_stream"` with
+/// the derived reason `remuxed to a different container` — a confident,
+/// specific, unobserved claim about the household, manufactured entirely out of
+/// a value the server never sent. The unparseable-entry argument above decides
+/// the same scope here: rejecting just that entry returns a list short by one
+/// with a count to match (the undercount), and keeping the entry with its
+/// transcode block ignored still states a playback decision derived from a
+/// payload we have just concluded was altered. So the WHOLE response is
+/// `malformed`, at every `size`, for a `TranscodeSession` that is `null`, a
+/// scalar, or a list.
+///
 /// `MediaContainer.size`, insisted upon as a non-negative whole number.
 ///
 /// Absent, fractional, negative or non-numeric are all `Err` — see
@@ -346,6 +375,20 @@ fn container_size(mc: &Value) -> Result<i64, String> {
         ));
     }
     Ok(n)
+}
+
+/// The NAME of a JSON shape, for a malformed detail that says what arrived
+/// without quoting the payload back (a rewritten body is not something to echo,
+/// and a large array would swamp the message).
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "an object",
+    }
 }
 
 fn session_items(raw: &Value) -> Result<Vec<&Value>, String> {
@@ -384,10 +427,26 @@ fn session_items(raw: &Value) -> Result<Vec<&Value>, String> {
             }
         }
         Some(Value::Array(items)) => {
-            if let Some(i) = items.iter().position(|item| !item.is_object()) {
-                return Err(format!(
-                    "MediaContainer.Metadata entry {i} was not a session object"
-                ));
+            for (i, item) in items.iter().enumerate() {
+                if !item.is_object() {
+                    return Err(format!(
+                        "MediaContainer.Metadata entry {i} was not a session object"
+                    ));
+                }
+                // A `TranscodeSession` that is PRESENT but is not an object —
+                // `null` above all — is the `Metadata: null` fault one level
+                // down, and is rejected for the same reason and on the same
+                // evidence. See the doc comment above.
+                if let Some(ts) = item.get("TranscodeSession") {
+                    if !ts.is_object() {
+                        return Err(format!(
+                            "MediaContainer.Metadata entry {i} carried a TranscodeSession that \
+                             was {}, not an object, and Plex emits neither a JSON null nor a \
+                             scalar there",
+                            json_kind(ts)
+                        ));
+                    }
+                }
             }
             if size != items.len() as i64 {
                 return Err(format!(
@@ -415,7 +474,15 @@ fn part_decision(item: &Value) -> Option<&str> {
 }
 
 fn decide(item: &Value) -> PlaybackDecision {
-    let Some(ts) = item.get("TranscodeSession") else {
+    // `.filter(is_object)` is the second half of the non-object-TranscodeSession
+    // rule and is deliberately redundant: [`session_items`] has already failed
+    // the whole response before any such entry reaches here. It stays because it
+    // is what makes the `transcode_reason` invariant true BY CONSTRUCTION rather
+    // than by upstream sequencing — these two functions are the only things that
+    // read the object, and neither may be reachable from a `null` and still
+    // produce a confident answer. A non-object is treated as ABSENT, so the
+    // decision falls to `Part.decision` and no reason can be derived.
+    let Some(ts) = item.get("TranscodeSession").filter(|ts| ts.is_object()) else {
         // No transcode session at all. Normally that is a direct play, but
         // Plex states the decision on the Part too, so cross-check it rather
         // than assuming: a payload that says `transcode` without a
@@ -452,7 +519,10 @@ fn decide(item: &Value) -> PlaybackDecision {
 /// The exact rule, and the one a consumer may rely on:
 ///
 /// > `transcode_reason` is non-null **iff** `decision != "direct_play"` **and**
-/// > the session carried a `TranscodeSession` object.
+/// > the session carried a `TranscodeSession` **object**. A `TranscodeSession`
+/// > that is present but is not an object — `null` above all — is never read as
+/// > one: it fails the WHOLE response as `malformed` ([`session_items`]), so it
+/// > can never surface as a confident decision with an invented reason.
 ///
 /// So it is always `None` for `direct_play`, and it is also `None` for the two
 /// payloads where Plex states a non-direct-play decision on `Media[0].Part[0]`
@@ -471,7 +541,12 @@ fn transcode_reason(item: &Value, decision: PlaybackDecision) -> Option<String> 
     if decision == PlaybackDecision::DirectPlay {
         return None;
     }
-    let ts = item.get("TranscodeSession")?;
+    // Only an OBJECT can carry a reason (see [`decide`] for why this guard is
+    // deliberately redundant with the `session_items` rejection). Without it a
+    // `"TranscodeSession": null` fell through every branch below to the
+    // direct-stream fallback and manufactured `remuxed to a different
+    // container` — a non-null reason from a session that carried no session.
+    let ts = item.get("TranscodeSession").filter(|ts| ts.is_object())?;
     if let Some(reason) = str_at(ts, "transcodeReason") {
         return Some(reason.to_string());
     }
@@ -638,17 +713,24 @@ fn server_json(raw: &Value) -> Value {
 /// >   altered response;
 /// > - a `size` that is **fractional, negative, or not a number** — a count of
 /// >   things is a whole non-negative number, so `0.5` is not an imprecise
-/// >   count but an impossible one and is never floored to `0`.
+/// >   count but an impossible one and is never floored to `0`;
+/// > - an entry whose `TranscodeSession` is present but is **not an object**
+/// >   (`null`, a scalar, a list) — same evidence, same verdict, one level
+/// >   down, and the whole response fails rather than that one entry.
 ///
 /// ### Per-session field contract, where it is not self-evident
 ///
 /// - `decision` is one of `direct_play` | `direct_stream` | `transcode`, and is
 ///   the ONLY discriminant for playback mode.
 /// - `transcode_reason` is non-null **iff** `decision != "direct_play"` **and**
-///   the session carried a `TranscodeSession`. It is therefore permitted to be
-///   null for `direct_stream` and `transcode` — a consumer must render a null
-///   reason as "no reason given" and must NOT infer direct play from it. See
-///   [`transcode_reason`] for why no reason is invented in that case.
+///   the session carried a `TranscodeSession` **object**. It is therefore
+///   permitted to be null for `direct_stream` and `transcode` — a consumer must
+///   render a null reason as "no reason given" and must NOT infer direct play
+///   from it. See [`transcode_reason`] for why no reason is invented in that
+///   case. A `TranscodeSession` that is present but is **not an object** —
+///   `null` above all — is never read as one: it fails the whole response as
+///   `malformed` (above), so no session ever renders a decision or a reason
+///   derived from it.
 /// - Numeric fields split by MEANING, and the split is part of the contract.
 ///   `season`, `episode` and `year` are ordinals: a fractional value is dropped
 ///   to `null` rather than truncated, so a consumer never sees an episode
@@ -1337,6 +1419,149 @@ mod tests {
         ] } });
         let err = session_items(&raw).expect_err("a non-object entry is not readable");
         assert!(err.contains("entry 1"), "the detail should locate it: {err}");
+    }
+
+    /// Build a one-session container whose `TranscodeSession` is `ts`, keeping
+    /// `size` honest so nothing but the transcode block can be the fault.
+    fn one_session_with_transcode_session(ts: Value) -> Value {
+        let mut item = transcoding_episode();
+        item["TranscodeSession"] = ts;
+        container(vec![item])
+    }
+
+    #[tokio::test]
+    async fn a_non_object_transcode_session_is_malformed_never_a_confident_decision() {
+        // DECISION (see `session_items`): REJECT, whole response, consistent
+        // with the `Metadata: null` precedent and with the unparseable-entry
+        // scope already settled above. TranscodeSession is the only nested
+        // block a playback decision is derived from, so a rewritten one is
+        // exactly where a confident-but-wrong decision comes from: before this,
+        // `"TranscodeSession": null` rendered as `direct_stream` with the
+        // manufactured reason `remuxed to a different container`.
+        for (label, ts) in [
+            ("null", Value::Null),
+            ("a number", json!(0)),
+            ("a string", json!("transcoding")),
+            ("a list", json!([{ "videoDecision": "copy" }])),
+            ("a boolean", json!(false)),
+        ] {
+            let raw = one_session_with_transcode_session(ts);
+            let err = session_items(&raw).expect_err(&format!(
+                "a TranscodeSession that is {label} must not parse as a session list"
+            ));
+            assert!(
+                err.contains("TranscodeSession"),
+                "{label}: the detail should name the block: {err}"
+            );
+            assert!(err.contains("entry 0"), "{label}: the detail should locate it: {err}");
+
+            // End to end, the shape Phase 2 renders: malformed, no count, no
+            // sessions — never a decision, and never an empty house either.
+            let p = MediaNowPlaying::with_source(CountingSource::ok(raw))
+                .run(entitled())
+                .await;
+            assert_eq!(p["status"], "malformed", "{label}");
+            assert_eq!(p["ok"], false, "{label}");
+            assert!(p.get("session_count").is_none(), "{label}");
+            assert!(p.get("sessions").is_none(), "{label}");
+            assert!(
+                !p.to_string().contains("remux"),
+                "{label}: a rewritten transcode block must never yield a reason: {p}"
+            );
+        }
+
+        // POSITIVE CONTROL 1 — a REAL TranscodeSession object still decides and
+        // still explains itself. The guard must reject only what is not an
+        // object.
+        let p = MediaNowPlaying::with_source(CountingSource::ok(container(vec![
+            transcoding_episode(),
+            direct_stream_movie(),
+        ])))
+        .run(entitled())
+        .await;
+        assert_eq!(p["status"], "playing");
+        assert_eq!(p["session_count"], 2);
+        assert_eq!(p["sessions"][0]["decision"], "transcode");
+        assert!(p["sessions"][0]["transcode_reason"]
+            .as_str()
+            .expect("a real transcode session still explains itself")
+            .contains("audio eac3 -> opus"));
+        assert_eq!(p["sessions"][1]["decision"], "direct_stream");
+        assert_eq!(p["sessions"][1]["transcode_reason"], "remuxed to dash");
+
+        // POSITIVE CONTROL 2 — an ABSENT TranscodeSession is still direct play
+        // with a null reason, exactly as before. Absence is not the fault; a
+        // rewritten value is.
+        let p = MediaNowPlaying::with_source(CountingSource::ok(container(vec![
+            direct_play_movie(),
+        ])))
+        .run(entitled())
+        .await;
+        assert_eq!(p["status"], "playing");
+        assert_eq!(p["sessions"][0]["decision"], "direct_play");
+        assert_eq!(p["sessions"][0]["transcode_reason"], Value::Null);
+    }
+
+    #[test]
+    fn a_non_object_transcode_session_never_derives_a_decision_if_it_reaches_the_derivation() {
+        // The invariant held BY CONSTRUCTION, not merely by upstream ordering:
+        // `decide` and `transcode_reason` are called here directly, bypassing
+        // the `session_items` rejection that would normally have failed the
+        // response first. `decide` must treat a non-object as ABSENT and fall
+        // to `Part.decision` (the payload says `transcode`), rather than
+        // reading its default `copy`/`copy` off a null and calling it a direct
+        // stream.
+        for ts in [Value::Null, json!(0), json!("x"), json!([])] {
+            let mut item = transcoding_episode();
+            item["TranscodeSession"] = ts.clone();
+            assert_eq!(
+                decide(&item),
+                PlaybackDecision::Transcode,
+                "a {ts} TranscodeSession must not be read as copy/copy"
+            );
+            assert_eq!(
+                session_json(&item)["decision"],
+                "transcode",
+                "payload decision for a {ts} TranscodeSession"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_object_transcode_session_never_yields_a_reason_if_it_reaches_the_derivation() {
+        // Second half of the same by-construction guarantee, and the exact
+        // regression: a null TranscodeSession fell through every branch of
+        // `transcode_reason` to the direct-stream fallback and manufactured
+        // `remuxed to a different container` — a non-null reason from a session
+        // that carried no session object, violating the documented iff.
+        for ts in [Value::Null, json!(0), json!("x"), json!([])] {
+            let mut item = transcoding_episode();
+            item["TranscodeSession"] = ts.clone();
+            for decision in [
+                PlaybackDecision::Transcode,
+                PlaybackDecision::DirectStream,
+                PlaybackDecision::DirectPlay,
+            ] {
+                assert_eq!(
+                    transcode_reason(&item, decision),
+                    None,
+                    "a {ts} TranscodeSession must explain nothing, at {}",
+                    decision.as_str()
+                );
+            }
+            assert_eq!(
+                session_json(&item)["transcode_reason"],
+                Value::Null,
+                "payload reason for a {ts} TranscodeSession"
+            );
+        }
+
+        // POSITIVE CONTROL — the derivation itself is untouched for a real
+        // object, including the `remuxed to …` fallback the null was stealing.
+        assert_eq!(
+            transcode_reason(&direct_stream_movie(), PlaybackDecision::DirectStream).as_deref(),
+            Some("remuxed to dash")
+        );
     }
 
     #[tokio::test]

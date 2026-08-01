@@ -420,13 +420,21 @@ Two properties are load-bearing rather than incidental:
   >   container it emits, so a missing one is the same evidence of an altered response;
   > - a `size` that is **fractional, negative, or not a number** — a count of things is
   >   a whole non-negative number, so `0.5` is not an imprecise count but an impossible
-  >   one, and it is never floored to `0`.
+  >   one, and it is never floored to `0`;
+  > - a session whose `TranscodeSession` is present but is **not an object** (`null`, a
+  >   scalar, a list) — the same evidence and the same verdict one level down, and the
+  >   whole response fails rather than that one session, because dropping it would be an
+  >   undercount and keeping it would state a playback decision derived from a payload
+  >   that was demonstrably rewritten.
 - **`transcode_reason` may be null for a non-direct-play session.** It is non-null *iff*
-  `decision != "direct_play"` **and** Plex supplied a `TranscodeSession`. Plex sometimes
-  states the decision on `Media[0].Part[0]` with no transcode session to explain it, and
-  no reason is invented for that case — a field whose job is to state a reason must not
-  carry a guess. Consumers read `decision` as the discriminant for playback mode and
-  render a null reason as "no reason given".
+  `decision != "direct_play"` **and** the session carried a `TranscodeSession` **object**.
+  Plex sometimes states the decision on `Media[0].Part[0]` with no transcode session to
+  explain it, and no reason is invented for that case — a field whose job is to state a
+  reason must not carry a guess. A `TranscodeSession` that is present but is not an
+  object is never read as one: it fails the whole response as `malformed` (above), so a
+  rewritten transcode block can never surface as a confident decision with a manufactured
+  reason. Consumers read `decision` as the discriminant for playback mode and render a
+  null reason as "no reason given".
 - **Numeric fields split by meaning.** `season`, `episode` and `year` are ordinals: a
   fractional value is dropped to `null` rather than truncated, so a consumer is never
   shown an episode number the payload did not state. `progress_ms`, `duration_ms` and
