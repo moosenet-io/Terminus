@@ -169,17 +169,41 @@ impl CallerKey {
         Self::for_principal_name(principal.name())
     }
 
-    /// Same, from an already-canonical principal NAME.
+    /// Same, from an already-authenticated principal NAME.
     ///
     /// `None` for an empty/blank name: with no identity there is no record to
     /// own, and the fail-closed answer is "this caller has no registry" rather
     /// than "this caller shares the blank-named one".
+    ///
+    /// ## The identifier is OPAQUE — this does NOT canonicalise case
+    ///
+    /// It used to `to_ascii_lowercase()` the name. That made `Alpha` and `alpha`
+    /// the same storage key, so they shared every saved location — a silent
+    /// cross-caller MERGE, which is the same class of bug as the leak this
+    /// module exists to prevent, just arriving through a different door.
+    ///
+    /// Case-folding is only safe if the principal namespace is guaranteed
+    /// case-insensitive, and nothing establishes that: the name comes from
+    /// `crate::mesh::Principal`, whose canonicalisation rules are that
+    /// implementation's business, not this registry's. So the rule here is:
+    /// treat the identity exactly as authenticated, and let whoever owns
+    /// authentication decide what "the same identity" means. Deciding that two
+    /// differently-spelled identities are one person is an AUTHENTICATION
+    /// decision, and a storage layer that quietly makes it is overreaching in
+    /// the direction that merges records.
+    ///
+    /// Whitespace is still trimmed, because leading/trailing whitespace is a
+    /// transport artefact rather than a distinguishing part of a name, and the
+    /// blank check above has to happen on the trimmed value anyway. If the
+    /// principal namespace ever IS specified as case-insensitive, the fix is for
+    /// the authenticated-principal implementation to normalise before it gets
+    /// here — not for this constructor to guess.
     pub fn for_principal_name(name: &str) -> Option<Self> {
         let name = name.trim();
         if name.is_empty() {
             return None;
         }
-        Some(Self { principal: name.to_ascii_lowercase(), person: None })
+        Some(Self { principal: name.to_string(), person: None })
     }
 
     /// The key for a specific PERSON behind a principal — the shape this
@@ -200,43 +224,21 @@ impl CallerKey {
     /// directions or it holds from neither.
     ///
     /// A blank person is a bug in the CALLER. Returning `None` makes that
-    /// caller's mistake unphraseable at the type level, exactly as
-    /// [`CallerKey::as_service_scoped`] did for the legacy bridge: there is no
-    /// key to pass on, so the fail-closed path (`Lookup::Denied`, no read) is
-    /// the only one left. Widening scope to make a malformed identity "work" is
-    /// the worst available response.
+    /// caller's mistake unphraseable at the type level: there is no key to pass
+    /// on, so the fail-closed path (`Lookup::Denied`, no read) is the only one
+    /// left. Widening scope to make a malformed identity "work" is the worst
+    /// available response.
+    ///
+    /// Like [`CallerKey::for_principal_name`], the person identifier is OPAQUE
+    /// and is NOT case-folded — see that constructor for why.
     pub fn for_person(principal: &str, person: &str) -> Option<Self> {
         let mut key = Self::for_principal_name(principal)?;
         let person = person.trim();
         if person.is_empty() {
             return None;
         }
-        key.person = Some(person.to_ascii_lowercase());
+        key.person = Some(person.to_string());
         Some(key)
-    }
-
-    /// This key VIEWED AS a service-only identity — `None` the moment it names
-    /// a person.
-    ///
-    /// This is the ONLY way to get at the principal string, and that is the
-    /// point. The legacy `COMMUTE_*` bridge (see
-    /// [`crate::weather::location::Routine::resolve_for`]) hands out the
-    /// OPERATOR's own addresses to whoever matches "the legacy principal". A
-    /// bare `principal()` accessor made that check `key.principal() == legacy`,
-    /// which is TRUE for `svc:lumina#person:someone` — so after TERM #577 every
-    /// person behind the `lumina` service principal would have inherited the
-    /// operator's home address. That is precisely the orphaning-safety property
-    /// [`CallerKey::storage_key`] claims, defeated by an accessor.
-    ///
-    /// So the accessor is gone and this replaces it: a person-scoped key cannot
-    /// produce a [`ServiceScoped`] at all, and the bridge takes a
-    /// [`ServiceScoped`], not a `&CallerKey`. The check is not "remember to also
-    /// test `is_person_scoped`" — there is no way to phrase the unsafe version.
-    pub fn as_service_scoped(&self) -> Option<ServiceScoped<'_>> {
-        match self.person {
-            None => Some(ServiceScoped(self)),
-            Some(_) => None,
-        }
     }
 
     /// Whether this key names a person, or only a service.
@@ -262,23 +264,24 @@ impl CallerKey {
     }
 }
 
-/// A [`CallerKey`] PROVEN to name a service and no person.
-///
-/// Constructible only through [`CallerKey::as_service_scoped`], which refuses a
-/// person-scoped key. A function that takes one of these has the "no person
-/// component" guarantee from the TYPE and cannot be called wrongly; a function
-/// that takes `&CallerKey` would have to remember to check, and the review that
-/// produced this type found exactly that check missing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ServiceScoped<'a>(&'a CallerKey);
-
-impl ServiceScoped<'_> {
-    /// The service principal. Safe to compare against a configured principal
-    /// name precisely because no person can be hiding behind it.
-    pub fn principal(&self) -> &str {
-        &self.0.principal
-    }
-}
+// There is deliberately NO accessor for the principal string on `CallerKey`.
+//
+// Round 3 had one, wrapped in a `ServiceScoped` newtype, so the legacy
+// `COMMUTE_*` bridge could compare a caller's principal against a configured
+// name. Round 4 deleted that bridge (see `crate::weather::location::Routine`),
+// and the accessor went with it — because the accessor is what makes the bug
+// re-expressible. Its only use is "is this caller THE configured one?", and
+// until TERM #577 attaches a person to authorization, the answer is yes for
+// every human in the household: they all authenticate as one service principal.
+// A gate built on that question therefore cannot identify anyone, however
+// carefully it is narrowed.
+//
+// The key's whole public surface is now `storage_key()` (file a record under
+// this identity), `is_person_scoped()` (say "your" versus "this assistant's"),
+// and equality. None of those can be turned into an entitlement check. If a
+// future feature genuinely needs to distinguish an operator from a guest, it
+// belongs in `crate::tool::CallerContext` — the authorization type — and it
+// needs an identity that has actually been authenticated as that person.
 
 // ── Outcomes ────────────────────────────────────────────────────────────────
 
@@ -372,6 +375,14 @@ fn now_unix() -> i64 {
 /// Lowercase + trimmed so "Home", " home " and "HOME" are one entry rather than
 /// three — a user who says "remember this is Home" and later asks for "home"
 /// must get their answer.
+///
+/// This is deliberately the OPPOSITE choice from [`CallerKey::for_principal_name`],
+/// which does not case-fold, and the difference is not an inconsistency. A
+/// location NAME is a label the user typed inside their OWN record; folding its
+/// case can only ever merge one person's entries with their own, and getting it
+/// wrong costs a re-ask. An IDENTITY is a claim about who is asking; folding its
+/// case merges DIFFERENT callers' records, and getting it wrong hands one
+/// person's home address to another. Same operation, incomparable blast radius.
 pub fn canonical_name(raw: &str) -> Result<String, String> {
     let n = raw.trim().to_lowercase();
     if n.is_empty() {
@@ -1082,11 +1093,6 @@ mod tests {
         let person = CallerKey::for_person("lumina", "someone").unwrap();
         assert_ne!(svc.storage_key(), person.storage_key());
         assert!(!svc.is_person_scoped() && person.is_person_scoped());
-        // Same underlying principal — which is exactly why the legacy bridge
-        // must not be allowed to compare principals directly. Only the
-        // service-scoped VIEW exposes one, and a person-scoped key has none.
-        assert_eq!(svc.as_service_scoped().unwrap().principal(), "lumina");
-        assert!(person.as_service_scoped().is_none());
 
         let s = CountingStore::new();
         set(&s, Some(&svc), entitled(), HOME, A_HOME, None, false);
@@ -1097,15 +1103,60 @@ mod tests {
         );
     }
 
+    /// FINDING 2 (round 4): identities are OPAQUE. This used to assert the
+    /// OPPOSITE — that `Lumina` and `lumina` produced the same storage key —
+    /// which is a silent cross-caller MERGE dressed up as convenience, and is
+    /// only safe if the principal namespace is guaranteed case-insensitive.
+    /// Nothing establishes that, so the registry no longer decides it.
     #[test]
-    fn caller_keys_are_case_insensitive_and_reject_blanks() {
-        assert_eq!(
+    fn caller_keys_are_case_sensitive_and_reject_blanks() {
+        assert_ne!(
             CallerKey::for_principal_name("Lumina").unwrap().storage_key(),
+            CallerKey::for_principal_name("lumina").unwrap().storage_key(),
+            "two spellings must not collapse into one record"
+        );
+        // Whitespace IS trimmed: it is a transport artefact, not part of a name.
+        assert_eq!(
+            CallerKey::for_principal_name("  lumina  ").unwrap().storage_key(),
             CallerKey::for_principal_name("lumina").unwrap().storage_key()
         );
         assert!(CallerKey::for_principal_name("   ").is_none());
         assert!(CallerKey::for_principal_name("").is_none());
         assert!(CallerKey::for_person("", "someone").is_none());
+    }
+
+    /// The property behind the constructor test above, asserted against the
+    /// STORE: a case-differing identity must not read another one's records.
+    #[test]
+    fn case_differing_identities_do_not_share_a_record() {
+        let s = CountingStore::new();
+        let lower = CallerKey::for_principal_name("alpha").unwrap();
+        let upper = CallerKey::for_principal_name("Alpha").unwrap();
+        set(&s, Some(&lower), entitled(), HOME, A_HOME, None, false);
+
+        assert_eq!(
+            lookup(&s, Some(&upper), entitled(), HOME),
+            Lookup::NotSet,
+            "`Alpha` read `alpha`'s saved home"
+        );
+        assert!(
+            !format!("{:?}", list(&s, Some(&upper), entitled())).contains("Placeholder"),
+            "another caller's home leaked across a case difference"
+        );
+
+        // Same for the person component, behind one shared principal.
+        let p_lower = CallerKey::for_person("lumina", "sam").unwrap();
+        let p_upper = CallerKey::for_person("lumina", "Sam").unwrap();
+        assert_ne!(p_lower.storage_key(), p_upper.storage_key());
+        set(&s, Some(&p_lower), entitled(), HOME, A_HOME, None, false);
+        assert_eq!(lookup(&s, Some(&p_upper), entitled(), HOME), Lookup::NotSet);
+
+        // POSITIVE CONTROL: the exact spelling that saved it still reads it, so
+        // this cannot be satisfied by a store that returns `NotSet` for anyone.
+        match lookup(&s, Some(&p_lower), entitled(), HOME) {
+            Lookup::Found(e) => assert_eq!(e.value, A_HOME),
+            other => panic!("the saving identity must get its own home back, got {other:?}"),
+        }
     }
 
     // ── FINDING 2: a blank person identity yields no key at all ─────────────
@@ -1153,7 +1204,9 @@ mod tests {
         let s = CountingStore::new();
         let k = CallerKey::for_person("lumina", "Someone").expect("a real person identity must work");
         assert!(k.is_person_scoped());
-        assert_eq!(k.storage_key(), "svc:lumina#person:someone");
+        // Verbatim, not case-folded — the identity is opaque (see
+        // `CallerKey::for_principal_name`).
+        assert_eq!(k.storage_key(), "svc:lumina#person:Someone");
         set(&s, Some(&k), entitled(), HOME, A_HOME, None, false);
         match lookup(&s, Some(&k), entitled(), HOME) {
             Lookup::Found(e) => assert_eq!(e.value, A_HOME),

@@ -312,28 +312,32 @@ Four properties worth knowing:
   explicit confirmation; clearing everything needs `all=true`. `weather`'s
   "or say *remember this is home*" is an **offer**, not an automatic save —
   answering a question is not consent to store the answer.
-- **`COMMUTE_HOME` / `COMMUTE_WORK` still work — for exactly one service
-  identity.** They are a legacy fallback filling a slot the registry leaves
-  empty, so nothing regresses on the day this ships; the registry wins as soon
-  as it has an answer. The scoping is narrow on purpose, because those variables
-  are process-global and hold one person's addresses:
-  - the fallback requires a **service-scoped** caller key matching
-    `TERMINUS_COMMUTE_LEGACY_PRINCIPAL`. A *person*-scoped key (the shape that
-    arrives once TERM #577 lands) shares that principal but gets **no**
-    fallback — otherwise every person behind one service identity would inherit
-    one person's home address. This is enforced by the key type, which will not
-    hand out a principal for a person-scoped key at all;
-  - a request that carries **no identity** gets no fallback and no registry
-    record — it resolves nothing and the answer degrades to *"which location do
-    you mean?"*. Missing identity is "nobody in particular", not "probably the
-    owner";
-  - so the bridge retires itself the day per-person identity arrives, which is
-    when it should.
+- **`COMMUTE_HOME` / `COMMUTE_WORK` are no longer read at all.** They were kept
+  briefly as a migration fallback, scoped to one service principal. That does
+  not work and cannot be made to: until **TERM #577** lands, every human reaches
+  Lumina as the *same* service principal, so "the configured principal" names
+  the service they all share rather than the operator — and the fallback would
+  hand the operator's home and work addresses to anyone entitled. Narrowing the
+  gate does not help, because any gate keyed on a shared principal has the same
+  defect. So the fallback is **deleted**, along with
+  `TERMINUS_COMMUTE_LEGACY_PRINCIPAL`. Both variables are unset on the live
+  host, so nothing working was lost; what was removed is a latent disclosure
+  that would have activated the moment someone set them.
+
+  The registry is the replacement, and the degradation is honest: with no saved
+  home, `weather` asks *"which location do you mean?"* and
+  `weather_severe_alerts` reports *"no home location is configured"* — which is
+  deliberately a different sentence from *"could not check"*.
+- **Identities are opaque.** A caller key stores the authenticated principal (and,
+  post-#577, person) **verbatim**, trimmed but never case-folded. `Alpha` and
+  `alpha` are two callers with two records. Deciding that two differently-spelled
+  identities are the same person is an authentication decision, not a storage
+  one; if the principal namespace is ever specified as case-insensitive, the
+  normalisation belongs upstream in the principal implementation.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `TERMINUS_LOCATION_REGISTRY_PATH` | `~/.terminus/locations.json` | Where the registry document lives (owner-readable only, written atomically) |
-| `TERMINUS_COMMUTE_LEGACY_PRINCIPAL` | `lumina` | The one principal the legacy `COMMUTE_*` fallback applies to |
 
 ### Tool availability — parking a tool without removing it
 

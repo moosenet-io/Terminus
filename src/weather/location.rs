@@ -21,13 +21,23 @@
 //! 2. **Calendar** — today's events carry locations; if the user is travelling, the
 //!    weather they care about is where they will BE. Advisory: the answer says which
 //!    location it used and why, so a wrong inference is visible and correctable.
-//! 3. **Routine** — home/work from configuration, chosen by time of day.
+//! 3. **Routine** — home/work from THIS CALLER's registry record
+//!    ([`crate::locations`]), chosen by time of day.
 //! 4. **Ask** — never guess.
 //!
+//! ## The `COMMUTE_*` env fallback is GONE (round 4, TERM #577)
+//! Step 3 used to fall back to the process-global `COMMUTE_HOME`/`COMMUTE_WORK`
+//! env vars, which hold the OPERATOR's own addresses. That fallback has been
+//! deleted outright — see [`Routine`]'s doc for the full reasoning. The short
+//! version: every human currently reaches this code as the SAME service
+//! principal, so no gate keyed on the principal can distinguish the operator
+//! from anyone else in the household, and a narrower gate is the same bug with
+//! more code. Nothing here reads `COMMUTE_HOME` or `COMMUTE_WORK`.
+//!
 //! ## Whose calendar? Whose home? (TRTR-05 privacy gate)
-//! Steps 2 and 3 are **process-global, not per-caller**: `events_now()` reads the
-//! OPERATOR's Google calendar and the routine reads the OPERATOR's configured home
-//! and work addresses. Terminus is a multi-principal gateway — a houseguest with a
+//! Step 2 is **process-global, not per-caller**: `events_now()` reads the
+//! OPERATOR's Google calendar. (Step 3 is now per-caller — that is what LOCREG-01
+//! bought.) Terminus is a multi-principal gateway — a houseguest with a
 //! guest grant can call `weather` — so resolving an omitted location for whoever
 //! happens to be asking would answer a guest's "what's the weather?" with the
 //! operator's whereabouts, attributed out loud ("using <place> — from your calendar
@@ -238,10 +248,40 @@ pub fn from_calendar(events: &[Value]) -> Option<(String, String)> {
 
 /// Routine locations. Non-secret addresses, but sensitive ones.
 ///
-/// LOCREG-01: this is now the WEATHER-SHAPED VIEW of the shared location
-/// registry ([`crate::locations`]), not a pair of env vars. Build it with
-/// [`Routine::resolve_for`] on the dispatch path; [`Routine::from_env`] survives
-/// only as the legacy input that feeds into it.
+/// LOCREG-01: this is the WEATHER-SHAPED VIEW of the shared location registry
+/// ([`crate::locations`]), and it is now the ONLY source. Build it with
+/// [`Routine::resolve_for`] on the dispatch path.
+///
+/// ## The `COMMUTE_HOME` / `COMMUTE_WORK` fallback was REMOVED (round 4). Do not
+/// reintroduce it, and do not reintroduce a narrower version of it.
+///
+/// Earlier rounds kept a migration bridge: if the registry had no `home`, the
+/// process-global `COMMUTE_HOME`/`COMMUTE_WORK` env vars — which hold the
+/// OPERATOR's own addresses — filled the empty slot for callers matching one
+/// configured service principal. Round 3 narrowed that gate to require a
+/// SERVICE-scoped key, on the reasoning that a person-scoped key could then
+/// never inherit the operator's address.
+///
+/// That reasoning was correct about the FUTURE and wrong about TODAY. Until
+/// TERM #577 lands, every human talking to the assistant authenticates as the
+/// SAME service principal — so "service-scoped key matching the configured
+/// principal" describes every person in the household, not the operator. The
+/// gate did not identify the operator; it identified the service they all share.
+/// Any gate keyed on the principal has this bug, because a shared service
+/// principal cannot distinguish people. A narrower gate is the same bug with
+/// more code; the only fix is that the fallback does not exist.
+///
+/// What replaces it: the registry, per caller, plus an honest degradation.
+/// With no stored home the chain lands on ASK ([`ASK_MESSAGE`]) and
+/// `weather_severe_alerts` reports "no home location is configured" — both true
+/// and both actionable. Nothing operational was lost: `COMMUTE_HOME` and
+/// `COMMUTE_WORK` are unset on the live host, so the fallback protected no
+/// working behaviour — it was a latent disclosure waiting for someone to set
+/// them.
+///
+/// If TERM #577 ever makes an independently authenticated PERSON identity
+/// available on this path, that is an argument for per-person registry records
+/// (which already work), not for resurrecting a process-env fallback.
 #[derive(Debug, Clone, Default)]
 pub struct Routine {
     pub home: Option<String>,
@@ -266,83 +306,15 @@ pub struct RoutineResolution {
     pub degraded: bool,
 }
 
-/// Env var naming the ONE principal the legacy `COMMUTE_*` fallback applies to.
-///
-/// See [`Routine::resolve_for`] for why the fallback is scoped to a single
-/// principal rather than applied to everyone.
-pub const LEGACY_PRINCIPAL_ENV: &str = "TERMINUS_COMMUTE_LEGACY_PRINCIPAL";
-
-/// Default legacy principal: the assistant service. Today, per TERM #577, every
-/// human talking to Lumina arrives as that one identity — so this default
-/// reproduces exactly today's behaviour and widens nothing.
-///
-/// **Why this KEEPS a default rather than becoming config-only.** The
-/// alternative — no default, so the bridge is inert unless
-/// [`LEGACY_PRINCIPAL_ENV`] is set — reads cleaner but fails in the wrong
-/// direction: on the deploy that ships this, the operator's already-configured
-/// `COMMUTE_HOME` would stop resolving, and the symptom is the assistant asking
-/// "which location do you mean?" for a question it answered yesterday, with no
-/// error and nothing in a log to explain it. A default that is load-bearing for
-/// exactly one migration is worth more than the tidiness.
-///
-/// It is also self-limiting in a way a bare default usually is not: the bridge
-/// now requires a SERVICE-scoped key (see
-/// [`Routine::resolve_for_legacy_principal`]), so the day TERM #577 attaches a
-/// person to the key this default stops applying to any human — the value can
-/// then be deleted along with the whole fallback rather than re-pointed.
-///
-/// `lumina` is a service principal name, not a secret or a personal detail: it
-/// is the identity the assistant authenticates as, it appears throughout this
-/// crate and its README, and it discloses nothing about anyone.
-pub const DEFAULT_LEGACY_PRINCIPAL: &str = "lumina";
-
-fn legacy_principal() -> String {
-    std::env::var(LEGACY_PRINCIPAL_ENV)
-        .ok()
-        .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_LEGACY_PRINCIPAL.to_string())
-}
-
 impl Routine {
-    /// The LEGACY input: `COMMUTE_HOME` / `COMMUTE_WORK`.
+    /// Build this caller's routine from the shared registry. **This is the
+    /// LOCREG-01 wiring point, and the registry is the only source.**
     ///
-    /// Kept as a fallback so nothing regresses for the operator on the day this
-    /// ships, and deliberately NOT the primary source any more — see
-    /// [`Routine::resolve_for`].
-    pub fn from_env() -> Self {
-        let get = |k: &str| {
-            std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
-        };
-        Self { home: get("COMMUTE_HOME"), work: get("COMMUTE_WORK"), current: None }
-    }
-
-    /// Build this caller's routine from the shared registry, with the legacy
-    /// env vars as a narrow fallback. **This is the LOCREG-01 wiring point.**
-    ///
-    /// ## Precedence, and why it is this way round
-    ///
-    /// 1. **The registry**, per caller. What the user told the assistant to
-    ///    remember beats what was configured on a host years ago — otherwise
-    ///    "I've moved" would appear to work and change nothing.
-    /// 2. **`COMMUTE_HOME` / `COMMUTE_WORK`**, but ONLY for the single principal
-    ///    named by [`LEGACY_PRINCIPAL_ENV`], and only for a slot the registry
-    ///    leaves empty.
-    ///
-    /// The scoping in (2) is the load-bearing part. Those env vars are
-    /// PROCESS-GLOBAL and hold the OPERATOR's own addresses; applying them to
-    /// every caller would hand one person's home address to whoever else is
-    /// entitled — the exact failure class fixed twice already this sprint. They
-    /// are a migration bridge for one identity, not a default for everyone, and
-    /// the moment that identity saves a `home` the registry wins and the bridge
-    /// stops mattering.
-    ///
-    /// Today, per TERM #577, that one identity is also the only one any human
-    /// reaches this code through, so this reproduces current behaviour exactly.
-    /// **When #577 closes this needs re-examining, not carrying forward**: a
-    /// per-person key will no longer match the legacy principal's record, and
-    /// the right answer is almost certainly to retire the env fallback rather
-    /// than re-point it.
+    /// There is no env fallback and no second tier: a slot the registry leaves
+    /// empty stays empty, and the chain degrades to ASK. See this type's doc for
+    /// why the `COMMUTE_*` bridge was removed rather than narrowed (short
+    /// version: every human shares one service principal until TERM #577, so no
+    /// principal-keyed gate can tell the operator from anyone else).
     ///
     /// An unentitled caller gets an EMPTY routine and the store is never
     /// touched — `crate::locations` makes that decision before any read.
@@ -350,23 +322,6 @@ impl Routine {
         store: &dyn crate::locations::store::LocationStore,
         key: Option<&crate::locations::CallerKey>,
         caller: CallerContext,
-        legacy: &Routine,
-    ) -> RoutineResolution {
-        Self::resolve_for_legacy_principal(store, key, caller, legacy, &legacy_principal())
-    }
-
-    /// [`Routine::resolve_for`] with the legacy principal passed explicitly.
-    ///
-    /// Exists so the tests can exercise the fallback's SCOPING without mutating
-    /// process env — `std::env::set_var` from a parallel test is a race, and the
-    /// property under test here ("one principal, not everyone") is exactly the
-    /// kind that a flaky test would quietly stop enforcing.
-    pub fn resolve_for_legacy_principal(
-        store: &dyn crate::locations::store::LocationStore,
-        key: Option<&crate::locations::CallerKey>,
-        caller: CallerContext,
-        legacy: &Routine,
-        legacy_principal: &str,
     ) -> RoutineResolution {
         use crate::locations::{self, Listing};
 
@@ -396,26 +351,12 @@ impl Routine {
             Listing::Unavailable(_) => degraded = true,
         }
 
-        // The legacy bridge: one SERVICE principal, filling only empty slots.
-        //
-        // `as_service_scoped()` is what makes this safe, and it is a type
-        // constraint rather than a comment. The check used to be
-        // `key.principal() == legacy_principal`, which is also true of
-        // `svc:lumina#person:someone` — so once TERM #577 attaches a person to
-        // the key, EVERY person behind the `lumina` service principal would have
-        // been handed the operator's `COMMUTE_HOME`. A person-scoped key cannot
-        // produce a `ServiceScoped` at all, so it cannot reach this bridge; it
-        // gets the registry and nothing else. That is also the bridge retiring
-        // itself the day #577 lands, which is the outcome this module's doc
-        // already said was almost certainly right.
-        let is_legacy = key
-            .and_then(crate::locations::CallerKey::as_service_scoped)
-            .is_some_and(|svc| svc.principal() == legacy_principal);
-        if is_legacy && !degraded {
-            home = home.or_else(|| legacy.home.clone());
-            work = work.or_else(|| legacy.work.clone());
-        }
-
+        // NOTHING follows the registry read. There is deliberately no second
+        // tier here: no `COMMUTE_*` env fallback, no principal-keyed bridge, no
+        // "just for the operator" special case. See this type's doc — a shared
+        // service principal (TERM #577) cannot distinguish people, so every
+        // variant of that gate hands one person's home address to everyone
+        // behind the same service identity.
         RoutineResolution { routine: Routine { home, work, current }, degraded }
     }
 
@@ -812,15 +753,12 @@ mod tests {
         use crate::locations::{self, CallerKey};
 
         const STORED_HOME: &str = "1 Placeholder Way, Examplecity"; // pii-test-fixture: obvious placeholder standing in for a saved home address
-        const LEGACY_HOME: &str = "9 Legacy Lane, Examplecity"; // pii-test-fixture: obvious placeholder standing in for the operator's COMMUTE_HOME
+        const LEGACY_HOME: &str = "9 Legacy Lane, Examplecity"; // pii-test-fixture: obvious placeholder standing in for a COMMUTE_HOME value that must never resolve
+        const LEGACY_WORK: &str = "8 Legacy Court, Examplecity"; // pii-test-fixture: obvious placeholder standing in for a COMMUTE_WORK value that must never resolve
         const OTHER_HOME: &str = "2 Otherplace Road, Examplecity"; // pii-test-fixture: obvious placeholder standing in for another caller's home address
 
         fn key(name: &str) -> CallerKey {
             CallerKey::for_principal_name(name).unwrap()
-        }
-
-        fn legacy() -> Routine {
-            Routine { home: Some(LEGACY_HOME.into()), work: None, current: None }
         }
 
         fn seed(store: &CountingStore, k: &CallerKey, name: &str, value: &str, hours: Option<i64>) {
@@ -839,7 +777,7 @@ mod tests {
             let k = key("alpha");
             seed(&s, &k, locations::HOME, STORED_HOME, None);
 
-            let r = Routine::resolve_for(&s, Some(&k), operator(), &Routine::default());
+            let r = Routine::resolve_for(&s, Some(&k), operator());
             assert!(!r.degraded);
             match resolve(None, &[], &r.routine, 20, true, operator()) {
                 Resolved::Found { location, source: LocationSource::Routine(w) } => {
@@ -850,96 +788,108 @@ mod tests {
             }
         }
 
+        /// **The round-4 privacy property, and the one that replaced the legacy
+        /// fallback's positive control.**
+        ///
+        /// The old control asserted that a service-scoped key on the configured
+        /// principal DID inherit `COMMUTE_HOME`. That proved the unsafe behaviour
+        /// was switched on, not that callers were isolated — and since every
+        /// human currently arrives as that one service principal (TERM #577), it
+        /// was asserting the leak.
+        ///
+        /// This asserts the property that actually matters: with `COMMUTE_HOME`
+        /// and `COMMUTE_WORK` genuinely SET in the process environment, NO caller
+        /// — no key, service key, person key, entitled or not — resolves an
+        /// ambient location from them. The env is set for real (rather than a
+        /// `legacy` argument being passed), because the claim under test is that
+        /// this code does not read the process environment at all.
+        ///
+        /// `#[serial]` because it mutates process env; the vars are restored.
         #[test]
-        fn the_registry_beats_the_legacy_env_vars() {
-            let s = CountingStore::new();
-            let k = key("alpha");
-            seed(&s, &k, locations::HOME, STORED_HOME, None);
+        #[serial_test::serial]
+        fn no_caller_resolves_an_ambient_location_from_the_commute_env_vars() {
+            struct EnvGuard(Vec<(&'static str, Option<String>)>);
+            impl Drop for EnvGuard {
+                fn drop(&mut self) {
+                    for (k, prev) in &self.0 {
+                        match prev {
+                            Some(v) => std::env::set_var(k, v),
+                            None => std::env::remove_var(k),
+                        }
+                    }
+                }
+            }
+            let _guard = EnvGuard(
+                ["COMMUTE_HOME", "COMMUTE_WORK"]
+                    .iter()
+                    .map(|k| (*k, std::env::var(k).ok()))
+                    .collect(),
+            );
+            std::env::set_var("COMMUTE_HOME", LEGACY_HOME);
+            std::env::set_var("COMMUTE_WORK", LEGACY_WORK);
 
-            let r = Routine::resolve_for_legacy_principal(&s, Some(&k), operator(), &legacy(), "alpha");
-            assert_eq!(r.routine.home.as_deref(), Some(STORED_HOME), "'I've moved' must actually take effect");
-        }
-
-        #[test]
-        fn the_legacy_env_fallback_still_resolves_when_the_registry_is_empty() {
-            // The no-regression case: the operator has COMMUTE_HOME set and
-            // nothing saved yet. Weather must keep working exactly as before.
             let s = CountingStore::new();
-            let r = Routine::resolve_for_legacy_principal(&s, Some(&key("alpha")), operator(), &legacy(), "alpha");
-            assert_eq!(r.routine.home.as_deref(), Some(LEGACY_HOME));
-            match resolve(None, &[], &r.routine, 20, true, operator()) {
-                Resolved::Found { location, .. } => assert_eq!(location, LEGACY_HOME),
-                other => panic!("got {other:?}"),
+            let svc = key("lumina");
+            let person = CallerKey::for_person("lumina", "someone").unwrap();
+            let other_person = CallerKey::for_person("lumina", "someone-else").unwrap();
+            let cases: [(&str, Option<&CallerKey>, CallerContext); 7] = [
+                ("no identity at all", None, operator()),
+                ("service key, entitled", Some(&svc), operator()),
+                ("service key, guest", Some(&svc), guest()),
+                ("person key, entitled", Some(&person), operator()),
+                ("person key, guest", Some(&person), guest()),
+                ("a second person behind the same service", Some(&other_person), operator()),
+                ("an unrelated principal", Some(&key("bravo")), operator()),
+            ];
+            for (what, k, ctx) in cases {
+                let r = Routine::resolve_for(&s, k, ctx);
+                assert_eq!(r.routine.home, None, "{what}: inherited an ambient home");
+                assert_eq!(r.routine.work, None, "{what}: inherited an ambient work");
+                // Not just "the slots are empty" — the value must appear NOWHERE
+                // in what this caller could be told.
+                let rendered = format!("{r:?}{:?}", resolve(None, &[], &r.routine, 20, true, ctx));
+                assert!(!rendered.contains("Legacy"), "{what}: a COMMUTE_* value leaked: {rendered}");
+                assert!(!rendered.contains("Examplecity"), "{what}: an address leaked: {rendered}");
+                assert_eq!(
+                    resolve(None, &[], &r.routine, 20, true, ctx),
+                    Resolved::AskUser,
+                    "{what}: with nothing saved the honest answer is to ASK"
+                );
             }
         }
 
+        /// FINDING 3, second half: identifiers are OPAQUE, so two spellings are
+        /// two callers. `Alpha` and `alpha` used to canonicalise to one storage
+        /// key and share every saved record — a silent cross-caller merge that is
+        /// only safe if the principal namespace is guaranteed case-insensitive,
+        /// which nothing establishes.
         #[test]
-        fn the_legacy_env_fallback_is_scoped_to_one_principal() {
-            // The operator's process-global COMMUTE_HOME must not become
-            // everybody else's home the moment they are entitled.
+        fn identities_differing_only_in_case_do_not_share_a_record() {
             let s = CountingStore::new();
-            let r = Routine::resolve_for_legacy_principal(&s, Some(&key("bravo")), operator(), &legacy(), "alpha");
-            assert_eq!(r.routine.home, None, "another principal must not inherit COMMUTE_HOME");
-            assert!(!format!("{r:?}").contains("Legacy"));
-        }
+            let lower = key("alpha");
+            let upper = key("Alpha");
+            assert_ne!(lower.storage_key(), upper.storage_key(), "case must not collapse");
 
-        /// The TERM #577 hazard the second review round caught. A person-scoped
-        /// key `svc:lumina#person:someone` shares the legacy PRINCIPAL, so a
-        /// check written as `key.principal() == legacy_principal` handed the
-        /// operator's `COMMUTE_HOME` to every person behind that service
-        /// identity — the exact opposite of the orphaning-safety property the
-        /// design claims.
-        #[test]
-        fn a_person_scoped_key_gets_no_legacy_fallback_even_on_the_legacy_principal() {
-            let s = CountingStore::new();
-            let person = CallerKey::for_person("alpha", "someone").unwrap();
+            seed(&s, &lower, locations::HOME, STORED_HOME, None);
+            let r = Routine::resolve_for(&s, Some(&upper), operator());
+            assert_eq!(r.routine.home, None, "`Alpha` read `alpha`'s saved home");
+            assert!(!format!("{r:?}").contains("Placeholder"), "another caller's home leaked");
 
-            let r = Routine::resolve_for_legacy_principal(
-                &s,
-                Some(&person),
-                operator(),
-                &legacy(),
-                "alpha",
-            );
-            assert_eq!(
-                r.routine.home, None,
-                "a person behind the legacy service principal must NOT inherit COMMUTE_HOME"
-            );
-            assert!(!format!("{r:?}").contains("Legacy"), "the operator's legacy home leaked");
-            // ...and downstream that is an honest "ask", not a wrong address.
-            assert_eq!(resolve(None, &[], &r.routine, 20, true, operator()), Resolved::AskUser);
-        }
-
-        /// POSITIVE CONTROL for the guard above: the same principal, WITHOUT a
-        /// person component, still gets the bridge. Without this, deleting the
-        /// fallback outright would pass every negative test.
-        #[test]
-        fn a_service_scoped_key_on_the_legacy_principal_still_gets_the_fallback() {
-            let s = CountingStore::new();
-            let svc = CallerKey::for_principal_name("alpha").unwrap();
-            let r =
-                Routine::resolve_for_legacy_principal(&s, Some(&svc), operator(), &legacy(), "alpha");
-            assert_eq!(r.routine.home.as_deref(), Some(LEGACY_HOME));
-        }
-
-        /// The type, not the caller, is what enforces it: there is no way to ask
-        /// a person-scoped key for its principal.
-        #[test]
-        fn a_person_scoped_key_cannot_be_viewed_as_service_scoped() {
-            let svc = CallerKey::for_principal_name("alpha").unwrap();
-            let person = CallerKey::for_person("alpha", "someone").unwrap();
-            assert_eq!(svc.as_service_scoped().map(|s| s.principal().to_string()), Some("alpha".into()));
-            assert!(
-                person.as_service_scoped().is_none(),
-                "a person-scoped key must not be able to present itself as its service"
-            );
+            // ...and the same for the person component.
+            let p_lower = CallerKey::for_person("alpha", "sam").unwrap();
+            let p_upper = CallerKey::for_person("alpha", "Sam").unwrap();
+            assert_ne!(p_lower.storage_key(), p_upper.storage_key());
+            seed(&s, &p_lower, locations::HOME, OTHER_HOME, None);
+            let r = Routine::resolve_for(&s, Some(&p_upper), operator());
+            assert_eq!(r.routine.home, None, "`Sam` read `sam`'s saved home");
+            assert!(!format!("{r:?}").contains("Otherplace"), "another person's home leaked");
         }
 
         #[test]
         fn one_callers_registry_home_is_invisible_to_another() {
             let s = CountingStore::new();
             seed(&s, &key("bravo"), locations::HOME, OTHER_HOME, None);
-            let r = Routine::resolve_for(&s, Some(&key("alpha")), operator(), &Routine::default());
+            let r = Routine::resolve_for(&s, Some(&key("alpha")), operator());
             assert_eq!(r.routine.home, None);
             assert!(!format!("{r:?}").contains("Otherplace"), "another caller's home leaked");
         }
@@ -951,7 +901,7 @@ mod tests {
             seed(&s, &k, locations::HOME, STORED_HOME, None);
             let reads_before = s.reads();
 
-            let r = Routine::resolve_for_legacy_principal(&s, Some(&k), guest(), &legacy(), "alpha");
+            let r = Routine::resolve_for(&s, Some(&k), guest());
             assert_eq!(s.reads(), reads_before, "an unentitled caller must cause ZERO registry reads");
             assert!(!r.degraded, "a refusal is not a degradation");
             assert_eq!(r.routine.home, None);
@@ -966,7 +916,7 @@ mod tests {
             seed(&s, &k, locations::HOME, STORED_HOME, None);
             seed(&s, &k, locations::CURRENT, "Denver", Some(168));
 
-            let r = Routine::resolve_for(&s, Some(&k), operator(), &Routine::default());
+            let r = Routine::resolve_for(&s, Some(&k), operator());
             match resolve(None, &[], &r.routine, 20, true, operator()) {
                 Resolved::Found { location, source: LocationSource::Routine(w) } => {
                     assert_eq!(location, "Denver");
@@ -992,7 +942,7 @@ mod tests {
                 .expires_at_unix = Some(chrono::Utc::now().timestamp() - 1);
             s.save(&doc).unwrap();
 
-            let r = Routine::resolve_for(&s, Some(&k), operator(), &Routine::default());
+            let r = Routine::resolve_for(&s, Some(&k), operator());
             assert_eq!(r.routine.current, None, "an expired travel location must not resolve");
             match resolve(None, &[], &r.routine, 20, true, operator()) {
                 Resolved::Found { location, .. } => assert_eq!(location, STORED_HOME),
@@ -1003,23 +953,24 @@ mod tests {
         #[test]
         fn an_empty_registry_and_an_unreadable_one_are_different_answers() {
             let empty = CountingStore::new();
-            let e = Routine::resolve_for(&empty, Some(&key("alpha")), operator(), &Routine::default());
+            let e = Routine::resolve_for(&empty, Some(&key("alpha")), operator());
             assert!(!e.degraded, "empty is NOT degraded — it is a complete, honest 'nothing set'");
             assert_eq!(e.routine.home, None);
 
             let broken = BrokenStore;
-            let b = Routine::resolve_for(&broken, Some(&key("alpha")), operator(), &Routine::default());
+            let b = Routine::resolve_for(&broken, Some(&key("alpha")), operator());
             assert!(b.degraded, "a read failure must be reported as such, never as 'nothing set'");
             assert_eq!(b.routine.home, None);
         }
 
         #[test]
-        fn a_degraded_registry_does_not_silently_fall_back_to_the_legacy_env() {
-            // Answering with COMMUTE_HOME when we could not read what the user
-            // actually saved would present a stale address as the current one.
-            let r = Routine::resolve_for_legacy_principal(&BrokenStore, Some(&key("alpha")), operator(), &legacy(), "alpha");
+        fn a_degraded_registry_reports_the_failure_and_invents_nothing() {
+            // Substituting ANY other source when we could not read what the user
+            // actually saved would present something else as the current answer.
+            let r = Routine::resolve_for(&BrokenStore, Some(&key("alpha")), operator());
             assert!(r.degraded);
             assert_eq!(r.routine.home, None);
+            assert_eq!(r.routine.work, None);
         }
 
         #[test]
