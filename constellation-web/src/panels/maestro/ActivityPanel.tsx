@@ -47,6 +47,7 @@ import { DataTable } from '../../components/DataTable';
 import type { DataTableColumn } from '../../components/DataTable';
 import { useMuseLiveSessions, useMuseSessionHistory, museArtUrlAt } from '../../hooks/useMuse';
 import type { HistorySession, LiveSession } from '../../lib/aggregationClient';
+import { ImportActivity } from './ImportActivity';
 import {
   accountLabel,
   classifyDecision,
@@ -357,6 +358,11 @@ export function ActivityPanel() {
         sessions={history.data?.sessions ?? []}
         source={history.data?.source ?? null}
       />
+
+      {/* MACT-05 (MUSE-125): "what is Muse importing right now" -- own section, own
+          degradation, below the LIVE/HISTORY panes (which are about who's watching, not
+          what's being acquired). */}
+      <ImportActivity />
     </PanelRoot>
   );
 }

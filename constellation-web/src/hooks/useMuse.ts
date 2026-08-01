@@ -844,6 +844,35 @@ export function useMuseDownloadQueue(): MuseSection<{ wanted: unknown[]; queue: 
   return useMuseSection<{ wanted: unknown[]; queue: MuseDownloadQueueRow[] }>('/api/requests/queue');
 }
 
+// ── Import / acquisition activity (MACT-05, MUSE-125) ────────────────────────
+// Extends the SAME `GET /api/requests/queue` endpoint `useMuseDownloadQueue` already binds
+// (MGUI-09/14) — no new endpoint, no new tracking. That hook left `wanted` typed `unknown[]`
+// because MGUI-09/14's queue view never reads it; the Activity panel's Import section needs a
+// count and a few display fields, so this adds the authoritative typing for that row instead of
+// widening the existing (narrower-purpose) hook's return shape.
+//
+// Typed from the Rust source, not a live capture — `CONSTELLATION_MUSE_TOKEN` is unprovisioned
+// (TERM-549) so this protected route 401s on a fresh session; a live capture isn't possible
+// right now (see this item's own note). Mirrors:
+//   - `WantedTitleRow` (Muse `src/repo/dashboard.rs`) as JSON-shaped by `get_requests_queue`
+//     (`src/web/dashboard.rs`) — a manually-built `json!({...})`, not a struct `Serialize`, so
+//     every key below is unconditionally present (no `#[serde(skip_serializing_if)]` involved).
+//   - `DownloadQueueEntry` (Muse `src/models/acquisition.rs`), same manual `json!({...})` — see
+//     `MuseDownloadQueueRow`'s doc above for the `progress: null` seam this type shares.
+export interface MuseWantedTitleRow {
+  monitored_item_id: number;
+  media_metadata_id: number;
+  library_id: number;
+  kind: string;
+  title: string;
+  year: number | null;
+  poster_url: string;
+}
+
+export function useMuseImportActivity(): MuseSection<{ wanted: MuseWantedTitleRow[]; queue: MuseDownloadQueueRow[] }> {
+  return useMuseSection<{ wanted: MuseWantedTitleRow[]; queue: MuseDownloadQueueRow[] }>('/api/requests/queue');
+}
+
 // ── Provider search + request (MGUI-16) ──────────────────────────────────────
 //
 // `GET /api/muse/api/search?q=&kind=movie|series|all` — the metadata-provider fan-out that
