@@ -3,9 +3,21 @@
 [← personal-life index](README.md) · [← tool index](../README.md) · [← docs index](../../README.md)
 
 Commute provides traffic-aware driving directions via the TomTom API, plus a named-location
-shortcut system (`home`/`work`/`family`) so the operator never has to repeat an address, IATA
-airport-code expansion for reliable geocoding, and a Bay Area public-transit planner stub for
-511.org. Defined in [`src/commute/mod.rs`](../../../src/commute/mod.rs).
+shortcut system (`home`/`work`/`family`, and any name the user saved) so nobody has to repeat
+an address, IATA airport-code expansion for reliable geocoding, and a Bay Area public-transit
+planner stub for 511.org. Defined in [`src/commute/mod.rs`](../../../src/commute/mod.rs).
+
+> **TERM #591 — named places come from the registry, not the environment.**
+> `COMMUTE_HOME` / `COMMUTE_WORK` / `COMMUTE_FAMILY` are **no longer read by anything**. They
+> were process-global — one person's addresses, returned to every entitled caller — which is a
+> disclosure that arms itself the moment an operator sets one. Named places now resolve through
+> the shared per-caller location registry (`crate::locations`, filled conversationally via
+> `location_set`), on the same entitlement and through the same call `weather` makes.
+>
+> Records are keyed per **authenticated principal, not per person**: until **TERM #577**
+> propagates a human identity to authorization, every human reaches the fleet as the same
+> service principal and so shares one record. Two separately-authenticated principals do get
+> two records and cannot reach each other's — that is what the env var never gave.
 
 <img src="../../../assets/commute-architecture.svg" alt="Three TomTom-backed tools (commute_estimate, route_traffic, traffic_incidents) resolve named locations via CommuteConfig, geocode through TomTom, then call calculateRoute or incidentDetails; transit_plan is gated on SF511_API_TOKEN and not yet wired" width="100%">
 
@@ -14,25 +26,35 @@ airport-code expansion for reliable geocoding, and a Bay Area public-transit pla
 | Env var | Required | Notes |
 |---|---|---|
 | `TOMTOM_API_KEY` | yes, for the 3 driving tools | unset → `NotConfigured` stubs for `commute_estimate`/`route_traffic`/`traffic_incidents`; `transit_plan` is unaffected |
-| `COMMUTE_HOME` | no | default home address; also consumed by the [weather](weather.md) tool as its location fallback |
-| `COMMUTE_WORK` | no | default work address |
-| `COMMUTE_FAMILY` | no | family / occasional-visit address |
 | `SF511_API_TOKEN` | no | 511.org token for `transit_plan`; even when set, the trip planner is **not yet wired** (see below) |
+| `TERMINUS_LOCATION_REGISTRY_PATH` | no | where saved locations live (shared with weather; default `~/.terminus/locations.json`) |
 
 ## Named-location resolution
 
-`CommuteConfig::resolve` (`src/commute/mod.rs:67-87`) maps a caller's location keyword
-(case-insensitive) to the configured address:
+`CommuteConfig::resolve` maps a caller's location keyword (case-insensitive) onto a name in
+**that caller's** location registry, and looks it up through `locations::lookup`:
 
 | Keywords | Resolves to |
 |---|---|
-| `home`, `house` | `COMMUTE_HOME` |
-| `work`, `office`, `the office` | `COMMUTE_WORK` |
-| `family`, `family home`, `parents` | `COMMUTE_FAMILY` |
-| anything else | passed through as a literal address/`lat,lon`, after IATA expansion (below) |
+| `home`, `house` | the caller's saved `home` |
+| `work`, `office`, `the office` | the caller's saved `work` |
+| `current`, `here`, `where i am` | the caller's saved `current` (the travel override) |
+| `family`, `family home`, `parents` | the caller's saved `family` |
+| any other name | looked up too — a user-chosen name like `the cabin` resolves; if nothing is saved under it, it falls through and is treated as a literal address/`lat,lon`, after IATA expansion (below) |
+| a `lat,lon` pair | never looked up — it is already a place |
 
-Resolving a named keyword whose backing env var is unset returns `NotConfigured` naming the
-specific missing variable (e.g. `"COMMUTE_HOME not configured"`), not a generic error.
+**Failure is never filled in with a guess**, and the three ways it can fail stay three
+different answers:
+
+| Outcome | What the caller gets |
+|---|---|
+| nothing saved under a well-known name | `NotConfigured` — an ask: *"I don't have a "home" saved for you… tell me the address, or say 'remember this is home'"* |
+| caller is unentitled, or arrived with no identity | `NotConfigured` — *"saved locations aren't available on this connection"*. **No read happens at all**, so nothing is in memory to leak; a literal address still routes |
+| the registry could not be read | `Execution` — *"I couldn't read your saved locations… that's a problem reading them, not an empty list"*. A **different error type** from an absent value, deliberately |
+
+An omitted `origin` still *means* `home` — the tool's contract is unchanged — but `home` is the
+caller's saved entry, and with none saved the tool asks rather than starting from somewhere
+else. The display label names a saved place (`Home (…)`) only when one was actually used.
 
 **IATA airport-code expansion** (`expand_iata`, `src/commute/mod.rs:91-134`): a bare 3-letter
 alphabetic string geocodes to the wrong place on its own (e.g. TomTom might resolve "SJC" to
@@ -73,7 +95,7 @@ Traffic-aware commute for a typical day, defaulting to home→work
 
 | Field | Type | Required | Default |
 |---|---|---|---|
-| `from` | string: `home`\|`work`\|`family`\|address | no | `home` |
+| `from` | string: a saved name (`home`/`work`/`family`/…) or an address | no | `home` (the caller's saved one; asks if absent) |
 | `to` | string: same | no | `work` |
 | `depart_at` | string: `"now"` or ISO time | no | `now` |
 | `arrive_by` | string: ISO time | no | — |
@@ -81,8 +103,9 @@ Traffic-aware commute for a typical day, defaulting to home→work
 Empty strings for `from`/`to`/`depart_at` are treated as "not provided" (the model sometimes
 passes `""` explicitly rather than omitting the key), so the defaults still apply.
 
-**Errors:** `NotConfigured` if `TOMTOM_API_KEY` or a referenced named location's env var is
-unset; `Http`/`NotFound` from geocoding/routing failures.
+**Errors:** `NotConfigured` if `TOMTOM_API_KEY` is unset, or if a referenced named place is
+not saved / not available to this caller; `Execution` if the registry could not be read;
+`Http`/`NotFound` from geocoding/routing failures.
 
 ## route_traffic
 
@@ -93,13 +116,13 @@ The general-purpose version: any two locations, any travel mode
 
 | Field | Type | Required | Default |
 |---|---|---|---|
-| `origin` | string: address, `lat,lon`, IATA code, or `home`/`work`/`family` | no | `home` |
+| `origin` | string: address, `lat,lon`, IATA code, or a saved name (`home`/`work`/`family`/…) | no | `home` (the caller's saved one; asks if absent) |
 | `destination` | string: same | **yes** | — |
 | `mode` | string: `car`\|`truck`\|`pedestrian`\|`bicycle` | no | `car`; any other value silently falls back to `car` |
 | `depart_at` | string | no | `now` |
 | `arrive_by` | string: ISO time | no | — |
 
-Unlike `commute_estimate`, `origin` is optional (defaults to `home`) but `destination` is
+Unlike `commute_estimate`, `origin` is optional (defaults to the caller's saved `home`) but `destination` is
 required and validated explicitly — a missing/empty `destination` raises `InvalidArgument`
 before any resolution or network call. When `mode != "car"`, the mode is appended to the
 formatted output as an extra line.
@@ -113,7 +136,7 @@ Lists current accidents, construction, and closures near a location
 
 | Field | Type | Required | Default |
 |---|---|---|---|
-| `location` | string: address, `lat,lon`, or `home`/`work`/`family` | yes | — |
+| `location` | string: address, `lat,lon`, or a saved name (`home`/`work`/`family`/…) | yes | — |
 | `radius_miles` | number | no | `10`, clamped to `1..=50` |
 
 **Behavior.** After geocoding the center point, a bounding box is computed with `dlat =

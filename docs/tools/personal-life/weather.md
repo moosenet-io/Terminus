@@ -3,10 +3,20 @@
 [← personal-life index](README.md) · [← tool index](../README.md) · [← docs index](../../README.md)
 
 A single tool, `weather`, backed by OpenWeatherMap. Despite being one tool it carries
-substantial logic: a `COMMUTE_HOME` location fallback, dual °F/°C rendering for an
+substantial logic: a per-caller saved-location fallback, dual °F/°C rendering for an
 internationally-traveling operator, a street-address-to-city geocoding fallback ladder, and a
 rule-based (non-LLM) "what to wear" suggestion engine. Defined in
 [`src/weather/mod.rs`](../../../src/weather/mod.rs).
+
+> **Correction (LOCREG-01 / TERM #591).** This page still describes the old `COMMUTE_HOME`
+> location fallback in several places below; that fallback **no longer exists**. A missing
+> `location` now resolves through the shared per-caller location registry
+> (`crate::locations` — explicit → calendar → the caller's saved `current`/`work`/`home`), and
+> with nothing saved the tool **asks** rather than guessing. `COMMUTE_HOME` / `COMMUTE_WORK`
+> are read by nothing, in weather or in [commute](commute.md). Registry records are keyed per
+> **authenticated principal, not per person**: until **TERM #577** lands every human reaches
+> the fleet as one service principal and shares a record. Read the sections below with that
+> substitution in mind; where they conflict with it, they are stale.
 
 <img src="../../../assets/weather-architecture.svg" alt="The weather tool resolves location (explicit or COMMUTE_HOME fallback), geocodes with a coarsening retry ladder against OpenWeatherMap's /geo/1.0/direct, then calls /data/2.5/weather (current) or /data/2.5/forecast (multi-day), always fetching in Celsius and rendering both °F and °C" width="100%">
 
@@ -16,7 +26,7 @@ rule-based (non-LLM) "what to wear" suggestion engine. Defined in
 |---|---|---|
 | `OPENWEATHER_API_KEY` | yes | unset → `NotConfiguredStub` registered instead of the real tool |
 | `OPENWEATHER_API_URL` | no | default `https://api.openweathermap.org` |
-| `COMMUTE_HOME` | no | shared with the [commute](commute.md) module; used as the location fallback when `location` is omitted |
+| `TERMINUS_LOCATION_REGISTRY_PATH` | no | where saved locations live, shared with [commute](commute.md); default `~/.terminus/locations.json`. (`COMMUTE_HOME` is **no longer read** — see the correction above) |
 
 `OPENWEATHER_UNITS` is **not** consulted — the tool documents this explicitly
 (`src/weather/mod.rs:42-43`): it always fetches in metric (canonical Celsius) and renders
@@ -28,7 +38,7 @@ both unit systems regardless of locale, so there is nothing for a units env var 
 
 | Field | Type | Required | Default |
 |---|---|---|---|
-| `location` | string: city, address, landmark, or `lat,lon` | no | falls back to `COMMUTE_HOME`; `NotConfigured` if both are absent |
+| `location` | string: city, address, landmark, or `lat,lon` | no | falls back to the calendar, then the caller's saved locations; **asks** if none resolve |
 | `days` | integer, 1–7 | no | takes precedence over `when` when present; `1` → current, `2`–`7` → that many forecast days (clamped to ~6 available) |
 | `when` | string enum: `current`\|`tomorrow`\|`week` | no | `current`; ignored if `days` is given |
 

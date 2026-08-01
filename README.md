@@ -279,6 +279,94 @@ source* — a guest cannot learn that the operator is travelling, where to, or w
 live. Results are **never cached**; a stale all-clear is the one failure mode this tool
 must not have.
 
+### Saved locations — one registry, many consumers
+
+`location_set`, `location_list` and `location_clear` let the assistant remember
+places **conversationally** — *"I've moved"*, *"remember this is home"*, *"I'm in
+Denver this week"* — instead of someone editing config on a host. What they write
+is a **shared registry**, not a weather feature: `weather` was the first
+consumer wired to it and `commute_estimate` / `route_traffic` /
+`traffic_incidents` are the second, reading the same registry through the same
+contract (`crate::locations`) — which is what wiring commute needed: the same
+call, no registry change. News and future modules read it the same way. Adding a consumer needs no change
+to the registry.
+
+Entries are named. `home`, `work` and `current` are the well-known names other
+tools understand; anything else the user chooses ("the cabin") is stored and
+retrievable by name. An entry is permanent, or **temporary with an absolute
+expiry** — which is what makes a travel override safe: `current` outranks
+`home`/`work` while it lasts, and because it expires it cannot quietly become
+where you live.
+
+Four properties worth knowing:
+
+- **Per authenticated principal — NOT per person today.** Records are keyed on a
+  caller identity derived from the server-verified principal, and reading or
+  writing needs the same entitlement that governs home/work location inference
+  (`commute_estimate`). Two separately-authenticated *principals* cannot read or
+  write each other's records, and an unentitled caller causes **zero reads** —
+  not a read whose result is discarded. But read the gap plainly rather than the
+  optimistic version: **every human talking to Lumina currently arrives as one
+  service identity (TERM #577), so everyone behind it shares a single record and
+  sees the same saved home.** This is per-*principal* isolation, and nothing
+  here should be read as per-*person* isolation until #577 closes — at which
+  point it becomes genuinely per-person with no rewrite, because the key already
+  has room for a person. Records written before then are **orphaned rather than
+  shared**: a re-entry prompt is cheap, a silently shared home address is not.
+- **Absence and failure stay distinct.** *"You have nothing saved"* and *"I
+  couldn't read what you've saved"* are different answers and are worded
+  differently, everywhere. A location is **never invented or inferred** to fill
+  either gap.
+- **Writes are deliberate.** Replacing an existing different value needs an
+  explicit confirmation; clearing everything needs `all=true`. `weather`'s
+  "or say *remember this is home*" is an **offer**, not an automatic save —
+  answering a question is not consent to store the answer.
+- **`COMMUTE_HOME` / `COMMUTE_WORK` / `COMMUTE_FAMILY` are no longer read at
+  all — by weather *or* by commute.** Weather stopped first; commute kept
+  reading all three directly out of the process environment until **TERM #591**,
+  which is the same disclosure in the module the variables are named after, and
+  removing it from one consumer while leaving it in the other closed half a
+  hole. In weather they were also kept
+  briefly as a migration fallback, scoped to one service principal. That does
+  not work and cannot be made to: until **TERM #577** lands, every human reaches
+  Lumina as the *same* service principal, so "the configured principal" names
+  the service they all share rather than the operator — and the fallback would
+  hand the operator's home and work addresses to anyone entitled. Narrowing the
+  gate does not help, because any gate keyed on a shared principal has the same
+  defect. So the fallback is **deleted**, along with
+  `TERMINUS_COMMUTE_LEGACY_PRINCIPAL`. All three variables are unset on the live
+  host, so nothing working was lost; what was removed is a latent disclosure
+  that would have activated the moment someone set them.
+
+  The registry is the replacement, and the degradation is honest: with no saved
+  home, `weather` asks *"which location do you mean?"* and
+  `weather_severe_alerts` reports *"no home location is configured, so there is
+  nowhere to watch"*. Both sit under the watch's standing *"this is unknown, not
+  clear"* framing — an unwatched home is never an all-clear — but the **reason**
+  stays distinct from *"your saved locations could not be read"*. Absence and
+  failure are different answers, and neither is ever filled in by a guess.
+
+  Commute degrades the same way. An omitted `origin` still **means** "home" —
+  that is the tool's contract and the user's own saved place — but "home" is now
+  the caller's registry entry, and with none saved the tool **asks** for a
+  starting point rather than routing from somewhere else. *"Nothing saved under
+  that name"*, *"saved locations aren't available on this connection"* and *"I
+  couldn't read your saved locations"* are three different answers with three
+  different wordings, and the last carries a different error type from the
+  first — an absent value and a broken read are not the same class of problem.
+  A literal address still routes for any caller, entitled or not: that discloses
+  nothing.
+- **Identities are opaque.** A caller key stores the authenticated principal (and,
+  post-#577, person) **verbatim**, trimmed but never case-folded. `Alpha` and
+  `alpha` are two callers with two records. Deciding that two differently-spelled
+  identities are the same person is an authentication decision, not a storage
+  one; if the principal namespace is ever specified as case-insensitive, the
+  normalisation belongs upstream in the principal implementation.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TERMINUS_LOCATION_REGISTRY_PATH` | `~/.terminus/locations.json` | Where the registry document lives (owner-readable only, written atomically) |
+
 ### Tool availability — parking a tool without removing it
 
 A tool whose backend has been retired should stop being offered to agents, but it should

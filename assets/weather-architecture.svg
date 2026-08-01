@@ -15,7 +15,7 @@
   <text x="640" y="80" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">WEATHER · 1 TOOL, 4 SUBSYSTEMS</text>
 
   <rect x="440" y="112" width="400" height="52" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowWx)"/>
-  <text x="640" y="144" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">location omitted? → COMMUTE_HOME</text>
+  <text x="640" y="144" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">location omitted? → saved locations</text>
 
   <line x1="640" y1="164" x2="640" y2="198" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowWx)" opacity="0.85"/>
 

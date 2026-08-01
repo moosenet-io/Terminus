@@ -45,9 +45,13 @@
 //!   OPENWEATHER_API_KEY  — OpenWeatherMap API key (free tier works)
 //! Optional env:
 //!   OPENWEATHER_API_URL  — base URL (default https://api.openweathermap.org)
-//!   COMMUTE_HOME         — home address for routine inference (shared with the
-//!                          commute tools; a plain address, not a secret)
-//!   COMMUTE_WORK         — work address for routine inference
+//!
+//! This module reads NO location env vars. The routine tier comes from the
+//! calling identity's own record in [`crate::locations`]. `COMMUTE_HOME` /
+//! `COMMUTE_WORK` were removed as a fallback in round 4 — see
+//! [`location::Routine`]; they are process-global, hold one person's addresses,
+//! and every human currently shares one service principal (TERM #577), so no
+//! principal-keyed gate could tell those people apart.
 //!
 //! NOTE: temperatures are always fetched and displayed in metric+imperial, so
 //! OPENWEATHER_UNITS is no longer consulted (canonical fetch is always metric).
@@ -78,12 +82,26 @@ pub(crate) struct WeatherConfig {
     pub(crate) api_key: String,
     pub(crate) base_url: String,
     units: String,
-    /// Home/work addresses (COMMUTE_HOME / COMMUTE_WORK, shared with the commute
-    /// tools) — the THIRD step of the resolution chain, below the calendar.
+    /// TEST-ONLY seed for the registry fixture — NOT a resolution source.
+    ///
+    /// This field used to hold `COMMUTE_HOME`/`COMMUTE_WORK` read from the
+    /// process environment, and `resolve_location_for` passed it to the legacy
+    /// fallback. That fallback is gone (see [`location::Routine`]), so the field
+    /// is `cfg(test)`: a shipped binary cannot load those variables into this
+    /// struct at all, and no future edit can reach them from here without first
+    /// re-adding a field. The tests that predate LOCREG-01 still express "this
+    /// caller has a home" as a `Routine`, which
+    /// [`WeatherConfig::keyed_for_test`] turns into SAVED registry entries.
+    #[cfg(test)]
     pub(crate) routine: Routine,
     /// Today's calendar, behind a trait object so this tool never reaches Google
     /// directly. `NoCalendar` when Google is unconfigured (degrade to routine→ask).
     pub(crate) calendar: Arc<dyn CalendarSource>,
+    /// LOCREG-01: the shared per-caller location registry. `weather` is the
+    /// FIRST CONSUMER of it, not its owner — commute and news read the same
+    /// registry through the same contract (`crate::locations`), and adding a
+    /// consumer needs no change here or there.
+    pub(crate) locations: Arc<dyn crate::locations::store::LocationStore>,
 }
 
 impl WeatherConfig {
@@ -113,8 +131,10 @@ impl WeatherConfig {
             api_key,
             base_url: base_url.trim_end_matches('/').to_string(),
             units: CANONICAL_UNITS.to_string(),
-            routine: Routine::from_env(),
+            #[cfg(test)]
+            routine: Routine::default(),
             calendar,
+            locations: crate::locations::shared_store(),
         })
     }
 
@@ -131,6 +151,7 @@ impl WeatherConfig {
             units: CANONICAL_UNITS.to_string(),
             routine: Routine::default(),
             calendar: Arc::new(NoCalendar),
+            locations: Arc::new(crate::locations::store::fake::CountingStore::new()),
         }
     }
 
@@ -140,6 +161,52 @@ impl WeatherConfig {
             .user_agent("MooseNet-MCP/1.0")
             .build()
             .map_err(|e| ToolError::Http(e.to_string()))
+    }
+
+    /// Test-only: this config's legacy `routine` re-expressed as one keyed
+    /// caller's SAVED registry entries, with the identity that owns them.
+    ///
+    /// The tests that predate LOCREG-01 configure a [`Routine`] and expect the
+    /// routine tier to resolve. The UN-KEYED path now fails closed (see
+    /// [`WeatherConfig::resolve_location_for`]) because those values are the
+    /// operator's and an un-keyed path cannot establish who is asking — so the
+    /// modern spelling of "this caller has a home configured" is "this caller
+    /// has a home SAVED". Same chain, same assertions, an identity attached.
+    ///
+    /// The un-keyed path keeps its own dedicated tests; this helper exists so
+    /// the OTHER tests keep testing what they were written to test.
+    #[cfg(test)]
+    fn keyed_for_test(&self) -> (Self, crate::locations::CallerKey) {
+        use crate::locations::{self, CallerKey};
+        let key = CallerKey::for_principal_name("test-caller").unwrap();
+        let store = Arc::new(crate::locations::store::fake::CountingStore::new());
+        let seeder = CallerContext::entitled_for_test_only(false, true);
+        for (name, value) in [
+            (locations::HOME, self.routine.home.as_deref()),
+            (locations::WORK, self.routine.work.as_deref()),
+            (locations::CURRENT, self.routine.current.as_deref()),
+        ] {
+            if let Some(v) = value {
+                match locations::set(store.as_ref(), Some(&key), seeder, name, v, None, true) {
+                    locations::WriteOutcome::Stored { .. } => {}
+                    other => panic!("fixture seed failed: {other:?}"),
+                }
+            }
+        }
+        let mut cfg = self.clone();
+        cfg.locations = store;
+        (cfg, key)
+    }
+
+    /// Test-only shim carrying the pre-LOCREG-01 signature (no caller key), so
+    /// the resolution tests that predate the registry keep testing what they
+    /// tested — now via [`WeatherConfig::keyed_for_test`], since a genuinely
+    /// un-keyed path no longer resolves a routine at all. Production dispatch
+    /// goes through [`WeatherConfig::resolve_location_for`].
+    #[cfg(test)]
+    async fn resolve_location(&self, input: Option<&str>, caller: CallerContext) -> Resolved {
+        let (cfg, key) = self.keyed_for_test();
+        cfg.resolve_location_for(input, caller, Some(&key)).await.0
     }
 
     /// Resolve the caller-supplied location through the full chain:
@@ -155,17 +222,68 @@ impl WeatherConfig {
     /// is reachable by household guests — so for anyone not entitled to those
     /// sources the chain is explicit→ASK, and the operator's calendar is not
     /// even read. See `location`'s privacy note.
-    async fn resolve_location(&self, input: Option<&str>, caller: CallerContext) -> Resolved {
+    ///
+    /// LOCREG-01: the routine tier is now sourced from THIS CALLER's registry
+    /// record rather than from process-global env vars.
+    ///
+    /// Returns the resolution AND whether the registry was unreadable, because
+    /// "nothing saved" and "couldn't read what's saved" must reach the user as
+    /// different sentences (see [`location::REGISTRY_UNAVAILABLE_MESSAGE`]).
+    ///
+    /// `key: None` means the dispatch path carried no identity, and it FAILS
+    /// CLOSED: no registry record, and nothing else to fall back to — the
+    /// `COMMUTE_*` fallback has been removed entirely (see
+    /// [`location::Routine`]).
+    ///
+    /// The first cut kept the legacy routine here, reasoning that it preserved
+    /// pre-LOCREG-01 behaviour. That reasoning was wrong, and the review that
+    /// caught it was right: preserving the old behaviour on this path preserves
+    /// the leak. `COMMUTE_HOME`/`COMMUTE_WORK` are PROCESS-GLOBAL and hold the
+    /// OPERATOR's own addresses; a path that does not know who is asking cannot
+    /// establish that the asker is the operator, so handing them over is a
+    /// disclosure to an unknown caller. Missing identity is not "probably the
+    /// owner" — it is "nobody in particular", and the requirement is absolute:
+    /// the operator's legacy locations must not reach another caller. Round 4
+    /// finished the thought: a KEYED path could not establish it either, because
+    /// every human shares one service principal (TERM #577).
+    ///
+    /// The consequence is that an un-keyed path can no longer resolve a routine
+    /// location at all. That is the correct outcome and it costs nothing real:
+    /// the un-keyed paths are `execute` (which already carries
+    /// [`CallerContext::untrusted`], so the routine tier was gated off anyway)
+    /// and `execute_with_caller` (reachable only via
+    /// `ToolRegistry::call_with_caller`, which no production path uses — the MCP
+    /// dispatch in `crate::mcp_server` calls `call_with_caller_key`). And the
+    /// chain degrades honestly: with no routine it lands on ASK, which is this
+    /// module's whole design.
+    ///
+    /// Not `degraded`: nothing failed to be read. "I don't know which location
+    /// you mean" is the truthful answer, and reporting it as "I couldn't read
+    /// your saved locations" would be a different lie.
+    async fn resolve_location_for(
+        &self,
+        input: Option<&str>,
+        caller: CallerContext,
+        key: Option<&crate::locations::CallerKey>,
+    ) -> (Resolved, bool) {
+        let resolution = match key {
+            None => location::RoutineResolution {
+                routine: Routine::default(),
+                degraded: false,
+            },
+            Some(k) => Routine::resolve_for(self.locations.as_ref(), Some(k), caller),
+        };
         let (hour, weekday) = location::local_hour_and_weekday();
-        location::resolve_with_calendar(
+        let resolved = location::resolve_with_calendar(
             input,
             self.calendar.as_ref(),
-            &self.routine,
+            &resolution.routine,
             hour,
             weekday,
             caller,
         )
-        .await
+        .await;
+        (resolved, resolution.degraded)
     }
 }
 
@@ -246,8 +364,8 @@ fn what_to_wear(feels_c: f64, desc: &str, wind_ms: Option<f64>) -> String {
 ///
 /// OWM's `/geo/1.0/direct` resolves CITY-level names, not full street
 /// addresses, and answers HTTP 200 with an empty array for an address it can't
-/// place. The default location is COMMUTE_HOME — a full street address shared
-/// with the commute tools — so we try the string as given, then retry with
+/// place. A saved `home` is typically a full street address, so we try the
+/// string as given, then retry with
 /// progressively coarser variants (dropping leading street components). e.g.
 /// "123 Main St, San Jose, CA 95123" falls back to "San Jose, CA 95123" →
 /// "CA 95123"; the first variant that resolves wins.
@@ -723,7 +841,7 @@ answer says which place it used and why."
     /// helper, a future path that forgets to thread one) gets the safe answer
     /// rather than the operator's whereabouts.
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        self.run(args, CallerContext::untrusted()).await
+        self.run(args, CallerContext::untrusted(), None).await
     }
 
     /// The authorized path: the gateway derived what operator context this
@@ -734,15 +852,39 @@ answer says which place it used and why."
         args: Value,
         caller: CallerContext,
     ) -> Result<crate::tool::ToolOutput, ToolError> {
-        Ok(crate::tool::ToolOutput::text_only(self.run(args, caller).await?))
+        Ok(crate::tool::ToolOutput::text_only(self.run(args, caller, None).await?))
+    }
+
+    /// LOCREG-01: the fullest path — entitlement AND which per-caller location
+    /// record is theirs, both derived from the one server-verified principal.
+    /// This is the proving consumer of the shared registry.
+    async fn execute_with_caller_key(
+        &self,
+        args: Value,
+        caller: CallerContext,
+        key: Option<crate::locations::CallerKey>,
+    ) -> Result<crate::tool::ToolOutput, ToolError> {
+        Ok(crate::tool::ToolOutput::text_only(self.run(args, caller, key.as_ref()).await?))
     }
 }
 
 impl Weather {
-    async fn run(&self, args: Value, caller: CallerContext) -> Result<String, ToolError> {
-        let resolved = self.cfg.resolve_location(args["location"].as_str(), caller).await;
+    async fn run(
+        &self,
+        args: Value,
+        caller: CallerContext,
+        key: Option<&crate::locations::CallerKey>,
+    ) -> Result<String, ToolError> {
+        let (resolved, registry_degraded) =
+            self.cfg.resolve_location_for(args["location"].as_str(), caller, key).await;
         let (location, attribution) = match &resolved {
             Resolved::Found { location, .. } => (location.clone(), resolved.attribution()),
+            // LOCREG-01: we could not read what this caller has saved, so we do
+            // not know whether they have a home set. Saying "which location do
+            // you mean?" here would imply we checked and found nothing.
+            Resolved::AskUser if registry_degraded => {
+                return Ok(location::REGISTRY_UNAVAILABLE_MESSAGE.to_string())
+            }
             // ASK. Deliberately `Ok`, not `Err`: an error is what made the model
             // retry and answer for a city out of the schema. A plain-language
             // question is a valid, final answer to "what's the weather?" when we
@@ -924,7 +1066,7 @@ mod tests {
     }
 
     fn routine_of(home: Option<&str>, work: Option<&str>) -> Routine {
-        Routine { home: home.map(str::to_string), work: work.map(str::to_string) }
+        Routine { home: home.map(str::to_string), work: work.map(str::to_string), current: None }
     }
 
     /// The caller context the gateway derives for the OPERATOR's own identity:
@@ -953,7 +1095,14 @@ mod tests {
         /// below read as the deliberate contrast they are, rather than as the
         /// odd one out.
         async fn execute_as_operator(&self, args: Value) -> Result<String, ToolError> {
-            self.execute_with_caller(args, operator()).await.map(|o| o.text)
+            // Keyed, for the reason `WeatherConfig::keyed_for_test` documents:
+            // the routine tier is per-caller now, and an un-keyed path
+            // deliberately resolves nothing.
+            let (cfg, key) = self.cfg.keyed_for_test();
+            Weather { cfg }
+                .execute_with_caller_key(args, operator(), Some(key))
+                .await
+                .map(|o| o.text)
         }
     }
 
@@ -974,6 +1123,7 @@ mod tests {
             units: "metric".into(),
             routine,
             calendar,
+            locations: Arc::new(crate::locations::store::fake::CountingStore::new()),
         }
     }
 
@@ -985,6 +1135,7 @@ mod tests {
             units: "metric".into(),
             routine,
             calendar,
+            locations: Arc::new(crate::locations::store::fake::CountingStore::new()),
         }
     }
 
@@ -1099,6 +1250,216 @@ mod tests {
         // and it answered for a city lifted out of this tool's own schema.
         let c = offline_cfg(Routine::default(), Arc::new(NoCalendar));
         assert_eq!(c.resolve_location(None, operator()).await, Resolved::AskUser);
+    }
+
+    // ── LOCREG-01: weather as the proving consumer of the shared registry ────
+
+    /// POSITIVE CONTROL for the production entry point: a caller who saved a
+    /// home through `location_set` gets it back from `weather`. Every negative
+    /// test around this would also pass on a build that resolved nothing.
+    #[tokio::test]
+    async fn locreg_the_weather_config_uses_this_callers_saved_home() {
+        use crate::locations::store::fake::CountingStore;
+        use crate::locations::{self, CallerKey};
+
+        const SAVED_HOME: &str = "1 Placeholder Way, Examplecity"; // pii-test-fixture: obvious placeholder standing in for a saved home address
+        let store = Arc::new(CountingStore::new());
+        let key = CallerKey::for_principal_name("alpha").unwrap();
+        locations::set(store.as_ref(), Some(&key), operator(), locations::HOME, SAVED_HOME, None, true);
+
+        let mut cfg = offline_cfg(Routine::default(), Arc::new(NoCalendar));
+        cfg.locations = store;
+
+        let (resolved, degraded) = cfg.resolve_location_for(None, operator(), Some(&key)).await;
+        assert!(!degraded);
+        match resolved {
+            Resolved::Found { location, source: LocationSource::Routine(w) } => {
+                assert_eq!(location, SAVED_HOME);
+                assert_eq!(w, "home");
+            }
+            other => panic!("expected the caller's saved home, got {other:?}"),
+        }
+    }
+
+    /// A guest must not reach another caller's saved home, and must not cause
+    /// the registry to be read on their behalf at all.
+    #[tokio::test]
+    async fn locreg_a_guest_reads_nothing_and_is_asked() {
+        use crate::locations::store::fake::CountingStore;
+        use crate::locations::{self, CallerKey};
+
+        const SAVED_HOME: &str = "1 Placeholder Way, Examplecity"; // pii-test-fixture: obvious placeholder standing in for the saved home a guest must never see
+        let store = Arc::new(CountingStore::new());
+        let key = CallerKey::for_principal_name("alpha").unwrap();
+        locations::set(store.as_ref(), Some(&key), operator(), locations::HOME, SAVED_HOME, None, true);
+        let reads_before = store.reads();
+
+        let mut cfg = offline_cfg(Routine::default(), Arc::new(NoCalendar));
+        cfg.locations = store.clone();
+
+        let (resolved, degraded) = cfg.resolve_location_for(None, guest(), Some(&key)).await;
+        assert_eq!(resolved, Resolved::AskUser);
+        assert!(!degraded, "a refusal is not a read failure");
+        assert_eq!(store.reads(), reads_before, "a guest must cause ZERO registry reads");
+        assert!(!format!("{resolved:?}").contains("Placeholder"));
+    }
+
+    /// An unreadable registry must reach the user as "I couldn't check", never
+    /// as the ordinary "which location did you mean?" — the latter implies we
+    /// looked and found nothing.
+    #[tokio::test]
+    async fn locreg_an_unreadable_registry_is_not_reported_as_nothing_saved() {
+        use crate::locations::store::fake::BrokenStore;
+        use crate::locations::CallerKey;
+
+        let mut cfg = offline_cfg(Routine::default(), Arc::new(NoCalendar));
+        cfg.locations = Arc::new(BrokenStore);
+        let key = CallerKey::for_principal_name("alpha").unwrap();
+
+        let out = Weather { cfg }
+            .run(json!({"when": "current"}), operator(), Some(&key))
+            .await
+            .unwrap();
+        assert_eq!(out, location::REGISTRY_UNAVAILABLE_MESSAGE);
+        assert_ne!(out, location::ASK_MESSAGE);
+    }
+
+    /// **Round 4: no caller — keyed or not, entitled or not — resolves an
+    /// ambient location out of `COMMUTE_HOME`/`COMMUTE_WORK`.**
+    ///
+    /// The earlier version of this test only covered the UN-keyed path, and its
+    /// counterpart asserted that a keyed caller on the configured principal DID
+    /// inherit those values. Since every human currently authenticates as that
+    /// one service principal (TERM #577), the pair together said "the leak is
+    /// off for nobody and on for everybody". The fallback is now deleted, so
+    /// this asserts the whole property at once, with the variables genuinely SET
+    /// in the process environment — the claim is that this code does not read
+    /// them, and only a real env var tests that.
+    ///
+    /// `#[serial]` because it mutates process env; the vars are restored.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn locreg_no_caller_resolves_an_ambient_commute_env_location() {
+        use crate::locations::store::fake::CountingStore;
+        use crate::locations::CallerKey;
+
+        const LEGACY_HOME: &str = "123 Legacy St, Examplecity"; // pii-test-fixture: obvious placeholder standing in for a COMMUTE_HOME value that must never resolve
+        const LEGACY_WORK: &str = "456 Legacy Ave, Examplecity"; // pii-test-fixture: obvious placeholder standing in for a COMMUTE_WORK value that must never resolve
+
+        struct EnvGuard(Vec<(&'static str, Option<String>)>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (k, prev) in &self.0 {
+                    match prev {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let _guard = EnvGuard(
+            ["COMMUTE_HOME", "COMMUTE_WORK"]
+                .iter()
+                .map(|k| (*k, std::env::var(k).ok()))
+                .collect(),
+        );
+        std::env::set_var("COMMUTE_HOME", LEGACY_HOME);
+        std::env::set_var("COMMUTE_WORK", LEGACY_WORK);
+
+        let store = Arc::new(CountingStore::new());
+        let mut cfg = offline_cfg(Routine::default(), Arc::new(NoCalendar));
+        cfg.locations = store.clone();
+
+        let svc = CallerKey::for_principal_name("lumina").unwrap();
+        let one = CallerKey::for_person("lumina", "someone").unwrap();
+        let two = CallerKey::for_person("lumina", "someone-else").unwrap();
+        let cases: [(&str, Option<&CallerKey>); 4] = [
+            ("entitled, no identity", None),
+            ("entitled, the shared service principal", Some(&svc)),
+            ("entitled, one person behind it", Some(&one)),
+            ("entitled, another person behind it", Some(&two)),
+        ];
+        for (what, key) in cases {
+            let reads_before = store.reads();
+            let (resolved, degraded) = cfg.resolve_location_for(None, operator(), key).await;
+            assert_eq!(resolved, Resolved::AskUser, "{what}: nothing saved ⇒ ask");
+            assert!(!degraded, "{what}: nothing failed to be read");
+            let seen = format!("{resolved:?}");
+            assert!(!seen.contains("Legacy"), "{what}: a COMMUTE_* value leaked: {seen}");
+            assert!(!seen.contains("Examplecity"), "{what}: an address leaked: {seen}");
+            if key.is_none() {
+                assert_eq!(
+                    store.reads(),
+                    reads_before,
+                    "{what}: no identity means no per-caller record to read"
+                );
+            }
+        }
+
+        // Same through the real un-keyed entry points, end to end.
+        let tool = Weather { cfg };
+        for out in [
+            tool.execute(json!({"when": "current"})).await.unwrap(),
+            tool.execute_with_caller(json!({"when": "current"}), operator()).await.unwrap().text,
+        ] {
+            assert_eq!(out, location::ASK_MESSAGE);
+            assert!(!out.contains("Legacy") && !out.contains("Examplecity"));
+        }
+    }
+
+    /// **POSITIVE CONTROL** for the test above, and the replacement for the
+    /// legacy-bridge control it retired: an entitled, keyed caller with a
+    /// location genuinely SAVED still gets it back, with `COMMUTE_*` set to
+    /// something else entirely.
+    ///
+    /// This is what proves the fallback was removed rather than the registry
+    /// being broken — the negative test alone would pass on a build where
+    /// resolution returned `AskUser` unconditionally.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn locreg_a_keyed_caller_with_a_saved_home_still_resolves_it() {
+        use crate::locations::store::fake::CountingStore;
+        use crate::locations::{self, CallerKey};
+
+        const SAVED_HOME: &str = "1 Placeholder Way, Examplecity"; // pii-test-fixture: obvious placeholder standing in for a saved home address
+        const LEGACY_HOME: &str = "123 Legacy St, Examplecity"; // pii-test-fixture: obvious placeholder standing in for a COMMUTE_HOME value that must never resolve
+
+        struct EnvGuard(Option<String>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("COMMUTE_HOME", v),
+                    None => std::env::remove_var("COMMUTE_HOME"),
+                }
+            }
+        }
+        let _guard = EnvGuard(std::env::var("COMMUTE_HOME").ok());
+        std::env::set_var("COMMUTE_HOME", LEGACY_HOME);
+
+        let store = Arc::new(CountingStore::new());
+        let key = CallerKey::for_principal_name("lumina").unwrap();
+        match locations::set(
+            store.as_ref(),
+            Some(&key),
+            operator(),
+            locations::HOME,
+            SAVED_HOME,
+            None,
+            true,
+        ) {
+            locations::WriteOutcome::Stored { .. } => {}
+            other => panic!("fixture seed failed: {other:?}"),
+        }
+
+        let mut cfg = offline_cfg(Routine::default(), Arc::new(NoCalendar));
+        cfg.locations = store;
+
+        match cfg.resolve_location_for(None, operator(), Some(&key)).await.0 {
+            Resolved::Found { location, source: LocationSource::Routine(_) } => {
+                assert_eq!(location, SAVED_HOME, "the SAVED home, not the env one");
+            }
+            other => panic!("a saved home must still resolve, got {other:?}"),
+        }
     }
 
     #[test]

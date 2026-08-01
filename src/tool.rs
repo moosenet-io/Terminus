@@ -103,6 +103,36 @@ pub trait RustTool: Send + Sync + 'static {
     ) -> Result<ToolOutput, ToolError> {
         self.execute_structured(args).await
     }
+
+    /// Execute the tool knowing who is calling AND which caller-scoped record
+    /// the answer belongs to (LOCREG-01).
+    ///
+    /// [`CallerContext`] answers "what may this caller SEE" and deliberately
+    /// carries no identity — it is a set of capability bits and nothing else,
+    /// and TRTR-05 keeps it that way on purpose. A per-caller STORE needs the
+    /// other half: which record is theirs. That is
+    /// [`CallerKey`](crate::locations::CallerKey), derived by the dispatch layer
+    /// from the same server-verified principal the gateway authorized, and it is
+    /// passed alongside the context rather than folded into it so that neither
+    /// type acquires the other's job.
+    ///
+    /// Additive by construction: the default delegates to
+    /// `execute_with_caller`, so every existing tool — including the ones that
+    /// already override `execute_with_caller` — is completely unaffected. A tool
+    /// overrides this ONLY if it reads or writes data filed under the caller.
+    ///
+    /// `None` is the fail-closed value and means "the dispatch path did not know
+    /// who this is". A tool that keys data on the caller has no correct record to
+    /// answer from in that case and MUST decline, never fall back to a shared or
+    /// default record.
+    async fn execute_with_caller_key(
+        &self,
+        args: Value,
+        caller: CallerContext,
+        _key: Option<crate::locations::CallerKey>,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute_with_caller(args, caller).await
+    }
 }
 
 #[cfg(test)]

@@ -360,8 +360,14 @@ impl McpServerState {
             .as_ref()
             .map(|gw| gw.caller_context(principal))
             .unwrap_or_default();
+        // LOCREG-01: alongside WHAT this caller may see, carry WHICH per-caller
+        // record is theirs — derived from the same server-verified principal,
+        // never from an argument or a header. `None` when there is no principal,
+        // which a caller-keyed tool must treat as "decline", not "use a default
+        // record".
+        let key = principal.and_then(crate::locations::CallerKey::for_principal);
         let reg = self.registry.load();
-        if let Some(r) = reg.call_with_caller(name, args.clone(), caller).await {
+        if let Some(r) = reg.call_with_caller_key(name, args.clone(), caller, key).await {
             return r.map(|o| o.text).map_err(|e| e.to_string());
         }
         // 3. Broker worker routes.
@@ -1249,7 +1255,7 @@ async fn handle_mcp(
                     )
                 }
                 Some(CallRoute::Local) | None => match reg
-                .call_with_caller(
+                .call_with_caller_key(
                     name,
                     arguments.clone(),
                     // TRTR-05: the same server-verified principal `guard()` just
@@ -1261,6 +1267,10 @@ async fn handle_mcp(
                         .as_ref()
                         .map(|gw| gw.caller_context(principal.as_ref()))
                         .unwrap_or_default(),
+                    // LOCREG-01: and WHICH per-caller record is theirs, from that
+                    // same principal. `None` when there is none — a caller-keyed
+                    // tool declines rather than falling back to a shared record.
+                    principal.as_ref().and_then(crate::locations::CallerKey::for_principal),
                 )
                 .await
             {
