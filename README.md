@@ -354,9 +354,12 @@ else from it is read, returned, or logged.
 Activity is **summarised, not streamed raw**: a transcript record carries a whole message, a
 whole tool input, or a whole command's stdout, so each collapses to one short line. Only the
 last `AGENTSESS_TAIL_BYTES` are read — transcripts reach tens of megabytes and none is ever read
-whole. Malformed and unrecognised records are skipped and **counted** in `skipped_lines`, so a
-format drift between CLI releases shows up as a visible number rather than a silently shorter
-list. Assistant `thinking` blocks are never surfaced.
+whole. A line that is not JSON is skipped and counted into `skipped_lines`; a record that IS JSON but
+whose shape is unrecognised is skipped and counted into `unknown_records`. The two are kept
+apart because they have different causes — a truncated write versus a CLI format change — and
+either being non-zero turns a format drift into a visible number rather than a silently shorter
+list. Neither pads the feed with "unrecognised record" noise, and assistant `thinking` blocks
+are never surfaced at all.
 
 Strings are scrubbed through the same `DeterministicCleaner` the public mirror uses, plus one
 transcript-specific layer for **unquoted** `NAME=VALUE` shell assignments (including this

@@ -23,10 +23,14 @@
 //!    hard-won pattern fix it has accumulated.
 //!
 //! 3. **Defensive parsing.** The transcript is an internal format that may add
-//!    fields or change shape between CLI releases. An unrecognised record maps
-//!    to [`EventKind::Other`], a malformed line is skipped and COUNTED, and
-//!    `skipped_lines` comes back in the response — so a format drift shows up
-//!    as a visible number rather than as a silently shorter list.
+//!    fields or change shape between CLI releases. A line that is not JSON is
+//!    skipped and counted into `skipped_lines`; a record that IS JSON but whose
+//!    shape we do not recognise is skipped and counted into `unknown_records`.
+//!    The two are kept apart because they have different causes — a truncated
+//!    write versus a CLI format change — and either being non-zero turns a
+//!    format drift into a visible number rather than a silently shorter list.
+//!    Neither is ever fatal, and neither pads the activity feed with
+//!    "unrecognised record" noise.
 //!
 //! ## What is deliberately NOT surfaced
 //! Assistant `thinking` blocks are skipped entirely. They are the model's
@@ -64,7 +68,6 @@ pub enum EventKind {
     ToolCall,
     ToolResult,
     Error,
-    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,17 +81,27 @@ pub struct ActivityEvent {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TranscriptTail {
     pub events: Vec<ActivityEvent>,
-    /// Lines that could not be parsed as JSON. A non-zero count here is how a
-    /// format drift becomes visible instead of silently shortening the list.
+    /// Lines that could not be parsed as JSON at all.
     pub skipped_lines: usize,
+    /// Records that parsed as JSON but whose SHAPE we do not recognise.
+    ///
+    /// Kept separate from `skipped_lines` on purpose: "this is not JSON" and
+    /// "this is JSON we do not understand" are different failures with
+    /// different causes (a truncated write vs. a CLI format change), and
+    /// collapsing them would hide which one is happening. Either being
+    /// non-zero is how a format drift becomes a visible number instead of a
+    /// silently shorter activity list.
+    pub unknown_records: usize,
     /// True when the read started mid-file (i.e. earlier activity exists).
     pub truncated: bool,
     pub path: String,
 }
 
-/// Record types that are session bookkeeping, not activity. Skipped rather
-/// than mapped to `Other`, which is reserved for records we genuinely do not
-/// recognise — the distinction is what makes an `Other` count meaningful.
+/// Record types that are session bookkeeping, not activity.
+///
+/// These are UNDERSTOOD and deliberately produce no activity, which is why
+/// they are not counted as `unknown_records` — counting a record we recognise
+/// as drift would make the drift signal meaningless.
 const BOOKKEEPING_TYPES: &[&str] = &[
     "agent-setting",
     "mode",
@@ -288,30 +301,39 @@ pub(crate) fn events_from_record(rec: &Value) -> Vec<ActivityEvent> {
                 }
             }
         }
-        "" => {
-            // No `type` at all — an unrecognised shape, not bookkeeping.
+        other if other.contains("error") => {
+            // An error record IS activity an observer wants to see.
             out.push(ActivityEvent {
                 at,
-                kind: EventKind::Other,
-                summary: "unrecognised transcript record".to_string(),
-                detail: None,
-            });
-        }
-        other => {
-            let kind = if other.contains("error") {
-                EventKind::Error
-            } else {
-                EventKind::Other
-            };
-            out.push(ActivityEvent {
-                at,
-                kind,
+                kind: EventKind::Error,
                 summary: redact(&truncate(other, SUMMARY_WIDTH)),
                 detail: None,
             });
         }
+        // Everything else — an unknown `type`, or no `type` at all — is a
+        // shape we do not understand. It is NOT surfaced as activity: a feed
+        // padded with "unrecognised record" lines is noise that crowds out the
+        // real work. The caller learns about it through `unknown_records`
+        // instead, which is a number that can be alerted on.
+        _ => {}
     }
     out
+}
+
+/// Does this record parse as JSON but present a shape we do not recognise?
+///
+/// Distinct from "did it produce events": a bookkeeping record is UNDERSTOOD
+/// and deliberately produces none, so counting it as unknown would make the
+/// drift signal meaningless.
+pub(crate) fn is_unknown_shape(rec: &Value) -> bool {
+    match rec.get("type").and_then(Value::as_str) {
+        Some(t) => {
+            !BOOKKEEPING_TYPES.contains(&t)
+                && !matches!(t, "user" | "assistant")
+                && !t.contains("error")
+        }
+        None => true,
+    }
 }
 
 /// Parse a raw tail window into events.
@@ -326,13 +348,19 @@ pub(crate) fn parse_tail(window: &str, started_mid_file: bool, limit: usize) -> 
 
     let mut events = Vec::new();
     let mut skipped = 0usize;
+    let mut unknown = 0usize;
     for line in &lines {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         match serde_json::from_str::<Value>(line) {
-            Ok(rec) => events.extend(events_from_record(&rec)),
+            Ok(rec) => {
+                if is_unknown_shape(&rec) {
+                    unknown += 1;
+                }
+                events.extend(events_from_record(&rec));
+            }
             // A truncated final line is normal on a file being appended to.
             Err(_) => skipped += 1,
         }
@@ -346,6 +374,7 @@ pub(crate) fn parse_tail(window: &str, started_mid_file: bool, limit: usize) -> 
     TranscriptTail {
         events,
         skipped_lines: skipped,
+        unknown_records: unknown,
         truncated: started_mid_file,
         path: String::new(),
     }
@@ -384,8 +413,18 @@ pub(crate) async fn read_tail(
     limit: usize,
 ) -> Result<TranscriptTail, ToolError> {
     let bytes = tail_bytes();
+    // Request ONE byte more than the window. `len == bytes + 1` then means the
+    // file is genuinely larger than the window (so the first line is a
+    // fragment and must be dropped); `len <= bytes` means we have the whole
+    // file and every line is complete.
+    //
+    // Reading exactly `bytes` cannot distinguish those two cases: a file of
+    // EXACTLY the window size comes back full, and treating "full" as
+    // "truncated" silently discards its first complete record. The extra byte
+    // is what makes the boundary decidable while keeping the read bounded.
+    let request = bytes.saturating_add(1);
     let out = exec
-        .run(&["tail", "-c", &bytes.to_string(), path])
+        .run(&["tail", "-c", &request.to_string(), path])
         .await
         .map_err(|e| ToolError::Execution(format!("could not read transcript: {e}")))?;
     if !out.ok() {
@@ -394,9 +433,7 @@ pub(crate) async fn read_tail(
             truncate(&out.stderr, 200)
         )));
     }
-    // If the window came back exactly at the cap, we almost certainly started
-    // mid-file and the first line is a fragment.
-    let started_mid_file = out.stdout.len() as u64 >= bytes;
+    let started_mid_file = out.stdout.len() as u64 > bytes;
     let mut tail = parse_tail(&out.stdout, started_mid_file, limit);
     tail.path = path.to_string();
     Ok(tail)
@@ -500,17 +537,48 @@ mod tests {
     }
 
     #[test]
-    fn bookkeeping_records_produce_nothing_and_unknown_ones_produce_other() {
+    fn bookkeeping_and_unknown_records_both_produce_no_activity() {
         for ty in ["agent-setting", "mode", "permission-mode", "file-history-snapshot"] {
             assert!(ev(json!({"type": ty})).is_empty(), "{ty} should be skipped");
         }
-        // An unrecognised type is `other` — that is what makes the count useful.
-        let e = ev(json!({"type": "some-future-record"}));
+        // An unknown shape is NOT surfaced as an activity line — a feed padded
+        // with "unrecognised record" crowds out the real work. It is counted
+        // instead (see the counting test below).
+        assert!(ev(json!({"type": "some-future-record"})).is_empty());
+        assert!(ev(json!({"foo": "bar"})).is_empty());
+        // An error record IS activity and must still come through.
+        let e = ev(json!({"type": "api-error"}));
         assert_eq!(e.len(), 1);
-        assert_eq!(e[0].kind, EventKind::Other);
-        // A record with no type at all is also surfaced rather than dropped.
-        let e = ev(json!({"foo": "bar"}));
-        assert_eq!(e[0].kind, EventKind::Other);
+        assert_eq!(e[0].kind, EventKind::Error);
+    }
+
+    #[test]
+    fn unknown_shapes_are_counted_separately_from_unparseable_lines() {
+        // The two failures have different causes — a truncated write vs. a CLI
+        // format change — so collapsing them would hide which is happening.
+        let window = concat!(
+            "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+            "{\"type\":\"some-future-record\"}\n",
+            "{\"type\":\"mode\"}\n",
+            "not json at all\n"
+        );
+        let t = parse_tail(window, false, 100);
+        assert_eq!(t.events.len(), 1, "only the real turn is activity");
+        assert_eq!(t.skipped_lines, 1, "the non-JSON line");
+        assert_eq!(t.unknown_records, 1, "the unknown shape, NOT the bookkeeping one");
+    }
+
+    #[test]
+    fn a_known_bookkeeping_record_is_not_counted_as_unknown() {
+        // Bookkeeping is UNDERSTOOD and deliberately silent; counting it as
+        // drift would make the signal meaningless.
+        for ty in ["agent-setting", "mode", "permission-mode", "attachment"] {
+            assert!(!is_unknown_shape(&json!({"type": ty})), "{ty}");
+        }
+        assert!(!is_unknown_shape(&json!({"type": "user"})));
+        assert!(!is_unknown_shape(&json!({"type": "assistant"})));
+        assert!(is_unknown_shape(&json!({"type": "brand-new"})));
+        assert!(is_unknown_shape(&json!({"no_type": 1})));
     }
 
     #[test]
@@ -648,6 +716,53 @@ mod tests {
         let out = redact(two_lines);
         assert!(out.contains("next_line_value_here"), "{out}");
         assert_eq!(out.lines().count(), two_lines.lines().count());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_file_exactly_the_window_size_is_not_treated_as_truncated() {
+        // The boundary case: reading exactly `bytes` cannot tell "file is
+        // exactly the window" from "file is larger", and mistaking the former
+        // for the latter silently discards a complete first record. The reader
+        // asks for one byte more so the distinction is decidable.
+        use crate::agentsess::exec::test_support::FakeExecutor;
+        std::env::set_var("AGENTSESS_TAIL_BYTES", "64");
+
+        // 64 bytes exactly => whole file, first line must survive.
+        let first = "{\"type\":\"user\",\"message\":{\"content\":\"keep-me\"}}";
+        let mut exact = String::from(first);
+        while exact.len() < 64 {
+            exact.push(' ');
+        }
+        assert_eq!(exact.len(), 64);
+        let exec = FakeExecutor::new().with_stdout("tail", &exact);
+        let t = read_tail(&exec, "/root/x.jsonl", 50).await.unwrap();
+        std::env::remove_var("AGENTSESS_TAIL_BYTES");
+
+        assert!(!t.truncated, "a file exactly the window size is not truncated");
+        assert_eq!(t.events.len(), 1, "its first complete line must not be dropped");
+        assert_eq!(t.events[0].summary, "keep-me");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_file_larger_than_the_window_drops_its_fragment_first_line() {
+        use crate::agentsess::exec::test_support::FakeExecutor;
+        std::env::set_var("AGENTSESS_TAIL_BYTES", "64");
+        // More than 64 bytes back => the file is genuinely larger than the
+        // window. The fragment is padded to length so the JSON line after it
+        // stays COMPLETE — truncating the JSON instead would test the
+        // malformed-line path, not the fragment-drop path.
+        let mut over = String::from("ragment-of-an-earlier-record-that-was-cut");
+        over.push('\n');
+        over.push_str("{\"type\":\"user\",\"message\":{\"content\":\"real\"}}");
+        assert!(over.len() > 64, "fixture must exceed the window: {}", over.len());
+        let exec = FakeExecutor::new().with_stdout("tail", &over);
+        let t = read_tail(&exec, "/root/x.jsonl", 50).await.unwrap();
+        std::env::remove_var("AGENTSESS_TAIL_BYTES");
+
+        assert!(t.truncated);
+        assert_eq!(t.skipped_lines, 0, "the fragment was dropped, not counted");
     }
 
     #[test]
