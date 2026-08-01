@@ -51,6 +51,7 @@ import { OverviewPanel as LuminaOverviewPanel } from './lumina/OverviewPanel';
 import { RosterPanel as ModelsRosterPanel } from './models/RosterPanel';
 import { DashboardPanel as MuseDashboardPanel } from './muse/DashboardPanel';
 import { LibraryPanel as MuseLibraryPanel } from './muse/LibraryPanel';
+import type { LibraryPanelProps } from './muse/LibraryPanel';
 import { MediaDetailPanel as MuseMediaDetailPanel } from './muse/MediaDetailPanel';
 import { RequestLifecyclePanel as MuseRequestLifecyclePanel } from './muse/RequestLifecyclePanel';
 import { DiscoverPanel as MuseDiscoverPanel } from './muse/DiscoverPanel';
@@ -284,6 +285,38 @@ registerPanel({
   // columns rather than a centred 1280px strip.
   wide: true,
   component: MuseLibraryPanel,
+});
+
+// MGUI-19: Movies and TV Shows as SEPARATE catalogs, the way a media manager presents them.
+//
+// Both render the same LibraryPanel with a `scope`, which makes the fetch itself kind-scoped
+// (MUSE #112) rather than filtering in the browser. That distinction is load-bearing: a browser
+// filter still ships every row and is still bounded by the same page limit, so on a library
+// larger than the cap "all your movies" would quietly mean "the movies among the first N of
+// everything" — a confident label over the wrong set.
+//
+// The combined Library stays. It is the only place to see recent additions across both kinds,
+// and removing it would make "what arrived this week" impossible to answer in one view.
+registerPanel({
+  id: 'muse.library.movies',
+  system: 'muse',
+  title: 'Movies',
+  path: '/muse/movies',
+  icon: '⛭',
+  available: true,
+  wide: true,
+  component: () => MuseLibraryPanel({ scope: 'movie', heading: 'Movies' } satisfies LibraryPanelProps),
+});
+
+registerPanel({
+  id: 'muse.library.shows',
+  system: 'muse',
+  title: 'TV Shows',
+  path: '/muse/shows',
+  icon: '⛁',
+  available: true,
+  wide: true,
+  component: () => MuseLibraryPanel({ scope: 'show', heading: 'TV Shows' } satisfies LibraryPanelProps),
 });
 
 // MGUI-03: the inspection bench. A DETAIL route (`:id`) rather than a rail entry —

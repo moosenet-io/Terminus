@@ -34,10 +34,18 @@ import { LibraryTableView } from './LibraryTableView';
 import { CardSizeSlider, useCardSize } from './CardSizeSlider';
 import { cardGridTemplate, fluidBodyHeight, CATALOG_TRACK_BASE } from '../../lib/catalogLayout';
 
-/** How many titles to request. Bounded because this is a browse surface, not an export; the
- *  header reports the untruncated total from `counts.owned` alongside it so a capped page can
- *  never read as "this is your whole library". */
-const PAGE_LIMIT = 240;
+/** How many titles to request.
+ *
+ *  MGUI-19: was 240, against a library of 1892 — so the operator saw an eighth of their media
+ *  and a header reading "240 of 240 loaded", which is true and reads as complete. The server
+ *  grid endpoint now caps at 5000 (MUSE #112, raised from 1000, which was itself below the
+ *  library size), so this asks for that cap.
+ *
+ *  Posters are `loading="lazy"`, so the cost of a larger page is DOM nodes rather than 1892
+ *  image fetches; the browser only requests what scrolls into view. If a library ever exceeds
+ *  the cap the header still says so — see `truncated` below, which is what makes a capped page
+ *  unable to read as the whole library. */
+const PAGE_LIMIT = 5000;
 /** MGUI-18: the poster wall's body FOLLOWS THE VIEWPORT.
  *
  *  It used to be a flat `720`, which is the operator's "the card area does not resize with the
@@ -198,9 +206,56 @@ function PosterTile({ item }: { item: MuseLibraryItem }) {
   );
 }
 
-export function LibraryPanel() {
-  const { data, loading, degraded } = useMuseLibrary(PAGE_LIMIT);
+/** The header line, as a pure function so its honesty is testable.
+ *
+ *  MGUI-19. The old line read "240 of 240 loaded · 1892 in library" — every number true, and
+ *  the sentence reads as complete: "240 of 240" is a full fraction. The operator reasonably
+ *  asked where the other 1600 titles went. A count is a claim, and "loaded" against its own
+ *  page size says nothing about whether the page holds the library.
+ *
+ *  So the loaded/total relationship is stated directly, and a page that hit its cap says so
+ *  rather than leaving the reader to compare two numbers and infer it.
+ */
+export function librarySubtitle(input: {
+  shown: number;
+  filtersActive: boolean;
+  loaded: number;
+  total: number;
+  onDisk: number;
+  scoped: boolean;
+  truncated: boolean;
+}): string {
+  const { shown, filtersActive, loaded, total, onDisk, scoped, truncated } = input;
+  const match = filtersActive ? ' matching' : '';
+  // On a scoped page `total` is the WHOLE library, not this kind's total — the counts envelope
+  // is library-wide. Claiming "of 1892" on a Movies page would misdescribe what is missing, so
+  // the library-wide total is labelled as such rather than presented as this page's denominator.
+  // Worded so it cannot be confused with the COMPLETENESS claim below. An early version said
+  // "in the whole library", which shares a substring with "your whole library" — two different
+  // statements one careless read apart, and a test that tried to assert both at once.
+  const totalPart = scoped ? `${total} across all kinds` : `${total} in library`;
+  const head =
+    loaded >= total && !scoped
+      ? `${shown}${match} of ${loaded} — your whole library`
+      : `${shown}${match} of ${loaded} loaded`;
+  const cap = truncated ? ' · page limit reached, some titles are not shown' : '';
+  return `${head} · ${totalPart} · ${onDisk} on disk${cap}`;
+}
+
+export interface LibraryPanelProps {
+  /** MGUI-19: when set, this surface is a SINGLE-KIND catalog (Movies / TV Shows) and the fetch
+   *  is scoped server-side. Undefined = the combined library. */
+  scope?: 'movie' | 'show';
+  /** Card title. Defaults to "Library" for the combined view. */
+  heading?: string;
+}
+
+export function LibraryPanel({ scope, heading }: LibraryPanelProps = {}) {
+  const { data, loading, degraded } = useMuseLibrary(PAGE_LIMIT, scope);
   const [query, setQuery] = useState('');
+  // On a scoped page the server has already filtered, so a kind control would be redundant at
+  // best and contradictory at worst ("Movies" + a SERIES filter = a guaranteed empty grid that
+  // looks like a data problem). Held at 'all' and the control is not rendered.
   const [kind, setKind] = useState<KindFilter>('all');
   const [avail, setAvail] = useState<AvailFilter>('all');
   const [sort, setSort] = useState<SortKey>('title_asc');
@@ -358,10 +413,18 @@ export function LibraryPanel() {
 
   return (
     <ChartCard
-      title="Library"
+      title={heading ?? 'Library'}
       subtitle={
         data
-          ? `${shown}${filtersActive ? ' matching' : ''} of ${loaded} loaded · ${total} in library · ${data.counts.on_disk} on disk`
+          ? librarySubtitle({
+              shown,
+              filtersActive,
+              loaded,
+              total,
+              onDisk: data.counts.on_disk,
+              scoped: scope !== undefined,
+              truncated: loaded >= PAGE_LIMIT,
+            })
           : 'Poster wall'
       }
       height={PANEL_BODY_HEIGHT}
@@ -429,6 +492,10 @@ export function LibraryPanel() {
           {/* Each axis is a labelled group. Without this a screen reader meets
               several ambiguous buttons — two of them effectively "everything" —
               with no way to tell which axis they belong to (codex). */}
+          {/* Hidden on a SCOPED page: the server already filtered, so the control would be
+              redundant at best and contradictory at worst — "Movies" plus a Series filter is a
+              guaranteed empty grid that looks like a data problem rather than a setting. */}
+          {scope === undefined && (
           <span role="group" aria-label="Filter by kind" style={{ display: 'inline-flex', gap: 2, alignItems: 'center' }}>
             <span aria-hidden style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', marginRight: 4 }}>kind</span>
             {(['all', 'movie', 'show'] as KindFilter[]).map(k => (
@@ -443,6 +510,7 @@ export function LibraryPanel() {
               </button>
             ))}
           </span>
+          )}
           <span role="group" aria-label="Filter by availability" style={{ display: 'inline-flex', gap: 2, alignItems: 'center' }}>
             <span aria-hidden style={{ fontSize: 'var(--fs-2xs, 10px)', color: 'var(--text-400, var(--text-300))', marginRight: 4 }}>have</span>
             {(['all', 'on_disk', 'wanted'] as AvailFilter[]).map(a => (
