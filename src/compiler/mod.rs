@@ -1354,6 +1354,28 @@ fn check_tmpdir_socket_headroom(
 /// PCON-10: best-effort reclaim of a per-job build-scratch dir on drop — covers
 /// build success AND every `?` early-return path of `build_inner`. A crash that
 /// skips the drop is covered by PCON-05's age/count GC backstop.
+/// TERM #609: refuse to publish a binary that is not there, and SAY WHY.
+///
+/// The premature-reclaim bug surfaced as a bare `sha256_file` ENOENT on a path
+/// cargo had just written successfully. That reads as a publish or filesystem
+/// fault, so it was chased in the wrong place — the build log showed a clean
+/// `Finished release`, and nothing connected the missing file to a scratch
+/// directory reclaimed by a guard that had gone out of scope.
+///
+/// This cannot prevent the class (a lifetime error is not detectable here),
+/// but it makes the failure name itself instead of presenting as a mystery.
+fn ensure_built_binary_present(built_bin: &std::path::Path, module: &str) -> Result<(), ToolError> {
+    if built_bin.exists() {
+        return Ok(());
+    }
+    Err(ToolError::Execution(format!(
+        "the built binary for {module} is missing at {} even though the build reported success — \
+         its per-job scratch directory was reclaimed before publish could read it (TERM #609). \
+         This is a lifetime bug in the build path, NOT a publish or disk fault.",
+        built_bin.display()
+    )))
+}
+
 struct ScratchReclaim(Option<PathBuf>);
 
 impl ScratchReclaim {
@@ -4550,6 +4572,9 @@ impl CompilerBuild {
         validate_segment("channel", channel)?;
         // Build done, artifact being checksummed + written → `publishing`.
         bus.emit(request_id, events::Emit::stage(events::Stage::Publishing));
+        // The last reader of `built_bin` starts here, so this is where its
+        // absence has to be caught and named.
+        ensure_built_binary_present(&built_bin, &module)?;
         let published = if let Some(relay_host) = env_nonempty(BUILD_DATASET_RELAY_HOST) {
             // Interim: relay-publish over a single hop to a host with the dataset RW.
             // The plan bundles BOTH the binary and its `.sha256` sidecar so the
@@ -7875,37 +7900,46 @@ Source:
     }
 
     #[test]
-    fn local_scratch_survives_the_branch_that_creates_it() {
-        // TERM #609. The guard used to be bound inside `if resolved.is_local()`,
-        // while the binary it protects is read by the publish step far outside
-        // that branch — so the scratch dir, and the freshly built binary in it,
-        // were deleted before anything could hash them. Every local build
-        // failed at publish with ENOENT on a file cargo had just written.
+    fn a_reclaimed_scratch_names_itself_instead_of_a_bare_enoent() {
+        // TERM #609. What made this expensive was not the bug but its
+        // DISGUISE: publish reported `No such file or directory` on a path
+        // cargo had just written, with a clean `Finished release` above it, so
+        // it read as a publish or disk fault and was hunted there.
         //
-        // This pins the LIFETIME, which is the thing that was wrong: the
-        // directory must outlive the block that creates it and be reclaimed
-        // only when the whole operation is done with it.
+        // I am being explicit about what this test does and does not do,
+        // because the first attempt at a regression test here was worthless
+        // and two reviewers were right to say so. It constructed the FIXED
+        // arrangement inline and asserted Rust move semantics, so reverting
+        // the production fix left it green — a test that cannot fail is worse
+        // than no test, because it reports safety it never checked.
+        //
+        // This one cannot pin the lifetime either: `built_bin` is produced ~800
+        // lines inside an async fn that shells out to cargo, and there is no
+        // seam that reaches it without a real build. What it DOES pin is that
+        // the failure arrives named. The lifetime itself is now held by the
+        // binding's scope and by the explicit reclaim after publish, and the
+        // honest statement is that those are reviewed, not test-covered.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let scratch = tmp.path().join("terminus-bu-deadbeef");
-        let built_bin = scratch.join("target/release/harmony-server");
-        std::fs::create_dir_all(built_bin.parent().unwrap()).expect("create");
-        std::fs::write(&built_bin, b"ELF").expect("write");
+        let missing = tmp.path().join("target/release/harmony-server");
 
-        let mut guard: Option<ScratchReclaim> = None;
-        {
-            // Stands in for the `is_local()` branch: it arms the guard and ends.
-            guard = Some(ScratchReclaim::new(scratch.clone()));
-        }
+        let err = ensure_built_binary_present(&missing, "harmony").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("TERM #609"), "must name the defect: {msg}");
         assert!(
-            built_bin.exists(),
-            "the binary must still be readable after the branch that built it returns — \
-             this is exactly what publish could not find"
+            msg.contains("reclaimed before publish"),
+            "must name the CAUSE, not just the symptom: {msg}"
         );
-
-        drop(guard);
         assert!(
-            !scratch.exists(),
-            "reclaim must still happen once the operation is finished with it"
+            msg.contains("NOT a publish or disk fault"),
+            "must rule out the two places this was wrongly hunted: {msg}"
+        );
+        assert!(msg.contains("harmony"), "must name the module: {msg}");
+
+        std::fs::create_dir_all(missing.parent().unwrap()).expect("create");
+        std::fs::write(&missing, b"ELF").expect("write");
+        assert!(
+            ensure_built_binary_present(&missing, "harmony").is_ok(),
+            "a present binary must publish normally"
         );
     }
 
