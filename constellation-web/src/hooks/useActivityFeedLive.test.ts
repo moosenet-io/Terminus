@@ -146,4 +146,45 @@ describe('useActivityFeedLive — visibility gating', () => {
     await advanceAndFlush(ACTIVITY_TIER_POLL_MS.tiles);
     expect(refetch).toHaveBeenCalledTimes(1); // exactly one recurring poll fired, not two
   });
+
+  it('ignores a stale in-flight completion that resolves after a hide/show cycle (generation guard, review round 3)', async () => {
+    // Sequence this reproduces: pollOnce fires -> request in flight -> tab hides (stop) -> tab
+    // shows (start, issuing a NEW poll) -> the OLD request finally settles. Without a
+    // generation guard, that stale settle would still see `stopped === false` (the new cycle's
+    // value) and overwrite `currentPollMs`/reschedule the timer with a stale result — a
+    // pre-hide failure backing off a feed that already recovered.
+    const deferreds: Array<(ok: boolean) => void> = [];
+    const refetch = vi.fn(
+      () => new Promise<boolean>(resolve => { deferreds.push(resolve); }),
+    );
+
+    const { result } = renderHook(() => useActivityFeedLive('live', refetch));
+    expect(deferreds).toHaveLength(1); // mount-time poll (generation 1), left UNRESOLVED
+
+    act(() => { setHidden(true); }); // stop() — bumps the generation; poll 1's promise is now stale
+    act(() => { setHidden(false); }); // start() — bumps the generation again, issues poll 2 (immediate)
+    expect(deferreds).toHaveLength(2);
+
+    // Settle the RECOVERED (current) cycle first, as a clean success.
+    deferreds[1](true);
+    await advanceAndFlush(0);
+    expect(result.current.pollIntervalMs).toBe(ACTIVITY_TIER_POLL_MS.live);
+
+    // NOW the stale pre-hide request finally resolves — as a FAILURE, specifically because a
+    // failure is what would corrupt state if it were wrongly let through (a success might
+    // coincidentally leave `pollIntervalMs` looking right for the wrong reason).
+    deferreds[0](false);
+    await advanceAndFlush(0);
+
+    // The recovered cycle's interval must be UNCHANGED by the stale failure.
+    expect(result.current.pollIntervalMs).toBe(ACTIVITY_TIER_POLL_MS.live);
+
+    // And only the recovered cycle's own (correct) timer is pending — advancing exactly its
+    // interval fires the next poll. If the stale settle had been let through, it would have
+    // backed the interval off and rescheduled at 2x, so this exact-interval advance would NOT
+    // have fired anything yet.
+    refetch.mockClear();
+    await advanceAndFlush(ACTIVITY_TIER_POLL_MS.live);
+    expect(refetch).toHaveBeenCalledTimes(1);
+  });
 });

@@ -196,11 +196,11 @@ export function ActivityTiles() {
   // `/api/requests/queue` `useMuseDownloadQueue` already binds), not a regression here.
   const live = useMuseLiveSessions();
 
-  // MACT-08 (MUSE-128): the 'tiles' cadence (10s polling fallback; WS-tick-coalesced when
-  // live) — one shared `useActivityFeedLive` call refetches every source feeding this row
-  // together, since a stale stat tile is no less honest a signal than a stale live pane.
-  // `terminusHealth` intentionally excluded: it is the shell's OWN `/api/health` poll, not a
-  // Muse activity source the tick fans in for.
+  // MACT-08 (MUSE-128): the 'tiles' cadence — one shared `useActivityFeedLive` call polls
+  // every source feeding this row together, at the tier's own 10s interval (there is no WS
+  // path; see useActivityFeedLive.ts's module doc for why), since a stale stat tile is no
+  // less honest a signal than a stale live pane. `terminusHealth` intentionally excluded: it
+  // is the shell's OWN `/api/health` poll, a separate concern from these Muse sources.
   // Aggregate every source's own `Promise<boolean>` (MUSE-128 review round 2 — `refetch()` now
   // actually resolves an outcome instead of returning `void`) into ONE outcome for the
   // backoff ladder: any degraded source counts as a failed poll cycle, so a genuinely-down

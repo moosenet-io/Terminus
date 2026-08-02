@@ -153,12 +153,14 @@ export function historySourceLabel(source: string): string {
   return source === 'muse-history' ? "Muse's permanent historical record" : `${source} (unrecognised source)`;
 }
 
-/** MACT-08 (MUSE-128): the panel's live-vs-polling honesty label — CLAUDE.md's "no colour-only
- *  or title-only signal" rule applies here as much as anywhere: whether a pane is truly live
- *  over `/ws` or falling back to polling must be a plain-text statement, not merely implied by
- *  (e.g.) a coloured dot. Renders "live" or "polling every Ns" from `useActivityFeedLive`'s
- *  returned `{live, pollIntervalMs}` — NEVER "live" when `live` is false, whatever the socket's
- *  raw connection state is (see that hook's own doc for why connection-state alone would lie). */
+/** MACT-08 (MUSE-128): the panel's cadence label — CLAUDE.md's "no colour-only or title-only
+ *  signal" rule applies here as much as anywhere: whether a pane is live or on a polling
+ *  cadence must be a plain-text statement, not merely implied by (e.g.) a coloured dot.
+ *  Renders "live" or "polling every Ns" from `useActivityFeedLive`'s returned
+ *  `{live, pollIntervalMs}`. As of review round 2, `live` is always `false` (there is no WS
+ *  path — see that hook's own module doc for why it was tried and dropped), so today this
+ *  always renders "polling every Ns"; the `live` branch is kept so the function's contract
+ *  stays correct if a genuine live source is ever wired in later, without a call-site change. */
 export function feedModeLabel(live: boolean, pollIntervalMs: number): string {
   if (live) return 'live';
   const seconds = Math.round(pollIntervalMs / 1000);

@@ -360,9 +360,10 @@ export function ActivityPanel() {
   const liveAvailable = live.loading ? null : live.degraded === false;
   const historyAvailable = history.loading ? null : history.degraded === false;
 
-  // MACT-08 (MUSE-128): live-over-`/ws`-with-polling-fallback, per pane, at the cadence the
-  // spec pins down (live: 5s poll floor; history: 60s) -- `ActivityTiles` wires its own
-  // 'tiles'-tier call internally since it owns several independent `useMuse*` sources.
+  // MACT-08 (MUSE-128): direct per-tier polling, per pane, at the cadence the spec pins down
+  // (live: 5s; history: 60s) -- there is no WS path (see useActivityFeedLive.ts's module doc).
+  // `ActivityTiles` wires its own 'tiles'-tier call internally since it owns several
+  // independent `useMuse*` sources.
   const liveFeed = useActivityFeedLive('live', live.refetch);
   const historyFeed = useActivityFeedLive('history', history.refetch);
 

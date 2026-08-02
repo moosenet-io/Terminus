@@ -83,6 +83,18 @@ export function useActivityFeedLive(tier: ActivityFeedTier, refetch: () => unkno
     let stopped = true;
     let currentPollMs = ACTIVITY_TIER_POLL_MS[tier];
     let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    // Guards a STALE in-flight completion racing a hide/show cycle (review round 3, finding 1):
+    // `stopped` alone isn't enough, because `stop()` -> `start()` (a hide then a show, both
+    // synchronous) flips `stopped` false -> true -> false WHILE an earlier `pollOnce()`'s
+    // promise is still in flight. That earlier call's `settle()` would then see
+    // `stopped === false` again (the NEW cycle's value) and be wrongly let through -- clobbering
+    // the new cycle's `currentPollMs`/timer with a stale result (a pre-hide failure backing off
+    // a feed that already recovered, or a pre-hide success erasing a newer failure's backoff).
+    // `generation` is bumped on every `start()` AND every `stop()`; each `pollOnce()` captures
+    // the generation it was issued under, and `settle()` only applies if that generation is
+    // STILL the current one -- so a completion from a superseded cycle is silently dropped
+    // instead of mutating state for a cycle it was never part of.
+    let generation = 0;
 
     function schedulePoll() {
       if (stopped) return;
@@ -92,10 +104,11 @@ export function useActivityFeedLive(tier: ActivityFeedTier, refetch: () => unkno
 
     function pollOnce() {
       if (stopped) return;
+      const gen = generation;
       setLastUpdatedAt(Date.now());
       const result = refetchRef.current();
       const settle = (ok: boolean) => {
-        if (stopped) return;
+        if (stopped || gen !== generation) return;
         currentPollMs = ok ? ACTIVITY_TIER_POLL_MS[tier] : Math.min(currentPollMs * 2, backoffCapMs(tier));
         setPollIntervalMs(currentPollMs);
         schedulePoll();
@@ -113,6 +126,7 @@ export function useActivityFeedLive(tier: ActivityFeedTier, refetch: () => unkno
 
     function start() {
       stopped = false;
+      generation += 1;
       currentPollMs = ACTIVITY_TIER_POLL_MS[tier];
       setPollIntervalMs(currentPollMs);
       pollOnce();
@@ -120,6 +134,7 @@ export function useActivityFeedLive(tier: ActivityFeedTier, refetch: () => unkno
 
     function stop() {
       stopped = true;
+      generation += 1;
       if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
     }
 
