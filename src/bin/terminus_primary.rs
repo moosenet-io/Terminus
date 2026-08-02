@@ -842,21 +842,91 @@ mod tests {
         clear_jwt_secret();
     }
 
+    /// Every forwarding route relays Chord's response body VERBATIM, and each one
+    /// reaches its OWN upstream path.
+    ///
+    /// TERM #598, two bugs in one test:
+    ///
+    /// 1. The mocks were path-AGNOSTIC (`when.method(POST)` and nothing else), all
+    ///    three registered on one `MockServer`, so nothing pinned which mock served
+    ///    which request. Every mock returned the same body, so a mis-routed request
+    ///    was indistinguishable from a correctly routed one — the assertion could not
+    ///    fail for the reason it existed. Each path now gets its own `.path(...)` mock
+    ///    with a DISTINCT body plus a hit assertion, so a request landing on the wrong
+    ///    upstream path is a failure rather than a silent pass.
+    ///
+    /// 2. `/v1/agent/execute` is only a blind forward when `TERMINUS_ROUTER_LOCAL=0`
+    ///    (see `handle_agent_execute`): TRTR-02 moved the tool loop in-process and
+    ///    made local routing the DEFAULT, so by default that route answers with the
+    ///    router's own `{"response", "status", "turns", ...}` envelope and never
+    ///    relays Chord's body. The test kept asserting the pre-TRTR-02 contract, so
+    ///    it failed on clean `main` for a real reason (`body["ok"]` was `Null`, the
+    ///    absent key) that had nothing to do with the branch under test. The
+    ///    forwarding contract is asserted here under the rollback flag the code
+    ///    documents; the default local-router posture is asserted by the test below.
     #[tokio::test]
     #[serial]
     async fn infer_agent_execute_and_coding_select_are_all_proxied() {
         set_jwt_secret();
+        // The documented rollback (`config::router_local_enabled`) — this test is
+        // about the FORWARDING contract, which `/v1/agent/execute` only has here.
+        std::env::set_var("TERMINUS_ROUTER_LOCAL", "0");
+
         let server = MockServer::start();
         for path in ["/v1/infer", "/v1/agent/execute", "/v1/coding/select"] {
-            server.mock(|when, then| {
-                when.method(httpmock::Method::POST);
-                then.status(200).json_body(json!({"ok": true}));
+            // Distinct body per path: proves the response came from THIS path's
+            // mock, not from whichever mock happened to match first.
+            let mock = server.mock(|when, then| {
+                when.method(httpmock::Method::POST).path(path);
+                then.status(200).json_body(json!({"ok": true, "from": path}));
             });
             let router = primary_router_with_inference_proxy(server.base_url());
             let (status, body, _) = post_json(router, path, json!({"model": "test-model"})).await;
+            mock.assert_hits(1);
             assert_eq!(status, axum::http::StatusCode::OK, "path {path} should proxy through");
             assert_eq!(body["ok"], true, "path {path} should relay chord's response body");
+            assert_eq!(
+                body["from"], path,
+                "path {path} must relay ITS OWN upstream response, not another route's"
+            );
         }
+
+        std::env::remove_var("TERMINUS_ROUTER_LOCAL");
+        clear_jwt_secret();
+    }
+
+    /// The other half of TERM #598: with the flag at its DEFAULT (local router on),
+    /// `/v1/agent/execute` must NOT relay Chord's body — it answers with the local
+    /// router's own envelope. Asserted explicitly so the contract that broke the test
+    /// above is pinned rather than merely worked around.
+    #[tokio::test]
+    #[serial]
+    async fn agent_execute_default_runs_the_local_router_not_a_blind_forward() {
+        set_jwt_secret();
+        std::env::remove_var("TERMINUS_ROUTER_LOCAL");
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST);
+            then.status(200).json_body(json!({"ok": true}));
+        });
+        let router = primary_router_with_inference_proxy(server.base_url());
+        let (status, body, _) = post_json(
+            router,
+            "/v1/agent/execute",
+            json!({"messages": [{"role": "user", "content": "hello"}]}),
+        )
+        .await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(
+            body["ok"].is_null(),
+            "the local router must not relay chord's raw body, got {body}"
+        );
+        assert!(
+            body.get("status").is_some() && body.get("turns").is_some(),
+            "expected the local router's own envelope, got {body}"
+        );
         clear_jwt_secret();
     }
 
