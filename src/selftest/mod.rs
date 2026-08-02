@@ -1016,11 +1016,78 @@ fn tool_router_canary_body(model: &str, user_id: &str) -> Value {
     })
 }
 
+/// TERM #557: inspect a 200 `/v1/agent/execute` body for evidence the router
+/// actually SELECTED AND DISPATCHED a tool — not merely that the endpoint
+/// accepted the request. Chord's `AgenticResponse`
+/// (Chord/src/agentic/context.rs) carries an `execution_log` of
+/// [`ExecutionStep`]-shaped entries, each with a `step_type` (`"tool_call"` /
+/// `"llm_response"` / `"guard_block"` / `"timeout"`), an optional `tool_name`,
+/// and a `status` (`"ok"` / `"blocked"` / `"error"` / `"timeout"`).
+///
+/// The real chat path a conversation takes is select→dispatch→answer, so the
+/// canary only passes on proof of a *successful* `tool_call` step. A 200 whose
+/// log contains no tool_call at all is the precise false-green a broken router
+/// produced (endpoint healthy, routing dead); a tool_call that `blocked`/
+/// `error`ed/`timeout`ed is a real dispatch failure. Both are RED, with a
+/// distinct detail, so the canary tells the truth about the live path.
+fn router_dispatch_outcome(body: &Value) -> (CheckStatus, String) {
+    let steps = body.get("execution_log").and_then(|v| v.as_array());
+    let tool_steps: Vec<&Value> = steps
+        .map(|arr| {
+            arr.iter()
+                .filter(|s| {
+                    s.get("step_type").and_then(|t| t.as_str()) == Some("tool_call")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // A successful dispatch: at least one tool_call step with status "ok".
+    if let Some(ok_step) = tool_steps
+        .iter()
+        .find(|s| s.get("status").and_then(|st| st.as_str()) == Some("ok"))
+    {
+        let name = ok_step
+            .get("tool_name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("a tool");
+        return (
+            CheckStatus::Pass,
+            format!("router selected+dispatched '{name}' via agent/execute"),
+        );
+    }
+
+    // Dispatched a tool, but it did not succeed: a real dispatch-path failure.
+    if let Some(bad_step) = tool_steps.first() {
+        let name = bad_step
+            .get("tool_name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("a tool");
+        let st = bad_step
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("failed");
+        return (
+            CheckStatus::Fail,
+            format!("router dispatched '{name}' but it {st} — dispatch path broken"),
+        );
+    }
+
+    // 200, but the router never dispatched a tool: the false-green TERM #557
+    // is about — the endpoint is up while the real select/dispatch path is not
+    // exercised at all.
+    (
+        CheckStatus::Fail,
+        "agent/execute returned 200 but dispatched NO tool — router select/dispatch path is broken (previously a false-green)".to_string(),
+    )
+}
+
 /// Tool-router canary: force a known read-only tool through Chord's
-/// `/v1/agent/execute` and assert a plausible, non-error response. A missing
-/// endpoint (404) or a 5xx/timeout is the CRITICAL router-failure signal; a 4xx
-/// request-contract rejection is surfaced distinctly (our-bug / contract drift)
-/// so it can never masquerade as a router outage.
+/// `/v1/agent/execute` and assert the router actually SELECTED AND DISPATCHED
+/// it (TERM #557 — a bare 200 is not enough; see [`router_dispatch_outcome`]).
+/// A missing endpoint (404) or a 5xx/timeout is the CRITICAL router-failure
+/// signal; a 4xx request-contract rejection is surfaced distinctly (our-bug /
+/// contract drift) so it can never masquerade as a router outage.
 async fn check_tool_router(profile: &SelftestProfile) -> CheckResult {
     let base = crate::config::chord_personal_federation_url();
     let timeout = chat_timeout();
@@ -1064,10 +1131,19 @@ async fn check_tool_router(profile: &SelftestProfile) -> CheckResult {
             let code = resp.status();
             let c = code.as_u16();
             if code.is_success() {
-                (
-                    CheckStatus::Pass,
-                    "agent/execute accepted a tool-restricted request".to_string(),
-                )
+                // TERM #557: a 200 alone is NOT proof the router works — the
+                // endpoint can accept a request and answer without ever
+                // selecting+dispatching a tool. Parse the AgenticResponse and
+                // require evidence of a real, successful tool dispatch.
+                match resp.json::<Value>().await {
+                    Ok(body) => router_dispatch_outcome(&body),
+                    Err(e) => (
+                        CheckStatus::Fail,
+                        format!(
+                            "agent/execute 200 but body unparseable ({e}) — cannot confirm a real tool dispatch"
+                        ),
+                    ),
+                }
             } else if c == 404 {
                 // Endpoint absent = real router outage.
                 (
@@ -2133,6 +2209,64 @@ mod tests {
         // blank; assert the body helper carries whatever principal it's given.
         let body = tool_router_canary_body("m", "selftest");
         assert_eq!(body["user_id"], "selftest");
+    }
+
+    // ── TERM #557: tool_router canary reflects a REAL select+dispatch ──────
+
+    #[test]
+    fn router_outcome_passes_only_on_a_successful_tool_dispatch() {
+        let body = json!({
+            "response": "It is 12:00 UTC.",
+            "execution_log": [
+                {"step_type": "tool_call", "tool_name": "time_now", "duration_ms": 5, "status": "ok"},
+                {"step_type": "llm_response", "duration_ms": 3, "status": "ok"}
+            ],
+            "tool_calls_made": 1
+        });
+        let (status, detail) = router_dispatch_outcome(&body);
+        assert_eq!(status, CheckStatus::Pass, "a successful dispatch is green");
+        assert!(detail.contains("time_now"), "names the dispatched tool: {detail}");
+    }
+
+    #[test]
+    fn router_outcome_fails_when_200_but_no_tool_dispatched() {
+        // The exact TERM #557 false-green: the endpoint answered, but the router
+        // never selected or dispatched a tool.
+        let body = json!({
+            "response": "It is probably around noon.",
+            "execution_log": [
+                {"step_type": "llm_response", "duration_ms": 3, "status": "ok"}
+            ],
+            "tool_calls_made": 0
+        });
+        let (status, detail) = router_dispatch_outcome(&body);
+        assert_eq!(status, CheckStatus::Fail, "no dispatch ⇒ RED, not a false-green");
+        assert!(detail.to_lowercase().contains("no tool"), "detail explains why: {detail}");
+    }
+
+    #[test]
+    fn router_outcome_fails_when_dispatch_errors_or_is_blocked() {
+        for bad in ["error", "blocked", "timeout"] {
+            let body = json!({
+                "response": "",
+                "execution_log": [
+                    {"step_type": "tool_call", "tool_name": "time_now", "duration_ms": 9, "status": bad}
+                ],
+                "tool_calls_made": 1
+            });
+            let (status, detail) = router_dispatch_outcome(&body);
+            assert_eq!(status, CheckStatus::Fail, "a {bad} dispatch must be RED");
+            assert!(detail.contains(bad), "detail carries the failure status: {detail}");
+        }
+    }
+
+    #[test]
+    fn router_outcome_fails_when_execution_log_absent() {
+        // A well-formed-looking 200 with no execution_log cannot prove a
+        // dispatch — must not pass.
+        let body = json!({"response": "hi", "tool_calls_made": 0});
+        let (status, _) = router_dispatch_outcome(&body);
+        assert_eq!(status, CheckStatus::Fail);
     }
 
     #[test]

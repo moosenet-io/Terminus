@@ -885,6 +885,29 @@ pub fn gateway_magicdns_name() -> Option<String> {
     env_nonempty("TERMINUS_MESH_GATEWAY_MAGICDNS_NAME")
 }
 
+/// Maximum age (seconds) a mesh upstream's last-successfully-merged tool
+/// catalog may be served after a transient fetch/health flap before the
+/// upstream's tools are actually dropped from the merged `tools/list`. From
+/// `MESH_UPSTREAM_STALE_MAX_SECS`; defaults to 300 (5 minutes).
+///
+/// TERM #565: an upstream that flaps for a few seconds (a restart, an idle
+/// session timeout, a proxy hop recycling — the observed Proxmox behaviour) must
+/// NOT have every one of its tools silently vanish from the catalog
+/// mid-conversation. Within this window the merge serves the upstream's
+/// last-good catalog (marked stale) instead. A genuinely-removed upstream still
+/// drops once it has failed to refresh for longer than this bound (or the
+/// moment it authoritatively returns a fresh, smaller/empty catalog), so a dead
+/// tool is never served forever. Default is deliberately generous relative to
+/// the health-probe backoff ceiling ([`crate::mesh`]'s ~120s) so a normal
+/// recovery cycle stays comfortably inside it, while a real outage still clears
+/// within a few minutes.
+pub fn mesh_upstream_stale_max_secs() -> u64 {
+    env_nonempty("MESH_UPSTREAM_STALE_MAX_SECS")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+        .unwrap_or(300)
+}
+
 /// Token-bucket burst capacity for the interim in-process rate limiter, per
 /// `(identity, action)` key. From `TERMINUS_GATEWAY_RATE_LIMIT_BURST`;
 /// defaults to 20 — generous enough for a legitimate multi-tool-call

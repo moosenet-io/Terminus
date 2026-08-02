@@ -154,6 +154,8 @@ impl MergedCatalog {
     /// `tracing::warn!`, not a build failure) — the same "one bad upstream
     /// doesn't take the others down" posture `UpstreamPool` itself follows.
     pub async fn build(local_tools: Vec<Value>, pool: &UpstreamPool) -> Self {
+        let stale_max =
+            std::time::Duration::from_secs(crate::config::mesh_upstream_stale_max_secs());
         let mut routing = RoutingTable::new();
         let mut tools = Vec::with_capacity(local_tools.len());
 
@@ -164,32 +166,29 @@ impl MergedCatalog {
             tools.push(tool);
         }
 
-        for client in pool.healthy_clients() {
-            match client.list_tools().await {
-                Ok(upstream_tools) => {
-                    for ut in upstream_tools {
-                        let advertised = namespaced(client.namespace(), &ut.name);
-                        routing.insert(
-                            advertised.clone(),
-                            Route::Upstream {
-                                namespace: client.namespace().to_string(),
-                                bare_name: ut.name.clone(),
-                            },
-                        );
-                        tools.push(json!({
-                            "name": advertised,
-                            "description": ut.description,
-                            "inputSchema": ut.input_schema,
-                        }));
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "mesh: excluding upstream \"{}\" (namespace \"{}\") from the merged catalog: {e}",
-                        client.name(),
-                        client.namespace(),
-                    );
-                }
+        // TERM #565: source each upstream's tools through the pool's
+        // flap-resilient path — a transient fetch/health failure serves the
+        // upstream's last-good catalog (within `stale_max`) instead of silently
+        // dropping every one of its tools from `tools/list`. Whether an entry is
+        // fresh or stale, it is namespaced and routed identically, so the
+        // MESH-08 per-principal identity filtering downstream (which operates on
+        // this same namespaced tool list) is unaffected.
+        for entry in pool.merge_entries(stale_max).await {
+            let namespace = entry.client.namespace();
+            for ut in entry.tools {
+                let advertised = namespaced(namespace, &ut.name);
+                routing.insert(
+                    advertised.clone(),
+                    Route::Upstream {
+                        namespace: namespace.to_string(),
+                        bare_name: ut.name.clone(),
+                    },
+                );
+                tools.push(json!({
+                    "name": advertised,
+                    "description": ut.description,
+                    "inputSchema": ut.input_schema,
+                }));
             }
         }
 

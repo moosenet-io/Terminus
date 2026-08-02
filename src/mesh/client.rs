@@ -546,6 +546,29 @@ fn classify_transport_error(name: &str, e: &reqwest::Error) -> UpstreamClientErr
     }
 }
 
+/// An upstream's last-successfully-merged tool catalog, retained so a
+/// transient fetch/health flap serves this last-good list (within a staleness
+/// bound) instead of silently dropping every one of the upstream's tools from
+/// the merged catalog.
+///
+/// TERM #565 has TWO failure modes; the two fixes are complementary:
+/// - a stale MCP *session* (an expired/forgotten `Mcp-Session-Id`) is
+///   recovered inside [`UpstreamClient::with_session_retry`] — one re-handshake
+///   and the same call succeeds, so the merge never even sees a failure;
+/// - a health-probe *flap* (the pool marks the upstream unhealthy for a backoff
+///   window) or a `list_tools` that STILL fails after that retry would, before
+///   this cache, drop all of the upstream's tools from `tools/list` — for the
+///   Proxmox upstream, all 40, mid-conversation, with the assistant then telling
+///   the operator it has no access to their own hardware. This cache closes
+///   that second mode: the last-good catalog is served (marked stale) across
+///   the flap, and only dropped once the failure outlasts
+///   `MESH_UPSTREAM_STALE_MAX_SECS` or the upstream authoritatively returns a
+///   fresh (possibly smaller/empty) catalog.
+struct CachedCatalog {
+    tools: Vec<ToolMeta>,
+    fetched_at: Instant,
+}
+
 /// Per-upstream health + backoff state a pool tracks alongside its
 /// [`UpstreamClient`]. Deliberately separate from `UpstreamClient` itself so
 /// the client stays a plain, cheaply-shared dial primitive and this struct
@@ -555,6 +578,13 @@ struct PooledUpstream {
     healthy: std::sync::atomic::AtomicBool,
     consecutive_failures: AtomicU32,
     next_probe_at: Mutex<Instant>,
+    /// Last catalog this upstream successfully returned (see [`CachedCatalog`]),
+    /// with the instant it was fetched. `None` until the first success.
+    last_good: Mutex<Option<CachedCatalog>>,
+    /// Whether the merge is CURRENTLY serving this upstream's last-good catalog
+    /// because a live refresh is failing. Used only to log the healthy→stale
+    /// and stale→(recovered|dropped) transitions ONCE each, never every merge.
+    serving_stale: std::sync::atomic::AtomicBool,
 }
 
 /// The set of [`UpstreamClient`]s built from a registry's enabled entries,
@@ -586,6 +616,8 @@ impl UpstreamPool {
                     healthy: std::sync::atomic::AtomicBool::new(true),
                     consecutive_failures: AtomicU32::new(0),
                     next_probe_at: Mutex::new(Instant::now()),
+                    last_good: Mutex::new(None),
+                    serving_stale: std::sync::atomic::AtomicBool::new(false),
                 }),
                 Err(e) => {
                     tracing::warn!(
@@ -648,6 +680,123 @@ impl UpstreamPool {
     pub fn all_clients(&self) -> impl Iterator<Item = &UpstreamClient> {
         self.upstreams.iter().map(|u| &u.client)
     }
+
+    /// Produce each upstream's tool list for a `tools/list` merge, resilient to
+    /// a transient upstream flap (TERM #565 — see [`CachedCatalog`]).
+    ///
+    /// For every configured upstream:
+    /// - if it is currently healthy, a live `tools/list` is attempted (which
+    ///   itself re-handshakes once on a stale MCP session — see
+    ///   [`UpstreamClient::with_session_retry`]); on success the result is
+    ///   cached as last-good and served FRESH — including an authoritative
+    ///   empty/smaller list, which is a real tool change, not a flap;
+    /// - on a live-fetch error, OR when the upstream is currently in
+    ///   health-probe backoff (so the merge sends it no traffic this cycle),
+    ///   the last-good catalog is served (marked `stale`) provided it is no
+    ///   older than `stale_max`;
+    /// - only when there is no cache, or the cache is older than `stale_max`, is
+    ///   the upstream dropped from the merge entirely — so a genuinely dead
+    ///   upstream still clears, but a few-second flap never drops live tools.
+    ///
+    /// A WARN is logged once on the healthy→serving-stale transition and once on
+    /// the serving-stale→(recovered|dropped) transition — never every merge.
+    pub async fn merge_entries(&self, stale_max: Duration) -> Vec<MergeEntry<'_>> {
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for u in &self.upstreams {
+            let healthy = u.healthy.load(Ordering::Relaxed);
+            // Only touch the network for a healthy upstream; an unhealthy one is
+            // in backoff and must be served from cache, if at all.
+            let live: Option<Result<Vec<ToolMeta>, String>> = if healthy {
+                Some(u.client.list_tools().await.map_err(|e| e.to_string()))
+            } else {
+                None
+            };
+
+            match live {
+                Some(Ok(tools)) => {
+                    *u.last_good.lock().expect("last_good mutex poisoned") =
+                        Some(CachedCatalog { tools: tools.clone(), fetched_at: now });
+                    if u.serving_stale.swap(false, Ordering::Relaxed) {
+                        tracing::info!(
+                            "mesh: upstream {:?} (namespace {:?}) refreshed successfully — \
+                             serving a fresh catalog again ({} tool(s))",
+                            u.client.name(),
+                            u.client.namespace(),
+                            tools.len(),
+                        );
+                    }
+                    out.push(MergeEntry { client: &u.client, tools, stale: false });
+                }
+                other => {
+                    let reason = match other {
+                        Some(Err(e)) => e,
+                        _ => "upstream in health-probe backoff".to_string(),
+                    };
+                    let cached = u.last_good.lock().expect("last_good mutex poisoned");
+                    match cached.as_ref() {
+                        Some(c) if now.duration_since(c.fetched_at) <= stale_max => {
+                            if !u.serving_stale.swap(true, Ordering::Relaxed) {
+                                tracing::warn!(
+                                    "mesh: upstream {:?} (namespace {:?}) failed to refresh \
+                                     ({reason}); serving its last-good catalog of {} tool(s) \
+                                     (STALE) rather than dropping them — will drop after {}s \
+                                     without a successful refresh",
+                                    u.client.name(),
+                                    u.client.namespace(),
+                                    c.tools.len(),
+                                    stale_max.as_secs(),
+                                );
+                            }
+                            out.push(MergeEntry {
+                                client: &u.client,
+                                tools: c.tools.clone(),
+                                stale: true,
+                            });
+                        }
+                        Some(_) => {
+                            // A cache exists but has outlived `stale_max`: treat
+                            // this as a genuine outage/removal and drop the
+                            // upstream's tools. Log the "giving up" transition once.
+                            if u.serving_stale.swap(false, Ordering::Relaxed) {
+                                tracing::warn!(
+                                    "mesh: upstream {:?} (namespace {:?}) failed to refresh \
+                                     ({reason}) for longer than {}s — dropping its tools from the \
+                                     merged catalog until it recovers",
+                                    u.client.name(),
+                                    u.client.namespace(),
+                                    stale_max.as_secs(),
+                                );
+                            }
+                        }
+                        None => {
+                            // Never produced a good catalog (e.g. down since
+                            // startup): nothing to serve — drop, same as the
+                            // pre-cache behaviour, logged per merge at DEBUG to
+                            // avoid WARN spam for a long-absent upstream.
+                            tracing::debug!(
+                                "mesh: excluding upstream {:?} (namespace {:?}) from the merged \
+                                 catalog (no last-good catalog yet): {reason}",
+                                u.client.name(),
+                                u.client.namespace(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// One upstream's contribution to a merged `tools/list`, produced by
+/// [`UpstreamPool::merge_entries`]. `stale` is true when `tools` came from the
+/// last-good cache because a live refresh failed (or the upstream was in
+/// health-probe backoff) this cycle — see [`CachedCatalog`].
+pub struct MergeEntry<'a> {
+    pub client: &'a UpstreamClient,
+    pub tools: Vec<ToolMeta>,
+    pub stale: bool,
 }
 
 #[cfg(test)]
@@ -901,6 +1050,94 @@ mod tests {
             err,
             UpstreamClientError::Unreachable(_, _) | UpstreamClientError::Timeout(_, _)
         ));
+    }
+
+    // ── TERM #565: merge_entries serves last-good on a flap, drops past the bound ──
+
+    /// Mount initialize + a `tools/list` returning exactly one tool, but NO
+    /// `/healthz`, so a health probe against this server FAILS (404 ⇒ the pool
+    /// marks the upstream unhealthy) even though `tools/list` itself succeeds.
+    /// That is precisely the flap shape TERM #565 is about: the catalog call
+    /// works, then a probe blip marks the upstream down and — before the cache —
+    /// dropped all of its tools.
+    fn mount_list_no_healthz(server: &MockServer, tool_name: &str) {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/mcp")
+                .json_body_partial(r#"{"method": "initialize"}"#);
+            then.status(200).header("Mcp-Session-Id", "s1").json_body(initialize_response());
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/mcp")
+                .json_body_partial(r#"{"method": "tools/list"}"#);
+            then.status(200).json_body(json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": {"tools": [
+                    {"name": tool_name, "description": "a tool", "inputSchema": {"type": "object"}}
+                ]}
+            }));
+        });
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn merge_entries_serves_last_good_across_a_flap_and_drops_past_stale_max() {
+        std::env::set_var("MESH_TEST_BEARER_TOKEN_FLAP", "fixture-token"); // pii-test-fixture
+        let server = MockServer::start();
+        mount_list_no_healthz(&server, "pve_status");
+        let json = format!(
+            r#"[{{"name":"<host>","url":"{}","transport":"bearer","namespace":"<host>","secret_key":"MESH_TEST_BEARER_TOKEN_FLAP"}}]"#, // pii-test-fixture
+            server.base_url()
+        );
+        let registry = UpstreamRegistry::from_json(&json).expect("valid json");
+        let pool = UpstreamPool::from_registry(&registry);
+        let big = Duration::from_secs(300);
+
+        // 1) First merge: upstream starts optimistically healthy → live fetch
+        //    succeeds → served FRESH and cached as last-good.
+        let first = pool.merge_entries(big).await;
+        assert_eq!(first.len(), 1, "healthy upstream contributes its tools");
+        assert!(!first[0].stale, "a live fetch is fresh, not stale");
+        assert_eq!(first[0].tools.len(), 1);
+        assert_eq!(first[0].tools[0].name, "pve_status");
+
+        // 2) A health probe flips the upstream unhealthy (no /healthz mounted).
+        pool.health_check_all().await;
+        assert_eq!(pool.healthy_clients().count(), 0, "flap marked it unhealthy");
+
+        // 3) Merge during the flap: the upstream is in backoff (no live fetch),
+        //    but its last-good catalog is well within `stale_max` → served STALE
+        //    rather than dropped. THIS is the TERM #565 fix: the 40 pve__* tools
+        //    do NOT vanish mid-conversation.
+        let during = pool.merge_entries(big).await;
+        assert_eq!(during.len(), 1, "last-good catalog is served across the flap");
+        assert!(during[0].stale, "served from cache ⇒ marked stale");
+        assert_eq!(during[0].tools[0].name, "pve_status");
+
+        // 4) Same failing state, but with a zero staleness bound: the cache has
+        //    now outlived the bound → the upstream is genuinely dropped, proving
+        //    a dead upstream is not served forever.
+        let expired = pool.merge_entries(Duration::ZERO).await;
+        assert!(expired.is_empty(), "past the staleness bound, the upstream drops");
+
+        std::env::remove_var("MESH_TEST_BEARER_TOKEN_FLAP");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn merge_entries_drops_an_upstream_that_never_produced_a_catalog() {
+        // Down since startup: no last-good cache exists, so there is nothing to
+        // serve and the upstream is dropped regardless of the staleness bound —
+        // the cache only rescues a flap AFTER at least one success.
+        std::env::set_var("MESH_TEST_BEARER_TOKEN_NEVER", "fixture-token"); // pii-test-fixture
+        let json = r#"[{"name":"down","url":"http://127.0.0.1:1","transport":"bearer","namespace":"downns","secret_key":"MESH_TEST_BEARER_TOKEN_NEVER"}]"#;
+        let registry = UpstreamRegistry::from_json(json).expect("valid json");
+        let pool = UpstreamPool::from_registry(&registry);
+
+        let entries = pool.merge_entries(Duration::from_secs(300)).await;
+        assert!(entries.is_empty(), "an upstream with no last-good catalog is dropped");
+        std::env::remove_var("MESH_TEST_BEARER_TOKEN_NEVER");
     }
 }
 
