@@ -554,6 +554,7 @@ mod tests {
             gated: None,
             quant_dtype: None,
             has_gguf: None,
+            fit_score: None,
         }
     }
 

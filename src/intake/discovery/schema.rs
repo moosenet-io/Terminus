@@ -509,6 +509,21 @@ pub struct DiscoveryCandidate {
     /// (fail-closed on `None`); `COALESCE`-protected on upsert so a bare listing
     /// re-observation never erases a measured value.
     pub has_gguf: Option<bool>,
+
+    // ---- Persisted blended practical fit score (S128, TERM) ----
+    /// The blended PRACTICAL fit score the selector ranks on
+    /// ([`crate::intake::discovery::select::fit_score`]: 0.35 hardware-fit +
+    /// 0.30 assistant-suitability + 0.25 recency + 0.10 popularity tiebreak),
+    /// computed and PERSISTED by the MEASURE/ENRICH pass (`measure.rs`) so
+    /// score-based cold-storage pruning (Chord CQH-01 F5) can act on the
+    /// practical fitness signal rather than the raw HF-popularity
+    /// `discovery_score`. `None` until the first MEASURE pass scores the row (a
+    /// bare `refresh.rs` discovery re-observation carries it as `None`, and the
+    /// DISC-03 upsert `COALESCE`-protects it so a re-observation never erases a
+    /// computed score). Nullable + fail-soft: the write path persists it only
+    /// when the `fit_score` column exists, so the code deploys BEFORE the S128
+    /// migration is applied (see `upsert.rs`).
+    pub fit_score: Option<f64>,
 }
 
 /// The migration SQL, applied out-of-band by an operator (matching
@@ -553,6 +568,18 @@ pub const MODEL_DISCOVERY_PRACTICAL_MIGRATION_SQL: &str =
 /// its shape without a live Postgres.
 pub const MODEL_DISCOVERY_GGUF_MIGRATION_SQL: &str =
     include_str!("../../../migrations/S127b-ask4-gguf-availability.sql");
+
+/// S128 (TERM) additive migration: adds the nullable `fit_score` column — the
+/// blended PRACTICAL fit score the selector ranks on
+/// ([`crate::intake::discovery::select::fit_score`]), persisted by the MEASURE
+/// pass so score-based cold-storage pruning (Chord CQH-01 F5) can use it instead
+/// of the raw HF-popularity `discovery_score`. Additive/idempotent
+/// (`ADD COLUMN IF NOT EXISTS`), applied out-of-band by an operator exactly like
+/// the DISC-01/CB-02/S127/S127b migrations. Kept byte-identical to the canonical
+/// copy in `migrations/`; the const exists so a test can assert its shape
+/// without a live Postgres.
+pub const MODEL_DISCOVERY_FITSCORE_MIGRATION_SQL: &str =
+    include_str!("../../../migrations/S128-fitscore-persist.sql");
 
 #[cfg(test)]
 mod tests {
@@ -842,6 +869,13 @@ mod tests {
         let sql = MODEL_DISCOVERY_GGUF_MIGRATION_SQL;
         assert!(sql.contains("ALTER TABLE model_discovery_candidate"));
         assert!(sql.contains("ADD COLUMN IF NOT EXISTS has_gguf"));
+    }
+
+    #[test]
+    fn fitscore_migration_sql_additively_adds_the_fit_score_column() {
+        let sql = MODEL_DISCOVERY_FITSCORE_MIGRATION_SQL;
+        assert!(sql.contains("ALTER TABLE model_discovery_candidate"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS fit_score DOUBLE PRECISION"));
     }
 
     #[test]
