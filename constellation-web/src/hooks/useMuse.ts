@@ -315,6 +315,22 @@ export function useMuseSubsystems(): MuseSection<{ subsystems: MuseSubsystem[] }
   return useMuseSection<{ subsystems: MuseSubsystem[] }>('/api/subsystems');
 }
 
+// ── Liveness / DB probe (MACT-06, MUSE-126) ──────────────────────────────────
+//
+// `GET /health` is Muse's PUBLIC liveness+DB probe (Muse `src/http/mod.rs::health`) — reused
+// as-is, no new endpoint. Field shape lives in `tileFormat.ts`'s `MuseHealthPayload` doc
+// comment (transcribed from the handler, not a live capture).
+
+export interface MuseHealth {
+  status: string;
+  version?: string;
+  db: string;
+}
+
+export function useMuseHealth(): MuseSection<MuseHealth> {
+  return useMuseSection<MuseHealth>('/health');
+}
+
 // ── Taste profile (MGUI-07) ──────────────────────────────────────────────────
 
 export interface MuseTasteProfile {
