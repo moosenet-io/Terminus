@@ -427,14 +427,56 @@ mod tests {
         assert!(p.per_principal, "this test is meaningless unless the tool is per-principal");
         let q = json!({"q": "today"});
 
-        // pii-test-fixture: invented household names
-        let alice = ToolCache::key("weather", &q, Some("svc:lumina#person:alice"), p.per_principal);
-        let bob = ToolCache::key("weather", &q, Some("svc:lumina#person:bob"), p.per_principal);
-        let service = ToolCache::key("weather", &q, Some("svc:lumina"), p.per_principal);
+        // Identities derived the way PRODUCTION derives them — through
+        // `CallerKey`, not hand-written strings. An earlier version of this test
+        // asserted literals, which proved only that `ToolCache::key` is injective
+        // and would have passed even while the caller computed the wrong identity.
+        let alice = ck_identity(Some("alice"));  // pii-test-fixture: invented names
+        let bob = ck_identity(Some("bob"));      // pii-test-fixture
+        let service = ck_identity(None);
 
-        assert_ne!(alice, bob, "two people must not share a cache bucket");
-        assert_ne!(alice, service, "a person must not read the shared service entry");
-        assert_ne!(bob, service);
+        let ka = ToolCache::key("weather", &q, Some(&alice), p.per_principal);
+        let kb = ToolCache::key("weather", &q, Some(&bob), p.per_principal);
+        let ks = ToolCache::key("weather", &q, Some(&service), p.per_principal);
+
+        assert_ne!(ka, kb, "two people must not share a cache bucket");
+        assert_ne!(ka, ks, "a person must not read the shared service entry");
+        assert_ne!(kb, ks);
+    }
+
+    /// Derive a cache identity the way `dispatch_tool` does: through `CallerKey`.
+    fn ck_identity(person: Option<&str>) -> String {
+        match person {
+            Some(p) => crate::locations::CallerKey::for_person("lumina", p)
+                .expect("a named person must key")
+                .storage_key(),
+            None => crate::locations::CallerKey::for_principal_name("lumina")
+                .expect("a service principal must key")
+                .storage_key(),
+        }
+    }
+
+    /// THE BUG THIS FIXES. A REFUSED assertion must not share the service bucket.
+    ///
+    /// The first version of the router change derived the cache identity as
+    /// `caller_key_for(..).or(principal)`. `caller_key_for` returns `None` for a
+    /// rejected assertion, so it fell through to the bare principal — and a claim
+    /// we had just refused to believe could read, and populate, the same cached
+    /// data as a legitimate service-scoped caller. That is "an attempted identity
+    /// indistinguishable from no identity", one layer below where the rest of this
+    /// work rules it out.
+    #[test]
+    fn a_refused_assertion_does_not_share_the_service_cache_bucket() {
+        let p = policy_for("weather").unwrap();
+        let q = json!({"q": "today"});
+        let service = ck_identity(None);
+
+        let refused = ToolCache::key("weather", &q, Some("<refused>"), p.per_principal);
+        let svc = ToolCache::key("weather", &q, Some(&service), p.per_principal);
+        let alice = ToolCache::key("weather", &q, Some(&ck_identity(Some("alice"))), p.per_principal); // pii-test-fixture
+
+        assert_ne!(refused, svc, "a refused claim must not read service-scoped cache");
+        assert_ne!(refused, alice, "nor any person's");
     }
 
     /// POSITIVE CONTROL for the above: the SAME identity asking the SAME question
@@ -443,8 +485,9 @@ mod tests {
     fn the_same_person_asking_twice_still_shares_one_entry() {
         let p = policy_for("weather").unwrap();
         let q = json!({"q": "today"});
-        let a = ToolCache::key("weather", &q, Some("svc:lumina#person:alice"), p.per_principal);
-        let b = ToolCache::key("weather", &q, Some("svc:lumina#person:alice"), p.per_principal);
+        let alice = ck_identity(Some("alice")); // pii-test-fixture
+        let a = ToolCache::key("weather", &q, Some(&alice), p.per_principal);
+        let b = ToolCache::key("weather", &q, Some(&alice), p.per_principal);
         assert_eq!(a, b);
     }
 

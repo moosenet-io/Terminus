@@ -683,6 +683,30 @@ async fn handle_agent_execute(
     // from no identity — reproduced on the one door that carries real traffic.
     let asserted = asserted_person_for_mcp(state.gateway.as_ref(), principal.as_ref(), &headers);
 
+    // And REFUSE it here, rather than merely running the turn with less privilege.
+    //
+    // Threading a `Rejected` assertion downstream does produce an unidentified
+    // context and no caller key, which is the safe direction — but it is not the
+    // same as refusing, and the sibling `handle_inference_proxy` path answers 403
+    // for exactly this input. Two doors giving different answers to the same
+    // refused claim is how one of them quietly becomes the way in.
+    if matches!(asserted, crate::mesh::AssertedPerson::Rejected) {
+        tracing::warn!(
+            principal = principal.as_ref().map(Principal::name).unwrap_or("<none>"),
+            "TERM-599: refusing an unhonourable person claim on the local router path"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            [("content-type", "application/json")],
+            json!({
+                "error": "on-behalf-of assertion refused",
+                "detail": "this identity could not be honoured; it was not silently downgraded"
+            })
+            .to_string(),
+        )
+            .into_response();
+    }
+
     // Same gate the forwarding path applies, on the same resolved principal — the
     // router is a caller of the sanctioned path, never a way around it.
     let gate_ctx = match &state.gateway {
