@@ -160,13 +160,17 @@ export function historySourceLabel(source: string): string {
  *  cause. A 401 specifically names the unprovisioned bearer (TERM-549) rather than reading as a
  *  generic failure — this is the one case CLAUDE.md's honesty rules call out by name for this
  *  item, since it WILL happen in practice until that token is provisioned. */
-export function degradeCause(detail: string | undefined): string {
-  if (!detail) return 'Muse session feed is unavailable (no further detail reported).';
+// MACT-05 (MUSE-125): generalised with an optional `feedLabel` so the Import Activity section
+// (a different protected endpoint, `/api/requests/queue`) gets the same 401/404/not-wired
+// cause-naming discipline without a copy-pasted near-duplicate — every existing call site keeps
+// the original "Muse session feed" wording via the default.
+export function degradeCause(detail: string | undefined, feedLabel = 'Muse session feed'): string {
+  if (!detail) return `${feedLabel} is unavailable (no further detail reported).`;
   if (/HTTP 401/.test(detail)) {
-    return 'Muse session feed requires CONSTELLATION_MUSE_TOKEN, which is unprovisioned on this deployment (TERM-549) — the backend rejected the request as unauthenticated.';
+    return `${feedLabel} requires CONSTELLATION_MUSE_TOKEN, which is unprovisioned on this deployment (TERM-549) — the backend rejected the request as unauthenticated.`;
   }
   if (/HTTP (404|501)/.test(detail)) {
-    return "Muse session feed isn't wired on this backend yet (404/501).";
+    return `${feedLabel} isn't wired on this backend yet (404/501).`;
   }
   return detail;
 }
