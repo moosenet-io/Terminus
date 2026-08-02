@@ -410,6 +410,44 @@ mod tests {
         assert_ne!(operator, anon);
     }
 
+    /// TERM-599: two PEOPLE behind one service principal must not share a
+    /// per-principal cache entry.
+    ///
+    /// The router keys this cache on `CallerKey::storage_key()`, which is
+    /// `svc:<principal>` for a service-scoped caller and
+    /// `svc:<principal>#person:<person>` once a person is verified. Keying on the
+    /// bare principal name instead would give every family member the same bucket:
+    /// the first person to ask "what's on my calendar" would populate an entry the
+    /// next person is then served. That is a disclosure strictly WORSE than the
+    /// uniform service-scoping it replaces, which is why this has to hold from the
+    /// moment per-person dispatch works, not afterwards.
+    #[test]
+    fn two_people_behind_one_principal_do_not_share_a_cache_entry() {
+        let p = policy_for("weather").expect("weather is cached per principal");
+        assert!(p.per_principal, "this test is meaningless unless the tool is per-principal");
+        let q = json!({"q": "today"});
+
+        // pii-test-fixture: invented household names
+        let alice = ToolCache::key("weather", &q, Some("svc:lumina#person:alice"), p.per_principal);
+        let bob = ToolCache::key("weather", &q, Some("svc:lumina#person:bob"), p.per_principal);
+        let service = ToolCache::key("weather", &q, Some("svc:lumina"), p.per_principal);
+
+        assert_ne!(alice, bob, "two people must not share a cache bucket");
+        assert_ne!(alice, service, "a person must not read the shared service entry");
+        assert_ne!(bob, service);
+    }
+
+    /// POSITIVE CONTROL for the above: the SAME identity asking the SAME question
+    /// still hits one key, so the partitioning has not simply disabled caching.
+    #[test]
+    fn the_same_person_asking_twice_still_shares_one_entry() {
+        let p = policy_for("weather").unwrap();
+        let q = json!({"q": "today"});
+        let a = ToolCache::key("weather", &q, Some("svc:lumina#person:alice"), p.per_principal);
+        let b = ToolCache::key("weather", &q, Some("svc:lumina#person:alice"), p.per_principal);
+        assert_eq!(a, b);
+    }
+
     #[test]
     fn uncached_tools_are_opt_in_only() {
         // The default for anything without a policy is NO caching — behaviour is
