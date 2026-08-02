@@ -681,7 +681,13 @@ mod tests {
         std::env::set_var("CHORD_RESIDENCY_STATE_PATH", &path);
 
         let out = ServingResidencyStatus.execute(json!({})).await.unwrap();
-        assert!(out.contains("granite4.1:8b"), "got: {out}");
+        // Assert the occupied form POSITIVELY, not just "is not the other two".
+        // A test that only says what an output is NOT passes against almost
+        // anything, including an empty string.
+        assert!(out.contains("residents:"), "occupied output must label its list: {out}");
+        assert!(out.contains("role=chat"), "and name the role: {out}");
+        assert!(out.contains("granite4.1:8b"), "and the model: {out}");
+        assert!(out.contains("vram_gb=12.5"), "and its footprint: {out}");
         assert!(out.contains("resident=1"));
         assert!(!out.contains("state=IDLE"));
         assert!(!out.contains("UNKNOWN"));
