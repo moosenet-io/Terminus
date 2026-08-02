@@ -24,6 +24,7 @@ import { MetricCard } from '../../components/MetricCard';
 import type { StatusColor } from '../../components/Card';
 import { getAggregationClient } from '../../lib/aggregationClient';
 import type { HealthStatus } from '../../lib/aggregationClient';
+import { useActivityFeedLive } from '../../hooks/useActivityFeedLive';
 import {
   useMuseGaps,
   useMuseHealth,
@@ -194,6 +195,24 @@ export function ActivityTiles() {
   // once is the existing `useMuse*` convention (see ImportActivity.tsx re-fetching the same
   // `/api/requests/queue` `useMuseDownloadQueue` already binds), not a regression here.
   const live = useMuseLiveSessions();
+
+  // MACT-08 (MUSE-128): the 'tiles' cadence — one shared `useActivityFeedLive` call polls
+  // every source feeding this row together, at the tier's own 10s interval (there is no WS
+  // path; see useActivityFeedLive.ts's module doc for why), since a stale stat tile is no
+  // less honest a signal than a stale live pane. `terminusHealth` intentionally excluded: it
+  // is the shell's OWN `/api/health` poll, a separate concern from these Muse sources.
+  // Aggregate every source's own `Promise<boolean>` (MUSE-128 review round 2 — `refetch()` now
+  // actually resolves an outcome instead of returning `void`) into ONE outcome for the
+  // backoff ladder: any degraded source counts as a failed poll cycle, so a genuinely-down
+  // endpoint escalates the tiles' poll interval exactly like a fully-failed one would.
+  useActivityFeedLive('tiles', () =>
+    Promise.all([
+      stats.refetch(),
+      gaps.refetch(),
+      subsystems.refetch(),
+      museHealthSection.refetch(),
+      live.refetch(),
+    ]).then(results => results.every(Boolean)));
 
   const states: TileRowStates = {
     librarySize: tileStateFromSection(stats, s => ({ text: formatCount(s.library_size) })),

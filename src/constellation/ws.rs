@@ -41,6 +41,29 @@
 //! - No per-connection registry/broadcast (one operator, one browser tab at
 //!   a time is the documented usage -- `docs/constellation/CONST-GUI-SPEC.md`
 //!   §9 "Technical architecture").
+//!
+//! ## MACT-08 evaluated the Muse fan-in seam above and did NOT use it (recorded finding)
+//! MACT-08 (MUSE-128, the Maestro Activity panel's live-vs-polling cadence) considered wiring
+//! a Muse `source` here -- a periodic `{source:'muse', event:{type:'activity_tick'}}` frame on
+//! a clock inside `pipe()`, since Muse has no outbound event stream Terminus can dial (unlike
+//! the Harmony upstream leg above, there is no socket to relay FROM). That was rejected in
+//! review: a clock-driven tick never observes Muse, so receiving it proves only that this
+//! relay's socket is alive, not that anything Muse-side is reachable or changed -- it is not a
+//! change signal, it is a heartbeat wearing a change signal's envelope. Against the panel's
+//! specified polling fallbacks (live 5s / tiles 10s / history 60s) a ~3s clock-driven tick was
+//! also STRICTLY WORSE than polling directly: more requests for the same or less information
+//! (five Muse round trips per tick for the stat-tile row alone), plus a spurious dependency on
+//! the Harmony upstream leg being configured for a feature that has nothing to do with Harmony.
+//! MACT-08 shipped **direct per-tier polling** instead (`constellation-web/src/hooks/
+//! useActivityFeedLive.ts`) and made no change to this file beyond this comment.
+//!
+//! The `source` seam itself is still exactly what its author left it as -- untouched, and still
+//! the right extension point WHEN a real Muse-side event source exists to fan in (e.g. Muse
+//! gains its own outbound push/webhook Terminus can dial, the same shape the Harmony leg above
+//! already has). At that point wiring it becomes a genuine improvement over polling, rather
+//! than a relabelled poll dressed up as "live" over an extra transport. Read this note before
+//! re-attempting a clock-driven "Muse activity" tick here -- it was tried and rejected for the
+//! reasons above, not merely not-yet-gotten-to.
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, Request, State};

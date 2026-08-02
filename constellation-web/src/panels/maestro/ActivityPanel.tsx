@@ -46,6 +46,7 @@ import { SkeletonList } from '../../components/Skeleton';
 import { DataTable } from '../../components/DataTable';
 import type { DataTableColumn } from '../../components/DataTable';
 import { useMuseLiveSessions, useMuseSessionHistory, museArtUrlAt } from '../../hooks/useMuse';
+import { useActivityFeedLive } from '../../hooks/useActivityFeedLive';
 import type { HistorySession, LiveSession } from '../../lib/aggregationClient';
 import { ImportActivity } from './ImportActivity';
 import { ActivityTiles } from './ActivityTiles';
@@ -55,6 +56,7 @@ import {
   classifyDecision,
   degradeCause,
   distinctBy,
+  feedModeLabel,
   historySourceLabel,
   isItemResolved,
   itemTitle,
@@ -149,16 +151,20 @@ export function LiveSessionCard({ session, onTerminated }: { session: LiveSessio
   );
 }
 
-export function LivePane({ available, detail, sessions, source, onTerminated }: {
+export function LivePane({ available, detail, sessions, source, onTerminated, feedMode }: {
   available: boolean | null;
   detail: string | undefined;
   sessions: LiveSession[];
   source: string | null;
   onTerminated?: () => void;
+  /** MACT-08: "live" / "polling every Ns" — plain-text, never a colour/title-only signal.
+   *  Optional so `ActivityPanel.test.tsx`'s existing prop-only renders (no hook wiring) are
+   *  unaffected; omitted entirely when the caller doesn't have a mode to report yet. */
+  feedMode?: string;
 }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
-      <CardTitle subtitle={source ? liveSourceLabel(source) : 'now playing'}>
+      <CardTitle subtitle={[source ? liveSourceLabel(source) : 'now playing', feedMode].filter(Boolean).join(' · ')}>
         Live
       </CardTitle>
 
@@ -214,11 +220,14 @@ function historyFilterValue(row: HistorySession, key: HistoryFilterKey): string 
   return classifyDecision(row.decision).label;
 }
 
-export function HistoryPane({ available, detail, sessions, source }: {
+export function HistoryPane({ available, detail, sessions, source, feedMode }: {
   available: boolean | null;
   detail: string | undefined;
   sessions: HistorySession[];
   source: string | null;
+  /** MACT-08: "live" / "polling every Ns" — see `LivePane`'s identical prop for the rationale;
+   *  optional for the same reason (existing prop-only tests don't pass it). */
+  feedMode?: string;
 }) {
   const [accountFilter, setAccountFilter] = useState<string | null>(null);
   const [deviceFilter, setDeviceFilter] = useState<string | null>(null);
@@ -282,7 +291,7 @@ export function HistoryPane({ available, detail, sessions, source }: {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
       {/* Read from the resolved envelope, not a hardcoded literal — see the module doc's
           "BOTH panes read `source` off the resolved envelope" note (MUSE-124 review fix). */}
-      <CardTitle subtitle={source ? historySourceLabel(source) : 'watch history'}>
+      <CardTitle subtitle={[source ? historySourceLabel(source) : 'watch history', feedMode].filter(Boolean).join(' · ')}>
         History
       </CardTitle>
 
@@ -351,6 +360,13 @@ export function ActivityPanel() {
   const liveAvailable = live.loading ? null : live.degraded === false;
   const historyAvailable = history.loading ? null : history.degraded === false;
 
+  // MACT-08 (MUSE-128): direct per-tier polling, per pane, at the cadence the spec pins down
+  // (live: 5s; history: 60s) -- there is no WS path (see useActivityFeedLive.ts's module doc).
+  // `ActivityTiles` wires its own 'tiles'-tier call internally since it owns several
+  // independent `useMuse*` sources.
+  const liveFeed = useActivityFeedLive('live', live.refetch);
+  const historyFeed = useActivityFeedLive('history', history.refetch);
+
   return (
     <PanelRoot style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', gap: 'var(--space-5)' }}>
       <CardTitle subtitle="Who is watching what, and what the box is doing">
@@ -368,6 +384,7 @@ export function ActivityPanel() {
         sessions={live.data?.sessions ?? []}
         source={live.data?.source ?? null}
         onTerminated={live.refetch}
+        feedMode={feedModeLabel(liveFeed.live, liveFeed.pollIntervalMs)}
       />
 
       <HistoryPane
@@ -375,6 +392,7 @@ export function ActivityPanel() {
         detail={history.degraded ? history.degraded.detail : undefined}
         sessions={history.data?.sessions ?? []}
         source={history.data?.source ?? null}
+        feedMode={feedModeLabel(historyFeed.live, historyFeed.pollIntervalMs)}
       />
 
       {/* MACT-05 (MUSE-125): "what is Muse importing right now" -- own section, own

@@ -680,6 +680,34 @@ after its bounded reconnect budget was exhausted -- same polling fallback applie
 is required for this item; a future item MAY use the code to distinguish "no backend
 configured" from "backend flapped" in the UI if that becomes useful.
 
+### Maestro Activity panel cadence (MACT-08, MUSE-128)
+
+`src/hooks/useActivityFeedLive.ts` drives the Maestro Activity panel's data on a fixed per-tier
+polling cadence -- live pane every 5s, stat tiles every 10s, history every 60s -- and stops
+ENTIRELY (no timer of any kind) while the tab/route is not visible (`document.visibilityState`).
+On repeated failures the live and tiles tiers double their interval up to a 30s cap; `history`
+does not back off at all, because its cap is the larger of 30s and its own base, and its base is
+already 60s. Polling does NOT fire an extra request on mount: each pane's `useMuseSection`
+already fetches from its own mount effect, so the first poll is scheduled rather than immediate
+(becoming visible again after a hide DOES poll immediately, since that data is stale). `ActivityPanel.tsx`'s `LivePane`/
+`HistoryPane` and `ActivityTiles.tsx` all use it and render the resulting cadence as a
+plain-text "polling every Ns" label next to their existing source label -- never a colour/
+title-only signal.
+
+**This item originally planned to ride the `/ws` relay** -- a periodic Muse `activity_tick`
+change-signal, coalesced client-side, promoted to a "live" state when ticks were arriving. That
+was rejected in review: the tick would have been a clock inside `ws.rs`'s `pipe()` loop, never
+actually observing Muse, so receiving it would have proven only that the relay's own socket was
+alive -- not that Muse was reachable or had changed. Its ~3s cadence was also tighter than every
+one of the panel's own polling numbers above, so wiring it would have INCREASED backend load
+(five Muse requests per tick for the stat-tile row alone) for zero additional information, on
+top of a spurious dependency on Harmony's upstream WS leg for a feature that has nothing to do
+with Harmony. `ws.rs` carries no functional change for MACT-08 -- only a doc comment recording
+this finding (its "MACT-08 evaluated..." section) so the next person inherits it rather than
+rediscovering it. The `source` envelope seam described in the "Real-time relay" section above
+is untouched and remains the right extension point if Muse ever grows a real outbound event
+source to fan in.
+
 ## Lumina Conversations panel (LGUI-07)
 
 `lumina.chat` (`/lumina/chat`, `src/panels/lumina/ChatPanel.tsx` +
