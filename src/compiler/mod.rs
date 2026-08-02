@@ -3705,6 +3705,30 @@ impl CompilerBuild {
         let built_bin: PathBuf;
         let mut test_outcome: Option<(bool, CargoTestSummary, String)> = None;
 
+        // TERM #609: the reclaim guard lives HERE, at the same scope as the
+        // `built_bin` it protects — not inside the local branch.
+        //
+        // It used to be a `let _scratch_guard` inside `if resolved.is_local()`.
+        // On that path `built_bin` points INTO the reclaimed directory, so the
+        // guard dropped at the end of the branch and deleted the binary
+        // roughly six hundred lines before the publish step tried to hash it:
+        //
+        //   read .../target/<triple>/release/<bin> for sha256:
+        //   No such file or directory (os error 2)
+        //
+        // The cargo build succeeded every time, which is what made it look
+        // like a publish bug rather than a lifetime bug. The remote path was
+        // unaffected only by accident — it copies the artifact to `local_bin`
+        // outside the scratch tree, so nothing it needed was inside the guard.
+        // That asymmetry is why this survived: the heavy path, being the one
+        // usually exercised, kept working while every local build was dead.
+        //
+        // Binding it at this scope ties the directory's lifetime to the last
+        // reader of its contents instead of to the block that happened to
+        // create it. Reclaim still always happens — the guard is dropped when
+        // the function returns, on the error paths too.
+        let mut scratch_guard: Option<ScratchReclaim> = None;
+
         if resolved.is_local() {
             // ── LOCAL build (primary, in place) ──────────────────────────────
             // PCON-10: a PER-JOB CARGO_TARGET_DIR + TMPDIR on the big-disk scratch
@@ -3726,7 +3750,7 @@ impl CompilerBuild {
             // Derive via job_scratch_base — NOT `scratch_root.join(&unit)`. The
             // job component is shortened, so joining the raw unit would name a
             // dir that never existed and leak the real one on every build.
-            let _scratch_guard = ScratchReclaim::new(job_scratch_base(&scratch_root, &unit));
+            scratch_guard = Some(ScratchReclaim::new(job_scratch_base(&scratch_root, &unit)));
             // cargo creates CARGO_TARGET_DIR itself, but TMPDIR must pre-exist.
             std::fs::create_dir_all(&tmp_dir).map_err(|e| {
                 ToolError::Execution(format!(
@@ -4586,6 +4610,18 @@ impl CompilerBuild {
         } else {
             publish::publish_local(&root, &module, channel, &triple, &bin, &built_bin).await?
         };
+
+        // TERM #609: reclaim the per-job scratch HERE, explicitly, now that the
+        // binary inside it has been hashed and published.
+        //
+        // Dropping it by scope-exit alone would work, but it left the binding
+        // looking dead — the compiler warned it was assigned and never read,
+        // which is an open invitation for someone to delete the assignment and
+        // restore the very bug this fixes. An explicit drop names the moment
+        // reclaim is safe, and puts it after the last reader rather than
+        // wherever a block happens to end. Later exits still reclaim: the guard
+        // is dropped on every path out of this function.
+        drop(scratch_guard.take());
 
         // ── BLD-07 store: on a LOCAL publish (dataset mounted RW on this host),
         // write the per-sha manifest and flip `experimental/current` onto the new
@@ -7836,6 +7872,41 @@ Source:
         assert!(j.contains("-o BatchMode=yes"), "{j}");
         assert!(j.contains("-o ConnectTimeout=10"), "{j}");
         assert_eq!(argv.last().unwrap(), "rm -rf '/mnt/bt/chord-deadbeef'");
+    }
+
+    #[test]
+    fn local_scratch_survives_the_branch_that_creates_it() {
+        // TERM #609. The guard used to be bound inside `if resolved.is_local()`,
+        // while the binary it protects is read by the publish step far outside
+        // that branch — so the scratch dir, and the freshly built binary in it,
+        // were deleted before anything could hash them. Every local build
+        // failed at publish with ENOENT on a file cargo had just written.
+        //
+        // This pins the LIFETIME, which is the thing that was wrong: the
+        // directory must outlive the block that creates it and be reclaimed
+        // only when the whole operation is done with it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let scratch = tmp.path().join("terminus-bu-deadbeef");
+        let built_bin = scratch.join("target/release/harmony-server");
+        std::fs::create_dir_all(built_bin.parent().unwrap()).expect("create");
+        std::fs::write(&built_bin, b"ELF").expect("write");
+
+        let mut guard: Option<ScratchReclaim> = None;
+        {
+            // Stands in for the `is_local()` branch: it arms the guard and ends.
+            guard = Some(ScratchReclaim::new(scratch.clone()));
+        }
+        assert!(
+            built_bin.exists(),
+            "the binary must still be readable after the branch that built it returns — \
+             this is exactly what publish could not find"
+        );
+
+        drop(guard);
+        assert!(
+            !scratch.exists(),
+            "reclaim must still happen once the operation is finished with it"
+        );
     }
 
     #[test]
