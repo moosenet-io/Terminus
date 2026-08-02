@@ -182,7 +182,10 @@ describe('wiringDisplay -- the same live/worker/seam/unmounted vocabulary as Sub
 // empty-queue message rendered side by side, contradicting each other. (2) It asserted the
 // function invents a SPECIFIC diagnosis ("download client") the subsystem payload never
 // actually asserts -- `seam`/`unmounted` only carry the generic meaning `get_subsystems`'s own
-// doc comment defines. These tests now pin the corrected, honestly-scoped behaviour instead.
+// doc comment defines. Round 3 (codex, confirmed real) caught a third, finer overclaim: "N
+// titles monitored with nothing grabbed yet" asserted a history `wanted[]` doesn't carry (see
+// `emptyQueueReason`'s doc for the corrected "no file yet" wording). These tests pin the fully
+// corrected, honestly-scoped behaviour.
 describe('emptyQueueReason -- reports only what wanted[]/subsystem state actually say, never a derived diagnosis', () => {
   it('names "nothing is currently monitored" when wantedCount is 0', () => {
     expect(emptyQueueReason('unmounted', 0)).toMatch(/nothing is currently monitored/);
@@ -190,12 +193,20 @@ describe('emptyQueueReason -- reports only what wanted[]/subsystem state actuall
 
   it('names the actual monitored COUNT rather than staying silent about it -- the contradiction this fix closes', () => {
     const withWanted = emptyQueueReason('worker', 3);
-    expect(withWanted).toMatch(/3 titles monitored/);
+    expect(withWanted).toMatch(/3 monitored titles have no file yet/);
     expect(withWanted).not.toMatch(/nothing is currently monitored/);
   });
 
   it('singularises a wanted count of exactly 1', () => {
-    expect(emptyQueueReason('worker', 1)).toMatch(/1 title monitored/);
+    expect(emptyQueueReason('worker', 1)).toMatch(/1 monitored title has no file yet/);
+  });
+
+  // Review fix (round 3, codex, confirmed real): "nothing grabbed yet" asserted a history
+  // `wanted[]` doesn't carry -- a title can be grabbed and complete while still having no file,
+  // or have left the queue in a previous run. The message must never claim that.
+  it('never claims anything about whether a title was ever grabbed -- only that it has no file', () => {
+    const withWanted = emptyQueueReason('worker', 2);
+    expect(withWanted).not.toMatch(/grabbed/i);
   });
 
   it('reports the subsystem state word + its OWN documented meaning, never a specific dependency diagnosis', () => {

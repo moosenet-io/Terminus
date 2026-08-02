@@ -174,24 +174,37 @@ export function wiringDisplay(state: string | null): WiringDisplay {
 // Fixed: report the two facts the payload actually contains — whether anything is monitored
 // (from `wanted`, which this function now takes), and the subsystem's OWN state word plus its
 // OWN documented meaning (never a derived diagnosis) — and say nothing beyond that.
+//
+// SOURCE OF TRUTH for the four values below: the doc comment directly above
+// `pub async fn get_subsystems` in Muse `src/web/dashboard.rs` (as of the S130 tree) --
+//   "`live` (wired + has data), `worker` (wired, background/on-demand), `seam` (implemented,
+//   not yet producing data), `unmounted` (not configured)."
+// These strings are meant to TRACK that comment, not paraphrase it -- if it changes, re-check
+// and update this map so the authority stays the authority.
 const WIRING_STATE_MEANING: Record<string, string> = {
-  live: 'wired, with data',
-  worker: 'wired as a background/on-demand worker',
+  live: 'wired + has data',
+  worker: 'wired, background/on-demand',
   seam: 'implemented, not yet producing data',
   unmounted: 'not configured',
 };
 
 /** Why the queue is empty. Two independent, honestly-scoped facts, never conflated:
- *   1. Whether anything is monitored at all (`wantedCount`, from the SAME payload's `wanted[]`
- *      — the count this section already renders as a link) — "nothing monitored" and "N
- *      monitored, nothing grabbed yet" are genuinely different states and must not collapse to
- *      one generic message.
+ *   1. Whether anything currently has no file at all (`wantedCount`, from the SAME payload's
+ *      `wanted[]` — the count this section already renders as a link). `wanted[]` only means
+ *      "monitored, no `media_files` row" (see `WantedTitleRow`'s doc in Muse's
+ *      `src/repo/dashboard.rs`) — it does NOT establish that nothing has ever been grabbed (a
+ *      release can complete and still have no file yet, or have left the queue in an earlier
+ *      run), so the message says exactly that and nothing more.
  *   2. The acquisition subsystem's own `/api/subsystems` state WORD plus its OWN documented
- *      meaning (`WIRING_STATE_MEANING`, straight from `get_subsystems`'s doc comment) — never a
- *      derived claim about which dependency is missing, since the payload doesn't say that. */
+ *      meaning (`WIRING_STATE_MEANING`, transcribed from `get_subsystems`'s doc comment) — never
+ *      a derived claim about which dependency is missing, since the payload doesn't say that. */
 export function emptyQueueReason(acquisitionState: string | null, wantedCount: number): string {
+  // Review fix (round 3, codex): "N titles monitored with nothing grabbed yet" was itself an
+  // overclaim -- `wanted[]` establishes "no file yet", not "never grabbed". A release can be
+  // grabbed and complete while the file is still absent, or have left the queue in a previous
+  // run; this endpoint carries no history that rules that out. Say only what `wanted[]` means.
   const monitoredNote = wantedCount > 0
-    ? `${wantedCount} title${wantedCount === 1 ? '' : 's'} monitored with nothing grabbed yet`
+    ? `${wantedCount} monitored title${wantedCount === 1 ? '' : 's'} ${wantedCount === 1 ? 'has' : 'have'} no file yet`
     : 'nothing is currently monitored';
 
   if (acquisitionState === null) {

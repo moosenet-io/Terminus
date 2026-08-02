@@ -125,7 +125,7 @@ describe('ImportActivitySection — degrade / empty / loading are visibly distin
     const html = render({ available: true, queue: [], acquisitionState: 'live', wanted: [] });
     expect(html).toContain('Nothing in the acquisition pipeline');
     expect(html).toContain('Acquisition reports state');
-    expect(html).toContain('wired, with data');
+    expect(html).toContain('wired + has data');
   });
 
   // Review fix (round 2, codex, confirmed real): a non-empty `wanted[]` next to an empty-queue
@@ -139,8 +139,12 @@ describe('ImportActivitySection — degrade / empty / loading are visibly distin
       wanted: [wantedRow(), wantedRow({ media_metadata_id: 2 }), wantedRow({ media_metadata_id: 3 })],
     });
     expect(html).toContain('3 waiting on a release');
-    expect(html).toContain('3 titles monitored');
+    // Review fix (round 3, codex): "3 monitored titles have no file yet" states exactly what
+    // wanted[] means -- never "nothing grabbed yet", which would assert a history (was it ever
+    // grabbed?) the payload doesn't carry.
+    expect(html).toContain('3 monitored titles have no file yet');
     expect(html).not.toContain('nothing is currently monitored');
+    expect(html).not.toMatch(/grabbed/i);
   });
 });
 
