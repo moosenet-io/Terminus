@@ -26,7 +26,17 @@ export interface MuseSection<T> {
   /** false = healthy; otherwise the detail string to hand straight to `ChartCard`'s
    *  `degraded` prop (renders the module-standard degraded card, never a crash). */
   degraded: { detail: string } | false;
-  refetch: () => void;
+  /**
+   * MACT-08 (MUSE-128 review round 2): resolves `true` on a successful fetch, `false` on a
+   * degraded/errored one -- NEVER rejects, so the overwhelming majority of call sites that
+   * call `refetch()` and ignore its return value (event handlers, mount effects) keep working
+   * completely unchanged; a `Promise<boolean>` assigned where `() => void` is expected is a
+   * normal, safe covariant widening. A caller that DOES need the outcome (the polling backoff
+   * in `useActivityFeedLive.ts`) can `await` it instead of guessing from a void return, which a
+   * prior version of this hook made structurally impossible (the promise was never returned) --
+   * see that file's own doc for the review finding this fixes.
+   */
+  refetch: () => Promise<boolean>;
 }
 
 const NOT_WIRED_STATUS = new Set([404, 501]);
@@ -52,31 +62,34 @@ function useMuseSection<T>(path: string | null): MuseSection<T> {
   const [loading, setLoading] = useState(path !== null);
   const [degraded, setDegraded] = useState<{ detail: string } | false>(false);
 
-  const fetchOnce = useCallback(() => {
+  const fetchOnce = useCallback((): Promise<boolean> => {
     if (path === null) {
       setLoading(false);
       setData(null);
       setDegraded(false);
-      return;
+      return Promise.resolve(true);
     }
     setLoading(true);
-    getAggregationClient()
+    return getAggregationClient()
       .request<T | null>('muse', path)
       .then(d => {
         if (d === null || d === undefined) {
           // mockAdapter's "not mocked" sentinel -- treat exactly like a 404 from a real backend.
           setDegraded({ detail: 'not yet wired' });
           setData(null);
-        } else {
-          setDegraded(false);
-          setData(d);
+          setLoading(false);
+          return false;
         }
+        setDegraded(false);
+        setData(d);
         setLoading(false);
+        return true;
       })
       .catch(err => {
         setDegraded(classifyError(err));
         setData(null);
         setLoading(false);
+        return false;
       });
   }, [path]);
 
@@ -1229,18 +1242,20 @@ function useMuseTypedSection<T extends { available: boolean; detail?: string }>(
 
   // eslint-disable-next-line react-hooks/exhaustive-deps -- `fetcher` is rebuilt by callers
   // every render from `deps`; keying the effect on `deps` (not `fetcher`) avoids a fetch loop.
-  const fetchOnce = useCallback(() => {
+  const fetchOnce = useCallback((): Promise<boolean> => {
     setLoading(true);
-    fetcher()
+    return fetcher()
       .then(res => {
         if (!res.available) {
           setDegraded({ detail: res.detail ?? 'unavailable' });
           setData(null);
-        } else {
-          setDegraded(false);
-          setData(res);
+          setLoading(false);
+          return false;
         }
+        setDegraded(false);
+        setData(res);
         setLoading(false);
+        return true;
       })
       .catch(err => {
         // Defensive only -- the typed client methods this feeds never throw (they resolve
@@ -1249,6 +1264,7 @@ function useMuseTypedSection<T extends { available: boolean; detail?: string }>(
         setDegraded({ detail: err instanceof Error ? err.message : 'unknown error' });
         setData(null);
         setLoading(false);
+        return false;
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps);

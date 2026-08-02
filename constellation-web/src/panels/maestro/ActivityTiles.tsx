@@ -201,13 +201,18 @@ export function ActivityTiles() {
   // together, since a stale stat tile is no less honest a signal than a stale live pane.
   // `terminusHealth` intentionally excluded: it is the shell's OWN `/api/health` poll, not a
   // Muse activity source the tick fans in for.
-  useActivityFeedLive('tiles', () => {
-    stats.refetch();
-    gaps.refetch();
-    subsystems.refetch();
-    museHealthSection.refetch();
-    live.refetch();
-  });
+  // Aggregate every source's own `Promise<boolean>` (MUSE-128 review round 2 — `refetch()` now
+  // actually resolves an outcome instead of returning `void`) into ONE outcome for the
+  // backoff ladder: any degraded source counts as a failed poll cycle, so a genuinely-down
+  // endpoint escalates the tiles' poll interval exactly like a fully-failed one would.
+  useActivityFeedLive('tiles', () =>
+    Promise.all([
+      stats.refetch(),
+      gaps.refetch(),
+      subsystems.refetch(),
+      museHealthSection.refetch(),
+      live.refetch(),
+    ]).then(results => results.every(Boolean)));
 
   const states: TileRowStates = {
     librarySize: tileStateFromSection(stats, s => ({ text: formatCount(s.library_size) })),

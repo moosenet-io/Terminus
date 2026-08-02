@@ -680,25 +680,29 @@ after its bounded reconnect budget was exhausted -- same polling fallback applie
 is required for this item; a future item MAY use the code to distinguish "no backend
 configured" from "backend flapped" in the UI if that becomes useful.
 
-### Muse activity fan-in + live-vs-polling cadence (MACT-08, MUSE-128)
+### Maestro Activity panel cadence (MACT-08, MUSE-128)
 
-The same `/ws` relay also fans in a small, periodic **change signal** for Maestro's Activity
-panel: `{source:'muse', event:{type:'activity_tick', ts}}`, emitted every ~3s for the
-lifetime of a connection once the upstream Harmony leg is established (see `ws.rs`'s "MACT-08"
-doc section). It is deliberately NOT the payload -- session/library/import data still comes
-exclusively through `proxy_muse` on `/api/*`, credential-gated and masked exactly as before;
-the tick only ever tells the client "go refetch through the client".
+`src/hooks/useActivityFeedLive.ts` drives the Maestro Activity panel's data on a fixed per-tier
+polling cadence -- live pane every 5s, stat tiles every 10s, history every 60s, backing off up
+to a 30s cap on repeated failures, and stopping ENTIRELY (no timer of any kind) while the
+tab/route is not visible (`document.visibilityState`). `ActivityPanel.tsx`'s `LivePane`/
+`HistoryPane` and `ActivityTiles.tsx` all use it and render the resulting cadence as a
+plain-text "polling every Ns" label next to their existing source label -- never a colour/
+title-only signal.
 
-`src/hooks/useActivityFeedLive.ts` is the client half: given a tier (`'live'` | `'tiles'` |
-`'history'`) and a `refetch` callback, it refetches on a coalesced tick (at most once every 2s)
-while ticks are actually arriving, falls back to polling at the tier's own cadence the moment
-they stop (WS unavailable: live pane 5s, stat tiles 10s, history 60s -- with backoff up to 30s
-on repeated poll failures), and stops entirely -- no socket, no timers -- while the tab/route
-is not visible (`document.visibilityState`). `ActivityPanel.tsx`'s `LivePane`/`HistoryPane` and
-`ActivityTiles.tsx` all use it and render the resulting mode as a plain-text "live" or "polling
-every Ns" label next to their existing source label -- never a colour/title-only signal, and
-never "live" merely because the socket happens to be open (a connected-but-silent fan-in source
-still reads as polling).
+**This item originally planned to ride the `/ws` relay** -- a periodic Muse `activity_tick`
+change-signal, coalesced client-side, promoted to a "live" state when ticks were arriving. That
+was rejected in review: the tick would have been a clock inside `ws.rs`'s `pipe()` loop, never
+actually observing Muse, so receiving it would have proven only that the relay's own socket was
+alive -- not that Muse was reachable or had changed. Its ~3s cadence was also tighter than every
+one of the panel's own polling numbers above, so wiring it would have INCREASED backend load
+(five Muse requests per tick for the stat-tile row alone) for zero additional information, on
+top of a spurious dependency on Harmony's upstream WS leg for a feature that has nothing to do
+with Harmony. `ws.rs` carries no functional change for MACT-08 -- only a doc comment recording
+this finding (its "MACT-08 evaluated..." section) so the next person inherits it rather than
+rediscovering it. The `source` envelope seam described in the "Real-time relay" section above
+is untouched and remains the right extension point if Muse ever grows a real outbound event
+source to fan in.
 
 ## Lumina Conversations panel (LGUI-07)
 
