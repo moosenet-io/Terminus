@@ -21,6 +21,25 @@
  *  caller never hand-types a near-duplicate string that drifts from this one. */
 export const MAESTRO_SEAM_LABEL = 'requires Maestro — not deployed';
 
+/** Max length of the VISIBLE degraded-cause line `StatTile` renders beneath the `—`. Review
+ *  finding (round 2, codex): the first cut of `StatTile` put the cause ONLY in an HTML `title`
+ *  attribute — invisible without a mouse hover, unavailable on touch, not reliably surfaced by
+ *  assistive tech, so the only VISIBLE difference between "degraded" and "not reported" was
+ *  colour alone. That fails the three-states rule (colour-only is not a distinct rendered
+ *  state) and is an independent accessibility defect. The fix renders a short cause line as
+ *  real card content; this constant bounds it so a long `HttpStatusError` message (a full URL
+ *  path, say) doesn't blow out the tile's fixed grid width. The full, untruncated detail stays
+ *  available via `title` too — that remains a nice-to-have, not the sole carrier. */
+export const DEGRADED_DETAIL_MAX_LEN = 28;
+
+/** Truncates a degrade `detail` string to a tile-sized visible line, ellipsizing rather than
+ *  hard-cutting mid-word where a trailing space exists. A string already within the bound is
+ *  returned verbatim (never re-padded/re-shaped) — this function only ever shortens. */
+export function truncateDetail(detail: string, maxLen: number = DEGRADED_DETAIL_MAX_LEN): string {
+  if (detail.length <= maxLen) return detail;
+  return `${detail.slice(0, Math.max(0, maxLen - 1)).trimEnd()}…`;
+}
+
 /** Restricted to the tones `StatTile` actually maps onto a `MetricCard` `valueColor`
  *  (components/Card.tsx's `StatusColor`) — kept narrow so a formatter cannot invent a tone the
  *  renderer doesn't understand. `undefined` (omitted) means "primary", the plain-fact default. */

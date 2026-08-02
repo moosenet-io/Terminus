@@ -39,6 +39,7 @@ import {
   formatRelativeTimestamp,
   formatSubsystemWiring,
   tileStateFromSection,
+  truncateDetail,
 } from './tileFormat';
 import type { TileTone, TileValueState } from './tileFormat';
 
@@ -92,9 +93,13 @@ function toneColor(tone: TileTone | undefined): StatusColor {
 /** One H1 stat tile. Three visually-distinct renders, never conflated (the honesty rule this
  *  whole file exists to enforce):
  *   - loading  -> "…", tertiary (a render-in-progress placeholder, not a value)
- *   - degraded -> "—", WARNING tone + a `title` naming the cause (never silently identical to
- *                 a healthy "not reported" dash — the tone and tooltip are what distinguish
- *                 them, since both happen to render the same glyph)
+ *   - degraded -> "—", WARNING tone, PLUS a short cause line rendered as real, visible card
+ *                 content (not just an HTML `title` attribute — review finding, round 2: a
+ *                 hover-only tooltip is invisible on touch and not reliably surfaced by
+ *                 assistive tech, so colour alone was the only thing distinguishing "degraded"
+ *                 from "not reported", which fails the three-states rule on its own terms).
+ *                 `title` is still set too, for the untruncated detail on hover — a nice-to-
+ *                 have now, never the sole carrier.
  *   - value    -> the formatted text verbatim, INCLUDING a genuine "0" (never re-dashed) */
 export function StatTile({ label, state }: { label: string; state: TileValueState }) {
   if (state.kind === 'loading') {
@@ -104,6 +109,16 @@ export function StatTile({ label, state }: { label: string; state: TileValueStat
     return (
       <div title={state.detail}>
         <MetricCard label={label} value="—" valueColor="warning" />
+        <div
+          style={{
+            fontSize: 'var(--fs-xs)',
+            color: 'var(--status-warning)',
+            marginTop: 'var(--space-1)',
+            overflowWrap: 'break-word',
+          }}
+        >
+          {truncateDetail(state.detail)}
+        </div>
       </div>
     );
   }

@@ -13,6 +13,22 @@ import { SeamTile, StatTile, TileRow } from './ActivityTiles';
 import type { TileRowStates } from './ActivityTiles';
 import { MAESTRO_SEAM_LABEL } from './tileFormat';
 
+/** Strips every HTML tag (and therefore every ATTRIBUTE — `title="..."` included) from a
+ *  `renderToStaticMarkup` string, leaving only the text a person actually sees rendered.
+ *
+ *  Review finding (round 2, codex): the first cut of the degraded-tile test asserted
+ *  `html.toContain(detail)`, which passed because the detail sat in an HTML `title` attribute
+ *  — invisible without a hover, unavailable on touch, not reliably surfaced by assistive tech.
+ *  That test would have stayed green forever with the bug it was meant to catch, because
+ *  `title="HTTP 401 for /stats"` and a genuinely rendered `<div>HTTP 401 for /stats</div>` both
+ *  satisfy a plain substring check on the raw markup. Asserting against `visibleText()` instead
+ *  of the raw HTML is what makes a test here actually prove "a person can see this" rather than
+ *  "this string exists somewhere in the DOM tree" — the exact distinction the review called out
+ *  ("being present in the markup is not the same as being communicated"). */
+function visibleText(html: string): string {
+  return html.replace(/<[^>]+>/g, ' ');
+}
+
 describe('StatTile — three visually distinct states', () => {
   it('loading renders a placeholder glyph, never a value or a dash', () => {
     const html = renderToStaticMarkup(<StatTile label="Library size" state={{ kind: 'loading' }} />);
@@ -20,13 +36,49 @@ describe('StatTile — three visually distinct states', () => {
     expect(html).not.toContain('>0<');
   });
 
-  it('degraded renders "—" with the cause in a title attribute (never a fabricated 0)', () => {
+  it('degraded renders "—" AND the cause as VISIBLE text — not only in a hover-only title attribute', () => {
     const html = renderToStaticMarkup(
       <StatTile label="Library size" state={{ kind: 'degraded', detail: 'HTTP 401 for /stats' }} />,
     );
-    expect(html).toContain('—');
-    expect(html).toContain('HTTP 401 for /stats');
+    const visible = visibleText(html);
+    // The dash is visible content.
+    expect(visible).toContain('—');
+    // THE finding this test exists to pin: the cause must be visible TEXT, not merely present
+    // somewhere in the raw markup (a `title="..."` attribute would satisfy a raw `html.toContain`
+    // check but disappear entirely once tags/attributes are stripped, which is what
+    // `visibleText()` does). This must survive stripping.
+    expect(visible).toContain('HTTP 401 for /stats');
     expect(html).not.toContain('>0<');
+  });
+
+  it('a long degraded detail is truncated in the VISIBLE line but kept in full in the title attribute', () => {
+    const longDetail = 'HTTP 401 for /api/requests/queue (unauthenticated, CONSTELLATION_MUSE_TOKEN unset)';
+    const html = renderToStaticMarkup(
+      <StatTile label="Library size" state={{ kind: 'degraded', detail: longDetail }} />,
+    );
+    const visible = visibleText(html);
+    // The full detail is still reachable on hover (a nice-to-have, never the sole carrier).
+    expect(html).toContain(`title="${longDetail}"`);
+    // But the VISIBLE line is shortened, not the raw 85-character string verbatim.
+    expect(visible).not.toContain(longDetail);
+    expect(visible).toContain('HTTP 401 for /api');
+  });
+
+  it('degraded and not-reported are distinguishable WITHOUT relying on colour alone', () => {
+    // "Not reported" in this codebase is a `value` state whose formatted text is itself "—"
+    // (e.g. formatRelativeTimestamp(null) -- see tileFormat.test.ts). Compare that render
+    // against a `degraded` render of the SAME tile: colour (valueColor) differs, but the
+    // review's point is that colour must not be the ONLY distinguishing signal. Proven here by
+    // showing the VISIBLE TEXT differs too, independent of any colour/style inspection.
+    const notReported = visibleText(
+      renderToStaticMarkup(<StatTile label="Last ingest" state={{ kind: 'value', text: '—' }} />),
+    );
+    const degraded = visibleText(
+      renderToStaticMarkup(<StatTile label="Last ingest" state={{ kind: 'degraded', detail: 'HTTP 401 for /stats' }} />),
+    );
+    expect(notReported).not.toEqual(degraded);
+    expect(degraded).toContain('HTTP 401 for /stats');
+    expect(notReported).not.toContain('HTTP 401 for /stats');
   });
 
   it('a genuine 0 value renders literally as "0" -- never coerced to "—"', () => {
@@ -93,7 +145,9 @@ describe('TileRow — the seam vs. a genuine 0 are distinguishable in the same r
     // calls, and this test pins that TileRow renders whatever state each tile is handed,
     // independently.
     const html = renderToStaticMarkup(<TileRow states={states} />);
-    expect(html).toContain('HTTP 401 for /stats');
+    const visible = visibleText(html);
+    // Visible, not just present in a title attribute -- see the StatTile tests above.
+    expect(visible).toContain('HTTP 401 for /stats');
     // The still-ready gaps-backlog tile ("17") must still be present.
     expect(html).toContain('17');
   });

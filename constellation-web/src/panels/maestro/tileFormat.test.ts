@@ -5,6 +5,7 @@
 // shows 0" must be DISTINGUISHABLE, not just individually true.
 import { describe, it, expect } from 'vitest';
 import {
+  DEGRADED_DETAIL_MAX_LEN,
   MAESTRO_SEAM_LABEL,
   formatCount,
   formatModuleHealth,
@@ -12,6 +13,7 @@ import {
   formatRelativeTimestamp,
   formatSubsystemWiring,
   tileStateFromSection,
+  truncateDetail,
 } from './tileFormat';
 
 describe('formatCount — a genuine 0 is a value, never re-dashed to "not reported"', () => {
@@ -133,6 +135,28 @@ describe('tileStateFromSection — loading/degraded/ready classification', () =>
       d => ({ text: formatCount(d.n), tone: 'success' as const }),
     );
     expect(state).toEqual({ kind: 'value', text: '0', tone: 'success' });
+  });
+});
+
+describe('truncateDetail — shortens a degrade cause for the tile\'s VISIBLE line', () => {
+  it('returns a short string unchanged', () => {
+    expect(truncateDetail('HTTP 401')).toBe('HTTP 401');
+  });
+  it('returns a string exactly at the bound unchanged', () => {
+    const exact = 'x'.repeat(DEGRADED_DETAIL_MAX_LEN);
+    expect(truncateDetail(exact)).toBe(exact);
+    expect(truncateDetail(exact).length).toBe(DEGRADED_DETAIL_MAX_LEN);
+  });
+  it('ellipsizes a string over the bound, staying at or under the bound', () => {
+    const long = 'HTTP 401 for /api/requests/queue (unauthenticated)';
+    const r = truncateDetail(long);
+    expect(r.length).toBeLessThanOrEqual(DEGRADED_DETAIL_MAX_LEN);
+    expect(r.endsWith('…')).toBe(true);
+    expect(long.startsWith(r.slice(0, -1))).toBe(true);
+  });
+  it('never returns the full untruncated string once it exceeds the bound', () => {
+    const long = 'HTTP 401 for /api/requests/queue (unauthenticated, CONSTELLATION_MUSE_TOKEN unset)';
+    expect(truncateDetail(long)).not.toBe(long);
   });
 });
 
