@@ -100,14 +100,19 @@ export function TerminateControl({ session, onTerminated }: TerminateControlProp
     setOpen(true);
   }
 
+  // Cancel NEVER calls `terminate()` — there is no call here to gate, on purpose (review
+  // finding, MUSE-127 round 2: a prior version routed this through a `shouldIssueTerminateCall`
+  // guard that was never actually reached by this function, i.e. a dead branch pretending to
+  // protect a path it wasn't on). All three of ConfirmDialog's cancel surfaces (Cancel button,
+  // Escape key, backdrop click) funnel through this ONE `onCancel` prop
+  // (`components/ConfirmDialog.tsx`), so this is the single place that matters — proven at the
+  // component level in `TerminateControl.interaction.test.tsx`, not merely asserted here.
   function cancel() {
-    // `shouldIssueTerminateCall('cancel', …)` is always `false` by construction (see its doc in
-    // terminateOutcome.ts) — cancel never reaches `terminate()`, full stop. Nothing to gate here.
     setOpen(false);
   }
 
   async function confirm() {
-    if (!shouldIssueTerminateCall('confirm', { canTarget, inFlight })) return;
+    if (!shouldIssueTerminateCall({ canTarget, inFlight })) return;
     const key = session.session_key as string;
     const outcome = await terminate(key, reason.trim() || undefined);
     setResult(outcome);

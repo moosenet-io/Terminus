@@ -12,25 +12,25 @@ import {
 } from './terminateOutcome';
 import type { MuseTerminateResult } from '../../lib/aggregationClient';
 
-describe('shouldIssueTerminateCall — confirm issues a call, cancel never does', () => {
-  // MUTATION-PROOF: reverting `if (action === 'cancel') return false;` to `return true;` makes
-  // this test fail. Verified by hand.
-  it('cancel is ALWAYS false, regardless of canTarget/inFlight', () => {
-    expect(shouldIssueTerminateCall('cancel', { canTarget: true, inFlight: false })).toBe(false);
-    expect(shouldIssueTerminateCall('cancel', { canTarget: false, inFlight: true })).toBe(false);
-    expect(shouldIssueTerminateCall('cancel', { canTarget: false, inFlight: false })).toBe(false);
+// Review finding (MUSE-127 round 2): this used to also test a `'cancel'` action on
+// `shouldIssueTerminateCall` — that branch was DEAD (see the function's doc in
+// terminateOutcome.ts for the full story: `cancel()` never called it, so the mutation test
+// that lived here "proved" a helper outside the path it claimed to protect). The function now
+// only guards the one real call site (`confirm()`); "cancel never calls terminate" is proven
+// at the component level instead — see `TerminateControl.interaction.test.tsx`.
+describe('shouldIssueTerminateCall — the ONE real call site (confirm)', () => {
+  // MUTATION-PROOF: reverting `return opts.canTarget && !opts.inFlight;` to `return true;` makes
+  // the next two tests fail. Verified by hand.
+  it('issues a call when targetable and not already in flight', () => {
+    expect(shouldIssueTerminateCall({ canTarget: true, inFlight: false })).toBe(true);
   });
 
-  it('confirm issues a call when targetable and not already in flight', () => {
-    expect(shouldIssueTerminateCall('confirm', { canTarget: true, inFlight: false })).toBe(true);
+  it('is blocked without a session_key to target (canTarget:false)', () => {
+    expect(shouldIssueTerminateCall({ canTarget: false, inFlight: false })).toBe(false);
   });
 
-  it('confirm is blocked without a session_key to target (canTarget:false)', () => {
-    expect(shouldIssueTerminateCall('confirm', { canTarget: false, inFlight: false })).toBe(false);
-  });
-
-  it('confirm is blocked while already in flight (double-submit guard)', () => {
-    expect(shouldIssueTerminateCall('confirm', { canTarget: true, inFlight: true })).toBe(false);
+  it('is blocked while already in flight (double-submit guard)', () => {
+    expect(shouldIssueTerminateCall({ canTarget: true, inFlight: true })).toBe(false);
   });
 });
 

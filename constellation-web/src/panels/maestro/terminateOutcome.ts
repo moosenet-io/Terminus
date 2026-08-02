@@ -9,12 +9,14 @@
 //      success either: a viewer not seeing an explanation is a different fact from the player
 //      still running (see `MuseTerminateResult`'s own doc comment in aggregationClient.ts).
 //   2. A `403` (`kind: 'forbidden'`) renders EXACTLY "operator role required" — the same
-//      wording `RoleGate`'s tooltip uses (`components/RoleGate.tsx`) — and must render
-//      distinguishably from a genuine transport failure (`kind: 'error'`), never the same copy.
+//      reason `RoleGate` exposes as persistent, accessible content (`components/RoleGate.tsx`,
+//      `OPERATOR_ROLE_REQUIRED_REASON`) — and must render distinguishably from a genuine
+//      transport failure (`kind: 'error'`), never the same copy.
 //   3. A `409` (`kind: 'conflict'`) renders its own distinct message — never the generic
 //      transport-error copy — so an operator can tell "ambiguous target, refused" from
 //      "actually broken".
 import type { MuseTerminateResult } from '../../lib/aggregationClient';
+import { OPERATOR_ROLE_REQUIRED_REASON } from '../../components/RoleGate';
 
 export type TerminateOutcomeTone = 'success' | 'warn' | 'error' | 'neutral';
 
@@ -25,11 +27,11 @@ export interface TerminateOutcome {
   tone: TerminateOutcomeTone;
 }
 
-/** The exact literal `RoleGate`'s tooltip uses (`components/RoleGate.tsx`'s `TOOLTIP` const) —
- *  a 403 here and the cosmetic disabled-button tooltip must read as the SAME reason, not two
- *  different explanations of the same fact. Kept as a named export so a test can assert this
- *  file and `RoleGate` never drift apart, rather than two independently-typed string literals. */
-export const OPERATOR_ROLE_REQUIRED = 'operator role required';
+/** Re-exported from `RoleGate` (not a second independently-typed literal) so a 403 here and
+ *  the cosmetic disabled-control's accessible reason are STRUCTURALLY the same string — they
+ *  cannot drift apart, because they are the same binding. Kept under this name for every
+ *  existing call site in this module and its tests. */
+export const OPERATOR_ROLE_REQUIRED = OPERATOR_ROLE_REQUIRED_REASON;
 
 /** Rejected approach (do not reinstate): collapsing `forbidden`/`conflict`/`unavailable` into
  *  the same `'error'` bucket as a real transport failure was the original draft of this
@@ -75,18 +77,22 @@ export function confirmDescription(accountText: string, titleText: string, posit
   return `${accountText} is watching "${titleText}" at ${positionLabel}. This will stop the stream now.`;
 }
 
-/** Pure gate deciding whether a confirm-dialog action should actually issue the terminate
- *  mutation. Split out of `TerminateControl.tsx` so "confirm issues a call, cancel never does"
- *  (this item's required test) is a directly provable fact about plain logic rather than
- *  something only observable by rendering and clicking a live DOM — this repo has no
- *  jsdom/testing-library configured (see every other `*.test.tsx` in this directory, all of
- *  which use `renderToStaticMarkup` for exactly this reason; `TerminateControl.test.tsx`'s
- *  module doc says so explicitly). `cancel` NEVER issues a call, full stop, regardless of
- *  `canTarget`/`inFlight` — those only gate `confirm`. */
-export function shouldIssueTerminateCall(
-  action: 'confirm' | 'cancel',
-  opts: { canTarget: boolean; inFlight: boolean },
-): boolean {
-  if (action === 'cancel') return false;
+/** Pure gate for the ONE call site that can ever issue the terminate mutation —
+ *  `TerminateControl`'s `confirm()` handler. Split out so "confirm issues a call only when
+ *  targetable and not already in flight" is a directly provable fact about plain logic.
+ *
+ *  Review finding (MUSE-127, round 2): an earlier version of this function also took a
+ *  `'cancel'` action and hardcoded it to `false`, with a comment asserting `cancel()` "goes
+ *  through" this guard. It never did — `cancel()` never called this function at all, so that
+ *  branch was provably dead code protecting nothing, and the mutation test that "proved" it
+ *  was mutating a helper outside the path it claimed to protect (a real, subtle failure mode:
+ *  a mutation test can mutate something the running code never reaches, and still fail
+ *  convincingly). Fixed by deleting the dead branch rather than wiring a fake guard around a
+ *  call that structurally does not exist: `cancel()` has NO call to `terminate()` anywhere in
+ *  it (see TerminateControl.tsx) — there is nothing for this function to gate on that path, so
+ *  it no longer pretends to. The real "cancel never calls terminate" property is now proven at
+ *  the component level, across all three cancel surfaces (button / Escape / backdrop — they
+ *  share ConfirmDialog's one `onCancel` prop) — see `TerminateControl.interaction.test.tsx`. */
+export function shouldIssueTerminateCall(opts: { canTarget: boolean; inFlight: boolean }): boolean {
   return opts.canTarget && !opts.inFlight;
 }

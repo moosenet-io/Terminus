@@ -35,7 +35,7 @@ function liveSession(overrides: Partial<LiveSession> = {}): LiveSession {
 }
 
 describe('LiveSessionCard — a viewer sees the terminate control disabled', () => {
-  it('renders aria-disabled + the operator-role tooltip for a viewer session', () => {
+  it('renders aria-disabled + the operator-role reason for a viewer session', () => {
     const html = renderToStaticMarkup(
       <AuthRoleProvider role="viewer">
         <LiveSessionCard session={liveSession()} />
@@ -43,6 +43,28 @@ describe('LiveSessionCard — a viewer sees the terminate control disabled', () 
     );
     expect(html).toContain('aria-disabled="true"');
     expect(html).toContain(OPERATOR_ROLE_REQUIRED);
+  });
+
+  // Review finding (MUSE-127 round 1): a `title` attribute is hover-only — unavailable on
+  // touch, unreliable for assistive tech. This test asserts against the RENDERED OUTPUT (an
+  // element carrying the reason as its own text content, wired via `aria-describedby`), not
+  // merely that the string appears somewhere in the markup — the string alone would already
+  // pass via the (still-present) `title` attribute and prove nothing about the fix.
+  it('renders the operator-role reason as PERSISTENT accessible content, not only inside a hover title', () => {
+    const html = renderToStaticMarkup(
+      <AuthRoleProvider role="viewer">
+        <LiveSessionCard session={liveSession()} />
+      </AuthRoleProvider>,
+    );
+    const describedByMatch = html.match(/aria-describedby="([^"]+)"/);
+    expect(describedByMatch).not.toBeNull();
+    const reasonId = describedByMatch![1];
+
+    // The described element must exist in the markup and carry the exact reason text as its
+    // own text content — present in the tree unconditionally, no hover/focus/gesture needed.
+    const describedElement = html.match(new RegExp(`id="${reasonId}"[^>]*>([^<]*)<`));
+    expect(describedElement).not.toBeNull();
+    expect(describedElement![1]).toBe(OPERATOR_ROLE_REQUIRED);
   });
 
   it('renders the control enabled (no aria-disabled wrapper) for an operator session', () => {
