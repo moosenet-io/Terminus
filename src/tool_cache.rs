@@ -410,6 +410,87 @@ mod tests {
         assert_ne!(operator, anon);
     }
 
+    /// TERM-599: two PEOPLE behind one service principal must not share a
+    /// per-principal cache entry.
+    ///
+    /// The router keys this cache on `CallerKey::storage_key()`, which is
+    /// `svc:<principal>` for a service-scoped caller and
+    /// `svc:<principal>#person:<person>` once a person is verified. Keying on the
+    /// bare principal name instead would give every family member the same bucket:
+    /// the first person to ask "what's on my calendar" would populate an entry the
+    /// next person is then served. That is a disclosure strictly WORSE than the
+    /// uniform service-scoping it replaces, which is why this has to hold from the
+    /// moment per-person dispatch works, not afterwards.
+    #[test]
+    fn two_people_behind_one_principal_do_not_share_a_cache_entry() {
+        let p = policy_for("weather").expect("weather is cached per principal");
+        assert!(p.per_principal, "this test is meaningless unless the tool is per-principal");
+        let q = json!({"q": "today"});
+
+        // Identities derived the way PRODUCTION derives them — through
+        // `CallerKey`, not hand-written strings. An earlier version of this test
+        // asserted literals, which proved only that `ToolCache::key` is injective
+        // and would have passed even while the caller computed the wrong identity.
+        let alice = ck_identity(Some("alice"));  // pii-test-fixture: invented names
+        let bob = ck_identity(Some("bob"));      // pii-test-fixture
+        let service = ck_identity(None);
+
+        let ka = ToolCache::key("weather", &q, Some(&alice), p.per_principal);
+        let kb = ToolCache::key("weather", &q, Some(&bob), p.per_principal);
+        let ks = ToolCache::key("weather", &q, Some(&service), p.per_principal);
+
+        assert_ne!(ka, kb, "two people must not share a cache bucket");
+        assert_ne!(ka, ks, "a person must not read the shared service entry");
+        assert_ne!(kb, ks);
+    }
+
+    /// Derive a cache identity the way `dispatch_tool` does: through `CallerKey`.
+    fn ck_identity(person: Option<&str>) -> String {
+        match person {
+            Some(p) => crate::locations::CallerKey::for_person("lumina", p)
+                .expect("a named person must key")
+                .storage_key(),
+            None => crate::locations::CallerKey::for_principal_name("lumina")
+                .expect("a service principal must key")
+                .storage_key(),
+        }
+    }
+
+    /// THE BUG THIS FIXES. A REFUSED assertion must not share the service bucket.
+    ///
+    /// The first version of the router change derived the cache identity as
+    /// `caller_key_for(..).or(principal)`. `caller_key_for` returns `None` for a
+    /// rejected assertion, so it fell through to the bare principal — and a claim
+    /// we had just refused to believe could read, and populate, the same cached
+    /// data as a legitimate service-scoped caller. That is "an attempted identity
+    /// indistinguishable from no identity", one layer below where the rest of this
+    /// work rules it out.
+    #[test]
+    fn a_refused_assertion_does_not_share_the_service_cache_bucket() {
+        let p = policy_for("weather").unwrap();
+        let q = json!({"q": "today"});
+        let service = ck_identity(None);
+
+        let refused = ToolCache::key("weather", &q, Some("<refused>"), p.per_principal);
+        let svc = ToolCache::key("weather", &q, Some(&service), p.per_principal);
+        let alice = ToolCache::key("weather", &q, Some(&ck_identity(Some("alice"))), p.per_principal); // pii-test-fixture
+
+        assert_ne!(refused, svc, "a refused claim must not read service-scoped cache");
+        assert_ne!(refused, alice, "nor any person's");
+    }
+
+    /// POSITIVE CONTROL for the above: the SAME identity asking the SAME question
+    /// still hits one key, so the partitioning has not simply disabled caching.
+    #[test]
+    fn the_same_person_asking_twice_still_shares_one_entry() {
+        let p = policy_for("weather").unwrap();
+        let q = json!({"q": "today"});
+        let alice = ck_identity(Some("alice")); // pii-test-fixture
+        let a = ToolCache::key("weather", &q, Some(&alice), p.per_principal);
+        let b = ToolCache::key("weather", &q, Some(&alice), p.per_principal);
+        assert_eq!(a, b);
+    }
+
     #[test]
     fn uncached_tools_are_opt_in_only() {
         // The default for anything without a policy is NO caching — behaviour is

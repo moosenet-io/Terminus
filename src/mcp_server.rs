@@ -135,7 +135,7 @@ fn asserted_person_for_mcp(
 ///   for a blank person, reached from the other direction. No key means
 ///   `Lookup::Denied`, which is the only safe answer to "who is this?" when the
 ///   answer failed verification.
-fn caller_key_for(
+pub(crate) fn caller_key_for(
     principal: Option<&crate::mesh::Principal>,
     asserted: &crate::mesh::AssertedPerson,
 ) -> Option<crate::locations::CallerKey> {
@@ -394,6 +394,10 @@ impl McpServerState {
         name: &str,
         args: Value,
         principal: Option<&Principal>,
+        // TERM-599: and WHICH HUMAN, so this path resolves the same per-person
+        // context and record as `tools/call` does. Passed explicitly rather than
+        // defaulted, so a new caller cannot silently inherit service scope.
+        asserted: &crate::mesh::AssertedPerson,
     ) -> Result<String, String> {
         // 1. Mesh upstream (a namespaced name is never coincidentally a local tool).
         if let Some(pool) = &self.mesh_pool {
@@ -424,17 +428,21 @@ impl McpServerState {
         // background cache refresh. With no gateway configured there is no
         // verified principal at all, and `CallerContext::untrusted()` is the
         // correct, fail-closed answer.
-        let caller = self
-            .gateway
-            .as_ref()
-            .map(|gw| gw.caller_context(principal))
-            .unwrap_or_default();
+        let caller = match self.gateway.as_ref() {
+            Some(gw) => gw.caller_context_for_person(principal, asserted),
+            // No gateway: no grant map, so nothing could have been verified. An
+            // unevaluated assertion must land BELOW the service default, not on it.
+            None if matches!(asserted, crate::mesh::AssertedPerson::None) => {
+                crate::tool::CallerContext::default()
+            }
+            None => crate::tool::CallerContext::unidentified(),
+        };
         // LOCREG-01: alongside WHAT this caller may see, carry WHICH per-caller
         // record is theirs — derived from the same server-verified principal,
         // never from an argument or a header. `None` when there is no principal,
         // which a caller-keyed tool must treat as "decline", not "use a default
         // record".
-        let key = principal.and_then(crate::locations::CallerKey::for_principal);
+        let key = caller_key_for(principal, asserted);
         let reg = self.registry.load();
         if let Some(r) = reg.call_with_caller_key(name, args.clone(), caller, key).await {
             return r.map(|o| o.text).map_err(|e| e.to_string());
@@ -661,6 +669,44 @@ async fn handle_agent_execute(
         tailnet.as_ref().map(|Extension(t)| t),
     );
 
+    // TERM-599: WHICH HUMAN this turn is for, on the path Lumina actually uses.
+    //
+    // TERM #595 threaded this into `handle_mcp` and refused unhonourable claims at
+    // the inference-proxy ingress — but BOTH live in handlers this one only reaches
+    // when `TERMINUS_ROUTER_LOCAL=0`. With the local router on (the default), the
+    // headers were read once for auth and then never again, so a client sending
+    // `x-terminus-on-behalf-of: alice` had it DROPPED WITHOUT ERROR and the turn ran
+    // against the shared, service-scoped record.
+    //
+    // That is the exact failure `asserted_person_for_mcp`'s doc describes — an
+    // attempted identity that cannot be honoured must never be indistinguishable
+    // from no identity — reproduced on the one door that carries real traffic.
+    let asserted = asserted_person_for_mcp(state.gateway.as_ref(), principal.as_ref(), &headers);
+
+    // And REFUSE it here, rather than merely running the turn with less privilege.
+    //
+    // Threading a `Rejected` assertion downstream does produce an unidentified
+    // context and no caller key, which is the safe direction — but it is not the
+    // same as refusing, and the sibling `handle_inference_proxy` path answers 403
+    // for exactly this input. Two doors giving different answers to the same
+    // refused claim is how one of them quietly becomes the way in.
+    if matches!(asserted, crate::mesh::AssertedPerson::Rejected) {
+        tracing::warn!(
+            principal = principal.as_ref().map(Principal::name).unwrap_or("<none>"),
+            "TERM-599: refusing an unhonourable person claim on the local router path"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            [("content-type", "application/json")],
+            json!({
+                "error": "on-behalf-of assertion refused",
+                "detail": "this identity could not be honoured; it was not silently downgraded"
+            })
+            .to_string(),
+        )
+            .into_response();
+    }
+
     // Same gate the forwarding path applies, on the same resolved principal — the
     // router is a caller of the sanctioned path, never a way around it.
     let gate_ctx = match &state.gateway {
@@ -736,6 +782,7 @@ async fn handle_agent_execute(
         chord,
         gateway: state.gateway.as_ref(),
         principal: principal.as_ref(),
+        asserted: &asserted,
     };
 
     let outcome = crate::agent_router::execute(

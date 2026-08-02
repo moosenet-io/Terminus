@@ -94,6 +94,9 @@ pub async fn dispatch_tool(
     name: &str,
     args: Value,
     principal: Option<&str>,
+    // TERM-599: threaded so dispatch resolves per-person context, and so the CACHE
+    // is keyed per person — see `cache_identity`.
+    asserted: &crate::mesh::AssertedPerson,
 ) -> Dispatch {
     // ── AUTHORIZATION, ENFORCED AT DISPATCH ──────────────────────────────────
     // Review (S128) caught this as the load-bearing hole: SELECTION IS ADVISORY.
@@ -156,8 +159,31 @@ pub async fn dispatch_tool(
     }
 
     let policy = tool_cache::policy_for(name);
+    // TERM-599: a per-principal cache entry must be keyed per PERSON once two people
+    // share one service principal, or one family member's cached answer is served to
+    // another — a disclosure strictly worse than the uniform service-scoping this
+    // replaces. `CallerKey::storage_key()` is already the canonical per-caller
+    // identity string (`svc:lumina` vs `svc:lumina#person:alice`), so reusing it
+    // keeps the cache and the record store partitioned the SAME way by construction
+    // rather than by two rules that could drift apart.
+    // Derived from the SAME tri-state the dispatch context is, so the three cases
+    // stay distinguishable here too. `caller_key_for(..).or(principal)` was WRONG:
+    // it returns `None` for a REJECTED assertion, which then fell back to the bare
+    // principal and shared a bucket with a legitimate service-scoped caller — an
+    // attempted identity made indistinguishable from no identity, in the cache
+    // instead of in the dispatch. A refused claim could read service-scoped
+    // cached data.
+    //
+    // `handle_agent_execute` now refuses a rejected claim outright, so that case
+    // should not reach here at all; this keeps the property locally true anyway,
+    // because a future caller of `dispatch_tool` has no way to know that.
+    let person_key = crate::mcp_server::caller_key_for(principal_obj, asserted).map(|k| k.storage_key());
+    let cache_identity: Option<&str> = match asserted {
+        crate::mesh::AssertedPerson::Rejected => Some("<refused>"),
+        _ => person_key.as_deref().or(principal),
+    };
     let key = policy
-        .map(|p| ToolCache::key(name, &args, principal, p.per_principal))
+        .map(|p| ToolCache::key(name, &args, cache_identity, p.per_principal))
         .unwrap_or_default();
 
     // Cache read.
@@ -185,6 +211,7 @@ pub async fn dispatch_tool(
                             name,
                             args.clone(),
                             key.clone(),
+                            asserted.clone(),
                         );
                     }
                 }
@@ -215,7 +242,7 @@ pub async fn dispatch_tool(
                  configured."
             )));
     };
-    match st.router_dispatch(name, args, principal_obj).await {
+    match st.router_dispatch(name, args, principal_obj, asserted).await {
         Ok(text) => {
             if policy.is_some() {
                 cache.put(&key, text.clone()).await;
@@ -299,6 +326,11 @@ fn spawn_refresh(
     name: &str,
     args: Value,
     key: String,
+    // TERM-599: the refresh writes back under a key that may be PERSON-scoped, so it
+    // must dispatch with the same person the foreground call had. Refreshing a
+    // person's entry with a service-scoped answer would quietly overwrite their data
+    // with someone else's view.
+    asserted: crate::mesh::AssertedPerson,
 ) {
     // Round-3 review: this used to call the core registry DIRECTLY, which bypassed
     // gateway authorization + auditing, the mesh/broker/personal dispatch precedence,
@@ -340,7 +372,7 @@ fn spawn_refresh(
                 }
             }
         }
-        match state.router_dispatch(&name, args, principal.as_ref()).await {
+        match state.router_dispatch(&name, args, principal.as_ref(), &asserted).await {
             Ok(text) => {
                 cache.put(&key, text).await;
                 if let Some(c) = ctx {
@@ -479,6 +511,9 @@ pub struct RouterDeps<'a> {
     pub chord: &'a InferenceProxyClient,
     pub gateway: Option<&'a crate::gateway_framework::GatewayFramework>,
     pub principal: Option<&'a Principal>,
+    /// TERM-599: WHICH HUMAN this turn is for. Borrowed rather than owned so the
+    /// router cannot mutate an authorization input it did not derive.
+    pub asserted: &'a crate::mesh::AssertedPerson,
 }
 
 /// TRTR-02 — the SSE progress-event wire contract.
@@ -674,6 +709,7 @@ pub async fn execute(
                     &call.name,
                     call.arguments.clone(),
                     principal_name,
+                    deps.asserted,
                 ),
             )
             .await
@@ -821,7 +857,7 @@ mod tests {
         // misconfiguration, and conflating the two would send an operator hunting for
         // a tool-name bug that is not there.
         let cache = ToolCache::default();
-        match dispatch_tool(None, &cache, None, None, "weather", json!({}), None).await {
+        match dispatch_tool(None, &cache, None, None, "weather", json!({}), None, &crate::mesh::AssertedPerson::None).await {
             Dispatch::Unknown(msg) => {
                 assert!(msg.contains("no tool-dispatch state"), "got: {msg}");
                 assert!(!msg.to_lowercase().contains("try again"));
@@ -891,7 +927,7 @@ mod tests {
         // gate entirely.
         let cache = ToolCache::default();
         for guarded in ["approval_grant", "approval_deny", "infisical_get_secret", "pg_ddl", "ansible_run_playbook"] {
-            match dispatch_tool(None, &cache, None, None, guarded, json!({}), None).await {
+            match dispatch_tool(None, &cache, None, None, guarded, json!({}), None, &crate::mesh::AssertedPerson::None).await {
                 Dispatch::Denied(msg) => {
                     assert!(msg.contains("operator approval"), "got: {msg}");
                 }
@@ -922,7 +958,7 @@ mod tests {
         // A guarded tool re-exported through a mesh upstream must not become
         // invocable just because it arrived namespaced.
         let cache = ToolCache::default();
-        match dispatch_tool(None, &cache, None, None, "ct322__approval_grant", json!({}), None).await {
+        match dispatch_tool(None, &cache, None, None, "ct322__approval_grant", json!({}), None, &crate::mesh::AssertedPerson::None).await {
             Dispatch::Denied(_) => {}
             other => panic!("namespaced guarded tool must be DENIED, got {other:?}"),
         }
@@ -935,7 +971,7 @@ mod tests {
         let cache = ToolCache::default();
         let key = ToolCache::key("news_headlines", &json!({}), None, false);
         cache.record_failure(&key).await;
-        match dispatch_tool(None, &cache, None, None, "news_headlines", json!({}), None).await {
+        match dispatch_tool(None, &cache, None, None, "news_headlines", json!({}), None, &crate::mesh::AssertedPerson::None).await {
             Dispatch::Failed(m) => assert!(m.contains("backing off"), "got: {m}"),
             // If the registry lacks the tool the Unknown path is also acceptable here;
             // what must NOT happen is a silent live re-fetch.
