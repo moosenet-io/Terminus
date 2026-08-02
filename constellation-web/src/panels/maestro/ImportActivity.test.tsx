@@ -110,16 +110,37 @@ describe('ImportActivitySection — degrade / empty / loading are visibly distin
   });
 
   it('empty (200, nothing queued) is visually distinct from degraded -- names acquisition wiring, not a generic empty', () => {
-    const html = render({ available: true, queue: [], acquisitionState: 'unmounted' });
+    const html = render({ available: true, queue: [], acquisitionState: 'unmounted', wanted: [] });
     expect(html).toContain('Nothing in the acquisition pipeline');
-    expect(html).toContain('download client');
+    expect(html).toContain('Acquisition reports state');
+    expect(html).toContain('unmounted');
+    expect(html).toContain('not configured');
     expect(html).not.toContain('CONSTELLATION_MUSE_TOKEN');
+    // Review fix (round 2, codex): never a fabricated dependency diagnosis the payload doesn't
+    // actually assert -- the subsystem state word is reported, not a guessed cause.
+    expect(html).not.toMatch(/Prowlarr/i);
   });
 
-  it('empty because acquisition IS wired reports a different, neutral reason', () => {
-    const html = render({ available: true, queue: [], acquisitionState: 'live' });
+  it('empty because acquisition IS wired reports a different, state-grounded reason', () => {
+    const html = render({ available: true, queue: [], acquisitionState: 'live', wanted: [] });
     expect(html).toContain('Nothing in the acquisition pipeline');
-    expect(html).not.toContain('download client');
+    expect(html).toContain('Acquisition reports state');
+    expect(html).toContain('wired, with data');
+  });
+
+  // Review fix (round 2, codex, confirmed real): a non-empty `wanted[]` next to an empty-queue
+  // message that claimed "nothing is currently monitored" directly contradicted the wanted-count
+  // link rendered in the SAME section. This is the required regression test for that.
+  it('a non-empty wanted count is reflected in the empty-queue message, never contradicted', () => {
+    const html = render({
+      available: true,
+      queue: [],
+      acquisitionState: 'worker',
+      wanted: [wantedRow(), wantedRow({ media_metadata_id: 2 }), wantedRow({ media_metadata_id: 3 })],
+    });
+    expect(html).toContain('3 waiting on a release');
+    expect(html).toContain('3 titles monitored');
+    expect(html).not.toContain('nothing is currently monitored');
   });
 });
 

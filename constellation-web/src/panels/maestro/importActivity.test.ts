@@ -177,19 +177,52 @@ describe('wiringDisplay -- the same live/worker/seam/unmounted vocabulary as Sub
   });
 });
 
-describe('emptyQueueReason -- names WHY the queue is empty from subsystem wiring, not a guess', () => {
-  it('names the missing download client when acquisition is unmounted', () => {
-    expect(emptyQueueReason('unmounted')).toMatch(/download client/);
+// Review fix (round 2, codex, confirmed real): the original version of this describe block
+// pinned two bugs. (1) It never passed a wanted count, so a non-empty `wanted[]` and this
+// empty-queue message rendered side by side, contradicting each other. (2) It asserted the
+// function invents a SPECIFIC diagnosis ("download client") the subsystem payload never
+// actually asserts -- `seam`/`unmounted` only carry the generic meaning `get_subsystems`'s own
+// doc comment defines. These tests now pin the corrected, honestly-scoped behaviour instead.
+describe('emptyQueueReason -- reports only what wanted[]/subsystem state actually say, never a derived diagnosis', () => {
+  it('names "nothing is currently monitored" when wantedCount is 0', () => {
+    expect(emptyQueueReason('unmounted', 0)).toMatch(/nothing is currently monitored/);
   });
 
-  it('distinguishes "no download client" (seam) from "unmounted" entirely', () => {
-    const seam = emptyQueueReason('seam');
-    const unmounted = emptyQueueReason('unmounted');
+  it('names the actual monitored COUNT rather than staying silent about it -- the contradiction this fix closes', () => {
+    const withWanted = emptyQueueReason('worker', 3);
+    expect(withWanted).toMatch(/3 titles monitored/);
+    expect(withWanted).not.toMatch(/nothing is currently monitored/);
+  });
+
+  it('singularises a wanted count of exactly 1', () => {
+    expect(emptyQueueReason('worker', 1)).toMatch(/1 title monitored/);
+  });
+
+  it('reports the subsystem state word + its OWN documented meaning, never a specific dependency diagnosis', () => {
+    const unmounted = emptyQueueReason('unmounted', 0);
+    expect(unmounted).toContain('"unmounted"');
+    expect(unmounted).toMatch(/not configured/);
+    // The fabricated claim this fix removes -- the payload never says WHICH dependency:
+    expect(unmounted).not.toMatch(/Prowlarr/i);
+    expect(unmounted).not.toMatch(/download client/i);
+  });
+
+  it('seam and unmounted report genuinely different, state-grounded text', () => {
+    const seam = emptyQueueReason('seam', 0);
+    const unmounted = emptyQueueReason('unmounted', 0);
     expect(seam).not.toBe(unmounted);
+    expect(seam).toContain('"seam"');
+    expect(seam).toMatch(/not yet producing data/);
   });
 
-  it('reports a neutral "nothing queued" when acquisition is actually wired', () => {
-    expect(emptyQueueReason('live')).not.toMatch(/download client/);
-    expect(emptyQueueReason('worker')).not.toMatch(/download client/);
+  it('an unrecognised state renders verbatim without a fabricated meaning', () => {
+    const weird = emptyQueueReason('totally-new-state', 0);
+    expect(weird).toContain('"totally-new-state"');
+    expect(weird).not.toMatch(/not configured|not yet producing data|wired/);
+  });
+
+  it('a null state (not yet loaded) omits the subsystem sentence entirely rather than guessing', () => {
+    const noState = emptyQueueReason(null, 0);
+    expect(noState).not.toContain('Acquisition reports state');
   });
 });

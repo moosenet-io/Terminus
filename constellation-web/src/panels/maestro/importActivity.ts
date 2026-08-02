@@ -159,21 +159,47 @@ export function wiringDisplay(state: string | null): WiringDisplay {
   }
 }
 
-/** Why the queue is empty, grounded in the acquisition subsystem's OWN wiring state (per this
- *  item's "name it from /api/subsystems' wiring state rather than guessing" edge case) —
- *  distinguishes "nothing to grab because nothing is monitored" (the live reality at S129,
- *  `monitored_items` had 0 rows) from "nothing to grab because the download client isn't
- *  configured", instead of one generic "empty" message covering both. */
-export function emptyQueueReason(acquisitionState: string | null): string {
-  switch (acquisitionState) {
-    case 'unmounted':
-      return "Acquisition isn't wired on this deployment — needs Prowlarr + a download client (see Subsystem health).";
-    case 'seam':
-      return 'Acquisition has an indexer but no download client configured yet, so nothing can be grabbed (see Subsystem health).';
-    case 'worker':
-    case 'live':
-      return 'Acquisition is wired; nothing is currently queued or being monitored.';
-    default:
-      return 'Nothing is currently queued.';
+// Review fix (round 2, codex): the first version of `emptyQueueReason` (a) ignored `wanted`
+// entirely, so a deployment with real monitored titles and an empty queue rendered "nothing is
+// currently monitored" right next to a "N waiting on a release" link contradicting it in the
+// same section; and (b) translated `seam`/`unmounted` into a SPECIFIC diagnosis ("needs
+// Prowlarr + a download client") that the subsystem payload does not actually assert — `seam`
+// only means "implemented, not yet producing data" and `unmounted` only means "not configured"
+// (the literal vocabulary `get_subsystems`'s own doc comment defines, Muse `src/web/
+// dashboard.rs`); neither says WHICH dependency is missing. That was the same fabricated-
+// confidence failure mode this item's own progress-seam handling exists to prevent, just one
+// function later — "the section correctly refuses to invent a download percentage, then
+// invents a configuration diagnosis two functions later" (review finding, verified in source).
+//
+// Fixed: report the two facts the payload actually contains — whether anything is monitored
+// (from `wanted`, which this function now takes), and the subsystem's OWN state word plus its
+// OWN documented meaning (never a derived diagnosis) — and say nothing beyond that.
+const WIRING_STATE_MEANING: Record<string, string> = {
+  live: 'wired, with data',
+  worker: 'wired as a background/on-demand worker',
+  seam: 'implemented, not yet producing data',
+  unmounted: 'not configured',
+};
+
+/** Why the queue is empty. Two independent, honestly-scoped facts, never conflated:
+ *   1. Whether anything is monitored at all (`wantedCount`, from the SAME payload's `wanted[]`
+ *      — the count this section already renders as a link) — "nothing monitored" and "N
+ *      monitored, nothing grabbed yet" are genuinely different states and must not collapse to
+ *      one generic message.
+ *   2. The acquisition subsystem's own `/api/subsystems` state WORD plus its OWN documented
+ *      meaning (`WIRING_STATE_MEANING`, straight from `get_subsystems`'s doc comment) — never a
+ *      derived claim about which dependency is missing, since the payload doesn't say that. */
+export function emptyQueueReason(acquisitionState: string | null, wantedCount: number): string {
+  const monitoredNote = wantedCount > 0
+    ? `${wantedCount} title${wantedCount === 1 ? '' : 's'} monitored with nothing grabbed yet`
+    : 'nothing is currently monitored';
+
+  if (acquisitionState === null) {
+    return `Nothing is currently queued (${monitoredNote}).`;
   }
+  const meaning = WIRING_STATE_MEANING[acquisitionState.toLowerCase()];
+  const stateNote = meaning
+    ? `Acquisition reports state "${acquisitionState}" — ${meaning} (see Subsystem health).`
+    : `Acquisition reports state "${acquisitionState}" (see Subsystem health).`;
+  return `Nothing is currently queued (${monitoredNote}). ${stateNote}`;
 }

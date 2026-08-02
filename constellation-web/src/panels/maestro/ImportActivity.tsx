@@ -127,10 +127,11 @@ export function ImportActivitySection({
 
       {available === true && groups.length === 0 && (
         <Card variant="content">
-          {/* A fact (200, zero active rows) grounded in the acquisition subsystem's own
-              wiring state — never a bare "empty", per this item's edge case on distinguishing
-              "nothing monitored" from "download client unconfigured". */}
-          <EmptyState title="Nothing in the acquisition pipeline" message={emptyQueueReason(acquisitionState)} />
+          {/* A fact (200, zero active rows) grounded in the wanted count AND the acquisition
+              subsystem's own state word (never a derived diagnosis of which dependency is
+              missing) — never a bare "empty", per this item's edge case on distinguishing
+              "nothing monitored" from "monitored, but the pipeline isn't producing rows". */}
+          <EmptyState title="Nothing in the acquisition pipeline" message={emptyQueueReason(acquisitionState, wanted.length)} />
         </Card>
       )}
 
