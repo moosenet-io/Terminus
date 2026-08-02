@@ -612,6 +612,94 @@ mod tests {
         assert!(out.contains("resident=1"));
     }
 
+    // ---- end-to-end through execute(), not just the constant ----
+    //
+    // Review caught that the tests above inspect `NO_SNAPSHOT` and call
+    // `format_residency` directly, so an `execute` that returned NO_SNAPSHOT
+    // UNCONDITIONALLY would pass every one of them — the exact "tests prove the
+    // wrong thing" failure this whole change is about. These drive the real tool.
+
+    /// Unique temp path per test so concurrent runs cannot collide.
+    fn temp_state_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("term601-{tag}-{}.json", std::process::id()));
+        p
+    }
+
+    /// Missing file, through the REAL tool: must report UNKNOWN, never IDLE.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_reports_unknown_when_the_snapshot_is_missing() {
+        let path = temp_state_path("missing");
+        let _ = std::fs::remove_file(&path);
+        std::env::set_var("CHORD_RESIDENCY_STATE_PATH", &path);
+
+        let out = ServingResidencyStatus.execute(json!({})).await.expect("absence is not an error");
+        assert!(out.contains("state=UNKNOWN"), "got: {out}");
+        assert!(!out.contains("IDLE"), "a missing snapshot must not read as idle: {out}");
+
+        std::env::remove_var("CHORD_RESIDENCY_STATE_PATH");
+    }
+
+    /// POSITIVE CONTROL, through the REAL tool. A snapshot that WAS written and
+    /// happens to be empty must still report IDLE with its real figures.
+    ///
+    /// This is the test that fails an implementation returning UNKNOWN
+    /// unconditionally — i.e. the one that makes the pair above meaningful.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_still_reports_idle_for_a_written_empty_snapshot() {
+        let path = temp_state_path("idle");
+        std::fs::write(
+            &path,
+            r#"{"residents":[],"free_vram_gb":96.0,"baseline_vram_gb":96.0,"pinned_chat_model":null}"#,
+        )
+        .unwrap();
+        std::env::set_var("CHORD_RESIDENCY_STATE_PATH", &path);
+
+        let out = ServingResidencyStatus.execute(json!({})).await.unwrap();
+        assert!(out.contains("state=IDLE"), "a real idle snapshot must still say IDLE: {out}");
+        assert!(out.contains("free_vram_gb=96.0"), "and keep its figures: {out}");
+        assert!(!out.contains("UNKNOWN"));
+
+        std::env::remove_var("CHORD_RESIDENCY_STATE_PATH");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// And an occupied snapshot renders its residents — so the three states are
+    /// genuinely distinguishable through the tool, not just in the formatter.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_renders_residents_for_an_occupied_snapshot() {
+        let path = temp_state_path("busy");
+        std::fs::write(
+            &path,
+            r#"{"residents":[{"role":"chat","model_id":"granite4.1:8b","vram_gb":12.5}],
+                "free_vram_gb":40.0,"baseline_vram_gb":96.0,"pinned_chat_model":"granite4.1:8b"}"#,
+        )
+        .unwrap();
+        std::env::set_var("CHORD_RESIDENCY_STATE_PATH", &path);
+
+        let out = ServingResidencyStatus.execute(json!({})).await.unwrap();
+        assert!(out.contains("granite4.1:8b"), "got: {out}");
+        assert!(out.contains("resident=1"));
+        assert!(!out.contains("state=IDLE"));
+        assert!(!out.contains("UNKNOWN"));
+
+        std::env::remove_var("CHORD_RESIDENCY_STATE_PATH");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An UNSET path is still NotConfigured — distinct from both a missing file
+    /// and an idle GPU. Three-way distinction plus the unconfigured case.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_is_not_configured_when_no_path_is_set() {
+        std::env::remove_var("CHORD_RESIDENCY_STATE_PATH");
+        let err = ServingResidencyStatus.execute(json!({})).await.unwrap_err();
+        assert!(matches!(err, ToolError::NotConfigured(_)), "got: {err:?}");
+    }
+
     fn meta_ok(tool: &dyn RustTool) {
         assert!(!tool.name().is_empty());
         assert!(!tool.description().is_empty());
