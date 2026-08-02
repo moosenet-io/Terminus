@@ -7,6 +7,7 @@
 // `onCancel`. role="dialog" + aria-modal + Esc-to-cancel + initial focus per §2.6's
 // accessibility floor ("role=\"dialog\" + focus trap on palette/drawer/confirm").
 import { useEffect, useRef } from 'react';
+import type { ReactNode } from 'react';
 import { Button } from './Button';
 
 interface ConfirmDialogProps {
@@ -21,6 +22,10 @@ interface ConfirmDialogProps {
   busy?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
+  /** MACT-07 (MUSE-127): optional extra content rendered between `description` and the action
+   *  row — e.g. an optional-reason field for a mutation that supports one. Additive; every
+   *  existing caller omits it and renders exactly as before. */
+  children?: ReactNode;
 }
 
 export function ConfirmDialog({
@@ -33,6 +38,7 @@ export function ConfirmDialog({
   busy = false,
   onConfirm,
   onCancel,
+  children,
 }: ConfirmDialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
 
@@ -90,6 +96,7 @@ export function ConfirmDialog({
             {description}
           </div>
         )}
+        {children && <div style={{ marginBottom: 'var(--space-4)' }}>{children}</div>}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-2)' }}>
           <Button variant="ghost" size="sm" onClick={onCancel} disabled={busy}>
             {cancelLabel}

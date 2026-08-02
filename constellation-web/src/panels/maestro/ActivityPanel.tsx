@@ -49,6 +49,7 @@ import { useMuseLiveSessions, useMuseSessionHistory, museArtUrlAt } from '../../
 import type { HistorySession, LiveSession } from '../../lib/aggregationClient';
 import { ImportActivity } from './ImportActivity';
 import { ActivityTiles } from './ActivityTiles';
+import { TerminateControl } from './TerminateControl';
 import {
   accountLabel,
   classifyDecision,
@@ -68,7 +69,7 @@ const HISTORY_FETCH_LIMIT = 200;
 
 // ── LIVE pane ─────────────────────────────────────────────────────────────
 
-export function LiveSessionCard({ session }: { session: LiveSession }) {
+export function LiveSessionCard({ session, onTerminated }: { session: LiveSession; onTerminated?: () => void }) {
   const progress = progressInfo(session.view_offset_ms, session.duration_ms, session.progress_pct);
   const decision = classifyDecision(session.decision);
   const resolved = isItemResolved(session.item);
@@ -136,16 +137,24 @@ export function LiveSessionCard({ session }: { session: LiveSession }) {
             <Badge tone={decision.tone}>{decision.label}</Badge>
           </span>
         </div>
+
+        {/* MACT-07 (MUSE-127): the panel's first mutation — RoleGate + ConfirmDialog gated,
+            wired to refetch the LIVE pane from the server (never an optimistic card removal).
+            See TerminateControl.tsx for the security model and rendering rules. */}
+        <div style={{ marginTop: 'var(--space-1)' }}>
+          <TerminateControl session={session} onTerminated={onTerminated} />
+        </div>
       </div>
     </Card>
   );
 }
 
-export function LivePane({ available, detail, sessions, source }: {
+export function LivePane({ available, detail, sessions, source, onTerminated }: {
   available: boolean | null;
   detail: string | undefined;
   sessions: LiveSession[];
   source: string | null;
+  onTerminated?: () => void;
 }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
@@ -186,7 +195,9 @@ export function LivePane({ available, detail, sessions, source }: {
             paddingRight: 2,
           }}
         >
-          {sessions.map(s => <LiveSessionCard key={s.session_key ?? s.session_id} session={s} />)}
+          {sessions.map(s => (
+            <LiveSessionCard key={s.session_key ?? s.session_id} session={s} onTerminated={onTerminated} />
+          ))}
         </div>
       )}
     </div>
@@ -356,6 +367,7 @@ export function ActivityPanel() {
         detail={live.degraded ? live.degraded.detail : undefined}
         sessions={live.data?.sessions ?? []}
         source={live.data?.source ?? null}
+        onTerminated={live.refetch}
       />
 
       <HistoryPane
