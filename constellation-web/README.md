@@ -683,9 +683,13 @@ configured" from "backend flapped" in the UI if that becomes useful.
 ### Maestro Activity panel cadence (MACT-08, MUSE-128)
 
 `src/hooks/useActivityFeedLive.ts` drives the Maestro Activity panel's data on a fixed per-tier
-polling cadence -- live pane every 5s, stat tiles every 10s, history every 60s, backing off up
-to a 30s cap on repeated failures, and stopping ENTIRELY (no timer of any kind) while the
-tab/route is not visible (`document.visibilityState`). `ActivityPanel.tsx`'s `LivePane`/
+polling cadence -- live pane every 5s, stat tiles every 10s, history every 60s -- and stops
+ENTIRELY (no timer of any kind) while the tab/route is not visible (`document.visibilityState`).
+On repeated failures the live and tiles tiers double their interval up to a 30s cap; `history`
+does not back off at all, because its cap is the larger of 30s and its own base, and its base is
+already 60s. Polling does NOT fire an extra request on mount: each pane's `useMuseSection`
+already fetches from its own mount effect, so the first poll is scheduled rather than immediate
+(becoming visible again after a hide DOES poll immediately, since that data is stale). `ActivityPanel.tsx`'s `LivePane`/
 `HistoryPane` and `ActivityTiles.tsx` all use it and render the resulting cadence as a
 plain-text "polling every Ns" label next to their existing source label -- never a colour/
 title-only signal.

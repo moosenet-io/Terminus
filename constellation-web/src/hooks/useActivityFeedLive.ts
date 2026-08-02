@@ -37,9 +37,12 @@ export const ACTIVITY_TIER_POLL_MS: Record<ActivityFeedTier, number> = {
 
 /** Backoff ceiling for consecutive poll failures (a 401 loop must not hammer the proxy).
  *  Doubles from the tier's own base on each failure, capped at the LARGER of 30s or the
- *  tier's own base -- `history`'s 60s base is already coarser than a 30s cap would be, so
- *  there's nothing to cap it down to; `live`/`tiles` (5s/10s bases) cap at 30s exactly as the
- *  spec's "5s -> 10s -> 30s cap" ladder describes. */
+ *  tier's own base -- `live`/`tiles` (5s/10s bases) cap at 30s exactly as the spec's
+ *  "5s -> 10s -> 30s cap" ladder describes. `history` is the deliberate exception: its 60s base
+ *  is already coarser than a 30s cap, so its cap equals its base and it therefore NEVER backs
+ *  off at all -- one failed 60s poll is already gentler than a backed-off live pane. Stated
+ *  outright because "all tiers back off up to 30s" was written in the README and was false for
+ *  history (review round 3, codex). */
 function backoffCapMs(tier: ActivityFeedTier): number {
   return Math.max(30000, ACTIVITY_TIER_POLL_MS[tier]);
 }
@@ -124,12 +127,21 @@ export function useActivityFeedLive(tier: ActivityFeedTier, refetch: () => unkno
       }
     }
 
-    function start() {
+    // `immediate` distinguishes the two ways polling begins, which need DIFFERENT first steps.
+    // On mount the caller's own section hook (`useMuseSection`/`useMuseTypedSection`) has
+    // already issued its fetch from its own mount effect, so polling immediately here would
+    // double every initial request -- ten of them for `ActivityTiles`' five-source bundle --
+    // and race two responses into the same state. On becoming visible again there is no such
+    // fetch in flight and the data on screen is stale by however long the tab was hidden, so an
+    // immediate poll is exactly right. Review round 3 (codex) caught the mount case; the tests
+    // isolated this hook, so its integration with the section hooks went unexercised.
+    function start(immediate: boolean) {
       stopped = false;
       generation += 1;
       currentPollMs = ACTIVITY_TIER_POLL_MS[tier];
       setPollIntervalMs(currentPollMs);
-      pollOnce();
+      if (immediate) pollOnce();
+      else schedulePoll();
     }
 
     function stop() {
@@ -147,13 +159,13 @@ export function useActivityFeedLive(tier: ActivityFeedTier, refetch: () => unkno
         stop();
       } else {
         // "Reconnect + immediate refetch on becoming visible" (APPROACH) -- there is no socket
-        // to reconnect anymore, so `start()`'s immediate `pollOnce()` covers the whole of it.
-        start();
+        // to reconnect anymore, so an immediate poll covers the whole of it.
+        start(true);
       }
     }
 
     const initiallyHidden = typeof document !== 'undefined' && document.hidden;
-    if (!initiallyHidden) start();
+    if (!initiallyHidden) start(false);
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', handleVisibilityChange);
     }

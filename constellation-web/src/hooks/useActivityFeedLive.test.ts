@@ -55,11 +55,13 @@ describe('useActivityFeedLive — per-tier polling cadence', () => {
   ])('polls %s at exactly its %ims cadence, not a neighbouring tier\'s', async (tier, intervalMs) => {
     const refetch = realShapedRefetch();
     renderHook(() => useActivityFeedLive(tier, refetch));
-    await advanceAndFlush(0); // flush the mount-time immediate fetch's promise
+    await advanceAndFlush(0);
 
-    // The mount itself does one immediate fetch — not part of what's being timed below.
-    expect(refetch).toHaveBeenCalledTimes(1);
-    refetch.mockClear();
+    // Mount must NOT fetch: the caller's own `useMuseSection` already fetched from its mount
+    // effect, so an immediate poll here would double every initial request (ten of them for
+    // ActivityTiles' five-source bundle). Round 3 (codex) caught this; the prior version of
+    // this test asserted the duplicate as if it were correct.
+    expect(refetch).not.toHaveBeenCalled();
 
     await advanceAndFlush(intervalMs - 1);
     expect(refetch).not.toHaveBeenCalled();
@@ -86,20 +88,40 @@ describe('useActivityFeedLive — poll-failure backoff (against the real MuseSec
     const refetch = realShapedRefetch(() => !shouldFail);
     const { result } = renderHook(() => useActivityFeedLive('live', refetch));
 
-    // Let the initial mount-time poll settle as a failure.
-    await advanceAndFlush(0);
-    expect(result.current.pollIntervalMs).toBeGreaterThan(ACTIVITY_TIER_POLL_MS.live);
+    // The first poll is SCHEDULED, not immediate, so drive one interval to get a failure.
+    await advanceAndFlush(ACTIVITY_TIER_POLL_MS.live);
+    expect(result.current.pollIntervalMs).toBe(ACTIVITY_TIER_POLL_MS.live * 2);
 
-    const afterFirstFailure = result.current.pollIntervalMs;
-    await advanceAndFlush(afterFirstFailure);
-    expect(result.current.pollIntervalMs).toBeGreaterThanOrEqual(afterFirstFailure);
-    expect(result.current.pollIntervalMs).toBeLessThanOrEqual(30000);
+    // Exact ladder, not a range: 5s -> 10s -> 20s -> 30s (capped), then PINNED at 30s however
+    // many further failures arrive. Round 3 (codex) caught the prior version asserting only
+    // `<= 30000`, which passes just as happily with the cap deleted entirely -- an assertion
+    // that cannot tell capped from uncapped is not evidence of a cap.
+    await advanceAndFlush(result.current.pollIntervalMs);
+    expect(result.current.pollIntervalMs).toBe(20000);
+    await advanceAndFlush(result.current.pollIntervalMs);
+    expect(result.current.pollIntervalMs).toBe(30000); // 40000 would exceed the cap
+    for (let i = 0; i < 3; i++) {
+      await advanceAndFlush(result.current.pollIntervalMs);
+      expect(result.current.pollIntervalMs).toBe(30000);
+    }
 
     // Recovery resets to the tier's base cadence.
     shouldFail = false;
     const current = result.current.pollIntervalMs;
     await advanceAndFlush(current);
     expect(result.current.pollIntervalMs).toBe(ACTIVITY_TIER_POLL_MS.live);
+  });
+
+  it('never backs off the history tier — its cap equals its own 60s base', async () => {
+    // The README previously claimed "all tiers back off up to a 30s cap", which is false here:
+    // backoffCapMs is max(30s, base), so history's cap IS its base and repeated failures leave
+    // the cadence untouched. Pinned so the doc and the behaviour cannot drift apart again.
+    const refetch = realShapedRefetch(() => false);
+    const { result } = renderHook(() => useActivityFeedLive('history', refetch));
+    for (let i = 0; i < 4; i++) {
+      await advanceAndFlush(ACTIVITY_TIER_POLL_MS.history);
+      expect(result.current.pollIntervalMs).toBe(ACTIVITY_TIER_POLL_MS.history);
+    }
   });
 
   it('never backs off on a refetch that returns void (a caller that has not opted into outcome reporting)', async () => {
@@ -159,7 +181,10 @@ describe('useActivityFeedLive — visibility gating', () => {
     );
 
     const { result } = renderHook(() => useActivityFeedLive('live', refetch));
-    expect(deferreds).toHaveLength(1); // mount-time poll (generation 1), left UNRESOLVED
+    // Mount only SCHEDULES (the section hook does the initial fetch), so advance one interval
+    // to get a real poll in flight — this is the request that must later be ignored.
+    act(() => { vi.advanceTimersByTime(ACTIVITY_TIER_POLL_MS.live); });
+    expect(deferreds).toHaveLength(1); // poll 1 in flight, left UNRESOLVED
 
     act(() => { setHidden(true); }); // stop() — bumps the generation; poll 1's promise is now stale
     act(() => { setHidden(false); }); // start() — bumps the generation again, issues poll 2 (immediate)
