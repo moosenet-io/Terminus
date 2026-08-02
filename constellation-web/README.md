@@ -680,6 +680,26 @@ after its bounded reconnect budget was exhausted -- same polling fallback applie
 is required for this item; a future item MAY use the code to distinguish "no backend
 configured" from "backend flapped" in the UI if that becomes useful.
 
+### Muse activity fan-in + live-vs-polling cadence (MACT-08, MUSE-128)
+
+The same `/ws` relay also fans in a small, periodic **change signal** for Maestro's Activity
+panel: `{source:'muse', event:{type:'activity_tick', ts}}`, emitted every ~3s for the
+lifetime of a connection once the upstream Harmony leg is established (see `ws.rs`'s "MACT-08"
+doc section). It is deliberately NOT the payload -- session/library/import data still comes
+exclusively through `proxy_muse` on `/api/*`, credential-gated and masked exactly as before;
+the tick only ever tells the client "go refetch through the client".
+
+`src/hooks/useActivityFeedLive.ts` is the client half: given a tier (`'live'` | `'tiles'` |
+`'history'`) and a `refetch` callback, it refetches on a coalesced tick (at most once every 2s)
+while ticks are actually arriving, falls back to polling at the tier's own cadence the moment
+they stop (WS unavailable: live pane 5s, stat tiles 10s, history 60s -- with backoff up to 30s
+on repeated poll failures), and stops entirely -- no socket, no timers -- while the tab/route
+is not visible (`document.visibilityState`). `ActivityPanel.tsx`'s `LivePane`/`HistoryPane` and
+`ActivityTiles.tsx` all use it and render the resulting mode as a plain-text "live" or "polling
+every Ns" label next to their existing source label -- never a colour/title-only signal, and
+never "live" merely because the socket happens to be open (a connected-but-silent fan-in source
+still reads as polling).
+
 ## Lumina Conversations panel (LGUI-07)
 
 `lumina.chat` (`/lumina/chat`, `src/panels/lumina/ChatPanel.tsx` +

@@ -35,9 +35,43 @@
 //!   upstream (accept, then immediately close) busy-looping the pipe with
 //!   no effective backoff.
 //!
+//! ## MACT-08: the Muse activity fan-in
+//! The first source to actually use the `source` seam described above.
+//! Every open `pipe()` connection also emits a small, PERIODIC
+//! `{source:'muse', event:{type:'activity_tick', ts:<unix_ms>}}` frame
+//! (see [`activity_tick_message`]) -- a CHANGE SIGNAL, not a payload. The
+//! payload itself (session/library/import state) is credential-gated per
+//! system and already goes through `proxy_muse` + `mask_response` on its
+//! own `/api/*` round trip (`constellation-web`'s `useMuse*` hooks); piping
+//! that data over the socket too would duplicate that proxy's auth and
+//! masking on a second path. A tick tells the client "go refetch through
+//! the client" and nothing else, keeping this socket cheap and the fetch
+//! door singular.
+//!
+//! **Rejected: a real Muse push source.** Muse has no outbound event
+//! stream Terminus can dial (unlike Harmony's upstream leg above) -- only
+//! the request/response `proxy_muse` surface. Standing up one is future
+//! work once Muse grows one; until then a periodic tick is a standard,
+//! honest "poll-via-push" invalidation signal (the same shape React
+//! Query's own "refetch on a live signal" pattern uses), and it is
+//! EXPLICITLY what the spec item calls for ("a lightweight CHANGE SIGNAL,
+//! not the payload") rather than an accidental simplification.
+//!
+//! **Deliberately NOT gated on the Harmony leg being configured beyond
+//! reusing its connection:** the tick only flows once `pipe()` is running,
+//! i.e. once the browser's `/ws` upgrade has succeeded AND (today) the
+//! Harmony upstream dial has succeeded too -- there is exactly one relay
+//! connection per browser tab (see "Single-door property" above), so the
+//! tick rides that same connection rather than opening a second one. When
+//! `CONSTELLATION_HARMONY_WS_URL` is unset the relay still closes
+//! immediately with [`CLOSE_CODE_NO_UPSTREAM`] exactly as before MACT-08 --
+//! this is not a regression, it is the documented client behavior for that
+//! case (the client polls and honestly labels itself "polling", never
+//! "live"; see `useActivityFeedLive.ts`).
+//!
 //! ## What is deliberately NOT here (v1, per §3.5/CONST-18 scope)
-//! - No fan-in of Chord/Muse events yet (the envelope's `source` field is
-//!   the seam for that, added when those sources exist).
+//! - No fan-in of Chord events yet (the envelope's `source` field remains
+//!   the seam for that).
 //! - No per-connection registry/broadcast (one operator, one browser tab at
 //!   a time is the documented usage -- `docs/constellation/CONST-GUI-SPEC.md`
 //!   §9 "Technical architecture").
@@ -106,6 +140,15 @@ const CLOSE_CODE_UPSTREAM_LOST: u16 = 4001;
 /// an obvious code to reach for without re-deriving the numbering.
 #[allow(dead_code)]
 const CLOSE_CODE_AUTH_FAILED: u16 = 4003;
+
+/// Cadence of the MACT-08 Muse activity change-signal (see the module doc's
+/// "MACT-08: the Muse activity fan-in" section). Deliberately coarser than
+/// the client's own <=1-refetch-per-2s coalescing floor
+/// (`useActivityFeedLive.ts`) -- the server-side interval is the primary
+/// throttle on how often a tick is even produced; the client's coalescing
+/// is a second, independent guarantee that holds even if this interval is
+/// ever tightened or a future second tick source is added.
+const ACTIVITY_TICK_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Count of upstream frames dropped because they weren't valid JSON text,
 /// or were binary, or exceeded [`MAX_FRAME_BYTES`] -- logged (not exposed
@@ -250,8 +293,22 @@ async fn pipe(socket: WebSocket, upstream: UpstreamStream, upstream_url: &str) {
     let (mut upstream_tx, mut upstream_rx) = upstream.split();
     let mut reconnect_count: u32 = 0;
 
+    // MACT-08: the Muse activity-tick source (see the module doc). Ticks on
+    // its own schedule for the lifetime of this connection, independent of
+    // upstream Harmony traffic -- `MissedTickBehavior::Delay` means a slow
+    // client (a full `client_tx.send` blocking the select loop) skips
+    // missed ticks rather than bursting a catch-up storm once it drains.
+    let mut activity_tick = tokio::time::interval(ACTIVITY_TICK_INTERVAL);
+    activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
+            _ = activity_tick.tick() => {
+                if client_tx.send(Message::Text(activity_tick_message())).await.is_err() {
+                    tracing::warn!("constellation::ws: failed sending activity tick to client");
+                    break;
+                }
+            }
             client_msg = client_rx.next() => {
                 match client_msg {
                     Some(Ok(msg)) => {
@@ -414,6 +471,21 @@ fn envelope_and_mask(raw: &str) -> Option<String> {
     Some(masked.to_string())
 }
 
+/// Build one MACT-08 Muse activity-tick frame -- `{source:'muse',
+/// event:{type:'activity_tick', ts:<unix_ms>}}`, passed through
+/// `mask::mask_response` exactly like every other outbound frame (the tick
+/// carries no PII today, but the masking property is unconditional on this
+/// socket per the module doc, not conditional on "this particular frame
+/// probably doesn't need it").
+fn activity_tick_message() -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let envelope = json!({"source": "muse", "event": {"type": "activity_tick", "ts": ts}});
+    mask::mask_response(envelope).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +582,36 @@ mod tests {
         assert_eq!(parsed["source"], "harmony");
         assert_eq!(parsed["event"]["kind"], "engine_start");
         assert_eq!(parsed["event"]["project"], "LUM");
+    }
+
+    /// MACT-08: the tick is the change SIGNAL, never the payload -- this
+    /// asserts its exact shape (`source:'muse'`, `event.type:'activity_tick'`,
+    /// a numeric `ts`) and that it carries nothing else, so a future change
+    /// can't accidentally grow it into a payload (the whole point of the
+    /// tick-vs-payload design this item exists to preserve).
+    #[test]
+    fn activity_tick_message_has_muse_source_and_tick_type() {
+        let out = activity_tick_message();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["source"], "muse");
+        assert_eq!(parsed["event"]["type"], "activity_tick");
+        assert!(parsed["event"]["ts"].as_u64().is_some(), "ts must be a numeric unix-ms timestamp");
+        // The change SIGNAL, not the payload: only `type` and `ts` on the event.
+        let event_obj = parsed["event"].as_object().expect("event must be an object");
+        assert_eq!(event_obj.len(), 2, "activity_tick must carry only type+ts, never session/library data");
+    }
+
+    /// The masking property is unconditional on this socket (module doc) --
+    /// this proves it also applies to the tick source, not just frames
+    /// relayed from Harmony (`negative_property_planted_secret_never_survives_envelope_and_mask`
+    /// above covers the Harmony leg; this is the MACT-08 counterpart).
+    #[test]
+    fn activity_tick_message_passes_through_masking_unmodified() {
+        // ts is not secret-shaped, so this is a structural round-trip check: masking must
+        // not corrupt the numeric ts field (e.g. stringify it) or drop the envelope shape.
+        let out = activity_tick_message();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["event"]["ts"].is_number(), "masking must not alter the ts field's type");
     }
 
     #[test]

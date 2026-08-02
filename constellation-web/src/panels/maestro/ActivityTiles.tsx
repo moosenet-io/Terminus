@@ -24,6 +24,7 @@ import { MetricCard } from '../../components/MetricCard';
 import type { StatusColor } from '../../components/Card';
 import { getAggregationClient } from '../../lib/aggregationClient';
 import type { HealthStatus } from '../../lib/aggregationClient';
+import { useActivityFeedLive } from '../../hooks/useActivityFeedLive';
 import {
   useMuseGaps,
   useMuseHealth,
@@ -194,6 +195,19 @@ export function ActivityTiles() {
   // once is the existing `useMuse*` convention (see ImportActivity.tsx re-fetching the same
   // `/api/requests/queue` `useMuseDownloadQueue` already binds), not a regression here.
   const live = useMuseLiveSessions();
+
+  // MACT-08 (MUSE-128): the 'tiles' cadence (10s polling fallback; WS-tick-coalesced when
+  // live) — one shared `useActivityFeedLive` call refetches every source feeding this row
+  // together, since a stale stat tile is no less honest a signal than a stale live pane.
+  // `terminusHealth` intentionally excluded: it is the shell's OWN `/api/health` poll, not a
+  // Muse activity source the tick fans in for.
+  useActivityFeedLive('tiles', () => {
+    stats.refetch();
+    gaps.refetch();
+    subsystems.refetch();
+    museHealthSection.refetch();
+    live.refetch();
+  });
 
   const states: TileRowStates = {
     librarySize: tileStateFromSection(stats, s => ({ text: formatCount(s.library_size) })),

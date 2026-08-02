@@ -8,6 +8,7 @@ import {
   classifyDecision,
   degradeCause,
   distinctBy,
+  feedModeLabel,
   formatMs,
   historySourceLabel,
   isItemResolved,
@@ -177,6 +178,27 @@ describe('liveSourceLabel / historySourceLabel (formatters only — see Activity
 
   it('history source is permanently muse-history, distinct copy from live', () => {
     expect(historySourceLabel('muse-history')).toBe("Muse's permanent historical record");
+  });
+});
+
+describe('feedModeLabel (MACT-08) — the honest live-vs-polling statement', () => {
+  it('renders "live" only when live is true, regardless of pollIntervalMs', () => {
+    expect(feedModeLabel(true, 5000)).toBe('live');
+    expect(feedModeLabel(true, 60000)).toBe('live'); // stale interval value must not leak through
+  });
+
+  it('renders "polling every Ns" from pollIntervalMs when not live', () => {
+    expect(feedModeLabel(false, 5000)).toBe('polling every 5s');
+    expect(feedModeLabel(false, 10000)).toBe('polling every 10s');
+    expect(feedModeLabel(false, 60000)).toBe('polling every 60s');
+  });
+
+  it('never claims live off a truthy-looking interval alone', () => {
+    // A caller mistakenly passing live=false with a small interval must still read "polling",
+    // never be misread as "live" — this is a plain-text statement, not inferred from a number.
+    const label = feedModeLabel(false, 2000);
+    expect(label).not.toBe('live');
+    expect(label).toBe('polling every 2s');
   });
 });
 
