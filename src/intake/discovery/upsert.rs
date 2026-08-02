@@ -131,10 +131,17 @@ fn upsert_sql(with_fit: bool) -> String {
 /// (an un-migrated host that has the table but not the S128 column). Postgres
 /// reports SQLSTATE `42703` (`undefined_column`), e.g.
 /// `column "fit_score" of relation "model_discovery_candidate" does not exist`.
-/// Checked via the SQLSTATE code (robust to message wording) AND a `fit_score`
-/// mention, so this only ever swallows the specific new-column case and never
-/// masks an unrelated undefined-column bug. Pure over its input.
-fn is_missing_fit_score_column(e: &sqlx::Error) -> bool {
+/// Classified by the SQLSTATE CODE (robust to message wording / localization) —
+/// only SQLSTATE `42703` (`undefined_column`) qualifies — with a `fit_score`
+/// message substring as a SECONDARY guard so the specific new-column case is
+/// distinguished from any other undefined-column bug. The code check is the
+/// primary discriminator, so a non-database error (or a DB error with a
+/// different code) never triggers this even if its text happens to contain the
+/// same words — the failure mode gpt56 flagged in the read path. Pure over input.
+///
+/// SHARED single source of truth: the READ fallback (`storage::read_brochure`)
+/// calls this same classifier so the read and write paths can never drift.
+pub(crate) fn is_missing_fit_score_column(e: &sqlx::Error) -> bool {
     let is_undefined_column = e
         .as_database_error()
         .and_then(|d| d.code())
@@ -538,6 +545,13 @@ mod tests {
         // a missing-column case — the fallback is reserved for the exact 42703/
         // fit_score scenario. (RowNotFound carries no SQLSTATE, so it is rejected.)
         assert!(!is_missing_fit_score_column(&sqlx::Error::RowNotFound));
+        // Not decided from message text: an error whose TEXT reads exactly like a
+        // missing-fit_score-column error, but which carries NO 42703 database
+        // code, must be rejected — classification is by CODE, not wording.
+        assert!(!is_missing_fit_score_column(&sqlx::Error::Protocol(
+            "column \"fit_score\" of relation \"model_discovery_candidate\" does not exist"
+                .to_string()
+        )));
     }
 
     // ---- gfx1151_class ON CONFLICT resolution (the 'unknown'-overwrite rule) ----

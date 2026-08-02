@@ -39,16 +39,14 @@ fn is_missing_relation_error(msg: &str) -> bool {
     m.contains("relation") && m.contains("does not exist")
 }
 
-/// True when a Postgres error indicates the S128 `fit_score` COLUMN is absent (a
-/// host that HAS the brochure table but not the S128 column — i.e. the code was
-/// deployed before the operator applied `S128-fitscore-persist.sql`). Postgres
-/// reports SQLSTATE `42703` (`undefined_column`); we also require a `fit_score`
-/// mention so this only ever triggers the specific fallback and never masks an
-/// unrelated undefined-column bug. Pure over its input.
-fn is_missing_fit_score_column(msg: &str) -> bool {
-    let m = msg.to_lowercase();
-    m.contains("column") && m.contains("does not exist") && m.contains("fit_score")
-}
+// The S128 `fit_score` missing-COLUMN classifier for the read fallback (a host
+// that HAS the brochure table but not the S128 column — i.e. the code was
+// deployed before the operator applied `S128-fitscore-persist.sql`). Delegates
+// to the SHARED, SQLSTATE-`42703`-based classifier the WRITE path uses, so the
+// two paths can never drift and the read fallback is NOT decided from message
+// text alone (it classifies by the database error CODE, with `fit_score` as a
+// secondary guard).
+use crate::intake::discovery::upsert::is_missing_fit_score_column;
 
 /// The full SELECT — every `model_discovery_candidate` column, in
 /// [`DiscoveryCandidate`] field order, INCLUDING the S128 `fit_score`.
@@ -179,9 +177,11 @@ pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, Too
             }
             // Fail-soft (forward/backward compatible): the code may be deployed
             // before the operator applies the S128 migration, so the table exists
-            // but the `fit_score` column doesn't. Retry with the legacy SELECT
-            // that omits it; those rows decode with `fit_score = None`.
-            if is_missing_fit_score_column(&msg) {
+            // but the `fit_score` column doesn't. Classify by the DB error CODE
+            // (SQLSTATE 42703, via the shared write-path classifier — never by
+            // message text alone), then retry with the legacy SELECT that omits
+            // it; those rows decode with `fit_score = None`.
+            if is_missing_fit_score_column(&e) {
                 match sqlx::query_as::<_, BrochureRow>(READ_BROCHURE_SQL_LEGACY)
                     .fetch_all(pool)
                     .await
@@ -303,19 +303,24 @@ mod tests {
     }
 
     #[test]
-    fn is_missing_fit_score_column_matches_only_the_fit_score_column() {
-        assert!(is_missing_fit_score_column(
-            "error returned from database: column \"fit_score\" of relation \
-             \"model_discovery_candidate\" does not exist"
-        ));
-        // An unrelated undefined-column error must NOT trigger the fit_score fallback.
-        assert!(!is_missing_fit_score_column(
-            "column \"some_other_col\" does not exist"
-        ));
-        // A missing-relation error is handled separately, not here.
-        assert!(!is_missing_fit_score_column(
-            "relation \"model_discovery_candidate\" does not exist"
-        ));
+    fn read_fallback_classifier_is_not_decided_from_message_text_alone() {
+        // The gpt56 finding: the read fallback must NOT trigger purely because an
+        // error's TEXT contains the words — it must classify by the DB error CODE
+        // (SQLSTATE 42703). A non-database error whose message literally reads
+        // like a missing-fit_score-column error must be REJECTED, because it
+        // carries no 42703 code. (The live 42703 positive path is exercised
+        // against a real Postgres — no public constructor for a PgDatabaseError —
+        // same DB-gated convention as the rest of this module's SQL bodies.)
+        let text_lookalike = sqlx::Error::Protocol(
+            "column \"fit_score\" of relation \"model_discovery_candidate\" does not exist"
+                .to_string(),
+        );
+        assert!(
+            !is_missing_fit_score_column(&text_lookalike),
+            "a non-DB error with matching text must NOT trigger the fallback (no 42703 code)"
+        );
+        // A DB-less sentinel error likewise never triggers it.
+        assert!(!is_missing_fit_score_column(&sqlx::Error::RowNotFound));
     }
 
     #[test]
