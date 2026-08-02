@@ -291,13 +291,29 @@ impl RustTool for ServingResidencyStatus {
             )
         })?;
 
-        // Missing snapshot ⇒ treat as IDLE (Chord has not written one yet), not a
-        // crash. A present-but-unreadable file is a genuine, genericized error.
+        // A MISSING snapshot is not an idle GPU.
+        //
+        // This used to return `ResidencySnapshot::default()`, which renders as
+        // "state=IDLE (no resident models; free VRAM at baseline)". The intent was
+        // benign — do not crash when Chord has not written one yet — but the effect
+        // was to turn "I could not read the state" into a confident assertion that
+        // nothing is resident. On a box actively serving models that is a WRONG
+        // answer, not a missing one, and it is indistinguishable from a healthy
+        // idle system: exactly the failure an operator cannot detect by reading it.
+        //
+        // Verified live 2026-08-02: no snapshot is ever written, because Chord's
+        // `VramResidencyManager` is built-but-never-constructed (CHRD-95). So this
+        // path was not a rare startup race — it was the ONLY path, and the tool
+        // reported a plausible falsehood every single call.
+        //
+        // Absence now reports as absence. Still not an error: a snapshot that has
+        // genuinely not been written yet is a normal state to be in, and callers
+        // that want the numbers can tell the difference without a failed call.
         let snapshot = match std::fs::read_to_string(&path) {
             Ok(contents) => serde_json::from_str::<ResidencySnapshot>(&contents).map_err(|_| {
                 ToolError::Execution("residency state snapshot is unreadable".into())
             })?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ResidencySnapshot::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(NO_SNAPSHOT.into()),
             Err(_) => {
                 // Do NOT echo the path (it is an infra mount) — generic message only.
                 return Err(ToolError::Execution(
@@ -309,6 +325,17 @@ impl RustTool for ServingResidencyStatus {
         Ok(format_residency(&snapshot))
     }
 }
+
+/// What we say when no snapshot exists.
+///
+/// Deliberately does NOT contain the word IDLE, and deliberately reports no
+/// numbers: every field would be a zero we invented. The one thing this message
+/// must never do is read like a description of the GPU's state.
+const NO_SNAPSHOT: &str = "state=UNKNOWN — no residency snapshot has been written, so the resident \
+                           set could not be read.\n\
+                           This is NOT a report that nothing is resident: models may well be loaded. \
+                           If snapshots never appear, Chord's residency state-file persistence is not \
+                           writing (unset path on the Chord side, or the residency manager is not wired).\n";
 
 /// Render the residency snapshot into a sanitized, operator-facing block.
 fn format_residency(s: &ResidencySnapshot) -> String {
@@ -512,6 +539,78 @@ pub fn register(registry: &mut ToolRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- TERM-601: a missing snapshot must not read as an idle GPU ----
+
+    /// THE BUG. No snapshot ⇒ the answer must not claim anything about residency.
+    ///
+    /// The old behaviour returned `ResidencySnapshot::default()`, which renders
+    /// "state=IDLE (no resident models; free VRAM at baseline)" — a confident,
+    /// plausible falsehood on a box that is actively serving models. Verified
+    /// live: no snapshot is ever written today, so that was not a startup race,
+    /// it was every single call.
+    #[test]
+    fn no_snapshot_does_not_claim_the_gpu_is_idle() {
+        assert!(
+            !NO_SNAPSHOT.contains("IDLE"),
+            "the absence message must not read as a residency state"
+        );
+        assert!(NO_SNAPSHOT.contains("UNKNOWN"));
+        assert!(
+            NO_SNAPSHOT.to_lowercase().contains("not a report that nothing is resident"),
+            "it must say explicitly what it is NOT claiming"
+        );
+    }
+
+    /// The absence message must not invent numbers. Every field would be a zero
+    /// we made up, and a zero looks like a measurement.
+    #[test]
+    fn the_absence_message_reports_no_figures() {
+        for fabricated in ["resident=", "free_vram_gb=", "baseline_vram_gb=", "chat_pinned="] {
+            assert!(
+                !NO_SNAPSHOT.contains(fabricated),
+                "{fabricated} in the absence message would read as a measurement"
+            );
+        }
+    }
+
+    /// POSITIVE CONTROL — and the reason this is not simply "delete IDLE".
+    ///
+    /// A GENUINELY idle GPU, reported by a snapshot that really was written, must
+    /// still say IDLE. Otherwise the fix trades one wrong answer for another and
+    /// the operator loses a true signal they had before.
+    #[test]
+    fn a_written_snapshot_with_no_residents_still_reports_idle() {
+        let idle = ResidencySnapshot {
+            residents: vec![],
+            free_vram_gb: 96.0,
+            baseline_vram_gb: 96.0,
+            pinned_chat_model: None,
+        };
+        let out = format_residency(&idle);
+        assert!(out.contains("state=IDLE"), "a real idle snapshot must still report IDLE");
+        assert!(out.contains("free_vram_gb=96.0"), "and must still report its figures");
+    }
+
+    /// And a snapshot WITH residents renders them, so the distinction is
+    /// three-way — unknown, idle, occupied — not two-way.
+    #[test]
+    fn a_snapshot_with_residents_renders_them_and_never_says_idle() {
+        let busy = ResidencySnapshot {
+            residents: vec![Resident {
+                role: "chat".into(),
+                model_id: "granite4.1:8b".into(),
+                vram_gb: 12.5,
+            }],
+            free_vram_gb: 40.0,
+            baseline_vram_gb: 96.0,
+            pinned_chat_model: Some("granite4.1:8b".into()),
+        };
+        let out = format_residency(&busy);
+        assert!(!out.contains("state=IDLE"));
+        assert!(out.contains("granite4.1:8b"));
+        assert!(out.contains("resident=1"));
+    }
 
     fn meta_ok(tool: &dyn RustTool) {
         assert!(!tool.name().is_empty());
