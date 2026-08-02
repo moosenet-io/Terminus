@@ -53,11 +53,95 @@
 //! `INTAKE_DATABASE_URL`/`DATABASE_URL` through `config.rs`, not a secret
 //! vault entry). No `std::env::var` reads, no vault access, here.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde_json::Value;
 use sqlx::PgPool;
 
 use crate::error::ToolError;
 use crate::intake::discovery::schema::{CandidateStatus, DiscoveryCandidate};
+
+/// Latched once the first fail-soft "the `fit_score` column doesn't exist yet"
+/// downgrade is logged, so a pre-migration deploy logs the degrade EXACTLY ONCE
+/// per process rather than once per upserted candidate (an enrich pass upserts
+/// many rows). Reset is intentionally impossible for a process lifetime.
+static FIT_SCORE_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// The shared column/VALUES/ON-CONFLICT-SET body every upsert uses, minus the
+/// S128 `fit_score` column. `{FIT_COLS}` / `{FIT_VALS}` / `{FIT_SET}` are spliced
+/// in (or left empty) by [`upsert_sql`] so the WITH-fit and LEGACY (pre-S128-
+/// migration) statements are generated from ONE source of truth — the 19 shared
+/// binds are identical between them, only the trailing `fit_score` bind differs.
+const UPSERT_SQL_TEMPLATE: &str =
+    "INSERT INTO model_discovery_candidate \
+         (model_name, hf_repo, category, status, gfx1151_class, size_b, \
+          vram_footprint_gb, discovery_source, discovery_score, \
+          discovered_at, last_seen_at, rationale, modality, \
+          published_at, updated_at, license, arch, is_instruct, gated, quant_dtype, \
+          has_gguf{FIT_COLS}) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), $10, $11, \
+             $12, $13, $14, $15, $16, $17, $18, $19{FIT_VALS}) \
+     ON CONFLICT (model_name) DO UPDATE SET \
+         hf_repo = EXCLUDED.hf_repo, \
+         category = EXCLUDED.category, \
+         discovery_source = EXCLUDED.discovery_source, \
+         discovery_score = EXCLUDED.discovery_score, \
+         last_seen_at = now(), \
+         rationale = EXCLUDED.rationale, \
+         gfx1151_class = CASE WHEN EXCLUDED.gfx1151_class = 'unknown' \
+                              THEN model_discovery_candidate.gfx1151_class \
+                              ELSE EXCLUDED.gfx1151_class END, \
+         size_b = COALESCE(EXCLUDED.size_b, model_discovery_candidate.size_b), \
+         vram_footprint_gb = COALESCE(EXCLUDED.vram_footprint_gb, \
+                                      model_discovery_candidate.vram_footprint_gb), \
+         modality = COALESCE(EXCLUDED.modality, model_discovery_candidate.modality), \
+         published_at = COALESCE(EXCLUDED.published_at, model_discovery_candidate.published_at), \
+         updated_at = COALESCE(EXCLUDED.updated_at, model_discovery_candidate.updated_at), \
+         license = COALESCE(EXCLUDED.license, model_discovery_candidate.license), \
+         arch = COALESCE(EXCLUDED.arch, model_discovery_candidate.arch), \
+         is_instruct = COALESCE(EXCLUDED.is_instruct, model_discovery_candidate.is_instruct), \
+         gated = COALESCE(EXCLUDED.gated, model_discovery_candidate.gated), \
+         quant_dtype = COALESCE(EXCLUDED.quant_dtype, model_discovery_candidate.quant_dtype), \
+         has_gguf = COALESCE(EXCLUDED.has_gguf, model_discovery_candidate.has_gguf){FIT_SET}";
+
+/// Render the upsert SQL, including the S128 `fit_score` column iff `with_fit`.
+/// When included, `fit_score` is `COALESCE`-protected identically to the other
+/// enrich-only columns (a MEASURE pass writes a real value; a bare listing
+/// re-observation carries `NULL` and must never erase a computed score). The
+/// LEGACY (no-fit) rendering is a byte-for-byte no-op of the new field, used as
+/// the fail-soft fallback when the column doesn't exist yet (pre-migration).
+fn upsert_sql(with_fit: bool) -> String {
+    if with_fit {
+        UPSERT_SQL_TEMPLATE
+            .replace("{FIT_COLS}", ", fit_score")
+            .replace("{FIT_VALS}", ", $20")
+            .replace(
+                "{FIT_SET}",
+                ", fit_score = COALESCE(EXCLUDED.fit_score, model_discovery_candidate.fit_score)",
+            )
+    } else {
+        UPSERT_SQL_TEMPLATE
+            .replace("{FIT_COLS}", "")
+            .replace("{FIT_VALS}", "")
+            .replace("{FIT_SET}", "")
+    }
+}
+
+/// True when a Postgres error indicates the `fit_score` COLUMN does not exist
+/// (an un-migrated host that has the table but not the S128 column). Postgres
+/// reports SQLSTATE `42703` (`undefined_column`), e.g.
+/// `column "fit_score" of relation "model_discovery_candidate" does not exist`.
+/// Checked via the SQLSTATE code (robust to message wording) AND a `fit_score`
+/// mention, so this only ever swallows the specific new-column case and never
+/// masks an unrelated undefined-column bug. Pure over its input.
+fn is_missing_fit_score_column(e: &sqlx::Error) -> bool {
+    let is_undefined_column = e
+        .as_database_error()
+        .and_then(|d| d.code())
+        .map(|c| c == "42703")
+        .unwrap_or(false);
+    is_undefined_column && e.to_string().to_lowercase().contains("fit_score")
+}
 
 /// Insert a new brochure row, or update an existing one on `model_name`
 /// conflict. Every call bumps `last_seen_at` to the DB's own `now()` — so
@@ -90,6 +174,17 @@ use crate::intake::discovery::schema::{CandidateStatus, DiscoveryCandidate};
 /// protected identically: a MEASURE/ENRICH pass writes real values, and a later
 /// bare-listing re-observation (which carries them as `NULL`) never erases them.
 /// The S127b `has_gguf` serveability flag is `COALESCE`-protected the same way.
+/// The S128 `fit_score` (the persisted blended practical rank score) is
+/// `COALESCE`-protected identically — a MEASURE pass writes a real score; a bare
+/// listing re-observation carries `NULL` and never erases it.
+///
+/// FAIL-SOFT ON A MISSING `fit_score` COLUMN (forward/backward compatible): this
+/// code is designed to deploy BEFORE the S128 migration is applied. The write
+/// first attempts the statement INCLUDING `fit_score`; if Postgres reports the
+/// column does not exist (SQLSTATE 42703, see [`is_missing_fit_score_column`]),
+/// it logs ONCE per process and RETRIES with a legacy statement that omits the
+/// column — a graceful no-op of the new field, never a crash of the intake pass.
+/// Once the operator applies the migration the first path simply succeeds.
 ///
 /// `gfx1151_class` keeps its CASE (not COALESCE) semantics — see
 /// [`resolve_gfx1151_on_conflict`] for the pure mirror this SQL implements: a
@@ -104,66 +199,71 @@ pub async fn upsert_candidate(
     pool: &PgPool,
     candidate: &DiscoveryCandidate,
 ) -> Result<(), ToolError> {
-    sqlx::query(
-        "INSERT INTO model_discovery_candidate \
-             (model_name, hf_repo, category, status, gfx1151_class, size_b, \
-              vram_footprint_gb, discovery_source, discovery_score, \
-              discovered_at, last_seen_at, rationale, modality, \
-              published_at, updated_at, license, arch, is_instruct, gated, quant_dtype, \
-              has_gguf) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), $10, $11, \
-                 $12, $13, $14, $15, $16, $17, $18, $19) \
-         ON CONFLICT (model_name) DO UPDATE SET \
-             hf_repo = EXCLUDED.hf_repo, \
-             category = EXCLUDED.category, \
-             discovery_source = EXCLUDED.discovery_source, \
-             discovery_score = EXCLUDED.discovery_score, \
-             last_seen_at = now(), \
-             rationale = EXCLUDED.rationale, \
-             gfx1151_class = CASE WHEN EXCLUDED.gfx1151_class = 'unknown' \
-                                  THEN model_discovery_candidate.gfx1151_class \
-                                  ELSE EXCLUDED.gfx1151_class END, \
-             size_b = COALESCE(EXCLUDED.size_b, model_discovery_candidate.size_b), \
-             vram_footprint_gb = COALESCE(EXCLUDED.vram_footprint_gb, \
-                                          model_discovery_candidate.vram_footprint_gb), \
-             modality = COALESCE(EXCLUDED.modality, model_discovery_candidate.modality), \
-             published_at = COALESCE(EXCLUDED.published_at, model_discovery_candidate.published_at), \
-             updated_at = COALESCE(EXCLUDED.updated_at, model_discovery_candidate.updated_at), \
-             license = COALESCE(EXCLUDED.license, model_discovery_candidate.license), \
-             arch = COALESCE(EXCLUDED.arch, model_discovery_candidate.arch), \
-             is_instruct = COALESCE(EXCLUDED.is_instruct, model_discovery_candidate.is_instruct), \
-             gated = COALESCE(EXCLUDED.gated, model_discovery_candidate.gated), \
-             quant_dtype = COALESCE(EXCLUDED.quant_dtype, model_discovery_candidate.quant_dtype), \
-             has_gguf = COALESCE(EXCLUDED.has_gguf, model_discovery_candidate.has_gguf)",
-    )
-    .bind(&candidate.model_name)
-    .bind(&candidate.hf_repo)
-    .bind(candidate.category.as_str())
-    .bind(candidate.status.as_str())
-    .bind(&candidate.gfx1151_class)
-    .bind(candidate.size_b)
-    .bind(candidate.vram_footprint_gb)
-    .bind(&candidate.discovery_source)
-    .bind(candidate.discovery_score)
-    .bind(candidate.rationale.as_deref())
-    .bind(candidate.modality.map(|m| m.as_str()))
-    .bind(candidate.published_at)
-    .bind(candidate.updated_at)
-    .bind(candidate.license.as_deref())
-    .bind(candidate.arch.as_deref())
-    .bind(candidate.is_instruct)
-    .bind(candidate.gated)
-    .bind(candidate.quant_dtype.as_deref())
-    .bind(candidate.has_gguf)
-    .execute(pool)
-    .await
-    .map_err(|e| {
-        ToolError::Database(format!(
+    // First attempt: persist EVERYTHING including the S128 `fit_score` column.
+    match execute_upsert(pool, candidate, true).await {
+        Ok(()) => Ok(()),
+        Err(e) if is_missing_fit_score_column(&e) => {
+            // Fail-soft: the S128 migration hasn't been applied yet. Log once per
+            // process (an enrich pass upserts many rows — don't spam), then retry
+            // WITHOUT `fit_score`. This is exactly what lets the code deploy
+            // BEFORE the operator-gated DDL runs.
+            if !FIT_SCORE_MISSING_LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "model_discovery_candidate.fit_score column is absent (S128 migration \
+                     not yet applied) — persisting candidates WITHOUT fit_score until an \
+                     operator applies migrations/S128-fitscore-persist.sql; ranking is \
+                     unaffected (fit_score is recomputed transiently at selection time)"
+                );
+            }
+            execute_upsert(pool, candidate, false).await.map_err(|e| {
+                ToolError::Database(format!(
+                    "upsert model_discovery_candidate row for '{}' (fit_score fallback): {e}",
+                    candidate.model_name
+                ))
+            })
+        }
+        Err(e) => Err(ToolError::Database(format!(
             "upsert model_discovery_candidate row for '{}': {e}",
             candidate.model_name
-        ))
-    })?;
-    Ok(())
+        ))),
+    }
+}
+
+/// Execute one upsert, WITH or WITHOUT the S128 `fit_score` column. The 19
+/// shared binds are identical between the two renderings; only the trailing
+/// `fit_score` bind (`$20`) is added when `with_fit`. Returns the raw
+/// [`sqlx::Error`] so the caller can classify a missing-column error and fall
+/// back — see [`upsert_candidate`].
+async fn execute_upsert(
+    pool: &PgPool,
+    candidate: &DiscoveryCandidate,
+    with_fit: bool,
+) -> Result<(), sqlx::Error> {
+    let sql = upsert_sql(with_fit);
+    let mut q = sqlx::query(&sql)
+        .bind(&candidate.model_name)
+        .bind(&candidate.hf_repo)
+        .bind(candidate.category.as_str())
+        .bind(candidate.status.as_str())
+        .bind(&candidate.gfx1151_class)
+        .bind(candidate.size_b)
+        .bind(candidate.vram_footprint_gb)
+        .bind(&candidate.discovery_source)
+        .bind(candidate.discovery_score)
+        .bind(candidate.rationale.as_deref())
+        .bind(candidate.modality.map(|m| m.as_str()))
+        .bind(candidate.published_at)
+        .bind(candidate.updated_at)
+        .bind(candidate.license.as_deref())
+        .bind(candidate.arch.as_deref())
+        .bind(candidate.is_instruct)
+        .bind(candidate.gated)
+        .bind(candidate.quant_dtype.as_deref())
+        .bind(candidate.has_gguf);
+    if with_fit {
+        q = q.bind(candidate.fit_score);
+    }
+    q.execute(pool).await.map(|_| ())
 }
 
 /// Pure mirror of the `gfx1151_class` `ON CONFLICT` CASE expression in
@@ -372,6 +472,73 @@ mod tests {
     // SQL — which transitions are legal — lives in
     // `predecessors_for_transition`/`allowed_predecessors`, which are pure
     // and fully covered here.
+
+    // ---- S128 fit_score persistence: SQL rendering + fail-soft classifier ----
+    //
+    // The live INSERT/UPDATE body is thin sqlx over a real Postgres (same
+    // DB-gated convention as the rest of this module), so it isn't unit-tested
+    // against a DB here. The load-bearing NEW logic — that the WITH-fit and
+    // LEGACY renderings differ ONLY by the fit_score column (so the fallback is a
+    // true no-op of the field), and that the missing-column classifier fires only
+    // on the specific 42703/fit_score case — is pure and fully covered below.
+
+    #[test]
+    fn with_fit_sql_persists_fit_score_and_coalesce_protects_it() {
+        let sql = upsert_sql(true);
+        // Column, value placeholder, and the COALESCE-on-conflict SET are all present.
+        assert!(sql.contains(", fit_score)"), "fit_score in the column list");
+        assert!(sql.contains(", $20)"), "the $20 bind for fit_score");
+        assert!(
+            sql.contains(
+                "fit_score = COALESCE(EXCLUDED.fit_score, model_discovery_candidate.fit_score)"
+            ),
+            "fit_score COALESCE-protected on conflict so a bare re-observation never erases it"
+        );
+        // No unrendered template markers leaked into the SQL.
+        assert!(!sql.contains("{FIT"), "all template markers substituted: {sql}");
+    }
+
+    #[test]
+    fn legacy_sql_is_a_true_no_op_of_fit_score() {
+        // The fallback (pre-S128-migration) statement must not mention fit_score
+        // ANYWHERE — no column, no bind, no SET — so it is a graceful no-op of the
+        // new field against a host whose table lacks the column.
+        let sql = upsert_sql(false);
+        assert!(
+            !sql.contains("fit_score"),
+            "legacy fallback SQL must omit fit_score entirely: {sql}"
+        );
+        // ...and it must still only bind through $19 (the 19 shared params).
+        assert!(sql.contains("$19)"), "legacy VALUES ends at $19");
+        assert!(!sql.contains("$20"), "legacy SQL has no $20 bind");
+        assert!(!sql.contains("{FIT"), "all template markers substituted: {sql}");
+    }
+
+    #[test]
+    fn with_fit_and_legacy_share_the_same_19_param_body() {
+        // Everything except the fit_score additions must be byte-identical, proving
+        // the two renderings can't drift in the shared binds.
+        let with = upsert_sql(true)
+            .replace(", fit_score)", ")")
+            .replace(", $20)", ")")
+            .replace(
+                ", fit_score = COALESCE(EXCLUDED.fit_score, model_discovery_candidate.fit_score)",
+                "",
+            );
+        assert_eq!(
+            with,
+            upsert_sql(false),
+            "WITH-fit minus its fit_score additions must equal the legacy rendering"
+        );
+    }
+
+    #[test]
+    fn missing_fit_score_classifier_ignores_unrelated_errors() {
+        // A non-database error (e.g. a pool/protocol error) must NOT be treated as
+        // a missing-column case — the fallback is reserved for the exact 42703/
+        // fit_score scenario. (RowNotFound carries no SQLSTATE, so it is rejected.)
+        assert!(!is_missing_fit_score_column(&sqlx::Error::RowNotFound));
+    }
 
     // ---- gfx1151_class ON CONFLICT resolution (the 'unknown'-overwrite rule) ----
 

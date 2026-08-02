@@ -1,0 +1,42 @@
+-- S128 (TERM): persist the blended PRACTICAL `fit_score` on the discovery
+-- "brochure" (`model_discovery_candidate`, DISC-01, see `S114-disc01-brochure.sql`).
+--
+-- WHY: the model-discovery auto-promotion loop computes a blended, practical
+-- `fit_score` (0.35 hardware-fit + 0.30 assistant-suitability + 0.25 recency +
+-- 0.10 popularity tiebreak — see `src/intake/discovery/select.rs::fit_score`) to
+-- RANK candidates, but it was only ever computed TRANSIENTLY at selection time
+-- and thrown away — only the raw HF-popularity `discovery_score` was persisted.
+-- Because of that, Chord's cold-quota pruning fallback (CQH-01 F5) had to prune
+-- un-swept models on `discovery_score` (a hype meter), since the real practical
+-- `fit_score` did not exist as a column. Persisting it lets score-based
+-- cold-storage pruning act on the practical fitness signal instead.
+--
+-- WHAT: one nullable column. It is written by the MEASURE/ENRICH pass
+-- (`measure.rs`), which is the only point at which a candidate carries the fully
+-- enriched fields the score blends (size/gfx-class/is_instruct/recency); a bare
+-- discovery re-observation (`refresh.rs`) carries it as NULL, and the DISC-03
+-- upsert `COALESCE`-protects it so a re-observation never erases a computed
+-- score. NULL = never enriched/scored yet.
+--
+--   fit_score  DOUBLE PRECISION  — blended practical fit ∈ [0, Σweights]
+--                                  (∈ [0,1] with the default weights, which sum
+--                                  to 1.0). NULL until the first MEASURE pass.
+--
+-- Applied OUT-OF-BAND by an operator, NOT by the harness (matching the
+-- DISC-01 / CB-02 / S127 / S127b convention — `src/intake/storage.rs` only
+-- INSERTs/SELECTs, never issues DDL). Additive, idempotent, non-destructive:
+-- `ADD COLUMN IF NOT EXISTS`, so re-applying is a safe no-op and existing rows
+-- simply carry NULL until the next MEASURE pass scores them. Depends only on
+-- `model_discovery_candidate` existing (the DISC-01 migration); touches no other
+-- table.
+--
+-- FORWARD/BACKWARD-COMPAT NOTE: the write path (`upsert.rs`) is deliberately
+-- fail-soft about this column — it deploys BEFORE this migration is applied. If
+-- the column is absent, the upsert detects the undefined-column error (SQLSTATE
+-- 42703), logs once, and retries the write WITHOUT `fit_score` (a graceful
+-- no-op of the new field). The read path (`storage.rs`) likewise falls back to a
+-- SELECT that omits the column. So applying this migration only ENABLES
+-- persistence; it is never a prerequisite for the code to run.
+
+ALTER TABLE model_discovery_candidate
+    ADD COLUMN IF NOT EXISTS fit_score DOUBLE PRECISION;

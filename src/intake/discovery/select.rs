@@ -878,6 +878,9 @@ mod tests {
             // aren't tripped by the S127b require-GGUF hard filter (default on);
             // the GGUF-filter tests below set this explicitly.
             has_gguf: Some(true),
+            // Persisted score is irrelevant to the selector (it recomputes
+            // fit_score transiently); default None in the test builder.
+            fit_score: None,
         }
     }
 

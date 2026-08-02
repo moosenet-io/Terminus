@@ -689,6 +689,14 @@ pub async fn measure_brochure(
     // host classifies "no" here exactly as the acquire fit check would skip it.
     let vram_ceiling = crate::intake::assistant::acquire::vram_ceiling_gb();
 
+    // S128: the selector's blended practical fit_score is computed from the SAME
+    // env-tuned weights/recency knobs the ranking uses, so the value we PERSIST
+    // matches what selection would derive. Resolved once per pass (not per
+    // candidate) and anchored to a single `now` so recency is consistent across
+    // the whole pass.
+    let fit_cfg = crate::intake::discovery::select::DiscoverySelectConfig::from_env();
+    let fit_now = chrono::Utc::now();
+
     for cand in targets {
         match client.get_model_info(&cand.hf_repo).await {
             Ok(info) => {
@@ -739,6 +747,17 @@ pub async fn measure_brochure(
                         updated.gated = enriched.gated.or(updated.gated);
                         updated.quant_dtype = enriched.quant_dtype.clone().or(updated.quant_dtype);
                         updated.has_gguf = enriched.has_gguf.or(updated.has_gguf);
+                        // S128: compute + persist the blended practical fit_score
+                        // from the NOW fully-enriched candidate (size/gfx-class/
+                        // is_instruct/recency all in place), so score-based
+                        // cold-storage pruning (Chord CQH-01 F5) can prune on the
+                        // real practical score rather than raw HF popularity. The
+                        // upsert COALESCE-protects it (a later bare re-observation
+                        // carries None and never erases this) and fail-softs if the
+                        // fit_score column isn't migrated in yet.
+                        updated.fit_score = Some(crate::intake::discovery::select::fit_score(
+                            &updated, &fit_cfg, fit_now,
+                        ));
                         match upsert_candidate(p, &updated).await {
                             Ok(()) => {
                                 if has_size {
@@ -922,6 +941,7 @@ mod tests {
             gated: None,
             quant_dtype: None,
             has_gguf: None,
+            fit_score: None,
         }
     }
 

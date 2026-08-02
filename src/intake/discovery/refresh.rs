@@ -117,6 +117,10 @@ fn candidate_from(
         // S127b: a bare listing carries no siblings blob; the MEASURE/ENRICH step
         // derives has_gguf and upsert COALESCE-protects it (None never erases it).
         has_gguf: None,
+        // S128: a bare listing has no enriched fields to score from; the MEASURE
+        // pass computes + persists fit_score, and the upsert COALESCE-protects it
+        // (this None never erases a previously computed score).
+        fit_score: None,
     }
 }
 

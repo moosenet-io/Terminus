@@ -39,9 +39,31 @@ fn is_missing_relation_error(msg: &str) -> bool {
     m.contains("relation") && m.contains("does not exist")
 }
 
+/// True when a Postgres error indicates the S128 `fit_score` COLUMN is absent (a
+/// host that HAS the brochure table but not the S128 column — i.e. the code was
+/// deployed before the operator applied `S128-fitscore-persist.sql`). Postgres
+/// reports SQLSTATE `42703` (`undefined_column`); we also require a `fit_score`
+/// mention so this only ever triggers the specific fallback and never masks an
+/// unrelated undefined-column bug. Pure over its input.
+fn is_missing_fit_score_column(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("column") && m.contains("does not exist") && m.contains("fit_score")
+}
+
 /// The full SELECT — every `model_discovery_candidate` column, in
-/// [`DiscoveryCandidate`] field order.
+/// [`DiscoveryCandidate`] field order, INCLUDING the S128 `fit_score`.
 const READ_BROCHURE_SQL: &str = "SELECT model_name, hf_repo, category, status, gfx1151_class, \
+     size_b, vram_footprint_gb, discovery_source, discovery_score, discovered_at, last_seen_at, \
+     fetched_at, marked_for_fleet_at, evicted_at, retained_profile, rationale, modality, \
+     published_at, updated_at, license, arch, is_instruct, gated, quant_dtype, has_gguf, fit_score \
+     FROM model_discovery_candidate ORDER BY model_name";
+
+/// LEGACY SELECT (pre-S128 migration) — identical to [`READ_BROCHURE_SQL`] but
+/// WITHOUT the `fit_score` column, used as the fail-soft fallback when the column
+/// doesn't exist yet. [`BrochureRow`]'s `FromRow` decodes `fit_score` via a
+/// tolerant `try_get(...).unwrap_or(None)`, so a row from THIS query simply
+/// carries `fit_score = None`.
+const READ_BROCHURE_SQL_LEGACY: &str = "SELECT model_name, hf_repo, category, status, gfx1151_class, \
      size_b, vram_footprint_gb, discovery_source, discovery_score, discovered_at, last_seen_at, \
      fetched_at, marked_for_fleet_at, evicted_at, retained_profile, rationale, modality, \
      published_at, updated_at, license, arch, is_instruct, gated, quant_dtype, has_gguf \
@@ -86,6 +108,10 @@ struct BrochureRow {
     quant_dtype: Option<String>,
     /// S127b GGUF-availability; NULL = not yet measured.
     has_gguf: Option<bool>,
+    /// S128 persisted blended practical fit score; NULL = not yet scored. Decoded
+    /// tolerantly (see `FromRow`) so a legacy (pre-S128) row missing the column
+    /// simply reads as `None`.
+    fit_score: Option<f64>,
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for BrochureRow {
@@ -117,6 +143,10 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for BrochureRow {
             gated: row.try_get("gated")?,
             quant_dtype: row.try_get("quant_dtype")?,
             has_gguf: row.try_get("has_gguf")?,
+            // Tolerant: the legacy (pre-S128) SELECT omits this column entirely,
+            // so `try_get` returns a ColumnNotFound error — treat that (and a SQL
+            // NULL) alike as `None`. Never propagates as a decode failure.
+            fit_score: row.try_get("fit_score").unwrap_or(None),
         })
     }
 }
@@ -147,9 +177,27 @@ pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, Too
                         .into(),
                 ));
             }
-            return Err(ToolError::Database(format!(
-                "Failed to read model_discovery_candidate: {msg}"
-            )));
+            // Fail-soft (forward/backward compatible): the code may be deployed
+            // before the operator applies the S128 migration, so the table exists
+            // but the `fit_score` column doesn't. Retry with the legacy SELECT
+            // that omits it; those rows decode with `fit_score = None`.
+            if is_missing_fit_score_column(&msg) {
+                match sqlx::query_as::<_, BrochureRow>(READ_BROCHURE_SQL_LEGACY)
+                    .fetch_all(pool)
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(e2) => {
+                        return Err(ToolError::Database(format!(
+                            "Failed to read model_discovery_candidate (fit_score fallback): {e2}"
+                        )));
+                    }
+                }
+            } else {
+                return Err(ToolError::Database(format!(
+                    "Failed to read model_discovery_candidate: {msg}"
+                )));
+            }
         }
     };
 
@@ -181,6 +229,7 @@ pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, Too
             gated,
             quant_dtype,
             has_gguf,
+            fit_score,
         } = row;
         let category = FleetCategory::from_str(&category).map_err(|e| {
             ToolError::Database(format!(
@@ -234,6 +283,7 @@ pub async fn read_brochure(pool: &PgPool) -> Result<Vec<DiscoveryCandidate>, Too
             gated,
             quant_dtype,
             has_gguf,
+            fit_score,
         });
     }
     Ok(out)
@@ -250,5 +300,29 @@ mod tests {
         ));
         assert!(!is_missing_relation_error("connection refused"));
         assert!(!is_missing_relation_error("column \"foo\" does not exist"));
+    }
+
+    #[test]
+    fn is_missing_fit_score_column_matches_only_the_fit_score_column() {
+        assert!(is_missing_fit_score_column(
+            "error returned from database: column \"fit_score\" of relation \
+             \"model_discovery_candidate\" does not exist"
+        ));
+        // An unrelated undefined-column error must NOT trigger the fit_score fallback.
+        assert!(!is_missing_fit_score_column(
+            "column \"some_other_col\" does not exist"
+        ));
+        // A missing-relation error is handled separately, not here.
+        assert!(!is_missing_fit_score_column(
+            "relation \"model_discovery_candidate\" does not exist"
+        ));
+    }
+
+    #[test]
+    fn legacy_select_omits_fit_score_but_full_select_includes_it() {
+        assert!(READ_BROCHURE_SQL.contains("fit_score"));
+        assert!(!READ_BROCHURE_SQL_LEGACY.contains("fit_score"));
+        // The legacy SELECT is otherwise the full column list up through has_gguf.
+        assert!(READ_BROCHURE_SQL_LEGACY.contains("has_gguf"));
     }
 }
