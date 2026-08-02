@@ -972,6 +972,11 @@ const MOCK_MUSE_STATS = {
   last_ingest_at: new Date(Date.now() - 45 * 60000).toISOString(),
 };
 
+// MACT-06 (MUSE-126): mirrors Muse's real `GET /health` shape exactly (`src/http/mod.rs::
+// health` — `{status, version, db}`, see tileFormat.ts's `MuseHealthPayload` doc). `db: "up"`
+// so the mock world's stat-tile row shows a healthy DB probe by default.
+const MOCK_MUSE_HEALTH = { status: 'ok', version: '0.0.0-mock', db: 'up' };
+
 // MGUI-10 review fix: this mock previously answered `{channels:[{id:'ch-1', …, item_count}]}` —
 // an envelope and an element shape Muse has never returned. Live `GET /api/channels` answers a
 // BARE ARRAY of `ChannelSummary` (Muse `src/web/guide.rs:35`). A mock that disagrees with its
@@ -1380,6 +1385,8 @@ const MOCK_GET: Record<string, unknown> = {
   // for why the dashboard MetricCards row calls this anyway (mock-adapter extension, same
   // GET-and-degrade shape as every other muse route).
   'muse /stats': MOCK_MUSE_STATS,
+  // MACT-06 (MUSE-126): Muse's public liveness+DB probe, reused as-is (no new endpoint).
+  'muse /health': MOCK_MUSE_HEALTH,
   'muse /api/channels': MOCK_MUSE_CHANNELS,
   'muse /api/graph/taste-clusters': MOCK_MUSE_TASTE_CLUSTERS,
   'muse /api/graph/watch-history': MOCK_MUSE_WATCH_HISTORY,

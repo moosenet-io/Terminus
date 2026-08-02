@@ -48,6 +48,7 @@ import type { DataTableColumn } from '../../components/DataTable';
 import { useMuseLiveSessions, useMuseSessionHistory, museArtUrlAt } from '../../hooks/useMuse';
 import type { HistorySession, LiveSession } from '../../lib/aggregationClient';
 import { ImportActivity } from './ImportActivity';
+import { ActivityTiles } from './ActivityTiles';
 import {
   accountLabel,
   classifyDecision,
@@ -344,6 +345,11 @@ export function ActivityPanel() {
       <CardTitle subtitle="Who is watching what, and what the box is doing">
         Maestro — Activity
       </CardTitle>
+
+      {/* MACT-06 (MUSE-126): the H1 (Muse-only) stat-tile row -- library/gaps/subsystem/module
+          health/live-stream count, all from EXISTING endpoints. Host CPU/RAM etc. are H2
+          (MACT-11) inert seams. Own section, own per-tile degradation -- see ActivityTiles.tsx. */}
+      <ActivityTiles />
 
       <LivePane
         available={liveAvailable}
