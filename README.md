@@ -1190,6 +1190,11 @@ so an operator does not have to hold two pattern languages in their head.
   the write it authorizes. A caller states *who* is writing; it never states what they are
   allowed to write. Requires the `S132-rmcp06-account-operator-flag.sql` migration —
   `schema_ready()` reports NOT ready without it.
+- **And it is re-checked on every resolution.** A write-time check is point-in-time, so a
+  stored `*` expands only if its group's owner is an operator *right now* and not disabled.
+  A wildcard written by someone since demoted — or stored before the flag column existed —
+  resolves to the **empty set**. General rule for anything built on top of this: an
+  authority that can be revoked must be re-derived on the read path, never cached in a row.
 
 ### What empty means
 

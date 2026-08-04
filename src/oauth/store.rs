@@ -26,7 +26,8 @@ use uuid::Uuid;
 
 use crate::error::ToolError;
 use crate::oauth::groups::{
-    normalize_description, validate_group, validate_patterns, GroupOwner, Pattern, STARTER_GROUPS,
+    normalize_description, validate_group, validate_patterns, AuthorizedGroup, GroupOwner, Pattern,
+    STARTER_GROUPS,
 };
 use crate::oauth::model::{
     Account, AuthCode, Client, Consent, RefreshToken, ServerOwner, TokenFamily, ToolGroup,
@@ -606,7 +607,13 @@ impl OauthStore {
         Ok(created)
     }
 
-    /// The groups a client draws on.
+    /// The groups a client draws on, as stored rows.
+    ///
+    /// For DISPLAY. Resolving a tool set from these is a bug: the rows carry a
+    /// stored `*` with no indication of whether its owner is still an operator,
+    /// and honouring one from a demoted owner is precisely the revocation gap
+    /// round 2 of review found. Use [`Self::client_authorized_groups`], which
+    /// reads the authority in the same query.
     ///
     /// Joins `rmcp_client` and requires the client to be ENABLED **and to share
     /// the group's owner account**.
@@ -655,6 +662,53 @@ impl OauthStore {
              JOIN rmcp_client c ON c.id = s.client_id AND NOT c.disabled \
                                 AND c.owner_account_id = g.owner_account_id \
              JOIN rmcp_account a ON a.id = g.owner_account_id AND NOT a.disabled \
+             WHERE s.client_id = $1 ORDER BY g.name",
+        )
+        .bind(client_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)
+    }
+
+    /// The groups a client draws on, each paired with its owner's CURRENT
+    /// authority — the input [`crate::oauth::groups::resolve_groups`] needs.
+    ///
+    /// This is the resolution entry point RMCP-07 should call.
+    /// [`Self::client_tool_groups`] returns the rows alone and is for display;
+    /// resolving from it would drop the authority and honour a stale `*`.
+    ///
+    /// ## Why the authority is read HERE, in this query
+    /// A bare `*` is only legitimate from an operator, and operator-ness is
+    /// revocable. Reading it in the same statement as the group rows means there
+    /// is no window in which an account could be demoted between the two reads,
+    /// and no way for a caller to supply an authority of its own choosing. The
+    /// flag is combined with `NOT a.disabled` because a disabled account is not
+    /// an operator for any purpose — it cannot even authenticate.
+    ///
+    /// It also carries [`Self::client_tool_groups`]'s read-path OWNER re-check
+    /// (`c.owner_account_id = g.owner_account_id`, added on main by round 9).
+    /// That check belongs here more than it belongs there: this is the query a
+    /// tool set is actually resolved from, so a group left attached across an
+    /// ownership TRANSFER must stop resolving here, not merely stop being
+    /// displayed. Losing it in a rebase would have left the enforcing path
+    /// weaker than the display path.
+    ///
+    /// The join to `rmcp_account` is INNER, so a group whose owning account has
+    /// gone yields no row at all rather than a group with no authority. That is
+    /// the fail-closed direction and it costs nothing: `owner_account_id`
+    /// cascades on delete, so this only fires in states that should not exist.
+    pub async fn client_authorized_groups(
+        &self,
+        client_id: Uuid,
+    ) -> Result<Vec<AuthorizedGroup>, ToolError> {
+        sqlx::query_as::<_, AuthorizedGroup>(
+            "SELECT g.id, g.name, g.description, g.patterns, g.owner_account_id, g.created_at, \
+                    (a.is_operator AND NOT a.disabled) AS owner_is_operator \
+             FROM rmcp_tool_group g \
+             JOIN rmcp_client_scope s ON s.tool_group_id = g.id \
+             JOIN rmcp_client c ON c.id = s.client_id AND NOT c.disabled \
+                                AND c.owner_account_id = g.owner_account_id \
+             JOIN rmcp_account a ON a.id = g.owner_account_id \
              WHERE s.client_id = $1 ORDER BY g.name",
         )
         .bind(client_id)

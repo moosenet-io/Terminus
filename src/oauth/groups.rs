@@ -58,10 +58,30 @@
 //! [`crate::oauth::store::OauthStore::insert_tool_group`]. An earlier revision
 //! took it as a store parameter, which made the delegated-wildcard rule
 //! advisory: a caller that passed [`GroupOwner::Operator`] stored a `*` that the
-//! read path then honours for the life of the row.
+//! read path then honoured for the life of the row.
+//!
+//! ## The general rule, for RMCP-12 and anything else that delegates
+//! **A write-time authorization check is point-in-time. Any authority that can
+//! be REVOKED must be re-derived on the read path.** Checking at write time
+//! answers "were you allowed to write this?"; it says nothing about "are you
+//! still allowed to have it?", and the gap between those two is permanent.
+//!
+//! This item pays that twice over: the store derives operator-ness from
+//! `rmcp_account` when a group is WRITTEN, and [`resolve_groups`] re-derives it
+//! when the group is READ, so a `*` written by an operator who was later
+//! demoted expands to nothing. RMCP-01 learned the same lesson on group and
+//! namespace ownership — the namespace case being the sharper one, since
+//! clearing a delegation would otherwise leave a connector reaching an entire
+//! federated server.
+//!
+//! RMCP-12 layers more revocable delegation on top of all of this. Every
+//! authority it introduces should be assumed revocable and read at the point of
+//! use, not cached into a row and trusted afterwards.
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+
+use sqlx::FromRow;
 
 use crate::error::ToolError;
 use crate::mesh::merge::{split_namespaced, MESH_NS_SEP};
@@ -174,20 +194,27 @@ impl Pattern {
         Ok(parsed)
     }
 
-    /// Parse a pattern READ BACK FROM STORAGE, with no owner check and no
-    /// error.
+    /// Parse a pattern READ BACK FROM STORAGE: syntax only, no error, and no
+    /// authority decision.
     ///
-    /// The two omissions are deliberate and different. There is no error
-    /// because this is on the dispatch path (rule 2 in the module docs); an
-    /// unparseable stored row yields `None` and is then SKIPPED by
-    /// [`resolve_groups`], which matches nothing — the fail-closed direction. A
-    /// row that cannot be understood must never widen anything.
+    /// There is no error because this is on the dispatch path (rule 2 in the
+    /// module docs); an unparseable stored row yields `None` and is then SKIPPED
+    /// by [`resolve_groups`], which matches nothing — the fail-closed direction.
+    /// A row that cannot be understood must never widen anything.
     ///
-    /// There is no owner check because the write path is the gate: a stored
-    /// `*` is one an operator was authorized to write. Re-deciding that here
-    /// would need an authority this function does not have, and RMCP-07's
-    /// intersection with the ACCOUNT's own grant is the final clamp regardless
-    /// — a group can only ever subtract from that.
+    /// **It does not re-check `*` authority, and must not be "simplified" into
+    /// doing so.** Not because the check is unnecessary — it is REQUIRED, and
+    /// round 2 of review was right that a write-time check alone is not enough
+    /// — but because this function is a pure parser with no database handle,
+    /// and the authority it would need is a live property of the owning account
+    /// that only a query can answer. Inventing an answer here is how the check
+    /// would come to be wrong.
+    ///
+    /// The authority check therefore lives one level up, in
+    /// [`resolve_groups`], which takes each group's owner authority as read from
+    /// `rmcp_account` at resolution time (see
+    /// [`crate::oauth::store::OauthStore::client_authorized_groups`]). A `*`
+    /// whose owner is not CURRENTLY an enabled operator expands to nothing.
     pub fn parse_stored(raw: &str) -> Option<Self> {
         Self::parse_syntax_checked(raw).ok()
     }
@@ -482,6 +509,36 @@ pub fn resolve<'a>(patterns: &[Pattern], catalog: &'a [CatalogTool]) -> Vec<&'a 
         .collect()
 }
 
+/// A stored group paired with its owner's authority AS IT IS NOW.
+///
+/// The pairing exists so the two can never be read at different times or from
+/// different rows. Authority is per GROUP, not per request: a client may draw on
+/// groups owned by different accounts, and each one's `*` stands or falls on its
+/// own owner.
+#[derive(Clone, Debug)]
+pub struct AuthorizedGroup {
+    pub group: ToolGroup,
+    /// [`GroupOwner::Operator`] only if the owning account is currently flagged
+    /// as an operator AND is not disabled.
+    pub owner: GroupOwner,
+}
+
+// Decoded by hand for the same reason as every row type in
+// `crate::oauth::model`: this workspace builds sqlx without the derive feature.
+// The authority column is projected by the query rather than stored on the
+// group, so it cannot be read from a stale row.
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for AuthorizedGroup {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        let owner = if row.try_get::<bool, _>("owner_is_operator")? {
+            GroupOwner::Operator
+        } else {
+            GroupOwner::Delegated
+        };
+        Ok(Self { group: ToolGroup::from_row(row)?, owner })
+    }
+}
+
 /// Resolve a client's groups — the UNION of their patterns — against the live
 /// catalog.
 ///
@@ -489,15 +546,45 @@ pub fn resolve<'a>(patterns: &[Pattern], catalog: &'a [CatalogTool]) -> Vec<&'a 
 /// result sets, so the catalog is indexed once no matter how many groups a
 /// client holds, and a tool matched by two groups appears once.
 ///
+/// ## Why authority is an argument here
+/// A write-time authorization check is POINT-IN-TIME. The check that refuses a
+/// bare `*` from a delegated author runs when the row is written, and nothing
+/// about that check survives into the future: a row written before the
+/// `is_operator` column existed, or one whose author was later DEMOTED, would
+/// otherwise leave a non-operator holding an unrestricted group forever —
+/// exactly the outcome the write-side check was added to prevent. Any authority
+/// that can be REVOKED has to be re-derived on the read path.
+///
+/// So a [`Pattern::Everything`] expands only when its group's owner is an
+/// operator RIGHT NOW. For any other owner it is DROPPED — the whole group
+/// collapses to whatever its remaining patterns match, which for a group whose
+/// only pattern was `*` is the empty set. Fail-closed, like every other
+/// resolution rule here; it is never downgraded to "everything except…" or to
+/// an error.
+///
 /// A stored pattern that no longer parses is skipped (see
-/// [`Pattern::parse_stored`]): it contributes nothing, which is the fail-closed
-/// direction. A group whose patterns ALL fail to parse therefore behaves
-/// exactly like an empty group — it grants nothing.
-pub fn resolve_groups<'a>(groups: &[ToolGroup], catalog: &'a [CatalogTool]) -> Vec<&'a CatalogTool> {
+/// [`Pattern::parse_stored`]): it contributes nothing, the same direction. A
+/// group whose patterns ALL fail to parse, or whose only pattern is a
+/// now-unauthorized `*`, therefore behaves exactly like an empty group.
+pub fn resolve_groups<'a>(
+    groups: &[AuthorizedGroup],
+    catalog: &'a [CatalogTool],
+) -> Vec<&'a CatalogTool> {
     let patterns: Vec<Pattern> = groups
         .iter()
-        .flat_map(|g| g.patterns.iter())
-        .filter_map(|raw| Pattern::parse_stored(raw))
+        .flat_map(|authorized| {
+            let owner = authorized.owner;
+            authorized.group.patterns.iter().filter_map(move |raw| {
+                match Pattern::parse_stored(raw) {
+                    // The revocation check. Not a filter over the RESULT set —
+                    // dropping the pattern is what makes an unauthorized `*`
+                    // resolve to nothing rather than to the catalog minus
+                    // something.
+                    Some(Pattern::Everything) if owner != GroupOwner::Operator => None,
+                    other => other,
+                }
+            })
+        })
         .collect();
     resolve(&patterns, catalog)
 }
@@ -579,6 +666,28 @@ mod tests {
         names(&resolve(&patterns, &cat))
     }
 
+    /// A stored row, as it comes back from the database — patterns as text,
+    /// with no authority attached to them.
+    fn stored_group(patterns: Vec<String>) -> ToolGroup {
+        ToolGroup {
+            id: Uuid::nil(),
+            name: "g".into(),
+            description: String::new(),
+            patterns,
+            owner_account_id: Uuid::nil(),
+            created_at: Utc::now(),
+        }
+    }
+
+    fn authorized(group: ToolGroup, owner: GroupOwner) -> AuthorizedGroup {
+        AuthorizedGroup { group, owner }
+    }
+
+    fn resolve_stored(groups: Vec<AuthorizedGroup>) -> Vec<String> {
+        let cat = catalog();
+        names(&resolve_groups(&groups, &cat))
+    }
+
     // ── The empty cases, first: this is the invariant the item is about ──────
 
     /// An empty group resolves to the empty set. Not "unrestricted", not the
@@ -589,16 +698,9 @@ mod tests {
         let cat = catalog();
         assert!(resolve(&[], &cat).is_empty(), "an empty pattern list must grant nothing");
 
-        let group = ToolGroup {
-            id: Uuid::nil(),
-            name: "unfilled".into(),
-            description: String::new(),
-            patterns: vec![],
-            owner_account_id: Uuid::nil(),
-            created_at: Utc::now(),
-        };
+        let group = stored_group(vec![]);
         assert!(group.is_empty());
-        assert!(resolve_groups(&[group], &cat).is_empty());
+        assert!(resolve_groups(&[authorized(group, GroupOwner::Operator)], &cat).is_empty());
     }
 
     /// A well-formed pattern that matches no tool in the current catalog is the
@@ -615,16 +717,87 @@ mod tests {
     #[test]
     fn an_unparseable_stored_pattern_grants_nothing() {
         let cat = catalog();
-        let group = ToolGroup {
-            id: Uuid::nil(),
-            name: "corrupt".into(),
-            description: String::new(),
-            patterns: vec!["we*ther_*".into(), "".into()],
-            owner_account_id: Uuid::nil(),
-            created_at: Utc::now(),
-        };
+        let group = stored_group(vec!["we*ther_*".into(), "".into()]);
         assert!(!group.is_empty(), "the row has patterns; they simply do not parse");
-        assert!(resolve_groups(&[group], &cat).is_empty());
+        assert!(resolve_groups(&[authorized(group, GroupOwner::Operator)], &cat).is_empty());
+    }
+
+    // ── Revocation: authority is re-derived on the READ path ─────────────────
+
+    /// The round-2 finding. A `*` was legitimately written by an operator who
+    /// has since been DEMOTED — the row is unchanged, the authority is gone, and
+    /// the pattern must stop expanding. Anything else leaves a delegated account
+    /// holding an unrestricted group permanently, which is the exact outcome the
+    /// write-side check exists to prevent.
+    #[test]
+    fn a_stored_wildcard_collapses_when_its_owner_is_no_longer_an_operator() {
+        let star = || stored_group(vec!["*".into()]);
+        assert_eq!(
+            resolve_stored(vec![authorized(star(), GroupOwner::Operator)]).len(),
+            catalog().len(),
+            "an operator's wildcard still means everything"
+        );
+        assert!(
+            resolve_stored(vec![authorized(star(), GroupOwner::Delegated)]).is_empty(),
+            "a demoted owner's wildcard must resolve to the EMPTY set, not to everything"
+        );
+    }
+
+    /// A row written before the `is_operator` column existed has an owner that
+    /// reads as delegated, because the column defaults to false. Its `*` must
+    /// collapse — that is the safe reading of a pre-migration row, and it is
+    /// what the default is chosen to produce.
+    #[test]
+    fn a_pre_migration_wildcard_reads_as_delegated_and_collapses() {
+        // `is_operator` DEFAULT false → `Account::group_owner_kind` → Delegated.
+        let owner = crate::oauth::model::Account {
+            id: Uuid::nil(),
+            name: "legacy".into(),
+            password_hash: "<REDACTED-SECRET>".into(),
+            totp_secret_enc: None,
+            disabled: false,
+            is_operator: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+        .group_owner_kind();
+        assert_eq!(owner, GroupOwner::Delegated);
+        assert!(resolve_stored(vec![authorized(stored_group(vec!["*".into()]), owner)]).is_empty());
+    }
+
+    /// Dropping an unauthorized `*` must not take the rest of the group with it,
+    /// and must not leak across groups. Only the wildcard is revoked.
+    #[test]
+    fn revoking_a_wildcard_leaves_the_groups_other_patterns_alone() {
+        assert_eq!(
+            resolve_stored(vec![
+                authorized(
+                    stored_group(vec!["*".into(), "weather_*".into()]),
+                    GroupOwner::Delegated,
+                ),
+                authorized(stored_group(vec!["news_headlines".into()]), GroupOwner::Operator),
+            ]),
+            vec!["news_headlines", "weather_alerts", "weather_get"],
+            "the delegated group keeps its explicit prefix; only its `*` is dropped"
+        );
+    }
+
+    /// Authority is per GROUP. One operator-owned wildcard in the set must not
+    /// bless a different owner's group, and one delegated group must not
+    /// suppress an operator's legitimate wildcard.
+    #[test]
+    fn authority_is_evaluated_per_group_not_per_request() {
+        let resolved = resolve_stored(vec![
+            authorized(stored_group(vec!["*".into()]), GroupOwner::Delegated),
+            authorized(stored_group(vec!["*".into()]), GroupOwner::Operator),
+        ]);
+        assert_eq!(resolved.len(), catalog().len(), "the operator's wildcard still applies");
+
+        let resolved = resolve_stored(vec![
+            authorized(stored_group(vec!["*".into()]), GroupOwner::Delegated),
+            authorized(stored_group(vec!["news_*".into()]), GroupOwner::Delegated),
+        ]);
+        assert_eq!(resolved, vec!["news_headlines"], "no wildcard survives here");
     }
 
     // ── The three accepted shapes ────────────────────────────────────────────
