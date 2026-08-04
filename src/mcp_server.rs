@@ -1725,7 +1725,7 @@ async fn handle_mcp(
                     // same record as every other connector-scope denial, with
                     // its own reason code.
                     None => Some(crate::gateway_framework::audit_client_scope_denial(
-                        principal.as_ref(),
+                        binding.principal(),
                         scope,
                         name,
                         crate::oauth::scope::DENY_NO_ACCOUNT_GRANT,
