@@ -863,10 +863,12 @@ mod tests {
         }
     }
 
-    /// The STABLE path (gpt56 review): the exact start time comes from the
-    /// process's own `/proc` record, so it is not a function of when the poll
-    /// ran at all. Parsing must survive a `comm` containing spaces AND
-    /// parentheses — a naive whitespace split silently reads the wrong field.
+    /// The STABLE path (gpt56 review): the WHOLE-SECOND start time comes from
+    /// the process's own `/proc` record, so it is not a function of when the
+    /// poll ran at all. (Stable, not tick-exact — the sub-second remainder is
+    /// deliberately dropped; see `start_epoch_from_proc`.) Parsing must survive
+    /// a `comm` containing spaces AND parentheses — a naive whitespace split
+    /// silently reads the wrong field.
     #[test]
     fn proc_starttime_parsing_survives_a_hostile_comm_and_yields_a_stable_epoch() {
         let sample = "\
