@@ -53,9 +53,15 @@ fn max_connections() -> u32 {
         .unwrap_or(DEFAULT_MAX_CONNECTIONS)
 }
 
-/// Every table the S132 migration creates. [`OauthStore::schema_ready`] requires
+/// Every table the S132 migrations create. [`OauthStore::schema_ready`] requires
 /// all of them, so a partially applied migration reports NOT ready.
-const REQUIRED_TABLES: [&str; 9] = [
+///
+/// Spans BOTH S132 migration files — `S132-rmcp01-oauth-core.sql` (the first
+/// nine) and `S132-rmcp03-login-session.sql` (the last). Deliberately one list
+/// rather than one per item: "the schema this code needs" is a single question,
+/// and a per-item split would let a deploy that applied only the older file
+/// report ready while the login path's single-use guard had no table behind it.
+const REQUIRED_TABLES: [&str; 10] = [
     "rmcp_account",
     "rmcp_client",
     "rmcp_tool_group",
@@ -65,6 +71,7 @@ const REQUIRED_TABLES: [&str; 9] = [
     "rmcp_refresh_token",
     "rmcp_consent",
     "rmcp_server_owner",
+    "rmcp_login_session_use",
 ];
 
 /// Repository over the `rmcp_*` tables.
@@ -616,6 +623,67 @@ impl OauthStore {
     }
 
     // -----------------------------------------------------------------------
+    // Login sessions (RMCP-03)
+    // -----------------------------------------------------------------------
+
+    /// Claim a login session as spent, cluster-wide. Returns `true` only for
+    /// the caller that claimed it; every later presentation returns `false`.
+    ///
+    /// This is what makes "one authentication yields at most one authorization
+    /// code" true in a multi-replica deployment. RMCP-03's first revision kept
+    /// the spent identifiers in a process-local map, which review round 1
+    /// rejected: the same signed session cookie arriving at two replicas is
+    /// unspent at both, so each issues a code. The property was right and the
+    /// place was wrong.
+    ///
+    /// The claim is a single `INSERT … ON CONFLICT DO NOTHING`. The PRIMARY KEY
+    /// on `jti_hash` is the arbiter, so exactly one caller anywhere in the
+    /// cluster sees `rows_affected() == 1` — no lock, and no read-then-write
+    /// window in which two callers both observe an unclaimed session. It is the
+    /// same reasoning as [`Self::consume_auth_code`]'s conditional UPDATE:
+    /// the check and the claim have to be one statement.
+    ///
+    /// Takes a [`SecretHash`], not the raw `jti`: the identifier lives inside a
+    /// live session cookie, and this schema's standing rule is that no table
+    /// holds anything presentable. `ttl_seconds` is applied against the
+    /// DATABASE clock, like every other expiry here.
+    ///
+    /// A database error propagates rather than degrading to `true`. The caller
+    /// must treat a failure as "cannot issue a code" — a guard that opens when
+    /// its backing store is unreachable is not a guard.
+    pub async fn claim_login_session(
+        &self,
+        jti_hash: &SecretHash,
+        ttl_seconds: i64,
+    ) -> Result<bool, ToolError> {
+        let claimed = sqlx::query(
+            "INSERT INTO rmcp_login_session_use (jti_hash, expires_at) \
+             VALUES ($1, now() + make_interval(secs => $2::double precision)) \
+             ON CONFLICT (jti_hash) DO NOTHING",
+        )
+        .bind(jti_hash.as_bytes())
+        .bind(ttl_seconds as f64)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        Ok(claimed == 1)
+    }
+
+    /// Delete login-session claims that are past their retention window.
+    ///
+    /// Housekeeping only. Correctness never depends on this having run: a row
+    /// still present always denies, and a session whose row has been purged
+    /// expired as a token long before.
+    pub async fn purge_expired_login_sessions(&self) -> Result<u64, ToolError> {
+        sqlx::query("DELETE FROM rmcp_login_session_use WHERE expires_at < now()")
+            .execute(&self.pool)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(db)
+    }
+
+    // -----------------------------------------------------------------------
     // Refresh tokens
     // -----------------------------------------------------------------------
 
@@ -1092,7 +1160,7 @@ mod tests {
     /// rather than silently weaken the readiness check.
     #[test]
     fn schema_readiness_covers_every_migrated_table() {
-        assert_eq!(REQUIRED_TABLES.len(), 9);
+        assert_eq!(REQUIRED_TABLES.len(), 10);
         for table in [
             "rmcp_account",
             "rmcp_client",
@@ -1103,6 +1171,10 @@ mod tests {
             "rmcp_refresh_token",
             "rmcp_consent",
             "rmcp_server_owner",
+            // RMCP-03's durable single-use login-session marker. Listed here so
+            // a deploy that applies only the core migration reports NOT ready
+            // rather than running the login path with no guard behind it.
+            "rmcp_login_session_use",
         ] {
             assert!(REQUIRED_TABLES.contains(&table), "{table} missing from the readiness check");
         }
