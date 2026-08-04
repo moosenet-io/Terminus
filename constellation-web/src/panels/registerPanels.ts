@@ -40,6 +40,7 @@ import { ChatPanel } from './lumina/ChatPanel';
 import { FleetPanel } from './terminus/FleetPanel';
 import { ToolsPanel } from './terminus/ToolsPanel';
 import { ActivityPanel } from './terminus/ActivityPanel';
+import { Connectors } from '../pages/Connectors';
 import { PersonaPanel } from './lumina/PersonaPanel';
 import { MemoryPanel } from './lumina/MemoryPanel';
 import { EngineDiagramPanel } from './status/EngineDiagramPanel';
@@ -555,6 +556,23 @@ registerPanel({
   icon: '▧',
   available: true,
   component: ToolsPanel,
+});
+
+// RMCP-13 (TERM-624): the OAuth/MCP connector administration surface (S132) — clients, tool
+// groups, and live sessions. It sits in the terminus module because the objects it manages are
+// terminus's own (the tool catalog it scopes over, the mesh namespaces it gates), and it reads
+// and writes exclusively through the `rmcp_*` Terminus tools (see `lib/rmcpClient.ts`), the same
+// door the CLI uses. Registered `available: true` like every other terminus panel: when the
+// backing tools are not deployed the PAGE explains that itself, which is more useful than a
+// missing nav entry that looks like the feature does not exist.
+registerPanel({
+  id: 'terminus.connectors',
+  system: 'terminus',
+  title: 'Connectors',
+  path: '/terminus/connectors',
+  icon: '⚿',
+  available: true,
+  component: Connectors,
 });
 
 registerPanel({
