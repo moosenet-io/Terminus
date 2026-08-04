@@ -45,14 +45,33 @@
 //! entry — see [`ScopeResolver`]'s own docs for why that cache is bounded the
 //! way it is.
 //!
-//! ## Relationship to RMCP-06
-//! RMCP-06 owns tool GROUPS — their CRUD, their seeded starter set, and
+//! ## Relationship to RMCP-06 — and the collapse onto one matcher
+//! RMCP-06 owns tool GROUPS: their CRUD, their seeded starter set, and
 //! write-time validation of the pattern syntax. It had not landed when this
-//! item was built, so [`ScopePattern`] parses the same minimal vocabulary here
-//! (exact name, trailing-`*` prefix, `<namespace>::*`) in order to be usable at
-//! all. When `groups.rs` lands, this parser is the one to delete: the semantics
-//! must have exactly one definition. Until then the two halves are consistent
-//! by having the same, deliberately tiny, grammar — no regex, no negation.
+//! item was built, so [`ScopePattern`] parses the same vocabulary here in order
+//! to be usable at all. The grammar is deliberately tiny either way — no regex,
+//! no negation.
+//!
+//! **Two matchers that must agree eventually disagree.** TERM #637 is the
+//! proof: this side qualified with `::` and the authoring side with `__`, so
+//! authored patterns were dead or over-granting the moment both shipped. The
+//! divergence was found by verification, not by either author noticing — which
+//! is the argument for collapsing rather than for documenting harder.
+//!
+//! **Sequencing, because it cannot be done here.** The collapse must FOLLOW
+//! RMCP-06 landing: deleting this parser now would leave the resolver with
+//! nothing to parse patterns with, and adopting RMCP-06's requires its code to
+//! exist. Once it merges the follow-up is mechanical — delete [`ScopePattern`],
+//! point [`ClientScope::from_rows`] at `groups.rs`'s matcher, and keep the
+//! tests.
+//!
+//! **Keep the tests, specifically.** They encode ENFORCEMENT properties an
+//! authoring-side suite has no reason to cover: that an unqualified prefix
+//! cannot cross a namespace boundary, that a bare `*` is still clamped by the
+//! account grant, that `tools/list` and `tools/call` never disagree, and that
+//! absence is the empty set. Re-point them at the surviving matcher rather than
+//! deleting them alongside the parser — they are the half of the contract that
+//! guards a live door.
 //!
 //! Note that parsing here is TOTAL and fail-closed: an unparseable pattern
 //! matches nothing rather than erroring at match time (a match-time error on
