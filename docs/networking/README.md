@@ -8,7 +8,14 @@ exact defaults). To reach it from outside the primary's own host, you need
 some network path that gets your client's traffic to that interface in the
 first place.
 
-This directory covers the two supported options:
+This directory covers the two supported options for private access, plus one
+document about the opposite problem — see
+[the public MCP connector edge](remote-mcp.md) for how a hosted third party
+(Anthropic's Claude surfaces) reaches one small, deliberately chosen part of
+Terminus over the public internet. That path is not a tunnel at all: it is a
+separate listener with a per-path source-address policy in front of it.
+
+The two private-transport options:
 
 | | [WireGuard](wireguard.md) | [Tailscale](tailscale.md) |
 |---|---|---|

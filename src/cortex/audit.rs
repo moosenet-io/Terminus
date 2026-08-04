@@ -799,7 +799,25 @@ mod tests {
         let _ = fs::remove_dir_all(&fixture);
     }
 
+    // `#[serial]` on the two `run_audit` tests below is NOT decoration, and they
+    // are not obviously in the same family as the `ScratchClone` tests that
+    // already carry it. `run_audit` creates a `ScratchClone` internally (see its
+    // first line), so each of these briefly adds a
+    // `terminus-cortex-audit-{pid}-*` directory to the shared temp dir — the
+    // exact population `count_scratch_dirs` snapshots before and after in
+    // `test_scratch_clone_cleans_up_on_clone_failure`.
+    //
+    // `serial_test` only serializes tests against each OTHER, so while these two
+    // ran unmarked they executed in parallel with that counting test and could
+    // land inside its before/after window, making it fail with a leak report for
+    // a scratch dir that was never leaked. Whether they did was pure libtest
+    // scheduling, so the failure moved around as unrelated tests were added
+    // elsewhere in the crate — it surfaced during RMCP-09 (TERM-620) because
+    // that item added tests, not because it touched anything here. Marking the
+    // producers serial closes the window; it is the same reason the three
+    // `ScratchClone` tests are already marked.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_run_audit_rejects_clone_over_size_ceiling() {
         let fixture = make_local_git_repo("sizecap", &[("src/lib.rs", "pub fn f() {}\n")]);
         let mut config = cfg();
@@ -810,6 +828,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_run_audit_rejects_repo_with_no_supported_source_files() {
         let fixture = make_local_git_repo("nosource", &[("README.md", "just docs, no source files")]);
         let config = cfg();

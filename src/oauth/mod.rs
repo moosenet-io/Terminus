@@ -57,6 +57,14 @@
 //! None of this is reachable from the network until a listener mounts the
 //! relevant router.
 //!
+//! ## What RMCP-09 adds ([`edge`])
+//! The public door's NETWORK policy, and still no endpoints. [`edge`] is the
+//! separate internet-facing listener and the per-path source-address policy that
+//! governs it — it decides which requests are allowed to reach a handler, not
+//! what any handler does. It is written and tested ahead of those handlers on
+//! purpose: the exposure surface of a public door is worth reviewing on its own,
+//! before there is anything behind it to be distracted by.
+//!
 //! ## Credential storage — nothing here is presentable
 //! No table in this schema stores a usable credential:
 //! - Authorization codes and refresh tokens are high-entropy machine-generated
@@ -78,6 +86,7 @@
 //! error.
 
 pub mod authorize;
+pub mod edge;
 pub mod jwt;
 pub mod model;
 pub mod password;
