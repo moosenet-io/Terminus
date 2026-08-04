@@ -1,0 +1,99 @@
+# RMCP-09 (S132) — reverse-proxy example for the public MCP connector edge.
+#
+# EVERY hostname, path and address below is a PLACEHOLDER. Substitute your own;
+# nothing here is a working configuration as written.
+#
+# What this file is for
+# ---------------------
+# The edge listener inside terminus-primary binds a private interface and speaks
+# plain HTTP. TLS terminates here, in front of it. This proxy is also the FIRST
+# of the two source controls: the edge's own per-path policy is defence in
+# depth, not the only gate, and the two are meant to agree.
+#
+# The one thing that must be right
+# --------------------------------
+# The edge decides everything from one value — the resolved client address — and
+# it takes that address from `X-Forwarded-For` ONLY when the connection's peer is
+# listed in RMCP_EDGE_TRUSTED_PROXIES, using the RIGHTMOST entry that is not
+# itself a trusted proxy. So:
+#
+#   * this proxy must APPEND the address it actually saw (nginx's
+#     `proxy_add_x_forwarded_for` does exactly that), never overwrite or
+#     rewrite the chain;
+#   * RMCP_EDGE_TRUSTED_PROXIES must name THIS host, exactly;
+#   * if you add a second proxy or a CDN in front of this one, add it to
+#     RMCP_EDGE_TRUSTED_PROXIES too — otherwise the edge will attribute every
+#     request to the hop it does not know about.
+#
+# Setting `X-Forwarded-For $remote_addr` (overwrite rather than append) is the
+# classic mistake here: it works perfectly in a single-proxy test and silently
+# discards the real client the moment anything is added in front.
+
+# ── nginx ───────────────────────────────────────────────────────────────────
+
+server {
+    listen 443 ssl http2;
+    server_name connector.example.invalid;          # PLACEHOLDER
+
+    ssl_certificate     /etc/ssl/example/fullchain.pem;   # PLACEHOLDER (ACME)
+    ssl_certificate_key /etc/ssl/example/privkey.pem;     # PLACEHOLDER
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # Only the connector's own paths are proxied at all. Everything else is
+    # refused here as well as at the edge — two independent statements of the
+    # same small exposure surface, so a mistake in either one is not enough.
+    location = /mcp                                        { proxy_pass http://rmcp_edge; }
+    location ^~ /oauth/                                    { proxy_pass http://rmcp_edge; }
+    location ^~ /.well-known/oauth-protected-resource      { proxy_pass http://rmcp_edge; }
+    location ^~ /.well-known/oauth-authorization-server    { proxy_pass http://rmcp_edge; }
+    location / { return 404; }
+
+    # Mirror the per-path source policy at the network layer. These are
+    # PLACEHOLDER ranges — put Anthropic's published OUTBOUND egress range in
+    # the first block and your own networks in the second. Note the split is the
+    # same one the edge enforces, and for the same reason: /oauth/authorize is
+    # opened in YOUR browser and never comes from Anthropic, so an
+    # Anthropic-only rule over the whole server breaks consent.
+    #
+    #   location = /mcp {
+    #       allow 203.0.113.0/24;   # PLACEHOLDER: Anthropic's outbound range
+    #       deny all;
+    #       proxy_pass http://rmcp_edge;
+    #   }
+    #   location = /oauth/authorize {
+    #       allow 198.51.100.0/24;  # PLACEHOLDER: your own networks
+    #       deny all;
+    #       proxy_pass http://rmcp_edge;
+    #   }
+
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    # APPEND, never overwrite. See the note above — this single line is what the
+    # edge's rightmost-untrusted resolution depends on.
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    # Discovery has a ~10s budget on the client side and /mcp may stream.
+    proxy_read_timeout 300s;
+    proxy_buffering off;
+}
+
+upstream rmcp_edge {
+    # RMCP_EDGE_BIND:RMCP_EDGE_PORT on the terminus-primary host. Loopback when
+    # the proxy is co-located; a private-network address otherwise, and in that
+    # case firewall the edge port to this proxy alone.
+    server 127.0.0.1:8311;
+}
+
+# ── Caddy equivalent ────────────────────────────────────────────────────────
+#
+# connector.example.invalid {                    # PLACEHOLDER
+#     @connector path /mcp /oauth/* /.well-known/oauth-protected-resource* /.well-known/oauth-authorization-server*
+#     handle @connector {
+#         reverse_proxy 127.0.0.1:8311
+#     }
+#     handle { respond 404 }
+# }
+#
+# Caddy's reverse_proxy appends X-Forwarded-For by default, which is the
+# behaviour the edge needs. Do not add a `header_up X-Forwarded-For {remote_host}`
+# — that overwrites the chain.

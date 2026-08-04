@@ -120,6 +120,18 @@
 //! `terminus_rs::mesh::tailnet`'s module doc for the full config surface
 //! (`TERMINUS_TSNET_HOSTNAME`/`TERMINUS_TSNET_STATE_DIR`/`TERMINUS_TSNET_AUTHKEY`)
 //! and the WhoIs scope boundary MESH-05 picks up next.
+//!
+//! ## RMCP-09 update — optional public edge listener
+//! When `RMCP_EDGE_ENABLED` is set, this binary ALSO binds a fourth listener on
+//! `RMCP_EDGE_BIND`/`RMCP_EDGE_PORT`, serving the same merged router behind
+//! `terminus_rs::oauth::edge`'s per-path source-address policy. Unlike the three
+//! private listeners, this one is meant to be reachable from the internet
+//! through a TLS-terminating reverse proxy — so it exposes only the two
+//! `.well-known` documents, `/oauth/*` and `/mcp`, and each of those only to the
+//! source class configured for it. Flag unset ⇒ no edge config is parsed and no
+//! listener is bound; flag set with an unusable policy ⇒ the process refuses to
+//! boot. See `terminus_rs::oauth::edge`'s module doc and
+//! `docs/networking/remote-mcp.md`.
 
 use terminus_rs::pki::server::{build_gateway_router, spawn_mtls_listener, GatewayServerConfig};
 use terminus_rs::registry::{register_all, ToolRegistry};
@@ -340,6 +352,71 @@ async fn main() {
         tracing::debug!(
             "terminus_primary: built without the tsnet feature -- no embedded tailnet listener available"
         );
+    }
+
+    // RMCP-09: the public edge. A SEPARATE listener serving the same router
+    // behind `terminus_rs::oauth::edge`'s per-path source policy, which exposes
+    // only the two `.well-known` documents, `/oauth/*` and `/mcp` — see that
+    // module's doc for why the policy is per-PATH and not one Anthropic-only
+    // pinhole (the browser half of the OAuth flow arrives from the operator's
+    // own network, so a single pinhole silently breaks consent).
+    //
+    // `RMCP_EDGE_ENABLED` unset ⇒ nothing is parsed and nothing is bound, and
+    // this binary behaves exactly as it did before this item. Enabled with an
+    // unusable policy ⇒ this process REFUSES TO BOOT, the same posture as the
+    // tool-availability map above and for the same reason: a listener that
+    // faces the internet must never run under a configuration nobody
+    // understood, and there is no permissive default that is safe to guess.
+    match terminus_rs::oauth::edge::EdgeConfig::from_env() {
+        Ok(None) => {
+            tracing::debug!("terminus_primary: RMCP public edge not enabled -- no edge listener");
+        }
+        Ok(Some(edge_config)) => {
+            let edge_config = std::sync::Arc::new(edge_config);
+            tracing::info!("terminus_primary: {}", edge_config.describe());
+            let edge_router =
+                terminus_rs::oauth::edge::build_edge_router(router.clone(), edge_config.clone());
+            let edge_bind = format!("{}:{}", edge_config.bind, edge_config.port);
+            tokio::spawn(async move {
+                // A bind failure disables ONLY the edge -- loudly. It is not
+                // fatal the way a bad POLICY is: an edge that never came up
+                // exposes nothing, whereas core-tool serving on the private
+                // listeners is what the rest of the fleet depends on, and
+                // taking that down over a busy public port would trade a
+                // reachability problem for an outage.
+                match tokio::net::TcpListener::bind(&edge_bind).await {
+                    Ok(listener) => {
+                        // `into_make_service_with_connect_info` is what puts the
+                        // peer address in each request's extensions. Without it
+                        // the policy has no source to police and (by design)
+                        // refuses everything -- so this is not an optional
+                        // detail of how the edge is served.
+                        if let Err(e) = axum::serve(
+                            listener,
+                            edge_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                        )
+                        .await
+                        {
+                            tracing::error!("terminus_primary: RMCP edge listener stopped: {e}");
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        "terminus_primary: RMCP edge disabled -- failed to bind {edge_bind}: {e}"
+                    ),
+                }
+            });
+        }
+        Err(e) => {
+            eprintln!("FATAL: {e}");
+            eprintln!(
+                "Refusing to start: the RMCP public edge is enabled but its source policy is not \
+                 usable. An internet-facing listener running under a policy that failed to parse \
+                 is how a pinhole silently becomes an open door. Fix the RMCP_EDGE_* configuration \
+                 (or unset {}) and restart.",
+                terminus_rs::oauth::edge::ENV_ENABLED
+            );
+            std::process::exit(1);
+        }
     }
 
     let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))

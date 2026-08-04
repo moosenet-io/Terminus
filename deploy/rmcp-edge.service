@@ -1,0 +1,51 @@
+[Unit]
+# RMCP-09 (S132): terminus-primary with the public OAuth/MCP edge listener
+# enabled. This is NOT a second binary -- the edge is a fourth listener inside
+# terminus-primary (see src/bin/terminus_primary.rs). Deploy this unit INSTEAD
+# of the plain terminus-primary unit on the host that fronts the connector, or
+# copy the RMCP_EDGE_* block below into that unit's EnvironmentFile.
+Description=Terminus primary gateway with the RMCP public edge listener
+After=network.target
+
+[Service]
+Type=simple
+# Every value below is CONFIGURATION, including the source ranges. Provide them
+# via an EnvironmentFile (not committed, 0600 root:root) or a systemd
+# credential -- never as literals in this unit, and never a secret here at all.
+EnvironmentFile=/etc/terminus/terminus-primary.env
+EnvironmentFile=/etc/terminus/rmcp-edge.env
+#
+# Example /etc/terminus/rmcp-edge.env contents. See docs/networking/remote-mcp.md
+# for the published Anthropic range to put in RMCP_EDGE_ANTHROPIC_CIDRS and for
+# how to choose the interactive ranges.
+#
+#   RMCP_EDGE_ENABLED=1
+#   RMCP_EDGE_BIND=127.0.0.1
+#   RMCP_EDGE_PORT=8311
+#   RMCP_EDGE_PROFILE=anthropic-hosted
+#   RMCP_EDGE_ANTHROPIC_CIDRS=<Anthropic's published OUTBOUND egress range>
+#   RMCP_EDGE_INTERACTIVE_CIDRS=<your own networks / tailnet range>
+#   RMCP_EDGE_BEHIND_PROXY=1
+#   RMCP_EDGE_TRUSTED_PROXIES=<the reverse proxy's address, exactly>
+#
+# An enabled edge with an unparseable policy, an unknown source class, or
+# BEHIND_PROXY set with no TRUSTED_PROXIES is a hard startup failure by design:
+# the service will not run under a policy that failed to parse. Restart=on-failure
+# will therefore loop on a misconfiguration -- that is intentional and visible in
+# the journal, and is preferable to serving the internet under a guessed default.
+ExecStart=/opt/terminus/bin/terminus_primary
+Restart=on-failure
+RestartSec=5
+#
+# The edge binds a PRIVATE interface (RMCP_EDGE_BIND defaults to loopback). TLS
+# is terminated by the reverse proxy in front of it -- see
+# deploy/rmcp-edge-proxy.conf.example. Nothing in this unit should ever bind a
+# public address directly.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=multi-user.target
