@@ -41,7 +41,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 
 use crate::error::ToolError;
 
@@ -66,6 +66,36 @@ const HELPER_SUBCOMMANDS: &[&str] = &[
     "doctor",
     "migrate-installer",
 ];
+
+/// Derive a process's start time from `ps -o etimes=` (elapsed seconds).
+///
+/// TERM #605 — **the result must be no more precise than its input justifies.**
+/// `etimes` has WHOLE-SECOND resolution. Subtracting it from a full-precision
+/// `Utc::now()` produced a value that carried the SUBSECOND component of
+/// whichever instant the poll happened to fire at — so an entirely unchanged
+/// process reported a different `started_at` on every discovery pass, drifting
+/// by up to a second. The extra digits were noise from the OBSERVER, not
+/// information about the OBSERVED, and they read as real precision downstream:
+/// any consumer diffing snapshots to detect change saw every session as
+/// "changed" every poll. Harmony's websocket dedup had to exclude the field
+/// entirely to stop an idle fleet broadcasting continuously (HARM #445) — a
+/// workaround at the consumer for a defect at the producer, which every future
+/// consumer would have hit in turn. Fixing it here means no consumer has to.
+///
+/// So: truncate `now` to a whole second BEFORE subtracting. For an unchanged
+/// process, `etimes` advances by exactly the number of whole seconds the clock
+/// advanced, so the derived start time is stable across passes.
+///
+/// (`last_activity_at`, the other timestamp on a session, is NOT in this class:
+/// it comes from a transcript file's mtime read as whole seconds
+/// (`DateTime::from_timestamp(secs, 0)`), so it is already whole-second and
+/// stable for an unchanged file. Reviewed, not changed.)
+fn started_at_from_etimes(now: DateTime<Utc>, etimes: i64) -> DateTime<Utc> {
+    // `with_nanosecond(0)` only returns None for an out-of-range value, which 0
+    // never is; the fallback keeps this total rather than panicking.
+    let whole_second_now = now.with_nanosecond(0).unwrap_or(now);
+    whole_second_now - Duration::seconds(etimes)
+}
 
 fn max_sessions() -> usize {
     std::env::var("AGENTSESS_MAX_SESSIONS")
@@ -470,7 +500,8 @@ pub(crate) async fn discover(
             cwd,
             repo,
             attachment,
-            started_at: Some(now - Duration::seconds(row.etimes)),
+            // TERM #605: whole-second resolution — see `started_at_from_etimes`.
+            started_at: Some(started_at_from_etimes(now, row.etimes)),
             last_activity_at: transcript.as_ref().and_then(|t| {
                 chrono::DateTime::from_timestamp(t.2, 0).map(|d| {
                     // Clock skew must never surface as a negative age.
@@ -613,6 +644,69 @@ mod tests {
    2200      1   5000 aider --model gpt
    3000      1    100 bash -lc 'claude something'
 ";
+
+    /// TERM #605 — the producer-side property: an UNCHANGED process must report
+    /// the SAME `started_at` on every poll.
+    ///
+    /// The two polls below land in the same wall-clock second (…:10.100 and
+    /// …:10.900) and read the same whole-second `etimes`, which is exactly what
+    /// happens in the field. Before the fix the derived start times differed by
+    /// 800 ms — enough to make every consumer diffing snapshots see a change
+    /// that did not happen.
+    #[test]
+    fn started_at_is_stable_across_polls_within_one_second() {
+        let poll_a = "2026-08-02T04:00:10.100Z".parse::<DateTime<Utc>>().unwrap();
+        let poll_b = "2026-08-02T04:00:10.900Z".parse::<DateTime<Utc>>().unwrap();
+        let etimes = 3_600; // ps reports whole seconds; unchanged between polls
+
+        assert_eq!(
+            started_at_from_etimes(poll_a, etimes),
+            started_at_from_etimes(poll_b, etimes),
+            "two polls in the SAME second must derive the SAME start time — the \
+             subsecond part of now() is observer noise, not information"
+        );
+    }
+
+    /// A second later, `etimes` has advanced by one — so the derived start time
+    /// must still be the SAME instant, not one second earlier/later. This is the
+    /// property that makes the value usable as a stable identity across polls.
+    #[test]
+    fn started_at_is_stable_as_the_clock_and_etimes_advance_together() {
+        let base = "2026-08-02T04:00:10.100Z".parse::<DateTime<Utc>>().unwrap();
+        let first = started_at_from_etimes(base, 3_600);
+        for tick in 1..=5i64 {
+            // Polls do NOT fire on an exact subsecond boundary, so jitter the
+            // subsecond part too — otherwise every poll would share one offset
+            // and the test would pass even against the un-truncated producer.
+            let later = base + Duration::seconds(tick) + Duration::milliseconds(tick * 37);
+            assert_eq!(
+                started_at_from_etimes(later, 3_600 + tick),
+                first,
+                "an unchanged process must keep one start time as now and etimes advance together"
+            );
+        }
+    }
+
+    /// The value must not CLAIM precision it does not have: `etimes` is whole
+    /// seconds, so the derived timestamp carries no subsecond component at all.
+    #[test]
+    fn started_at_carries_no_subsecond_component() {
+        for nanos in [0u32, 1, 500_000_000, 999_999_999] {
+            let now = "2026-08-02T04:00:10Z"
+                .parse::<DateTime<Utc>>()
+                .unwrap()
+                .with_nanosecond(nanos)
+                .unwrap();
+            let started = started_at_from_etimes(now, 42);
+            assert_eq!(
+                started.nanosecond(),
+                0,
+                "derived start time must be whole-second (now had {nanos}ns)"
+            );
+            // And it is still the CORRECT second, not merely a round one.
+            assert_eq!(started.timestamp(), now.timestamp() - 42);
+        }
+    }
 
     #[test]
     fn ps_parsing_extracts_all_columns() {
