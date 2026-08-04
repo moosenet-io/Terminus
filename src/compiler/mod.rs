@@ -5672,7 +5672,11 @@ pub fn render_status_rows(
     stale_after: Duration,
     now_ms: i64,
 ) -> (Vec<Value>, Vec<Value>) {
-    let stale_ms = stale_after.as_millis() as i64;
+    // `as_millis()` is u128 and `as i64` WRAPS — a large configured
+    // BUILD_STALE_BUILDING_SECS could produce a negative deadline, i.e. a claim
+    // reported as already reconcile-eligible when it is nowhere near. Saturate
+    // instead (gpt56 review).
+    let stale_ms = i64::try_from(stale_after.as_millis()).unwrap_or(i64::MAX);
     let queued: Vec<Value> = snapshot
         .queued
         .iter()
@@ -5701,6 +5705,10 @@ pub fn render_status_rows(
             // time in the past.
             let held_ms = now_ms.saturating_sub(l.started_at_ms).max(0);
             let remaining_ms = eligible_at.saturating_sub(now_ms).max(0);
+            // Round the countdown UP: with floor, a claim 400ms from eligible
+            // reported "0 seconds" while `reconcile_eligible` was still false,
+            // which reads as a contradiction. `0` now means exactly "eligible".
+            let remaining_secs = (remaining_ms + 999) / 1000;
             json!({
                 "job_id": l.job_id,
                 "module": l.module,
@@ -5710,7 +5718,7 @@ pub fn render_status_rows(
                 "resolved_sha": l.resolved_sha,
                 "held_for_secs": held_ms / 1000,
                 "reconcile_eligible_at_ms": eligible_at,
-                "reconcile_eligible_in_secs": remaining_ms / 1000,
+                "reconcile_eligible_in_secs": remaining_secs,
                 "reconcile_eligible": now_ms >= eligible_at,
             })
         })

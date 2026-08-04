@@ -643,6 +643,11 @@ pub fn assemble_matrix(
 }
 
 
+/// How long the status surface will wait on the durable queue before degrading.
+/// Short on purpose: `compiler_status` is a read an operator runs while
+/// something is already wrong, so it must answer.
+const QUEUE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// What [`collect_queue_rows`] resolved: the rendered rows, whether the queue
 /// could be read at all, and the note explaining a miss.
 pub struct QueueRows {
@@ -678,7 +683,28 @@ pub async fn collect_queue_rows(
             ),
         };
     };
-    match store.snapshot().await {
+    // BOUNDED (gpt56 review): errors already degrade, but a Redis that is slow
+    // rather than broken — DNS, a half-open socket, a blocked pool — would
+    // otherwise hold the whole status call open for as long as it liked. The
+    // status surface must answer promptly even when the queue does not; a
+    // timeout here degrades exactly like an error does.
+    let read = tokio::time::timeout(QUEUE_READ_TIMEOUT, store.snapshot()).await;
+    let read = match read {
+        Ok(r) => r,
+        Err(_) => {
+            return QueueRows {
+                queue: Vec::new(),
+                in_flight: Vec::new(),
+                degraded: true,
+                note: Some(format!(
+                    "build queue read timed out after {}s — queue/in-flight NOT shown (this is \
+                     'unknown', not 'empty')",
+                    QUEUE_READ_TIMEOUT.as_secs()
+                )),
+            }
+        }
+    };
+    match read {
         Ok(snapshot) => {
             let (queue, in_flight) = super::render_status_rows(&snapshot, stale_after, now_ms);
             QueueRows {
@@ -710,6 +736,7 @@ pub fn build_payload(
     host_rows: &[Value],
     queue: Vec<Value>,
     in_flight: Vec<Value>,
+    queue_readable: bool,
     degraded: bool,
     notes: &[String],
 ) -> Value {
@@ -724,6 +751,12 @@ pub fn build_payload(
         "hosts": host_rows,
         "queue": queue,
         "in_flight": in_flight,
+        // TERM #611 (gpt56 review): an EXPLICIT flag, not a convention. Empty
+        // arrays plus a note are readable by a human but a consumer that
+        // inspects only `queue`/`in_flight` still cannot tell "nothing is
+        // building" from "we could not find out" — which is the entire failure
+        // this item exists to close. `false` ⇒ the lists are UNKNOWN, not empty.
+        "queue_readable": queue_readable,
         "degraded": degraded,
         "notes": notes,
     })
@@ -786,6 +819,28 @@ impl RustTool for CompilerStatus {
     }
 
     async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        // The ONE piece of environment this tool cannot be handed: the shared
+        // Redis queue handle. Everything downstream of here is `assemble`, which
+        // takes the store as an argument so the REAL payload assembly — not just
+        // its helpers — is exercised by tests (gpt56 review).
+        let queue_store = super::queue::RedisQueue::from_env();
+        self.assemble(
+            args,
+            queue_store
+                .as_ref()
+                .map(|q| q as &dyn super::queue::QueueStore),
+        )
+        .await
+    }
+}
+
+impl CompilerStatus {
+    /// The whole `compiler_status` assembly, with the queue source injected.
+    async fn assemble(
+        &self,
+        args: Value,
+        queue_store: Option<&dyn super::queue::QueueStore>,
+    ) -> Result<ToolOutput, ToolError> {
         let mut notes: Vec<String> = Vec::new();
         let mut degraded = false;
 
@@ -913,13 +968,13 @@ impl RustTool for CompilerStatus {
         // Fail-safe posture: an unconfigured or unreachable queue is reported as
         // DEGRADED with a note, never as an error and never as a confident empty
         // queue (which is exactly the false "nothing is blocking" this closes).
-        let queue_store = super::queue::RedisQueue::from_env();
         let rows = collect_queue_rows(
-            queue_store.as_ref().map(|q| q as &dyn super::queue::QueueStore),
+            queue_store,
             super::scheduler::SchedulerConfig::from_env().stale_after,
             chrono::Utc::now().timestamp_millis(),
         )
         .await;
+        let queue_readable = !rows.degraded;
         if rows.degraded {
             degraded = true;
         }
@@ -936,6 +991,7 @@ impl RustTool for CompilerStatus {
             &host_rows,
             queue,
             in_flight,
+            queue_readable,
             degraded,
             &notes,
         );
@@ -1214,6 +1270,7 @@ mod tests {
             &host_rows,
             Vec::new(),
             Vec::new(),
+            true,
             false,
             &["ok".to_string()],
         );
@@ -1419,5 +1476,194 @@ mod tests {
         assert_eq!(rows.queue.len(), 1, "the queued job must be visible");
         assert_eq!(rows.queue[0]["module"], "harmony");
         assert_eq!(rows.queue[0]["force"], true);
+    }
+
+    /// gpt56 review: the earlier tests exercised the helpers, so reverting the
+    /// PRODUCTION call site back to hardcoded empty arrays would have left them
+    /// green. This drives the REAL assembly (`CompilerStatus::assemble`) and
+    /// asserts the emitted payload — the thing a consumer actually reads.
+    #[tokio::test]
+    async fn the_status_payload_carries_the_real_queue_when_it_is_readable() {
+        use crate::compiler::queue::{fake::InMemoryQueue, JobRequest, Priority, QueueStore};
+
+        let q = InMemoryQueue::new();
+        q.enqueue(&JobRequest {
+            module: "harmony".into(),
+            git_ref: "main".into(),
+            priority: Priority::High,
+            heavy: true,
+            ready: true,
+            bin: None,
+            force: false,
+            mode: "build".into(),
+            resolved_sha: None,
+        })
+        .await
+        .expect("enqueue");
+
+        let out = CompilerStatus
+            .assemble(json!({"probe_hosts": false}), Some(&q as &dyn QueueStore))
+            .await
+            .expect("status must never hard-fail");
+        let payload = out.structured.expect("structured payload");
+
+        assert_eq!(payload["queue_readable"], true);
+        assert_eq!(
+            payload["queue"].as_array().map(Vec::len),
+            Some(1),
+            "the queued job must reach the PAYLOAD, not just the helper"
+        );
+        assert_eq!(payload["queue"][0]["module"], "harmony");
+    }
+
+    /// And the distinction that matters: an unreadable queue must be
+    /// distinguishable from a genuinely empty one BY A CONSUMER, not only by a
+    /// human reading `notes`.
+    #[tokio::test]
+    async fn the_status_payload_marks_an_unreadable_queue_as_unknown_not_empty() {
+        let out = CompilerStatus
+            .assemble(json!({"probe_hosts": false}), None)
+            .await
+            .expect("status must never hard-fail");
+        let payload = out.structured.expect("structured payload");
+
+        assert_eq!(
+            payload["queue_readable"], false,
+            "a consumer inspecting only queue/in_flight would otherwise read \
+             'nothing is building' — the exact false answer this item closes"
+        );
+        assert_eq!(payload["degraded"], true);
+        assert!(payload["queue"].as_array().unwrap().is_empty());
+        let notes = payload["notes"].to_string();
+        assert!(notes.contains("not 'empty'"), "{notes}");
+    }
+
+    /// A queue that is slow rather than broken must not hold the status call
+    /// open; it degrades exactly like an error does (gpt56 review).
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_queue_read_times_out_into_the_degraded_path() {
+        use crate::compiler::queue::{
+            ClaimOutcome, Enqueued, FinalizeOutcome, JobRequest, JobState, QueueError,
+            QueueSnapshot, QueueStore, QueuedJob, ReconcileReport,
+        };
+        use crate::compiler::host::HostRole;
+
+        struct Hanging;
+        #[async_trait]
+        impl QueueStore for Hanging {
+            async fn enqueue(&self, _: &JobRequest) -> Result<Enqueued, QueueError> {
+                unreachable!()
+            }
+            async fn peek(&self, _: usize) -> Result<Vec<QueuedJob>, QueueError> {
+                unreachable!()
+            }
+            async fn claim(
+                &self,
+                _: &str,
+                _: &str,
+                _: HostRole,
+                _: u32,
+            ) -> Result<ClaimOutcome, QueueError> {
+                unreachable!()
+            }
+            async fn finalize(
+                &self,
+                _: &str,
+                _: JobState,
+                _: &str,
+            ) -> Result<FinalizeOutcome, QueueError> {
+                unreachable!()
+            }
+            async fn release(&self, _: &str, _: &str, _: HostRole, _: &str) -> Result<(), QueueError> {
+                unreachable!()
+            }
+            async fn requeue(
+                &self,
+                _: &str,
+                _: &str,
+                _: HostRole,
+                _: &str,
+                _: &str,
+            ) -> Result<(), QueueError> {
+                unreachable!()
+            }
+            async fn reconcile(&self, _: Duration) -> Result<ReconcileReport, QueueError> {
+                unreachable!()
+            }
+            async fn snapshot(&self) -> Result<QueueSnapshot, QueueError> {
+                // Longer than any sane bound; the timeout must win.
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                unreachable!()
+            }
+        }
+
+        let rows = collect_queue_rows(
+            Some(&Hanging as &dyn QueueStore),
+            Duration::from_secs(9_000),
+            0,
+        )
+        .await;
+        assert!(rows.degraded, "a hung queue read must degrade, not hang");
+        let note = rows.note.expect("it must say WHY");
+        assert!(note.contains("timed out"), "{note}");
+        assert!(note.contains("not 'empty'"), "{note}");
+    }
+
+    /// gpt56 review: `render_status_rows` is fed a `Lease` fixture elsewhere, so
+    /// the load-bearing assumption — that a claim whose worker died is still
+    /// PRESENT in `snapshot().leases` — was never verified. Drive the queue for
+    /// real: enqueue, claim, never complete (the worker is gone), and assert the
+    /// held claim is exactly what the status surface would show.
+    #[tokio::test]
+    async fn a_claim_whose_worker_died_is_still_present_in_the_snapshot() {
+        use crate::compiler::host::HostRole;
+        use crate::compiler::queue::{fake::InMemoryQueue, ClaimOutcome, JobRequest, Priority, QueueStore};
+
+        let q = InMemoryQueue::new();
+        let job = q
+            .enqueue(&JobRequest {
+                module: "harmony".into(),
+                git_ref: "main".into(),
+                priority: Priority::High,
+                heavy: true,
+                ready: true,
+                bin: None,
+                force: false,
+                mode: "build".into(),
+                resolved_sha: None,
+            })
+            .await
+            .expect("enqueue");
+        let claimed = q
+            .claim(&job.job_id, "harmony", HostRole::Heavy, 4)
+            .await
+            .expect("claim");
+        assert!(matches!(claimed, ClaimOutcome::Claimed { .. }));
+        // The worker is now gone: no finalize, no release. This is the leak.
+
+        let snapshot = q.snapshot().await.expect("snapshot");
+        assert!(
+            snapshot.queued.is_empty(),
+            "the job is no longer dispatchable — which is why resubmissions coalesce onto it"
+        );
+        assert_eq!(
+            snapshot.leases.len(),
+            1,
+            "the held claim MUST still be visible, or compiler_status cannot show it"
+        );
+        assert_eq!(snapshot.leases[0].module, "harmony");
+
+        let rows = collect_queue_rows(
+            Some(&q as &dyn QueueStore),
+            Duration::from_secs(9_000),
+            snapshot.leases[0].started_at_ms + 9_000_000,
+        )
+        .await;
+        assert_eq!(rows.in_flight.len(), 1);
+        assert_eq!(
+            rows.in_flight[0]["reconcile_eligible"], true,
+            "at exactly the deadline the claim reports itself eligible (the == boundary)"
+        );
+        assert_eq!(rows.in_flight[0]["reconcile_eligible_in_secs"], 0);
     }
 }
