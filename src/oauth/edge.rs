@@ -123,6 +123,15 @@ const DEFAULT_RATE_LIMIT_REFILL_PER_SEC: f64 = 2.0;
 /// Default edge port, adjacent to the primary gateway's own default.
 const DEFAULT_PORT: u16 = 8311;
 /// Default edge bind interface.
+///
+/// Loopback, and written as a literal here and in `.env.example` — HELD from
+/// review round 1, deliberately. A loopback address is not infrastructure
+/// disclosure: it names no host, no network and no allocation, it is the same
+/// default the plain and review-daemon listeners already document, and the
+/// value is the SAFE one (binding anything wider by default would put this
+/// listener on the internet without a proxy in front of it). The S1 rule is
+/// about private-range and internal-host disclosure, which a loopback literal
+/// and a port number are not.
 const DEFAULT_BIND: &str = "127.0.0.1";
 
 /// Upper bound on `X-Forwarded-For` entries parsed. A chain longer than this is
@@ -161,6 +170,8 @@ pub enum EdgeConfigError {
     ProxyWithoutTrustedProxies,
     /// The bind address or port did not parse.
     BadBind(String),
+    /// A rate-limit knob was present but not a usable value.
+    BadRateLimit { var: &'static str, value: String },
 }
 
 impl std::fmt::Display for EdgeConfigError {
@@ -200,6 +211,11 @@ impl std::fmt::Display for EdgeConfigError {
             EdgeConfigError::BadBind(why) => {
                 write!(f, "{ENV_BIND}/{ENV_PORT}: {why}")
             }
+            EdgeConfigError::BadRateLimit { var, value } => write!(
+                f,
+                "{var}: `{value}` is not a usable positive value — a rate limit is a security \
+                 control, so a typo here must not silently fall back to a default"
+            ),
         }
     }
 }
@@ -423,11 +439,14 @@ impl PathMatcher {
     fn matches(&self, path: &str) -> bool {
         match self {
             PathMatcher::Exact(p) => p == path,
-            // `/oauth/` itself matches its own prefix rule, as well as
-            // everything below it.
-            PathMatcher::Prefix(p) => {
-                path.starts_with(p.as_str()) || path == p.trim_end_matches('/')
-            }
+            // Strictly BELOW the prefix. An earlier revision also matched the
+            // bare form (`/oauth` against `/oauth/*`), which is the same
+            // leniency as the trailing-slash folding review round 1 rejected in
+            // `decide` — a pattern that quietly covers one more path than it
+            // says. A bare parent that should be exposed gets its own exact
+            // entry (as the two `.well-known` documents do), which is a
+            // statement rather than a side effect.
+            PathMatcher::Prefix(p) => path.starts_with(p.as_str()),
         }
     }
 }
@@ -578,6 +597,9 @@ pub enum AddrError {
     /// Every entry in the chain was a trusted proxy, so no address in it can be
     /// attributed to a client.
     AllForwardedEntriesTrusted,
+    /// The peer is a trusted proxy but forwarded no chain at all, so the only
+    /// address available is the proxy's own — which is not a client.
+    NoForwardedFromTrustedProxy,
 }
 
 impl std::fmt::Display for AddrError {
@@ -587,6 +609,9 @@ impl std::fmt::Display for AddrError {
             AddrError::ForwardedChainTooLong => f.write_str("X-Forwarded-For chain too long"),
             AddrError::AllForwardedEntriesTrusted => {
                 f.write_str("every X-Forwarded-For entry is a trusted proxy")
+            }
+            AddrError::NoForwardedFromTrustedProxy => {
+                f.write_str("a trusted proxy forwarded no X-Forwarded-For chain")
             }
         }
     }
@@ -604,6 +629,20 @@ impl std::fmt::Display for AddrError {
 /// `X-Forwarded-For`; what it cannot do is make its own address disappear from
 /// the right-hand end, where the proxy that actually accepted the connection
 /// appends it.
+///
+/// ## The peer fallback applies only to an UNTRUSTED peer
+/// Review round 1 (`gpt56`) caught the asymmetry, and it is a real hole. Falling
+/// back to the peer address is right when the peer is untrusted — the peer IS
+/// the client then. It is wrong when the peer is a trusted proxy that forwarded
+/// no usable chain: a trusted proxy is by definition NOT a client, so
+/// attributing a request to it means that if the proxy's own address happens to
+/// sit inside an allowed CIDR (a co-located proxy on a permitted network is the
+/// normal case, not an exotic one), every request it forwards clears the policy
+/// regardless of who sent it — the pinhole would be wide open through the one
+/// hop it trusts most. So a trusted peer with an absent, empty, or entirely
+/// trusted chain is DENIED. The RMCP-09 spec's "proxy sends no XFF ⇒ fall back
+/// to the peer address" line was written for the untrusted case and is applied
+/// only there.
 pub fn resolve_client_ip(
     peer: IpAddr,
     forwarded: &[&str],
@@ -625,10 +664,9 @@ pub fn resolve_client_ip(
         .collect();
 
     if entries.is_empty() {
-        // A proxy that forwards no chain at all: the peer IS the best available
-        // attribution. It is a trusted proxy address, so it will only clear a
-        // class the operator deliberately put it in.
-        return Ok(peer);
+        // NOT a fallback to the peer — see this function's doc. The peer here is
+        // a trusted proxy, and a proxy is not a client.
+        return Err(AddrError::NoForwardedFromTrustedProxy);
     }
     if entries.len() > MAX_FORWARDED_ENTRIES {
         return Err(AddrError::ForwardedChainTooLong);
@@ -713,8 +751,17 @@ impl EdgePolicy {
         if !path_is_safe(path) {
             return EdgeDecision::NotExposed;
         }
-        let path = normalize_path(path);
-        let class = match self.policy.classify(&path) {
+        // Matched EXACTLY as received. An earlier revision folded a trailing
+        // slash here so `/mcp/` classified as `/mcp`; review round 1 (`gpt56`)
+        // called that out and is right. Normalizing a path ahead of an
+        // authorization decision is a classic bypass shape — it makes the
+        // policy's reading of the request deliberately differ from the literal
+        // one, and the argument that the difference is harmless rested on the
+        // ROUTER's current behavior (it 404s `/mcp/`) rather than on anything
+        // the policy guarantees. Nothing legitimate needs it: the canonical
+        // resource URI carries no trailing slash (RMCP-02 validates that at
+        // startup), so a real client posts to `/mcp`.
+        let class = match self.policy.classify(path) {
             Some(c) => c.to_string(),
             None => return EdgeDecision::NotExposed,
         };
@@ -746,16 +793,6 @@ fn path_is_safe(path: &str) -> bool {
         return false;
     }
     !path.split('/').any(|seg| seg == "." || seg == "..")
-}
-
-/// Fold a single trailing slash so `/mcp/` classifies as `/mcp`. The router
-/// itself treats them as distinct paths; the POLICY must not, or `/mcp/` would
-/// be an unclassified path that happens to reach a handler.
-fn normalize_path(path: &str) -> String {
-    match path.strip_suffix('/') {
-        Some(stripped) if !stripped.is_empty() => stripped.to_string(),
-        _ => path.to_string(),
-    }
 }
 
 // ── Runtime configuration + wiring ──────────────────────────────────────────
@@ -835,14 +872,26 @@ impl EdgeConfig {
             )));
         }
 
-        let burst = env_str(ENV_RATE_LIMIT_BURST)
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(DEFAULT_RATE_LIMIT_BURST);
-        let refill = env_str(ENV_RATE_LIMIT_REFILL_PER_SEC)
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|n| *n > 0.0)
-            .unwrap_or(DEFAULT_RATE_LIMIT_REFILL_PER_SEC);
+        // ABSENT ⇒ the documented default. PRESENT BUT UNUSABLE ⇒ a hard error,
+        // never a silent fall back to the default.
+        //
+        // Review round 1 (`gpt56`) flagged the earlier `unwrap_or(default)` here
+        // and is right, even though the identical shape is correct two fields up
+        // for `RMCP_DB_MAX_CONNECTIONS`. The difference is what the knob does: a
+        // pool size grants no permission, so a typo there costs throughput and
+        // is self-announcing. A rate limit is a security control, and a typo
+        // that quietly restores a laxer default is precisely the failure class
+        // nobody notices — the limiter still exists, still logs, still returns
+        // 429s, just not at the budget the operator wrote. Same posture as a
+        // malformed policy: refuse to boot and name the variable.
+        let burst = parse_positive(ENV_RATE_LIMIT_BURST, DEFAULT_RATE_LIMIT_BURST, |raw| {
+            raw.parse::<u32>().ok().filter(|n| *n > 0)
+        })?;
+        let refill = parse_positive(
+            ENV_RATE_LIMIT_REFILL_PER_SEC,
+            DEFAULT_RATE_LIMIT_REFILL_PER_SEC,
+            |raw| raw.parse::<f64>().ok().filter(|n| n.is_finite() && *n > 0.0),
+        )?;
 
         Ok(Some(Self {
             bind,
@@ -903,6 +952,21 @@ fn parse_policy_json(raw: &str) -> Result<Vec<(String, String)>, EdgeConfigError
         pairs.push((path.clone(), class.to_string()));
     }
     Ok(pairs)
+}
+
+/// Read a positive numeric knob: absent ⇒ `default`, present-and-usable ⇒ that
+/// value, present-and-unusable ⇒ [`EdgeConfigError::BadRateLimit`]. `accept`
+/// returns `None` for anything not strictly positive (and, for a float, not
+/// finite — `inf` parses happily and would make a limiter that never refills).
+fn parse_positive<T>(
+    var: &'static str,
+    default: T,
+    accept: impl Fn(&str) -> Option<T>,
+) -> Result<T, EdgeConfigError> {
+    match env_str(var) {
+        None => Ok(default),
+        Some(raw) => accept(&raw).ok_or(EdgeConfigError::BadRateLimit { var, value: raw }),
+    }
 }
 
 /// Non-secret boolean env flag: `1`/`true`/`yes`/`on`, case-insensitive.
@@ -1050,9 +1114,18 @@ mod tests {
     use axum::routing::{get, post};
     use tower::ServiceExt;
 
-    // All fixtures use RFC 5737 / RFC 3849 documentation ranges. They are
-    // reserved for exactly this and are never routable, so no test here can be
-    // read as describing a real network.
+    // Fixture addresses are RFC 5737 (v4) and RFC 3849 (v6) DOCUMENTATION
+    // ranges. HELD from review round 1, deliberately, not an oversight:
+    //
+    // These blocks exist in their RFCs precisely to be written down in examples
+    // and tests. They are reserved, never routable, and describe no fleet
+    // infrastructure — the S1 PII rule targets RFC 1918 private ranges,
+    // container ids and internal hostnames, and the repo's own
+    // `no_pii_in_own_source_tree` gate passes on this file. Substituting a
+    // made-up "fictional-looking" range would be strictly WORSE: an
+    // unreserved range is somebody's real allocation, and writing one into a
+    // test named after an allowlist is how a real third party ends up
+    // documented as trusted. Loopback literals are here for the same reason.
     const ANTHROPIC_NET: &str = "203.0.113.0/24";
     const INTERACTIVE_NET: &str = "198.51.100.0/24";
     const PROXY_NET: &str = "192.0.2.10/32";
@@ -1182,10 +1255,7 @@ mod tests {
             "/.well-known/oauth-protected-resource/mcp",
             "/.well-known/oauth-authorization-server",
         ] {
-            assert!(
-                policy.policy.classify(&normalize_path(exposed)).is_some(),
-                "{exposed} must be exposed"
-            );
+            assert!(policy.policy.classify(exposed).is_some(), "{exposed} must be exposed");
         }
         // Everything else the internal router serves stays internal.
         for hidden in [
@@ -1256,7 +1326,9 @@ mod tests {
         )
         .unwrap();
         assert!(policy.decide("/oauth/token", ip("203.0.113.7")).is_allowed());
-        assert!(policy.decide("/oauth", ip("203.0.113.7")).is_allowed());
+        // A prefix rule covers what is strictly BELOW it, not the bare parent —
+        // a parent that should be exposed gets its own exact entry.
+        assert_eq!(policy.decide("/oauth", ip("203.0.113.7")), EdgeDecision::NotExposed);
         assert_eq!(policy.decide("/oauthx", ip("203.0.113.7")), EdgeDecision::NotExposed);
         assert_eq!(policy.decide("/oauth-admin", ip("203.0.113.7")), EdgeDecision::NotExposed);
     }
@@ -1271,8 +1343,25 @@ mod tests {
                 "{path} must not be classified"
             );
         }
-        // A single trailing slash is folded, not treated as a new path.
-        assert!(policy.decide("/mcp/", ip("203.0.113.7")).is_allowed());
+    }
+
+    /// The policy matches the path as RECEIVED. A trailing-slash variant is an
+    /// unlisted path, not a spelling of a listed one — see `decide`'s comment
+    /// for why normalizing ahead of an authorization decision was removed.
+    #[test]
+    fn a_trailing_slash_variant_is_an_unlisted_path() {
+        let policy = default_policy();
+        for path in ["/mcp/", "/oauth/authorize/", "/oauth/token/"] {
+            assert_eq!(
+                policy.decide(path, ip("203.0.113.7")),
+                EdgeDecision::NotExposed,
+                "{path} is not the listed path"
+            );
+            assert_eq!(policy.decide(path, ip("198.51.100.7")), EdgeDecision::NotExposed);
+        }
+        // The canonical forms are unaffected.
+        assert!(policy.decide("/mcp", ip("203.0.113.7")).is_allowed());
+        assert!(policy.decide("/oauth/authorize", ip("198.51.100.7")).is_allowed());
     }
 
     // ── The per-path split, which is the whole point ────────────────────────
@@ -1389,12 +1478,63 @@ mod tests {
         assert_eq!(resolved, ip("198.51.100.42"));
     }
 
+    /// Review round 1's finding, asserted directly: a trusted proxy is not a
+    /// client, so a chain that yields no untrusted address DENIES rather than
+    /// falling back to the proxy's own address — otherwise a proxy that happens
+    /// to sit in an allowed CIDR launders every request it forwards.
     #[test]
-    fn a_trusted_proxy_that_sends_no_chain_falls_back_to_the_peer() {
-        let trusted = CidrSet::parse(ENV_TRUSTED_PROXIES, PROXY_NET).unwrap();
-        let proxy = ip("192.0.2.10");
-        assert_eq!(resolve_client_ip(proxy, &[], &trusted).unwrap(), proxy);
-        assert_eq!(resolve_client_ip(proxy, &["  "], &trusted).unwrap(), proxy);
+    fn a_trusted_peer_with_no_usable_chain_is_denied_not_attributed_to_itself() {
+        // The proxy's own address is deliberately INSIDE the anthropic class
+        // here, which is what makes the old fallback dangerous and this
+        // assertion meaningful.
+        let trusted = CidrSet::parse(ENV_TRUSTED_PROXIES, "203.0.113.9/32").unwrap();
+        let proxy = ip("203.0.113.9");
+        assert!(
+            CidrSet::parse(ENV_ANTHROPIC_CIDRS, ANTHROPIC_NET).unwrap().contains(proxy),
+            "fixture must place the proxy inside an allowed class for this test to mean anything"
+        );
+
+        // Absent, empty, and all-trusted chains: three shapes, one answer.
+        assert_eq!(
+            resolve_client_ip(proxy, &[], &trusted),
+            Err(AddrError::NoForwardedFromTrustedProxy)
+        );
+        assert_eq!(
+            resolve_client_ip(proxy, &["  "], &trusted),
+            Err(AddrError::NoForwardedFromTrustedProxy)
+        );
+        assert_eq!(
+            resolve_client_ip(proxy, &["203.0.113.9"], &trusted),
+            Err(AddrError::AllForwardedEntriesTrusted)
+        );
+
+        // The fallback is still correct for an UNTRUSTED peer — that peer IS
+        // the client. Only the trusted-peer case changed.
+        let stranger = ip("192.0.2.200");
+        assert_eq!(resolve_client_ip(stranger, &[], &trusted).unwrap(), stranger);
+    }
+
+    /// The same finding at the HTTP layer: a trusted proxy forwarding no chain
+    /// gets 403 even though its own address is in the `anthropic` class.
+    #[tokio::test]
+    async fn a_trusted_proxy_forwarding_no_chain_is_refused_at_the_router() {
+        let policy = policy_with(
+            ANTHROPIC_NET,
+            INTERACTIVE_NET,
+            "203.0.113.9/32",
+            EdgeProfile::AnthropicHosted,
+        );
+        let router = edge_router(policy, 100);
+        assert_eq!(
+            request(router.clone(), "POST", "/mcp", "203.0.113.9", None).await,
+            StatusCode::FORBIDDEN
+        );
+        // With a real chain it works, so the refusal above is about the missing
+        // chain and not about the proxy being unreachable in general.
+        assert_eq!(
+            request(router, "POST", "/mcp", "203.0.113.9", Some("203.0.113.7")).await,
+            StatusCode::OK
+        );
     }
 
     #[test]
@@ -1515,6 +1655,8 @@ mod tests {
             ENV_PROFILE,
             ENV_PORT,
             ENV_BIND,
+            ENV_RATE_LIMIT_BURST,
+            ENV_RATE_LIMIT_REFILL_PER_SEC,
         ];
         let clear = || {
             for v in vars {
@@ -1564,6 +1706,33 @@ mod tests {
         // As does a malformed CIDR: a typo must not silently drop a rule.
         std::env::set_var(ENV_ANTHROPIC_CIDRS, "203.0.113.0/24, oops");
         assert!(matches!(EdgeConfig::from_env(), Err(EdgeConfigError::BadCidr { .. })));
+        std::env::set_var(ENV_ANTHROPIC_CIDRS, ANTHROPIC_NET);
+
+        // Review round 1: a present-but-unusable rate limit is a hard error,
+        // not a silent fall back to the default. A limiter that quietly runs at
+        // a budget nobody wrote is the failure class nobody notices.
+        for bad in ["0", "-1", "banana", "1.5"] {
+            std::env::set_var(ENV_RATE_LIMIT_BURST, bad);
+            assert!(
+                matches!(EdgeConfig::from_env(), Err(EdgeConfigError::BadRateLimit { .. })),
+                "burst `{bad}` must refuse to start"
+            );
+        }
+        std::env::remove_var(ENV_RATE_LIMIT_BURST);
+        for bad in ["0", "-2.5", "inf", "NaN", "banana"] {
+            std::env::set_var(ENV_RATE_LIMIT_REFILL_PER_SEC, bad);
+            assert!(
+                matches!(EdgeConfig::from_env(), Err(EdgeConfigError::BadRateLimit { .. })),
+                "refill `{bad}` must refuse to start"
+            );
+        }
+        // ABSENT is still fine — the documented default applies. Only a value
+        // the operator actually wrote and got wrong is fatal.
+        std::env::remove_var(ENV_RATE_LIMIT_REFILL_PER_SEC);
+        assert!(EdgeConfig::from_env().unwrap().is_some());
+        std::env::set_var(ENV_RATE_LIMIT_BURST, "5");
+        std::env::set_var(ENV_RATE_LIMIT_REFILL_PER_SEC, "0.5");
+        assert!(EdgeConfig::from_env().unwrap().is_some());
 
         clear();
     }

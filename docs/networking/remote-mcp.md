@@ -101,9 +101,13 @@ range as well; only the **outbound** one is relevant to an inbound pinhole here.
 
 - An **empty** CIDR list for a class denies that whole class. It is never read
   as "unrestricted".
-- An **unparseable** policy, an unknown class name, a malformed CIDR, or
-  `RMCP_EDGE_BEHIND_PROXY` with no trusted proxies is a **hard startup error**.
-  The service will refuse to boot and say why in the journal.
+- An **unparseable** policy, an unknown class name, a malformed CIDR,
+  `RMCP_EDGE_BEHIND_PROXY` with no trusted proxies, or a rate-limit knob that is
+  present but not a usable positive number is a **hard startup error**. The
+  service will refuse to boot and say why in the journal. An ABSENT optional
+  value is fine and takes its documented default — only a value you wrote and
+  got wrong is fatal, because a security control that quietly reverts to a
+  default is the failure nobody notices.
 - A `.well-known`-style path that is not in the table is a `404` from the edge
   even from an allowed source.
 - A path containing `%`, `.` or `..` segments is refused without being decoded.
@@ -130,8 +134,21 @@ test:
   proxy in front and the edge will attribute every request to the hop it does
   not know about.
 
-If the chain is entirely trusted proxies, or the entry that would have been
-chosen does not parse, the request is denied rather than guessed at.
+A trusted peer that yields **no untrusted address** is denied, not attributed to
+itself. If your proxy is in `RMCP_EDGE_TRUSTED_PROXIES` but forwards no
+`X-Forwarded-For` (or forwards a chain made only of other trusted proxies), every
+request through it gets a 403 — because a proxy is not a client, and treating it
+as one would admit everything it forwards whenever the proxy's own address
+happens to sit in an allowed range. Fix the proxy config; do not "fix" it by
+removing the hop from the trusted list.
+
+The same applies when the entry that would have been chosen does not parse: the
+request is denied rather than guessed at.
+
+Paths are matched **exactly as received**. `/mcp/` is not `/mcp` — it is an
+unlisted path and returns 404. Nothing legitimate sends the trailing form (the
+canonical resource URI carries no trailing slash), and normalizing a path before
+an authorization decision is a well-known bypass shape, so the edge does not.
 
 ## Bringing it up
 

@@ -784,6 +784,36 @@ rotation grace window, while minting always uses the current one.
 The full inventory (17 subsystems, plus `compiler`, `constellation-web`, `compat`,
 and the crate-root modules) is in [docs/reference/index.md](docs/reference/index.md).
 
+## The public MCP connector edge
+
+Terminus's three original doors — the loopback plain listener, the mTLS
+listener, and the tailnet listener — are all private and all bind a caller's
+identity to a transport artifact (a client-certificate CN, a tailnet identity).
+A hosted third-party client can present neither.
+
+`RMCP_EDGE_ENABLED` adds a fourth listener inside `terminus_primary`
+(`src/oauth/edge.rs`) for exactly that case: an internet-facing door, behind a
+TLS-terminating reverse proxy, exposing **only** the two OAuth `.well-known`
+documents, `/oauth/*`, and `/mcp`. Everything else the router serves —
+`/enroll`, `/admin/*`, `/healthz`, the inference routes — is unreachable through
+it, and a path with no policy entry is denied rather than defaulted to open.
+
+The policy is per-**path**, not per-host, because the two halves of an OAuth
+flow arrive from different networks: Anthropic fetches discovery, `/oauth/token`
+and `/mcp` from its published egress range, while `/oauth/authorize` opens in the
+operator's own browser and never comes from Anthropic. A single "allow only
+Anthropic" pinhole serves discovery perfectly and then silently 403s the person
+trying to consent — which is the failure this design exists to avoid.
+
+The listener is off unless configured, and an unusable policy is a hard startup
+error rather than a permissive default. See
+**[docs/networking/remote-mcp.md](docs/networking/remote-mcp.md)** for the
+runbook: the configuration surface, the reverse-proxy and TLS layout, how the
+client address is resolved (and the two proxy misconfigurations that break it),
+and a troubleshooting table. Deploy assets live in
+[`deploy/rmcp-edge.service`](deploy/rmcp-edge.service) and
+[`deploy/rmcp-edge-proxy.conf.example`](deploy/rmcp-edge-proxy.conf.example).
+
 ## Quick Start
 
 ```sh
@@ -816,6 +846,7 @@ for liveness). Full walkthrough: [docs/getting-started.md](docs/getting-started.
 | [docs/guides/index.md](docs/guides/index.md) | Operator guides: model-intake sweeps, review panels, the git-public mirror |
 | [docs/tools/README.md](docs/tools/README.md) | Existing per-tool documentation, grouped by domain |
 | [docs/architecture/](docs/architecture/mesh.md) | Existing deep dives: auth, broker, chord-integration, federation, mesh |
+| [docs/networking/remote-mcp.md](docs/networking/remote-mcp.md) | The public MCP connector edge: per-path source policy, reverse proxy + TLS, troubleshooting |
 | [docs/build.md](docs/build.md) | Build pipeline notes; see also [docs/house-style.md](docs/house-style.md) |
 
 ## At a glance
