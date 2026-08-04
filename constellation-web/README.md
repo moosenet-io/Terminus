@@ -860,7 +860,14 @@ same cosmetic-plus-server-enforced pattern as every other panel.
 - **Revocation is per-row and bulk**, from the Sessions tab or from inside a connector, with a
   confirmation that names what stops working and states that it takes effect at the next
   dispatch (not at token expiry). Revoked rows stay visible, marked — the list is an audit
-  surface as much as a control.
+  surface as much as a control. A revoke naming **no** target is refused at both ends (client
+  runtime check, fixture/server rule documented in `rmcpContract.ts`) rather than reported as a
+  success that changed nothing — the shape of failure that convinces an operator access was cut
+  when it was not.
+- **A cancelled creation leaves nothing behind.** The dialog clears on every close route (it is
+  render-guarded, not unmounted) and a create that resolves after the close is discarded, so a
+  one-time secret never survives an abandoned flow or reappears on reopen. Covered by
+  `ClientCreateDialog.interaction.test.tsx`, which fails against the pre-fix component.
 
 ### Backend readiness (`src/lib/rmcpFixtures.ts` — the one mocked boundary)
 

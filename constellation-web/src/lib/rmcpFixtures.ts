@@ -332,9 +332,15 @@ function delay<T>(value: T): Promise<T> {
 }
 
 /** The fixture server's `rmcp_*` dispatch. Mirrors the real envelope semantics: a refusal is a
- *  thrown `RmcpError` with the same kinds `callTool` would have produced from an `ok:false`
- *  envelope, so the panels take identical code paths in both modes. */
-export function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string, unknown>): Promise<T> {
+ *  rejected promise carrying an `RmcpError` of the same kind `callTool` would have produced from
+ *  an `ok:false` envelope, so the panels take identical code paths in both modes.
+ *
+ *  `async` deliberately: a refusal must be a REJECTION, never a synchronous throw. Over a real
+ *  transport there is no such thing as a synchronous failure, so a fixture that threw sync would
+ *  be a second behaviour no caller has to handle against the live server — and callers written
+ *  against it would quietly skip their error path. (Found by a test calling this directly rather
+ *  than through `callTool`, whose own `async` wrapper had been masking the difference.) */
+export async function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string, unknown>): Promise<T> {
   switch (tool) {
     case RMCP_TOOLS.clientList:
       // Scoped read: another owner's clients are not listed at all. Enumeration is itself a
@@ -484,6 +490,14 @@ export function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string, unkn
       const now = new Date().toISOString();
       const sessionId = args.session_id as string | undefined;
       const clientRowId = args.client_id as string | undefined;
+      // A revoke naming NOTHING is refused, not answered with a cheerful success (review round 2).
+      // "Matched no rows" and "you never said what to revoke" are different facts, and reporting
+      // the second as the first tells an operator that access was cut when nothing was touched —
+      // after which they stop looking. The fixture enforces this itself precisely because it is a
+      // SERVER boundary: the caller's type signature is not a control the server may rely on.
+      if (!sessionId && !clientRowId) {
+        throw new RmcpError('invalid', tool, 'a revoke must name a session_id or a client_id');
+      }
       // Authorize the target before touching anything: a revoke names an object, so an
       // unauthorized revoke is both a write attempt AND an existence oracle.
       if (clientRowId) clientOr404(clientRowId, tool);

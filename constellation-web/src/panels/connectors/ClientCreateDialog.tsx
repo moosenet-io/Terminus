@@ -9,12 +9,18 @@
 //     argon2id hash (RMCP-08).
 //   • Closing requires an explicit acknowledgement, so it cannot be dismissed by reflex before
 //     the secret has been copied.
+//   • CANCELLING CLEARS EVERYTHING, and an in-flight create that resolves after the dialog closed
+//     is DISCARDED rather than written back (review round 2). Two bugs hid there: the component
+//     is kept mounted while closed (`open` gates rendering, not mounting), so without an explicit
+//     reset a cancelled flow's secret stayed in state and could reappear on reopen; and a create
+//     that landed after close would have set that state from a stale promise. A one-time secret
+//     surviving a flow the operator abandoned is the last thing you want lingering in memory.
 //   • The statement "this is the only time you will see this" is shown next to the value, not
 //     buried in help text, because a secret the operator did not save means minting a new one.
 //
 // A public client (no secret) skips that step entirely — inventing a ceremony for a value that
 // does not exist would teach the operator to click through the one that matters.
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Badge } from '../../components/Badge';
 import { Button } from '../../components/Button';
 import { describeRmcpError, createClient } from '../../lib/rmcpClient';
@@ -66,13 +72,11 @@ export function ClientCreateDialog({ open, groups, servers, onDone, onCancel }: 
   const [secret, setSecret] = useState<string | null>(null);
   const [acknowledged, setAcknowledged] = useState(false);
   const [copied, setCopied] = useState(false);
+  /** Bumped on every close/cancel. A create resolving with a stale generation is discarded —
+   *  including its secret, which is never written into state. */
+  const generation = useRef(0);
 
-  if (!open) return null;
-
-  const redirectUris = parseLines(redirectText);
-  const hints = redirectUriHints(redirectUris);
-
-  const reset = () => {
+  const reset = useCallback(() => {
     setName('');
     setRedirectText('');
     setConfidential(false);
@@ -83,22 +87,64 @@ export function ClientCreateDialog({ open, groups, servers, onDone, onCancel }: 
     setAcknowledged(false);
     setCopied(false);
     setFailure(null);
-  };
+    setBusy(false);
+  }, []);
+
+  /** Cancel: invalidate any in-flight create FIRST, then clear, then tell the parent. Order
+   *  matters — bumping after the reset would let a promise that resolves in between repopulate
+   *  the state we just cleared. */
+  const cancel = useCallback(() => {
+    generation.current += 1;
+    reset();
+    onCancel();
+  }, [reset, onCancel]);
+
+  // The dialog stays MOUNTED while closed (see `if (!open) return null` below — that is a render
+  // guard, not an unmount), so closing by any route other than `cancel` (the parent flipping
+  // `open`, an Escape handled upstream, a re-render after the parent's own state change) must
+  // still clear. This is the backstop that makes "cleared on close" true for every route.
+  useEffect(() => {
+    if (!open) {
+      generation.current += 1;
+      reset();
+    }
+  }, [open, reset]);
+
+  // Unmount: invalidate so a late resolution cannot call setState on a dead component.
+  useEffect(() => () => { generation.current += 1; }, []);
+
+  if (!open) return null;
+
+  const redirectUris = parseLines(redirectText);
+  const hints = redirectUriHints(redirectUris);
 
   const submit = () => {
+    const attempt = generation.current;
     setBusy(true);
     setFailure(null);
     createClient({ name: name.trim(), redirectUris, confidential, toolGroupIds: groupIds, namespaces })
       .then(result => {
+        // Cancelled (or unmounted) while this was in flight: drop the result on the floor. The
+        // connector still exists server-side — the operator will find it in the list — but its
+        // secret is deliberately NOT surfaced here, because a secret shown outside the
+        // acknowledge-once flow is a secret nobody stored. Never written to state either way.
+        if (attempt !== generation.current) return;
         setCreated(result.client);
         setSecret(result.clientSecret);
       })
-      .catch(e => setFailure(describeRmcpError(e).message))
-      .finally(() => setBusy(false));
+      .catch(e => {
+        if (attempt !== generation.current) return;
+        setFailure(describeRmcpError(e).message);
+      })
+      .finally(() => {
+        if (attempt !== generation.current) return;
+        setBusy(false);
+      });
   };
 
   const finish = () => {
     const c = created;
+    generation.current += 1;
     reset();
     if (c) onDone(c);
   };
@@ -129,7 +175,7 @@ export function ClientCreateDialog({ open, groups, servers, onDone, onCancel }: 
   return (
     <div
       role="presentation"
-      onClick={created ? undefined : onCancel}
+      onClick={created ? undefined : cancel}
       style={{
         position: 'fixed',
         inset: 0,
@@ -216,7 +262,7 @@ export function ClientCreateDialog({ open, groups, servers, onDone, onCancel }: 
             {failure && <div style={{ color: 'var(--status-error)', fontSize: 'var(--fs-sm)' }}>{failure}</div>}
 
             <div style={{ display: 'flex', gap: 'var(--space-3)', justifyContent: 'flex-end' }}>
-              <Button variant="ghost" onClick={onCancel} disabled={busy}>Cancel</Button>
+              <Button variant="ghost" onClick={cancel} disabled={busy}>Cancel</Button>
               <Button variant="primary" onClick={submit} disabled={busy || name.trim().length === 0}>
                 {busy ? 'Creating…' : 'Create connector'}
               </Button>

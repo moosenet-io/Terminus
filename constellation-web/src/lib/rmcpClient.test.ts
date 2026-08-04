@@ -27,21 +27,58 @@ import {
 // imported the fixture matcher (or grew one of its own), the preview would become a plausible
 // guess that agrees with reality right up until it doesn't. This scans the sources the way the
 // existing fetch-exclusivity guard does.
+//
+// TWO TRAPS, both found by review round 2, both of the "a guard test quietly stops guarding"
+// family — it still passes, so nobody looks:
+//
+//  1. **The needle must not appear literally in a scanned file.** A regex literal containing the
+//     module name makes the scanning file itself a match. It happens that Vite's `import.meta.glob`
+//     EXCLUDES the importing module from its own result (verified directly: a probe file's own path
+//     is absent from its glob keys), so the round-2 version of this test was in fact reporting what
+//     it claimed. But it was accidentally right: move the glob into a shared helper, or add a
+//     second test file that names the module, and the result silently changes. A guard may not
+//     depend on an implicit bundler behaviour nobody wrote down. The needle is therefore assembled
+//     at RUNTIME, so it never appears as a literal in any scanned source.
+//  2. **Tests are not shipped and legitimately name the module.** They are excluded explicitly
+//     rather than by accident, which also removes any dependence on trap 1's self-exclusion.
+//
+// Non-vacuity is verified the same way the bundle assertion was: by temporarily adding a real
+// violating import and watching this fail. See the commit message for what was observed.
+
 // @ts-expect-error -- import.meta.glob has no ambient type in this project (see aggregationClient.sessions.test.ts)
 const RAW_SOURCES: Record<string, string> = import.meta.glob('/src/**/*.{ts,tsx}', { query: '?raw', import: 'default', eager: true });
 
+/** Assembled at runtime — see trap 1. `'rmcp' + 'Fixtures'`. */
+const FIXTURE_MODULE = ['rmcp', 'Fix', 'tures'].join('');
+
+/** Sources this guard is responsible for: everything the app ships, excluding test files. */
+function scannedSources(): [string, string][] {
+  return Object.entries(RAW_SOURCES).filter(([path]) => !/\.test\.tsx?$/.test(path));
+}
+
 describe('no UI module resolves scope locally', () => {
-  it('nothing under src/panels or src/pages imports the fixture server', () => {
-    const offenders = Object.entries(RAW_SOURCES)
+  it('the scan actually covers the files it claims to (self-test)', () => {
+    // Guards against the silent-empty-scan failure: if the glob returned nothing, or excluded the
+    // very files of interest, every assertion below would pass vacuously.
+    const paths = scannedSources().map(([p]) => p);
+    expect(paths).toContain('/src/lib/rmcpClient.ts');
+    expect(paths).toContain('/src/pages/Connectors.tsx');
+    expect(paths).toContain('/src/panels/connectors/ResolvedToolPreview.tsx');
+    expect(paths.some(p => /\.test\.tsx?$/.test(p))).toBe(false);
+  });
+
+  it('nothing under src/panels or src/pages references the fixture server', () => {
+    const offenders = scannedSources()
       .filter(([path]) => path.startsWith('/src/panels/') || path.startsWith('/src/pages/'))
-      .filter(([, text]) => /rmcpFixtures/.test(text))
+      .filter(([, text]) => text.includes(FIXTURE_MODULE))
       .map(([path]) => path);
     expect(offenders).toEqual([]);
   });
 
-  it('only the client references the fixture module, and only behind the build-time guard', () => {
-    const referencing = Object.entries(RAW_SOURCES)
-      .filter(([, text]) => /rmcpFixtures'/.test(text))
+  it('only the API client references the fixture module, and only behind the build-time guard', () => {
+    const referencing = scannedSources()
+      .filter(([path]) => path !== `/src/lib/${FIXTURE_MODULE}.ts`) // the module naming itself
+      .filter(([, text]) => text.includes(FIXTURE_MODULE))
       .map(([path]) => path)
       .sort();
     expect(referencing).toEqual(['/src/lib/rmcpClient.ts']);
@@ -51,9 +88,9 @@ describe('no UI module resolves scope locally', () => {
     // build so the module never enters that bundle's graph. A top-level `import … from
     // './rmcpFixtures'` would defeat that, so assert there isn't one.
     const client = RAW_SOURCES['/src/lib/rmcpClient.ts'];
-    expect(client).not.toMatch(/^import .*rmcpFixtures/m);
+    expect(client).not.toMatch(new RegExp(`^import .*${FIXTURE_MODULE}`, 'm'));
     expect(client).toMatch(/!import\.meta\.env\.PROD && resolveMode\(\) === 'mock'/);
-    expect(client).toMatch(/await import\('\.\/rmcpFixtures'\)/);
+    expect(client).toMatch(new RegExp(`await import\\('\\./${FIXTURE_MODULE}'\\)`));
   });
 });
 
@@ -288,6 +325,31 @@ describe('a delegated owner sees and touches only their own objects', () => {
     await expect(revokeSessions({ clientRowId: 'c-4' })).rejects.toMatchObject({ kind: 'forbidden' });
     // Still live: a refused revoke must not half-apply.
     expect((await listSessions()).find(s => s.id === 's-4')).toBeUndefined();
+  });
+});
+
+describe('a revoke must name a target — at both ends', () => {
+  it('the client refuses a targetless revoke at runtime, not only in the type system', async () => {
+    // Types are erased; this call is reachable from untyped JS. The cast is the point of the test.
+    await expect(revokeSessions({} as unknown as { sessionId: string })).rejects.toMatchObject({
+      kind: 'invalid',
+    });
+  });
+
+  it('the FIXTURE SERVER refuses it independently of what the client would send', async () => {
+    // Straight at the server boundary, bypassing the wrapper's guard entirely: a server may never
+    // rely on its callers being well-behaved. Answering success here would tell an operator that
+    // access was cut when nothing was touched — the failure that stops an investigation.
+    const { rmcpFixtureCall } = await import('./rmcpFixtures');
+    await expect(rmcpFixtureCall('rmcp_session_revoke', {})).rejects.toMatchObject({ kind: 'invalid' });
+  });
+
+  it('and it changes nothing when refused', async () => {
+    const { rmcpFixtureCall } = await import('./rmcpFixtures');
+    const before = await listSessions();
+    await rmcpFixtureCall('rmcp_session_revoke', {}).catch(() => undefined);
+    const after = await listSessions();
+    expect(after.map(s => s.revokedAt)).toEqual(before.map(s => s.revokedAt));
   });
 });
 

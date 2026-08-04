@@ -18,6 +18,13 @@ export const RMCP_TOOLS = {
   groupPreview: 'rmcp_group_preview',
   serverOwnerList: 'rmcp_server_owner_list',
   sessionList: 'rmcp_session_list',
+  // CONTRACT NOTE (review round 2) — `rmcp_session_revoke` MUST reject a call that names neither
+  // `session_id` nor `client_id`, with `invalid_argument`. It must NOT treat "no target" as "no
+  // rows matched" and answer success: a revocation that silently did nothing is the precise shape
+  // of failure that leaves an operator believing access was cut when it was not, and they stop
+  // looking. (The TypeScript wrapper's argument union already prevents a typed caller from
+  // sending one — that is not the point. This is a SERVER rule, because the server is the
+  // boundary, and a caller willing to send a malformed request is exactly what a boundary is for.)
   sessionRevoke: 'rmcp_session_revoke',
 } as const;
 
