@@ -1154,10 +1154,17 @@ and a troubleshooting table. Deploy assets live in
 
 The OAuth connector door (`src/oauth/`) scopes a client by **tool group** — a name plus a
 small list of patterns over the tool catalog — so an operator scopes a connector as
-"media" rather than by listing several hundred tool names. Groups are resolved against the
-**live merged catalog on every `tools/list` and every `tools/call`**, so a newly registered
-tool that matches an existing pattern is included with no config edit, and a pattern is
-never frozen into a snapshot that has drifted from what the server actually serves.
+"media" rather than by listing several hundred tool names. Patterns are matched against the
+live catalog rather than expanded once and stored, so a newly registered tool matching an
+existing pattern needs no config edit.
+
+> **Status — authored here, enforced elsewhere.** Everything below describes how groups are
+> **authored, validated and stored**. It does not yet describe what authorizes a request:
+> nothing calls this resolver on the request path, and the effective enforcement point is
+> still RMCP-07's own matcher, reading the same stored rows. TERM #637 sequences the
+> collapse of the two. The single authoritative account of what is and is not wired lives in
+> the `Status` section of the `src/oauth/groups.rs` module docs — this note points there
+> rather than restating it.
 
 ### Pattern syntax
 
@@ -1204,7 +1211,7 @@ old-vocabulary pattern looks like — so `peerhub__*` errors with the correct fo
 Rejected at write time, exhaustively: the empty pattern; anything over 96 characters; any
 non-printable-ASCII character; a `*` anywhere but as the single final character (`*weather`
 and `weather*foo` are errors, not suffix matches); a pattern beginning with `__`; and any
-namespace that cannot round-trip (`__*`, `a__b__*`, `foo___*`). Every one of those would
+namespace that cannot round-trip (`::*`, `a__b::*`, `foo_::*`). Every one of those would
 otherwise parse to something the author did not write — usually a pattern that silently
 matches nothing, leaving a connector quietly missing tools with no error to explain it.
 
@@ -1216,12 +1223,9 @@ at the RMCP-07 intersection rather than by the matcher. `*` is deliberately not 
 heavily gated pattern here, and it is what gives the namespace dimension of the
 intersection something to bound.
 
-This is the same vocabulary the gateway's MESH-08 allow entries already use, deliberately,
-so an operator does not have to hold two pattern languages in their head.
-
-- **No regex.** A pattern may be authored by a delegated federation user, and the matcher
-  runs on every request — an author-supplied regex on the dispatch path is a denial of
-  service.
+- **No regex.** A pattern may be authored by a delegated federation user, and this matcher
+  is designed to run on the dispatch path, once per request per pattern — an author-supplied
+  regex there is a denial of service.
 - **No negation.** Subtraction is the existing deny layer's job
   (`DEFAULT_SENSITIVE_DENY_PREFIXES`). Two subtractive mechanisms in two files is how two
   authorization systems come to disagree.
@@ -1239,16 +1243,17 @@ so an operator does not have to hold two pattern languages in their head.
   the write it authorizes. A caller states *who* is writing; it never states what they are
   allowed to write. Requires the `S132-rmcp06-account-operator-flag.sql` migration —
   `schema_ready()` reports NOT ready without it.
-- **And it is re-checked on every resolution.** A write-time check is point-in-time, so a
-  stored `*` expands only if its group's owner is an operator *right now* and not disabled.
+- **And this resolver re-derives it rather than trusting the row.** A write-time check is
+  point-in-time, so a stored `*` expands only if its group's owner is an operator *right
+  now* and not disabled.
   A wildcard written by someone since demoted — or stored before the flag column existed —
   resolves to the **empty set**. General rule for anything built on top of this: an
   authority that can be revoked must be re-derived on the read path, never cached in a row.
 
 ### Bounds
 
-A group holds at most 128 patterns, a client is scoped to at most 32 groups, and resolution
-refuses outright above `32 x 128` patterns. The per-group cap alone bounds nothing that
+A group holds at most 128 patterns and a client is scoped to at most 32 groups, both
+enforced at write time; this resolver refuses outright above `32 x 128` patterns. The per-group cap alone bounds nothing that
 matters: resolution concatenates every group a client holds and walks that list once per
 catalog tool, so the group count is the unbounded factor. Over the limit, resolution is
 **refused, never truncated** — a truncated pattern list is a scope that silently differs
@@ -1258,9 +1263,10 @@ from the configured one, and which patterns survived would depend on row orderin
 
 **Empty means empty.** An empty group grants nothing, and a well-formed pattern that
 happens to match no tool in the current catalog grants nothing. Neither is ever read as
-"unrestricted". A group can only ever *narrow* — the effective set is intersected with the
-account's own grant and with the client's visible namespaces (RMCP-07), so no group can
-grant a tool the human behind it could not already call.
+"unrestricted". A group can only ever *narrow*: RMCP-07 intersects the group set with the
+account's own grant and the client's visible namespaces, so no group can grant a tool the
+human behind it could not already call. That intersection is RMCP-07's, and today it runs
+against RMCP-07's matcher — see the status note above.
 
 ### Starter groups
 

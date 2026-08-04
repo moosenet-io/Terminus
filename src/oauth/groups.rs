@@ -5,22 +5,26 @@
 //! The fleet exports several hundred tools. Asking an operator to enumerate
 //! them when minting a connector guarantees one of two outcomes: a
 //! hand-authored list that goes stale the day a tool is added, or a shrug and a
-//! wildcard. A group ("media", "home automation") is a small set of PATTERNS
-//! resolved against the LIVE merged catalog on every list and every call, so a
-//! newly registered tool that matches an existing pattern is included without a
-//! config edit, and no pattern is ever frozen into a snapshot that quietly
-//! diverges from what the server actually serves.
+//! wildcard. A group ("media", "home automation") is a small set of PATTERNS,
+//! resolved against the LIVE merged catalog rather than expanded once and
+//! stored — so a newly registered tool matching an existing pattern is included
+//! without a config edit, and no pattern is ever frozen into a snapshot that
+//! quietly diverges from what the server actually serves.
+//!
+//! **Where that resolution runs today is a separate question, and the answer is
+//! "not here yet".** See "Status" below before reading any of this as a
+//! description of what currently authorizes a request.
 //!
 //! ## Three rules this module exists to enforce
 //!
-//! **1. The syntax is deliberately minimal, and it is the syntax MESH-08
-//! already uses.** An exact name, a trailing-`*` prefix, or a namespace form
+//! **1. The syntax is deliberately minimal.** An exact name, a trailing-`*`
+//! prefix, or a namespace form
 //! (`<namespace>::*`, delimiter [`PATTERN_NS_SEP`] — deliberately NOT the `__`
 //! that separates the halves of an advertised name; see [`Pattern::parse`]).
 //! Nothing else parses. No regex: a pattern here may be authored by a DELEGATED
 //! federation user (RMCP-12), and a regex from an untrusted author is a
-//! denial-of-service against the dispatch path, which runs the matcher on every
-//! request. No negation either — negation is the existing deny layer's job
+//! denial-of-service against the dispatch path, which is where this matcher is
+//! designed to run — once per request, per pattern. No negation either — negation is the existing deny layer's job
 //! ([`crate::gateway_framework::DEFAULT_SENSITIVE_DENY_PREFIXES`]), and a second
 //! subtractive mechanism in a different file is how two authorization systems
 //! come to disagree.
@@ -83,16 +87,38 @@
 //! enforcer into a whole federated namespace. That is TERM #637; the resolution
 //! was to standardise on `::`, which is what this module now uses.
 //!
-//! ## This module has no caller yet, and that is the design
-//! [`resolve`] is not wired into `tools/list` or `tools/call`, and must not be
-//! wired in here. Enforcement is RMCP-07's single `effective()` function, which
-//! intersects the account's own grant with the client's groups and its visible
-//! namespaces, and which backs BOTH the list filter and the call guard from one
-//! definition. Calling this resolver directly from a dispatch path would create
-//! a SECOND enforcement point — which is precisely the thing RMCP-07 exists to
-//! prevent, because two authorization sites over one decision is how they come
-//! to disagree, silently, in the widening direction. So this item ships the
-//! matcher and the store and stops there, deliberately caller-less.
+//! ## Status: authored here, ENFORCED elsewhere (the one account of this)
+//!
+//! This is the single authoritative statement of what is and is not wired. The
+//! README points here rather than restating it, because a second account is how
+//! documentation drifts from the code it describes.
+//!
+//! **What this module does today:** groups are authored, validated and stored
+//! through it, with every semantic below applying at WRITE time.
+//!
+//! **What it does not do today:** nothing calls [`resolve`] or
+//! [`resolve_groups`] on the request path. [`crate::oauth::store::OauthStore::client_authorized_groups`]
+//! has no consumer in the enforcement decision. The effective enforcement point
+//! is RMCP-07's own matcher in `scope.rs`, which reads the same stored rows
+//! through `client_tool_groups`. So the fail-closed resolution semantics here —
+//! the empty-set rules, the aggregate bound, the read-path re-derivation of
+//! wildcard authority — govern what can be STORED, and do not yet govern what is
+//! ALLOWED at dispatch.
+//!
+//! **When that changes:** TERM #637 sequences the matcher collapse — this item
+//! merges, then `ScopePattern` is deleted and `ClientScope::from_rows` points at
+//! this matcher, with the enforcement tests RE-POINTED rather than deleted
+//! alongside the parser. Until that lands, read anything below as a description
+//! of the authoring path.
+//!
+//! **Why the gap is not closed here.** Wiring this resolver into `tools/list` or
+//! `tools/call` from this branch would create a SECOND enforcement point beside
+//! RMCP-07's `effective()`, which already backs both the list filter and the
+//! call guard from one definition. Two authorization sites over one decision is
+//! how they come to disagree — silently, in the widening direction — which is
+//! the failure TERM #637 already documented once. So this item ships the matcher
+//! and the store and stops there, deliberately caller-less, and the collapse
+//! happens as its own change.
 //!
 //! ## Where authority comes from
 //! [`GroupOwner`] is an input to PURE validation here; it is not a claim a
@@ -1366,7 +1392,7 @@ mod tests {
     /// A namespace that cannot round-trip through `split_namespaced` is refused,
     /// because it would store cleanly, read as meaningful, and match nothing.
     ///
-    /// The trailing-underscore case (`foo___*` → namespace `foo_`) is the one
+    /// The trailing-underscore case (`foo_::*` → namespace `foo_`) is the one
     /// that was not previously caught: the splitter always cuts at the FIRST
     /// `__`, so an advertised `foo___bar` resolves to namespace `foo`, and no
     /// tool can ever resolve to `foo_`.
