@@ -1354,6 +1354,29 @@ fn check_tmpdir_socket_headroom(
 /// PCON-10: best-effort reclaim of a per-job build-scratch dir on drop — covers
 /// build success AND every `?` early-return path of `build_inner`. A crash that
 /// skips the drop is covered by PCON-05's age/count GC backstop.
+struct ScratchReclaim(Option<PathBuf>);
+
+impl ScratchReclaim {
+    fn new(dir: PathBuf) -> Self {
+        Self(Some(dir))
+    }
+}
+
+impl Drop for ScratchReclaim {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "PCON-10: failed to reclaim per-job build scratch {}: {e}",
+                        dir.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// TERM #609: refuse to publish a binary that is not there, and say what is
 /// actually known about why.
 ///
@@ -1392,29 +1415,6 @@ fn ensure_built_binary_present(built_bin: &std::path::Path, module: &str) -> Res
             "the built binary for {module} at {} could not be checked before publish: {e}",
             built_bin.display()
         ))),
-    }
-}
-
-struct ScratchReclaim(Option<PathBuf>);
-
-impl ScratchReclaim {
-    fn new(dir: PathBuf) -> Self {
-        Self(Some(dir))
-    }
-}
-
-impl Drop for ScratchReclaim {
-    fn drop(&mut self) {
-        if let Some(dir) = self.0.take() {
-            if let Err(e) = std::fs::remove_dir_all(&dir) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        "PCON-10: failed to reclaim per-job build scratch {}: {e}",
-                        dir.display()
-                    );
-                }
-            }
-        }
     }
 }
 
