@@ -1037,7 +1037,7 @@ pub(crate) fn insufficient_scope(
 /// authorized" posture, and it is correct for a loopback/mTLS-only host. But
 /// combined with an ENABLED OAuth door it was a hole of exactly the shape this
 /// whole item exists to prevent: a first-time operator sets
-/// `RMCP_CANONICAL_RESOURCE`, does not set a legacy `TERMINUS_AUTH_TOKEN`
+/// `RMCP_OAUTH_RESOURCE`, does not set a legacy `TERMINUS_AUTH_TOKEN`
 /// (there is no reason they would — they are configuring OAuth), and an
 /// uncredentialed `/mcp` answers `200`. Discovery is entirely `401`-driven and
 /// a `WWW-Authenticate` on a `200` is discarded, so the connector fails with a

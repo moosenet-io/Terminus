@@ -61,27 +61,45 @@ use crate::error::ToolError;
 
 /// The connector URL, exactly as typed into the client's custom-connector
 /// form. Required; its absence means the OAuth door is simply not configured.
-pub const CANONICAL_RESOURCE_ENV: &str = "RMCP_CANONICAL_RESOURCE";
+///
+/// **This is the SAME variable [`crate::oauth::authorize::RESOURCE_ENV`]
+/// reads**, and deliberately so. An earlier revision of this item, written
+/// before RMCP-03/04 merged, introduced a parallel `RMCP_CANONICAL_RESOURCE`
+/// for the same value — which would have been the exact defect this module
+/// exists to prevent, one level up. The `resource` published here and the
+/// `resource` the authorization endpoint requires on every request must be
+/// byte-equal (RMCP-04's own docs say so), and the only way to guarantee two
+/// values are equal is for there to be one value. Two variables that "must
+/// match" are two variables that will eventually not match, and the resulting
+/// audience mismatch is invisible from both sides.
+pub const CANONICAL_RESOURCE_ENV: &str = "RMCP_OAUTH_RESOURCE";
 
 /// The OAuth issuer identifier. Optional — defaults to the canonical
 /// resource's ORIGIN, which is what a single-host deployment always wants.
-pub const ISSUER_ENV: &str = "RMCP_ISSUER";
+///
+/// Same variable as [`crate::oauth::jwt::ISSUER_ENV`] and
+/// [`crate::oauth::authorize::ISSUER_ENV`], for the reason given on
+/// [`CANONICAL_RESOURCE_ENV`]: the `issuer` in this document, the RFC 9207
+/// `iss` on the authorization response, and the `iss` claim in a minted token
+/// are the same identifier, so they read the same variable rather than three
+/// that are documented to agree.
+pub const ISSUER_ENV: &str = "RMCP_OAUTH_ISSUER";
 
 /// Space-separated scopes this resource advertises. Optional.
-pub const SCOPES_SUPPORTED_ENV: &str = "RMCP_SCOPES_SUPPORTED";
+pub const SCOPES_SUPPORTED_ENV: &str = "RMCP_OAUTH_SCOPES_SUPPORTED";
 
 /// The scope an access token must carry to reach `/mcp`. Optional.
-pub const REQUIRED_SCOPE_ENV: &str = "RMCP_REQUIRED_SCOPE";
+pub const REQUIRED_SCOPE_ENV: &str = "RMCP_OAUTH_REQUIRED_SCOPE";
 
 /// Whether RFC 7591 dynamic client registration is enabled. Optional,
 /// default OFF — see [`Discovery::new`] for why the metadata key is omitted
 /// rather than advertised-but-refusing.
-pub const DCR_ENABLED_ENV: &str = "RMCP_DCR_ENABLED";
+pub const DCR_ENABLED_ENV: &str = "RMCP_OAUTH_DCR_ENABLED";
 
 /// Operator acknowledgement that a cross-origin [`ISSUER_ENV`] is served
 /// elsewhere. Optional, default off — see [`Discovery::new`] for why a
 /// cross-origin issuer is refused without it.
-pub const ISSUER_EXTERNALLY_SERVED_ENV: &str = "RMCP_ISSUER_EXTERNALLY_SERVED";
+pub const ISSUER_EXTERNALLY_SERVED_ENV: &str = "RMCP_OAUTH_ISSUER_EXTERNALLY_SERVED";
 
 /// Default advertised scopes. `offline_access` is present because a hosted
 /// connector that cannot refresh silently degrades into "reauthorize every
@@ -416,11 +434,47 @@ impl Discovery {
             )));
         }
 
+        // Review round 3. Both scope inputs are validated HERE, at construction,
+        // rather than only where they are used.
+        //
+        // The constructor was weaker than the module's own contract: it claimed
+        // published values are validated, but took `scopes_supported` and
+        // `required_scope` on trust. `required_scope` is interpolated into a
+        // `WWW-Authenticate` header and both are published in the metadata
+        // documents, so a malformed token could reach the wire even though
+        // `insufficient_scope_challenge` sanitizes its own argument — that
+        // sanitizer defends the RUNTIME path (a scope arriving from a stored
+        // client scoping record, RMCP-07), and it cannot defend a document that
+        // was rendered at startup from a bad configuration. Same shape of gap
+        // as the whitespace trimming fixed in round 1: a guarantee stated in one
+        // place and enforced in another, narrower one.
+        //
+        // Startup refusal, consistent with `CanonicalUri`: a scope list is
+        // configuration, and a typo in it should stop the process rather than
+        // quietly narrow what the resource advertises.
         if scopes_supported.is_empty() {
             return Err(ToolError::InvalidArgument(format!(
                 "{SCOPES_SUPPORTED_ENV} resolved to an empty scope list — a protected resource \
                  that advertises no scopes gives the client nothing to request"
             )));
+        }
+        for scope in &scopes_supported {
+            validate_scope_token(SCOPES_SUPPORTED_ENV, scope)?;
+        }
+        if required_scope.is_empty() {
+            return Err(ToolError::InvalidArgument(format!(
+                "{REQUIRED_SCOPE_ENV} is empty — a resource that requires no scope cannot say \
+                 what a client is missing, and its `insufficient_scope` challenge would carry \
+                 an empty `scope` parameter that tells the client nothing"
+            )));
+        }
+        // Split on a single space, not `split_whitespace`: a scope list is
+        // space-delimited by RFC 6749, so a tab or a double space is a
+        // malformed list rather than an alternative spelling of the same one.
+        // `split_whitespace` would silently accept both and publish a value the
+        // operator did not write.
+        for scope in required_scope.split(' ') {
+            validate_scope_token(REQUIRED_SCOPE_ENV, scope)?;
         }
         // A required scope the resource does not advertise is unobtainable: the
         // client asks for what `scopes_supported` offers, the token comes back
@@ -711,13 +765,9 @@ fn read_env(var: &str) -> Option<String> {
 fn parse_scope_list(var: &str, raw: &str) -> Result<Vec<String>, ToolError> {
     let mut out = Vec::new();
     for token in raw.split_whitespace() {
-        if !token.bytes().all(is_scope_char) {
-            return Err(ToolError::InvalidArgument(format!(
-                "{var} contains {token:?}, which is not a valid OAuth scope token (RFC 6749 \
-                 permits %x21 / %x23-5B / %x5D-7E — notably not a quote or a backslash, which \
-                 would break the `WWW-Authenticate` header this value is interpolated into)"
-            )));
-        }
+        // Same validator `Discovery::new` uses, so the reader and the publisher
+        // cannot disagree about what a scope may contain.
+        validate_scope_token(var, token)?;
         if !out.iter().any(|s: &String| s == token) {
             out.push(token.to_string());
         }
@@ -728,6 +778,36 @@ fn parse_scope_list(var: &str, raw: &str) -> Result<Vec<String>, ToolError> {
         )));
     }
     Ok(out)
+}
+
+/// Validate ONE scope token against RFC 6749's `scope-token` production.
+///
+/// The single place that decides what a scope may contain, so
+/// [`parse_scope_list`] (which reads configuration) and [`Discovery::new`]
+/// (which publishes it) cannot drift apart on the answer. `var` names the
+/// setting so a startup failure points at a line the operator can edit.
+///
+/// An EMPTY token is refused explicitly rather than skipped. An empty entry can
+/// only arise from a delimiter mistake — a double space, a trailing space, a
+/// stray comma — and skipping it would publish a scope list subtly different
+/// from the one that was written, which is the class of silent normalization
+/// this module refuses everywhere else.
+fn validate_scope_token(var: &str, scope: &str) -> Result<(), ToolError> {
+    if scope.is_empty() {
+        return Err(ToolError::InvalidArgument(format!(
+            "{var} contains an empty scope token — scopes are separated by a SINGLE space, so \
+             this is a delimiter mistake (a double space, or a leading/trailing one) rather \
+             than a scope"
+        )));
+    }
+    if !scope.bytes().all(is_scope_char) {
+        return Err(ToolError::InvalidArgument(format!(
+            "{var} contains {scope:?}, which is not a valid OAuth scope token (RFC 6749 permits \
+             %x21 / %x23-5B / %x5D-7E — notably not a space, a tab, a quote or a backslash; the \
+             last two would break the `WWW-Authenticate` header this value is interpolated into)"
+        )));
+    }
+    Ok(())
 }
 
 /// RFC 6749 `scope-token` character set: printable ASCII except `"` and `\`.
@@ -1229,6 +1309,60 @@ mod tests {
             false,
         )
         .is_ok());
+    }
+
+    /// Review round 3: the CONSTRUCTOR must enforce the scope rules, not just
+    /// the env reader and not just the challenge builder.
+    ///
+    /// `required_scope` is interpolated into a `WWW-Authenticate` header and
+    /// both inputs are published in the metadata documents, so a malformed
+    /// token could otherwise reach the wire from a caller that did not go
+    /// through `from_env`. `insufficient_scope_challenge`'s sanitizer defends
+    /// the RUNTIME path (a scope arriving from a stored scoping record); it
+    /// cannot defend a document rendered once at startup.
+    #[test]
+    fn the_constructor_validates_both_scope_inputs() {
+        let build = |scopes: Vec<&str>, required: &str| {
+            Discovery::new(
+                uri("https://connector.test/mcp"),
+                uri("https://connector.test"),
+                false,
+                scopes.into_iter().map(str::to_string).collect(),
+                required.to_string(),
+                false,
+            )
+        };
+
+        // A header-breaking character in the ADVERTISED list.
+        assert!(build(vec!["mcp", "ad\"min"], "mcp").is_err());
+        assert!(build(vec!["mcp", "back\\slash"], "mcp").is_err());
+        // Whitespace inside a token is a delimiter mistake, not a scope.
+        assert!(build(vec!["mcp", "two words"], "mcp").is_err());
+        assert!(build(vec!["mcp", "\ttab"], "mcp").is_err());
+        // An empty entry can only come from a delimiter mistake, so it is
+        // refused rather than skipped — skipping would publish a list subtly
+        // different from the one that was written.
+        assert!(build(vec!["mcp", ""], "mcp").is_err());
+
+        // And the same rules on the REQUIRED scope, which is the one that
+        // reaches a header.
+        assert!(build(vec!["mcp"], "").is_err());
+        assert!(build(vec!["mcp"], "mcp  admin").is_err(), "double space");
+        assert!(build(vec!["mcp"], "mcp\tadmin").is_err(), "tab is not a delimiter");
+        assert!(build(vec!["mcp"], "mcp ").is_err(), "trailing space");
+        assert!(build(vec!["mcp", "ad\"min"], "ad\"min").is_err());
+
+        // The rule that already existed still holds: a requirement the resource
+        // does not advertise is unobtainable.
+        assert!(build(vec!["mcp"], "admin").is_err());
+
+        // Valid input is still accepted — a guard that refuses real
+        // configuration is worse than the gap it closes.
+        let ok = build(vec!["mcp", "offline_access", "profile:read"], "mcp offline_access")
+            .expect("a valid scope configuration must build");
+        assert!(ok
+            .insufficient_scope_challenge("mcp offline_access")
+            .contains("scope=\"mcp offline_access\""));
     }
 
     /// A scope list is configuration, so a typo in it fails loudly rather than

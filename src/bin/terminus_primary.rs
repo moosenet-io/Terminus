@@ -260,7 +260,7 @@ async fn main() {
     );
 
     // RMCP-02: the OAuth connector door's discovery configuration. Absent
-    // `RMCP_CANONICAL_RESOURCE` this resolves to `None` and nothing changes —
+    // `RMCP_OAUTH_RESOURCE` this resolves to `None` and nothing changes —
     // no new routes, and the same bare `401` from `/mcp` as before.
     //
     // A PRESENT-but-malformed configuration aborts startup, deliberately unlike
