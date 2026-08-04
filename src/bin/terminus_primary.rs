@@ -259,6 +259,44 @@ async fn main() {
         mesh_registry.enabled_upstreams().count()
     );
 
+    // RMCP-02: the OAuth connector door's discovery configuration. Absent
+    // `RMCP_OAUTH_RESOURCE` this resolves to `None` and nothing changes —
+    // no new routes, and the same bare `401` from `/mcp` as before.
+    //
+    // A PRESENT-but-malformed configuration aborts startup, deliberately unlike
+    // the mesh and principal-resolver degrade-and-log policies above. Those
+    // have a safe dormant state to fall back to; this one does not. A canonical
+    // resource URI that is subtly wrong (a trailing slash, an uppercase scheme)
+    // still produces a discovery document that clients fetch happily, and then
+    // fails at token issuance with a client-side message — "couldn't reach the
+    // MCP server" — that names neither the field nor this process. Refusing to
+    // start is the only failure mode an operator can act on.
+    let rmcp_discovery = match terminus_rs::oauth::metadata::Discovery::from_env() {
+        Ok(discovery) => discovery,
+        Err(e) => {
+            tracing::error!("terminus_primary: RMCP OAuth discovery configuration is invalid: {e}");
+            std::process::exit(1);
+        }
+    };
+    // RMCP-02 (review round 6): which OAuth surfaces this process serves,
+    // detected from the environment rather than inferred from the discovery
+    // config above. Discovery and RMCP-05's resource-server door are
+    // INDEPENDENT switches, and keying the admission decision on the one this
+    // item happens to own is what let an anonymous, token-less request through
+    // twice. See `terminus_rs::oauth::metadata::OauthDoors` for why this
+    // detects "OAuth is configured at all" instead of listing doors.
+    let oauth_doors = terminus_rs::oauth::metadata::OauthDoors::detect_from_env();
+    tracing::info!("terminus_primary: {}", oauth_doors.describe());
+
+    if let Some(discovery) = &rmcp_discovery {
+        tracing::info!(
+            "terminus_primary: RMCP OAuth door enabled for resource {} (issuer {}, dcr {})",
+            discovery.resource().as_str(),
+            discovery.issuer().as_str(),
+            if discovery.dcr_enabled() { "enabled" } else { "disabled" },
+        );
+    }
+
     let gateway_config = GatewayServerConfig {
         server_name: "terminus-primary".to_string(),
         server_version: terminus_rs::VERSION.to_string(),
@@ -270,6 +308,8 @@ async fn main() {
         inference_proxy,
         gateway,
         mesh_pool: mesh_pool.clone(),
+        rmcp_discovery: rmcp_discovery.map(std::sync::Arc::new),
+        oauth_doors: oauth_doors.clone(),
     };
 
     // Same shared setup `terminus_personal` uses (TGW-01 extraction, see
@@ -488,6 +528,8 @@ mod tests {
             inference_proxy: None,
             gateway: None,
             mesh_pool: None,
+            rmcp_discovery: None,
+            oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
         };
         build_gateway_router(registry, &config)
     }
@@ -512,6 +554,8 @@ mod tests {
             inference_proxy: None,
             gateway: Some(gateway),
             mesh_pool: None,
+            rmcp_discovery: None,
+            oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
         };
         build_gateway_router(registry, &config)
     }
@@ -534,6 +578,8 @@ mod tests {
             inference_proxy: Some(InferenceProxyClient::with_base_url(chord_base_url)),
             gateway: None,
             mesh_pool: None,
+            rmcp_discovery: None,
+            oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
         };
         build_gateway_router(registry, &config)
     }
@@ -558,6 +604,8 @@ mod tests {
             inference_proxy: Some(InferenceProxyClient::with_base_url(chord_base_url)),
             gateway: Some(gateway),
             mesh_pool: None,
+            rmcp_discovery: None,
+            oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
         };
         build_gateway_router(registry, &config)
     }
@@ -707,6 +755,8 @@ mod tests {
             inference_proxy: None,
             gateway: None,
             mesh_pool: None,
+            rmcp_discovery: None,
+            oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
         };
         let router = build_gateway_router(registry, &config);
         let body = post_mcp(
@@ -1042,6 +1092,8 @@ mod tests {
             inference_proxy: None,
             gateway: None,
             mesh_pool: None,
+            rmcp_discovery: None,
+            oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
         };
         let router = build_gateway_router(registry, &config);
         let (status, _, _) = post_json(router, "/v1/chat/completions", json!({})).await;

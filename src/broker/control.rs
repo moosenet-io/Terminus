@@ -835,6 +835,8 @@ mod tests {
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
             broker_routes: RouteTable::new(),
+            rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         })
     }
 

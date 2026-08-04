@@ -226,6 +226,35 @@ pub struct McpServerState {
     /// worker-onboarding scope) — an empty table is behavior-preserving,
     /// identical to pre-TMOD-04 dispatch.
     pub broker_routes: RouteTable,
+    /// RMCP-02: when `Some`, this process is an OAuth-protected remote-MCP
+    /// connector door. Two things change, and nothing else:
+    ///
+    /// 1. The unauthenticated `.well-known` discovery routes are mounted (see
+    ///    [`crate::oauth::router::oauth_router`]).
+    /// 2. A `401` from `/mcp` carries the `WWW-Authenticate` challenge that
+    ///    tells a client where those documents are — the ONLY way a client
+    ///    learns which authorization server to use.
+    ///
+    /// `None` (the default, and every deployment that predates this item)
+    /// preserves the previous behavior byte-for-byte: no new routes, and a bare
+    /// `401` with the same JSON-RPC body. Same additive `Option`-gated
+    /// convention as `personal_federation`/`gateway`/`mesh_pool` above.
+    ///
+    /// Note what this field does NOT do: it does not make `/mcp` accept an
+    /// OAuth token. Token validation is RMCP-05's scope. Until then this is a
+    /// discovery surface only, which is deliberate — a door that advertises
+    /// where to get a key before it can check one is inert, whereas the reverse
+    /// order would be a live unauthenticated path.
+    pub rmcp_discovery: Option<Arc<crate::oauth::metadata::Discovery>>,
+    /// RMCP-02: which OAuth surfaces this process serves — the authoritative
+    /// input to [`McpServerState::oauth_door_enabled`], and through it the only
+    /// thing that narrows `is_authorized`'s open arm.
+    ///
+    /// Deliberately NOT derived from the other fields on this struct. See
+    /// [`crate::oauth::metadata::OauthDoors`] for why two attempts at deriving
+    /// it both missed a door that is switched on somewhere else.
+    /// `OauthDoors::none()` is the pre-RMCP-02 posture and changes nothing.
+    pub oauth_doors: crate::oauth::metadata::OauthDoors,
 }
 
 impl McpServerState {
@@ -239,6 +268,54 @@ impl McpServerState {
     /// purely as the foundation for a future hot-reload/admin-tool item.
     pub fn swap_registry(&self, new: ToolRegistry) {
         self.registry.store(Arc::new(new));
+    }
+
+    /// Whether this process serves ANY internet-facing OAuth surface.
+    ///
+    /// # This is the one place a door registers
+    ///
+    /// [`is_authorized`]'s open arm — "no shared token is configured, so admit
+    /// everyone" — is correct for a private loopback/mTLS host and catastrophic
+    /// for a public one. Which of those a process is depends on whether an
+    /// OAuth door is mounted, and that question is asked HERE and nowhere else,
+    /// so there is exactly one function deciding when an uncredentialed request
+    /// is admitted. Two pieces of code making that decision independently is a
+    /// dual-writer hazard: they drift, and the drift is silent because the
+    /// failure mode is a `200` that should have been a `401`.
+    ///
+    /// # Why a named question instead of a field test
+    ///
+    /// Review round 5 caught the reason this matters. The condition used to
+    /// read `state.rmcp_discovery.is_none()`, keyed on RMCP-02's own discovery
+    /// config. But discovery and the resource-server door are INDEPENDENT
+    /// switches — an operator can enable OAuth without configuring discovery —
+    /// so an anonymous, tokenless request reached dispatch through the second
+    /// switch. The identical `401`-vs-`200` defect this item had already fixed
+    /// once, arriving by a different route, because the test named a field
+    /// rather than asking the question.
+    ///
+    /// # Adding a door
+    ///
+    /// Nothing. That is the point of round 6's rewrite.
+    ///
+    /// The first two attempts at this both enumerated: `rmcp_discovery.is_some()`,
+    /// dressed up the second time as a predicate. Both missed RMCP-05's
+    /// resource-server door, which is switched on independently by
+    /// `RMCP_OAUTH_ENABLED` and is not a field here at all — so the open arm
+    /// stayed open and an anonymous, token-less request still reached dispatch
+    /// with a `200`. The source-scan guard could not catch it either, because a
+    /// door configured elsewhere is not an OAuth-shaped field on this struct;
+    /// it read as coverage while providing none, so it has been removed.
+    ///
+    /// [`crate::oauth::metadata::OauthDoors`] now answers the question
+    /// authoritatively, by detecting whether OAuth is configured AT ALL rather
+    /// than by listing doors — see its docs. A door nobody can configure is not
+    /// a door, and the moment one is configurable it is configurable through
+    /// the shared `RMCP_OAUTH_*` prefix, which is what this detects. So a
+    /// future door cannot silently reopen the arm, and no one has to remember
+    /// to register it.
+    pub(crate) fn oauth_door_enabled(&self) -> bool {
+        self.oauth_doors.any()
     }
 }
 
@@ -286,7 +363,17 @@ pub(crate) fn resolve_principal(
 }
 
 pub fn build_router(state: Arc<McpServerState>) -> Router {
-    Router::new()
+    // RMCP-02: built from its OWN `Arc<Discovery>` state rather than from
+    // `McpServerState`, which is the point of the whole surface — those routes
+    // must keep answering when everything reachable through `McpServerState`
+    // (registry, mesh pool, database) is degraded. Captured here, before
+    // `state` is moved into the constellation router below.
+    let discovery_routes = state
+        .rmcp_discovery
+        .clone()
+        .map(crate::oauth::router::oauth_router);
+
+    let router = Router::new()
         .route("/mcp", post(handle_mcp))
         .route("/healthz", get(handle_healthz))
         // PROMEX-01: Prometheus application-metrics scrape endpoint. Same
@@ -310,7 +397,20 @@ pub fn build_router(state: Arc<McpServerState>) -> Router {
         // like every route above, deliberately NOT a broker worker -- see
         // `crate::constellation`'s module doc and
         // `docs/architecture/broker.md` for why.
-        .merge(crate::constellation::constellation_router(state))
+        .merge(crate::constellation::constellation_router(state));
+
+    // A `match` that returns the router untouched rather than merging an empty
+    // one: an unconfigured deployment must get the pre-RMCP-02 router exactly,
+    // not one that merely happens to behave the same. These are explicit
+    // routes, so they take precedence over the constellation router's SPA
+    // fallback (which would otherwise answer `/.well-known/…` with the app
+    // shell) irrespective of merge order.
+    let router = match discovery_routes {
+        Some(discovery) => router.merge(discovery),
+        None => router,
+    };
+
+    router
         // Request-level tracing (method/path/status/latency) via RUST_LOG —
         // useful for an admin-tools endpoint where knowing who called what,
         // when, matters operationally.
@@ -894,8 +994,29 @@ async fn handle_metrics() -> impl IntoResponse {
     )
 }
 
-fn unauthorized() -> Response {
-    (
+/// The `401` for a request that presented no usable credential.
+///
+/// RMCP-02: when this process is configured as an OAuth connector door, this
+/// response carries `WWW-Authenticate: Bearer resource_metadata="…"`. That
+/// header is the entire discovery bootstrap — a hosted MCP client learns which
+/// authorization server to use from it and from nowhere else — and it is
+/// honoured ONLY on a `401`. The same header on a `200` is discarded, which is
+/// why the unauthenticated path must genuinely fail rather than succeed with a
+/// hint attached.
+///
+/// The JSON-RPC body is unchanged from the pre-RMCP-02 response, and no header
+/// is added when the door is unconfigured, so every existing deployment and
+/// every existing test sees exactly what it saw before.
+///
+/// Note the argument is DISCOVERY specifically, not
+/// [`McpServerState::oauth_door_enabled`], and that is correct rather than an
+/// oversight: the challenge's whole payload is a `resource_metadata` URL, so a
+/// process with a door but no discovery surface has nothing to point a client
+/// at and correctly emits a bare `401`. The status code — the part that decides
+/// whether the request was admitted — is gated on the predicate; only the
+/// advisory header is gated on discovery.
+fn unauthorized(discovery: Option<&crate::oauth::metadata::Discovery>) -> Response {
+    let mut response = (
         StatusCode::UNAUTHORIZED,
         [("content-type", "application/json")],
         json!({
@@ -905,12 +1026,106 @@ fn unauthorized() -> Response {
         })
         .to_string(),
     )
-        .into_response()
+        .into_response();
+
+    if let Some(discovery) = discovery {
+        // Infallible in practice — `CanonicalUri` refuses every byte that could
+        // not appear in a header value, which is precisely why it refuses them
+        // at startup. Handled rather than unwrapped anyway: a panic here would
+        // turn a config edge case into a downed listener, and a `401` without
+        // the challenge is still a correct (if undiscoverable) answer.
+        match axum::http::HeaderValue::from_str(discovery.unauthorized_challenge()) {
+            Ok(value) => {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::WWW_AUTHENTICATE, value);
+            }
+            Err(_) => warn!(
+                "rmcp: the configured discovery challenge is not a valid header value — \
+                 clients will be unable to discover the authorization server"
+            ),
+        }
+    }
+    response
 }
 
-fn is_authorized(state: &McpServerState, headers: &HeaderMap) -> bool {
+/// The `403` for a VALID token that lacks a scope this resource requires.
+///
+/// Kept next to [`unauthorized`] because the pair is easy to collapse and
+/// costly to collapse. `401` means "your credential is not good here" and a
+/// client responds by discarding it and authorizing afresh; `403` +
+/// `insufficient_scope` means "your credential is fine and too narrow" and a
+/// client responds by re-authorizing for the NAMED scopes. Answering `401` to a
+/// scope problem sends the user around a consent loop that re-grants exactly
+/// the scope that was already insufficient.
+///
+/// Unused on any live path as of RMCP-02 — `/mcp` cannot yet accept an OAuth
+/// token at all, so nothing can currently present a valid-but-narrow one. It
+/// lands here, with the challenge builder it belongs to, so RMCP-05's token
+/// validation has one shape to call rather than inventing a second.
+pub(crate) fn insufficient_scope(
+    discovery: &crate::oauth::metadata::Discovery,
+    required_scope: &str,
+) -> Response {
+    let mut response = (
+        StatusCode::FORBIDDEN,
+        [("content-type", "application/json")],
+        json!({
+            "jsonrpc": "2.0",
+            "id": Value::Null,
+            "error": {"code": -32003, "message": "Insufficient scope"}
+        })
+        .to_string(),
+    )
+        .into_response();
+
+    if let Ok(value) =
+        axum::http::HeaderValue::from_str(&discovery.insufficient_scope_challenge(required_scope))
+    {
+        response
+            .headers_mut()
+            .insert(axum::http::header::WWW_AUTHENTICATE, value);
+    }
+    response
+}
+
+/// Whether this request may proceed past the door.
+///
+/// `has_transport_identity` is true when the listener attached a
+/// server-verified identity to the request — an mTLS client certificate or a
+/// resolved tailnet WhoIs. It is NOT derived from any header: both extensions
+/// are inserted by the listener itself post-handshake, so a client cannot set
+/// one (the same property `resolve_principal` relies on).
+///
+/// RMCP-02, review round 2 — the defect this parameter exists to close. The
+/// `None` arm below is the legacy "no token configured, so everyone is
+/// authorized" posture, and it is correct for a loopback/mTLS-only host. But
+/// combined with an ENABLED OAuth door it was a hole of exactly the shape this
+/// whole item exists to prevent: a first-time operator sets
+/// `RMCP_OAUTH_RESOURCE`, does not set a legacy `TERMINUS_AUTH_TOKEN`
+/// (there is no reason they would — they are configuring OAuth), and an
+/// uncredentialed `/mcp` answers `200`. Discovery is entirely `401`-driven and
+/// a `WWW-Authenticate` on a `200` is discarded, so the connector fails with a
+/// generic "couldn't reach the MCP server" while the metadata documents sit
+/// there being served perfectly. The header would have been right, the status
+/// code wrong, and the status code is the part that carries the meaning.
+///
+/// So when the door is enabled, the open arm narrows: a caller the transport
+/// layer vouched for still passes (this must not break the mTLS and tailnet
+/// callers an existing gateway serves), and anything else — which is precisely
+/// the shape of a request arriving from the public internet — is refused so it
+/// receives the challenge.
+///
+/// A bearer token presented in that state is deliberately NOT accepted either.
+/// Nothing in this item can validate an OAuth access token (that is RMCP-05),
+/// and honouring an unvalidated one would be a live unauthenticated path, which
+/// is a far worse outcome than a client being told to authorize again.
+fn is_authorized(state: &McpServerState, headers: &HeaderMap, has_transport_identity: bool) -> bool {
     let Some(expected) = &state.auth_token else {
-        return true; // no token configured -> unauthenticated posture (matches legacy host)
+        // No shared token configured. Open, UNLESS ANY OAuth door is on — see
+        // this function's doc, and [`McpServerState::oauth_door_enabled`] for
+        // why this asks a named question rather than naming a field.
+        return !state.oauth_door_enabled() || has_transport_identity;
     };
     let Some(got) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
         return false;
@@ -932,8 +1147,13 @@ async fn handle_mcp(
     tailnet: Option<Extension<TailnetIdentity>>,
     body: Bytes,
 ) -> Response {
-    if !is_authorized(&state, &headers) {
-        return unauthorized();
+    // RMCP-02: the two transport identities are read here, BEFORE dispatch,
+    // purely as a presence check — `resolve_principal` below still does the
+    // real resolution. Both are listener-inserted extensions, never headers, so
+    // a public-internet caller cannot manufacture either one.
+    let has_transport_identity = identity.is_some() || tailnet.is_some();
+    if !is_authorized(&state, &headers, has_transport_identity) {
+        return unauthorized(state.rmcp_discovery.as_deref());
     }
 
     // TMOD-01: capture ONE tool-registry snapshot for the ENTIRE request —
@@ -2036,6 +2256,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::Request;
+    use serial_test::serial; // RMCP-02: env-mutating door-detection tests
     use tower::ServiceExt; // for `oneshot`
 
     struct EchoHealthTool;
@@ -2071,6 +2292,8 @@ mod tests {
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
+            rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         })
     }
 
@@ -2230,6 +2453,8 @@ mod tests {
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
             broker_routes,
+            rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         })
     }
 
@@ -2364,6 +2589,8 @@ mod tests {
                 mesh_pool: None,
                 principal_resolver: PrincipalResolver::default(),
                 broker_routes,
+                rmcp_discovery: None,
+                oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             })
         };
         let router = build_router(state);
@@ -2426,6 +2653,8 @@ mod tests {
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
             broker_routes,
+            rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         });
 
         // tools/list: the colliding name is advertised exactly ONCE, as the
@@ -2503,6 +2732,8 @@ mod tests {
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
+            rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -2574,6 +2805,8 @@ mod tests {
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
+            rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -2624,6 +2857,8 @@ mod tests {
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
+            rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -2654,6 +2889,8 @@ mod tests {
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
+            rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -2667,6 +2904,513 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── RMCP-02: OAuth discovery and the 401 challenge ──────────────────────
+
+    /// `auth_token` here is a test DOUBLE for a bearer credential, not a
+    /// secret, and is passed as a literal on purpose.
+    ///
+    /// Review round 1 flagged the literal as a hardcoded credential. Held, with
+    /// reasoning: it authenticates nothing, exists only inside the test binary,
+    /// and grants access to a `ToolRegistry` containing one echo tool built two
+    /// lines above. The S7/S8 secrets rule governs how the RUNTIME obtains real
+    /// credentials — routing this through a vault accessor would test the vault
+    /// rather than the router, and would leave the thing under test (does an
+    /// unauthenticated `/mcp` emit a discovery challenge?) dependent on secret
+    /// provisioning that has nothing to do with it. The pre-existing
+    /// `test_unauthorized_when_token_configured_and_missing` above uses the
+    /// same literal for the same reason; this follows that precedent rather
+    /// than inventing a second convention beside it.
+    fn rmcp_state(auth_token: Option<&str>) -> Arc<McpServerState> {
+        use crate::oauth::metadata::{CanonicalUri, Discovery, OauthDoors};
+
+        // A discovery surface built in code rather than read from the
+        // environment, so it registers itself explicitly.
+        let mut doors = OauthDoors::none();
+        doors.register("rmcp-discovery (test fixture)");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoHealthTool)).unwrap();
+        let discovery = Discovery::new(
+            CanonicalUri::parse("TEST", "https://connector.test/mcp").unwrap(),
+            CanonicalUri::parse("TEST", "https://connector.test").unwrap(),
+            false,
+            vec!["mcp".to_string(), "offline_access".to_string()],
+            "mcp".to_string(),
+            false,
+        )
+        .unwrap();
+        Arc::new(McpServerState {
+            registry: ArcSwap::from_pointee(registry),
+            server_name: "terminus-primary-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            auth_token: auth_token.map(str::to_string),
+            personal_federation: None,
+            inference_proxy: None,
+            tool_cache: Default::default(),
+            gateway: None,
+            mesh_pool: None,
+            principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
+            rmcp_discovery: Some(Arc::new(discovery)),
+            oauth_doors: doors,
+        })
+    }
+
+    /// THE acceptance criterion for this item. An unauthenticated `/mcp` must
+    /// return `401` — never `200` — carrying a `WWW-Authenticate` whose
+    /// `resource_metadata` URL is where the document actually is. That header
+    /// is the ONLY way a hosted client learns which authorization server to
+    /// use, and it is honoured only on a `401`: attached to a `200` it is
+    /// discarded and the user sees a generic "couldn't reach the MCP server".
+    #[tokio::test]
+    async fn rmcp02_unauthenticated_mcp_returns_a_401_challenge() {
+        let state = rmcp_state(Some("secret-abc"));
+        let expected = state
+            .rmcp_discovery
+            .as_ref()
+            .unwrap()
+            .protected_resource_url()
+            .to_string();
+        let (status, _body, headers) = post_mcp(
+            build_router(state),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "must be 401, never 200");
+        let challenge = headers
+            .get("www-authenticate")
+            .expect("a 401 without a challenge is undiscoverable")
+            .to_str()
+            .expect("header must be printable ASCII");
+        assert!(challenge.starts_with("Bearer "));
+        assert!(
+            challenge.contains(&format!("resource_metadata=\"{expected}\"")),
+            "challenge must point at the served document: {challenge}"
+        );
+        assert!(challenge.contains("scope=\"mcp\""), "{challenge}");
+    }
+
+    /// The `resource_metadata` URL in the challenge and the path this router
+    /// mounts are derived from the same configuration, but nothing structural
+    /// forces them to agree — so the loop is closed here: take the URL out of
+    /// the live challenge header and fetch it from the live router.
+    #[tokio::test]
+    async fn rmcp02_the_challenges_metadata_url_is_actually_mounted() {
+        let state = rmcp_state(Some("secret-abc"));
+        let origin = state
+            .rmcp_discovery
+            .as_ref()
+            .unwrap()
+            .resource()
+            .origin()
+            .to_string();
+        let router = build_router(state);
+
+        let (_status, _body, headers) = post_mcp(
+            router.clone(),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        let challenge = headers.get("www-authenticate").unwrap().to_str().unwrap();
+        let advertised = challenge
+            .split("resource_metadata=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("challenge carries a metadata URL")
+            .to_string();
+        let path = advertised
+            .strip_prefix(&origin)
+            .expect("the advertised URL is on this server's own origin");
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "advertised path {path}");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let doc: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["resource"], json!("https://connector.test/mcp"));
+        assert_eq!(doc["authorization_servers"], json!(["https://connector.test"]));
+    }
+
+    /// Discovery is unauthenticated even when `/mcp` is not — requiring a
+    /// credential to discover how to obtain a credential is a loop with no
+    /// entry point.
+    #[tokio::test]
+    async fn rmcp02_discovery_is_reachable_without_credentials() {
+        let router = build_router(rmcp_state(Some("secret-abc")));
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-authorization-server",
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "unauthenticated GET {path}");
+        }
+    }
+
+    /// A deployment that has not configured the door must be byte-for-byte
+    /// what it was before this item: no discovery routes, and a bare `401`
+    /// with no challenge. A stray `WWW-Authenticate` on an unconfigured server
+    /// would advertise an authorization server that does not exist.
+    #[tokio::test]
+    async fn rmcp02_an_unconfigured_door_adds_nothing() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoHealthTool)).unwrap();
+        let state = Arc::new(McpServerState {
+            registry: ArcSwap::from_pointee(registry),
+            server_name: "terminus-personal-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            auth_token: Some("secret-abc".to_string()),
+            personal_federation: None,
+            inference_proxy: None,
+            tool_cache: Default::default(),
+            gateway: None,
+            mesh_pool: None,
+            principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
+            rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
+        });
+        let router = build_router(state);
+
+        let (status, _body, headers) = post_mcp(
+            router.clone(),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            !headers.contains_key("www-authenticate"),
+            "an unconfigured server must not advertise an authorization server"
+        );
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/.well-known/oauth-protected-resource")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Deliberately NOT an assertion on the status code: the constellation
+        // router installs an SPA fallback, so an unmounted path may answer
+        // `200 index.html` rather than `404` depending on whether a web bundle
+        // is embedded in this build. What matters — and what is asserted — is
+        // that nothing on this path is a protected-resource metadata document.
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body.contains("authorization_servers"),
+            "the discovery routes must not be mounted at all: {body}"
+        );
+    }
+
+    /// A successfully authenticated call must NOT carry the challenge: a
+    /// `WWW-Authenticate` on a `200` is ignored by clients anyway, and emitting
+    /// one would make a working connection look like a failing one to anything
+    /// that logs on the header's presence.
+    #[tokio::test]
+    async fn rmcp02_an_authorized_call_carries_no_challenge() {
+        let router = build_router(rmcp_state(Some("secret-abc")));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret-abc")
+            .body(Body::from(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!resp.headers().contains_key("www-authenticate"));
+    }
+
+    /// REVIEW ROUND 2, and the deployment shape a first-time operator will
+    /// actually have: the OAuth door enabled and NO legacy `auth_token` set —
+    /// because someone configuring OAuth has no reason to also set a shared
+    /// bearer token.
+    ///
+    /// Before the fix this answered `200`. That is the single worst outcome
+    /// available to this item: the whole discovery flow is `401`-driven, a
+    /// `WWW-Authenticate` on a `200` is discarded by the client, and the
+    /// operator sees a generic "couldn't reach the MCP server" while the
+    /// metadata documents are being served perfectly. The header was right and
+    /// the status code was wrong, and the status code is what carries the
+    /// meaning.
+    #[tokio::test]
+    async fn rmcp02_door_enabled_without_a_legacy_token_still_challenges() {
+        let (status, _body, headers) = post_mcp(
+            build_router(rmcp_state(None)),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an uncredentialed call to an OAuth-enabled door must never be 200"
+        );
+        assert!(
+            headers
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|c| c.contains("resource_metadata=")),
+            "and it must carry the challenge that bootstraps discovery"
+        );
+    }
+
+    /// A bearer token presented in that same state must not be honoured either.
+    /// Nothing in this item can validate an OAuth access token (RMCP-05 owns
+    /// that), and accepting an unvalidated one would be a live unauthenticated
+    /// path — strictly worse than telling the client to authorize again.
+    #[tokio::test]
+    async fn rmcp02_an_unvalidatable_bearer_is_not_honoured() {
+        let router = build_router(rmcp_state(None));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer not-a-validatable-access-token")
+            .body(Body::from(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().contains_key("www-authenticate"));
+    }
+
+    /// The narrowing must not break the callers a gateway already serves. An
+    /// mTLS or tailnet caller is vouched for by the LISTENER — an extension
+    /// inserted post-handshake, which a public-internet client cannot
+    /// manufacture — so it keeps the pre-RMCP-02 open posture.
+    #[tokio::test]
+    async fn rmcp02_a_transport_verified_caller_is_unaffected() {
+        for tag in ["mtls", "tailnet"] {
+            let router = build_router(rmcp_state(None));
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(Body::from(
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
+                ))
+                .unwrap();
+            match tag {
+                "mtls" => {
+                    req.extensions_mut()
+                        .insert(ClientIdentity("a-enrolled-service".to_string()));
+                }
+                _ => {
+                    req.extensions_mut().insert(TailnetIdentity {
+                        login: "a-tailnet-account".to_string(),
+                        node: "a-tailnet-peer".to_string(),
+                        tags: vec![],
+                    });
+                }
+            }
+            let resp = router.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "a {tag}-verified caller must keep working"
+            );
+        }
+    }
+
+    /// And a deployment with NO door and no token keeps the legacy open
+    /// posture exactly — the narrowing above is gated on the door, not on the
+    /// absence of a token.
+    #[tokio::test]
+    async fn rmcp02_no_door_and_no_token_stays_open() {
+        let (status, _body, _headers) = post_mcp(
+            build_router(test_state()),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The open arm follows `oauth_door_enabled`, in BOTH directions.
+    #[test]
+    fn the_open_arm_follows_the_door_predicate_not_a_single_field() {
+        let state = rmcp_state(None);
+        assert!(
+            state.oauth_door_enabled(),
+            "a configured discovery surface IS a door"
+        );
+        // Door on, no legacy token, no transport identity => refused, so the
+        // caller receives the challenge.
+        assert!(!is_authorized(&state, &HeaderMap::new(), false));
+        // Door on, but the listener vouched for the caller => unchanged.
+        assert!(is_authorized(&state, &HeaderMap::new(), true));
+
+        let no_door = test_state();
+        assert!(!no_door.oauth_door_enabled());
+        // No door and no token => the legacy open posture, untouched.
+        assert!(is_authorized(&no_door, &HeaderMap::new(), false));
+    }
+
+    /// REVIEW ROUND 6 — the case the previous two attempts got wrong, and the
+    /// one the removed source-scan guard could never have caught.
+    ///
+    /// A door that is NOT this item's discovery surface — RMCP-05's
+    /// resource server, switched on by its own `RMCP_OAUTH_ENABLED` — must
+    /// close the open arm just the same. Here `rmcp_discovery` is `None` and
+    /// the ONLY evidence of a door is the environment, exactly the deployment
+    /// shape that was still answering `200`.
+    ///
+    /// `#[serial]`: mutates process-global environment, per the crate's
+    /// convention.
+    #[tokio::test]
+    #[serial]
+    async fn rmcp02_a_door_other_than_discovery_still_closes_the_open_arm() {
+        use crate::oauth::metadata::OauthDoors;
+
+        std::env::set_var("RMCP_OAUTH_ENABLED", "1");
+        let doors = OauthDoors::detect_from_env();
+        std::env::remove_var("RMCP_OAUTH_ENABLED");
+
+        assert!(
+            doors.any(),
+            "a resource-server door configured purely by env must be detected: {}",
+            doors.describe()
+        );
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoHealthTool)).unwrap();
+        let state = Arc::new(McpServerState {
+            registry: ArcSwap::from_pointee(registry),
+            server_name: "terminus-primary-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            // No legacy shared token — the posture a first-time OAuth operator
+            // has, and the one that used to fall through to "admit everyone".
+            auth_token: None,
+            personal_federation: None,
+            inference_proxy: None,
+            tool_cache: Default::default(),
+            gateway: None,
+            mesh_pool: None,
+            principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
+            // Discovery is DELIBERATELY unset. This is the whole point.
+            rmcp_discovery: None,
+            oauth_doors: doors,
+        });
+
+        assert!(
+            state.oauth_door_enabled(),
+            "a door is a door even when this item's own config is absent"
+        );
+
+        let (status, _body, headers) = post_mcp(
+            build_router(state),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an uncredentialed call to an OAuth-enabled process must never be 200, \
+             whichever switch enabled it"
+        );
+        // No discovery surface means no `resource_metadata` to point at, so a
+        // BARE 401 is correct here — the status code is what decides admission,
+        // and RMCP-05 owns the challenge for its own door.
+        assert!(!headers.contains_key("www-authenticate"));
+    }
+
+    /// Detection must not fire on an unrelated environment, or every deployment
+    /// on the fleet would narrow. Pins both directions of the prefix rule.
+    #[test]
+    #[serial]
+    fn oauth_door_detection_keys_on_the_shared_prefix() {
+        use crate::oauth::metadata::OauthDoors;
+
+        std::env::remove_var("RMCP_OAUTH_ENABLED");
+        std::env::set_var("TERMINUS_SOMETHING_ELSE", "1");
+        let unrelated = OauthDoors::detect_from_env();
+        std::env::remove_var("TERMINUS_SOMETHING_ELSE");
+        assert!(
+            !unrelated.any(),
+            "an unrelated variable must not be read as a door: {}",
+            unrelated.describe()
+        );
+
+        // An EMPTY value is "not configured" — the same rule `read_env` applies,
+        // and the reason a materialized `.env` template does not switch every
+        // gateway into the narrowed posture.
+        std::env::set_var("RMCP_OAUTH_ENABLED", "");
+        let blank = OauthDoors::detect_from_env();
+        std::env::remove_var("RMCP_OAUTH_ENABLED");
+        assert!(!blank.any(), "an empty setting is not evidence of a door");
+
+        // And `describe` must never leak a value — one of these settings is a
+        // signing key.
+        std::env::set_var("RMCP_OAUTH_SIGNING_KEY", "super-secret-value");
+        let doors = OauthDoors::detect_from_env();
+        std::env::remove_var("RMCP_OAUTH_SIGNING_KEY");
+        assert!(doors.any());
+        assert!(
+            !doors.describe().contains("super-secret-value"),
+            "describe must name settings, never their values: {}",
+            doors.describe()
+        );
+    }
+
+    /// Insufficient scope is a `403` with its own error code, not a `401`.
+    /// Collapsing the two sends a user round a consent loop that re-grants
+    /// exactly the scope that was already too narrow.
+    #[tokio::test]
+    async fn rmcp02_insufficient_scope_is_a_403_naming_what_is_needed() {
+        let state = rmcp_state(None);
+        let discovery = state.rmcp_discovery.as_ref().unwrap();
+        let response = insufficient_scope(discovery, "mcp admin");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let challenge = response
+            .headers()
+            .get("www-authenticate")
+            .expect("a scope failure must say which scope")
+            .to_str()
+            .unwrap();
+        assert!(challenge.contains("error=\"insufficient_scope\""), "{challenge}");
+        assert!(challenge.contains("scope=\"mcp admin\""), "{challenge}");
+        assert!(
+            challenge.contains(&format!(
+                "resource_metadata=\"{}\"",
+                discovery.protected_resource_url()
+            )),
+            "{challenge}"
+        );
     }
 
     // ── TMOD-01: hot-swappable ArcSwap tool registry ────────────────────────
@@ -2840,6 +3584,8 @@ mod tests {
             mesh_pool: None,
             principal_resolver,
             broker_routes: crate::broker::routes::RouteTable::new(),
+            rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         })
     }
 
@@ -3013,6 +3759,8 @@ mod tests {
             mesh_pool: Some(Arc::new(mesh_pool)),
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
+            rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         })
     }
 

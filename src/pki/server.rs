@@ -90,6 +90,28 @@ pub struct GatewayServerConfig {
     /// when the feature is enabled -- `None` (this field's default posture)
     /// when it isn't, byte-for-byte the pre-MESH-15 behavior.
     pub mesh_pool: Option<Arc<crate::mesh::UpstreamPool>>,
+    /// RMCP-02: when `Some`, the OAuth discovery documents are mounted and an
+    /// unauthenticated `/mcp` returns the `WWW-Authenticate` challenge that
+    /// points at them — see `crate::mcp_server::McpServerState::rmcp_discovery`.
+    ///
+    /// The value is built and VALIDATED in each binary's `main()`
+    /// (`crate::oauth::metadata::Discovery::from_env`), not here, and a
+    /// malformed configuration aborts startup there. That placement is
+    /// deliberate and differs from the `principal_resolver` degrade-and-log
+    /// policy a few lines below in [`build_gateway_router`], for a reason
+    /// specific to this surface: a wrong canonical connector URI does not fail
+    /// on THIS side at all. It produces a discovery document a client happily
+    /// fetches and then a token-audience mismatch whose client-visible symptom
+    /// ("couldn't reach the MCP server") names neither the field nor the
+    /// server. There is no safe default to degrade to, so it must not start.
+    pub rmcp_discovery: Option<Arc<crate::oauth::metadata::Discovery>>,
+    /// RMCP-02: which OAuth surfaces this process serves — see
+    /// `crate::mcp_server::McpServerState::oauth_doors`. `terminus_primary`
+    /// passes `OauthDoors::detect_from_env()`; `terminus_personal` passes
+    /// `OauthDoors::none()`, because it is not an internet-facing binary and
+    /// must keep its existing tokenless-loopback posture even on a host whose
+    /// environment carries the authorization server's settings.
+    pub oauth_doors: crate::oauth::metadata::OauthDoors,
 }
 
 /// Manual `Debug` (rather than `#[derive(Debug)]` on the struct): every
@@ -111,6 +133,11 @@ impl std::fmt::Debug for GatewayServerConfig {
             .field("inference_proxy", &self.inference_proxy.is_some())
             .field("gateway", &self.gateway.is_some())
             .field("mesh_pool_upstreams", &self.mesh_pool.as_ref().map(|p| p.len()))
+            // Presence only. The canonical connector URI is not a secret, but a
+            // `Debug` line is not where an operator should read configuration.
+            .field("rmcp_discovery", &self.rmcp_discovery.is_some())
+            // Names only, never values — one of them is a signing key.
+            .field("oauth_doors", &self.oauth_doors.describe())
             .finish()
     }
 }
@@ -169,6 +196,11 @@ pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig
         // nothing on a live path installs a route yet (TMOD-05's worker
         // onboarding scope), so this is behavior-preserving.
         broker_routes: crate::broker::routes::RouteTable::new(),
+        // RMCP-02: passed straight through from the caller's already-validated
+        // config -- see `GatewayServerConfig::rmcp_discovery`'s doc for why the
+        // validation lives in `main()` rather than here.
+        rmcp_discovery: config.rmcp_discovery.clone(),
+        oauth_doors: config.oauth_doors.clone(),
     });
 
     // TMOD-05: the admin control plane (`/admin/workers*`) is merged in
@@ -280,6 +312,8 @@ mod tests {
             inference_proxy: None,
             gateway: None,
             mesh_pool: None,
+            rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         }
     }
 

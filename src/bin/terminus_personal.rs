@@ -339,6 +339,18 @@ async fn main() {
         // item deliberately does not touch terminus_personal) -- always
         // `None` here.
         mesh_pool: None,
+        // RMCP-02: the OAuth connector door is a terminus_primary concern, for
+        // the same reason `gateway` and `mesh_pool` above are — it is the
+        // internet-facing gateway. Wiring it here too would put an
+        // externally-advertised discovery surface on a binary that has no
+        // gateway pipeline in front of it, which is the wrong default even
+        // though this item mounts nothing but public documents.
+        rmcp_discovery: None,
+        // RMCP-02: never detected from the environment here. This binary is not
+        // internet-facing, and narrowing its tokenless-loopback posture merely
+        // because the host also runs the authorization server would break it
+        // for no security gain — its callers arrive over loopback or mTLS.
+        oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
     };
 
     // TCLI-02: the enrollment endpoint is a fully separate, additive router

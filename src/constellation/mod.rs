@@ -410,6 +410,8 @@ mod tests {
             mesh_pool: None,
             principal_resolver: crate::mesh::PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
+            rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         })
     }
 
