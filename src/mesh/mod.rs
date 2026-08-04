@@ -100,7 +100,10 @@ pub use onboarding::{
     TrustStatus,
 };
 pub use person::{AssertedPerson, PersonAssertionError, VerifiedPerson};
-pub use principal::{AuthError, Principal, PrincipalMap, PrincipalResolver, PrincipalSource};
+pub use principal::{
+    AuthError, CallerBinding, OauthAccount, Principal, PrincipalMap, PrincipalResolver,
+    PrincipalSource,
+};
 pub use registry::{
     MeshConfigError, ResolvedSecret, UpstreamRegistry, UpstreamServer, UpstreamTransport,
 };

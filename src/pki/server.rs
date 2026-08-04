@@ -112,6 +112,19 @@ pub struct GatewayServerConfig {
     /// must keep its existing tokenless-loopback posture even on a host whose
     /// environment carries the authorization server's settings.
     pub oauth_doors: crate::oauth::metadata::OauthDoors,
+    /// RMCP-05: when `Some`, `/mcp` accepts an OAuth 2.1 bearer token as a
+    /// fourth identity source — see `crate::oauth::resource`'s module doc.
+    /// `None` (the default, and what `terminus_personal` passes) means the
+    /// door does not exist: no token is inspected and no challenge is emitted,
+    /// byte-for-byte the pre-RMCP-05 behaviour.
+    ///
+    /// Built by [`crate::oauth::resource::resource_server_from_env`] in the
+    /// binary's `main`, NOT here. That split is the point: this struct carries
+    /// an already-valid door, so there is exactly one place the door's
+    /// configuration is read and exactly one place a misconfiguration can
+    /// abort — and no path by which an enabled-but-broken door degrades to a
+    /// silently closed one on its way through this function.
+    pub oauth_resource: Option<Arc<crate::oauth::resource::OauthResourceServer>>,
 }
 
 /// Manual `Debug` (rather than `#[derive(Debug)]` on the struct): every
@@ -138,6 +151,9 @@ impl std::fmt::Debug for GatewayServerConfig {
             .field("rmcp_discovery", &self.rmcp_discovery.is_some())
             // Names only, never values — one of them is a signing key.
             .field("oauth_doors", &self.oauth_doors.describe())
+            // Presence only: the resource server holds HMAC key material and a
+            // live pool, neither of which belongs in a debug dump.
+            .field("oauth_resource", &self.oauth_resource.is_some())
             .finish()
     }
 }
@@ -201,6 +217,12 @@ pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig
         // validation lives in `main()` rather than here.
         rmcp_discovery: config.rmcp_discovery.clone(),
         oauth_doors: config.oauth_doors.clone(),
+        // RMCP-05: pass through the door the caller's `main` already built and
+        // validated. Nothing is read from the environment here, so this
+        // function keeps its documented degrade-and-log policy for the config
+        // it DOES read (the principal resolver above) while the one thing that
+        // must abort a process aborts in the process's own `main` instead.
+        oauth_resource: config.oauth_resource.clone(),
     });
 
     // TMOD-05: the admin control plane (`/admin/workers*`) is merged in
@@ -314,7 +336,128 @@ mod tests {
             mesh_pool: None,
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         }
+    }
+
+    /// RMCP-05, review round 2: a configured OAuth door must actually REACH
+    /// the live request path.
+    ///
+    /// The bug this guards against is not a wrong answer, it is no answer:
+    /// `oauth_resource` was hardcoded `None` here, so every line of the
+    /// validator was unreachable outside its own unit tests and an operator
+    /// would have seen a connector that silently never linked. So this asserts
+    /// the observable consequence at the ROUTER — the only place that proves
+    /// config → `McpServerState` → `handle_mcp` is joined up — rather than
+    /// inspecting the struct, which would have passed even while the handler
+    /// ignored the field.
+    ///
+    /// A `WWW-Authenticate` challenge is the tell: nothing but a constructed
+    /// resource server can emit one.
+    #[tokio::test]
+    async fn a_configured_oauth_door_is_reachable_through_the_built_router() {
+        use crate::oauth::resource::{OauthResourceServer, ResourceServerConfig, TokenState};
+
+        struct NeverAsked;
+        #[async_trait::async_trait]
+        impl TokenState for NeverAsked {
+            async fn active_client_row(&self, _: &str) -> Result<Option<uuid::Uuid>, crate::error::ToolError> {
+                Ok(None)
+            }
+            async fn active_account_name(&self, _: uuid::Uuid) -> Result<Option<String>, crate::error::ToolError> {
+                Ok(None)
+            }
+            async fn consent_is_live(&self, _: uuid::Uuid, _: uuid::Uuid) -> Result<bool, crate::error::ToolError> {
+                Ok(false)
+            }
+            async fn any_session_is_live(&self, _: uuid::Uuid, _: uuid::Uuid) -> Result<bool, crate::error::ToolError> {
+                Ok(false)
+            }
+        }
+
+        // pii-test-fixture: invented connector URIs and an invented HMAC key.
+        let signer = crate::oauth::jwt::JwtSigner::new(
+            "pki-server-test-signing-key-32-bytes++".to_string(), // pii-test-fixture
+            None,
+            "https://connector.example.test".to_string(), // pii-test-fixture
+            900,
+            30,
+        )
+        .expect("valid signer");
+        let oauth_config = ResourceServerConfig::new(
+            "https://connector.example.test/mcp", // pii-test-fixture
+            signer,
+        )
+        .expect("valid resource-server config");
+
+        let mut config = test_config(0);
+        config.oauth_resource = Some(Arc::new(OauthResourceServer::with_state(
+            oauth_config,
+            Arc::new(NeverAsked),
+        )));
+
+        let router = build_gateway_router(ToolRegistry::new(), &config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/mcp"))
+            .header("authorization", "Bearer not.a.real.token") // pii-test-fixture: invented token
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+            .send()
+            .await
+            .expect("request should reach the server");
+
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "a configured door must VALIDATE the bearer token, not ignore it"
+        );
+        let challenge = resp
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            challenge.contains("resource_metadata="),
+            "the challenge proves a real resource server was constructed and wired: {challenge:?}"
+        );
+    }
+
+    /// The other half of the same proof, and the reason the assertion above is
+    /// meaningful: with NO door configured, the identical request is not
+    /// challenged at all. Without this control the test above would pass on any
+    /// build that 401'd bearer tokens for some unrelated reason.
+    #[tokio::test]
+    async fn no_oauth_door_configured_means_no_token_is_inspected() {
+        let config = test_config(0); // oauth_resource: None
+        let router = build_gateway_router(ToolRegistry::new(), &config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/mcp"))
+            .header("authorization", "Bearer not.a.real.token") // pii-test-fixture: invented token
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+            .send()
+            .await
+            .expect("request should reach the server");
+
+        assert!(
+            resp.status().is_success(),
+            "with the door closed the pre-RMCP-05 behaviour is unchanged: the token is not \
+             inspected and the request is served, got {}",
+            resp.status()
+        );
+        assert!(resp.headers().get("www-authenticate").is_none());
     }
 
     /// `build_gateway_router` is independently unit-testable: it must not

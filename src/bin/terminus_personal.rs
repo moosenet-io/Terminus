@@ -351,6 +351,11 @@ async fn main() {
         // because the host also runs the authorization server would break it
         // for no security gain — its callers arrive over loopback or mTLS.
         oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
+        // RMCP-05: the OAuth connector door is a gateway-only concern, exactly
+        // as `gateway`/`mesh_pool` above are. This binary is not
+        // internet-facing and has no OAuth store, so the door does not exist
+        // here and no bearer token is ever inspected.
+        oauth_resource: None,
     };
 
     // TCLI-02: the enrollment endpoint is a fully separate, additive router

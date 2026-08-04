@@ -3027,6 +3027,98 @@ mod tests {
         );
     }
 
+    /// RMCP-05: an OAuth-sourced principal gets its entitlements from the SAME
+    /// grant map as any other, and gets NOTHING for having come through the
+    /// OAuth door.
+    ///
+    /// # Why the proof is a test rather than a code change
+    ///
+    /// Review round 1 asked whether "we changed nothing, therefore nothing
+    /// changed" is adequate evidence. It is the right DECISION and the wrong
+    /// KIND of evidence, so the evidence is strengthened here instead.
+    ///
+    /// The alternative — a branch in this module that recognises
+    /// `PrincipalSource::OAuth` — would be strictly worse whatever it did with
+    /// it, because its mere existence is the thing the item forbids: a second
+    /// place where entitlement depends on how a caller authenticated rather
+    /// than on what they were granted. There would then be two answers to "may
+    /// this caller read the operator's calendar", and the seam between them is
+    /// the bug. So the correct implementation is genuinely the empty diff, and
+    /// what has to be demonstrated is the CONSEQUENCE: that the source is inert.
+    ///
+    /// A structural claim ("no code reads the source") cannot be asserted at
+    /// runtime; an observational one can, and it is what actually protects the
+    /// property, because it also fails if some future change makes the source
+    /// matter indirectly — through the media account map, the person scope, or
+    /// anything else reachable from `caller_context`. Hence: compare the WHOLE
+    /// `CallerContext` (every entitlement flag, the media account, and the
+    /// person scope), field by field as well as by value, in both the entitled
+    /// and unentitled direction. A branch that widened the new door breaks the
+    /// entitled half; one that clamped it breaks the unentitled half.
+    #[test]
+    fn rmcp05_an_oauth_sourced_principal_is_entitled_exactly_as_a_cert_sourced_one() {
+        fn oauth_identity(s: &str) -> Principal {
+            Principal::new(s, crate::mesh::PrincipalSource::OAuth).with_oauth_account("some-account")
+        }
+
+        /// Every observable on the type, compared one by one — so a failure
+        /// names the field that diverged instead of just "the values differ",
+        /// and so adding a field to `CallerContext` without adding it here is
+        /// visible as an omission rather than silently uncovered.
+        fn assert_same_surface(label: &str, a: crate::tool::CallerContext, b: crate::tool::CallerContext) {
+            assert_eq!(a.may_infer_from_calendar(), b.may_infer_from_calendar(), "{label}: calendar");
+            assert_eq!(a.may_infer_from_routine(), b.may_infer_from_routine(), "{label}: routine");
+            assert_eq!(a.media_account(), b.media_account(), "{label}: media account");
+            assert_eq!(a.person_scope(), b.person_scope(), "{label}: person scope");
+            assert_eq!(a.person(), b.person(), "{label}: person");
+            // And by value, which catches any field this function forgot.
+            assert_eq!(a, b, "{label}: whole context");
+        }
+
+        // ── Entitled: the source must not clamp. ─────────────────────────
+        let fw = framework_with(AllowlistPolicy::new(scaffold_defaults()), 10);
+        let via_oauth = fw.caller_context(Some(&oauth_identity("lumina")));
+        let via_cert = fw.caller_context(Some(&identity("lumina")));
+        assert_same_surface("entitled", via_oauth, via_cert);
+        // Positive control: the shared value is the ENTITLED one, so this
+        // cannot pass by both sides being fail-closed.
+        assert_ne!(via_oauth, crate::tool::CallerContext::untrusted());
+        assert!(via_oauth.may_infer_from_calendar() && via_oauth.may_infer_from_routine());
+
+        // ── Unentitled: the source must not widen. ───────────────────────
+        let guest_fw = framework_with(guest_policy(), 10);
+        assert_same_surface(
+            "guest",
+            guest_fw.caller_context(Some(&oauth_identity("guest-relative"))),
+            guest_fw.caller_context(Some(&identity("guest-relative"))),
+        );
+        assert_eq!(
+            guest_fw.caller_context(Some(&oauth_identity("guest-relative"))),
+            crate::tool::CallerContext::untrusted()
+        );
+
+        // ── Unmapped: an OAuth principal nobody granted anything is still
+        // nobody, exactly as an unknown cert principal is. ────────────────
+        assert_same_surface(
+            "never-enrolled",
+            fw.caller_context(Some(&oauth_identity("never-enrolled"))),
+            fw.caller_context(Some(&identity("never-enrolled"))),
+        );
+
+        // ── And the person-scoped path, which is the one place a future
+        // change could make the source matter indirectly. ─────────────────
+        for asserted in [
+            crate::mesh::AssertedPerson::None,
+            crate::mesh::AssertedPerson::Rejected,
+        ] {
+            assert_same_surface(
+                "person-scoped",
+                fw.caller_context_for_person(Some(&oauth_identity("lumina")), &asserted),
+                fw.caller_context_for_person(Some(&identity("lumina")), &asserted),
+            );
+        }
+    }
+
     /// A guest holds no admin power, by the same kind-aware rule that stops a
     /// broad tool identity escalating (TMOD-05) — nothing in the baseline is
     /// admin-namespaced.

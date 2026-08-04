@@ -460,6 +460,7 @@ mod tests {
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         })
     }
 

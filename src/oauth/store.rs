@@ -159,6 +159,30 @@ impl OauthStore {
         .map_err(db)
     }
 
+    /// Look up an account by its row id. `None` for unknown OR disabled — same
+    /// collapsing, and the same anti-oracle reasoning, as
+    /// [`Self::find_active_account_by_name`].
+    ///
+    /// RMCP-05 needs this because an access token carries the account UUID in
+    /// `sub` while the operator-authored principal map is keyed on the account
+    /// NAME. Resolving one to the other per request is what keeps the
+    /// authorization key coming from the database rather than from the
+    /// credential: a renamed or disabled account cannot be outlived by a token
+    /// still carrying its old identity.
+    pub async fn find_active_account_by_id(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<Account>, ToolError> {
+        sqlx::query_as::<_, Account>(
+            "SELECT id, name, password_hash, totp_secret_enc, disabled, created_at, updated_at \
+             FROM rmcp_account WHERE id = $1 AND NOT disabled",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)
+    }
+
     /// Whether an account exists and is not disabled.
     ///
     /// Exists for the token endpoint (RMCP-04), which holds an account UUID
@@ -881,6 +905,67 @@ impl OauthStore {
     /// Revoke every token in a family. The response to a detected reuse: the
     /// legitimate holder and the thief cannot be told apart, so both are cut
     /// off and the human re-authorizes.
+    /// Whether the (account, client) pair has ANY live session, for the
+    /// per-request check on the RESOURCE-SERVER dispatch path (RMCP-05).
+    ///
+    /// ## Read the name literally — this is NOT per-session
+    /// It answers a question about the PAIR, not about the session the
+    /// presented token belongs to, and the difference is a real gap rather than
+    /// a rounding error:
+    ///
+    /// - Revoking EVERY session for the pair (what consent revocation and
+    ///   client disablement do) ⇒ this returns `false` ⇒ the next dispatch is
+    ///   denied. That is the case this check enforces.
+    /// - Revoking ONE session while another is still active ⇒ this returns
+    ///   `true`, and **an access token minted for the revoked session is still
+    ///   accepted** until it expires.
+    ///
+    /// An earlier revision of this comment called that "coarser but never
+    /// wider", on the grounds that it can only deny what a family-precise check
+    /// would also deny. That reasoning is wrong and worth naming so it is not
+    /// reintroduced: denying LESS is permitting MORE, which on the security
+    /// axis is WIDER, not narrower. This check is the permissive direction, and
+    /// the gap above is its cost.
+    ///
+    /// ## Why it is not per-session today
+    /// Not a design preference — there is nothing to key on. An access token
+    /// carries `iss`, `sub`, `aud`, `client_id`, `scope`, `jti`, `exp`, `iat`
+    /// and `nbf`, and none of them identifies a session: `sub` is the account,
+    /// `client_id` is the client, and the `jti` is generated at mint time and
+    /// persisted nowhere — this schema has no access-token table at all.
+    /// Relating `iat` to a refresh row would be a guess, because families
+    /// overlap in time and rotation moves the rows.
+    ///
+    /// **TERM #635 is the blocker.** Closing it means putting the family id in
+    /// the access token; the family is already in scope at both mint sites in
+    /// `crate::oauth::token`, so it is a claim away. Until then, per-session
+    /// revocation at dispatch is not expressible and must not be claimed.
+    ///
+    /// The rule, exactly: no refresh rows for the pair ⇒ live (a client that
+    /// never asked for `offline_access` has no sessions, and denying it would
+    /// break every non-offline connector); at least one row unrevoked and
+    /// unexpired ⇒ live; rows exist and all are revoked or expired ⇒ not live.
+    pub async fn any_session_is_live(
+        &self,
+        account_id: Uuid,
+        client_id: Uuid,
+    ) -> Result<bool, ToolError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT NOT EXISTS ( \
+                 SELECT 1 FROM rmcp_refresh_token WHERE account_id = $1 AND client_id = $2 \
+             ) OR EXISTS ( \
+                 SELECT 1 FROM rmcp_refresh_token \
+                 WHERE account_id = $1 AND client_id = $2 \
+                   AND revoked_at IS NULL AND expires_at > now() \
+             )",
+        )
+        .bind(account_id)
+        .bind(client_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)
+    }
+
     pub async fn revoke_refresh_family(&self, family_id: Uuid) -> Result<u64, ToolError> {
         sqlx::query(
             "UPDATE rmcp_refresh_token SET revoked_at = now() \

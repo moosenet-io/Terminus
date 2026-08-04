@@ -296,6 +296,34 @@ async fn main() {
             if discovery.dcr_enabled() { "enabled" } else { "disabled" },
         );
     }
+    // RMCP-05: build the OAuth connector door, if the operator opened it.
+    //
+    // Same refuse-to-boot posture as the availability map above, and for the
+    // same reason: once `RMCP_OAUTH_ENABLED` is set, a door that cannot be
+    // built must stop this process rather than leave it running with the door
+    // silently shut. A closed-but-believed-open door produces no error
+    // anywhere — the connector simply never links, and there is nothing in any
+    // log to grep for, because the code that would have complained is never
+    // reached. Refusing to start says it in one line, at deploy, to the
+    // operator who just changed the configuration.
+    //
+    // With the flag unset this is `Ok(None)` and nothing else is read, so a
+    // host that has not opted in cannot be stopped from starting by this item.
+    let oauth_resource = match terminus_rs::oauth::resource::resource_server_from_env().await {
+        Ok(door) => door,
+        Err(e) => {
+            eprintln!("FATAL: {e}");
+            eprintln!(
+                "Refusing to start: {} is set, so the OAuth connector door must be fully \
+                 configured and reachable. Starting without it would leave an internet-facing \
+                 door that looks configured, accepts nothing, and logs nothing. Fix the \
+                 configuration or unset {} and restart.",
+                terminus_rs::oauth::resource::ENABLED_ENV,
+                terminus_rs::oauth::resource::ENABLED_ENV
+            );
+            std::process::exit(1);
+        }
+    };
 
     let gateway_config = GatewayServerConfig {
         server_name: "terminus-primary".to_string(),
@@ -310,6 +338,7 @@ async fn main() {
         mesh_pool: mesh_pool.clone(),
         rmcp_discovery: rmcp_discovery.map(std::sync::Arc::new),
         oauth_doors: oauth_doors.clone(),
+        oauth_resource,
     };
 
     // Same shared setup `terminus_personal` uses (TGW-01 extraction, see
@@ -530,6 +559,7 @@ mod tests {
             mesh_pool: None,
             rmcp_discovery: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         };
         build_gateway_router(registry, &config)
     }
@@ -556,6 +586,7 @@ mod tests {
             mesh_pool: None,
             rmcp_discovery: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         };
         build_gateway_router(registry, &config)
     }
@@ -580,6 +611,7 @@ mod tests {
             mesh_pool: None,
             rmcp_discovery: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         };
         build_gateway_router(registry, &config)
     }
@@ -606,6 +638,7 @@ mod tests {
             mesh_pool: None,
             rmcp_discovery: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         };
         build_gateway_router(registry, &config)
     }
@@ -757,6 +790,7 @@ mod tests {
             mesh_pool: None,
             rmcp_discovery: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         };
         let router = build_gateway_router(registry, &config);
         let body = post_mcp(
@@ -1094,6 +1128,7 @@ mod tests {
             mesh_pool: None,
             rmcp_discovery: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         };
         let router = build_gateway_router(registry, &config);
         let (status, _, _) = post_json(router, "/v1/chat/completions", json!({})).await;
