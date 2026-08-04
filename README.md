@@ -668,13 +668,30 @@ prefix, or `<namespace>::*` — with no regex (a regex authored by a delegated f
 is a denial-of-service on the dispatch path) and no negation (denial already has a layer,
 which composes on top and overrides unconditionally).
 
+Pattern shapes, and what each reaches:
+
+| pattern | reaches |
+|---|---|
+| `weather_now` | the LOCAL tool of that name |
+| `weather_*` | LOCAL tools with that prefix |
+| `peerhub::*` | every tool on the `peerhub` peer |
+| `peerhub::weather_now` | exactly one tool on `peerhub` |
+| `peerhub::weather_*` | tools on `peerhub` whose bare name has that prefix |
+| `*` | the whole merged catalog, bounded by the connector's allowed namespaces |
+
 **An unqualified pattern addresses the local namespace and nothing else.** `peer*` matches a
 local `peermetrics` but *not* `peerhub__alerts_list`, even though the advertised name starts
-with `peer` — reaching a federated tool requires an explicitly qualified `peerhub::*`.
-Absence of a qualifier means local-only, never "anything starting this way". The namespace
-dimension does not make this redundant: a connector legitimately scoped to `peerhub` passes
-the namespace check, and without the boundary rule an over-broad local prefix would hand it
-that server's entire catalog.
+with `peer` — reaching a federated tool requires an explicit qualifier. Absence of a
+qualifier means local-only, never "anything starting this way". The namespace dimension does
+not make this redundant: a connector legitimately scoped to `peerhub` passes the namespace
+check, and without the boundary rule an over-broad local prefix would hand it that server's
+entire catalog.
+
+**The qualifier is `::`, while advertised names separate with `__`,** and the difference is
+deliberate. `a__b__*` has two legitimate readings — namespace `a` with prefix `b__`, or
+namespace `a__b` — and settling that by fiat is a rule operators will get wrong in the other
+direction. `a::b__*` has exactly one reading, and as a direct consequence a bare tool name may
+contain `__` freely without becoming ambiguous.
 
 **"Only I can link my account" is enforced at consent, not at registration.** Possession of
 a `client_id` gets a caller as far as a login screen. Issuing a token needs an argon2id
