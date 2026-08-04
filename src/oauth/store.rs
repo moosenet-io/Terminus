@@ -107,6 +107,10 @@ impl OauthStore {
     /// possibility. Reporting it as a clear "unconfigured" at boot beats every
     /// endpoint failing later with an opaque `relation does not exist`.
     pub async fn schema_ready(&self) -> bool {
+        // Restricted to BASE TABLE: `information_schema.tables` also lists
+        // views, so without this a view named `rmcp_client` would report the
+        // schema ready with no migrated table behind it.
+        //
         // Checks ALL nine tables, not a sentinel one. Review round 1: probing a
         // single table reports "ready" for a partially applied migration —
         // precisely the state a half-finished deploy leaves behind, and the one
@@ -114,7 +118,8 @@ impl OauthStore {
         // one query at startup and makes a partial apply loud.
         let found = sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM information_schema.tables \
-             WHERE table_schema = current_schema() AND table_name = ANY($1)",
+             WHERE table_schema = current_schema() AND table_name = ANY($1) \
+               AND table_type = 'BASE TABLE'",
         )
         .bind(REQUIRED_TABLES.iter().map(|t| t.to_string()).collect::<Vec<_>>())
         .fetch_one(&self.pool)
@@ -363,32 +368,41 @@ impl OauthStore {
     ) -> Result<(), ToolError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
 
-        let owns_client = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM rmcp_client WHERE id = $1 AND owner_account_id = $2)",
+        // `FOR SHARE` locks the client row for the rest of the transaction, so
+        // its ownership cannot be reassigned between this check and the write.
+        // Without it the check is a TOCTOU: a concurrent transfer could land in
+        // the gap and the write would proceed on stale authority.
+        let owns_client = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM rmcp_client WHERE id = $1 AND owner_account_id = $2 FOR SHARE",
         )
         .bind(client_id)
         .bind(actor_account_id)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(db)?;
+        .map_err(db)?
+        .is_some();
         if !owns_client {
             // Same answer for "no such client" and "not yours": distinguishing
             // them would confirm the existence of another account's client.
             return Err(ToolError::NotFound("no such client for this account".into()));
         }
 
-        // Every requested group must belong to the actor. Counting DISTINCT ids
-        // means a duplicate in the input cannot inflate the count past the
-        // check.
-        let owned_groups = sqlx::query_scalar::<_, i64>(
-            "SELECT count(DISTINCT id) FROM rmcp_tool_group \
-             WHERE id = ANY($1) AND owner_account_id = $2",
+        // Every requested group must belong to the actor, and each matching row
+        // is LOCKED for the rest of the transaction (`FOR SHARE`) so ownership
+        // cannot be reassigned underneath the write. An aggregate cannot be
+        // combined with a row lock, so the ids are selected and counted here
+        // rather than counted in SQL. Comparing against the DISTINCT input
+        // count means a duplicate in the input cannot inflate the match.
+        let owned_groups = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM rmcp_tool_group WHERE id = ANY($1) AND owner_account_id = $2 \
+             FOR SHARE",
         )
         .bind(group_ids)
         .bind(actor_account_id)
-        .fetch_one(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(db)?;
+        .map_err(db)?
+        .len() as i64;
         let requested = group_ids.iter().collect::<std::collections::HashSet<_>>().len() as i64;
         if owned_groups != requested {
             return Err(ToolError::InvalidArgument(
@@ -447,15 +461,20 @@ impl OauthStore {
             return Err(ToolError::NotFound("no such client for this account".into()));
         }
 
-        let owned_namespaces = sqlx::query_scalar::<_, i64>(
-            "SELECT count(DISTINCT namespace) FROM rmcp_server_owner \
-             WHERE namespace = ANY($1) AND owner_account_id = $2",
+        // Locked with `FOR SHARE` for the same reason as the client and group
+        // checks: `set_server_owner` could otherwise reassign a namespace
+        // between the check and the insert, letting the PREVIOUS owner attach a
+        // server they no longer own. Holding the lock to commit closes that.
+        let owned_namespaces = sqlx::query_scalar::<_, String>(
+            "SELECT namespace FROM rmcp_server_owner \
+             WHERE namespace = ANY($1) AND owner_account_id = $2 FOR SHARE",
         )
         .bind(namespaces)
         .bind(actor_account_id)
-        .fetch_one(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(db)?;
+        .map_err(db)?
+        .len() as i64;
         let requested = namespaces.iter().collect::<std::collections::HashSet<_>>().len() as i64;
         if owned_namespaces != requested {
             return Err(ToolError::InvalidArgument(
