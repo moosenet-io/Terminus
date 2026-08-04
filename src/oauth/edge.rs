@@ -1581,9 +1581,14 @@ mod tests {
             .route("/admin/workers", get(|| async { "workers" }))
     }
 
+    /// A negligible refill rate (not a fast one) so the budget tests are
+    /// deterministic: these requests drive a real router, and at any realistic
+    /// refill the bucket tops back up between calls, which makes a
+    /// rate-limit assertion pass or fail on scheduling luck rather than on
+    /// behavior. Same trick the gateway's own limiter tests use.
     fn edge_router(policy: Arc<EdgePolicy>, burst: u32) -> Router {
         let limiter = Arc::new(
-            crate::gateway_framework::rate_limit::InProcessRateLimiter::new(burst, 1000.0),
+            crate::gateway_framework::rate_limit::InProcessRateLimiter::new(burst, 0.0001),
         );
         build_edge_router(
             inner_router(),
