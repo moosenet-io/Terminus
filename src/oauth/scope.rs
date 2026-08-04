@@ -499,6 +499,21 @@ impl ClientScope {
         self.patterns.is_empty()
     }
 
+    /// A scope permitting the whole catalog, for tests in OTHER modules whose
+    /// subject is not the connector ceiling.
+    ///
+    /// `cfg(test)`-only and named so it cannot be mistaken for a production
+    /// constructor: there is no code path by which a real connector becomes
+    /// unrestricted without an operator writing a `*` group and owning it.
+    #[cfg(test)]
+    pub fn unrestricted_for_test(client_id: impl Into<String>) -> Self {
+        Self {
+            client_id: client_id.into(),
+            patterns: vec![ScopePattern::All],
+            namespaces: BTreeSet::new(),
+        }
+    }
+
     /// The namespaces this client may see. Test/diagnostic accessor.
     pub fn namespaces(&self) -> &BTreeSet<String> {
         &self.namespaces
@@ -1222,6 +1237,32 @@ impl ScopeResolver {
         let result = self.store.set_client_disabled(client_uuid, disabled).await;
         self.invalidate(client);
         result
+    }
+}
+
+/// The connector scope for a `client_id`, as `crate::mcp_server` needs it.
+///
+/// A trait rather than a direct [`ScopeResolver`] for the same reason
+/// [`crate::oauth::resource::TokenState`] is one, and stated there: this crate
+/// stands up no Postgres in tests, so a concrete store on the request path
+/// would make the end-to-end behaviour of the scoping gate assertable only by
+/// reading the code — which, for the control that decides what an
+/// internet-facing connector may reach, is not good enough.
+///
+/// Production is [`ScopeResolver`]. There is deliberately no default
+/// implementation and no blanket impl: a type that cannot answer this question
+/// must not silently answer it permissively.
+#[async_trait::async_trait]
+pub trait ClientScopeSource: Send + Sync {
+    /// The scope for `client_id`. Infallible by contract — every failure is the
+    /// EMPTY scope, never an error the caller might mishandle into a permit.
+    async fn scope_for(&self, client_id: &str) -> Arc<ClientScope>;
+}
+
+#[async_trait::async_trait]
+impl ClientScopeSource for ScopeResolver {
+    async fn scope_for(&self, client_id: &str) -> Arc<ClientScope> {
+        self.resolve(client_id).await
     }
 }
 

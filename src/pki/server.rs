@@ -128,7 +128,7 @@ pub struct GatewayServerConfig {
 
     /// RMCP-07: the connector-scope resolver, passed through the same way and
     /// for the same reason as `oauth_resource` above.
-    pub scope_resolver: Option<Arc<crate::oauth::scope::ScopeResolver>>,
+    pub scope_resolver: Option<Arc<dyn crate::oauth::scope::ClientScopeSource>>,
 }
 
 /// Manual `Debug` (rather than `#[derive(Debug)]` on the struct): every

@@ -280,7 +280,7 @@ pub struct McpServerState {
     /// a request that carries a connector while this is `None` is refused
     /// rather than let through — see `handle_mcp`. A missing resolver is a
     /// configuration fault, and the fail-closed reading of a fault is denial.
-    pub scope_resolver: Option<Arc<crate::oauth::scope::ScopeResolver>>,
+    pub scope_resolver: Option<Arc<dyn crate::oauth::scope::ClientScopeSource>>,
 }
 
 impl McpServerState {
@@ -1435,7 +1435,7 @@ async fn handle_mcp(
         match binding.oauth_client_id() {
             None => None,
             Some(client_id) => Some(match &state.scope_resolver {
-                Some(resolver) => resolver.resolve(client_id).await,
+                Some(resolver) => resolver.scope_for(client_id).await,
                 // A connector arrived but nothing can resolve what it may
                 // reach. That is a misconfiguration, and the only safe reading
                 // of it is the empty scope — never "unscoped, therefore
@@ -4483,8 +4483,33 @@ mod tests {
         .expect("mint")
     }
 
+    /// A scope source that grants every connector the whole catalog.
+    ///
+    /// RMCP-05's tests are about IDENTITY — that a token maps to its account's
+    /// principal, and that the connector is a ceiling rather than an identity.
+    /// With RMCP-07's connector ceiling now wired in, those tests would fail
+    /// for a reason they are not about (an unscoped connector reaches nothing),
+    /// and weakening their assertions to accommodate that would gut the guards
+    /// they exist to be. Giving them a fully-scoped connector keeps each test
+    /// testing its own property. RMCP-07's own behaviour — including the
+    /// fail-closed default when no source is configured — has its own tests.
+    struct ScopeSourceAllowingEverything;
+
+    #[async_trait::async_trait]
+    impl crate::oauth::scope::ClientScopeSource for ScopeSourceAllowingEverything {
+        async fn scope_for(&self, client_id: &str) -> Arc<crate::oauth::scope::ClientScope> {
+            Arc::new(crate::oauth::scope::ClientScope::unrestricted_for_test(client_id))
+        }
+    }
+
     fn state_with_oauth(gateway: GatewayFramework) -> Arc<McpServerState> {
         state_with_oauth_and_discovery(gateway, None)
+    }
+
+    /// The same OAuth state with NO scope source configured — the fail-closed
+    /// deployment case RMCP-07 must refuse rather than let through.
+    fn state_with_oauth_unscoped(gateway: GatewayFramework) -> Arc<McpServerState> {
+        state_with_oauth_scoped(gateway, None, None)
     }
 
     /// As above, plus RMCP-02's discovery surface — which is what gives a `401`
@@ -4492,6 +4517,14 @@ mod tests {
     fn state_with_oauth_and_discovery(
         gateway: GatewayFramework,
         discovery: Option<crate::oauth::metadata::Discovery>,
+    ) -> Arc<McpServerState> {
+        state_with_oauth_scoped(gateway, discovery, Some(Arc::new(ScopeSourceAllowingEverything)))
+    }
+
+    fn state_with_oauth_scoped(
+        gateway: GatewayFramework,
+        discovery: Option<crate::oauth::metadata::Discovery>,
+        scope_resolver: Option<Arc<dyn crate::oauth::scope::ClientScopeSource>>,
     ) -> Arc<McpServerState> {
         let resolver = PrincipalResolver::new(
             serde_json::from_value::<PrincipalMap>(json!({
@@ -4526,7 +4559,7 @@ mod tests {
                 doors
             },
             oauth_resource: Some(oauth_server()),
-            scope_resolver: None,
+            scope_resolver,
         })
     }
 
@@ -4590,6 +4623,40 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["result"]["isError"], false, "mapped OAuth principal must be granted: {body}");
+    }
+
+    /// RMCP-07: an OAuth caller reaching a process with NO scope source
+    /// configured is REFUSED, not let through on its account grant alone.
+    ///
+    /// This is a deliberate behaviour change to what RMCP-05 shipped, and the
+    /// reasoning is the item's premise: an internet-facing door onto the whole
+    /// fleet catalog is only safe if the door is narrower than the room behind
+    /// it. A process that cannot read a connector's ceiling does not know how
+    /// narrow the door is, and "unknown" resolves to denied everywhere else in
+    /// this module. Falling back to the account grant would make a missing
+    /// config field silently produce the unscoped door this item exists to
+    /// prevent.
+    ///
+    /// The identical request succeeds in the test above, whose state HAS a
+    /// scope source — so this pins the fail-closed default rather than some
+    /// unrelated denial.
+    #[tokio::test]
+    async fn rmcp07_an_oauth_caller_is_refused_when_no_scope_source_is_configured() {
+        let router = build_router(state_with_oauth_unscoped(gateway_allowing("lumina", &["health"])));
+        let auth = bearer_header(&oauth_token());
+        let (status, body, _) = post_mcp_to(
+            router,
+            "/mcp",
+            health_call(72),
+            None,
+            &[("authorization", auth.as_str())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["result"]["isError"], true,
+            "a connector whose ceiling cannot be read must reach nothing: {body}"
+        );
     }
 
     /// FINDING 3, the half that proves the connector is NOT the identity.
