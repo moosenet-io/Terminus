@@ -263,7 +263,7 @@ impl OauthStore {
         owner_account_id: Uuid,
         registration_source: &str,
     ) -> Result<Uuid, ToolError> {
-        sqlx::query_scalar::<_, Uuid>(
+        let result = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO rmcp_client (client_id, client_secret_hash, name, redirect_uris, \
                                       grant_types, token_endpoint_auth_method, \
                                       owner_account_id, registration_source) \
@@ -279,7 +279,8 @@ impl OauthStore {
         .bind(registration_source)
         .fetch_one(&self.pool)
         .await
-        .map_err(unique_aware("a client with that client_id already exists"))
+        .map_err(unique_aware("a client with that client_id already exists"));
+        scope_write(result)
     }
 
     /// List the clients an account owns.
@@ -316,20 +317,23 @@ impl OauthStore {
             .map(|_| ())
             .map_err(db);
         // Disabling is the fastest revocation an operator has; it must not wait
-        // out a resolver's cache TTL. See `bump_scope_generation`.
-        crate::oauth::scope::bump_scope_generation();
-        result
+        // out a resolver's cache TTL.
+        scope_write(result)
     }
 
     // -----------------------------------------------------------------------
     // Tool groups and client scoping
     //
-    // INVARIANT for anything added below: every write that can NARROW what a
-    // connector reaches must call `crate::oauth::scope::bump_scope_generation()`
-    // before returning. That call — not any caller's discipline — is what
-    // invalidates RMCP-07's resolution cache, including resolutions already in
-    // flight. Omitting it on a new write leaves a revoked permission usable and
-    // nothing in the system will report it. See that function's docs.
+    // INVARIANT: every write touching a table in
+    // `crate::oauth::scope::SCOPE_AFFECTING_TABLES` returns through
+    // `scope_write`, which invalidates RMCP-07's resolution cache — including
+    // resolutions already in flight.
+    //
+    // This is ENFORCED, not merely stated: `every_scope_affecting_write_bumps_
+    // the_generation` reads this file's own source and fails if a mutation of
+    // one of those tables ever appears in a function that does not go through
+    // the chokepoint. Add a group-pattern edit, a client-scope delete, or any
+    // future mutation without it and the build goes red naming the function.
     // -----------------------------------------------------------------------
 
     /// Insert a tool group. An empty `patterns` slice is permitted and stores a
@@ -342,7 +346,7 @@ impl OauthStore {
         patterns: &[String],
         owner_account_id: Uuid,
     ) -> Result<Uuid, ToolError> {
-        sqlx::query_scalar::<_, Uuid>(
+        let result = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO rmcp_tool_group (name, description, patterns, owner_account_id) \
              VALUES ($1, $2, $3, $4) RETURNING id",
         )
@@ -352,7 +356,8 @@ impl OauthStore {
         .bind(owner_account_id)
         .fetch_one(&self.pool)
         .await
-        .map_err(unique_aware("a tool group with that name already exists"))
+        .map_err(unique_aware("a tool group with that name already exists"));
+        scope_write(result)
     }
 
     /// The groups a client draws on.
@@ -526,13 +531,11 @@ impl OauthStore {
             .await
             .map_err(db)?;
         }
-        let committed = tx.commit().await.map_err(db);
-        // Bumped on the ERROR path too: a commit that failed to report is not a
-        // commit that provably did not happen, and an unnecessary invalidation
-        // costs one store read while a missed one leaves a revoked permission
-        // live. See `crate::oauth::scope::bump_scope_generation`.
-        crate::oauth::scope::bump_scope_generation();
-        committed
+        // Invalidates on the ERROR path too: a commit that failed to report is
+        // not a commit that provably did not happen, and an unnecessary
+        // invalidation costs one store read while a missed one leaves a revoked
+        // permission live.
+        scope_write(tx.commit().await.map_err(db))
     }
 
     /// Replace a client's namespace assignments wholesale, after verifying that
@@ -606,13 +609,11 @@ impl OauthStore {
             .await
             .map_err(db)?;
         }
-        let committed = tx.commit().await.map_err(db);
-        // Bumped on the ERROR path too: a commit that failed to report is not a
-        // commit that provably did not happen, and an unnecessary invalidation
-        // costs one store read while a missed one leaves a revoked permission
-        // live. See `crate::oauth::scope::bump_scope_generation`.
-        crate::oauth::scope::bump_scope_generation();
-        committed
+        // Invalidates on the ERROR path too: a commit that failed to report is
+        // not a commit that provably did not happen, and an unnecessary
+        // invalidation costs one store read while a missed one leaves a revoked
+        // permission live.
+        scope_write(tx.commit().await.map_err(db))
     }
 
     // -----------------------------------------------------------------------
@@ -1166,8 +1167,7 @@ impl OauthStore {
         // A delegation change narrows an arbitrary number of clients at once —
         // `client_namespaces` re-joins ownership, so reassigning a namespace
         // silently strips it from every client the previous owner scoped to it.
-        crate::oauth::scope::bump_scope_generation();
-        result
+        scope_write(result)
     }
 
     /// The namespaces an account owns. Empty for an account that owns none —
@@ -1211,9 +1211,43 @@ impl OauthStore {
             .map_err(db);
         // The most narrowing write in the schema: clearing a delegation removes
         // that whole federated server from every client scoped to it.
-        crate::oauth::scope::bump_scope_generation();
-        result
+        scope_write(result)
     }
+}
+
+/// The single chokepoint every scope-affecting write returns through.
+///
+/// Invalidates RMCP-07's resolution cache and hands the outcome straight back,
+/// so a write method's tail becomes `scope_write(result)` instead of the
+/// three-line remember-to-invalidate dance that round 1 shipped and round 2
+/// found holes in.
+///
+/// ## Why a function plus a source guard, rather than a type
+/// The instinct is to make this impossible to skip with a type — a `#[must_use]`
+/// token threaded through every write. That does not actually work here: any
+/// in-crate caller can mint such a token and claim an invalidation it never
+/// performed, which is the same "a data-free token proves nothing" objection
+/// review round 5 raised against exactly that shape in
+/// [`OauthStore::set_client_tool_groups`]. It would look like enforcement and be
+/// documentation.
+///
+/// What genuinely enforces the rule is
+/// `every_scope_affecting_write_bumps_the_generation`, which reads this file's
+/// own source, finds every mutation of a table in
+/// [`crate::oauth::scope::SCOPE_AFFECTING_TABLES`], and fails if the enclosing
+/// function does not route through here. That catches a NEW write added by an
+/// author who never read this comment — which is the failure mode that matters,
+/// and the one a comment cannot address. It is the same self-scanning idiom the
+/// repo already uses for `no_pii_in_own_source_tree` and the hermeticity
+/// ratchet.
+///
+/// Invalidating slightly too often is free (one extra store read); invalidating
+/// too rarely leaves revoked authority usable. So the rule is keyed on the
+/// TABLE, not on a judgement about whether a particular write could narrow
+/// anything — a judgement is exactly what gets made wrong.
+fn scope_write<T>(outcome: T) -> T {
+    crate::oauth::scope::bump_scope_generation();
+    outcome
 }
 
 /// Map a sqlx error to a [`ToolError`] without leaking connection details.
@@ -1246,6 +1280,115 @@ fn unique_aware(conflict_message: &'static str) -> impl Fn(sqlx::Error) -> ToolE
 
 #[cfg(test)]
 mod tests {
+
+    /// **Enforces** the invariant that every mutation of a scope-affecting
+    /// table invalidates RMCP-07's resolution cache.
+    ///
+    /// Reads this file's own source, finds every `INSERT INTO` / `UPDATE` /
+    /// `DELETE FROM` against a table in
+    /// [`crate::oauth::scope::SCOPE_AFFECTING_TABLES`], and requires the
+    /// enclosing function to route through [`scope_write`].
+    ///
+    /// Round 2 of review found the hole this closes: round 1 covered the five
+    /// client-scoping writes but not the tool-group DEFINITION writes, even
+    /// though narrowing a group's patterns revokes tools from every client the
+    /// group is attached to. The residual was then handled by writing down an
+    /// obligation for RMCP-06 to honour — which is documentation wearing the
+    /// costume of a guard. This is the guard. A future group-pattern edit,
+    /// scope delete, or any mutation nobody has thought of yet fails HERE,
+    /// naming the function, rather than silently keeping a revoked permission
+    /// alive until a TTL expires.
+    ///
+    /// Uses `include_str!` rather than reading a path at runtime: it is
+    /// resolved at compile time, so the test needs no filesystem, no working
+    /// directory and no environment — it cannot drift from the file it guards.
+    #[test]
+    fn every_scope_affecting_write_bumps_the_generation() {
+        const SOURCE: &str = include_str!("store.rs");
+
+        // Stop before this module: its own fixtures and doc comments mention
+        // the very SQL shapes being scanned for.
+        let production = SOURCE
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(SOURCE);
+
+        // Split into top-level `impl` methods. A function owns every line from
+        // its signature to the next signature.
+        let mut current = "<file scope>";
+        let mut bodies: Vec<(&str, String)> = Vec::new();
+        for line in production.lines() {
+            let trimmed = line.trim_start();
+            let is_fn_decl = line.starts_with("    ")
+                && !line.starts_with("     ")
+                && (trimmed.starts_with("fn ")
+                    || trimmed.starts_with("pub fn ")
+                    || trimmed.starts_with("async fn ")
+                    || trimmed.starts_with("pub async fn ")
+                    || trimmed.starts_with("pub(crate) async fn ")
+                    || trimmed.starts_with("pub(crate) fn "));
+            if is_fn_decl {
+                let name = trimmed
+                    .rsplit_once("fn ")
+                    .map(|(_, rest)| rest.split(['(', '<', ' ']).next().unwrap_or(rest))
+                    .unwrap_or(trimmed);
+                current = name;
+                bodies.push((name, String::new()));
+            }
+            if bodies.is_empty() {
+                bodies.push((current, String::new()));
+            }
+            let last = bodies.last_mut().expect("seeded above");
+            last.1.push_str(line);
+            last.1.push('\n');
+        }
+
+        // A mutation is `<verb> <table>` once whitespace (including the `\`
+        // line continuations inside the SQL literals) is collapsed.
+        let verbs = ["INSERT INTO", "UPDATE", "DELETE FROM"];
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, body) in &bodies {
+            let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut mutated: Vec<&str> = Vec::new();
+            for table in crate::oauth::scope::SCOPE_AFFECTING_TABLES {
+                for verb in verbs {
+                    if flat.contains(&format!("{verb} {table}")) {
+                        mutated.push(table);
+                    }
+                }
+            }
+            if mutated.is_empty() {
+                continue;
+            }
+            if !body.contains("scope_write(") {
+                mutated.sort_unstable();
+                mutated.dedup();
+                offenders.push(format!("  {name}: mutates {mutated:?} without scope_write"));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "RMCP-07: {} function(s) mutate a scope-affecting table without invalidating the \
+             resolution cache. A cached connector scope would keep permitting the OLD answer \
+             until the TTL expired — narrowing a group's patterns or a client's scope is a \
+             REVOCATION and must take effect on the next call. Return the outcome through \
+             `scope_write(..)`:\n{}",
+            offenders.len(),
+            offenders.join("\n")
+        );
+
+        // The scanner must actually be looking at something — a refactor that
+        // broke the function splitting would otherwise pass vacuously.
+        let covered = bodies
+            .iter()
+            .filter(|(_, body)| body.contains("scope_write("))
+            .count();
+        assert!(
+            covered >= 7,
+            "expected the known scope-affecting writes to be found; saw {covered}"
+        );
+    }
     use super::*;
 
     /// The error mapper must not become a channel for the connection string.

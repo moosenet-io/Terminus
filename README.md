@@ -608,14 +608,22 @@ without guesswork:
 | `no_account_grant` | the process has no gateway configured, so there is no account grant to intersect with — a configuration fault, denied rather than permitted |
 
 **Revocation takes effect immediately, including mid-resolution.** Resolved scopes are
-cached, so the store's own narrowing writes — regrouping, re-scoping, disabling a client,
-and reassigning or clearing a namespace delegation — bump a process-wide *generation*
-counter from **inside the store**, not from a wrapper a caller has to remember to use. A
-resolution may only populate the cache at the generation it began at, so a read that started
-before a revocation cannot repopulate a stale permit after it. A short TTL remains only as a
-backstop for an out-of-process edit (an operator changing the tables by hand); it is not what
-makes revocation correct. The distinction matters because a stale *denial* costs someone a
-retry, while a stale *permit* is revoked authority that still works.
+cached, so every write against a scope-affecting table — a client's groups or namespaces, a
+group's own patterns, a client being disabled, a namespace delegation being reassigned or
+cleared — returns through one chokepoint in the store that bumps a process-wide *generation*
+counter. A resolution may only populate the cache at the generation it began at, so a read
+that started before a revocation cannot repopulate a stale permit after it. The distinction
+this protects is that a stale *denial* costs someone a retry, while a stale *permit* is
+revoked authority that still works.
+
+That rule is **enforced rather than documented**: a test reads the store's own source and
+fails, naming the function, if a mutation of any scope-affecting table is ever added outside
+the chokepoint. Editing a group's patterns revokes tools from every client the group is
+attached to, so a future group-CRUD path that forgot to invalidate would turn the cache into
+a window of live revoked authority — an obligation written in a comment does not stop that,
+and a red build does. The only residual is an out-of-process edit (an operator changing the
+tables by hand), which no in-process mechanism can observe; the short TTL is the backstop for
+that case alone and is not what makes revocation correct.
 
 Pattern syntax inside a tool group is deliberately tiny — an exact tool name, a trailing-`*`
 prefix, or `<namespace>::*` — with no regex (a regex authored by a delegated federation owner

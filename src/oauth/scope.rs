@@ -515,16 +515,53 @@ pub const DENY_NO_ACCOUNT_GRANT: &str = "no_account_grant";
 /// only a re-read, and two resolvers in one process sharing one epoch is
 /// strictly safer than each keeping its own.
 ///
-/// ## The obligation this places on future items
-/// **Any new write that can narrow what a client reaches must bump this.**
-/// RMCP-06 editing a group's patterns and RMCP-12 changing a delegation are
-/// both such writes. Adding one without a bump reintroduces exactly the defect
-/// this counter exists to close, and nothing will report it.
+/// ## How future writes are held to this
+/// Not by asking them to remember. Every mutation of a table in
+/// [`SCOPE_AFFECTING_TABLES`] returns through the store's `scope_write`
+/// chokepoint, and
+/// `store::tests::every_scope_affecting_write_bumps_the_generation` reads the
+/// store's own source and fails if one ever appears outside it. Round 2 of
+/// review found that round 1 had left the tool-group DEFINITION writes
+/// uncovered and had addressed the residual by documenting an obligation for
+/// RMCP-06 — which is the fake-guard shape: a comment describing a rule is not
+/// a rule, because the author who needs it is the one who did not read it.
 ///
 /// The one thing it cannot see is an out-of-process write (an operator editing
 /// the tables by hand). That is what the short TTL backstop remains for, and
 /// it is the only residual — stated plainly rather than left implied.
 static SCOPE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The tables whose contents determine what a connector resolves to.
+///
+/// Any mutation of one of these can NARROW some client's effective set, so any
+/// mutation of one of these must bump the epoch. This list is the single source
+/// of truth for that rule and is consumed by
+/// `store::tests::every_scope_affecting_write_bumps_the_generation`, which reads
+/// the store's own source and fails if a write against one of these tables ever
+/// appears outside the invalidating chokepoint.
+///
+/// Round 2 of review is why that guard exists. Round 1 closed the client-scoping
+/// writes but left the tool-group DEFINITION writes uncovered — editing a
+/// group's patterns narrows every client the group is attached to, and that is a
+/// revocation — and the residual was addressed by DOCUMENTING an obligation on
+/// RMCP-06 rather than enforcing one. A comment describing a rule is not a rule;
+/// the next author does not read it, and nothing fails when they do not.
+///
+/// Deliberately NOT listed, because none of them feeds
+/// [`ScopeResolver::load`]: `rmcp_account` (account state is the GRANT side,
+/// re-derived per request and never cached here), `rmcp_auth_code`,
+/// `rmcp_refresh_token`, `rmcp_login_session_use` and `rmcp_consent` (all
+/// per-token state checked on their own paths). Including them would be
+/// harmless for correctness but would flush this cache on every token issuance,
+/// which is frequent — the list is narrow because it is exact, not to save
+/// work.
+pub const SCOPE_AFFECTING_TABLES: &[&str] = &[
+    "rmcp_client",
+    "rmcp_client_scope",
+    "rmcp_client_server",
+    "rmcp_server_owner",
+    "rmcp_tool_group",
+];
 
 /// The current invalidation epoch.
 ///
@@ -1432,6 +1469,75 @@ mod tests {
             cache.get("cid").is_none(),
             "a store write must invalidate without anyone calling the resolver's mutators"
         );
+    }
+
+    /// **Round 2 finding — narrowing a GROUP's patterns is a revocation and
+    /// must take effect on the very next call.**
+    ///
+    /// A group is shared: editing its patterns changes what every client it is
+    /// attached to resolves to. Round 1 bumped the epoch inside the five
+    /// client-scoping writes but not inside the group-definition writes, so a
+    /// scope cached before such an edit kept permitting the removed tools until
+    /// the TTL expired.
+    ///
+    /// The link from `insert_tool_group` (and any future group edit) to this
+    /// bump is enforced separately, and by construction, by
+    /// `store::tests::every_scope_affecting_write_bumps_the_generation` — there
+    /// is no live database in this test binary, so what is asserted HERE is the
+    /// half that does not need one: once the bump happens, the previously
+    /// cached permit is gone immediately rather than a TTL later.
+    #[test]
+    fn narrowing_a_groups_patterns_revokes_the_removed_tool_on_the_next_call() {
+        let cache = isolated_cache(Duration::from_secs(3600));
+
+        // A client scoped through a group whose patterns cover two families.
+        let before = Arc::new(scope(&["weather_*", "media_*"], &[]));
+        put_now(&cache, "cid", Arc::clone(&before));
+
+        let cached = cache.get("cid").expect("the scope is cached");
+        assert!(
+            decide(&allow_all, &cached, "media_search").is_allowed(),
+            "precondition: the cached scope permits the tool"
+        );
+
+        // The operator narrows the GROUP itself, dropping `media_*`. This is
+        // the call every scope-affecting store write funnels through.
+        cache.bump();
+
+        assert!(
+            cache.get("cid").is_none(),
+            "the cached scope must not survive a group edit — it still permits a tool the \
+             operator just revoked"
+        );
+
+        // And what the next call re-resolves to no longer permits it.
+        let after = scope(&["weather_*"], &[]);
+        assert_eq!(
+            decide(&allow_all, &after, "media_search").deny_code(),
+            Some("no_group"),
+            "the re-resolved scope refuses the removed tool"
+        );
+        assert!(
+            decide(&allow_all, &after, "weather_now").is_allowed(),
+            "and the patterns that survived still work"
+        );
+    }
+
+    /// Deleting a group outright is the same revocation in its strongest form:
+    /// the client is left with nothing.
+    #[test]
+    fn deleting_a_group_leaves_the_client_reaching_nothing() {
+        let cache = isolated_cache(Duration::from_secs(3600));
+        put_now(&cache, "cid", Arc::new(scope(&["media_*"], &[])));
+        assert!(cache.get("cid").is_some());
+
+        cache.bump();
+        assert!(cache.get("cid").is_none());
+
+        // With its only group gone, the client resolves to the empty scope.
+        let after = ClientScope::empty("cid");
+        assert!(after.is_empty());
+        assert!(!decide(&allow_all, &after, "media_search").is_allowed());
     }
 
     /// The epoch only ever moves forward, and every invalidation moves it.
