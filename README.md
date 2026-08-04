@@ -84,6 +84,7 @@ flowchart LR
 | `pg` | The single sanctioned Postgres door: identity-scoped, approval-gated `pg_*` suite | [reference/pg](docs/reference/pg.md) |
 | `agent_router` | The agentic tool router: identity-scoped selection, local dispatch, Chord for inference only | see below |
 | `availability` | Tool availability state (`available`/`off`/`broken`) — park a dead tool without de-registering it; `tool_availability` is the admin view | see below |
+| `oauth` | The OAuth 2.1 remote-MCP connector door: authorization server, login/consent, per-client tool and server scoping | see below |
 
 ### Agent tool router — selection, dispatch, and caching
 
@@ -562,6 +563,96 @@ signals a process. Being able to *watch* an autonomous agent carries no risk; be
 *type into* one can alter a build mid-flight. A send capability is a separate, gated change
 needing a session allowlist, a control-character whitelist, rate limiting and an audit-log
 entry — do not add one here without that gate.
+
+### The OAuth connector door — letting a hosted client in without widening anything
+
+Terminus has three ways in, and all three are private: the loopback listener, the mTLS
+listener, and the tailnet listener. Each binds a caller's identity to a transport artifact —
+a client certificate CN, or a tailnet WhoIs. That works for the fleet's own services. It
+cannot work for a **hosted third-party client**: Anthropic's Claude surfaces reach an
+external MCP server over public HTTPS with OAuth 2.1 and cannot present a certificate this
+fleet issued.
+
+The `oauth` subsystem is the fourth door. Its output is an ordinary `Principal`, which the
+**existing** `gateway_framework` authorization already understands — the new door changes
+how a caller proves who they are, never what they may do once in.
+
+**The scoping model, which is the reason this is safe to expose at all.** Every request
+resolves to an intersection, and an intersection can only ever *remove*:
+
+```text
+effective = grant_of(account)          // what the HUMAN may do  (existing machinery)
+          ∩ tools_of(client.groups)    // what THIS connector may do
+          ∩ namespaces(client.servers) // which federated servers it sees
+```
+
+There is deliberately no path by which a client scoping record grants a tool the account's
+own grant would have denied. A client with no scoping record reaches the **empty set**, not
+the account's full grant; a tool-group pattern matching nothing is empty, not a wildcard.
+
+**"Only I can link my account" is enforced at consent, not at registration.** Possession of
+a `client_id` gets a caller as far as a login screen. Issuing a token needs an argon2id
+password sign-in *and* an explicit approval of a named client and a named capability set. A
+client nobody consents to holds nothing.
+
+The interactive endpoints (`GET /oauth/authorize`, `POST /oauth/login`, `POST /oauth/consent`)
+are server-rendered pages with no JavaScript, no framework and no external resource, served
+under `default-src 'none'; frame-ancestors 'none'`. Several of their properties are
+load-bearing rather than incidental:
+
+- **Two failures never redirect.** An unknown `client_id` or an unregistered `redirect_uri`
+  renders a terminal error page and emits no `Location` header at all — redirecting to an
+  unvalidated address is an open redirect. Everything checked afterwards *is* an OAuth error
+  redirect, because by then the destination is one an operator registered.
+- **Redirect matching is exact, with one named exception.** An RFC 8252 loopback URI matches
+  with the port ignored, because a native client binds an ephemeral port it cannot know at
+  registration time. That exception requires the scheme to be `http`, no userinfo in the
+  authority, an identical host from a fixed three-item allowlist, and identical path, query
+  and fragment. Only the port may differ. A general fuzzy match is how open redirects are
+  born; this is a branch with its own tests in both directions.
+- **A redirect URI that already carries a response parameter is refused.** `…/cb?code=x`
+  would produce a response with two `code` parameters and let the *client's* query parser
+  decide which wins. Reserved names (`code`, `state`, `iss`, `error`, `error_description`)
+  are refused at validation and dropped at build time.
+- **PKCE S256 is required**; `plain` **and an omitted method** are both refused — RFC 7636
+  makes `plain` the default when the method is absent, so accepting the omission would be
+  accepting `plain`.
+- **Tokens are audience-bound.** The RFC 8707 `resource` parameter is required and must equal
+  the configured canonical resource, so a token minted here cannot be replayed at a federated
+  peer.
+- **An unknown account and a wrong password are indistinguishable** in body, status and
+  *timing* — the no-account path verifies the submitted password against a real argon2id hash
+  with the same cost parameters rather than returning early. Both the per-account and the
+  per-source rate-limit budgets are consumed before any credential work, so the limiter is
+  not an oracle either. The source address comes from the connection, never from
+  `X-Forwarded-For`: a rate-limit key the caller can rotate is not a rate limit.
+- **Consent shows resolved capabilities, not a scope string.** "mcp" tells a human nothing
+  about whether they are approving a weather lookup or a host restart, so the page lists the
+  client's resolved tool groups with their patterns and its federated namespaces. An empty
+  list is stated in words as *grants no tool access at all* — an empty section reads as
+  "unrestricted", which is the exact misreading the scoping model exists to prevent.
+- **Loopback clients carry a warning**, as the MCP specification requires: a loopback
+  redirect cannot be authenticated, so any process on the user's machine that binds the port
+  first receives the code.
+- **Authorization codes** carry 366 bits of entropy, are stored only as a SHA-256 digest,
+  live 60 seconds, and are bound to client, account, redirect URI, resource, PKCE challenge
+  and scope. One authentication yields at most one code: the login session's identifier is
+  claimed by an `INSERT … ON CONFLICT DO NOTHING`, so a replayed consent post loses the race
+  **across every replica**, not merely within one process.
+
+**Configuration** (names only — values are materialized from the runtime secret store, never
+authored by hand): `RMCP_DATABASE_URL`, `RMCP_OAUTH_SIGNING_KEY`, `RMCP_OAUTH_ISSUER`,
+`RMCP_OAUTH_RESOURCE`. The schema lives in `migrations/S132-rmcp01-oauth-core.sql` and
+`migrations/S132-rmcp03-login-session.sql` and is **not** applied at startup: apply it via
+`pg_ddl` as part of the deploy. Until it is, the store reports the door unconfigured rather
+than serving a silently dead auth surface.
+
+**Not yet complete.** An account with a TOTP second factor is currently **refused** at
+sign-in rather than admitted on its password alone: the stored seed is encrypted with a
+subkey nothing derives yet, and a verifier cannot check a code against a seed it cannot
+decrypt. That is a deliberate fail-closed gate, not a fault — RMCP-08 provisions the subkey.
+Clearing `totp_secret_enc` to work around it would silently downgrade the account to one
+factor and must not be done.
 
 ### Live viewing activity — `media_now_playing`
 

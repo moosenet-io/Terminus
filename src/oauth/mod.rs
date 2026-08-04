@@ -36,13 +36,21 @@
 //! dangerous failure in an authorization change is never a spurious denial, it
 //! is a silent widening that nobody notices until it is used.
 //!
-//! ## What RMCP-01 delivers
-//! The persistence layer and nothing else. There is no HTTP surface here yet —
-//! the metadata documents (RMCP-02), the authorize/token endpoints (RMCP-03,
-//! RMCP-04), resource-server validation (RMCP-05) and the scoping resolver
-//! (RMCP-07) each land as their own item on top of these types. This item is
-//! deliberately unreachable from the network so the schema and its fail-closed
-//! contracts can be reviewed on their own.
+//! ## What is here so far
+//! - **RMCP-01** — the persistence layer ([`model`], [`store`]) and the two
+//!   credential-storage newtypes below. No HTTP surface of its own.
+//! - **RMCP-03** — the interactive half of the flow: [`authorize`] (the
+//!   endpoint and its state machine), [`session`] (the signed, short-lived
+//!   login cookie), [`password`] (argon2id verification) and [`templates`]
+//!   (the server-rendered login and consent pages). Read
+//!   [`authorize`]'s module docs before changing anything in it: the ORDER of
+//!   its checks is a security property, not a style choice, because the first
+//!   two failures must never produce a redirect.
+//!
+//! Still to land as their own items: the metadata documents (RMCP-02), the
+//! token endpoint (RMCP-04), resource-server validation (RMCP-05) and the
+//! scoping resolver (RMCP-07). None of this is reachable from the network until
+//! a listener mounts [`authorize::router`].
 //!
 //! ## Credential storage — nothing here is presentable
 //! No table in this schema stores a usable credential:
@@ -51,8 +59,9 @@
 //!   work factor precisely because they are full-entropy and short-lived;
 //!   argon2 on a 256-bit random value buys nothing and costs latency on the
 //!   token endpoint, which has a 10-second budget.
-//! - Client secrets and account passwords are stored as argon2id PHC strings,
-//!   written by RMCP-03/RMCP-08 which own the verification path.
+//! - Client secrets and account passwords are stored as argon2id PHC strings.
+//!   [`password`] (RMCP-03) owns the hashing and verification; RMCP-08 owns
+//!   provisioning.
 //!
 //! ## Secret access (S7/S8)
 //! This crate has no separate `SecretManager::get()` API; the runtime secret
@@ -63,8 +72,12 @@
 //! ([`OauthConfig::from_env`]) and is never logged, returned, or embedded in an
 //! error.
 
+pub mod authorize;
 pub mod model;
+pub mod password;
+pub mod session;
 pub mod store;
+pub mod templates;
 
 use crate::error::ToolError;
 

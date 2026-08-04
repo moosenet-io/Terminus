@@ -236,6 +236,15 @@ redis = { version = "0.24", default-features = false, features = ["tokio-comp", 
 # builds sharing one Redis never fragment the cache (unlike std DefaultHasher).
 # Already in the tree (redis uses it for EVALSHA), so no new build cost.
 sha1_smol = "1"
+# RMCP-03 (S132): argon2id verification for the OAuth door's account passwords
+# and client secrets. Account passwords are human-chosen and therefore
+# low-entropy, so the threat is an offline dictionary run over a stolen
+# `rmcp_account` table -- which calls for a memory-hard KDF, not the SHA-256
+# used for the high-entropy machine-generated codes and refresh tokens. The
+# cost parameters are deliberately the crate's own defaults (it tracks the
+# OWASP recommendation) rather than numbers frozen into this repo.
+argon2 = "0.5"
+
 # BLD-05: SHA-256 of published build artifacts (the `.sha256` sidecar the
 # constellation-updater verifies before an atomic-mv swap). A pure-Rust digest
 # so the artifact checksum is computed in-process (testable offline) rather than
