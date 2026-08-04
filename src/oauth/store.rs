@@ -691,9 +691,29 @@ impl OauthStore {
     /// A bare `*` is only legitimate from an operator, and operator-ness is
     /// revocable. Reading it in the same statement as the group rows means there
     /// is no window in which an account could be demoted between the two reads,
-    /// and no way for a caller to supply an authority of its own choosing. The
-    /// flag is combined with `NOT a.disabled` because a disabled account is not
-    /// an operator for any purpose — it cannot even authenticate.
+    /// and no way for a caller to supply an authority of its own choosing.
+    ///
+    /// ## One gate, composed — not two half-checks
+    /// Owner state is decided in exactly ONE place: the `rmcp_account` join,
+    /// which carries `AND NOT a.disabled` verbatim as in
+    /// [`Self::client_tool_groups`] and [`Self::client_namespaces`] (TERM #637B).
+    /// A disabled owner's groups therefore do not appear here AT ALL, so the
+    /// projected `owner_is_operator` does not restate the disabled check — by
+    /// the time a row exists, its owner is known enabled.
+    ///
+    /// An earlier revision had this backwards and it is worth recording why,
+    /// because a clean rebase produced it silently: the join omitted
+    /// `NOT a.disabled` and the projection carried
+    /// `(a.is_operator AND NOT a.disabled)` instead. That reads as equivalent
+    /// and is not. It gated only the WILDCARD on the owner being enabled, so a
+    /// disabled owner's `*` collapsed while every one of their ordinary
+    /// patterns — `weather_*`, `peerhub::*` — kept resolving. The two hunks live
+    /// in different functions, so there was no textual conflict to notice; the
+    /// enforcing query was simply weaker than the display query beside it, on
+    /// exactly the hole 637B had just closed.
+    ///
+    /// If the join predicate is ever changed, the projection must be revisited
+    /// with it. They are one rule written in two clauses, not two rules.
     ///
     /// It also carries [`Self::client_tool_groups`]'s read-path OWNER re-check
     /// (`c.owner_account_id = g.owner_account_id`, added on main by round 9).
@@ -713,12 +733,12 @@ impl OauthStore {
     ) -> Result<Vec<AuthorizedGroup>, ToolError> {
         sqlx::query_as::<_, AuthorizedGroup>(
             "SELECT g.id, g.name, g.description, g.patterns, g.owner_account_id, g.created_at, \
-                    (a.is_operator AND NOT a.disabled) AS owner_is_operator \
+                    a.is_operator AS owner_is_operator \
              FROM rmcp_tool_group g \
              JOIN rmcp_client_scope s ON s.tool_group_id = g.id \
              JOIN rmcp_client c ON c.id = s.client_id AND NOT c.disabled \
                                 AND c.owner_account_id = g.owner_account_id \
-             JOIN rmcp_account a ON a.id = g.owner_account_id \
+             JOIN rmcp_account a ON a.id = g.owner_account_id AND NOT a.disabled \
              WHERE s.client_id = $1 ORDER BY g.name",
         )
         .bind(client_id)
@@ -2199,6 +2219,75 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
         ] {
             assert!(REQUIRED_TABLES.contains(&table), "{table} missing from the readiness check");
         }
+    }
+
+    /// Every query that feeds an authorization decision from an OWNER account
+    /// must exclude a disabled owner, in the join.
+    ///
+    /// This is a source-text guard, which is unusual and deliberate. The
+    /// property is a SQL predicate, so it is not reachable from a unit test
+    /// without a database — but it regressed silently once already: TERM #637B
+    /// added `AND NOT a.disabled` to two queries while a third, added on a
+    /// branch, kept the check only in a projected column. The two hunks were in
+    /// different functions, so the rebase that combined them produced no
+    /// conflict and no failing test, and the query that actually feeds
+    /// resolution ended up weaker than the one beside it.
+    ///
+    /// Asserting the text is a blunt instrument that would have caught exactly
+    /// that. It cannot prove the predicate is correct; it can prove nobody
+    /// deleted it.
+    #[test]
+    fn every_owner_scoped_query_excludes_a_disabled_owner() {
+        // Scan the PRODUCTION half only, and drop comments — the same two rules
+        // the `ScopeWrite` detector applies, both load-bearing here.
+        //
+        // Comments, because the doc above deliberately quotes the WRONG spelling
+        // as the anti-pattern, and a guard its own explanation can break is a
+        // guard people delete.
+        //
+        // The test module, for a sharper reason: the markers below are string
+        // literals in THIS file. Scanning the whole file would find them in the
+        // test's own array and pass even if every query had been deleted —
+        // false coverage of exactly the kind this guard exists to prevent.
+        let file = include_str!("store.rs");
+        let production = file.split("#[cfg(test)]").next().expect("file has a production half");
+        let src: String = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Proof the scan is looking at something: the queries themselves.
+        assert!(src.contains("FROM rmcp_tool_group g"), "scan lost the production text");
+
+        for (function, marker) in [
+            ("client_tool_groups / client_authorized_groups",
+             "JOIN rmcp_account a ON a.id = g.owner_account_id AND NOT a.disabled"),
+            ("client_namespaces",
+             "JOIN rmcp_account a ON a.id = o.owner_account_id AND NOT a.disabled"),
+        ] {
+            assert!(
+                src.contains(marker),
+                "{function} must exclude a disabled owner in its join: missing {marker:?}"
+            );
+        }
+        // BOTH group queries, not just one — the regression was exactly that the
+        // display query had it and the resolution query did not.
+        assert_eq!(
+            src.matches("JOIN rmcp_account a ON a.id = g.owner_account_id AND NOT a.disabled").count(),
+            2,
+            "both client_tool_groups and client_authorized_groups must carry the join"
+        );
+
+        // Assembled from parts so this needle does not appear verbatim in the
+        // file it is scanning.
+        let split_projection =
+            format!("({} AND NOT a.disabled) AS owner_is_operator", "a.is_operator");
+        assert!(
+            !src.contains(&split_projection),
+            "owner state belongs in the join, not split across the projection"
+        );
+        assert!(src.contains("a.is_operator AS owner_is_operator"));
     }
 
     /// The operator flag is an AUTHORIZATION input, so a deploy that is missing

@@ -1424,6 +1424,48 @@ mod tests {
         assert!(!p.matches("a__c"));
     }
 
+    /// TERM #637B symmetry: the AUTHORING matcher here and the ENFORCING
+    /// matcher in RMCP-07's `scope.rs` must select the same set for every
+    /// pattern this validator accepts. Mirrors 637B's own qualified-forms test,
+    /// case for case, so a divergence shows up on whichever side changes first.
+    ///
+    /// The representations differ deliberately and are equivalent: 637B holds
+    /// `NamespacedExact(ns, bare)` and compares the split halves; this side
+    /// stores the ADVERTISED name and compares it whole. Those agree because
+    /// `split_namespaced` cuts at the FIRST `__`, so exactly one advertised
+    /// string splits to any given `(ns, bare)` — the mapping is a bijection, not
+    /// an approximation.
+    #[test]
+    fn qualified_forms_agree_with_the_enforcing_matcher() {
+        let exact = Pattern::parse("peerone::weather_now", GroupOwner::Operator).unwrap();
+        assert_eq!(exact, Pattern::Exact("peerone__weather_now".into()));
+        assert!(exact.matches("peerone__weather_now"));
+        assert!(!exact.matches("peertwo__weather_now"), "not another namespace");
+        assert!(!exact.matches("weather_now"), "not the local tool of the same name");
+        assert!(!exact.matches("peerone__weather_forecast"), "not a sibling");
+
+        let prefix = Pattern::parse("peerone::weather_*", GroupOwner::Operator).unwrap();
+        assert_eq!(
+            prefix,
+            Pattern::NamespacedPrefix { namespace: "peerone".into(), prefix: "weather_".into() }
+        );
+        assert!(prefix.matches("peerone__weather_now"));
+        assert!(prefix.matches("peerone__weather_forecast"));
+        assert!(!prefix.matches("peertwo__weather_now"), "cannot leak across the boundary");
+        assert!(!prefix.matches("weather_now"), "and does not reach local tools");
+        assert!(!prefix.matches("peerone__media_search"));
+
+        // The qualified prefix matches the BARE name, so a prefix equal to the
+        // namespace's own text does not match by accident.
+        let bare = Pattern::parse("peerone::peer*", GroupOwner::Operator).unwrap();
+        assert!(bare.matches("peerone__peer_status"));
+        assert!(!bare.matches("peerone__weather_now"));
+
+        // And the exact form round-trips back to `::` for display.
+        assert_eq!(exact.render(), "peerone::weather_now");
+        assert_eq!(Pattern::parse_stored(&exact.render()), Some(exact));
+    }
+
     /// CARRY-OVER 1 from TERM #637: the over-grant hole must stay closed.
     ///
     /// Under the old vocabulary `peerhub::*` passed write-time validation as an
