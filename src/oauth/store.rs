@@ -28,7 +28,7 @@ use crate::error::ToolError;
 use crate::oauth::model::{
     Account, AuthCode, Client, Consent, RefreshToken, ServerOwner, ToolGroup,
 };
-use crate::oauth::{Argon2idHash, OauthConfig, SecretHash};
+use crate::oauth::{Argon2idHash, OauthConfig, ScopeWriteAuthorization, SecretHash};
 
 /// Maximum pooled connections. The OAuth endpoints are latency-sensitive
 /// (Anthropic allows 10s for discovery/token, 30s for refresh) but very
@@ -344,12 +344,17 @@ impl OauthStore {
     /// partial check scattered into the repository would make that single guard
     /// look optional and is how the two copies drift apart.
     ///
-    /// What round 2 correctly objected to was not the location of the check but
-    /// the SURFACE: a bare `pub fn` with an inviting name is a footgun no doc
-    /// comment closes. So the method is now `pub(crate)` (unreachable outside
-    /// this crate) and carries `_unchecked` in its name, which puts the
-    /// obligation at every call site instead of only in this doc block —
-    /// the standard Rust idiom for exactly this contract.
+    /// What rounds 2-4 correctly objected to was not the location of the check
+    /// but the SURFACE: a doc comment and an `_unchecked` suffix are advisory,
+    /// and a caller added later can simply not do the check. So the method is
+    /// `pub(crate)`, is named `_unchecked`, AND requires a
+    /// [`ScopeWriteAuthorization`] — a token whose only constructor is
+    /// `ownership_verified()`. "Forgot to authorize" is now inexpressible: the
+    /// worst a caller can do is claim an audit it did not perform, which names
+    /// itself at the call site and is findable by grepping one constructor.
+    ///
+    /// There are currently NO callers at all — this item ships no HTTP surface —
+    /// so nothing is exposed today either way.
     ///
     /// Delete-then-insert inside a transaction, rather than a diff: a partially
     /// applied scope change is a permission state nobody chose, and under
@@ -359,6 +364,7 @@ impl OauthStore {
         &self,
         client_id: Uuid,
         group_ids: &[Uuid],
+        _authorized: ScopeWriteAuthorization,
     ) -> Result<(), ToolError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
         sqlx::query("DELETE FROM rmcp_client_scope WHERE client_id = $1")
@@ -387,6 +393,7 @@ impl OauthStore {
         &self,
         client_id: Uuid,
         namespaces: &[String],
+        _authorized: ScopeWriteAuthorization,
     ) -> Result<(), ToolError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
         sqlx::query("DELETE FROM rmcp_client_server WHERE client_id = $1")

@@ -119,6 +119,46 @@ impl OauthConfig {
     }
 }
 
+/// Proof that a caller has performed the ownership check before writing a
+/// client's scope.
+///
+/// ## Why this type exists
+/// Three review rounds objected — reasonably — that
+/// [`store::OauthStore::set_client_tool_groups_unchecked`] and its namespace
+/// counterpart will attach one account's tool groups, or an arbitrary
+/// namespace, to another account's client. The reviewers' point was that a doc
+/// comment and an `_unchecked` suffix are advisory: a caller added later can
+/// still simply not do the check.
+///
+/// The ownership RULE still belongs in one place — RMCP-12 puts it in a single
+/// guard that every write path calls, so it cannot be implemented two ways or
+/// drift. What this type fixes is the other half: the scope-writing methods now
+/// REQUIRE a value that can only be produced by explicitly claiming the check
+/// was done. "Forgot to authorize" is no longer expressible; the worst a caller
+/// can do is lie in a way that names itself at the call site and shows up in a
+/// grep for the constructor.
+///
+/// This is the same idiom as [`crate::tool::CallerContext`]'s entitlement
+/// constructors, which exist because the compiler is a better enforcer of an
+/// authorization contract than a comment.
+///
+/// The field is private and carries no data: the value IS the claim.
+#[derive(Debug, Clone, Copy)]
+pub struct ScopeWriteAuthorization(());
+
+impl ScopeWriteAuthorization {
+    /// Assert that the caller has verified the actor owns both the client being
+    /// scoped and every namespace and tool group being attached.
+    ///
+    /// RMCP-12's single ownership guard is the intended — and, once it lands,
+    /// the only — caller. Anything else calling this is claiming an audit it
+    /// did not perform, which is a reviewable defect rather than an accident.
+    #[must_use]
+    pub fn ownership_verified() -> Self {
+        Self(())
+    }
+}
+
 /// Hash a high-entropy machine-generated secret (an authorization code or a
 /// refresh token) for storage and lookup.
 ///
@@ -278,12 +318,12 @@ impl Argon2idHash {
             return Err(refuse("algorithm is not argon2id"));
         }
 
-        // Version: `v=<digits>`.
-        let version = fields[2]
-            .strip_prefix("v=")
-            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()));
-        if version.is_none() {
-            return Err(refuse("missing or non-numeric version"));
+        // Version. Argon2 has exactly two published versions — 0x10 (16) and
+        // the current 0x13 (19) — so an arbitrary number here is not a real
+        // hash. Accepting any digits was the weaker check round 4 flagged.
+        match fields[2].strip_prefix("v=") {
+            Some("19") | Some("16") => {}
+            _ => return Err(refuse("missing or unsupported argon2 version (expected v=19 or v=16)")),
         }
 
         // Cost parameters: exactly m, t and p, each numeric. Checked by NAME
@@ -300,12 +340,20 @@ impl Argon2idHash {
             if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(refuse("non-numeric cost parameter"));
             }
-            match key {
-                "m" => seen_m = true,
-                "t" => seen_t = true,
-                "p" => seen_p = true,
+            // A REPEATED parameter is rejected rather than last-write-wins:
+            // `m=1,m=999999` is not a hash any implementation emits, and
+            // silently accepting one of two conflicting cost values is how a
+            // weak parameter hides behind a strong-looking one.
+            let slot = match key {
+                "m" => &mut seen_m,
+                "t" => &mut seen_t,
+                "p" => &mut seen_p,
                 _ => return Err(refuse("unknown cost parameter")),
+            };
+            if *slot {
+                return Err(refuse("duplicate cost parameter"));
             }
+            *slot = true;
         }
         if !(seen_m && seen_t && seen_p) {
             return Err(refuse("missing one of the m/t/p cost parameters"));
@@ -404,6 +452,11 @@ mod tests {
             "$argon2id$v=19$t=2,m=19456,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG"
         )
         .is_ok());
+        // Both published argon2 versions are accepted.
+        assert!(Argon2idHash::parse(
+            "$argon2id$v=16$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG"
+        )
+        .is_ok());
         // The crypt-style `.` is accepted too, so an implementation that emits
         // it cannot break authentication (see `is_segment_char`).
         assert!(Argon2idHash::parse(
@@ -431,6 +484,11 @@ mod tests {
             "$argon2id$v=19$m=1,t=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
             "$argon2id$v=19$m=a,t=1,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
             "$argon2id$v=19$m=1,t=1,p=1,q=9$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            // Round 4: a repeated cost parameter must not be last-write-wins.
+            "$argon2id$v=19$m=1,m=99999,t=1,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            // Round 4: only argon2's two published versions are real.
+            "$argon2id$v=99$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2id$v=0$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
             "$argon2id$v=19$m=1,t=1,p=1$short$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
             "$argon2id$v=19$m=1,t=1,p=1$c29tZXNhbHRzYWx0$sh",
             "$argon2id$v=19$m=1,t=1,p=1$c29tZXNhbHRzYWx0$has h$extra",
