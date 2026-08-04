@@ -85,6 +85,11 @@ use serde_json::{json, Value};
 
 use crate::mesh::person::{self, AssertedPerson, PersonAssertionError, VerifiedPerson};
 use crate::mesh::Principal;
+// RMCP-07: the connector-scoping half of the authorization decision. This
+// module owns the ACCOUNT half and hands it to `oauth::scope` through the
+// `AccountGrant` adapter below; the intersection itself lives there so that
+// `tools/list` and `tools/call` share exactly one implementation of it.
+use crate::oauth::scope::{AccountGrant, ClientScope, ListFilterTally};
 use audit::{AuditDecision, AuditEntry, AuditResult};
 use rate_limit::{rate_limit_key, InProcessRateLimiter, RateLimitDecision, RateLimiter};
 
@@ -1973,6 +1978,231 @@ impl GatewayFramework {
             None => Vec::new(),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // RMCP-07: per-client (OAuth connector) intersection
+    // -----------------------------------------------------------------------
+
+    /// The account grant, as [`crate::oauth::scope`] wants to see it.
+    ///
+    /// A three-line adapter and nothing more — the OAuth layer must not get a
+    /// second way to decide what an account may do, so this hands it the
+    /// EXISTING [`AllowlistPolicy`] decision (deny layer, guest clamp, admin
+    /// rules and all) rather than reimplementing any part of it.
+    ///
+    /// `None` principal denies everything, matching
+    /// [`Self::filter_catalog_for_principal`]'s empty return and [`Self::guard`]'s
+    /// no-identity refusal. There is no anonymous OAuth caller.
+    fn account_grant<'a>(&'a self, principal: Option<&'a Principal>) -> PolicyGrant<'a> {
+        PolicyGrant {
+            policy: &self.inner.allowlist,
+            identity: principal.map(Principal::name),
+        }
+    }
+
+    /// The `tools/call` half of the RMCP-07 intersection.
+    ///
+    /// Returns `Ok(())` when `scope` is `None` — a request that did NOT arrive
+    /// through the OAuth door has no connector to intersect with and is
+    /// governed by [`Self::guard`] alone, exactly as before this item. That is
+    /// the one place absence does not mean the empty set, and it is safe
+    /// precisely because it is keyed on TRANSPORT (there is no client) rather
+    /// than on data (a client with no rows, which
+    /// [`crate::oauth::scope::ScopeResolver::resolve`] returns as an EMPTY
+    /// scope, never as `None`).
+    ///
+    /// On denial this audits with a machine-readable reason and returns the
+    /// text for the caller. It is called BEFORE [`Self::guard`], so exactly one
+    /// audit entry is still written per request — the same invariant `guard`
+    /// itself maintains.
+    pub fn guard_client_scope(
+        &self,
+        principal: Option<&Principal>,
+        scope: Option<&ClientScope>,
+        tool: &str,
+    ) -> Result<(), String> {
+        let Some(scope) = scope else {
+            return Ok(());
+        };
+        let decision = crate::oauth::scope::decide(&self.account_grant(principal), scope, tool);
+        match decision.deny_code() {
+            None => Ok(()),
+            Some(reason) => Err(audit_client_scope_denial(principal, scope, tool, reason)),
+        }
+    }
+
+    /// The `tools/list` half of the RMCP-07 intersection.
+    ///
+    /// Routes through the SAME [`crate::oauth::scope::decide`] the call guard
+    /// uses, so a tool this keeps is always callable and a tool it drops is
+    /// always denied. Two similar functions is how those two drift apart, and
+    /// list/call parity is a stated invariant of this module.
+    ///
+    /// `None` scope is a passthrough for the same reason as
+    /// [`Self::guard_client_scope`]. A tool object with no `name` string is
+    /// dropped, matching [`AllowlistPolicy::filter_tools`]'s own fail-closed
+    /// handling of a malformed entry.
+    pub fn filter_catalog_for_client(
+        &self,
+        principal: Option<&Principal>,
+        scope: Option<&ClientScope>,
+        tools: Vec<Value>,
+    ) -> Vec<Value> {
+        self.filter_catalog_for_client_tallied(principal, scope, tools).0
+    }
+
+    /// [`Self::filter_catalog_for_client`]'s body, also returning the tally it
+    /// audited.
+    ///
+    /// The seam exists because the round-3 tests were checked with a mutation
+    /// run and did NOT catch the regression they were written for: they built a
+    /// tally by hand and asserted on that, so deleting the `tally.record(..)`
+    /// call from the real filter left every test green. A test that
+    /// reconstructs the thing it is meant to be verifying is testing its own
+    /// arithmetic. Returning the production tally makes the assertions bind to
+    /// the production path.
+    pub fn filter_catalog_for_client_tallied(
+        &self,
+        principal: Option<&Principal>,
+        scope: Option<&ClientScope>,
+        tools: Vec<Value>,
+    ) -> (Vec<Value>, ListFilterTally) {
+        let Some(scope) = scope else {
+            return (tools, ListFilterTally::default());
+        };
+        let grant = self.account_grant(principal);
+        let mut tally = ListFilterTally::default();
+        let kept = tools
+            .into_iter()
+            .filter(|tool| match tool.get("name").and_then(Value::as_str) {
+                Some(name) => {
+                    let decision = crate::oauth::scope::decide(&grant, scope, name);
+                    tally.record(decision);
+                    decision.is_allowed()
+                }
+                // A nameless entry is dropped without being tallied: it is a
+                // malformed catalog entry, not a scoping denial, and counting
+                // it would misattribute a producer bug to a permission.
+                None => false,
+            })
+            .collect();
+        audit_client_scope_list(principal, scope, &tally);
+        (kept, tally)
+    }
+}
+
+/// Audit one `tools/list` evaluation, as a single aggregate record.
+///
+/// Emits nothing when the connector could see everything it was offered —
+/// there is no denial to diagnose, and a row per successful list would be pure
+/// noise. Free function for the same reason as
+/// [`audit_client_scope_denial`]: the gateway-less list branch in
+/// [`crate::mcp_server`] has no [`GatewayFramework`] to call a method on, and
+/// that is exactly the branch that was forgotten on the `tools/call` path one
+/// round earlier.
+///
+/// The record is keyed on the action `tools/list`, so it can never be confused
+/// with a per-tool call denial, and it carries [`AuditResult::DeniedNotAllowlisted`]
+/// because it exists only when something WAS denied. Note that makes
+/// `is_denied()` true for a list where most tools were visible — the counts in
+/// the detail are what distinguish "hid three of four hundred" from "hid
+/// everything", and any metric summing these must read them rather than the
+/// result alone.
+pub fn audit_client_scope_list(
+    principal: Option<&Principal>,
+    scope: &ClientScope,
+    tally: &ListFilterTally,
+) {
+    if tally.denied() == 0 {
+        return;
+    }
+    let identity = principal
+        .map(|p| p.name().to_string())
+        .unwrap_or_else(|| ANONYMOUS_IDENTITY.to_string());
+    let detail = format!(
+        "rmcp connector list filtered: client_id={} {}",
+        scope.client_id(),
+        tally.summary()
+    );
+    AuditEntry::new(
+        &identity,
+        "tools/list",
+        ActionKind::Tool,
+        AuditResult::DeniedNotAllowlisted,
+        Some(&detail),
+    )
+    .log();
+}
+
+/// Audit one connector-scope denial and return the caller-facing text.
+///
+/// A FREE function, not a method, and that is the point of round 1's finding 3:
+/// there is a denial path that has no [`GatewayFramework`] to call a method on
+/// — an OAuth-scoped request reaching a process with no gateway configured.
+/// That call used to be refused without any audit record at all, which broke
+/// the acceptance criterion that every denial is diagnosable without guesswork.
+/// Both paths now emit the SAME record through this one function, so a denial
+/// can never be silent because of where it happened to be decided.
+///
+/// `reason` is a code from [`crate::oauth::scope`] — the three [`DenyReason`]
+/// codes, or [`crate::oauth::scope::DENY_NO_ACCOUNT_GRANT`] for the
+/// gateway-less case.
+///
+/// [`DenyReason`]: crate::oauth::scope::DenyReason
+pub fn audit_client_scope_denial(
+    principal: Option<&Principal>,
+    scope: &ClientScope,
+    tool: &str,
+    reason: &str,
+) -> String {
+    let identity = principal
+        .map(|p| p.name().to_string())
+        .unwrap_or_else(|| ANONYMOUS_IDENTITY.to_string());
+    // The reason code and the client_id are the whole point: an operator
+    // diagnosing "why can my connector not see this" needs to know WHICH
+    // dimension refused, without guessing. Neither value is a secret — a
+    // `client_id` is pasted into a connector form by hand.
+    let detail = format!(
+        "rmcp connector scope denied: reason={reason} client_id={} tool={tool}",
+        scope.client_id()
+    );
+    match crate::mesh::split_namespaced(tool) {
+        Some((namespace, bare)) => AuditEntry::new_federated(
+            &identity,
+            Some(namespace.to_string()),
+            tool,
+            bare,
+            ActionKind::Tool,
+            AuditResult::DeniedNotAllowlisted,
+            AuditDecision::Deny,
+            Some(&detail),
+        )
+        .log(),
+        None => AuditEntry::new(
+            &identity,
+            tool,
+            ActionKind::Tool,
+            AuditResult::DeniedNotAllowlisted,
+            Some(&detail),
+        )
+        .log(),
+    }
+    detail
+}
+
+/// Adapter exposing the existing [`AllowlistPolicy`] decision as an
+/// [`AccountGrant`]. Holds no state of its own — see
+/// [`GatewayFramework::account_grant`].
+struct PolicyGrant<'a> {
+    policy: &'a AllowlistPolicy,
+    identity: Option<&'a str>,
+}
+
+impl AccountGrant for PolicyGrant<'_> {
+    fn permits_tool(&self, tool: &str) -> bool {
+        self.identity
+            .is_some_and(|identity| self.policy.is_allowed(identity, tool))
+    }
 }
 
 fn denied_response(status: StatusCode, message: &str) -> Response {
@@ -2826,6 +3056,347 @@ mod tests {
         let catalog = vec![tool_json("ledger_accounts")];
         let filtered = fw.filter_catalog_for_principal(None, catalog);
         assert!(filtered.is_empty());
+    }
+
+    // ── RMCP-07: the per-connector intersection, at the gateway seam ──────
+
+    /// Build a connector scope the way `ScopeResolver` would, without a store.
+    fn connector_scope(patterns: &[&str], namespaces: &[&str]) -> ClientScope {
+        use crate::oauth::model::ToolGroup;
+        let group = ToolGroup {
+            id: uuid::Uuid::nil(),
+            name: "test-group".into(),
+            description: String::new(),
+            patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
+            owner_account_id: uuid::Uuid::nil(),
+            created_at: chrono::Utc::now(),
+        };
+        ClientScope::from_rows(
+            "a-connector-client-id",
+            &[group],
+            namespaces.iter().map(|n| (*n).to_string()).collect(),
+        )
+    }
+
+    fn test_principal(name: &str) -> Principal {
+        Principal::new(name, crate::mesh::PrincipalSource::MtlsCert)
+    }
+
+    /// The whole point of the item, at the seam where it is wired: a connector
+    /// scope can only ever REMOVE from what the account's own grant permits.
+    #[test]
+    fn a_connector_scope_never_widens_the_account_grant() {
+        // The account may only use `ledger_accounts`.
+        let fw = framework_with(policy_allowing("dev-box", &["ledger_accounts"]), 10);
+        let principal = test_principal("dev-box");
+        // The connector is scoped to EVERYTHING, including a tool the account
+        // cannot use at all.
+        let scope = connector_scope(&["*"], &["peerone"]);
+
+        let catalog = vec![
+            tool_json("ledger_accounts"),
+            tool_json("vitals_summary"),
+            tool_json("peerone__vitals_summary"),
+        ];
+        let filtered = fw.filter_catalog_for_client(Some(&principal), Some(&scope), catalog);
+        let names: Vec<&str> =
+            filtered.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(names, vec!["ledger_accounts"]);
+
+        // And the call gate agrees, with the grant named as the reason.
+        assert!(fw
+            .guard_client_scope(Some(&principal), Some(&scope), "ledger_accounts")
+            .is_ok());
+        let denial = fw
+            .guard_client_scope(Some(&principal), Some(&scope), "vitals_summary")
+            .expect_err("the account grant must still refuse it");
+        assert!(denial.contains("denied_by_grant"), "reason in denial: {denial}");
+    }
+
+    /// A tool the account MAY use but the connector is not scoped to is both
+    /// invisible and uncallable — the disclosure bug and the enforcement bug
+    /// are the same requirement seen from two sides.
+    #[test]
+    fn a_connector_scope_hides_and_blocks_the_same_tools() {
+        let fw = framework_with(policy_allowing("dev-box", &["*"]), 10);
+        let principal = test_principal("dev-box");
+        // Note `ledger_*` matches the ADVERTISED name, so it deliberately does
+        // NOT reach `peerone__ledger_accounts` — the namespace forms are what
+        // address federated tools. Both peers are in a group; only one is in
+        // the client's namespaces, which is the case this test is about.
+        let scope = connector_scope(&["ledger_*", "peerone::*", "peertwo::*"], &["peerone"]);
+
+        let catalog = vec![
+            tool_json("ledger_accounts"),
+            tool_json("vitals_summary"),
+            tool_json("peerone__ledger_accounts"),
+            tool_json("peertwo__ledger_accounts"),
+        ];
+        let filtered =
+            fw.filter_catalog_for_client(Some(&principal), Some(&scope), catalog.clone());
+        let visible: Vec<String> = filtered
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+
+        for tool in catalog.iter().filter_map(|t| t["name"].as_str()) {
+            let callable = fw
+                .guard_client_scope(Some(&principal), Some(&scope), tool)
+                .is_ok();
+            assert_eq!(
+                visible.contains(&tool.to_string()),
+                callable,
+                "list/call drift at the gateway seam on {tool}"
+            );
+        }
+        assert_eq!(visible, vec!["ledger_accounts", "peerone__ledger_accounts"]);
+        // And the tool that a group DID match but the namespace refused names
+        // the namespace as the reason, not the group.
+        let denial = fw
+            .guard_client_scope(Some(&principal), Some(&scope), "peertwo__ledger_accounts")
+            .expect_err("an unscoped upstream is uncallable even when a group matches");
+        assert!(denial.contains("no_namespace"), "reason in denial: {denial}");
+    }
+
+    /// A connector with no scoping rows reaches nothing, even when the account
+    /// behind it is unrestricted. The `unwrap_or(full_grant)` refactor would
+    /// break exactly this.
+    #[test]
+    fn an_unscoped_connector_reaches_nothing() {
+        let fw = framework_with(policy_allowing("dev-box", &["*"]), 10);
+        let principal = test_principal("dev-box");
+        let scope = ClientScope::empty("a-connector-client-id");
+
+        let catalog = vec![tool_json("ledger_accounts"), tool_json("vitals_summary")];
+        assert!(fw
+            .filter_catalog_for_client(Some(&principal), Some(&scope), catalog)
+            .is_empty());
+        let denial = fw
+            .guard_client_scope(Some(&principal), Some(&scope), "ledger_accounts")
+            .expect_err("an unscoped connector must reach nothing");
+        assert!(denial.contains("no_group"), "reason in denial: {denial}");
+    }
+
+    /// No principal means no account grant to intersect with, so the connector
+    /// scope alone permits nothing — mirroring
+    /// `filter_catalog_for_principal(None, ..)` and `guard(None, ..)`.
+    #[test]
+    fn a_connector_with_no_principal_reaches_nothing() {
+        let fw = framework_with(policy_allowing("dev-box", &["*"]), 10);
+        let scope = connector_scope(&["*"], &["peerone"]);
+        assert!(fw
+            .filter_catalog_for_client(None, Some(&scope), vec![tool_json("ledger_accounts")])
+            .is_empty());
+        assert!(fw
+            .guard_client_scope(None, Some(&scope), "ledger_accounts")
+            .is_err());
+    }
+
+    /// `None` scope is the NON-OAUTH transport case and must be a byte-for-byte
+    /// passthrough — every existing mTLS and tailnet caller depends on it.
+    /// This is the one place absence is not the empty set, and it is keyed on
+    /// transport rather than on data, which is why it is safe.
+    #[test]
+    fn no_connector_scope_is_a_passthrough_not_an_empty_set() {
+        let fw = framework_with(policy_allowing("dev-box", &["*"]), 10);
+        let principal = test_principal("dev-box");
+        let catalog = vec![tool_json("ledger_accounts"), tool_json("vitals_summary")];
+        let filtered =
+            fw.filter_catalog_for_client(Some(&principal), None, catalog.clone());
+        assert_eq!(filtered, catalog, "a non-OAuth request must be untouched");
+        assert!(fw
+            .guard_client_scope(Some(&principal), None, "ledger_accounts")
+            .is_ok());
+        // Including for an identity the allowlist does not know: with no
+        // connector this method has no opinion at all, and `guard` is what
+        // refuses. Applying the intersection here would be a second, silent
+        // denial path.
+        assert!(fw
+            .guard_client_scope(Some(&test_principal("stranger")), None, "ledger_accounts")
+            .is_ok());
+    }
+
+    /// A malformed catalog entry (no `name`) is dropped rather than passed
+    /// through unjudged, matching `AllowlistPolicy::filter_tools`.
+    #[test]
+    fn a_nameless_catalog_entry_is_dropped_by_the_connector_filter() {
+        let fw = framework_with(policy_allowing("dev-box", &["*"]), 10);
+        let principal = test_principal("dev-box");
+        let scope = connector_scope(&["*"], &[]);
+        let catalog = vec![json!({"description": "no name field"}), tool_json("ledger_accounts")];
+        let (filtered, tally) =
+            fw.filter_catalog_for_client_tallied(Some(&principal), Some(&scope), catalog);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["name"], "ledger_accounts");
+        // The malformed entry is dropped WITHOUT being tallied: it is a
+        // producer bug, and counting it would misattribute one to a permission.
+        assert_eq!(tally.considered(), 1);
+        assert_eq!(tally.denied(), 0);
+    }
+
+    /// The account's deny layer still overrides unconditionally through the
+    /// intersection: it lives inside `Grant::permits`, so `decide`'s first
+    /// check carries it and no connector scope can lose it.
+    #[test]
+    fn the_deny_layer_survives_the_intersection() {
+        let mut map = HashMap::new();
+        map.insert(
+            "dev-box".to_string(),
+            Grant::AllowDeny {
+                allow: vec!["*".to_string()],
+                deny: vec!["secrets_".to_string()],
+            },
+        );
+        let fw = framework_with(AllowlistPolicy::new(map), 10);
+        let principal = test_principal("dev-box");
+        let scope = connector_scope(&["*"], &[]);
+
+        assert!(fw
+            .guard_client_scope(Some(&principal), Some(&scope), "ledger_accounts")
+            .is_ok());
+        let denial = fw
+            .guard_client_scope(Some(&principal), Some(&scope), "secrets_read")
+            .expect_err("a denied tool stays denied through the intersection");
+        assert!(denial.contains("denied_by_grant"));
+        assert!(fw
+            .filter_catalog_for_client(
+                Some(&principal),
+                Some(&scope),
+                vec![tool_json("secrets_read")]
+            )
+            .is_empty());
+    }
+
+    /// Round 1 finding 3: the gateway-less denial path must produce the SAME
+    /// diagnosable record as every other connector-scope denial, rather than
+    /// refusing silently. `audit_client_scope_denial` is a free function
+    /// precisely so that path — which has no `GatewayFramework` to call a
+    /// method on — can reach it.
+    #[test]
+    fn every_connector_denial_carries_a_machine_readable_reason() {
+        let principal = test_principal("dev-box");
+        let scope = connector_scope(&["ledger_*"], &["peerone"]);
+
+        // The gateway-less case, with its own reason code.
+        let detail = audit_client_scope_denial(
+            Some(&principal),
+            &scope,
+            "ledger_accounts",
+            crate::oauth::scope::DENY_NO_ACCOUNT_GRANT,
+        );
+        assert!(detail.contains("reason=no_account_grant"), "{detail}");
+        assert!(detail.contains("client_id=a-connector-client-id"), "{detail}");
+        assert!(detail.contains("tool=ledger_accounts"), "{detail}");
+
+        // A federated name is attributed to its upstream and still carries the
+        // reason — the namespaced branch must not lose it.
+        let federated = audit_client_scope_denial(
+            Some(&principal),
+            &scope,
+            "peertwo__ledger_accounts",
+            crate::oauth::scope::DenyReason::NoNamespace.code(),
+        );
+        assert!(federated.contains("reason=no_namespace"), "{federated}");
+
+        // And with no principal at all it is attributed to the anonymous label
+        // rather than panicking or inventing an identity.
+        let anon = audit_client_scope_denial(
+            None,
+            &scope,
+            "ledger_accounts",
+            crate::oauth::scope::DenyReason::NoGroup.code(),
+        );
+        assert!(anon.contains("reason=no_group"), "{anon}");
+
+        // The guarded path returns the identical text, so the two cannot drift.
+        let fw = framework_with(policy_allowing("dev-box", &["*"]), 10);
+        let via_guard = fw
+            .guard_client_scope(Some(&principal), Some(&scope), "peertwo__ledger_accounts")
+            .expect_err("denied");
+        assert_eq!(via_guard, federated);
+    }
+
+    /// Round 3 finding: a `tools/list` evaluation that hides tools must leave a
+    /// diagnosable trace. One AGGREGATE record per evaluation, carrying counts
+    /// per machine-readable reason — not one record per hidden tool, which on a
+    /// 400-tool catalog would bury the call-path denials that matter.
+    #[test]
+    fn a_filtered_list_is_audited_once_with_counts_per_reason() {
+        // Grant refuses `admin_*`; connector is scoped to `ledger_*` plus one
+        // peer, so all three reasons appear in a single evaluation.
+        let mut map = HashMap::new();
+        map.insert(
+            "dev-box".to_string(),
+            Grant::AllowDeny { allow: vec!["*".to_string()], deny: vec!["admin_".to_string()] },
+        );
+        let fw = framework_with(AllowlistPolicy::new(map), 10);
+        let principal = test_principal("dev-box");
+        let scope = connector_scope(&["ledger_*", "peerone::*"], &["peerone"]);
+
+        let catalog = vec![
+            tool_json("ledger_accounts"),        // allowed
+            tool_json("peerone__ledger_report"), // allowed
+            tool_json("admin_reset"),            // denied_by_grant
+            tool_json("peertwo__ledger_report"), // no_namespace
+            tool_json("vitals_summary"),         // no_group
+        ];
+        // The tally asserted on is the one the FILTER produced, not one
+        // rebuilt here — see `filter_catalog_for_client_tallied`. A test that
+        // recomputes the value it is checking cannot fail when the production
+        // path stops computing it, which is exactly what a mutation run caught.
+        let (kept, tally) =
+            fw.filter_catalog_for_client_tallied(Some(&principal), Some(&scope), catalog);
+        let names: Vec<&str> = kept.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(names, vec!["ledger_accounts", "peerone__ledger_report"]);
+
+        // Each denial must be attributed to the right dimension — that
+        // attribution is the whole diagnostic value of the record.
+        let summary = tally.summary();
+        assert_eq!(tally.considered(), 5);
+        assert_eq!(tally.allowed(), 2);
+        assert_eq!(tally.denied(), 3);
+        assert!(summary.contains("denied_by_grant=1"), "{summary}");
+        assert!(summary.contains("no_namespace=1"), "{summary}");
+        assert!(summary.contains("no_group=1"), "{summary}");
+        // Every reason present even at zero, so a log query cannot silently
+        // miss a row whose count happened to be zero.
+        assert!(summary.contains("no_account_grant=0"), "{summary}");
+    }
+
+    /// A list that hides nothing emits no record — a row per successful list
+    /// would be noise, and the audit stream is for things worth reading.
+    #[test]
+    fn an_unfiltered_list_emits_no_record() {
+        let mut tally = ListFilterTally::default();
+        tally.record(crate::oauth::scope::Decision::Allow);
+        tally.record(crate::oauth::scope::Decision::Allow);
+        assert_eq!(tally.denied(), 0);
+
+        // Nothing to assert on the emitter beyond it being a no-op; the
+        // condition it keys on is the tally, so that is what is asserted.
+        let principal = test_principal("dev-box");
+        let scope = connector_scope(&["*"], &[]);
+        audit_client_scope_list(Some(&principal), &scope, &tally);
+    }
+
+    /// The gateway-less list branch — the one most likely to be forgotten,
+    /// exactly as its `tools/call` twin was a round earlier. Every considered
+    /// tool is attributed to `no_account_grant`, so "the connector suddenly
+    /// sees nothing" reads as a configuration fault rather than as a scoping
+    /// decision nobody made.
+    #[test]
+    fn the_gateway_less_list_branch_attributes_every_tool_to_no_account_grant() {
+        let mut tally = ListFilterTally::default();
+        for _ in 0..4 {
+            tally.record_no_account_grant();
+        }
+        assert_eq!(tally.considered(), 4);
+        assert_eq!(tally.allowed(), 0);
+        assert_eq!(tally.denied(), 4);
+        let summary = tally.summary();
+        assert!(summary.contains("no_account_grant=4"), "{summary}");
+        assert!(summary.contains("allowed=0"), "{summary}");
+        assert!(summary.contains("no_group=0"), "{summary}");
     }
 
     /// A namespace wildcard grant referencing a namespace with no live

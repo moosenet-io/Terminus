@@ -838,6 +838,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         })
     }
 

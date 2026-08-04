@@ -28,6 +28,7 @@ use crate::error::ToolError;
 use crate::oauth::model::{
     Account, AuthCode, Client, Consent, RefreshToken, ServerOwner, ToolGroup,
 };
+use crate::oauth::scope::ScopeWrite;
 use crate::oauth::{Argon2idHash, OauthConfig, SecretHash};
 
 /// Maximum pooled connections. The OAuth endpoints are latency-sensitive
@@ -263,6 +264,7 @@ impl OauthStore {
         owner_account_id: Uuid,
         registration_source: &str,
     ) -> Result<Uuid, ToolError> {
+        let _scope_write = ScopeWrite::begin();
         sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO rmcp_client (client_id, client_secret_hash, name, redirect_uris, \
                                       grant_types, token_endpoint_auth_method, \
@@ -308,6 +310,7 @@ impl OauthStore {
         client_id: Uuid,
         disabled: bool,
     ) -> Result<(), ToolError> {
+        let _scope_write = ScopeWrite::begin();
         sqlx::query("UPDATE rmcp_client SET disabled = $2 WHERE id = $1")
             .bind(client_id)
             .bind(disabled)
@@ -319,6 +322,28 @@ impl OauthStore {
 
     // -----------------------------------------------------------------------
     // Tool groups and client scoping
+    //
+    // INVARIANT: every method touching a table in
+    // `crate::oauth::scope::SCOPE_AFFECTING_TABLES` opens with
+    //
+    //     let _scope_write = ScopeWrite::begin();
+    //
+    // which invalidates RMCP-07's resolution cache on BOTH sides of the write —
+    // before it, so a committed revocation is never served from a cache hit
+    // while the write is still in progress, and again on drop, for a resolve
+    // that read the old rows and is about to cache them. See `ScopeWrite`.
+    //
+    // The binding must be NAMED. `let _ = ScopeWrite::begin()` drops the guard
+    // immediately, putting both bumps before the write and losing the trailing
+    // one entirely.
+    //
+    // This is ENFORCED, not merely stated, and CRATE-WIDE:
+    // `no_in_crate_write_bypasses_scope_invalidation` walks every `.rs` file
+    // under `src/` and fails — naming the file and the function — if a mutation
+    // of one of those tables appears anywhere without the guard. The rule is
+    // not special to this file: a future admin endpoint or ops tool elsewhere
+    // may legitimately write these tables, it simply cannot do so without
+    // invalidating. `ScopeWrite` is `pub(crate)` precisely so it can comply.
     // -----------------------------------------------------------------------
 
     /// Insert a tool group. An empty `patterns` slice is permitted and stores a
@@ -331,6 +356,7 @@ impl OauthStore {
         patterns: &[String],
         owner_account_id: Uuid,
     ) -> Result<Uuid, ToolError> {
+        let _scope_write = ScopeWrite::begin();
         sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO rmcp_tool_group (name, description, patterns, owner_account_id) \
              VALUES ($1, $2, $3, $4) RETURNING id",
@@ -451,6 +477,7 @@ impl OauthStore {
         client_id: Uuid,
         group_ids: &[Uuid],
     ) -> Result<(), ToolError> {
+        let _scope_write = ScopeWrite::begin();
         let mut tx = self.pool.begin().await.map_err(db)?;
 
         // `FOR SHARE` locks the client row for the rest of the transaction, so
@@ -515,6 +542,10 @@ impl OauthStore {
             .await
             .map_err(db)?;
         }
+        // Invalidates on the ERROR path too: a commit that failed to report is
+        // not a commit that provably did not happen, and an unnecessary
+        // invalidation costs one store read while a missed one leaves a revoked
+        // permission live.
         tx.commit().await.map_err(db)
     }
 
@@ -532,6 +563,7 @@ impl OauthStore {
         client_id: Uuid,
         namespaces: &[String],
     ) -> Result<(), ToolError> {
+        let _scope_write = ScopeWrite::begin();
         let mut tx = self.pool.begin().await.map_err(db)?;
 
         // `FOR SHARE`, exactly as in `set_client_tool_groups`. Round 8 caught
@@ -589,6 +621,10 @@ impl OauthStore {
             .await
             .map_err(db)?;
         }
+        // Invalidates on the ERROR path too: a commit that failed to report is
+        // not a commit that provably did not happen, and an unnecessary
+        // invalidation costs one store read while a missed one leaves a revoked
+        // permission live.
         tx.commit().await.map_err(db)
     }
 
@@ -1129,6 +1165,7 @@ impl OauthStore {
         namespace: &str,
         owner_account_id: Uuid,
     ) -> Result<(), ToolError> {
+        let _scope_write = ScopeWrite::begin();
         sqlx::query(
             "INSERT INTO rmcp_server_owner (namespace, owner_account_id) VALUES ($1, $2) \
              ON CONFLICT (namespace) DO UPDATE SET owner_account_id = EXCLUDED.owner_account_id, \
@@ -1175,6 +1212,7 @@ impl OauthStore {
 
     /// Remove a delegation.
     pub async fn clear_server_owner(&self, namespace: &str) -> Result<(), ToolError> {
+        let _scope_write = ScopeWrite::begin();
         sqlx::query("DELETE FROM rmcp_server_owner WHERE namespace = $1")
             .bind(namespace)
             .execute(&self.pool)
@@ -1214,6 +1252,260 @@ fn unique_aware(conflict_message: &'static str) -> impl Fn(sqlx::Error) -> ToolE
 
 #[cfg(test)]
 mod tests {
+
+    /// One function that mutates a scope-affecting table without invalidating.
+    #[derive(Debug, PartialEq, Eq)]
+    struct UnguardedWrite {
+        file: String,
+        function: String,
+        detail: String,
+    }
+
+    /// The detector, as a PURE function over one file's source.
+    ///
+    /// Pure and separately callable for two reasons. It lets the real guard run
+    /// over the WHOLE crate rather than one file (round 6's finding), and it
+    /// lets the detector itself be tested against synthetic source containing a
+    /// deliberate violation — without which "the guard would catch a write in
+    /// another module" would be an untested claim about a scanner that has
+    /// never once seen a positive case.
+    fn scan_for_unguarded_scope_writes(file: &str, source: &str) -> Vec<UnguardedWrite> {
+        // Production code only: a `#[cfg(test)]` module quotes these very SQL
+        // shapes as fixtures.
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(source);
+
+        // Split into functions at ANY indentation — a free function at column 0,
+        // an inherent method at 4, a nested one deeper. The store's methods sit
+        // at 4, but a violation in another module will not.
+        let mut current = "<file scope>".to_string();
+        let mut bodies: Vec<(String, String)> = vec![(current.clone(), String::new())];
+        for line in production.lines() {
+            let trimmed = line.trim_start();
+            let is_fn_decl = trimmed.starts_with("fn ")
+                || trimmed.starts_with("pub fn ")
+                || trimmed.starts_with("async fn ")
+                || trimmed.starts_with("pub async fn ")
+                || trimmed.starts_with("pub(crate) fn ")
+                || trimmed.starts_with("pub(crate) async fn ")
+                || trimmed.starts_with("pub(super) fn ")
+                || trimmed.starts_with("pub(super) async fn ");
+            if is_fn_decl {
+                current = trimmed
+                    .rsplit_once("fn ")
+                    .map(|(_, rest)| rest.split(['(', '<', ' ']).next().unwrap_or(rest).to_string())
+                    .unwrap_or_else(|| trimmed.to_string());
+                bodies.push((current.clone(), String::new()));
+            }
+            // COMMENTS ARE NOT CODE. The store's section comment quotes the
+            // guard verbatim as an example, and without this a method that lost
+            // its real guard could still be "covered" by prose sitting in its
+            // span. A guard satisfied by a comment is the exact failure mode
+            // this whole review thread has been about.
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let last = bodies.last_mut().expect("seeded above");
+            last.1.push_str(line);
+            last.1.push('\n');
+        }
+
+        let verbs = ["INSERT INTO", "UPDATE", "DELETE FROM"];
+        let mut offenders = Vec::new();
+        for (name, body) in &bodies {
+            // Collapse whitespace so the `\` continuations inside multi-line SQL
+            // literals do not hide a `<verb> <table>` pair.
+            let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut mutated: Vec<&str> = Vec::new();
+            for table in crate::oauth::scope::SCOPE_AFFECTING_TABLES {
+                for verb in verbs {
+                    if flat.contains(&format!("{verb} {table}")) {
+                        mutated.push(table);
+                    }
+                }
+            }
+            if mutated.is_empty() {
+                continue;
+            }
+            mutated.sort_unstable();
+            mutated.dedup();
+            if !body.contains("let _scope_write = ScopeWrite::begin();") {
+                offenders.push(UnguardedWrite {
+                    file: file.to_string(),
+                    function: name.clone(),
+                    detail: format!("mutates {mutated:?} without holding the ScopeWrite guard"),
+                });
+            } else if body.contains("let _ = ScopeWrite::begin()") {
+                // The guard's whole value is being HELD across the write. Bound
+                // to `_` it drops immediately, so both bumps land before the
+                // write and the trailing invalidation is silently lost.
+                offenders.push(UnguardedWrite {
+                    file: file.to_string(),
+                    function: name.clone(),
+                    detail: "binds ScopeWrite to `_`, which drops it immediately and loses the \
+                             post-write invalidation — bind it to a NAME"
+                        .to_string(),
+                });
+            }
+        }
+        offenders
+    }
+
+    /// Every `.rs` file under `src/`.
+    fn crate_source_files() -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        files.sort();
+        files
+    }
+
+    /// **Enforces**, across the WHOLE CRATE, that every mutation of a
+    /// scope-affecting table invalidates RMCP-07's resolution cache.
+    ///
+    /// Round 6 of review found this scanning only `store.rs` via
+    /// `include_str!`. That made the enforced invariant "scope-affecting writes
+    /// invalidate, PROVIDED they live in one file" — materially weaker than
+    /// what the README claims, and blind to exactly the thing it exists to
+    /// notice: a future admin endpoint, migration helper or ops tool updating
+    /// `rmcp_server_owner` from another module would bypass the chokepoint
+    /// AND the detector in one step.
+    ///
+    /// The rule is uniform rather than store-specific: ANY function anywhere
+    /// that mutates one of these tables must hold the guard. `ScopeWrite` is
+    /// `pub(crate)`, so a legitimate future writer elsewhere can comply — it
+    /// just cannot do so silently.
+    ///
+    /// Scope boundary, stated so the widened scan is not mistaken for more than
+    /// it is: this proves NO IN-CRATE WRITE can bypass invalidation. It says
+    /// nothing about an out-of-process edit (an operator changing the tables by
+    /// hand), which no in-crate mechanism can observe and which the short cache
+    /// TTL remains the backstop for.
+    #[test]
+    fn no_in_crate_write_bypasses_scope_invalidation() {
+        let files = crate_source_files();
+        assert!(
+            files.len() > 50,
+            "the crate walk found only {} file(s); it is not scanning the tree",
+            files.len()
+        );
+
+        let mut offenders: Vec<UnguardedWrite> = Vec::new();
+        let mut guarded_writes = 0usize;
+        let mut scanned = 0usize;
+        for path in &files {
+            let Ok(source) = std::fs::read_to_string(path) else { continue };
+            scanned += 1;
+            let label = path
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            offenders.extend(scan_for_unguarded_scope_writes(&label, &source));
+            guarded_writes += source
+                .split_once("\n#[cfg(test)]")
+                .map(|(before, _)| before)
+                .unwrap_or(&source)
+                .lines()
+                .filter(|l| {
+                    !l.trim_start().starts_with("//")
+                        && l.contains("let _scope_write = ScopeWrite::begin();")
+                })
+                .count();
+        }
+
+        let report: Vec<String> = offenders
+            .iter()
+            .map(|o| format!("  {}: fn {} — {}", o.file, o.function, o.detail))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "RMCP-07: {} function(s) across the crate mutate a scope-affecting table without \
+             invalidating the resolution cache. A cached connector scope would keep permitting \
+             the OLD answer until the TTL expired — narrowing a group's patterns or a client's \
+             scope is a REVOCATION and must take effect on the next call. Open the function \
+             with `let _scope_write = ScopeWrite::begin();`:\n{}",
+            offenders.len(),
+            report.join("\n")
+        );
+
+        // Non-vacuity, both halves: the walk read real files, and it still sees
+        // the known writes. A refactor that broke the function splitting, or a
+        // path change that silently scanned nothing, fails here rather than
+        // passing green.
+        assert!(scanned > 50, "only {scanned} file(s) were read");
+        assert!(
+            guarded_writes >= 7,
+            "expected the known scope-affecting writes to be found; saw {guarded_writes}"
+        );
+    }
+
+    /// The detector must actually FIRE — and name the file.
+    ///
+    /// Without this, "a write in another module would be caught" is a claim
+    /// about a scanner that has only ever been run against clean source. It is
+    /// also the mutation target: narrow the real guard back to `store.rs` and
+    /// the violation planted in another module here stops being reported.
+    #[test]
+    fn the_detector_catches_an_unguarded_write_in_any_module() {
+        // A plausible future violation: an admin endpoint reassigning a
+        // federated server's owner, in a module that is not the store.
+        let elsewhere = r#"
+pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), ToolError> {
+    sqlx::query("UPDATE rmcp_server_owner SET owner_account_id = $2 WHERE namespace = $1")
+        .bind(ns)
+        .bind(owner)
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(db)
+}
+"#;
+        let found = scan_for_unguarded_scope_writes("src/admin/servers.rs", elsewhere);
+        assert_eq!(found.len(), 1, "the violation must be reported: {found:?}");
+        assert_eq!(found[0].file, "src/admin/servers.rs", "the message must name the FILE");
+        assert_eq!(found[0].function, "reassign_owner", "and the function");
+        assert!(found[0].detail.contains("rmcp_server_owner"));
+
+        // The same write, guarded, is clean.
+        let guarded = elsewhere.replace(
+            "    sqlx::query(",
+            "    let _scope_write = ScopeWrite::begin();\n    sqlx::query(",
+        );
+        assert!(
+            scan_for_unguarded_scope_writes("src/admin/servers.rs", &guarded).is_empty(),
+            "a guarded write elsewhere in the crate is legitimate"
+        );
+
+        // A guard bound to `_` drops immediately and is still an offence.
+        let dropped_early = elsewhere.replace(
+            "    sqlx::query(",
+            "    let _ = ScopeWrite::begin();\n    let _scope_write = ScopeWrite::begin();\n    sqlx::query(",
+        );
+        assert_eq!(
+            scan_for_unguarded_scope_writes("src/admin/servers.rs", &dropped_early).len(),
+            1,
+            "binding the guard to `_` must still be reported"
+        );
+
+        // A table NOT in the scope-affecting set is none of this guard's
+        // business — the rule is keyed on the table, and staying narrow is what
+        // keeps it from flushing the cache on every token issuance.
+        let unrelated = elsewhere.replace("rmcp_server_owner", "rmcp_refresh_token");
+        assert!(scan_for_unguarded_scope_writes("src/oauth/tokens.rs", &unrelated).is_empty());
+    }
     use super::*;
 
     /// The error mapper must not become a channel for the connection string.

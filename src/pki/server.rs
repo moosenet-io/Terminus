@@ -125,6 +125,10 @@ pub struct GatewayServerConfig {
     /// abort — and no path by which an enabled-but-broken door degrades to a
     /// silently closed one on its way through this function.
     pub oauth_resource: Option<Arc<crate::oauth::resource::OauthResourceServer>>,
+
+    /// RMCP-07: the connector-scope resolver, passed through the same way and
+    /// for the same reason as `oauth_resource` above.
+    pub scope_resolver: Option<Arc<dyn crate::oauth::scope::ClientScopeSource>>,
 }
 
 /// Manual `Debug` (rather than `#[derive(Debug)]` on the struct): every
@@ -154,6 +158,7 @@ impl std::fmt::Debug for GatewayServerConfig {
             // Presence only: the resource server holds HMAC key material and a
             // live pool, neither of which belongs in a debug dump.
             .field("oauth_resource", &self.oauth_resource.is_some())
+            .field("scope_resolver", &self.scope_resolver.is_some())
             .finish()
     }
 }
@@ -223,6 +228,7 @@ pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig
         // it DOES read (the principal resolver above) while the one thing that
         // must abort a process aborts in the process's own `main` instead.
         oauth_resource: config.oauth_resource.clone(),
+        scope_resolver: config.scope_resolver.clone(),
     });
 
     // TMOD-05: the admin control plane (`/admin/workers*`) is merged in
@@ -337,6 +343,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         }
     }
 

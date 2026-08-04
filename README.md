@@ -590,6 +590,92 @@ There is deliberately no path by which a client scoping record grants a tool the
 own grant would have denied. A client with no scoping record reaches the **empty set**, not
 the account's full grant; a tool-group pattern matching nothing is empty, not a wildcard.
 
+**One function decides it, for both `tools/list` and `tools/call`.** `oauth::scope::decide`
+is the whole decision; the catalog filter is a `filter` over it and the call gate calls it
+directly. Filtering the catalog without gating the call is a disclosure bug, gating the call
+without filtering the catalog leaks what exists — two *similar* functions is how those drift
+apart, so there is only one. A property test asserts `effective ⊆ account grant` over
+generated grants, pattern sets, namespace sets and catalogs.
+
+Denials are audited with a machine-readable reason, in two shapes — and the difference is
+deliberate:
+
+- **`tools/call`** emits one record per denied call, naming the tool and its exact reason.
+- **`tools/list`** emits **one aggregate record per evaluation**, carrying the client, the
+  principal, how many tools were considered and allowed, and the count per reason. It is
+  emitted only when something was hidden. Individual hidden tool **names are not enumerated**
+  on the list path: a 400-tool catalog would otherwise produce hundreds of records on every
+  list and bury the call-path denials that describe something a caller actually attempted.
+  The counts answer the question an operator actually has — *which dimension is eliminating
+  my tools* — and a call to any hidden tool still yields a per-tool record naming it.
+
+The reasons:
+
+| reason | meaning |
+|---|---|
+| `denied_by_grant` | the **account's own** grant refuses the tool; no connector scoping can widen past it |
+| `no_namespace` | the tool belongs to a federated server this connector is not scoped to |
+| `no_group` | no tool group attached to this connector matches the name |
+| `no_account_grant` | the process has no gateway configured, so there is no account grant to intersect with — a configuration fault, denied rather than permitted |
+
+A connector that mysteriously sees nothing is the case this is for: one `tools/list` row with
+`allowed=0` and the counts alongside says immediately whether the account grant, the
+namespaces, the groups, or a missing gateway is responsible.
+
+**Revocation takes effect immediately, including mid-resolution.** Resolved scopes are
+cached, so every write against a scope-affecting table — a client's groups or namespaces, a
+group's own patterns, a client being disabled, a namespace delegation being reassigned or
+cleared — returns through one chokepoint in the store that bumps a process-wide *generation*
+counter — **on both sides of the write**, and refuses to cache any resolution while a write
+is in progress. Bumping before it means that from the instant a
+revocation begins, no resident cache entry can be served, so there is no interval in which a
+committed revocation is still being honoured from cache; bumping after it catches a
+resolution that read the old rows and is about to cache them, and covers a write that fails
+partway. A resolution may only populate the cache at the generation it began at AND only when no
+write is in flight — the second condition closes the interval between the two bumps, in which
+a read that began after the write started, and returned before it finished, would otherwise
+persist a pre-write answer that is already revoked. Such a read may still compute and serve
+its own answer; it simply may not cache one for later callers. Concurrent readers therefore
+re-derive for the duration of a write — a re-read, not a wrong answer, and no lock is held
+across the database round trip. The
+distinction this protects is that a stale *denial* costs someone a retry, while a stale
+*permit* is revoked authority that still works.
+
+That rule is **enforced rather than documented, across the whole crate**: a test walks every
+Rust source file and fails — naming the file and the function — if a mutation of any
+scope-affecting table appears outside the chokepoint. Editing a group's patterns revokes tools
+from every client the group is attached to, so a future group-CRUD path, admin endpoint or ops
+tool that forgot to invalidate would turn the cache into a window of live revoked authority.
+An obligation written in a comment does not stop that; a red build does.
+
+Two boundaries worth stating precisely, because the difference matters:
+
+- **No in-crate write can bypass invalidation.** That is what the scan proves, and it holds
+  for any module, not merely the store.
+- **Not "no write at all".** A change made directly against the database from outside this
+  process — an operator editing the tables by hand — is invisible to any in-crate mechanism.
+  That case, and only that case, is what the short cache TTL backstops. It is not what makes
+  revocation correct.
+
+A stronger form is possible and is recorded as follow-up rather than claimed: making these
+tables reachable *only* through the store, so a write from elsewhere fails to compile instead
+of failing a test. It is not done here because Rust cannot fully deliver it — nothing stops a
+module opening its own connection pool and issuing SQL, so encapsulation would raise the cost
+of bypassing without closing it, and the source scan is what actually holds the line today.
+
+Pattern syntax inside a tool group is deliberately tiny — an exact tool name, a trailing-`*`
+prefix, or `<namespace>::*` — with no regex (a regex authored by a delegated federation owner
+is a denial-of-service on the dispatch path) and no negation (denial already has a layer,
+which composes on top and overrides unconditionally).
+
+**An unqualified pattern addresses the local namespace and nothing else.** `peer*` matches a
+local `peermetrics` but *not* `peerhub__alerts_list`, even though the advertised name starts
+with `peer` — reaching a federated tool requires an explicitly qualified `peerhub::*`.
+Absence of a qualifier means local-only, never "anything starting this way". The namespace
+dimension does not make this redundant: a connector legitimately scoped to `peerhub` passes
+the namespace check, and without the boundary rule an over-broad local prefix would hand it
+that server's entire catalog.
+
 **"Only I can link my account" is enforced at consent, not at registration.** Possession of
 a `client_id` gets a caller as far as a login screen. Issuing a token needs an argon2id
 password sign-in *and* an explicit approval of a named client and a named capability set. A
@@ -725,6 +811,17 @@ schema lives in `migrations/S132-rmcp01-oauth-core.sql` and
 `migrations/S132-rmcp03-login-session.sql` and is **not** applied at startup: apply it via
 `pg_ddl` as part of the deploy. Until it is, the store reports the door unconfigured rather
 than serving a silently dead auth surface.
+
+**The scoping intersection is wired but not yet reachable.** It is applied at both
+enforcement points in `mcp_server` and enforced by `gateway_framework`, but it engages only
+for a request carrying a resolved connector scope in its extensions — and nothing inserts
+that yet. RMCP-05's resource-server validation is what turns a verified access token into
+one. Until it lands, **every request takes the non-OAuth path and the connector scoping is
+inert**: it is not silently permitting anything (there is no OAuth request for it to permit),
+but neither is it an active control, and it should not be described to anyone as one. Absence
+of a connector scope means "this request did not come through the OAuth door", which is a
+statement about the *transport*; it is never read as "an unscoped connector", which is a
+statement about *data* and always resolves to the empty set.
 
 **Not yet complete.** An account with a TOTP second factor is currently **refused** at
 sign-in rather than admitted on its password alone: the stored seed is encrypted with a

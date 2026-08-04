@@ -272,6 +272,15 @@ pub struct McpServerState {
     /// serve a cert caller and an OAuth caller, and precedence between them is
     /// a per-request decision, not a per-route one.
     pub oauth_resource: Option<Arc<crate::oauth::resource::OauthResourceServer>>,
+
+    /// RMCP-07: resolves an OAuth `client_id` to its connector scope.
+    ///
+    /// `Option` for the same reason as `oauth_resource`: a deployment with no
+    /// OAuth door has no use for it. But the two are INDEPENDENT settings, and
+    /// a request that carries a connector while this is `None` is refused
+    /// rather than let through — see `handle_mcp`. A missing resolver is a
+    /// configuration fault, and the fail-closed reading of a fault is denial.
+    pub scope_resolver: Option<Arc<dyn crate::oauth::scope::ClientScopeSource>>,
 }
 
 impl McpServerState {
@@ -1404,6 +1413,44 @@ async fn handle_mcp(
     // connector quietly stripped off.
     let principal = binding.principal();
 
+    // RMCP-07: the connector scope for this request, read ONCE like the
+    // principal above and used by BOTH the `tools/list` filter and the
+    // `tools/call` gate below — the same value through the same
+    // `crate::oauth::scope::decide`, so visibility and callability cannot
+    // disagree within a request.
+    // RMCP-07: the connector scope for this request, resolved ONCE from the
+    // `client_id` RMCP-05 bound to the token, and used by BOTH the
+    // `tools/list` filter and the `tools/call` gate below — the same value
+    // through the same `crate::oauth::scope::decide`, so visibility and
+    // callability cannot disagree within a request.
+    //
+    // `None` means "this request has no OAuth connector" (every mTLS, tailnet
+    // and loopback caller) and leaves the account grant to decide alone. It
+    // never means "an unscoped connector": resolution never yields absence —
+    // an unknown, disabled or unscoped client resolves to an EMPTY
+    // `ClientScope`, which permits nothing. Conflating the two in either
+    // direction is a bug; read as "empty" it would deny the entire fleet, and
+    // the reverse is the widening this item exists to prevent.
+    let client_scope: Option<Arc<crate::oauth::scope::ClientScope>> =
+        match binding.oauth_client_id() {
+            None => None,
+            Some(client_id) => Some(match &state.scope_resolver {
+                Some(resolver) => resolver.scope_for(client_id).await,
+                // A connector arrived but nothing can resolve what it may
+                // reach. That is a misconfiguration, and the only safe reading
+                // of it is the empty scope — never "unscoped, therefore
+                // unrestricted".
+                None => {
+                    tracing::warn!(
+                        oauth_client_id = %client_id,
+                        "rmcp: no scope resolver is configured, so this connector's scope \
+                         cannot be read; resolving to the empty scope"
+                    );
+                    Arc::new(crate::oauth::scope::ClientScope::empty(client_id))
+                }
+            }),
+        };
+
     // TERM #595: and WHICH HUMAN this turn is being run for, if a trusted
     // principal said so. Resolved ONCE per request from the same server-verified
     // principal above plus a SIGNED, principal-bound assertion -- never from a
@@ -1549,14 +1596,57 @@ async fn handle_mcp(
             // `terminus_personal`, every pre-TGW-04 deployment) preserves
             // the exact pre-MESH-08 behavior: no filtering at all.
             if let Some(gateway) = &state.gateway {
-                // RMCP-05 → RMCP-07 SEAM (visibility half). Today the decision
-                // is the account's grant alone. RMCP-07 intersects it with
-                // `binding.oauth_client_id()`'s tool groups and namespaces —
-                // which is why the whole `binding` is in scope here and not
-                // just a principal: the same value reaches the `tools/call`
-                // gate below, so the catalog a caller SEES and the calls it may
-                // MAKE cannot end up computed from different inputs.
-                tools = gateway.filter_catalog_for_principal(binding.principal(), tools);
+                // RMCP-05 → RMCP-07 SEAM (visibility half), now closed.
+                // `client_scope` is `Some` exactly when `binding` carries a
+                // connector, so the catalog a caller SEES is computed from the
+                // same inputs as the calls it may MAKE.
+                //
+                // An OAuth request takes ONE pass, not two.
+                // `filter_catalog_for_client` re-checks the account grant
+                // itself (it is `decide`'s first check), so the result is
+                // identical to running the principal filter first — but
+                // running that filter first would strip grant-denied tools
+                // BEFORE the connector filter ever saw them, and the aggregate
+                // audit record would then report `denied_by_grant=0` no matter
+                // what the grant did. The single pass is what makes the audit
+                // counts true. A transport caller has no connector and takes
+                // the account-grant-only path unchanged.
+                match client_scope.as_deref() {
+                    Some(scope) => {
+                        tools = gateway.filter_catalog_for_client(
+                            binding.principal(),
+                            Some(scope),
+                            tools,
+                        );
+                    }
+                    None => {
+                        tools = gateway.filter_catalog_for_principal(binding.principal(), tools);
+                    }
+                }
+            } else if let Some(scope) = client_scope.as_deref() {
+                // An OAuth request reaching a process with no gateway: there is
+                // no account grant to intersect WITH, so there is no safe
+                // answer other than the empty one. The alternative — falling
+                // back to the connector scope alone — would be the widening
+                // this item exists to prevent, because a connector scope is
+                // only ever meaningful as the narrow side of an intersection.
+                //
+                // Audited, not merely logged. Round 3 found this branch
+                // substituting an empty catalog with no audit record — the same
+                // gap, in the same shape, as the gateway-less `tools/call`
+                // branch that round 1 found. A connector that suddenly sees
+                // nothing is the case an operator has to diagnose, so it emits
+                // the same aggregate record as every other filtered list.
+                let mut tally = crate::oauth::scope::ListFilterTally::default();
+                for _ in tools.iter() {
+                    tally.record_no_account_grant();
+                }
+                crate::gateway_framework::audit_client_scope_list(
+                    binding.principal(),
+                    scope,
+                    &tally,
+                );
+                tools = Vec::new();
             }
             // TAVAIL-01: availability filter — COMPOSES WITH the authorization filter
             // above, never replaces it. Authorization answers "may THIS principal use
@@ -1609,6 +1699,50 @@ async fn handle_mcp(
             // tool" case below), but the underlying gate decision and its
             // sanitized audit entry are identical to the inference-proxy
             // path's real `403`/`429` HTTP responses.
+            // RMCP-07: the connector-scope gate, run BEFORE `guard()` and
+            // through the SAME `crate::oauth::scope::decide` that filtered the
+            // catalog above — so a tool `tools/list` hid is never callable and
+            // a tool it advertised is never refused here. It denies in the same
+            // JSON-RPC `isError` shape as the gate below and audits with a
+            // machine-readable reason (`no_group` / `no_namespace` /
+            // `denied_by_grant`), so exactly one audit entry is still written
+            // per request. A no-op for every non-OAuth caller.
+            //
+            // Ordering: before `guard()` for the same reason `guard()` runs
+            // authorization before rate limiting — a call the caller was never
+            // permitted to make should not consume its budget. The mirror of
+            // the `tools/list` branch above, an OAuth request on a
+            // gateway-less process, is denied here for the same reason.
+            if let Some(scope) = client_scope.as_deref() {
+                let denial_text = match &state.gateway {
+                    Some(gateway) => gateway
+                        .guard_client_scope(binding.principal(), Some(scope), name)
+                        .err(),
+                    // No gateway means no account grant to intersect with, so
+                    // there is no safe answer but the empty one. Round 1
+                    // finding 3: this used to deny WITHOUT an audit record,
+                    // which made a real denial undiagnosable. It now emits the
+                    // same record as every other connector-scope denial, with
+                    // its own reason code.
+                    None => Some(crate::gateway_framework::audit_client_scope_denial(
+                        binding.principal(),
+                        scope,
+                        name,
+                        crate::oauth::scope::DENY_NO_ACCOUNT_GRANT,
+                    )),
+                };
+                if let Some(denial_text) = denial_text {
+                    return sse_response(
+                        id,
+                        Ok(json!({
+                            "content": [{"type": "text", "text": denial_text}],
+                            "isError": true
+                        })),
+                        "",
+                    );
+                }
+            }
+
             let gate_ctx = if let Some(gateway) = &state.gateway {
                 // RMCP-05 → RMCP-07 SEAM (enforcement half), the twin of the
                 // `tools/list` filter above and fed from the SAME `binding`.
@@ -2530,6 +2664,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         })
     }
 
@@ -2692,6 +2827,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         })
     }
 
@@ -2829,6 +2965,7 @@ mod tests {
                 rmcp_discovery: None,
                 oauth_doors: crate::oauth::metadata::OauthDoors::none(),
                 oauth_resource: None,
+                scope_resolver: None,
             })
         };
         let router = build_router(state);
@@ -2894,6 +3031,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         });
 
         // tools/list: the colliding name is advertised exactly ONCE, as the
@@ -2974,6 +3112,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -3048,6 +3187,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -3101,6 +3241,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -3134,6 +3275,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -3199,6 +3341,7 @@ mod tests {
             rmcp_discovery: Some(Arc::new(discovery)),
             oauth_doors: doors,
             oauth_resource: None,
+            scope_resolver: None,
         })
     }
 
@@ -3337,6 +3480,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         });
         let router = build_router(state);
 
@@ -3570,6 +3714,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: doors,
             oauth_resource: None,
+            scope_resolver: None,
         });
 
         assert!(
@@ -3833,6 +3978,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         })
     }
 
@@ -4009,6 +4155,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         })
     }
 
@@ -4336,8 +4483,33 @@ mod tests {
         .expect("mint")
     }
 
+    /// A scope source that grants every connector the whole catalog.
+    ///
+    /// RMCP-05's tests are about IDENTITY — that a token maps to its account's
+    /// principal, and that the connector is a ceiling rather than an identity.
+    /// With RMCP-07's connector ceiling now wired in, those tests would fail
+    /// for a reason they are not about (an unscoped connector reaches nothing),
+    /// and weakening their assertions to accommodate that would gut the guards
+    /// they exist to be. Giving them a fully-scoped connector keeps each test
+    /// testing its own property. RMCP-07's own behaviour — including the
+    /// fail-closed default when no source is configured — has its own tests.
+    struct ScopeSourceAllowingEverything;
+
+    #[async_trait::async_trait]
+    impl crate::oauth::scope::ClientScopeSource for ScopeSourceAllowingEverything {
+        async fn scope_for(&self, client_id: &str) -> Arc<crate::oauth::scope::ClientScope> {
+            Arc::new(crate::oauth::scope::ClientScope::unrestricted_for_test(client_id))
+        }
+    }
+
     fn state_with_oauth(gateway: GatewayFramework) -> Arc<McpServerState> {
         state_with_oauth_and_discovery(gateway, None)
+    }
+
+    /// The same OAuth state with NO scope source configured — the fail-closed
+    /// deployment case RMCP-07 must refuse rather than let through.
+    fn state_with_oauth_unscoped(gateway: GatewayFramework) -> Arc<McpServerState> {
+        state_with_oauth_scoped(gateway, None, None)
     }
 
     /// As above, plus RMCP-02's discovery surface — which is what gives a `401`
@@ -4345,6 +4517,14 @@ mod tests {
     fn state_with_oauth_and_discovery(
         gateway: GatewayFramework,
         discovery: Option<crate::oauth::metadata::Discovery>,
+    ) -> Arc<McpServerState> {
+        state_with_oauth_scoped(gateway, discovery, Some(Arc::new(ScopeSourceAllowingEverything)))
+    }
+
+    fn state_with_oauth_scoped(
+        gateway: GatewayFramework,
+        discovery: Option<crate::oauth::metadata::Discovery>,
+        scope_resolver: Option<Arc<dyn crate::oauth::scope::ClientScopeSource>>,
     ) -> Arc<McpServerState> {
         let resolver = PrincipalResolver::new(
             serde_json::from_value::<PrincipalMap>(json!({
@@ -4379,6 +4559,7 @@ mod tests {
                 doors
             },
             oauth_resource: Some(oauth_server()),
+            scope_resolver,
         })
     }
 
@@ -4442,6 +4623,40 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["result"]["isError"], false, "mapped OAuth principal must be granted: {body}");
+    }
+
+    /// RMCP-07: an OAuth caller reaching a process with NO scope source
+    /// configured is REFUSED, not let through on its account grant alone.
+    ///
+    /// This is a deliberate behaviour change to what RMCP-05 shipped, and the
+    /// reasoning is the item's premise: an internet-facing door onto the whole
+    /// fleet catalog is only safe if the door is narrower than the room behind
+    /// it. A process that cannot read a connector's ceiling does not know how
+    /// narrow the door is, and "unknown" resolves to denied everywhere else in
+    /// this module. Falling back to the account grant would make a missing
+    /// config field silently produce the unscoped door this item exists to
+    /// prevent.
+    ///
+    /// The identical request succeeds in the test above, whose state HAS a
+    /// scope source — so this pins the fail-closed default rather than some
+    /// unrelated denial.
+    #[tokio::test]
+    async fn rmcp07_an_oauth_caller_is_refused_when_no_scope_source_is_configured() {
+        let router = build_router(state_with_oauth_unscoped(gateway_allowing("lumina", &["health"])));
+        let auth = bearer_header(&oauth_token());
+        let (status, body, _) = post_mcp_to(
+            router,
+            "/mcp",
+            health_call(72),
+            None,
+            &[("authorization", auth.as_str())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["result"]["isError"], true,
+            "a connector whose ceiling cannot be read must reach nothing: {body}"
+        );
     }
 
     /// FINDING 3, the half that proves the connector is NOT the identity.
