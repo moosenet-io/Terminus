@@ -78,6 +78,11 @@ pub const REQUIRED_SCOPE_ENV: &str = "RMCP_REQUIRED_SCOPE";
 /// rather than advertised-but-refusing.
 pub const DCR_ENABLED_ENV: &str = "RMCP_DCR_ENABLED";
 
+/// Operator acknowledgement that a cross-origin [`ISSUER_ENV`] is served
+/// elsewhere. Optional, default off — see [`Discovery::new`] for why a
+/// cross-origin issuer is refused without it.
+pub const ISSUER_EXTERNALLY_SERVED_ENV: &str = "RMCP_ISSUER_EXTERNALLY_SERVED";
+
 /// Default advertised scopes. `offline_access` is present because a hosted
 /// connector that cannot refresh silently degrades into "reauthorize every
 /// hour", which reads to the user as an unreliable server rather than as a
@@ -231,11 +236,16 @@ impl CanonicalUri {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, ""),
         };
-        if authority.is_empty() {
-            return Err(refuse("has no host"));
-        }
         if authority.contains('@') {
             return Err(refuse("must not carry userinfo"));
+        }
+        // Review round 2: an authority is more than "non-empty". `https://:8443`
+        // has a port and no host, and passed the old emptiness check — it would
+        // have been published as a `resource` no client could ever resolve.
+        // Completing a check already started rather than adding a new concern:
+        // userinfo, fragments and queries were already refused here.
+        if let Err(why) = validate_authority(authority) {
+            return Err(refuse(why));
         }
         if raw.ends_with('/') {
             return Err(refuse("must not end with a trailing slash"));
@@ -344,7 +354,24 @@ impl Discovery {
             })
             .unwrap_or(false);
 
-        Self::new(resource, issuer, scopes, required_scope, dcr_enabled).map(Some)
+        let issuer_externally_served = read_env(ISSUER_EXTERNALLY_SERVED_ENV)
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+
+        Self::new(
+            resource,
+            issuer,
+            issuer_externally_served,
+            scopes,
+            required_scope,
+            dcr_enabled,
+        )
+        .map(Some)
     }
 
     /// Build the documents. Separate from [`Self::from_env`] so every property
@@ -353,10 +380,42 @@ impl Discovery {
     pub fn new(
         resource: CanonicalUri,
         issuer: CanonicalUri,
+        issuer_externally_served: bool,
         scopes_supported: Vec<String>,
         required_scope: String,
         dcr_enabled: bool,
     ) -> Result<Self, ToolError> {
+        // Review round 2. This process serves the RFC 8414 metadata document on
+        // ITS OWN origin and nowhere else — an axum router cannot answer for a
+        // host that does not route to it. So a configured issuer on a different
+        // origin produces a protected-resource document naming an authorization
+        // server whose `.well-known` nothing here serves. The client follows
+        // `authorization_servers[0]`, gets whatever that origin returns (very
+        // likely a 404), and reports the same undifferentiated "couldn't reach
+        // the MCP server".
+        //
+        // Refused rather than documented, because the operator has no way to
+        // satisfy it from this configuration: there is no setting here that
+        // makes another host serve a document. The escape hatch exists for the
+        // deployment where the issuer genuinely IS a separate authorization
+        // server that publishes its own metadata — that is a legitimate
+        // architecture and this check must not make it unbuildable — but it
+        // requires the operator to say so explicitly, because the failure it
+        // guards is invisible from this side and silent on the other.
+        if !issuer_externally_served && issuer.origin() != resource.origin() {
+            return Err(ToolError::InvalidArgument(format!(
+                "{ISSUER_ENV} is on a different origin ({}) from {CANONICAL_RESOURCE_ENV} ({}), \
+                 but this process only serves {AUTHORIZATION_SERVER_WELL_KNOWN} on its own \
+                 origin — so nothing would answer the client's discovery request for that \
+                 issuer. Either drop {ISSUER_ENV} (it defaults to the resource's origin, which \
+                 is what a single-host deployment wants), or set \
+                 {ISSUER_EXTERNALLY_SERVED_ENV}=1 to confirm that origin runs its own \
+                 authorization server publishing its own RFC 8414 metadata",
+                issuer.origin(),
+                resource.origin()
+            )));
+        }
+
         if scopes_supported.is_empty() {
             return Err(ToolError::InvalidArgument(format!(
                 "{SCOPES_SUPPORTED_ENV} resolved to an empty scope list — a protected resource \
@@ -530,6 +589,87 @@ impl Discovery {
     }
 }
 
+/// Structural check on a URI authority: a non-empty host, and — when a port is
+/// present — a numeric port in range.
+///
+/// Not a full RFC 3986 host parser, and deliberately not one. The job here is
+/// to rule out an authority that CANNOT name a reachable server, because such a
+/// value would be published as a `resource` no client can resolve and would
+/// then fail as an audience mismatch rather than as a connection error. Deciding
+/// whether a syntactically fine host actually exists is DNS's job, not this
+/// function's.
+///
+/// The bracketed IPv6 form is handled explicitly: without it, `[::1]:8443` reads
+/// as a host containing colons, and either the brackets get rejected or the
+/// port check misfires on the address's own colons.
+fn validate_authority(authority: &str) -> Result<(), &'static str> {
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal. Everything up to `]` is the address; anything after it
+        // must be a port or nothing at all.
+        let Some((inner, after)) = rest.split_once(']') else {
+            return Err("has an unterminated IPv6 literal in its authority");
+        };
+        let port = match after {
+            "" => None,
+            with_port => match with_port.strip_prefix(':') {
+                Some(port) => Some(port),
+                None => return Err("has trailing junk after its IPv6 literal"),
+            },
+        };
+        if inner.is_empty() {
+            return Err("has an empty IPv6 literal");
+        }
+        if !inner
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+        {
+            return Err("has a malformed IPv6 literal");
+        }
+        (inner, port)
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+
+    if host.is_empty() {
+        return Err("has no host");
+    }
+    // A stray colon left in a non-bracketed host means either a second port
+    // separator or a bare IPv6 address that should have been bracketed. Both
+    // are malformed, and both would otherwise sail through.
+    if host.contains(':') {
+        return Err("has a malformed host (an IPv6 address must be bracketed)");
+    }
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+    {
+        return Err("has a host containing characters that are not valid in a hostname");
+    }
+    if host.starts_with('.') || host.ends_with('.') || host.contains("..") {
+        return Err("has a host with an empty label");
+    }
+
+    if let Some(port) = port {
+        if port.is_empty() {
+            return Err("has a colon in its authority but no port");
+        }
+        if !port.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("has a non-numeric port");
+        }
+        // `u16::from_str` rejects anything above 65535; port 0 is syntactically
+        // fine but never listenable, and a URL carrying it is a typo.
+        match port.parse::<u16>() {
+            Ok(0) | Err(_) => return Err("has a port outside the range 1-65535"),
+            Ok(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
 /// Read an env var VERBATIM, treating a blank or whitespace-only value as
 /// absent.
 ///
@@ -630,6 +770,7 @@ mod tests {
         Discovery::new(
             uri("https://connector.test/mcp"),
             uri("https://connector.test"),
+            false,
             vec!["mcp".to_string(), "offline_access".to_string()],
             "mcp".to_string(),
             dcr_enabled,
@@ -646,6 +787,7 @@ mod tests {
         let d = Discovery::new(
             uri(configured),
             uri("https://connector.test"),
+            false,
             vec!["mcp".to_string()],
             "mcp".to_string(),
             false,
@@ -799,6 +941,7 @@ mod tests {
         let bare = Discovery::new(
             uri("https://connector.test"),
             uri("https://connector.test"),
+            false,
             vec!["mcp".to_string()],
             "mcp".to_string(),
             false,
@@ -952,6 +1095,7 @@ mod tests {
         let err = Discovery::new(
             uri("https://connector.test/mcp"),
             uri("https://connector.test"),
+            false,
             vec!["mcp".to_string()],
             "admin".to_string(),
             false,
@@ -962,11 +1106,122 @@ mod tests {
         assert!(Discovery::new(
             uri("https://connector.test/mcp"),
             uri("https://connector.test"),
+            false,
             vec![],
             "mcp".to_string(),
             false,
         )
         .is_err());
+    }
+
+    /// Review round 2: an authority is more than "not empty". Each of these
+    /// would have been published as a `resource` that no client could resolve,
+    /// and would then have failed as an audience mismatch rather than as the
+    /// connection error it actually is.
+    #[test]
+    fn malformed_authorities_are_refused() {
+        for bad in [
+            // A port with no host — the case that passed the old emptiness
+            // check outright.
+            "https://:8443/mcp",
+            "https://:/mcp",
+            // Ports that are not ports.
+            "https://connector.test:/mcp",
+            "https://connector.test:http/mcp",
+            "https://connector.test:8443x/mcp",
+            "https://connector.test:65536/mcp",
+            "https://connector.test:99999/mcp",
+            "https://connector.test:0/mcp",
+            // A bare IPv6 address must be bracketed, or the colons are
+            // indistinguishable from a port separator.
+            "https://::1/mcp",
+            "https://connector.test:8443:9000/mcp",
+            // Malformed brackets.
+            "https://[::1/mcp",
+            "https://[]/mcp",
+            "https://[::1]x/mcp",
+            "https://[zz::gg]/mcp",
+            // Empty host labels.
+            "https://.connector.test/mcp",
+            "https://connector..test/mcp",
+            "https://connector.test./mcp",
+        ] {
+            assert!(
+                CanonicalUri::parse("TEST_VAR", bad).is_err(),
+                "must refuse {bad:?}"
+            );
+        }
+
+        // The guard must not be so eager that it rejects real authorities.
+        for good in [
+            "https://connector.test/mcp",
+            "https://connector.test:8443/mcp",
+            "https://connector.test:1/mcp",
+            "https://connector.test:65535/mcp",
+            "https://sub.connector.test/mcp",
+            "https://connector-1.test/mcp",
+            "https://[::1]/mcp",
+            "https://[::1]:8443/mcp",
+        ] {
+            assert!(
+                CanonicalUri::parse("TEST_VAR", good).is_ok(),
+                "must accept {good:?}"
+            );
+        }
+    }
+
+    /// Review round 2: this process serves the RFC 8414 document on its OWN
+    /// origin and nowhere else, so an issuer on a different origin names an
+    /// authorization server whose metadata nothing here publishes — discovery
+    /// then fails at the client with the same undifferentiated message.
+    /// Refused rather than documented, because there is no setting here that
+    /// makes another host serve a document; the acknowledgement flag exists so
+    /// a genuine separate-authorization-server deployment stays buildable.
+    #[test]
+    fn a_cross_origin_issuer_is_refused_unless_acknowledged() {
+        let err = Discovery::new(
+            uri("https://connector.test/mcp"),
+            uri("https://auth.elsewhere.test"),
+            false,
+            vec!["mcp".to_string()],
+            "mcp".to_string(),
+            false,
+        )
+        .expect_err("a cross-origin issuer must not silently break discovery");
+        let message = err.to_string();
+        assert!(message.contains(ISSUER_EXTERNALLY_SERVED_ENV), "{message}");
+        assert!(message.contains("https://auth.elsewhere.test"), "{message}");
+
+        // Acknowledged: the operator has stated that origin publishes its own
+        // metadata, so the document is built and points there.
+        let acknowledged = Discovery::new(
+            uri("https://connector.test/mcp"),
+            uri("https://auth.elsewhere.test"),
+            true,
+            vec!["mcp".to_string()],
+            "mcp".to_string(),
+            false,
+        )
+        .expect("an acknowledged external issuer must build");
+        let doc: serde_json::Value =
+            serde_json::from_str(acknowledged.protected_resource_json()).expect("valid JSON");
+        assert_eq!(
+            doc["authorization_servers"],
+            json!(["https://auth.elsewhere.test"])
+        );
+
+        // A same-origin issuer with a PATH is not cross-origin and needs no
+        // acknowledgement — the suffixed RFC 8414 well-known covers it, and it
+        // is served from this very router.
+        assert!(Discovery::new(
+            uri("https://connector.test/mcp"),
+            uri("https://connector.test/tenant-a"),
+            false,
+            vec!["mcp".to_string()],
+            "mcp".to_string(),
+            false,
+        )
+        .is_ok());
     }
 
     /// A scope list is configuration, so a typo in it fails loudly rather than

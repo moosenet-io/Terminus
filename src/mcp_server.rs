@@ -1024,9 +1024,42 @@ pub(crate) fn insufficient_scope(
     response
 }
 
-fn is_authorized(state: &McpServerState, headers: &HeaderMap) -> bool {
+/// Whether this request may proceed past the door.
+///
+/// `has_transport_identity` is true when the listener attached a
+/// server-verified identity to the request — an mTLS client certificate or a
+/// resolved tailnet WhoIs. It is NOT derived from any header: both extensions
+/// are inserted by the listener itself post-handshake, so a client cannot set
+/// one (the same property `resolve_principal` relies on).
+///
+/// RMCP-02, review round 2 — the defect this parameter exists to close. The
+/// `None` arm below is the legacy "no token configured, so everyone is
+/// authorized" posture, and it is correct for a loopback/mTLS-only host. But
+/// combined with an ENABLED OAuth door it was a hole of exactly the shape this
+/// whole item exists to prevent: a first-time operator sets
+/// `RMCP_CANONICAL_RESOURCE`, does not set a legacy `TERMINUS_AUTH_TOKEN`
+/// (there is no reason they would — they are configuring OAuth), and an
+/// uncredentialed `/mcp` answers `200`. Discovery is entirely `401`-driven and
+/// a `WWW-Authenticate` on a `200` is discarded, so the connector fails with a
+/// generic "couldn't reach the MCP server" while the metadata documents sit
+/// there being served perfectly. The header would have been right, the status
+/// code wrong, and the status code is the part that carries the meaning.
+///
+/// So when the door is enabled, the open arm narrows: a caller the transport
+/// layer vouched for still passes (this must not break the mTLS and tailnet
+/// callers an existing gateway serves), and anything else — which is precisely
+/// the shape of a request arriving from the public internet — is refused so it
+/// receives the challenge.
+///
+/// A bearer token presented in that state is deliberately NOT accepted either.
+/// Nothing in this item can validate an OAuth access token (that is RMCP-05),
+/// and honouring an unvalidated one would be a live unauthenticated path, which
+/// is a far worse outcome than a client being told to authorize again.
+fn is_authorized(state: &McpServerState, headers: &HeaderMap, has_transport_identity: bool) -> bool {
     let Some(expected) = &state.auth_token else {
-        return true; // no token configured -> unauthenticated posture (matches legacy host)
+        // No shared token configured. Open, UNLESS the OAuth door is on — see
+        // this function's doc for why that combination cannot stay open.
+        return state.rmcp_discovery.is_none() || has_transport_identity;
     };
     let Some(got) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
         return false;
@@ -1048,7 +1081,12 @@ async fn handle_mcp(
     tailnet: Option<Extension<TailnetIdentity>>,
     body: Bytes,
 ) -> Response {
-    if !is_authorized(&state, &headers) {
+    // RMCP-02: the two transport identities are read here, BEFORE dispatch,
+    // purely as a presence check — `resolve_principal` below still does the
+    // real resolution. Both are listener-inserted extensions, never headers, so
+    // a public-internet caller cannot manufacture either one.
+    let has_transport_identity = identity.is_some() || tailnet.is_some();
+    if !is_authorized(&state, &headers, has_transport_identity) {
         return unauthorized(state.rmcp_discovery.as_deref());
     }
 
@@ -2817,6 +2855,7 @@ mod tests {
         let discovery = Discovery::new(
             CanonicalUri::parse("TEST", "https://connector.test/mcp").unwrap(),
             CanonicalUri::parse("TEST", "https://connector.test").unwrap(),
+            false,
             vec!["mcp".to_string(), "offline_access".to_string()],
             "mcp".to_string(),
             false,
@@ -3029,6 +3068,113 @@ mod tests {
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(!resp.headers().contains_key("www-authenticate"));
+    }
+
+    /// REVIEW ROUND 2, and the deployment shape a first-time operator will
+    /// actually have: the OAuth door enabled and NO legacy `auth_token` set —
+    /// because someone configuring OAuth has no reason to also set a shared
+    /// bearer token.
+    ///
+    /// Before the fix this answered `200`. That is the single worst outcome
+    /// available to this item: the whole discovery flow is `401`-driven, a
+    /// `WWW-Authenticate` on a `200` is discarded by the client, and the
+    /// operator sees a generic "couldn't reach the MCP server" while the
+    /// metadata documents are being served perfectly. The header was right and
+    /// the status code was wrong, and the status code is what carries the
+    /// meaning.
+    #[tokio::test]
+    async fn rmcp02_door_enabled_without_a_legacy_token_still_challenges() {
+        let (status, _body, headers) = post_mcp(
+            build_router(rmcp_state(None)),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an uncredentialed call to an OAuth-enabled door must never be 200"
+        );
+        assert!(
+            headers
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|c| c.contains("resource_metadata=")),
+            "and it must carry the challenge that bootstraps discovery"
+        );
+    }
+
+    /// A bearer token presented in that same state must not be honoured either.
+    /// Nothing in this item can validate an OAuth access token (RMCP-05 owns
+    /// that), and accepting an unvalidated one would be a live unauthenticated
+    /// path — strictly worse than telling the client to authorize again.
+    #[tokio::test]
+    async fn rmcp02_an_unvalidatable_bearer_is_not_honoured() {
+        let router = build_router(rmcp_state(None));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer not-a-validatable-access-token")
+            .body(Body::from(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().contains_key("www-authenticate"));
+    }
+
+    /// The narrowing must not break the callers a gateway already serves. An
+    /// mTLS or tailnet caller is vouched for by the LISTENER — an extension
+    /// inserted post-handshake, which a public-internet client cannot
+    /// manufacture — so it keeps the pre-RMCP-02 open posture.
+    #[tokio::test]
+    async fn rmcp02_a_transport_verified_caller_is_unaffected() {
+        for tag in ["mtls", "tailnet"] {
+            let router = build_router(rmcp_state(None));
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(Body::from(
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
+                ))
+                .unwrap();
+            match tag {
+                "mtls" => {
+                    req.extensions_mut()
+                        .insert(ClientIdentity("a-enrolled-service".to_string()));
+                }
+                _ => {
+                    req.extensions_mut().insert(TailnetIdentity {
+                        login: "a-tailnet-account".to_string(),
+                        node: "a-tailnet-peer".to_string(),
+                        tags: vec![],
+                    });
+                }
+            }
+            let resp = router.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "a {tag}-verified caller must keep working"
+            );
+        }
+    }
+
+    /// And a deployment with NO door and no token keeps the legacy open
+    /// posture exactly — the narrowing above is gated on the door, not on the
+    /// absence of a token.
+    #[tokio::test]
+    async fn rmcp02_no_door_and_no_token_stays_open() {
+        let (status, _body, _headers) = post_mcp(
+            build_router(test_state()),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// Insufficient scope is a `403` with its own error code, not a `401`.

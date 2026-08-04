@@ -126,6 +126,7 @@ mod tests {
             Discovery::new(
                 CanonicalUri::parse("TEST", "https://connector.test/mcp").expect("valid"),
                 CanonicalUri::parse("TEST", "https://connector.test").expect("valid"),
+                false,
                 vec!["mcp".to_string(), "offline_access".to_string()],
                 "mcp".to_string(),
                 false,

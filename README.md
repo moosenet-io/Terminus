@@ -841,7 +841,8 @@ fails in a way the client cannot describe.
 | Key | Meaning |
 |---|---|
 | `RMCP_CANONICAL_RESOURCE` | **The connector URL, byte-for-byte as typed into the client's connector form.** Enables the door. |
-| `RMCP_ISSUER` | OAuth issuer identifier. Defaults to the canonical resource's origin. |
+| `RMCP_ISSUER` | OAuth issuer identifier. Defaults to the canonical resource's origin. Must be on that **same origin** unless the flag below is set. |
+| `RMCP_ISSUER_EXTERNALLY_SERVED` | Acknowledges that a cross-origin `RMCP_ISSUER` publishes its own RFC 8414 metadata. Default off. |
 | `RMCP_SCOPES_SUPPORTED` | Space-separated advertised scopes. Default `mcp offline_access`. |
 | `RMCP_REQUIRED_SCOPE` | Scope an access token must carry to reach `/mcp`. Default `mcp`. |
 | `RMCP_DCR_ENABLED` | Advertise and accept RFC 7591 dynamic client registration. Default off. |
@@ -857,7 +858,18 @@ otherwise have had to normalize:
 - **no trailing slash** (`https://host/mcp` and `https://host/mcp/` are different
   audiences — this is the single most common cause of a connector that authorizes and
   then fails every call);
-- no fragment, no query string, no userinfo, no whitespace or non-ASCII.
+- no fragment, no query string, no userinfo, no whitespace or non-ASCII;
+- a real authority: a non-empty host, an IPv6 literal bracketed if present, and a
+  numeric port in `1-65535` if present.
+
+**The issuer must be on the resource's own origin.** This process serves
+`/.well-known/oauth-authorization-server` on its own origin and nowhere else, so an
+`RMCP_ISSUER` pointing at a different host names an authorization server whose metadata
+nothing here publishes — the client follows it, gets a 404, and reports the same generic
+error. That combination is **refused at startup**. If the issuer genuinely is a separate
+authorization server that publishes its own RFC 8414 document, set
+`RMCP_ISSUER_EXTERNALLY_SERVED=1` to say so explicitly. An issuer with a *path* on the
+same origin needs no flag — the path-suffixed well-known covers it and is served here.
 
 A malformed value **aborts startup**. That is deliberate: a *nearly* correct value
 starts fine, serves a document the client fetches happily, and then fails at token
@@ -873,6 +885,14 @@ store is down), and all answering `HEAD` as well as `GET`:
 | `/.well-known/oauth-protected-resource` | RFC 9728 protected-resource metadata |
 | `/.well-known/oauth-protected-resource/<resource path>` | The same document. Clients probe **this** form first. |
 | `/.well-known/oauth-authorization-server` | RFC 8414 authorization-server metadata |
+
+**Enabling the door narrows one legacy posture.** Without `RMCP_CANONICAL_RESOURCE`, a
+gateway configured with no `auth_token` treats every `/mcp` caller as authorized. With
+the door enabled that would answer `200` to exactly the request the discovery flow
+depends on failing, so the open arm narrows: callers the *listener* vouched for (mTLS
+client certificate, resolved tailnet identity) still pass, and everything else — the
+shape a public-internet request has — gets the `401` challenge. Deployments that do not
+set `RMCP_CANONICAL_RESOURCE` are unaffected.
 
 An unauthenticated `POST /mcp` answers `401` with
 `WWW-Authenticate: Bearer realm="…", resource_metadata="…", scope="…"`. That header is
