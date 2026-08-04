@@ -159,6 +159,26 @@ impl OauthStore {
         .map_err(db)
     }
 
+    /// Whether an account exists and is not disabled.
+    ///
+    /// Exists for the token endpoint (RMCP-04), which holds an account UUID
+    /// taken from an authorization code or a refresh-token row rather than a
+    /// name, and must re-check the account on every exchange: a grant is
+    /// created before the account is disabled, and it must not outlive the
+    /// human. Returns `false` — never an error and never a default — for an
+    /// unknown id, so the caller's `if !active { deny }` is correct for both
+    /// "gone" and "turned off", exactly as
+    /// [`Self::find_active_account_by_name`] collapses the same two cases.
+    pub async fn account_is_active(&self, account_id: Uuid) -> Result<bool, ToolError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM rmcp_account WHERE id = $1 AND NOT disabled)",
+        )
+        .bind(account_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)
+    }
+
     /// Insert an account.
     ///
     /// Takes an [`Argon2idHash`], not a `&str`. This layer never hashes — the

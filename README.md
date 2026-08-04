@@ -84,7 +84,7 @@ flowchart LR
 | `pg` | The single sanctioned Postgres door: identity-scoped, approval-gated `pg_*` suite | [reference/pg](docs/reference/pg.md) |
 | `agent_router` | The agentic tool router: identity-scoped selection, local dispatch, Chord for inference only | see below |
 | `availability` | Tool availability state (`available`/`off`/`broken`) — park a dead tool without de-registering it; `tool_availability` is the admin view | see below |
-| `oauth` | The OAuth 2.1 remote-MCP connector door: authorization server, login/consent, per-client tool and server scoping | see below |
+| `oauth` | The OAuth 2.1 remote-MCP connector door: authorization server, login/consent, the token endpoint that mints audience-bound access tokens, and per-client tool and server scoping | see below |
 
 ### Agent tool router — selection, dispatch, and caching
 
@@ -734,6 +734,52 @@ Two properties are load-bearing rather than incidental:
   alone discloses occupancy. The gate runs *before* the client is touched, so an
   unentitled call issues no Plex request at all. It is deliberately **not** in the guest
   baseline.
+
+### The OAuth 2.1 connector door (`oauth`)
+
+Terminus's three existing doors — the loopback listener, mTLS, and the tailnet — all bind
+a caller's identity to a transport artifact: a client-certificate CN, or a tailnet WhoIs.
+That works for the fleet's own services and for machines the operator enrolled by hand. It
+cannot work for a hosted third-party client, which reaches an external MCP server over
+public HTTPS as an **OAuth 2.1 public client with PKCE**. This subsystem is the fourth
+door. It changes how a caller proves who they are; it does not introduce a second way to
+decide what they may do — every request still resolves to an existing `mesh::Principal`,
+and per-client scoping can only ever *narrow* the account's own grant.
+
+**`POST /oauth/token`** (`oauth::token`) implements both grants. Three properties carry the
+security of the whole door:
+
+- **The body is `application/x-www-form-urlencoded`, checked here rather than delegated to
+  a framework extractor.** Hosted clients send both the initial exchange and every refresh
+  that way; a JSON-only parser answers with a bare `415` carrying no `error` field, which a
+  client cannot distinguish from a broken server — every connection would fail identically
+  and silently. A repeated parameter is refused rather than last-write-wins, so a proxy and
+  this origin can never disagree about which `resource` or `scope` was authorized.
+- **Access tokens are audience-bound.** The JWT's `aud` is the RFC 8707 `resource` bound to
+  the *code* (or to the refresh token's family), never a value taken from the request — a
+  `resource` parameter may only *agree* with the binding, never establish one. That is what
+  stops a token minted for a federated peer being replayed at this server. Verification
+  requires the caller to state which audience it is; there is no "any audience" mode.
+- **Refresh tokens rotate, and reuse is treated as theft.** Presenting an already-rotated
+  token revokes the entire family and returns exactly `invalid_grant`: the legitimate
+  holder and the thief cannot be told apart, so both are cut off and the human
+  re-authorizes. Every error is a registered RFC 6749 code, because a hosted client keys
+  its re-authorization on `invalid_grant` and a custom code strands the user permanently.
+
+Ordering is part of the design. Client authentication runs *before* the authorization code
+is touched, so an unauthenticated caller cannot burn codes it does not own; the code is then
+consumed *before* the PKCE, redirect and resource checks, so a stolen code cannot be retried
+with different parameters until one combination is accepted. Single-use and rotation are
+decided in SQL (`oauth::store`) — one conditional `UPDATE` and one transaction — and nothing
+in the endpoint re-implements them, because a read-then-write there would reopen exactly the
+races the store closes. PKCE is compared in constant time, and a code somehow persisted
+without a challenge is **not** exchangeable.
+
+Nothing here stores a presentable credential: codes and refresh tokens are high-entropy
+values kept as SHA-256 digests, client secrets and passwords as argon2id PHC strings. Keys
+and lifetimes come from the vault-materialized environment (`RMCP_OAUTH_SIGNING_KEY` and the
+other `RMCP_*` names in `.env.example`); verification accepts a *previous* signing key for a
+rotation grace window, while minting always uses the current one.
 
 The full inventory (17 subsystems, plus `compiler`, `constellation-web`, `compat`,
 and the crate-root modules) is in [docs/reference/index.md](docs/reference/index.md).

@@ -250,6 +250,24 @@ argon2 = "0.5"
 # so the artifact checksum is computed in-process (testable offline) rather than
 # shelling out to `sha256sum`.
 sha2 = "0.10"
+# RMCP-04: the OAuth token endpoint. Three small, focused additions, all for
+# `src/oauth/`:
+#  - `argon2` verifies a confidential client's `client_secret` against the
+#    argon2id PHC string RMCP-01's schema stores. Its own verifier is used
+#    rather than a re-derive-and-compare, because it reads the salt and cost
+#    parameters back out of the stored string and compares in constant time.
+#  - `getrandom` is the single source of entropy for authorization codes,
+#    refresh tokens and `jti`s (`crate::oauth::random_token`) -- a thin wrapper
+#    over the OS CSPRNG, chosen over a userspace PRNG so there is no seeding or
+#    reseeding-after-fork state to get wrong on a credential-minting path.
+#  - `form_urlencoded` parses the token endpoint's mandatory
+#    `application/x-www-form-urlencoded` body. Already resolved transitively
+#    (via `url`); pinned directly so `src/oauth/token.rs` may call it.
+#  - `argon2` is NOT re-declared here: RMCP-03 already added it above, with
+#    the rationale for using the crate's own default cost parameters. A rebase
+#    auto-merge produced a duplicate key, which cargo rejects outright.
+getrandom = "0.3"
+form_urlencoded = "1"
 # TCLI-03: mTLS listener (`src/pki/mtls.rs`) needs to parse the peer leaf
 # cert's Extended Key Usage + validity window at runtime (post-handshake,
 # fail-closed EKU/expiry check independent of rustls's own chain

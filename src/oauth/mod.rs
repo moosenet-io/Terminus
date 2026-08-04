@@ -38,19 +38,24 @@
 //!
 //! ## What is here so far
 //! - **RMCP-01** — the persistence layer ([`model`], [`store`]) and the two
-//!   credential-storage newtypes below. No HTTP surface of its own.
+//!   credential-storage newtypes below. Deliberately unreachable from the
+//!   network, so the schema and its fail-closed contracts could be reviewed on
+//!   their own.
 //! - **RMCP-03** — the interactive half of the flow: [`authorize`] (the
 //!   endpoint and its state machine), [`session`] (the signed, short-lived
 //!   login cookie), [`password`] (argon2id verification) and [`templates`]
-//!   (the server-rendered login and consent pages). Read
-//!   [`authorize`]'s module docs before changing anything in it: the ORDER of
-//!   its checks is a security property, not a style choice, because the first
-//!   two failures must never produce a redirect.
+//!   (the server-rendered login and consent pages). Read [`authorize`]'s
+//!   module docs before changing anything in it: the ORDER of its checks is a
+//!   security property, not a style choice, because the first two failures
+//!   must never produce a redirect.
+//! - **RMCP-04** — the token endpoint ([`token`]) and access-token minting and
+//!   verification ([`jwt`]). It is a standalone router a binary merges in; it
+//!   is not mounted anywhere by this item.
 //!
-//! Still to land as their own items: the metadata documents (RMCP-02), the
-//! token endpoint (RMCP-04), resource-server validation (RMCP-05) and the
-//! scoping resolver (RMCP-07). None of this is reachable from the network until
-//! a listener mounts [`authorize::router`].
+//! Still to land as their own items: the metadata documents (RMCP-02),
+//! resource-server validation (RMCP-05) and the scoping resolver (RMCP-07).
+//! None of this is reachable from the network until a listener mounts the
+//! relevant router.
 //!
 //! ## Credential storage — nothing here is presentable
 //! No table in this schema stores a usable credential:
@@ -73,11 +78,13 @@
 //! error.
 
 pub mod authorize;
+pub mod jwt;
 pub mod model;
 pub mod password;
 pub mod session;
 pub mod store;
 pub mod templates;
+pub mod token;
 
 use crate::error::ToolError;
 
@@ -149,6 +156,28 @@ pub fn secret_hash(secret: &str) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());
     hasher.finalize().to_vec()
+}
+
+/// Generate a URL-safe, unpadded-base64 token carrying `bytes` bytes of
+/// operating-system entropy.
+///
+/// The one place this module makes a random value — authorization codes,
+/// refresh tokens and `jti`s all come from here, so there is a single answer to
+/// "where does the entropy come from" rather than one per call site.
+///
+/// `getrandom` is used rather than a userspace PRNG deliberately: it is a thin
+/// wrapper over the OS CSPRNG with no seeding, no reseeding-after-fork hazard,
+/// and no fallible-initialisation state to get wrong. A failure is returned
+/// rather than papered over with a weaker source — an entropy failure must
+/// refuse to issue a credential, never quietly issue a guessable one.
+pub fn random_token(bytes: usize) -> Result<String, ToolError> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    let mut buf = vec![0u8; bytes];
+    getrandom::fill(&mut buf).map_err(|e| {
+        ToolError::Execution(format!("cannot read operating-system entropy: {e}"))
+    })?;
+    Ok(URL_SAFE_NO_PAD.encode(buf))
 }
 
 /// A digest of a high-entropy secret, which can ONLY be produced by hashing.
@@ -420,6 +449,23 @@ mod tests {
     fn secret_hash_is_deterministic() {
         assert_eq!(secret_hash("same-input"), secret_hash("same-input"));
         assert_ne!(secret_hash("one-input"), secret_hash("another-input"));
+    }
+
+    /// A credential generator that repeated itself, or that returned a
+    /// predictable value, would be the single worst bug this module could
+    /// have — so the properties are asserted rather than assumed of the OS.
+    #[test]
+    fn random_tokens_are_long_and_never_repeat() {
+        let token = random_token(32).expect("os entropy");
+        // 32 bytes is 43 unpadded base64url characters, and the encoding must
+        // stay URL-safe: these values travel in form bodies.
+        assert_eq!(token.len(), 43);
+        assert!(token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            assert!(seen.insert(random_token(32).expect("os entropy")), "a token repeated");
+        }
     }
 
     /// A blank materialized secret is a MISSING one. If this ever returned
