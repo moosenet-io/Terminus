@@ -283,14 +283,38 @@ pub enum ScopePattern {
     /// a bare `*` to an operator-owned group at write time; that restriction is
     /// a usability and blast-radius guard, not the thing that makes `*` safe.
     All,
-    /// An exact advertised tool name.
-    Exact(String),
-    /// A trailing-`*` prefix over the ADVERTISED name.
+    /// An exact LOCAL tool name.
     ///
-    /// Matching the advertised (namespaced) name rather than the bare one is
-    /// what makes `a*` fail to match `peerone__anything`: the advertised name
-    /// starts with `peerone`, not `a`. Matching the bare name would have made a
-    /// prefix pattern silently reach across every federated server.
+    /// Local-only for the same reason as [`Self::Prefix`]: an unqualified
+    /// pattern addresses the local namespace. A bare pattern that spelled out a
+    /// namespaced name in full (`peerhub__alerts_list`) therefore matches
+    /// nothing — the grammar has no `<namespace>::<tool>` form, so a single
+    /// federated tool is not addressable, and refusing is the fail-closed
+    /// reading of a pattern that cannot be expressed.
+    Exact(String),
+    /// A trailing-`*` prefix, matching LOCAL tool names only.
+    ///
+    /// The local-only restriction is load-bearing and was added after RMCP-06's
+    /// review found the shared semantics wrong. A plain
+    /// `advertised.starts_with(prefix)` crosses namespace boundaries whenever
+    /// the prefix is also a prefix of a NAMESPACE: `peer*` matched
+    /// `peerhub__alerts_list`, so a pattern written for local tools silently
+    /// reached every tool of a federated server whose namespace happened to
+    /// start the same way.
+    ///
+    /// An earlier revision of this file claimed the boundary was already
+    /// enforced because prefixes match the advertised name — `ledger_*` does
+    /// not reach `peerone__ledger_accounts`. That was true, but only
+    /// incidentally: it holds because `peerone…` does not start with `ledger_`,
+    /// not because any rule forbade the crossing. Change the namespace to
+    /// `ledgerhub` and the same pattern reached straight into it. The property
+    /// is now enforced rather than emergent, and pinned by
+    /// `a_bare_prefix_cannot_reach_a_namespace_it_is_a_prefix_of`.
+    ///
+    /// The namespace dimension does not save this case: a client legitimately
+    /// scoped to `peerhub` passes the namespace check, and the over-broad
+    /// pattern is then the only thing standing between it and that server's
+    /// entire catalog.
     Prefix(String),
     /// `<namespace>::*` — every tool advertised under one mesh namespace.
     Namespace(String),
@@ -364,10 +388,15 @@ impl ScopePattern {
     /// parse time. A matcher that can error is a matcher that can be made to
     /// error on the dispatch path.
     pub fn matches(&self, advertised: &str) -> bool {
+        // An UNQUALIFIED pattern addresses the local namespace and nothing
+        // else. Reaching a federated tool requires an explicitly qualified
+        // `<namespace>::*` pattern — absence of a qualifier means local-only,
+        // never "anything that happens to start this way".
+        let is_local = split_namespaced(advertised).is_none();
         match self {
             Self::All => true,
-            Self::Exact(name) => advertised == name,
-            Self::Prefix(prefix) => advertised.starts_with(prefix.as_str()),
+            Self::Exact(name) => is_local && advertised == name,
+            Self::Prefix(prefix) => is_local && advertised.starts_with(prefix.as_str()),
             Self::Namespace(namespace) => {
                 split_namespaced(advertised).is_some_and(|(ns, _)| ns == namespace)
             }
@@ -1146,6 +1175,68 @@ mod tests {
         // itself contains the separator stays inside its own namespace.
         assert!(namespaced.matches("peerone__deep__name"));
         assert!(!ScopePattern::parse("deep::*").unwrap().matches("peerone__deep__name"));
+    }
+
+    /// **The adversarial shape RMCP-06's review found.** A bare prefix that is
+    /// also a strict prefix of a NAMESPACE must not reach into that namespace.
+    ///
+    /// This is the case an unrestricted `starts_with` gets wrong, and the case
+    /// the older `ledger_*` / `peerone__…` test did NOT cover: there the
+    /// pattern failed to match for the incidental reason that the namespace
+    /// spelled differently. Here the namespace begins with the pattern's own
+    /// prefix, so only an actual boundary rule can refuse it.
+    #[test]
+    fn a_bare_prefix_cannot_reach_a_namespace_it_is_a_prefix_of() {
+        let pattern = ScopePattern::parse("peer*").unwrap();
+
+        // Genuinely LOCAL tools starting with the prefix still match — the fix
+        // must narrow the boundary, not break the pattern.
+        assert!(pattern.matches("peermetrics"));
+        assert!(pattern.matches("peer"));
+
+        // But nothing across a namespace boundary, however the namespace is
+        // spelled — including when it starts with the prefix itself.
+        assert!(!pattern.matches("peerhub__alerts_list"));
+        assert!(!pattern.matches("peer__alerts_list"));
+        assert!(!pattern.matches("peermetrics__alerts_list"));
+
+        // A qualified pattern still reaches in, when written deliberately.
+        let qualified = ScopePattern::parse("peerhub::*").unwrap();
+        assert!(qualified.matches("peerhub__alerts_list"));
+        assert!(!qualified.matches("peermetrics"));
+
+        // And a bare EXACT pattern spelling out a namespaced name reaches
+        // nothing: the grammar cannot address one federated tool.
+        let bare_exact = ScopePattern::parse("peerhub__alerts_list").unwrap();
+        assert!(!bare_exact.matches("peerhub__alerts_list"));
+    }
+
+    /// The same boundary at the level that matters — a full [`decide`] where
+    /// the client IS scoped to the namespace, so the namespace dimension passes
+    /// and the pattern is the only thing left to refuse the crossing.
+    ///
+    /// Without the local-only rule this is a genuine unintended permit: the
+    /// connector was granted one federated server and a local-looking prefix,
+    /// and would have received that server's entire catalog.
+    #[test]
+    fn a_bare_prefix_does_not_widen_into_an_allowed_namespace() {
+        let sc = scope(&["peer*"], &["peerhub"]);
+
+        assert!(
+            decide(&allow_all, &sc, "peermetrics").is_allowed(),
+            "the local tool the pattern was written for still works"
+        );
+        assert_eq!(
+            decide(&allow_all, &sc, "peerhub__alerts_list").deny_code(),
+            Some("no_group"),
+            "the namespace check PASSES here — only the pattern boundary refuses this, \
+             which is exactly why the boundary has to be a rule and not a coincidence"
+        );
+
+        // Written deliberately, the qualified form does reach it.
+        let deliberate = scope(&["peer*", "peerhub::*"], &["peerhub"]);
+        assert!(decide(&allow_all, &deliberate, "peerhub__alerts_list").is_allowed());
+        assert!(decide(&allow_all, &deliberate, "peermetrics").is_allowed());
     }
 
     /// Namespace collision: a local tool and a mesh-prefixed tool of the same

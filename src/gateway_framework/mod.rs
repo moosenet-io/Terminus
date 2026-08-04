@@ -2048,8 +2048,27 @@ impl GatewayFramework {
         scope: Option<&ClientScope>,
         tools: Vec<Value>,
     ) -> Vec<Value> {
+        self.filter_catalog_for_client_tallied(principal, scope, tools).0
+    }
+
+    /// [`Self::filter_catalog_for_client`]'s body, also returning the tally it
+    /// audited.
+    ///
+    /// The seam exists because the round-3 tests were checked with a mutation
+    /// run and did NOT catch the regression they were written for: they built a
+    /// tally by hand and asserted on that, so deleting the `tally.record(..)`
+    /// call from the real filter left every test green. A test that
+    /// reconstructs the thing it is meant to be verifying is testing its own
+    /// arithmetic. Returning the production tally makes the assertions bind to
+    /// the production path.
+    pub fn filter_catalog_for_client_tallied(
+        &self,
+        principal: Option<&Principal>,
+        scope: Option<&ClientScope>,
+        tools: Vec<Value>,
+    ) -> (Vec<Value>, ListFilterTally) {
         let Some(scope) = scope else {
-            return tools;
+            return (tools, ListFilterTally::default());
         };
         let grant = self.account_grant(principal);
         let mut tally = ListFilterTally::default();
@@ -2068,7 +2087,7 @@ impl GatewayFramework {
             })
             .collect();
         audit_client_scope_list(principal, scope, &tally);
-        kept
+        (kept, tally)
     }
 }
 
@@ -3205,9 +3224,14 @@ mod tests {
         let principal = test_principal("dev-box");
         let scope = connector_scope(&["*"], &[]);
         let catalog = vec![json!({"description": "no name field"}), tool_json("ledger_accounts")];
-        let filtered = fw.filter_catalog_for_client(Some(&principal), Some(&scope), catalog);
+        let (filtered, tally) =
+            fw.filter_catalog_for_client_tallied(Some(&principal), Some(&scope), catalog);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["name"], "ledger_accounts");
+        // The malformed entry is dropped WITHOUT being tallied: it is a
+        // producer bug, and counting it would misattribute one to a permission.
+        assert_eq!(tally.considered(), 1);
+        assert_eq!(tally.denied(), 0);
     }
 
     /// The account's deny layer still overrides unconditionally through the
@@ -3316,23 +3340,17 @@ mod tests {
             tool_json("peertwo__ledger_report"), // no_namespace
             tool_json("vitals_summary"),         // no_group
         ];
-        let kept = fw.filter_catalog_for_client(Some(&principal), Some(&scope), catalog);
+        // The tally asserted on is the one the FILTER produced, not one
+        // rebuilt here — see `filter_catalog_for_client_tallied`. A test that
+        // recomputes the value it is checking cannot fail when the production
+        // path stops computing it, which is exactly what a mutation run caught.
+        let (kept, tally) =
+            fw.filter_catalog_for_client_tallied(Some(&principal), Some(&scope), catalog);
         let names: Vec<&str> = kept.iter().filter_map(|t| t["name"].as_str()).collect();
         assert_eq!(names, vec!["ledger_accounts", "peerone__ledger_report"]);
 
-        // The tally the record is built from must attribute each denial to the
-        // right dimension — that attribution is the whole diagnostic value.
-        let grant = fw.account_grant(Some(&principal));
-        let mut tally = ListFilterTally::default();
-        for tool in [
-            "ledger_accounts",
-            "peerone__ledger_report",
-            "admin_reset",
-            "peertwo__ledger_report",
-            "vitals_summary",
-        ] {
-            tally.record(crate::oauth::scope::decide(&grant, &scope, tool));
-        }
+        // Each denial must be attributed to the right dimension — that
+        // attribution is the whole diagnostic value of the record.
         let summary = tally.summary();
         assert_eq!(tally.considered(), 5);
         assert_eq!(tally.allowed(), 2);

@@ -643,9 +643,15 @@ that case alone and is not what makes revocation correct.
 Pattern syntax inside a tool group is deliberately tiny — an exact tool name, a trailing-`*`
 prefix, or `<namespace>::*` — with no regex (a regex authored by a delegated federation owner
 is a denial-of-service on the dispatch path) and no negation (denial already has a layer,
-which composes on top and overrides unconditionally). Prefixes match the **advertised** name,
-so `a*` cannot reach `somepeer__anything`; the namespace forms are what address federated
-tools.
+which composes on top and overrides unconditionally).
+
+**An unqualified pattern addresses the local namespace and nothing else.** `peer*` matches a
+local `peermetrics` but *not* `peerhub__alerts_list`, even though the advertised name starts
+with `peer` — reaching a federated tool requires an explicitly qualified `peerhub::*`.
+Absence of a qualifier means local-only, never "anything starting this way". The namespace
+dimension does not make this redundant: a connector legitimately scoped to `peerhub` passes
+the namespace check, and without the boundary rule an over-broad local prefix would hand it
+that server's entire catalog.
 
 **"Only I can link my account" is enforced at consent, not at registration.** Possession of
 a `client_id` gets a caller as far as a login screen. Issuing a token needs an argon2id
