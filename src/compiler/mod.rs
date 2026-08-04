@@ -1377,6 +1377,47 @@ impl Drop for ScratchReclaim {
     }
 }
 
+/// TERM #609: refuse to publish a binary that is not there, and say what is
+/// actually known about why.
+///
+/// The premature-reclaim bug surfaced as a bare `sha256_file` ENOENT on a path
+/// cargo had just written successfully. That reads as a publish or filesystem
+/// fault, so it was chased in the wrong place — the build log showed a clean
+/// `Finished release`, and nothing connected the missing file to a scratch
+/// directory reclaimed by a guard that had gone out of scope.
+///
+/// The first version of this check asserted the cause outright: "this is a
+/// lifetime bug, NOT a publish or disk fault". Two reviewers pointed out that
+/// it cannot know that, which is the same defect it exists to report. Once the
+/// lifetime is fixed, a future firing is by construction something ELSE, so a
+/// confident TERM #609 attribution would misdiagnose it exactly as convincingly
+/// as the bare ENOENT misdiagnosed the original. And `Path::exists()` is false
+/// for a permission or I/O error too, so the disk fault it ruled out was a
+/// fault it could not even distinguish.
+///
+/// So it now separates what it observed from what it suspects: the reason the
+/// file could not be read, stated exactly, plus the known prior cause offered
+/// as a lead rather than a verdict.
+fn ensure_built_binary_present(built_bin: &std::path::Path, module: &str) -> Result<(), ToolError> {
+    match std::fs::metadata(built_bin) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ToolError::Execution(format!(
+            "the built binary for {module} is missing at {} even though the build reported \
+             success. One known cause is its per-job scratch directory being reclaimed before \
+             publish could read it (TERM #609); anything else that removed the artifact between \
+             build and publish would look the same from here.",
+            built_bin.display()
+        ))),
+        // Not absence — we could not look. Saying "missing" here would invent a
+        // fact, and this is the branch where a real disk or permission fault
+        // actually lives.
+        Err(e) => Err(ToolError::Execution(format!(
+            "the built binary for {module} at {} could not be checked before publish: {e}",
+            built_bin.display()
+        ))),
+    }
+}
+
 fn target_triple() -> String {
     env_nonempty(BUILD_TARGET_TRIPLE).unwrap_or_else(|| DEFAULT_TARGET_TRIPLE.to_string())
 }
@@ -3705,6 +3746,30 @@ impl CompilerBuild {
         let built_bin: PathBuf;
         let mut test_outcome: Option<(bool, CargoTestSummary, String)> = None;
 
+        // TERM #609: the reclaim guard lives HERE, at the same scope as the
+        // `built_bin` it protects — not inside the local branch.
+        //
+        // It used to be a `let _scratch_guard` inside `if resolved.is_local()`.
+        // On that path `built_bin` points INTO the reclaimed directory, so the
+        // guard dropped at the end of the branch and deleted the binary
+        // roughly six hundred lines before the publish step tried to hash it:
+        //
+        //   read .../target/<triple>/release/<bin> for sha256:
+        //   No such file or directory (os error 2)
+        //
+        // The cargo build succeeded every time, which is what made it look
+        // like a publish bug rather than a lifetime bug. The remote path was
+        // unaffected only by accident — it copies the artifact to `local_bin`
+        // outside the scratch tree, so nothing it needed was inside the guard.
+        // That asymmetry is why this survived: the heavy path, being the one
+        // usually exercised, kept working while every local build was dead.
+        //
+        // Binding it at this scope ties the directory's lifetime to the last
+        // reader of its contents instead of to the block that happened to
+        // create it. Reclaim still always happens — the guard is dropped when
+        // the function returns, on the error paths too.
+        let mut scratch_guard: Option<ScratchReclaim> = None;
+
         if resolved.is_local() {
             // ── LOCAL build (primary, in place) ──────────────────────────────
             // PCON-10: a PER-JOB CARGO_TARGET_DIR + TMPDIR on the big-disk scratch
@@ -3726,7 +3791,7 @@ impl CompilerBuild {
             // Derive via job_scratch_base — NOT `scratch_root.join(&unit)`. The
             // job component is shortened, so joining the raw unit would name a
             // dir that never existed and leak the real one on every build.
-            let _scratch_guard = ScratchReclaim::new(job_scratch_base(&scratch_root, &unit));
+            scratch_guard = Some(ScratchReclaim::new(job_scratch_base(&scratch_root, &unit)));
             // cargo creates CARGO_TARGET_DIR itself, but TMPDIR must pre-exist.
             std::fs::create_dir_all(&tmp_dir).map_err(|e| {
                 ToolError::Execution(format!(
@@ -4526,6 +4591,9 @@ impl CompilerBuild {
         validate_segment("channel", channel)?;
         // Build done, artifact being checksummed + written → `publishing`.
         bus.emit(request_id, events::Emit::stage(events::Stage::Publishing));
+        // The last reader of `built_bin` starts here, so this is where its
+        // absence has to be caught and named.
+        ensure_built_binary_present(&built_bin, &module)?;
         let published = if let Some(relay_host) = env_nonempty(BUILD_DATASET_RELAY_HOST) {
             // Interim: relay-publish over a single hop to a host with the dataset RW.
             // The plan bundles BOTH the binary and its `.sha256` sidecar so the
@@ -4586,6 +4654,18 @@ impl CompilerBuild {
         } else {
             publish::publish_local(&root, &module, channel, &triple, &bin, &built_bin).await?
         };
+
+        // TERM #609: reclaim the per-job scratch HERE, explicitly, now that the
+        // binary inside it has been hashed and published.
+        //
+        // Dropping it by scope-exit alone would work, but it left the binding
+        // looking dead — the compiler warned it was assigned and never read,
+        // which is an open invitation for someone to delete the assignment and
+        // restore the very bug this fixes. An explicit drop names the moment
+        // reclaim is safe, and puts it after the last reader rather than
+        // wherever a block happens to end. Later exits still reclaim: the guard
+        // is dropped on every path out of this function.
+        drop(scratch_guard.take());
 
         // ── BLD-07 store: on a LOCAL publish (dataset mounted RW on this host),
         // write the per-sha manifest and flip `experimental/current` onto the new
@@ -7836,6 +7916,75 @@ Source:
         assert!(j.contains("-o BatchMode=yes"), "{j}");
         assert!(j.contains("-o ConnectTimeout=10"), "{j}");
         assert_eq!(argv.last().unwrap(), "rm -rf '/mnt/bt/chord-deadbeef'");
+    }
+
+    #[test]
+    fn a_missing_binary_reports_what_is_known_without_asserting_the_cause() {
+        // What made this bug expensive was its DISGUISE: publish reported
+        // `No such file or directory` on a path cargo had just written, under
+        // a clean `Finished release`, so it read as a publish or disk fault
+        // and was hunted there.
+        //
+        // But the fix for a misleading message must not be a differently
+        // misleading message. My first version asserted "this is a lifetime
+        // bug, NOT a publish or disk fault" — a claim it had no way to check,
+        // in a function whose whole purpose is to stop a confident wrong
+        // diagnosis. Once the lifetime is fixed, any future firing is by
+        // construction some other cause.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("target/release/harmony-server");
+
+        let msg = ensure_built_binary_present(&missing, "harmony")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("harmony"), "names the module: {msg}");
+        assert!(msg.contains("TERM #609"), "offers the known lead: {msg}");
+        assert!(
+            msg.contains("One known cause") && msg.contains("would look the same"),
+            "offers it as a LEAD, not a verdict: {msg}"
+        );
+        assert!(
+            !msg.contains("NOT a publish or disk fault"),
+            "must not rule out a cause it cannot distinguish: {msg}"
+        );
+
+        std::fs::create_dir_all(missing.parent().unwrap()).expect("create");
+        std::fs::write(&missing, b"ELF").expect("write");
+        assert!(
+            ensure_built_binary_present(&missing, "harmony").is_ok(),
+            "a present binary publishes normally"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_binary_is_not_reported_as_a_missing_one() {
+        // Path::exists() is false for a permission or I/O error as well as for
+        // genuine absence, so the previous check called an unreadable file
+        // missing — inventing a fact, and doing it in the one branch where a
+        // real disk fault actually lives.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("locked");
+        std::fs::create_dir_all(&dir).expect("create");
+        let target = dir.join("harmony-server");
+        std::fs::write(&target, b"ELF").expect("write");
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let res = ensure_built_binary_present(&target, "harmony");
+        // Restore before asserting, so a failure cannot leave an unremovable dir.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("restore");
+
+        if let Err(e) = res {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("could not be checked"),
+                "an unreadable path is not a missing one: {msg}"
+            );
+            assert!(!msg.contains("TERM #609"), "and is not that bug: {msg}");
+        }
+        // Running as root defeats the permission bit; the NotFound branch above
+        // is the one that must hold in every environment, so this test does not
+        // fail when it cannot create the condition it wants.
     }
 
     #[test]
