@@ -641,14 +641,27 @@ across the database round trip. The
 distinction this protects is that a stale *denial* costs someone a retry, while a stale
 *permit* is revoked authority that still works.
 
-That rule is **enforced rather than documented**: a test reads the store's own source and
-fails, naming the function, if a mutation of any scope-affecting table is ever added outside
-the chokepoint. Editing a group's patterns revokes tools from every client the group is
-attached to, so a future group-CRUD path that forgot to invalidate would turn the cache into
-a window of live revoked authority — an obligation written in a comment does not stop that,
-and a red build does. The only residual is an out-of-process edit (an operator changing the
-tables by hand), which no in-process mechanism can observe; the short TTL is the backstop for
-that case alone and is not what makes revocation correct.
+That rule is **enforced rather than documented, across the whole crate**: a test walks every
+Rust source file and fails — naming the file and the function — if a mutation of any
+scope-affecting table appears outside the chokepoint. Editing a group's patterns revokes tools
+from every client the group is attached to, so a future group-CRUD path, admin endpoint or ops
+tool that forgot to invalidate would turn the cache into a window of live revoked authority.
+An obligation written in a comment does not stop that; a red build does.
+
+Two boundaries worth stating precisely, because the difference matters:
+
+- **No in-crate write can bypass invalidation.** That is what the scan proves, and it holds
+  for any module, not merely the store.
+- **Not "no write at all".** A change made directly against the database from outside this
+  process — an operator editing the tables by hand — is invisible to any in-crate mechanism.
+  That case, and only that case, is what the short cache TTL backstops. It is not what makes
+  revocation correct.
+
+A stronger form is possible and is recorded as follow-up rather than claimed: making these
+tables reachable *only* through the store, so a write from elsewhere fails to compile instead
+of failing a test. It is not done here because Rust cannot fully deliver it — nothing stops a
+module opening its own connection pool and issuing SQL, so encapsulation would raise the cost
+of bypassing without closing it, and the source scan is what actually holds the line today.
 
 Pattern syntax inside a tool group is deliberately tiny — an exact tool name, a trailing-`*`
 prefix, or `<namespace>::*` — with no regex (a regex authored by a delegated federation owner

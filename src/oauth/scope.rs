@@ -687,14 +687,26 @@ pub const DENY_NO_ACCOUNT_GRANT: &str = "no_account_grant";
 /// strictly safer than each keeping its own.
 ///
 /// ## How future writes are held to this
-/// Not by asking them to remember. Every mutation of a table in
-/// [`SCOPE_AFFECTING_TABLES`] is bracketed by a held [`ScopeWrite`] guard, and
+/// Not by asking them to remember, and not only in the store. Every mutation of
+/// a table in [`SCOPE_AFFECTING_TABLES`] — anywhere in the crate — is bracketed
+/// by a held [`ScopeWrite`] guard, and
 /// `store::tests::every_scope_affecting_write_bumps_the_generation` reads the
-/// store's own source and fails if one ever appears outside it. Round 2 of
-/// review found that round 1 had left the tool-group DEFINITION writes
-/// uncovered and had addressed the residual by documenting an obligation for
-/// RMCP-06 — which is the fake-guard shape: a comment describing a rule is not
-/// a rule, because the author who needs it is the one who did not read it.
+/// WHOLE CRATE's source and fails, naming the file and the function, if one
+/// ever appears outside it. Round 2 of review found that round 1 had left the
+/// tool-group DEFINITION writes uncovered and had addressed the residual by
+/// documenting an obligation for RMCP-06 — which is the fake-guard shape: a
+/// comment describing a rule is not a rule, because the author who needs it is
+/// the one who did not read it. Round 6 found the guard itself carried a
+/// narrower version of the same flaw: it scanned one FILE, so its real claim
+/// was "provided the write lives in `store.rs`", while the README claimed the
+/// general rule. A detector blind to the case it exists to catch is the same
+/// shape again, one level up.
+///
+/// FOLLOW-UP (not done here, and not claimed): making these tables reachable
+/// only through the store, so a write from another module fails to COMPILE
+/// rather than failing a test. Rust cannot fully deliver that — nothing stops a
+/// module opening its own pool and issuing SQL — so it would raise the cost of
+/// bypassing without closing it. The crate-wide scan is what holds the line.
 ///
 /// The one thing it cannot see is an out-of-process write (an operator editing
 /// the tables by hand). That is what the short TTL backstop remains for, and
