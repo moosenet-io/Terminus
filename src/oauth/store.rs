@@ -394,7 +394,19 @@ impl OauthStore {
     /// operator had just switched off. Review round 1 (free) flagged exactly
     /// that path; defence in depth costs one join.
     ///
-    /// An unknown client, a disabled client, or a known client with no scope
+    /// TERM #637 (part B, finding 3) added the OWNER-ACCOUNT re-check
+    /// (`JOIN rmcp_account … AND NOT a.disabled`). Disabling an account is what
+    /// an operator reaches for when it is compromised, and without this join a
+    /// disabled owner's groups kept authorizing: the caller behind a token need
+    /// NOT be the client's owner (consent is `(account_id, client_id)` and is
+    /// independent of `rmcp_client.owner_account_id`), so RMCP-05's
+    /// active-account check on the CALLER does not cover the OWNER. The group's
+    /// authority outlived the account it derived from — the same read-path
+    /// re-derivation rule this method already applied to ownership, with one
+    /// input missed.
+    ///
+    /// An unknown client, a disabled client, a client whose owner is disabled,
+    /// or a known client with no scope
     /// rows all yield an EMPTY vector — which RMCP-07 intersects to the empty set. This is the
     /// fail-closed default the whole scoping model rests on, and the reason
     /// this method does not signal "unknown client" differently: there is no
@@ -406,6 +418,7 @@ impl OauthStore {
              JOIN rmcp_client_scope s ON s.tool_group_id = g.id \
              JOIN rmcp_client c ON c.id = s.client_id AND NOT c.disabled \
                                 AND c.owner_account_id = g.owner_account_id \
+             JOIN rmcp_account a ON a.id = g.owner_account_id AND NOT a.disabled \
              WHERE s.client_id = $1 ORDER BY g.name",
         )
         .bind(client_id)
@@ -430,6 +443,12 @@ impl OauthStore {
     /// nothing, consistent with the write path's refusal to attach one: "nobody
     /// has claimed this server" must never read as "everyone may reach it".
     ///
+    /// And joining `rmcp_account` means a DISABLED owner's delegation stops
+    /// resolving too — TERM #637 part B, the symmetric half of the same gap
+    /// closed in [`Self::client_tool_groups`]. A federated server delegated to
+    /// an account that has since been disabled must not remain reachable
+    /// through that account's connectors.
+    ///
     /// Same note to RMCP-12 as on [`Self::client_tool_groups`]: if delegation
     /// introduces a legitimate operator override, THIS is the predicate to
     /// widen deliberately and with tests.
@@ -439,6 +458,7 @@ impl OauthStore {
              JOIN rmcp_client c ON c.id = s.client_id AND NOT c.disabled \
              JOIN rmcp_server_owner o ON o.namespace = s.namespace \
                                      AND o.owner_account_id = c.owner_account_id \
+             JOIN rmcp_account a ON a.id = o.owner_account_id AND NOT a.disabled \
              WHERE s.client_id = $1 ORDER BY s.namespace",
         )
         .bind(client_id)

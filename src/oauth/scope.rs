@@ -262,8 +262,20 @@ where
 /// data rather than a defence against a request body.
 const MAX_PATTERN_LEN: usize = 256;
 
-/// The suffix marking a namespace pattern, per the RMCP-06 vocabulary.
-const NAMESPACE_SUFFIX: &str = "::*";
+/// The delimiter separating a namespace qualifier from the rest of a pattern.
+///
+/// Deliberately NOT [`crate::mesh::MESH_NS_SEP`] (`__`), which is what an
+/// ADVERTISED name uses. TERM #637 settled the vocabulary this way because a
+/// distinct delimiter removes an ambiguity `__` cannot: `a__b__*` has two
+/// legitimate readings (namespace `a`, prefix `b__`; or namespace `a__b`), and
+/// picking one is a fiat that operators will get wrong in the other direction.
+/// `a::b__*` has exactly one reading — and, as a direct consequence, a BARE
+/// tool name may contain `__` freely without becoming ambiguous, which matters
+/// because plenty of them do.
+///
+/// So: patterns qualify with `::`, advertised names separate with `__`, and the
+/// two never have to be told apart by position.
+const NAMESPACE_SEP: &str = "::";
 
 /// One entry in a tool group.
 ///
@@ -277,6 +289,14 @@ const NAMESPACE_SUFFIX: &str = "::*";
 /// > namespace it names; and the bare `*` matches the whole merged catalog,
 /// > local and federated alike, bounded by the client's allowed namespaces at
 /// > RMCP-07's intersection rather than by the matcher.
+///
+/// TERM #637 settled the two open points that ruling did not cover. The
+/// qualifier is `::` (not `__`), and the grammar has FOUR shapes rather than
+/// two: `<ns>::*`, `<ns>::<tool>`, `<ns>::<prefix>*` and the unqualified
+/// local-only pair. The qualified forms exist because without them a connector
+/// could only ever be given a whole federated server — an expressiveness gap
+/// that reads as a broken feature to the first operator who tries the obvious
+/// narrower thing.
 ///
 /// ## Why `*` is exempt rather than inconsistent
 /// This is the part someone will later be tempted to "fix", so the reasoning
@@ -354,6 +374,23 @@ pub enum ScopePattern {
     Prefix(String),
     /// `<namespace>::*` — every tool advertised under one mesh namespace.
     Namespace(String),
+    /// `<namespace>::<tool>` — ONE specific federated tool.
+    ///
+    /// TERM #637 (part B, finding 1): without this form the only way to reach a
+    /// federated tool was to grant its whole namespace, because
+    /// [`Self::Exact`] is local-only. An operator who wants a connector to
+    /// reach exactly one tool on one peer had to hand it the entire peer — the
+    /// opposite of what a scoping feature is for, and the kind of gap that
+    /// reads as "scoping is broken" to whoever tries the obvious thing first.
+    NamespacedExact(String, String),
+    /// `<namespace>::<prefix>*` — a prefix WITHIN one namespace.
+    ///
+    /// TERM #637 (part B, finding 2). The prefix matches the BARE name inside
+    /// the namespace, never the advertised name, so `peerone::weather_*`
+    /// selects `peerone__weather_now` and cannot leak into `peertwo`. This is
+    /// the qualified counterpart of [`Self::Prefix`], and it is what makes the
+    /// two sides of the vocabulary able to express the same set.
+    NamespacedPrefix(String, String),
 }
 
 impl ScopePattern {
@@ -389,25 +426,58 @@ impl ScopePattern {
             return Ok(Self::All);
         }
 
-        if let Some(namespace) = pattern.strip_suffix(NAMESPACE_SUFFIX) {
+        // At most one trailing `*`, wherever it appears. `a*b`, `**` and `*a`
+        // are all refused: accepting them would imply a glob grammar this
+        // matcher does not implement, and an operator who believes they wrote a
+        // glob has written a permission they cannot predict.
+        let trailing_star_only = |body: &str| {
+            let stars = body.matches('*').count();
+            stars == 0 || (stars == 1 && body.ends_with('*'))
+        };
+
+        // QUALIFIED: `<namespace>::<rest>`, split at the FIRST `::`.
+        if let Some((namespace, rest)) = pattern.split_once(NAMESPACE_SEP) {
             if namespace.is_empty() {
                 return Err(refuse("namespace pattern with no namespace"));
             }
-            // `a::b::*` is not a namespace this catalog can produce — mesh
-            // namespaces never contain `:` — so it is refused rather than
-            // quietly matching nothing, which would look like a working rule.
+            // A mesh namespace never contains `:` or `*`, so `a::b::*` and
+            // `a*::x` are refused rather than quietly matching nothing — which
+            // would look like a working rule while granting no access at all.
             if namespace.contains(':') || namespace.contains('*') {
                 return Err(refuse("malformed namespace"));
             }
-            return Ok(Self::Namespace(namespace.to_string()));
+            if rest.is_empty() {
+                return Err(refuse("namespace qualifier with nothing after it"));
+            }
+            // A second `::` is a third component this grammar has no meaning
+            // for. Refusing keeps `split_once` from silently deciding which
+            // half won.
+            if rest.contains(':') {
+                return Err(refuse("only one `::` qualifier is permitted"));
+            }
+            if !trailing_star_only(rest) {
+                return Err(refuse(
+                    "`*` is only permitted as a whole pattern or as a trailing wildcard",
+                ));
+            }
+            if rest == "*" {
+                return Ok(Self::Namespace(namespace.to_string()));
+            }
+            if let Some(prefix) = rest.strip_suffix('*') {
+                // Non-empty: `rest == "*"` was handled above.
+                return Ok(Self::NamespacedPrefix(namespace.to_string(), prefix.to_string()));
+            }
+            return Ok(Self::NamespacedExact(namespace.to_string(), rest.to_string()));
         }
 
-        // Exactly one trailing `*` and no other. `a*b`, `**` and `*a` are all
-        // refused: accepting them would imply a glob grammar this matcher does
-        // not implement, and an operator who believes they wrote a glob has
-        // written a permission they cannot predict.
-        let stars = pattern.matches('*').count();
-        if stars > 1 || (stars == 1 && !pattern.ends_with('*')) {
+        // UNQUALIFIED: local names only. A stray `:` here is a malformed
+        // qualifier (`a:b`, `a:::b`), not a tool name — no advertised name
+        // contains one — so it is refused rather than read as an exact match
+        // that can never fire.
+        if pattern.contains(':') {
+            return Err(refuse("`:` is only meaningful in a `<namespace>::` qualifier"));
+        }
+        if !trailing_star_only(pattern) {
             return Err(refuse("`*` is only permitted as a whole pattern or as a trailing wildcard"));
         }
         if let Some(prefix) = pattern.strip_suffix('*') {
@@ -436,6 +506,15 @@ impl ScopePattern {
             Self::Namespace(namespace) => {
                 split_namespaced(advertised).is_some_and(|(ns, _)| ns == namespace)
             }
+            // The qualified forms match the BARE name inside the named
+            // namespace. Matching the advertised name instead would reintroduce
+            // the boundary bug the local-only rule exists to prevent, one level
+            // in: `peerone::peer*` would then match nothing, or worse, some
+            // other namespace's tool depending on how the halves were compared.
+            Self::NamespacedExact(namespace, name) => split_namespaced(advertised)
+                .is_some_and(|(ns, bare)| ns == namespace && bare == name),
+            Self::NamespacedPrefix(namespace, prefix) => split_namespaced(advertised)
+                .is_some_and(|(ns, bare)| ns == namespace && bare.starts_with(prefix.as_str())),
         }
     }
 }
@@ -1428,6 +1507,130 @@ mod tests {
         // itself contains the separator stays inside its own namespace.
         assert!(namespaced.matches("peerone__deep__name"));
         assert!(!ScopePattern::parse("deep::*").unwrap().matches("peerone__deep__name"));
+    }
+
+    /// TERM #637 part B, findings 1 and 2: the qualified forms.
+    ///
+    /// Before these existed the only way to reach a federated tool was to grant
+    /// its whole namespace, because the unqualified forms are local-only. That
+    /// is a scoping feature that cannot express the narrowest thing an operator
+    /// would ask for first.
+    #[test]
+    fn qualified_patterns_address_one_federated_tool_or_one_prefix_within_a_namespace() {
+        // ONE specific federated tool — and nothing else, in either namespace.
+        let exact = ScopePattern::parse("peerone::weather_now").unwrap();
+        assert_eq!(
+            exact,
+            ScopePattern::NamespacedExact("peerone".into(), "weather_now".into())
+        );
+        assert!(exact.matches("peerone__weather_now"));
+        assert!(!exact.matches("peertwo__weather_now"), "not another namespace");
+        assert!(!exact.matches("weather_now"), "not the local tool of the same name");
+        assert!(!exact.matches("peerone__weather_forecast"), "not a sibling");
+
+        // A prefix WITHIN one namespace.
+        let prefix = ScopePattern::parse("peerone::weather_*").unwrap();
+        assert_eq!(
+            prefix,
+            ScopePattern::NamespacedPrefix("peerone".into(), "weather_".into())
+        );
+        assert!(prefix.matches("peerone__weather_now"));
+        assert!(prefix.matches("peerone__weather_forecast"));
+        assert!(!prefix.matches("peertwo__weather_now"), "cannot leak across the boundary");
+        assert!(!prefix.matches("weather_now"), "and does not reach local tools");
+        assert!(!prefix.matches("peerone__media_search"));
+
+        // The prefix matches the BARE name, so a namespace that merely starts
+        // the same way is not reachable — the round-3 boundary lesson, applied
+        // to the qualified form.
+        let peer = ScopePattern::parse("peer::w*").unwrap();
+        assert!(peer.matches("peer__weather_now"));
+        assert!(!peer.matches("peerone__weather_now"));
+
+        // A bare name containing the advertised separator is addressable,
+        // which is the whole reason the qualifier is `::` and not `__`.
+        let awkward = ScopePattern::parse("peerone::deep__name").unwrap();
+        assert!(awkward.matches("peerone__deep__name"));
+        assert!(ScopePattern::parse("peerone::deep*").unwrap().matches("peerone__deep__name"));
+    }
+
+    /// The qualified forms must not open a hole in the grammar's strictness.
+    #[test]
+    fn qualified_patterns_reject_everything_outside_the_grammar() {
+        for bad in [
+            "::weather_now",     // no namespace
+            "peerone::",         // qualifier with nothing after it
+            "peerone::a::b",     // a third component has no meaning
+            "a::b::*",           // (the pre-existing case, still refused)
+            "peerone::a*b",      // interior star
+            "peerone::*a",       // leading star
+            "peerone::**",
+            "peer*::weather",    // star in the namespace
+            "peer:one::weather", // stray colon in the namespace
+            "weather:now",       // stray colon, unqualified
+        ] {
+            assert!(
+                ScopePattern::parse(bad).is_err(),
+                "must refuse the pattern {bad:?}"
+            );
+        }
+    }
+
+    /// The two halves of the vocabulary must be able to express the SAME set —
+    /// that is what TERM #637 was filed about. For every shape, a qualified
+    /// pattern reaches exactly the federated tools an unqualified one reaches
+    /// locally.
+    #[test]
+    fn qualified_and_unqualified_forms_are_symmetric() {
+        let local = ["weather_now", "weather_forecast", "media_search"];
+        let federated = [
+            "peerone__weather_now",
+            "peerone__weather_forecast",
+            "peerone__media_search",
+        ];
+        for (unqualified, qualified) in [
+            ("weather_now", "peerone::weather_now"),
+            ("weather_*", "peerone::weather_*"),
+        ] {
+            let u = ScopePattern::parse(unqualified).unwrap();
+            let q = ScopePattern::parse(qualified).unwrap();
+            let matched_local: Vec<&str> =
+                local.iter().copied().filter(|t| u.matches(t)).collect();
+            let matched_federated: Vec<String> = federated
+                .iter()
+                .copied()
+                .filter(|t| q.matches(t))
+                .map(|t| t.trim_start_matches("peerone__").to_string())
+                .collect();
+            assert_eq!(
+                matched_local, matched_federated,
+                "{unqualified} and {qualified} must select the same names"
+            );
+        }
+    }
+
+    /// End to end through `decide`: a connector scoped to ONE federated tool
+    /// reaches that tool and nothing else on that peer — the expressiveness gap
+    /// finding 1 was about, at the level that actually gates a call.
+    #[test]
+    fn a_connector_can_be_scoped_to_a_single_federated_tool() {
+        let sc = scope(&["peerone::weather_now"], &["peerone"]);
+        assert!(decide(&allow_all, &sc, "peerone__weather_now").is_allowed());
+        assert_eq!(
+            decide(&allow_all, &sc, "peerone__media_search").deny_code(),
+            Some("no_group"),
+            "the rest of the peer stays out of reach"
+        );
+        assert_eq!(
+            decide(&allow_all, &sc, "peertwo__weather_now").deny_code(),
+            Some("no_namespace"),
+            "and another peer is refused on the namespace dimension first"
+        );
+        assert_eq!(
+            decide(&allow_all, &sc, "weather_now").deny_code(),
+            Some("no_group"),
+            "and the local tool of the same name is NOT granted by a qualified pattern"
+        );
     }
 
     /// **The adversarial shape RMCP-06's review found.** A bare prefix that is
