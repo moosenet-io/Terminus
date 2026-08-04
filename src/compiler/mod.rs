@@ -1354,7 +1354,8 @@ fn check_tmpdir_socket_headroom(
 /// PCON-10: best-effort reclaim of a per-job build-scratch dir on drop — covers
 /// build success AND every `?` early-return path of `build_inner`. A crash that
 /// skips the drop is covered by PCON-05's age/count GC backstop.
-/// TERM #609: refuse to publish a binary that is not there, and SAY WHY.
+/// TERM #609: refuse to publish a binary that is not there, and say what is
+/// actually known about why.
 ///
 /// The premature-reclaim bug surfaced as a bare `sha256_file` ENOENT on a path
 /// cargo had just written successfully. That reads as a publish or filesystem
@@ -1362,18 +1363,36 @@ fn check_tmpdir_socket_headroom(
 /// `Finished release`, and nothing connected the missing file to a scratch
 /// directory reclaimed by a guard that had gone out of scope.
 ///
-/// This cannot prevent the class (a lifetime error is not detectable here),
-/// but it makes the failure name itself instead of presenting as a mystery.
+/// The first version of this check asserted the cause outright: "this is a
+/// lifetime bug, NOT a publish or disk fault". Two reviewers pointed out that
+/// it cannot know that, which is the same defect it exists to report. Once the
+/// lifetime is fixed, a future firing is by construction something ELSE, so a
+/// confident TERM #609 attribution would misdiagnose it exactly as convincingly
+/// as the bare ENOENT misdiagnosed the original. And `Path::exists()` is false
+/// for a permission or I/O error too, so the disk fault it ruled out was a
+/// fault it could not even distinguish.
+///
+/// So it now separates what it observed from what it suspects: the reason the
+/// file could not be read, stated exactly, plus the known prior cause offered
+/// as a lead rather than a verdict.
 fn ensure_built_binary_present(built_bin: &std::path::Path, module: &str) -> Result<(), ToolError> {
-    if built_bin.exists() {
-        return Ok(());
+    match std::fs::metadata(built_bin) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ToolError::Execution(format!(
+            "the built binary for {module} is missing at {} even though the build reported \
+             success. One known cause is its per-job scratch directory being reclaimed before \
+             publish could read it (TERM #609); anything else that removed the artifact between \
+             build and publish would look the same from here.",
+            built_bin.display()
+        ))),
+        // Not absence — we could not look. Saying "missing" here would invent a
+        // fact, and this is the branch where a real disk or permission fault
+        // actually lives.
+        Err(e) => Err(ToolError::Execution(format!(
+            "the built binary for {module} at {} could not be checked before publish: {e}",
+            built_bin.display()
+        ))),
     }
-    Err(ToolError::Execution(format!(
-        "the built binary for {module} is missing at {} even though the build reported success — \
-         its per-job scratch directory was reclaimed before publish could read it (TERM #609). \
-         This is a lifetime bug in the build path, NOT a publish or disk fault.",
-        built_bin.display()
-    )))
 }
 
 struct ScratchReclaim(Option<PathBuf>);
@@ -7900,47 +7919,72 @@ Source:
     }
 
     #[test]
-    fn a_reclaimed_scratch_names_itself_instead_of_a_bare_enoent() {
-        // TERM #609. What made this expensive was not the bug but its
-        // DISGUISE: publish reported `No such file or directory` on a path
-        // cargo had just written, with a clean `Finished release` above it, so
-        // it read as a publish or disk fault and was hunted there.
+    fn a_missing_binary_reports_what_is_known_without_asserting_the_cause() {
+        // What made this bug expensive was its DISGUISE: publish reported
+        // `No such file or directory` on a path cargo had just written, under
+        // a clean `Finished release`, so it read as a publish or disk fault
+        // and was hunted there.
         //
-        // I am being explicit about what this test does and does not do,
-        // because the first attempt at a regression test here was worthless
-        // and two reviewers were right to say so. It constructed the FIXED
-        // arrangement inline and asserted Rust move semantics, so reverting
-        // the production fix left it green — a test that cannot fail is worse
-        // than no test, because it reports safety it never checked.
-        //
-        // This one cannot pin the lifetime either: `built_bin` is produced ~800
-        // lines inside an async fn that shells out to cargo, and there is no
-        // seam that reaches it without a real build. What it DOES pin is that
-        // the failure arrives named. The lifetime itself is now held by the
-        // binding's scope and by the explicit reclaim after publish, and the
-        // honest statement is that those are reviewed, not test-covered.
+        // But the fix for a misleading message must not be a differently
+        // misleading message. My first version asserted "this is a lifetime
+        // bug, NOT a publish or disk fault" — a claim it had no way to check,
+        // in a function whose whole purpose is to stop a confident wrong
+        // diagnosis. Once the lifetime is fixed, any future firing is by
+        // construction some other cause.
         let tmp = tempfile::tempdir().expect("tempdir");
         let missing = tmp.path().join("target/release/harmony-server");
 
-        let err = ensure_built_binary_present(&missing, "harmony").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("TERM #609"), "must name the defect: {msg}");
+        let msg = ensure_built_binary_present(&missing, "harmony")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("harmony"), "names the module: {msg}");
+        assert!(msg.contains("TERM #609"), "offers the known lead: {msg}");
         assert!(
-            msg.contains("reclaimed before publish"),
-            "must name the CAUSE, not just the symptom: {msg}"
+            msg.contains("One known cause") && msg.contains("would look the same"),
+            "offers it as a LEAD, not a verdict: {msg}"
         );
         assert!(
-            msg.contains("NOT a publish or disk fault"),
-            "must rule out the two places this was wrongly hunted: {msg}"
+            !msg.contains("NOT a publish or disk fault"),
+            "must not rule out a cause it cannot distinguish: {msg}"
         );
-        assert!(msg.contains("harmony"), "must name the module: {msg}");
 
         std::fs::create_dir_all(missing.parent().unwrap()).expect("create");
         std::fs::write(&missing, b"ELF").expect("write");
         assert!(
             ensure_built_binary_present(&missing, "harmony").is_ok(),
-            "a present binary must publish normally"
+            "a present binary publishes normally"
         );
+    }
+
+    #[test]
+    fn an_unreadable_binary_is_not_reported_as_a_missing_one() {
+        // Path::exists() is false for a permission or I/O error as well as for
+        // genuine absence, so the previous check called an unreadable file
+        // missing — inventing a fact, and doing it in the one branch where a
+        // real disk fault actually lives.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("locked");
+        std::fs::create_dir_all(&dir).expect("create");
+        let target = dir.join("harmony-server");
+        std::fs::write(&target, b"ELF").expect("write");
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let res = ensure_built_binary_present(&target, "harmony");
+        // Restore before asserting, so a failure cannot leave an unremovable dir.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("restore");
+
+        if let Err(e) = res {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("could not be checked"),
+                "an unreadable path is not a missing one: {msg}"
+            );
+            assert!(!msg.contains("TERM #609"), "and is not that bug: {msg}");
+        }
+        // Running as root defeats the permission bit; the NotFound branch above
+        // is the one that must hold in every environment, so this test does not
+        // fail when it cannot create the condition it wants.
     }
 
     #[test]
