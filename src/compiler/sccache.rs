@@ -847,8 +847,11 @@ pub fn prestart_local(sccache: &SccacheEnv, stable_tmpdir: &str) -> ServerPresta
 /// NEVER written onto a command line (S7), which is exactly why this returns a
 /// fragment for that shell rather than an ssh command of its own.
 ///
-/// Returns an empty string when there is nothing to do, so splicing it in is a
-/// no-op in that case. `|| true` keeps it fail-open (see the type doc).
+/// Always returns a non-empty fragment: the TMPDIR and idle pins are the point
+/// of this function, so there is no "nothing to do" case even when the backend
+/// resolved to the local-disk fallback. (opus review corrected an earlier
+/// comment here that claimed an empty return.) `|| true` keeps it fail-open
+/// (see the type doc).
 pub fn prestart_remote_shell_prefix(
     sccache: &SccacheEnv,
     stable_tmpdir: &str,
