@@ -356,6 +356,7 @@ async fn main() {
         // internet-facing and has no OAuth store, so the door does not exist
         // here and no bearer token is ever inspected.
         oauth_resource: None,
+        scope_resolver: None,
     };
 
     // TCLI-02: the enrollment endpoint is a fully separate, additive router

@@ -626,12 +626,18 @@ namespaces, the groups, or a missing gateway is responsible.
 cached, so every write against a scope-affecting table — a client's groups or namespaces, a
 group's own patterns, a client being disabled, a namespace delegation being reassigned or
 cleared — returns through one chokepoint in the store that bumps a process-wide *generation*
-counter — **on both sides of the write**. Bumping before it means that from the instant a
+counter — **on both sides of the write**, and refuses to cache any resolution while a write
+is in progress. Bumping before it means that from the instant a
 revocation begins, no resident cache entry can be served, so there is no interval in which a
 committed revocation is still being honoured from cache; bumping after it catches a
 resolution that read the old rows and is about to cache them, and covers a write that fails
-partway. A resolution may only populate the cache at the generation it began at. Concurrent
-readers re-derive for the duration of a write — a re-read, not a wrong answer. The
+partway. A resolution may only populate the cache at the generation it began at AND only when no
+write is in flight — the second condition closes the interval between the two bumps, in which
+a read that began after the write started, and returned before it finished, would otherwise
+persist a pre-write answer that is already revoked. Such a read may still compute and serve
+its own answer; it simply may not cache one for later callers. Concurrent readers therefore
+re-derive for the duration of a write — a re-read, not a wrong answer, and no lock is held
+across the database round trip. The
 distinction this protects is that a stale *denial* costs someone a retry, while a stale
 *permit* is revoked authority that still works.
 

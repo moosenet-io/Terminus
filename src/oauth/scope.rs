@@ -648,7 +648,84 @@ pub const DENY_NO_ACCOUNT_GRANT: &str = "no_account_grant";
 /// The one thing it cannot see is an out-of-process write (an operator editing
 /// the tables by hand). That is what the short TTL backstop remains for, and
 /// it is the only residual — stated plainly rather than left implied.
-static SCOPE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SCOPE_EPOCH: ScopeEpoch = ScopeEpoch::new();
+
+/// The two counters that together make invalidation linearizable with reads.
+///
+/// ## Why a generation alone is not enough
+/// A generation says *something changed*. It does not say *a write is in
+/// progress*, and round 5 of review found the interval that distinction leaves
+/// open:
+///
+/// 1. `ScopeWrite::begin` bumps the generation to `g+1`.
+/// 2. A resolver misses the cache, observes `g+1`, and reads the OLD rows while
+///    the transaction is still open.
+/// 3. The write commits.
+/// 4. Before `Drop` bumps to `g+2`, that resolver inserts what it read — at
+///    generation `g+1`, which is *still current*, so the entry is accepted.
+/// 5. A later request is served that entry and uses revoked authority.
+///
+/// The pre-write bump stops old RESIDENT entries being served and the
+/// post-write bump stops a stale result surviving past `Drop`, but neither
+/// stops a read that BEGAN after the pre-bump from populating in the gap.
+///
+/// ## The distinction that fixes it
+/// "May I compute an answer?" is not "may I persist it?". A read that began
+/// before the commit is entitled to compute and serve a pre-write answer —
+/// that is ordinary concurrency, and the request genuinely preceded the
+/// revocation. What must not happen is that answer being CACHED, because
+/// caching is what converts a legitimately-concurrent read into authority
+/// served *after* the commit, to callers who arrived after it.
+///
+/// So [`writes_in_flight`](Self::writes_in_flight) is tracked as its own state
+/// and cache POPULATION refuses while it is non-zero, in addition to the
+/// generation check. Reads still compute; they just do not persist.
+///
+/// A COUNT, not a flag: with two concurrent writers a boolean would let the
+/// second writer's drop clear the first writer's exclusion while its
+/// transaction was still open. The count only returns to zero when the last
+/// guard drops.
+///
+/// This is deliberately NOT a lock. Nothing waits on anything, and no lock is
+/// held across a database round trip — holding one over a transaction is how a
+/// stall appears under load on the exact path an operator is using during an
+/// incident. The only cost is that concurrent readers re-derive for the
+/// duration of a write.
+pub(crate) struct ScopeEpoch {
+    generation: AtomicU64,
+    writes_in_flight: AtomicU64,
+}
+
+impl ScopeEpoch {
+    pub(crate) const fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            writes_in_flight: AtomicU64::new(0),
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    fn bump(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn writes_in_flight(&self) -> u64 {
+        self.writes_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Whether a resolution that observed `observed_generation` may be cached.
+    ///
+    /// Both conditions are required and neither implies the other: the
+    /// generation check catches a read whose answer has been superseded, and
+    /// the in-flight check catches a read whose answer is about to be, in the
+    /// window where the generation has not moved yet.
+    fn may_populate(&self, observed_generation: u64) -> bool {
+        self.writes_in_flight() == 0 && self.generation() == observed_generation
+    }
+}
 
 /// The tables whose contents determine what a connector resolves to.
 ///
@@ -690,7 +767,7 @@ pub const SCOPE_AFFECTING_TABLES: &[&str] = &[
 /// a hot path worth shaving, and a total order is the version of this that is
 /// obviously correct rather than the version that needs an argument.
 pub fn scope_generation() -> u64 {
-    SCOPE_GENERATION.load(Ordering::SeqCst)
+    SCOPE_EPOCH.generation()
 }
 
 /// Advance the epoch, invalidating every cached scope and — crucially — every
@@ -711,7 +788,7 @@ pub fn scope_generation() -> u64 {
 /// rather than authoritative. The cost of losing the race is one extra store
 /// read; the cost of winning it the old way was a live revoked permission.
 pub fn bump_scope_generation() -> u64 {
-    SCOPE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+    SCOPE_EPOCH.bump()
 }
 
 /// Brackets one scope-affecting write, advancing the epoch on BOTH sides of it.
@@ -740,6 +817,14 @@ pub fn bump_scope_generation() -> u64 {
 ///   write fails or panics partway, so a half-applied write never leaves a
 ///   cache the process believes is fresh.
 ///
+/// Neither bump closes the interval BETWEEN them — a read that began after the
+/// pre-bump and returns before the drop finds its observed generation still
+/// current. That is what [`ScopeEpoch`]'s in-flight count is for; read its docs
+/// next. The guard maintains both: the count is incremented before the
+/// generation is bumped and decremented after it is bumped again, so there is
+/// never an instant in which the generation reads as changed while the write
+/// reads as finished.
+///
 /// The cost is re-derivation for concurrent readers for the duration of the
 /// write: a re-read, not a wrong answer. That is the correct direction of error
 /// for an authorization control and the same trade made everywhere else here.
@@ -753,27 +838,39 @@ pub fn bump_scope_generation() -> u64 {
               drops it immediately, so both bumps happen before the write and the \
               post-write invalidation is lost"]
 pub(crate) struct ScopeWrite {
-    counter: &'static AtomicU64,
+    epoch: &'static ScopeEpoch,
 }
 
 impl ScopeWrite {
     /// Begin a scope-affecting write against the process-global epoch.
     pub(crate) fn begin() -> Self {
-        Self::on(&SCOPE_GENERATION)
+        Self::on(&SCOPE_EPOCH)
     }
 
-    /// Begin against an explicit counter, so the ordering can be tested without
+    /// Begin against an explicit epoch, so the ordering can be tested without
     /// racing every other test in the binary — the same injection the cache
-    /// uses. This is the production code path; only the counter differs.
-    fn on(counter: &'static AtomicU64) -> Self {
-        counter.fetch_add(1, Ordering::SeqCst);
-        Self { counter }
+    /// uses. This is the production code path; only the epoch differs.
+    fn on(epoch: &'static ScopeEpoch) -> Self {
+        // ORDER MATTERS. The exclusion is established BEFORE the change is
+        // announced. Bumping first would leave an instant in which the
+        // generation already reads `g+1` while `writes_in_flight` is still 0 —
+        // and a resolver that observed `g+1` in exactly that instant could
+        // populate, which is the hole this guard exists to close.
+        epoch.writes_in_flight.fetch_add(1, Ordering::SeqCst);
+        epoch.bump();
+        Self { epoch }
     }
 }
 
 impl Drop for ScopeWrite {
     fn drop(&mut self) {
-        self.counter.fetch_add(1, Ordering::SeqCst);
+        // The exact mirror, and equally order-sensitive. Decrementing first
+        // would leave an instant with `writes_in_flight == 0` while the
+        // generation still reads `g+1` — so a resolver holding `observed ==
+        // g+1` with pre-write rows would find both checks satisfied and cache
+        // a revoked permit. Bump first, so no such instant exists.
+        self.epoch.bump();
+        self.epoch.writes_in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -797,35 +894,35 @@ struct ScopeCache {
     ttl: Duration,
     /// The epoch this cache is keyed against.
     ///
-    /// A `&'static AtomicU64` rather than a direct reference to
-    /// [`SCOPE_GENERATION`] for one reason: it lets a test give a cache its OWN
-    /// counter. The generation tests assert exact epoch transitions, and on the
-    /// process-global counter they would race every other test that performs a
+    /// A `&'static ScopeEpoch` rather than a direct reference to
+    /// [`SCOPE_EPOCH`] for one reason: it lets a test give a cache its OWN
+    /// epoch. The generation tests assert exact epoch transitions, and on the
+    /// process-global epoch they would race every other test that performs a
     /// scoping write — a guard against a race must not itself be racy.
-    generation: &'static AtomicU64,
+    epoch: &'static ScopeEpoch,
 }
 
 impl ScopeCache {
     /// A cache keyed against the process-global epoch — the only form used
     /// outside tests.
     fn new(ttl: Duration) -> Self {
-        Self::with_counter(ttl, &SCOPE_GENERATION)
+        Self::with_epoch(ttl, &SCOPE_EPOCH)
     }
 
-    fn with_counter(ttl: Duration, generation: &'static AtomicU64) -> Self {
+    fn with_epoch(ttl: Duration, epoch: &'static ScopeEpoch) -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
             ttl,
-            generation,
+            epoch,
         }
     }
 
     fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+        self.epoch.generation()
     }
 
     fn bump(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        self.epoch.bump()
     }
 
     /// A live entry, or `None` when absent, expired, or resolved at a
@@ -859,9 +956,14 @@ impl ScopeCache {
     /// the guarantee: even if an entry does land at a superseded generation,
     /// [`Self::get`] will not serve it.
     fn put_at(&self, client_id: &str, scope: Arc<ClientScope>, observed_generation: u64) {
-        if self.generation() != observed_generation {
-            // A narrowing write landed while this resolve was reading. What it
-            // read may already be revoked, so it is dropped rather than cached.
+        // Two conditions, neither implying the other (see `ScopeEpoch`):
+        // the generation must not have moved since this resolve began, AND no
+        // write may be in progress. The second is what closes the round-5
+        // interval — a read that began after the pre-write bump, read pre-write
+        // rows, and is now trying to persist them while the write's guard is
+        // still held. It computed an answer, which is fine; it must not cache
+        // one, which would serve it to callers who arrived after the commit.
+        if !self.epoch.may_populate(observed_generation) {
             return;
         }
         self.insert(client_id, scope, observed_generation);
@@ -958,7 +1060,7 @@ impl ScopeCache {
 ///   that narrows after a token was issued takes effect on the next call.
 ///
 /// ## Invalidation
-/// Invalidation is driven by the EPOCH ([`SCOPE_GENERATION`]), which the store
+/// Invalidation is driven by the EPOCH ([`SCOPE_EPOCH`]), which the store
 /// bumps from inside its own narrowing writes. It therefore does not depend on
 /// a caller choosing to go through this type: a direct
 /// [`crate::oauth::store::OauthStore`] write, and an ownership or delegation
@@ -1590,8 +1692,12 @@ mod tests {
     /// a scoping write. Leaking one counter per test is a few bytes and buys a
     /// guard against a race that is not itself racy.
     fn isolated_cache(ttl: Duration) -> ScopeCache {
-        let counter: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
-        ScopeCache::with_counter(ttl, counter)
+        ScopeCache::with_epoch(ttl, leaked_epoch())
+    }
+
+    /// A fresh process-independent epoch for one test.
+    fn leaked_epoch() -> &'static ScopeEpoch {
+        Box::leak(Box::new(ScopeEpoch::new()))
     }
 
     /// Cache a scope the way a resolve that started just now would.
@@ -1709,8 +1815,8 @@ mod tests {
     /// property is not itself racing every other test in the binary.
     #[test]
     fn a_read_between_the_commit_and_the_post_write_bump_is_not_served() {
-        let counter: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
-        let cache = ScopeCache::with_counter(Duration::from_secs(3600), counter);
+        let epoch = leaked_epoch();
+        let cache = ScopeCache::with_epoch(Duration::from_secs(3600), epoch);
 
         // A connector's scope is resolved and cached, permitting a tool.
         let permitting = Arc::new(scope(&["media_*"], &[]));
@@ -1720,7 +1826,7 @@ mod tests {
 
         // An operator revokes it. The store method opens by taking the guard,
         // and the database write then commits...
-        let guard = ScopeWrite::on(counter);
+        let guard = ScopeWrite::on(epoch);
 
         // ...and HERE, after the commit and before the guard drops, a
         // concurrent request reads the cache. This is the window.
@@ -1731,35 +1837,131 @@ mod tests {
         );
 
         // The trailing bump still happens, for the in-flight-resolve case.
-        let before_drop = counter.load(Ordering::SeqCst);
+        let before_drop = epoch.generation();
         drop(guard);
         assert!(
-            counter.load(Ordering::SeqCst) > before_drop,
+            epoch.generation() > before_drop,
             "dropping the guard must still advance the epoch"
         );
         assert!(cache.get("cid").is_none());
+    }
+
+    /// **Round 5 finding — the commit-to-drop interval.**
+    ///
+    /// The generation alone says *something changed*; it does not say *a write
+    /// is in progress*. So a resolver that began AFTER the pre-write bump, read
+    /// the old rows, and returns before `Drop` finds its observed generation
+    /// still current and caches a revoked permit.
+    ///
+    /// This is the exact interleaving: pre-bump, a reader that observes `g+1`
+    /// and reads old rows, the commit, then the reader attempting to populate
+    /// while the guard is still held. Remove the `writes_in_flight` half of
+    /// `ScopeEpoch::may_populate` and this test fails — the generation check on
+    /// its own is satisfied, so the stale scope is cached and then served.
+    ///
+    /// ## How this observes the production path
+    /// Every object here is the production one. The guard is `ScopeWrite`, with
+    /// the real `begin` ordering and the real `Drop`. The population attempt
+    /// goes through `ScopeCache::put_at` — the same method
+    /// `ScopeResolver::resolve` calls, with the same `observed` value taken the
+    /// same way (`cache.generation()` before the read). The read is asserted
+    /// through `cache.get`. Nothing is reimplemented: only the epoch is
+    /// injected, so the test does not race the rest of the binary. The mutation
+    /// run is the proof — deleting the production check turns this red.
+    #[test]
+    fn a_read_that_spans_a_write_cannot_populate_before_the_guard_drops() {
+        let epoch = leaked_epoch();
+        let cache = ScopeCache::with_epoch(Duration::from_secs(3600), epoch);
+
+        // 1. The write begins: the store method takes the guard.
+        let guard = ScopeWrite::on(epoch);
+
+        // 2. A resolver misses the cache and observes the CURRENT generation —
+        //    `g+1`, already bumped — then reads the OLD rows, because the
+        //    transaction has not committed yet.
+        let observed = cache.generation();
+        let stale_permitting = Arc::new(scope(&["media_*"], &[]));
+        assert!(
+            decide(&allow_all, &stale_permitting, "media_search").is_allowed(),
+            "precondition: what the reader read still permits the tool"
+        );
+
+        // 3. The write COMMITS. (The commit is in the database; from this
+        //    module's point of view nothing observable changes — which is
+        //    precisely why the generation cannot detect this moment, and why
+        //    the in-flight count has to.)
+
+        // 4. The reader returns and tries to cache what it read, before Drop.
+        cache.put_at("cid", Arc::clone(&stale_permitting), observed);
+
+        assert!(
+            cache.get("cid").is_none(),
+            "a read that spanned a committed write must not be CACHED — it may compute and \
+             serve its own answer, but persisting it would serve revoked authority to callers \
+             who arrived after the commit"
+        );
+        assert_eq!(cache.len(), 0, "and it must not be inserted at all");
+
+        // 5. After the guard drops, the entry is still absent, and a fresh
+        //    resolution caches normally — the fix excludes population during a
+        //    write, it does not disable the cache.
+        drop(guard);
+        assert!(cache.get("cid").is_none());
+        put_now(&cache, "cid", Arc::new(scope(&["weather_*"], &[])));
+        assert!(
+            cache.get("cid").is_some(),
+            "once no write is in flight, resolutions cache again"
+        );
+    }
+
+    /// Concurrent writers: the exclusion must last until the LAST guard drops.
+    /// A boolean instead of a count would let the second writer's drop clear
+    /// the first writer's exclusion while its transaction was still open.
+    #[test]
+    fn concurrent_writes_hold_the_exclusion_until_the_last_one_drops() {
+        let epoch = leaked_epoch();
+        let cache = ScopeCache::with_epoch(Duration::from_secs(3600), epoch);
+
+        let first = ScopeWrite::on(epoch);
+        let second = ScopeWrite::on(epoch);
+        assert_eq!(epoch.writes_in_flight(), 2);
+
+        // The second writer finishes; the first is still mid-transaction.
+        drop(second);
+        assert_eq!(epoch.writes_in_flight(), 1, "one write is still in progress");
+
+        let observed = cache.generation();
+        cache.put_at("cid", Arc::new(scope(&["media_*"], &[])), observed);
+        assert!(
+            cache.get("cid").is_none(),
+            "a boolean would have been cleared by the second writer's drop, letting a stale \
+             scope be cached while the first writer's transaction was still open"
+        );
+
+        drop(first);
+        assert_eq!(epoch.writes_in_flight(), 0);
+        put_now(&cache, "cid", Arc::new(scope(&["media_*"], &[])));
+        assert!(cache.get("cid").is_some());
     }
 
     /// The guard advances the epoch on both sides, and the production
     /// constructor is wired to the same logic as the injected one.
     #[test]
     fn the_write_guard_bumps_before_and_after() {
-        let counter: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
-        let start = counter.load(Ordering::SeqCst);
+        let epoch = leaked_epoch();
+        let start = epoch.generation();
 
         {
-            let _guard = ScopeWrite::on(counter);
+            let _guard = ScopeWrite::on(epoch);
             assert_eq!(
-                counter.load(Ordering::SeqCst),
+                epoch.generation(),
                 start + 1,
                 "the epoch must advance BEFORE the write, not only after it"
             );
+            assert_eq!(epoch.writes_in_flight(), 1, "and the write is marked in progress");
         }
-        assert_eq!(
-            counter.load(Ordering::SeqCst),
-            start + 2,
-            "and again when the guard drops"
-        );
+        assert_eq!(epoch.generation(), start + 2, "and again when the guard drops");
+        assert_eq!(epoch.writes_in_flight(), 0, "and the write is no longer in progress");
 
         // The production entry point advances the global epoch the same way.
         // Only the direction is asserted, because that counter is shared with
@@ -1777,13 +1979,18 @@ mod tests {
     /// in `store` rejects that binding; this pins why it matters.
     #[test]
     fn dropping_the_guard_early_collapses_both_bumps_to_the_front() {
-        let counter: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
-        let start = counter.load(Ordering::SeqCst);
-        let _ = ScopeWrite::on(counter); // dropped immediately
+        let epoch = leaked_epoch();
+        let start = epoch.generation();
+        let _ = ScopeWrite::on(epoch); // dropped immediately
         assert_eq!(
-            counter.load(Ordering::SeqCst),
+            epoch.generation(),
             start + 2,
             "both bumps land up front, so nothing invalidates work that lands later"
+        );
+        assert_eq!(
+            epoch.writes_in_flight(),
+            0,
+            "and the write reads as finished while the database work has not started"
         );
     }
 

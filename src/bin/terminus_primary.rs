@@ -339,6 +339,12 @@ async fn main() {
         rmcp_discovery: rmcp_discovery.map(std::sync::Arc::new),
         oauth_doors: oauth_doors.clone(),
         oauth_resource,
+        // RMCP-07: not wired here yet. The resolver needs its own handle on the
+        // OAuth store, which `resource_server_from_env` currently consumes;
+        // mounting that is RMCP-11/RMCP-14's job. Until then a connector that
+        // reaches `/mcp` resolves to the EMPTY scope and is refused — the
+        // fail-closed reading, and the one `handle_mcp` logs a warning for.
+        scope_resolver: None,
     };
 
     // Same shared setup `terminus_personal` uses (TGW-01 extraction, see
@@ -560,6 +566,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         };
         build_gateway_router(registry, &config)
     }
@@ -587,6 +594,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         };
         build_gateway_router(registry, &config)
     }
@@ -612,6 +620,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         };
         build_gateway_router(registry, &config)
     }
@@ -639,6 +648,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         };
         build_gateway_router(registry, &config)
     }
@@ -791,6 +801,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         };
         let router = build_gateway_router(registry, &config);
         let body = post_mcp(
@@ -1129,6 +1140,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         };
         let router = build_gateway_router(registry, &config);
         let (status, _, _) = post_json(router, "/v1/chat/completions", json!({})).await;

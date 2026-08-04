@@ -2664,6 +2664,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         })
     }
 
@@ -2826,6 +2827,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         })
     }
 
@@ -2963,6 +2965,7 @@ mod tests {
                 rmcp_discovery: None,
                 oauth_doors: crate::oauth::metadata::OauthDoors::none(),
                 oauth_resource: None,
+                scope_resolver: None,
             })
         };
         let router = build_router(state);
@@ -3028,6 +3031,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         });
 
         // tools/list: the colliding name is advertised exactly ONCE, as the
@@ -3108,6 +3112,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -3182,6 +3187,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -3235,6 +3241,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -3268,6 +3275,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -3333,6 +3341,7 @@ mod tests {
             rmcp_discovery: Some(Arc::new(discovery)),
             oauth_doors: doors,
             oauth_resource: None,
+            scope_resolver: None,
         })
     }
 
@@ -3471,6 +3480,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         });
         let router = build_router(state);
 
@@ -3704,6 +3714,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: doors,
             oauth_resource: None,
+            scope_resolver: None,
         });
 
         assert!(
@@ -3967,6 +3978,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         })
     }
 
@@ -4143,6 +4155,7 @@ mod tests {
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
+            scope_resolver: None,
         })
     }
 
@@ -4513,6 +4526,7 @@ mod tests {
                 doors
             },
             oauth_resource: Some(oauth_server()),
+            scope_resolver: None,
         })
     }
 
