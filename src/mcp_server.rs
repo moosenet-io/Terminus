@@ -246,6 +246,15 @@ pub struct McpServerState {
     /// where to get a key before it can check one is inert, whereas the reverse
     /// order would be a live unauthenticated path.
     pub rmcp_discovery: Option<Arc<crate::oauth::metadata::Discovery>>,
+    /// RMCP-02: which OAuth surfaces this process serves — the authoritative
+    /// input to [`McpServerState::oauth_door_enabled`], and through it the only
+    /// thing that narrows `is_authorized`'s open arm.
+    ///
+    /// Deliberately NOT derived from the other fields on this struct. See
+    /// [`crate::oauth::metadata::OauthDoors`] for why two attempts at deriving
+    /// it both missed a door that is switched on somewhere else.
+    /// `OauthDoors::none()` is the pre-RMCP-02 posture and changes nothing.
+    pub oauth_doors: crate::oauth::metadata::OauthDoors,
 }
 
 impl McpServerState {
@@ -287,19 +296,26 @@ impl McpServerState {
     ///
     /// # Adding a door
     ///
-    /// Add ONE clause below. That is the whole integration, and it is not
-    /// optional: `oauth_door_fields_are_all_registered` (in this module's
-    /// tests) scans this struct for OAuth-shaped fields and fails if any of
-    /// them is not named in this function's body. So a future door cannot
-    /// silently reopen the arm — forgetting to register it is a red gate, not a
-    /// production incident. That guard exists precisely because the honest
-    /// answer to "can someone forget?" was yes.
+    /// Nothing. That is the point of round 6's rewrite.
     ///
-    /// RMCP-05's `oauth_resource` is the next clause to land here.
+    /// The first two attempts at this both enumerated: `rmcp_discovery.is_some()`,
+    /// dressed up the second time as a predicate. Both missed RMCP-05's
+    /// resource-server door, which is switched on independently by
+    /// `RMCP_OAUTH_ENABLED` and is not a field here at all — so the open arm
+    /// stayed open and an anonymous, token-less request still reached dispatch
+    /// with a `200`. The source-scan guard could not catch it either, because a
+    /// door configured elsewhere is not an OAuth-shaped field on this struct;
+    /// it read as coverage while providing none, so it has been removed.
+    ///
+    /// [`crate::oauth::metadata::OauthDoors`] now answers the question
+    /// authoritatively, by detecting whether OAuth is configured AT ALL rather
+    /// than by listing doors — see its docs. A door nobody can configure is not
+    /// a door, and the moment one is configurable it is configurable through
+    /// the shared `RMCP_OAUTH_*` prefix, which is what this detects. So a
+    /// future door cannot silently reopen the arm, and no one has to remember
+    /// to register it.
     pub(crate) fn oauth_door_enabled(&self) -> bool {
-        // RMCP-02: the discovery surface. Its presence means this process is
-        // advertising itself to a hosted MCP client over public HTTPS.
-        self.rmcp_discovery.is_some()
+        self.oauth_doors.any()
     }
 }
 
@@ -2240,6 +2256,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::Request;
+    use serial_test::serial; // RMCP-02: env-mutating door-detection tests
     use tower::ServiceExt; // for `oneshot`
 
     struct EchoHealthTool;
@@ -2276,6 +2293,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         })
     }
 
@@ -2436,6 +2454,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes,
             rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         })
     }
 
@@ -2571,6 +2590,7 @@ mod tests {
                 principal_resolver: PrincipalResolver::default(),
                 broker_routes,
                 rmcp_discovery: None,
+                oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             })
         };
         let router = build_router(state);
@@ -2634,6 +2654,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes,
             rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         });
 
         // tools/list: the colliding name is advertised exactly ONCE, as the
@@ -2712,6 +2733,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -2784,6 +2806,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -2835,6 +2858,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -2866,6 +2890,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -2898,7 +2923,12 @@ mod tests {
     /// same literal for the same reason; this follows that precedent rather
     /// than inventing a second convention beside it.
     fn rmcp_state(auth_token: Option<&str>) -> Arc<McpServerState> {
-        use crate::oauth::metadata::{CanonicalUri, Discovery};
+        use crate::oauth::metadata::{CanonicalUri, Discovery, OauthDoors};
+
+        // A discovery surface built in code rather than read from the
+        // environment, so it registers itself explicitly.
+        let mut doors = OauthDoors::none();
+        doors.register("rmcp-discovery (test fixture)");
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoHealthTool)).unwrap();
@@ -2924,6 +2954,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: Some(Arc::new(discovery)),
+            oauth_doors: doors,
         })
     }
 
@@ -3060,6 +3091,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         });
         let router = build_router(state);
 
@@ -3227,112 +3259,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    /// REVIEW ROUND 5, and the structural answer to "can someone forget?".
-    ///
-    /// The open arm in `is_authorized` is gated on
-    /// `McpServerState::oauth_door_enabled`. If a future door adds a field to
-    /// `McpServerState` and does not register it there, the arm silently
-    /// reopens and an anonymous request reaches dispatch — the same
-    /// `401`-vs-`200` defect this item has now been bitten by twice, once
-    /// through discovery and once through the resource-server switch.
-    ///
-    /// So registration is enforced rather than remembered: every OAuth-shaped
-    /// field on the struct must be named in that function's body. This is a
-    /// source scan in the same idiom as the crate's other structural guards
-    /// (`github::pii`'s tree self-check, `hermeticity`'s ratchet) — a textual
-    /// lint, deliberately, because the alternative is trusting a reviewer to
-    /// notice an omission whose symptom only appears in production.
-    #[test]
-    fn oauth_door_fields_are_all_registered() {
-        let source = include_str!("mcp_server.rs");
-
-        // The struct body: from its declaration to the closing brace.
-        let struct_start = source
-            .find("pub struct McpServerState {")
-            .expect("McpServerState must be declared in this file");
-        let struct_body = &source[struct_start..];
-        let struct_end = struct_body
-            .find("\n}")
-            .expect("the struct must be brace-terminated");
-        let struct_body = &struct_body[..struct_end];
-
-        // The registration function's body.
-        let fn_start = source
-            .find("pub(crate) fn oauth_door_enabled(&self) -> bool {")
-            .expect("the registration point must exist");
-        let fn_body = &source[fn_start..];
-        let fn_end = fn_body
-            .find("\n    }")
-            .expect("the function must be brace-terminated");
-        let fn_body = &fn_body[..fn_end];
-
-        let mut unregistered = Vec::new();
-        for line in struct_body.lines() {
-            let line = line.trim();
-            // `pub <name>: <type>,` — skip doc comments and attributes.
-            let Some(rest) = line.strip_prefix("pub ") else {
-                continue;
-            };
-            let Some((name, ty)) = rest.split_once(':') else {
-                continue;
-            };
-            let name = name.trim();
-            // An OAuth-shaped field is one whose NAME or TYPE mentions the
-            // door. Deliberately generous: a false positive costs one clause or
-            // one rename, a false negative costs an open `/mcp`.
-            let haystack = format!("{name} {ty}").to_ascii_lowercase();
-            let is_oauth_shaped = haystack.contains("oauth") || haystack.contains("rmcp");
-            if is_oauth_shaped && !fn_body.contains(name) {
-                unregistered.push(name.to_string());
-            }
-        }
-
-        assert!(
-            unregistered.is_empty(),
-            "these OAuth-shaped McpServerState field(s) are not registered in \
-             `oauth_door_enabled`: {unregistered:?}.\n\nAdd a clause for each. That function is \
-             the single input to `is_authorized`'s open arm — a door that is not named there \
-             does not narrow the arm, so an uncredentialed request would reach dispatch with a \
-             `200` instead of the spec-shaped `401` challenge."
-        );
-
-        // The guard is only meaningful if it can actually see a registered
-        // field, so prove the positive case rather than trusting an empty
-        // result — an assertion that passes because it matched nothing is the
-        // classic way a scan-based guard rots into a no-op.
-        assert!(
-            struct_body.contains("pub rmcp_discovery:"),
-            "the scan must be looking at the real struct"
-        );
-        assert!(
-            fn_body.contains("rmcp_discovery"),
-            "the scan must be looking at the real registration point"
-        );
-
-        // And the decision point must ask the QUESTION, not name a field. This
-        // is the exact regression round 5 reported: `is_authorized` keyed on
-        // `rmcp_discovery`, so a door enabled by any other switch left the arm
-        // open. Pinned textually because the type system cannot express it.
-        let auth_start = source
-            .find("fn is_authorized(")
-            .expect("the decision point must exist");
-        let auth_body = &source[auth_start..];
-        let auth_body = &auth_body[..auth_body.find("\n}").expect("brace-terminated")];
-        assert!(
-            auth_body.contains("oauth_door_enabled()"),
-            "is_authorized must gate its open arm on the door predicate"
-        );
-        assert!(
-            !auth_body.contains("rmcp_discovery"),
-            "is_authorized must not test a single door's field directly — that is what let an \
-             independently-switched door reopen the open arm"
-        );
-    }
-
-    /// The behavioural pair the guard above protects: the open arm follows
-    /// `oauth_door_enabled`, in BOTH directions. Written against the predicate
-    /// rather than against `rmcp_discovery` so that when RMCP-05 registers
-    /// `oauth_resource`, this test covers that door too without being touched.
+    /// The open arm follows `oauth_door_enabled`, in BOTH directions.
     #[test]
     fn the_open_arm_follows_the_door_predicate_not_a_single_field() {
         let state = rmcp_state(None);
@@ -3350,6 +3277,113 @@ mod tests {
         assert!(!no_door.oauth_door_enabled());
         // No door and no token => the legacy open posture, untouched.
         assert!(is_authorized(&no_door, &HeaderMap::new(), false));
+    }
+
+    /// REVIEW ROUND 6 — the case the previous two attempts got wrong, and the
+    /// one the removed source-scan guard could never have caught.
+    ///
+    /// A door that is NOT this item's discovery surface — RMCP-05's
+    /// resource server, switched on by its own `RMCP_OAUTH_ENABLED` — must
+    /// close the open arm just the same. Here `rmcp_discovery` is `None` and
+    /// the ONLY evidence of a door is the environment, exactly the deployment
+    /// shape that was still answering `200`.
+    ///
+    /// `#[serial]`: mutates process-global environment, per the crate's
+    /// convention.
+    #[tokio::test]
+    #[serial]
+    async fn rmcp02_a_door_other_than_discovery_still_closes_the_open_arm() {
+        use crate::oauth::metadata::OauthDoors;
+
+        std::env::set_var("RMCP_OAUTH_ENABLED", "1");
+        let doors = OauthDoors::detect_from_env();
+        std::env::remove_var("RMCP_OAUTH_ENABLED");
+
+        assert!(
+            doors.any(),
+            "a resource-server door configured purely by env must be detected: {}",
+            doors.describe()
+        );
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoHealthTool)).unwrap();
+        let state = Arc::new(McpServerState {
+            registry: ArcSwap::from_pointee(registry),
+            server_name: "terminus-primary-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            // No legacy shared token — the posture a first-time OAuth operator
+            // has, and the one that used to fall through to "admit everyone".
+            auth_token: None,
+            personal_federation: None,
+            inference_proxy: None,
+            tool_cache: Default::default(),
+            gateway: None,
+            mesh_pool: None,
+            principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
+            // Discovery is DELIBERATELY unset. This is the whole point.
+            rmcp_discovery: None,
+            oauth_doors: doors,
+        });
+
+        assert!(
+            state.oauth_door_enabled(),
+            "a door is a door even when this item's own config is absent"
+        );
+
+        let (status, _body, headers) = post_mcp(
+            build_router(state),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an uncredentialed call to an OAuth-enabled process must never be 200, \
+             whichever switch enabled it"
+        );
+        // No discovery surface means no `resource_metadata` to point at, so a
+        // BARE 401 is correct here — the status code is what decides admission,
+        // and RMCP-05 owns the challenge for its own door.
+        assert!(!headers.contains_key("www-authenticate"));
+    }
+
+    /// Detection must not fire on an unrelated environment, or every deployment
+    /// on the fleet would narrow. Pins both directions of the prefix rule.
+    #[test]
+    #[serial]
+    fn oauth_door_detection_keys_on_the_shared_prefix() {
+        use crate::oauth::metadata::OauthDoors;
+
+        std::env::remove_var("RMCP_OAUTH_ENABLED");
+        std::env::set_var("TERMINUS_SOMETHING_ELSE", "1");
+        let unrelated = OauthDoors::detect_from_env();
+        std::env::remove_var("TERMINUS_SOMETHING_ELSE");
+        assert!(
+            !unrelated.any(),
+            "an unrelated variable must not be read as a door: {}",
+            unrelated.describe()
+        );
+
+        // An EMPTY value is "not configured" — the same rule `read_env` applies,
+        // and the reason a materialized `.env` template does not switch every
+        // gateway into the narrowed posture.
+        std::env::set_var("RMCP_OAUTH_ENABLED", "");
+        let blank = OauthDoors::detect_from_env();
+        std::env::remove_var("RMCP_OAUTH_ENABLED");
+        assert!(!blank.any(), "an empty setting is not evidence of a door");
+
+        // And `describe` must never leak a value — one of these settings is a
+        // signing key.
+        std::env::set_var("RMCP_OAUTH_SIGNING_KEY", "super-secret-value");
+        let doors = OauthDoors::detect_from_env();
+        std::env::remove_var("RMCP_OAUTH_SIGNING_KEY");
+        assert!(doors.any());
+        assert!(
+            !doors.describe().contains("super-secret-value"),
+            "describe must name settings, never their values: {}",
+            doors.describe()
+        );
     }
 
     /// Insufficient scope is a `403` with its own error code, not a `401`.
@@ -3551,6 +3585,7 @@ mod tests {
             principal_resolver,
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         })
     }
 
@@ -3725,6 +3760,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            oauth_doors: crate::oauth::metadata::OauthDoors::none(),
         })
     }
 

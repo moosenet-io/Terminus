@@ -799,9 +799,36 @@ fn validate_authority(authority: &str) -> Result<(), &'static str> {
 /// nothing here" is a different statement from "there is something here and I
 /// have quietly altered it".
 fn read_env(var: &str) -> Result<Option<String>, ToolError> {
-    let Ok(value) = std::env::var(var) else {
-        // Unset, or not UTF-8. Nothing here.
-        return Ok(None);
+    // ONE rule, applied to every setting this module reads:
+    //
+    //   ABSENT   -> the feature is not configured. Unset, or set to the empty
+    //               string, are both absent.
+    //   PRESENT  -> the value must be usable. Anything present-but-unusable is
+    //               malformed configuration and ABORTS startup.
+    //
+    // The three arms below are that rule, not three special cases. What makes
+    // them one rule is the consequence: on this door, "not configured" disables
+    // an internet-facing surface, and disabling it on a gateway with no legacy
+    // `auth_token` restores an open `/mcp`. So every value that is not clearly
+    // an operator saying "off" must stop the process rather than be guessed at.
+    let value = match std::env::var(var) {
+        Ok(value) => value,
+        // Not set at all. Absent.
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        // Set, but not UTF-8. Review round 6 caught this being folded into
+        // "absent" along with `NotPresent`, which is the same fail-open as the
+        // whitespace case and for the same reason: the operator DID configure
+        // something, and this process cannot read it. Invalid encoding is
+        // malformed configuration, never absence. The value is not echoed —
+        // there is no safe way to render bytes that are not text, and the
+        // variable name is what the operator needs.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(ToolError::InvalidArgument(format!(
+                "{var} is set to a value that is not valid UTF-8. That is a malformed setting, \
+                 not an absent one — reading it as \"not configured\" would silently disable \
+                 the OAuth door. Re-set the variable with a valid value, or clear it"
+            )))
+        }
     };
     if value.is_empty() {
         // Set to the EMPTY string. Still "nothing here".
@@ -843,6 +870,104 @@ fn read_env(var: &str) -> Result<Option<String>, ToolError> {
         )));
     }
     Ok(Some(value))
+}
+
+/// The prefix every RMCP OAuth setting shares, across every item in the sprint
+/// (RMCP-01 through RMCP-13). [`OauthDoors::detect_from_env`] keys on it.
+pub const OAUTH_ENV_PREFIX: &str = "RMCP_OAUTH_";
+
+/// Which OAuth surfaces this process serves — the authoritative answer to
+/// "is this process internet-facing?", and the single input to
+/// `crate::mcp_server::McpServerState::oauth_door_enabled`.
+///
+/// # Why this is not a list of doors
+///
+/// Review round 5 replaced a test of one field with a predicate, and round 6
+/// correctly pointed out that the predicate was still just that field: it
+/// returned `rmcp_discovery.is_some()`, so RMCP-05's resource-server door —
+/// enabled by its own independent `RMCP_OAUTH_ENABLED` switch — did not close
+/// the open arm. Generalizing the CALL SITE while leaving the predicate an
+/// enumeration fixed nothing, and the source-scan guard could not catch it,
+/// because a door configured elsewhere is not a field on that struct. A test
+/// that cannot fail for the case it exists to catch reads as coverage while
+/// providing none, which is worse than having no test.
+///
+/// So this type does not enumerate doors. It detects whether OAuth is
+/// CONFIGURED AT ALL, by looking for the `RMCP_OAUTH_*` prefix that every
+/// setting in this sprint already shares. A door that does not exist yet is
+/// still covered, because a door nobody can configure is not a door — and the
+/// moment someone can configure one, they do it through a variable with this
+/// prefix. Registration is therefore not something a future author can forget
+/// to do; it is a consequence of the door being configurable at all.
+///
+/// # Direction of failure
+///
+/// Detection is deliberately broad, and every inaccuracy points the same way.
+/// A process with, say, only `RMCP_OAUTH_SIGNING_KEY` set is treated as having
+/// a door even if it serves no OAuth surface. The consequence is that an
+/// anonymous caller with no transport identity and no legacy token gets a `401`
+/// instead of being admitted — which is the safe answer on any host where that
+/// question is even close, and no answer at all for the mTLS and tailnet
+/// callers a gateway actually serves, since the listener vouches for them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OauthDoors {
+    /// The setting names that evidenced a door, for logging. Empty means none.
+    evidence: Vec<String>,
+}
+
+impl OauthDoors {
+    /// No OAuth surface. The posture of every deployment that predates this
+    /// sprint, and of `terminus_personal`, which is not internet-facing.
+    pub fn none() -> Self {
+        Self {
+            evidence: Vec::new(),
+        }
+    }
+
+    /// Detect from the process environment: any non-empty `RMCP_OAUTH_*`
+    /// setting is evidence that an OAuth door is configured here.
+    ///
+    /// Reads the whole environment once, at startup, rather than naming
+    /// variables — naming them is what made the previous two attempts miss a
+    /// door. A non-UTF-8 key or value is still evidence: it means SOMETHING was
+    /// configured, and the point of this function is presence, not parsing.
+    /// (`Discovery::from_env` is where an unreadable value becomes a hard
+    /// error; treating it as absence here would be the round-6 fail-open.)
+    pub fn detect_from_env() -> Self {
+        let mut evidence: Vec<String> = std::env::vars_os()
+            .filter(|(key, value)| {
+                key.to_string_lossy().starts_with(OAUTH_ENV_PREFIX) && !value.is_empty()
+            })
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        evidence.sort();
+        Self { evidence }
+    }
+
+    /// Register a door explicitly, for one built in code rather than read from
+    /// the environment (a test, or a caller that constructs a [`Discovery`]
+    /// directly).
+    pub fn register(&mut self, what: impl Into<String>) {
+        let what = what.into();
+        if !self.evidence.contains(&what) {
+            self.evidence.push(what);
+        }
+    }
+
+    /// Whether ANY OAuth door is configured on this process.
+    pub fn any(&self) -> bool {
+        !self.evidence.is_empty()
+    }
+
+    /// A log-safe description: the setting NAMES that evidenced a door, never
+    /// their values (one of them is a signing key).
+    pub fn describe(&self) -> String {
+        if self.evidence.is_empty() {
+            "no OAuth door configured".to_string()
+        } else {
+            format!("OAuth door configured, evidenced by: {}", self.evidence.join(", "))
+        }
+    }
 }
 
 /// Read a boolean flag, applying [`read_env`]'s presence rules first.
@@ -1147,6 +1272,34 @@ mod tests {
         // And unset is the same as empty.
         std::env::remove_var(CANONICAL_RESOURCE_ENV);
         assert!(matches!(Discovery::from_env(), Ok(None)));
+    }
+
+    /// REVIEW ROUND 6, and the third member of the same family. A CONFIGURED
+    /// but non-UTF-8 value used to be folded into "absent" alongside
+    /// `NotPresent`, which switched the door off and — with no legacy
+    /// `auth_token` — restored the open `/mcp` posture. Invalid encoding is
+    /// malformed configuration, never absence.
+    ///
+    /// The one rule, in one test: unset and empty are ABSENT; whitespace and
+    /// invalid encoding are MALFORMED and must abort.
+    #[test]
+    #[serial]
+    fn a_non_utf8_value_is_malformed_not_absent() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        // A lone continuation byte: valid as an OS string, never valid UTF-8.
+        std::env::set_var(
+            CANONICAL_RESOURCE_ENV,
+            OsString::from_vec(vec![b'h', b't', b't', b'p', 0x80]),
+        );
+        let result = Discovery::from_env();
+        std::env::remove_var(CANONICAL_RESOURCE_ENV);
+
+        let err = result.expect_err("a non-UTF-8 value must abort, never disable the door");
+        let message = err.to_string();
+        assert!(message.contains(CANONICAL_RESOURCE_ENV), "{message}");
+        assert!(message.contains("UTF-8"), "{message}");
     }
 
     /// The other route to the same fail-open: the operator configured the
