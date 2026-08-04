@@ -18,6 +18,8 @@
 //!    precisely the widening bug this shape is meant to prevent.
 
 use chrono::{DateTime, Utc};
+use sqlx::postgres::PgRow;
+use sqlx::Row;
 use uuid::Uuid;
 
 /// A human who can authenticate and consent.
@@ -29,7 +31,7 @@ use uuid::Uuid;
 /// No `Debug` derive: `totp_secret_enc` is encrypted rather than hashed (it has
 /// to be recoverable to verify a code), so it is the one field in this module
 /// that a careless `{:?}` could put in a log with the key sitting next to it.
-#[derive(Clone, sqlx::FromRow)]
+#[derive(Clone)]
 pub struct Account {
     pub id: Uuid,
     pub name: String,
@@ -80,7 +82,7 @@ impl RegistrationSource {
 /// One connector. `client_id` is the public identifier pasted into the client
 /// application; `client_secret_hash` is `None` for a public client (which is
 /// what Claude registers as under both DCR and CIMD).
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug)]
 pub struct Client {
     pub id: Uuid,
     pub client_id: String,
@@ -120,7 +122,7 @@ impl Client {
 /// invariant in the type and is asserted by tests in both this module and the
 /// store, because "empty means unrestricted" is the intuitive-but-catastrophic
 /// reading.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug)]
 pub struct ToolGroup {
     pub id: Uuid,
     pub name: String,
@@ -142,7 +144,7 @@ impl ToolGroup {
 
 /// A single-use authorization code, bound to everything needed to detect a
 /// replay or a substituted client, redirect, or resource.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug)]
 pub struct AuthCode {
     pub code_hash: Vec<u8>,
     pub client_id: Uuid,
@@ -157,7 +159,7 @@ pub struct AuthCode {
 }
 
 /// A refresh token in a rotation family.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug)]
 pub struct RefreshToken {
     pub token_hash: Vec<u8>,
     pub family_id: Uuid,
@@ -182,7 +184,7 @@ impl RefreshToken {
 }
 
 /// A recorded human approval of a client for a scope.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug)]
 pub struct Consent {
     pub id: Uuid,
     pub account_id: Uuid,
@@ -193,12 +195,97 @@ pub struct Consent {
 }
 
 /// Which account administers a federated namespace (RMCP-12).
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug)]
 pub struct ServerOwner {
     pub namespace: String,
     pub owner_account_id: Uuid,
     pub granted_at: DateTime<Utc>,
 }
+
+// ---------------------------------------------------------------------------
+// Row decoding
+// ---------------------------------------------------------------------------
+//
+// Written by hand rather than derived: this workspace builds `sqlx` with
+// `default-features = false` and without the `macros`/`derive` feature, so
+// `#[derive(sqlx::FromRow)]` is not available (same constraint as
+// `crate::scribe::graph::rules_store` and `crate::intake::discovery::storage`,
+// which decode the same way). Each impl is keyed by COLUMN NAME, so it stays
+// correct if a `SELECT`'s column order changes — only a rename can break it,
+// and that breaks loudly at the first query rather than silently decoding the
+// wrong field into the right-typed slot.
+
+macro_rules! impl_from_row {
+    ($ty:ident, $($field:ident),+ $(,)?) => {
+        impl<'r> sqlx::FromRow<'r, PgRow> for $ty {
+            fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+                Ok(Self { $($field: row.try_get(stringify!($field))?),+ })
+            }
+        }
+    };
+}
+
+impl_from_row!(
+    Account,
+    id,
+    name,
+    password_hash,
+    totp_secret_enc,
+    disabled,
+    created_at,
+    updated_at
+);
+impl_from_row!(
+    Client,
+    id,
+    client_id,
+    client_secret_hash,
+    name,
+    redirect_uris,
+    grant_types,
+    token_endpoint_auth_method,
+    owner_account_id,
+    registration_source,
+    disabled,
+    created_at
+);
+impl_from_row!(
+    ToolGroup,
+    id,
+    name,
+    description,
+    patterns,
+    owner_account_id,
+    created_at
+);
+impl_from_row!(
+    AuthCode,
+    code_hash,
+    client_id,
+    account_id,
+    redirect_uri,
+    resource,
+    code_challenge,
+    scope,
+    issued_at,
+    expires_at,
+    consumed_at
+);
+impl_from_row!(
+    RefreshToken,
+    token_hash,
+    family_id,
+    client_id,
+    account_id,
+    resource,
+    scope,
+    issued_at,
+    expires_at,
+    rotated_to,
+    revoked_at
+);
+impl_from_row!(Consent, id, account_id, client_id, scope, granted_at, revoked_at);
+impl_from_row!(ServerOwner, namespace, owner_account_id, granted_at);
 
 #[cfg(test)]
 mod tests {
