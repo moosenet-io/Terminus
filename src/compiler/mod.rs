@@ -5741,6 +5741,106 @@ pub fn render_queue_status(snapshot: &queue::QueueSnapshot) -> Value {
     })
 }
 
+/// TERM #611 — render the `compiler_status` `queue` / `in_flight` rows from ONE
+/// queue snapshot, including **when each held claim becomes reconcile-eligible**.
+///
+/// ## The gap this closes
+/// A `terminus-primary` restart mid-build leaves the job's dedupe pointer at
+/// `state=building` with no worker. Every resubmission — INCLUDING `force:true`,
+/// which only bypasses the heavy window/quiet gate, not the claim — coalesces
+/// onto that dead job id, and once the ephemeral progress record expires
+/// `compiler_progress` answers `not_found`. Observed live on <host> 2026-08-02
+/// (`harmony@main`, heavy, 286/310 when the gateway restarted).
+///
+/// **It is a long-TTL recovery, not a permanent wedge**: the scheduler's
+/// reconcile path requeues a `building` job with no completion once its claim is
+/// older than `BUILD_STALE_BUILDING_SECS` (default 9000s = 2.5h — `MAX_BUILD_TIMEOUT`
+/// 3600 + 900 headroom, doubled). The real defect is OBSERVABILITY: while the
+/// claim is held, an operator can see NOTHING — the progress record is gone, and
+/// `compiler_status` reported a hardcoded empty `queue`/`in_flight` with the note
+/// "pending the job scheduler (BLD-06)", years after BLD-06 landed. So the
+/// question "what is blocking this module, and when does it clear?" had no
+/// answer through the sanctioned tool surface at all, and the only recourse was
+/// poking queue keys in Redis directly — an unsanctioned door.
+///
+/// Each in-flight row therefore carries `held_for_secs`, `reconcile_eligible_at_ms`
+/// and `reconcile_eligible_in_secs`, so the wait is a stated fact with a
+/// deadline rather than an invisible one.
+///
+/// ## Why there is deliberately NO cancel here
+/// A claim that looks abandoned and a genuinely live long build are
+/// indistinguishable from outside the worker. The conservative
+/// `MIN_STALE_BUILDING_SECS` floor (a full build timeout PLUS the completion-retry
+/// window) exists precisely so reconcile can never requeue a live build and start
+/// a SECOND concurrent one. A cancel affordance would re-open exactly that hazard
+/// for the sake of impatience. Surfacing the deadline is the correct fix; making
+/// the deadline overridable is not.
+///
+/// Pure (takes `now_ms` and `stale_after`) so the arithmetic is testable.
+pub fn render_status_rows(
+    snapshot: &queue::QueueSnapshot,
+    stale_after: Duration,
+    now_ms: i64,
+) -> (Vec<Value>, Vec<Value>) {
+    // `as_millis()` is u128 and `as i64` WRAPS — a large configured
+    // BUILD_STALE_BUILDING_SECS could produce a negative deadline, i.e. a claim
+    // reported as already reconcile-eligible when it is nowhere near. Saturate
+    // instead (gpt56 review).
+    let stale_ms = i64::try_from(stale_after.as_millis()).unwrap_or(i64::MAX);
+    let queued: Vec<Value> = snapshot
+        .queued
+        .iter()
+        .enumerate()
+        .map(|(pos, j)| {
+            json!({
+                "position": pos,
+                "job_id": j.job_id,
+                "module": j.module,
+                "ref": j.git_ref,
+                "priority": j.priority.as_str(),
+                "heavy": j.heavy,
+                "force": j.force,
+                "mode": j.mode,
+                "resolved_sha": j.resolved_sha,
+            })
+        })
+        .collect();
+    let in_flight: Vec<Value> = snapshot
+        .leases
+        .iter()
+        .map(|l| {
+            let eligible_at = l.started_at_ms.saturating_add(stale_ms);
+            // Saturating + clamped at zero: a clock that moved backwards must
+            // report "0s remaining", never a negative countdown that reads as a
+            // time in the past.
+            let held_ms = now_ms.saturating_sub(l.started_at_ms).max(0);
+            let remaining_ms = eligible_at.saturating_sub(now_ms).max(0);
+            // Round the countdown UP: with floor, a claim 400ms from eligible
+            // reported "0 seconds" while `reconcile_eligible` was still false,
+            // which reads as a contradiction. `0` now means exactly "eligible".
+            //
+            // Ceiling WITHOUT the `+ 999` (gpt56 review): `remaining_ms` reaches
+            // `i64::MAX` when `stale_ms` saturates, and `+ 999` would then panic
+            // in a debug build and wrap in release — turning an absurd config
+            // into a crash or a nonsense countdown instead of a large number.
+            let remaining_secs = remaining_ms / 1000 + i64::from(remaining_ms % 1000 != 0);
+            json!({
+                "job_id": l.job_id,
+                "module": l.module,
+                "ref": l.git_ref,
+                "host": l.host.as_str(),
+                "started_at_ms": l.started_at_ms,
+                "resolved_sha": l.resolved_sha,
+                "held_for_secs": held_ms / 1000,
+                "reconcile_eligible_at_ms": eligible_at,
+                "reconcile_eligible_in_secs": remaining_secs,
+                "reconcile_eligible": now_ms >= eligible_at,
+            })
+        })
+        .collect();
+    (queued, in_flight)
+}
+
 /// Register the `compiler_*` tool surface on the registry, and — when the shared
 /// Redis is configured — spawn the background scheduler that drains the queue.
 ///
@@ -6924,16 +7024,35 @@ Source:
     /// separator and the NUL terminator, so it accepted directories whose
     /// sockets could not actually be created. A guard against a silent failure
     /// has to be proven against the real thing.
+    ///
+    /// TERM #594 — the fixture must NOT come from the ambient `TMPDIR`.
+    /// `tempfile::tempdir()` honours `TMPDIR`, and on a build host `TMPDIR` is
+    /// the compiler's own long per-job scratch path (PCON-10). That made the
+    /// fixture — a directory of a length this test CHOOSES — unbuildable, so the
+    /// test failed on the build host and passed everywhere else: it was asserting
+    /// something about the environment, not about the code. The property under
+    /// test is purely about path LENGTH, so the base must be a SHORT root the
+    /// test controls. `/tmp` is that root: it exists on every Linux host, is 4
+    /// bytes, and is used here only for a few empty directories and one socket
+    /// (never as a build target — the PCON-10 "never the /tmp tmpfs" rule is
+    /// about `CARGO_TARGET_DIR`/`TMPDIR` sizing, not about a byte-sized fixture).
     #[test]
     fn sun_path_budget_matches_the_kernel() {
         use std::os::unix::net::UnixListener;
 
-        // Build a directory whose path length is exactly TMPDIR_MAX_BYTES.
-        let base = tempfile::tempdir().expect("tempdir");
+        // Build a directory whose path length is exactly TMPDIR_MAX_BYTES,
+        // rooted at a SHORT, test-controlled base — never `std::env::temp_dir()`
+        // / `tempfile::tempdir()`, which read the ambient TMPDIR.
+        const SHORT_ROOT: &str = "/tmp";
+        let base = tempfile::Builder::new()
+            .prefix("sunpath")
+            .tempdir_in(SHORT_ROOT)
+            .expect("tempdir under a short, test-controlled root");
         let base_len = base.path().as_os_str().as_encoded_bytes().len();
         assert!(
             base_len + 2 <= TMPDIR_MAX_BYTES,
-            "tempdir {base_len} too long to build this fixture"
+            "fixture base {base_len} bytes is too long to build this fixture — \
+             {SHORT_ROOT} must stay short; this must never depend on TMPDIR"
         );
         let pad = TMPDIR_MAX_BYTES - base_len - 1; // -1 for the joining '/'
         let dir = base.path().join("d".repeat(pad));
@@ -7179,6 +7298,90 @@ Source:
         assert!(
             !env_file.exists(),
             "the one-shot secret file must be gone by the time the build step runs"
+        );
+    }
+
+    // ── TERM #611: a held in-flight claim must be VISIBLE, with a deadline ───
+
+    fn lease_fixture(started_at_ms: i64) -> queue::QueueSnapshot {
+        queue::QueueSnapshot {
+            queued: Vec::new(),
+            leases: vec![queue::Lease {
+                job_id: "job-dead".to_string(),
+                module: "harmony".to_string(),
+                git_ref: "main".to_string(),
+                host: HostRole::Heavy,
+                started_at_ms,
+                resolved_sha: Some("deadbeef".to_string()),
+            }],
+        }
+    }
+
+    /// The whole point: a claim whose worker is gone (a terminus-primary restart
+    /// mid-build) is still surfaced, and it states WHEN it clears. Before this,
+    /// `compiler_status` reported a hardcoded empty `in_flight`, so an operator
+    /// watching a module coalesce onto a dead job saw nothing at all.
+    #[test]
+    fn a_held_claim_is_surfaced_with_the_time_it_becomes_reconcile_eligible() {
+        let started = 1_000_000_000_000i64;
+        let stale = Duration::from_secs(9_000); // the default: 2x(3600+900)
+        let now = started + 3_600_000; // held one hour so far
+
+        let (_queued, in_flight) = render_status_rows(&lease_fixture(started), stale, now);
+
+        assert_eq!(in_flight.len(), 1, "the held claim must be visible");
+        let row = &in_flight[0];
+        assert_eq!(row["job_id"], "job-dead");
+        assert_eq!(row["module"], "harmony");
+        assert_eq!(row["held_for_secs"], 3_600);
+        assert_eq!(row["reconcile_eligible_at_ms"], started + 9_000_000);
+        assert_eq!(
+            row["reconcile_eligible_in_secs"], 5_400,
+            "the operator must be told how long the wait still is"
+        );
+        assert_eq!(row["reconcile_eligible"], false);
+    }
+
+    /// Past the stale lease, the row says so — the claim is self-healing and the
+    /// next reconcile tick releases it. This is what makes it a long-TTL
+    /// recovery rather than the permanent wedge it was reported as.
+    #[test]
+    fn a_claim_past_the_stale_lease_reports_itself_eligible_with_no_negative_countdown() {
+        let started = 1_000_000_000_000i64;
+        let stale = Duration::from_secs(9_000);
+        let now = started + 10_000_000; // well past eligibility
+
+        let (_q, in_flight) = render_status_rows(&lease_fixture(started), stale, now);
+        assert_eq!(in_flight[0]["reconcile_eligible"], true);
+        assert_eq!(
+            in_flight[0]["reconcile_eligible_in_secs"], 0,
+            "a passed deadline counts down to zero, never negative"
+        );
+    }
+
+    /// An absurd configured stale window must produce a large number, never a
+    /// panic (debug) or a wrapped nonsense countdown (release) — gpt56 review.
+    #[test]
+    fn an_absurd_stale_window_saturates_instead_of_overflowing() {
+        let (_q, in_flight) =
+            render_status_rows(&lease_fixture(0), Duration::from_secs(u64::MAX), 0);
+        let remaining = in_flight[0]["reconcile_eligible_in_secs"].as_i64().unwrap();
+        assert!(remaining > 0, "must not wrap negative, got {remaining}");
+        assert_eq!(in_flight[0]["reconcile_eligible"], false);
+    }
+
+    /// A clock that jumps backwards must not produce a negative age or a
+    /// countdown that reads as a time already gone.
+    #[test]
+    fn a_backwards_clock_never_yields_a_negative_age_or_countdown() {
+        let started = 1_000_000_000_000i64;
+        let (_q, in_flight) =
+            render_status_rows(&lease_fixture(started), Duration::from_secs(9_000), started - 60_000);
+        assert_eq!(in_flight[0]["held_for_secs"], 0);
+        assert_eq!(in_flight[0]["reconcile_eligible"], false);
+        assert!(
+            in_flight[0]["reconcile_eligible_in_secs"].as_i64().unwrap() >= 0,
+            "countdown must never be negative"
         );
     }
 
