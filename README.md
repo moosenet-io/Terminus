@@ -1150,6 +1150,56 @@ and a troubleshooting table. Deploy assets live in
 [`deploy/rmcp-edge.service`](deploy/rmcp-edge.service) and
 [`deploy/rmcp-edge-proxy.conf.example`](deploy/rmcp-edge-proxy.conf.example).
 
+## Connector tool groups (RMCP-06)
+
+The OAuth connector door (`src/oauth/`) scopes a client by **tool group** — a name plus a
+small list of patterns over the tool catalog — so an operator scopes a connector as
+"media" rather than by listing several hundred tool names. Groups are resolved against the
+**live merged catalog on every `tools/list` and every `tools/call`**, so a newly registered
+tool that matches an existing pattern is included with no config edit, and a pattern is
+never frozen into a snapshot that has drifted from what the server actually serves.
+
+### Pattern syntax
+
+Exactly three shapes parse. There is no glob, no regex, and no negation.
+
+| Pattern | Meaning | Example |
+|---|---|---|
+| `tool_name` | that one tool, exactly | `weather_get` |
+| `prefix*` | every advertised name starting with `prefix` | `weather_*` |
+| `namespace__*` | every tool advertised by one mesh upstream | `peerhub__*` |
+| `*` | every tool — **operator-owned groups only** | |
+
+This is the same vocabulary the gateway's MESH-08 allow entries already use, deliberately,
+so an operator does not have to hold two pattern languages in their head.
+
+- **No regex.** A pattern may be authored by a delegated federation user, and the matcher
+  runs on every request — an author-supplied regex on the dispatch path is a denial of
+  service.
+- **No negation.** Subtraction is the existing deny layer's job
+  (`DEFAULT_SENSITIVE_DENY_PREFIXES`). Two subtractive mechanisms in two files is how two
+  authorization systems come to disagree.
+- **Patterns match the ADVERTISED name**, which is already namespaced for a federated
+  tool. So `a*` does **not** reach `peerhub__alerts_list`: a prefix stays on its own side of
+  the namespace boundary, and crossing it takes a pattern that names the upstream.
+- **A bad pattern is refused when it is stored, never when it is matched.** Matching is
+  pure and total; an error there would be an availability failure inside the authorization
+  system rather than a safety property.
+
+### What empty means
+
+**Empty means empty.** An empty group grants nothing, and a well-formed pattern that
+happens to match no tool in the current catalog grants nothing. Neither is ever read as
+"unrestricted". A group can only ever *narrow* — the effective set is intersected with the
+account's own grant and with the client's visible namespaces (RMCP-07), so no group can
+grant a tool the human behind it could not already call.
+
+### Starter groups
+
+`groups::STARTER_GROUPS` seeds a few ordinary, editable groups (`daily briefing`, `home`,
+`media`, `personal records`) built from tool-name prefixes that already exist in the
+registry, so the first connector is usable without hand-authoring. None of them uses `*`.
+
 ## Quick Start
 
 ```sh

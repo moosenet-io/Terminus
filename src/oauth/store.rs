@@ -25,6 +25,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::ToolError;
+use crate::oauth::groups::{
+    normalize_description, validate_group, validate_patterns, GroupOwner, Pattern, STARTER_GROUPS,
+};
 use crate::oauth::model::{
     Account, AuthCode, Client, Consent, RefreshToken, ServerOwner, TokenFamily, ToolGroup,
 };
@@ -347,28 +350,168 @@ impl OauthStore {
     // invalidating. `ScopeWrite` is `pub(crate)` precisely so it can comply.
     // -----------------------------------------------------------------------
 
-    /// Insert a tool group. An empty `patterns` slice is permitted and stores a
-    /// group that matches nothing — a legitimate state (a group being built
-    /// up), and one the matcher must handle rather than one to reject here.
+    /// Insert a tool group, VALIDATING it first (RMCP-06).
+    ///
+    /// This is the write-time gate the matcher depends on. Every pattern is
+    /// parsed here — under `owner_kind`, which is what refuses a bare `*` from a
+    /// delegated author — and the name is normalised, so no row can hold
+    /// something [`crate::oauth::groups::Pattern::matches`] would have to cope
+    /// with at dispatch time. Storing the CANONICAL rendering rather than the
+    /// author's literal text means the round-trip is stable and two spellings of
+    /// one pattern cannot both sit in the same row.
+    ///
+    /// An empty `patterns` slice is permitted and stores a group that matches
+    /// nothing — a legitimate state (a group being built up), and one the
+    /// matcher already handles, rather than one to reject here.
     pub async fn insert_tool_group(
         &self,
         name: &str,
         description: &str,
         patterns: &[String],
         owner_account_id: Uuid,
+        owner_kind: GroupOwner,
     ) -> Result<Uuid, ToolError> {
         let _scope_write = ScopeWrite::begin();
+        let group = validate_group(name, description, patterns, owner_kind)?;
+        let rendered = group.rendered_patterns();
         sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO rmcp_tool_group (name, description, patterns, owner_account_id) \
              VALUES ($1, $2, $3, $4) RETURNING id",
         )
-        .bind(name)
-        .bind(description)
-        .bind(patterns)
+        .bind(&group.name)
+        .bind(&group.description)
+        .bind(rendered.as_slice())
         .bind(owner_account_id)
         .fetch_one(&self.pool)
         .await
         .map_err(unique_aware("a tool group with that name already exists"))
+    }
+
+    /// Every group owned by one account, name-ordered.
+    ///
+    /// Scoped to the owner rather than listing globally: the group NAME column
+    /// is unique fleet-wide, so an unscoped list would let any account enumerate
+    /// every other account's groups. RMCP-12 layers the operator's cross-account
+    /// view on top of this; the default view is your own.
+    pub async fn list_tool_groups(&self, owner_account_id: Uuid) -> Result<Vec<ToolGroup>, ToolError> {
+        sqlx::query_as::<_, ToolGroup>(
+            "SELECT id, name, description, patterns, owner_account_id, created_at \
+             FROM rmcp_tool_group WHERE owner_account_id = $1 ORDER BY name",
+        )
+        .bind(owner_account_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)
+    }
+
+    /// Rewrite a group's description and patterns, after validating them and
+    /// confirming `actor` owns the group.
+    ///
+    /// The ownership predicate is part of the UPDATE's `WHERE` rather than a
+    /// preceding `SELECT`: one statement cannot race itself, so there is no
+    /// window in which ownership could change between check and write — the
+    /// same property [`Self::set_client_tool_groups`] buys with a row lock,
+    /// obtained here for free because this is a single statement.
+    ///
+    /// Patterns are replaced wholesale, never merged. A partially applied
+    /// permission change is a state nobody chose.
+    ///
+    /// Returns [`ToolError::NotFound`] for both "no such group" and "not
+    /// yours", deliberately without distinguishing them — the distinction would
+    /// confirm the existence of another account's group.
+    pub async fn update_tool_group(
+        &self,
+        actor_account_id: Uuid,
+        group_id: Uuid,
+        description: &str,
+        patterns: &[String],
+        owner_kind: GroupOwner,
+    ) -> Result<(), ToolError> {
+        // The name is not editable here (renaming would have to contend with the
+        // fleet-wide UNIQUE constraint, which is RMCP-08's surface to own), so
+        // only the two editable fields are validated.
+        let description = normalize_description(description)?;
+        let patterns: Vec<String> =
+            validate_patterns(patterns, owner_kind)?.iter().map(Pattern::render).collect();
+        let updated = sqlx::query(
+            "UPDATE rmcp_tool_group SET description = $3, patterns = $4 \
+             WHERE id = $1 AND owner_account_id = $2",
+        )
+        .bind(group_id)
+        .bind(actor_account_id)
+        .bind(&description)
+        .bind(patterns.as_slice())
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        if updated.rows_affected() == 0 {
+            return Err(ToolError::NotFound("no such tool group for this account".into()));
+        }
+        Ok(())
+    }
+
+    /// Delete a group the actor owns.
+    ///
+    /// `rmcp_client_scope` cascades, so deleting a group REVOKES it from every
+    /// client that drew on it. That direction is safe by construction — a
+    /// deletion can only ever narrow what a connector reaches, which is the one
+    /// direction of change this schema never has to guard.
+    pub async fn delete_tool_group(
+        &self,
+        actor_account_id: Uuid,
+        group_id: Uuid,
+    ) -> Result<(), ToolError> {
+        let deleted = sqlx::query("DELETE FROM rmcp_tool_group WHERE id = $1 AND owner_account_id = $2")
+            .bind(group_id)
+            .bind(actor_account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        if deleted.rows_affected() == 0 {
+            return Err(ToolError::NotFound("no such tool group for this account".into()));
+        }
+        Ok(())
+    }
+
+    /// Seed [`STARTER_GROUPS`] for an operator account, idempotently.
+    ///
+    /// Exists so a fresh install has usable scoping the moment the first
+    /// connector is registered. The alternative — an operator facing several
+    /// hundred tool names — is how a wildcard gets reached for, which is the
+    /// outcome this whole item is built to avoid.
+    ///
+    /// `ON CONFLICT DO NOTHING` on the unique name makes re-running a no-op, so
+    /// this is safe to call on every startup and, crucially, will not overwrite
+    /// an operator's edits to a seeded group. Seeded rows are ordinary rows:
+    /// editable, deletable, and not re-created if deleted on purpose... which is
+    /// exactly why this is not called automatically from anywhere yet. RMCP-08
+    /// owns when it runs.
+    ///
+    /// Returns the number of groups actually created.
+    pub async fn seed_starter_groups(&self, owner_account_id: Uuid) -> Result<u64, ToolError> {
+        let mut created = 0u64;
+        for starter in STARTER_GROUPS {
+            let patterns: Vec<String> = starter.patterns.iter().map(|p| (*p).to_string()).collect();
+            // Validated on the way in like any other write, so a bad edit to the
+            // seed list fails here rather than being the one path that bypasses
+            // the matcher's contract.
+            let group =
+                validate_group(starter.name, starter.description, &patterns, GroupOwner::Operator)?;
+            let rendered = group.rendered_patterns();
+            let inserted = sqlx::query(
+                "INSERT INTO rmcp_tool_group (name, description, patterns, owner_account_id) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (name) DO NOTHING",
+            )
+            .bind(&group.name)
+            .bind(&group.description)
+            .bind(rendered.as_slice())
+            .bind(owner_account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+            created += inserted.rows_affected();
+        }
+        Ok(created)
     }
 
     /// The groups a client draws on.
