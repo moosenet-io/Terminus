@@ -987,7 +987,43 @@ mod tests {
         assert!(matches!(err, ForgeError::InvalidRequest(_)), "{err:?}");
     }
 
+    /// Restore `CARGO_PUBLISH_MAX_CRATE_BYTES` to whatever it was (usually
+    /// unset) when the test scope ends — INCLUDING on a panic, which a bare
+    /// `remove_var` after the assertions does not do.
+    ///
+    /// TERM #594: the crate-size ceiling is read from a PROCESS-GLOBAL env var,
+    /// so a test that sets it is mutating shared state for every concurrently
+    /// running test in the same binary. `packages_publish_rejects_oversized_crate`
+    /// set it to `16` while `packages_publish_accepts_crate_within_limit`
+    /// published a 32-byte crate and relied on the *ambient default* — so when
+    /// the two interleaved, the "within limit" crate was over the leaked 16-byte
+    /// cap and that test failed for a reason that had nothing to do with it.
+    /// Both tests are now `#[serial]` (they cannot interleave with each other or
+    /// with any other serial env-mutating test) AND each sets the value it needs
+    /// EXPLICITLY rather than depending on the ambient environment.
+    struct MaxCrateBytesGuard(Option<String>);
+
+    impl MaxCrateBytesGuard {
+        const VAR: &'static str = "CARGO_PUBLISH_MAX_CRATE_BYTES";
+
+        fn set(value: &str) -> Self {
+            let prev = std::env::var(Self::VAR).ok();
+            std::env::set_var(Self::VAR, value);
+            Self(prev)
+        }
+    }
+
+    impl Drop for MaxCrateBytesGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(prev) => std::env::set_var(Self::VAR, prev),
+                None => std::env::remove_var(Self::VAR),
+            }
+        }
+    }
+
     #[tokio::test]
+    #[serial_test::serial(cargo_publish_max_crate_bytes)]
     async fn packages_publish_rejects_oversized_crate(){
         // codex P2: packages_publish must reject an oversized crate_b64 BEFORE
         // ever issuing the upload request — no mock registered, so any HTTP
@@ -995,8 +1031,8 @@ mod tests {
         let server = MockServer::start();
         let forge = mock_gitea(&server);
         // Force a tiny ceiling via the env override so the test doesn't need
-        // to construct a real 64MiB+ payload.
-        std::env::set_var("CARGO_PUBLISH_MAX_CRATE_BYTES", "16");
+        // to construct a real 64MiB+ payload. The guard restores it on panic too.
+        let _cap = MaxCrateBytesGuard::set("16");
         let oversized = B64.encode(vec![b'x'; 1024]); // decodes to 1024 bytes >> 16-byte cap
         let err = forge
             .dispatch(
@@ -1009,12 +1045,16 @@ mod tests {
             )
             .await
             .expect_err("oversized crate_b64 must be rejected");
-        std::env::remove_var("CARGO_PUBLISH_MAX_CRATE_BYTES");
         assert!(matches!(err, ForgeError::InvalidRequest(_)), "{err:?}");
     }
 
     #[tokio::test]
+    #[serial_test::serial(cargo_publish_max_crate_bytes)]
     async fn packages_publish_accepts_crate_within_limit() {
+        // Pin the ceiling EXPLICITLY: this test is about a crate that is under
+        // the limit, so the limit must be a fact of the test, not of whatever
+        // the ambient environment (or a concurrently-running test) left behind.
+        let _cap = MaxCrateBytesGuard::set("1024");
         let server = MockServer::start();
         let m = server.mock(|when, then| {
             when.method(PUT).path("/api/packages/moosenet/cargo/api/v1/crates/new");
