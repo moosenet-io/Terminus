@@ -831,6 +831,56 @@ materialized from the vault at runtime, never committed. The minimum useful set:
 - `GITHUB_PAT_<NAME>` — GitHub tools; `POSTGRES_URL_<NAME>` — `pg_*` connection identities.
 - `REVIEW_DAEMON_URL`, `REVIEW_DAEMON_TOKEN` — CLI-backed review providers (run `review_daemon` separately).
 
+### The remote-MCP connector URL (OAuth door)
+
+`terminus_primary` can additionally expose an OAuth 2.1 door for hosted MCP clients
+(RMCP). It is **off** unless `RMCP_CANONICAL_RESOURCE` is set, and when it is set the
+value has a contract that is worth reading once, because getting it slightly wrong
+fails in a way the client cannot describe.
+
+| Key | Meaning |
+|---|---|
+| `RMCP_CANONICAL_RESOURCE` | **The connector URL, byte-for-byte as typed into the client's connector form.** Enables the door. |
+| `RMCP_ISSUER` | OAuth issuer identifier. Defaults to the canonical resource's origin. |
+| `RMCP_SCOPES_SUPPORTED` | Space-separated advertised scopes. Default `mcp offline_access`. |
+| `RMCP_REQUIRED_SCOPE` | Scope an access token must carry to reach `/mcp`. Default `mcp`. |
+| `RMCP_DCR_ENABLED` | Advertise and accept RFC 7591 dynamic client registration. Default off. |
+
+**The contract.** `RMCP_CANONICAL_RESOURCE` is published verbatim as the `resource`
+field of the protected-resource metadata document, is echoed by the client as the
+RFC 8707 `resource` parameter, and becomes the audience of every issued token. Those
+three strings are compared byte-for-byte. The server therefore **does not normalize
+it**, and refuses at startup — with a message naming the variable — anything it would
+otherwise have had to normalize:
+
+- must be an absolute `https://` URI, with a lowercase scheme;
+- **no trailing slash** (`https://host/mcp` and `https://host/mcp/` are different
+  audiences — this is the single most common cause of a connector that authorizes and
+  then fails every call);
+- no fragment, no query string, no userinfo, no whitespace or non-ASCII.
+
+A malformed value **aborts startup**. That is deliberate: a *nearly* correct value
+starts fine, serves a document the client fetches happily, and then fails at token
+issuance with a client-side message — "Couldn't reach the MCP server" — that names
+neither the field nor this server.
+
+**The discovery contract.** Three unauthenticated endpoints implement it, all served
+from bodies rendered once at startup (no database, so discovery answers even when the
+store is down), and all answering `HEAD` as well as `GET`:
+
+| Path | Document |
+|---|---|
+| `/.well-known/oauth-protected-resource` | RFC 9728 protected-resource metadata |
+| `/.well-known/oauth-protected-resource/<resource path>` | The same document. Clients probe **this** form first. |
+| `/.well-known/oauth-authorization-server` | RFC 8414 authorization-server metadata |
+
+An unauthenticated `POST /mcp` answers `401` with
+`WWW-Authenticate: Bearer realm="…", resource_metadata="…", scope="…"`. That header is
+the entire discovery bootstrap and is honoured **only** on a `401` — a client discards
+it on a `200`. A valid token that lacks a required scope answers `403` with
+`error="insufficient_scope"` and the scopes needed, which is a different instruction to
+the client than `401`: re-authorize for more scope, rather than discard the credential.
+
 Then connect any MCP client to the endpoint and call `initialize` /
 `tools/list` / `tools/call` (JSON-RPC 2.0 over streamable HTTP; `GET /healthz`
 for liveness). Full walkthrough: [docs/getting-started.md](docs/getting-started.md).

@@ -41,6 +41,12 @@
 //!   credential-storage newtypes below. Deliberately unreachable from the
 //!   network, so the schema and its fail-closed contracts could be reviewed on
 //!   their own.
+//! - **RMCP-02** — discovery ([`metadata`], [`router`]): the two `.well-known`
+//!   documents and the `401` challenge that points at them. The only part of
+//!   this module with NO store dependency — discovery must answer while the
+//!   database is down, because "the connector is unreachable" and "the
+//!   connector's database is down" are different operator problems that must
+//!   not present identically.
 //! - **RMCP-03** — the interactive half of the flow: [`authorize`] (the
 //!   endpoint and its state machine), [`session`] (the signed, short-lived
 //!   login cookie), [`password`] (argon2id verification) and [`templates`]
@@ -52,10 +58,10 @@
 //!   verification ([`jwt`]). It is a standalone router a binary merges in; it
 //!   is not mounted anywhere by this item.
 //!
-//! Still to land as their own items: the metadata documents (RMCP-02),
-//! resource-server validation (RMCP-05) and the scoping resolver (RMCP-07).
-//! None of this is reachable from the network until a listener mounts the
-//! relevant router.
+//! Still to land as their own items: resource-server validation (RMCP-05) and
+//! the scoping resolver (RMCP-07). Apart from RMCP-02's discovery documents —
+//! which are deliberately public and unauthenticated — none of this is
+//! reachable from the network until a listener mounts the relevant router.
 //!
 //! ## What RMCP-09 adds ([`edge`])
 //! The public door's NETWORK policy, and still no endpoints. [`edge`] is the
@@ -88,8 +94,10 @@
 pub mod authorize;
 pub mod edge;
 pub mod jwt;
+pub mod metadata;
 pub mod model;
 pub mod password;
+pub mod router;
 pub mod session;
 pub mod store;
 pub mod templates;
