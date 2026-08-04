@@ -203,15 +203,54 @@ const ARGON2ID_ID: &str = "argon2id";
 /// database.
 ///
 /// [PHC string format]: https://github.com/P-H-C/phc-string-format/blob/master/phc-sf-spec.md
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Argon2idHash(String);
 
+/// `Debug` redacts the PHC string entirely.
+///
+/// A password hash is not a presentable credential, but it IS offline-crackable
+/// — a leaked `client_secret_hash` in a log is a cracking target with the salt
+/// and cost parameters helpfully attached. Round 3 of review flagged the derived
+/// `Debug` here, correctly. Written by hand rather than derived so that adding a
+/// field cannot silently re-expose the value.
+impl std::fmt::Debug for Argon2idHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Argon2idHash(<redacted>)")
+    }
+}
+
 impl Argon2idHash {
-    /// Shortest plausible base64 (no padding) for a salt or digest segment.
-    /// argon2's own minimums are 8 bytes of salt and 4 bytes of output, both of
-    /// which encode to more than this; the bound only has to be tight enough to
-    /// reject a human-typed string.
-    const MIN_SEGMENT_LEN: usize = 8;
+    /// Minimum encoded length of the SALT segment, derived from argon2's own
+    /// 8-byte minimum salt (8 bytes -> 11 unpadded base64 characters).
+    const MIN_SALT_LEN: usize = 11;
+
+    /// Minimum encoded length of the DIGEST segment. argon2 permits a 4-byte
+    /// output, but no real password hash uses one; 16 bytes (22 unpadded base64
+    /// characters) is comfortably below the 32-byte default every argon2
+    /// implementation actually emits, so this rejects a decorative value
+    /// without risking a genuine hash.
+    const MIN_DIGEST_LEN: usize = 22;
+
+    /// Characters permitted in the salt and digest segments.
+    ///
+    /// The PHC string format specifies STANDARD base64 without `=` padding, so
+    /// `A-Za-z0-9+/` is the correct alphabet and is what argon2's reference
+    /// implementation emits. Round 3 of review asserted that argon2 PHC uses
+    /// the crypt(3) alphabet containing `.`; that is not what the PHC
+    /// specification says (it is bcrypt's alphabet). The finding is not adopted
+    /// as stated — but its underlying RISK is real and worth insuring against:
+    /// if any implementation in this fleet's future did emit `.`, `-` or `_`,
+    /// rejecting its output would break authentication in production. So those
+    /// three characters are accepted too.
+    ///
+    /// Widening the alphabet costs this guard nothing. Its job is to rule out
+    /// "this is not a hash at all" — a plaintext password, an empty string, a
+    /// decorative prefix — and no plausible plaintext secret passes the
+    /// structural field, version, cost-parameter and length checks regardless
+    /// of which of those characters are permitted.
+    fn is_segment_char(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'.' | b'-' | b'_')
+    }
 
     /// Accept a PHC string, rejecting anything not structurally argon2id.
     ///
@@ -272,18 +311,15 @@ impl Argon2idHash {
             return Err(refuse("missing one of the m/t/p cost parameters"));
         }
 
-        // Salt and digest: non-trivial, and drawn from the base64 alphabet PHC
-        // uses (unpadded standard base64).
-        let segment_ok = |segment: &str| {
-            segment.len() >= Self::MIN_SEGMENT_LEN
-                && segment
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+        // Salt and digest: long enough to be real, and drawn from the base64
+        // alphabet (see `is_segment_char`).
+        let segment_ok = |segment: &str, min: usize| {
+            segment.len() >= min && segment.bytes().all(Self::is_segment_char)
         };
-        if !segment_ok(fields[4]) {
+        if !segment_ok(fields[4], Self::MIN_SALT_LEN) {
             return Err(refuse("salt is too short or not base64"));
         }
-        if !segment_ok(fields[5]) {
+        if !segment_ok(fields[5], Self::MIN_DIGEST_LEN) {
             return Err(refuse("digest is too short or not base64"));
         }
 
@@ -353,7 +389,8 @@ mod tests {
         assert!(!rendered.contains("some-secret"));
     }
 
-    const VALID_PHC: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g";
+    const VALID_PHC: &str =
+        "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG";
 
     /// A genuine argon2id PHC string must still be accepted — the guard is
     /// worthless if it is so strict that the real hasher's output fails it.
@@ -363,7 +400,16 @@ mod tests {
             Argon2idHash::parse(VALID_PHC).expect("a real argon2id PHC string must be accepted");
         assert_eq!(parsed.as_str(), VALID_PHC);
         // Parameter order is not significant in PHC.
-        assert!(Argon2idHash::parse("$argon2id$v=19$t=2,m=19456,p=1$c2FsdHNhbHQ$aGFzaGhhc2g").is_ok());
+        assert!(Argon2idHash::parse(
+            "$argon2id$v=19$t=2,m=19456,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG"
+        )
+        .is_ok());
+        // The crypt-style `.` is accepted too, so an implementation that emits
+        // it cannot break authentication (see `is_segment_char`).
+        assert!(Argon2idHash::parse(
+            "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzYWx.$RdescudvJCsgt3ubXbXdWRWJTmaaJOb."
+        )
+        .is_ok());
     }
 
     /// The specific catastrophic mistake this guard exists for: a caller that
@@ -379,21 +425,31 @@ mod tests {
             "$argon2id$plaintext",
             "$argon2id$",
             "$2b$12$abcdefghijklmnopqrstuv",
-            "$argon2i$v=19$m=1,t=1,p=1$c2FsdHNhbHQ$aGFzaGhhc2g",
-            "$argon2id$v=$m=1,t=1,p=1$c2FsdHNhbHQ$aGFzaGhhc2g",
-            "$argon2id$v=xx$m=1,t=1,p=1$c2FsdHNhbHQ$aGFzaGhhc2g",
-            "$argon2id$v=19$m=1,t=1$c2FsdHNhbHQ$aGFzaGhhc2g",
-            "$argon2id$v=19$m=a,t=1,p=1$c2FsdHNhbHQ$aGFzaGhhc2g",
-            "$argon2id$v=19$m=1,t=1,p=1,q=9$c2FsdHNhbHQ$aGFzaGhhc2g",
-            "$argon2id$v=19$m=1,t=1,p=1$short$aGFzaGhhc2g",
-            "$argon2id$v=19$m=1,t=1,p=1$c2FsdHNhbHQ$sh",
-            "$argon2id$v=19$m=1,t=1,p=1$c2FsdHNhbHQ$has h$extra",
+            "$argon2i$v=19$m=1,t=1,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2id$v=$m=1,t=1,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2id$v=xx$m=1,t=1,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2id$v=19$m=1,t=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2id$v=19$m=a,t=1,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2id$v=19$m=1,t=1,p=1,q=9$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2id$v=19$m=1,t=1,p=1$short$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2id$v=19$m=1,t=1,p=1$c29tZXNhbHRzYWx0$sh",
+            "$argon2id$v=19$m=1,t=1,p=1$c29tZXNhbHRzYWx0$has h$extra",
         ] {
             assert!(
                 Argon2idHash::parse(bad).is_err(),
                 "must refuse a non-argon2id value"
             );
         }
+    }
+
+    /// A password hash is offline-crackable, so it must never reach a log.
+    #[test]
+    fn argon2id_debug_is_redacted() {
+        let parsed = Argon2idHash::parse(VALID_PHC).expect("valid");
+        let rendered = format!("{parsed:?}");
+        assert_eq!(rendered, "Argon2idHash(<redacted>)");
+        assert!(!rendered.contains("RdescudvJCsgt3ub"));
+        assert!(!rendered.contains("c29tZXNhbHRzYWx0"));
     }
 
     /// The refusal must not echo the rejected value: if a caller really did

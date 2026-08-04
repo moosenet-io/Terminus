@@ -3,13 +3,20 @@
 //! These mirror `migrations/S132-rmcp01-oauth-core.sql` one-for-one. Two
 //! conventions run through the whole file and are worth stating once:
 //!
-//! 1. **No type here can hold a presentable credential.** `password_hash` and
-//!    `client_secret_hash` are argon2id PHC strings; `code_hash` and
-//!    `token_hash` are SHA-256 digests. There is no field anywhere that carries
-//!    a plaintext code, token, or secret, which is what makes `Debug` safe to
-//!    derive on these types — a `{:?}` of any of them cannot print a
-//!    credential. (`Account` still opts out of `Debug` for its encrypted TOTP
-//!    seed; see below.)
+//! 1. **No type here can hold a presentable credential**, and no type prints
+//!    its sensitive material. `password_hash` and `client_secret_hash` are
+//!    argon2id PHC strings; `code_hash` and `token_hash` are SHA-256 digests.
+//!    None of those can be replayed as-is.
+//!
+//!    An earlier revision concluded from that that `Debug` was safe to derive.
+//!    Round 3 of review pushed back, and was right to: "cannot be replayed" is
+//!    not "harmless in a log". A client-secret PHC string is an offline
+//!    cracking target with its own salt and cost parameters attached, and a
+//!    code or token digest is live authentication material that confirms which
+//!    token a log line concerns. So every type here that holds such a field
+//!    implements `Debug` BY HAND with that field redacted, rather than deriving
+//!    it — hand-written specifically so that adding a sensitive field later
+//!    cannot silently re-expose it, which a derive would.
 //!
 //! 2. **Absence is denial, never a default.** No type implements `Default`, and
 //!    no field is populated with a permissive fallback. An empty
@@ -82,7 +89,7 @@ impl RegistrationSource {
 /// One connector. `client_id` is the public identifier pasted into the client
 /// application; `client_secret_hash` is `None` for a public client (which is
 /// what Claude registers as under both DCR and CIMD).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Client {
     pub id: Uuid,
     pub client_id: String,
@@ -144,7 +151,7 @@ impl ToolGroup {
 
 /// A single-use authorization code, bound to everything needed to detect a
 /// replay or a substituted client, redirect, or resource.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AuthCode {
     pub code_hash: Vec<u8>,
     pub client_id: Uuid,
@@ -159,7 +166,7 @@ pub struct AuthCode {
 }
 
 /// A refresh token in a rotation family.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RefreshToken {
     pub token_hash: Vec<u8>,
     pub family_id: Uuid,
@@ -200,6 +207,75 @@ pub struct ServerOwner {
     pub namespace: String,
     pub owner_account_id: Uuid,
     pub granted_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
+// Redacted Debug
+// ---------------------------------------------------------------------------
+//
+// Hand-written, not derived, for the three row types that carry hashed
+// credential material (see rule 1 in the module docs). Each prints every
+// non-sensitive field normally — the useful part for debugging — and replaces
+// the sensitive one with a marker. `Account` has no `Debug` at all, because its
+// encrypted TOTP seed is recoverable rather than hashed.
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("id", &self.id)
+            .field("client_id", &self.client_id)
+            // The PHC string is an offline cracking target; only its presence
+            // (which is what `is_confidential` turns on) is ever interesting.
+            .field("client_secret_hash", &self.client_secret_hash.as_ref().map(|_| "<redacted>"))
+            .field("name", &self.name)
+            .field("redirect_uris", &self.redirect_uris)
+            .field("grant_types", &self.grant_types)
+            .field("token_endpoint_auth_method", &self.token_endpoint_auth_method)
+            .field("owner_account_id", &self.owner_account_id)
+            .field("registration_source", &self.registration_source)
+            .field("disabled", &self.disabled)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for AuthCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthCode")
+            .field("code_hash", &"<redacted>")
+            .field("client_id", &self.client_id)
+            .field("account_id", &self.account_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("resource", &self.resource)
+            // The PKCE challenge is a digest of the verifier and is not secret,
+            // but it identifies the exchange; there is no debugging value in it
+            // that the code hash's presence does not already give.
+            .field("code_challenge", &"<redacted>")
+            .field("scope", &self.scope)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .field("consumed_at", &self.consumed_at)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RefreshToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshToken")
+            .field("token_hash", &"<redacted>")
+            .field("family_id", &self.family_id)
+            .field("client_id", &self.client_id)
+            .field("account_id", &self.account_id)
+            .field("resource", &self.resource)
+            .field("scope", &self.scope)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            // Whether it was rotated is the load-bearing fact for reuse
+            // detection; the successor's digest is not.
+            .field("rotated_to", &self.rotated_to.as_ref().map(|_| "<redacted>"))
+            .field("revoked_at", &self.revoked_at)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +429,51 @@ mod tests {
     fn confidentiality_follows_the_stored_secret_not_the_method() {
         assert!(!client_with_secret(None).is_confidential());
         assert!(client_with_secret(Some("$argon2id$v=19$...")).is_confidential());
+    }
+
+    /// No hashed credential material may reach a log through `Debug`, while
+    /// the fields that make a log line useful must still be there.
+    #[test]
+    fn debug_redacts_hashes_but_keeps_context() {
+        let client = client_with_secret(Some("$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$ZGlnZXN0"));
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains("argon2id"), "the PHC string must not appear: {rendered}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("cid"), "the client_id is not secret and aids debugging");
+
+        let code = AuthCode {
+            code_hash: b"\xde\xad\xbe\xef".to_vec(),
+            client_id: Uuid::nil(),
+            account_id: Uuid::nil(),
+            redirect_uri: "https://example.test/cb".into(),
+            resource: "https://example.test/mcp".into(),
+            code_challenge: "a-pkce-challenge-value".into(),
+            scope: "mcp".into(),
+            issued_at: Utc::now(),
+            expires_at: Utc::now(),
+            consumed_at: None,
+        };
+        let rendered = format!("{code:?}");
+        assert!(!rendered.contains("dead"), "no digest bytes: {rendered}");
+        assert!(!rendered.contains("a-pkce-challenge-value"));
+        assert!(rendered.contains("https://example.test/mcp"), "the audience aids debugging");
+
+        let token = RefreshToken {
+            token_hash: vec![1, 2, 3],
+            family_id: Uuid::nil(),
+            client_id: Uuid::nil(),
+            account_id: Uuid::nil(),
+            resource: "https://example.test/mcp".into(),
+            scope: "mcp".into(),
+            issued_at: Utc::now(),
+            expires_at: Utc::now(),
+            rotated_to: Some(vec![4, 5, 6]),
+            revoked_at: None,
+        };
+        let rendered = format!("{token:?}");
+        assert!(!rendered.contains("[1, 2, 3]"), "no digest bytes: {rendered}");
+        assert!(!rendered.contains("[4, 5, 6]"));
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]
