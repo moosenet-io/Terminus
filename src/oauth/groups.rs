@@ -273,10 +273,38 @@ impl Pattern {
         Self::parse_syntax_checked(raw).ok()
     }
 
-    /// The shared syntax check. Order matters: character legality is checked
-    /// before shape, so a pattern with a control character is rejected as such
-    /// rather than being reported as an odd prefix.
+    /// The shared syntax check, and the one place the GRAMMAR is enforced.
+    ///
+    /// ```text
+    /// pattern   := "*"                        -- Everything (operator-only)
+    ///            | namespace "__" "*"         -- Namespace
+    ///            | namespace "__" bare "*"    -- NamespacedPrefix
+    ///            | namespace "__" bare        -- Exact, qualified
+    ///            | local "*"                  -- Prefix, LOCAL ONLY
+    ///            | local                      -- Exact, local
+    ///
+    /// namespace := ASCII-graphic+, no "*", and must round-trip through
+    ///              `split_namespaced` (so: no "__" inside it, no trailing "_")
+    /// bare      := ASCII-graphic+, no "*"   (may itself contain "__")
+    /// local     := ASCII-graphic+, no "*", no "__"
+    /// ```
+    ///
+    /// Rejected, exhaustively: the empty pattern; anything over
+    /// [`MAX_PATTERN_CHARS`]; any non-ASCII-graphic character (whitespace,
+    /// control bytes, homoglyphs); a `*` anywhere but as the single FINAL
+    /// character; a pattern beginning with the separator; and any namespace
+    /// that cannot round-trip.
+    ///
+    /// ## Why every rejection is a rejection
+    /// Each one is a shape that would otherwise parse to something the author
+    /// did not write. The direction is usually UNDER-granting — a pattern that
+    /// silently matches nothing, so a connector is quietly missing tools with no
+    /// error to explain it — but "means something other than what was written"
+    /// is the defect either way, and the next person to add suffix matching
+    /// should be adding it to a parser that refused the syntax rather than one
+    /// that already accepted it and did something else with it.
     fn parse_syntax_checked(raw: &str) -> Result<Self, ToolError> {
+        // ---- whole-string checks, before any shape is considered ----
         if raw.is_empty() {
             return Err(ToolError::InvalidArgument("an empty pattern matches nothing; remove it".into()));
         }
@@ -297,35 +325,62 @@ impl Pattern {
                     .into(),
             ));
         }
-        // `*` is understood ONLY as a trailing wildcard. `a*b` and `**` read to
-        // a human as globs and would be matched here as neither, so they are
-        // refused rather than quietly reinterpreted — the same fail-closed
-        // stance `gateway_framework`'s grant validation takes on the same
-        // character, for the same reason.
-        if raw[..raw.len() - 1].contains('*') {
+        // `*` is understood ONLY as the single trailing character. This is
+        // counted over the WHOLE string and decided before any shape is chosen,
+        // so a leading (`*weather`) or interior (`weather*foo`, `**`) star is
+        // refused as such rather than falling through to some other branch and
+        // being accepted as, say, an exact name that no tool could ever have.
+        // Both read to a human as globs; there is no glob syntax here, so they
+        // are refused rather than quietly reinterpreted — the same fail-closed
+        // stance `gateway_framework`'s grant validation takes on this character.
+        let stars = raw.matches('*').count();
+        let trailing_star = raw.ends_with('*');
+        if stars > 1 || (stars == 1 && !trailing_star) {
             return Err(ToolError::InvalidArgument(
-                "`*` is only meaningful as the LAST character of a pattern; \
-                 there is no general glob or regex syntax here"
+                "`*` is only meaningful as the LAST character of a pattern, and only once; \
+                 there is no general glob, suffix, or regex syntax here"
                     .into(),
             ));
         }
 
-        let Some(head) = raw.strip_suffix('*') else {
-            return Ok(Pattern::Exact(raw.to_string()));
-        };
+        // ---- shape ----
+        //
+        // An EXACT pattern is a literal advertised name and is decided first,
+        // before any namespace splitting. It has to be: `peerhub__ledger_add`
+        // as an exact name must stay exact. Running it through the qualified
+        // split would turn it into a PREFIX over that namespace — matching
+        // `peerhub__ledger_add_v2` as well — which is a widening, and precisely
+        // the "parses to something other than what was written" class this
+        // function exists to close.
+        let head = if trailing_star { &raw[..raw.len() - 1] } else { raw };
         if head.is_empty() {
+            // Only reachable as the bare `*`; the empty string was rejected above.
             return Ok(Pattern::Everything);
         }
+        // A leading separator can never denote anything: `split_namespaced`
+        // treats an empty namespace half as no split at all, so `__foo*` would
+        // otherwise fall through to a LOCAL prefix beginning with `__` — one
+        // that no advertised name can match, since any name starting with `__`
+        // has that same empty half. Silently storing an unmatchable pattern is
+        // the same "means something other than what was written" defect as an
+        // unsupported glob, so it is refused where an author can still fix it.
+        if head.starts_with(MESH_NS_SEP) {
+            return Err(ToolError::InvalidArgument(format!(
+                "a pattern may not begin with `{MESH_NS_SEP}`; write `<namespace>{MESH_NS_SEP}...` \
+                 to name an upstream, or drop the separator for a local tool"
+            )));
+        }
+
+        if !trailing_star {
+            return Ok(Pattern::Exact(head.to_string()));
+        }
+
         // `ns__*` is the namespace form. Recognising it here (rather than
         // leaving it as a prefix that happens to end in the separator) is what
         // lets it render back identically and lets the matcher use the mesh's
         // own splitter instead of a second, parallel notion of "namespaced".
         if let Some(namespace) = head.strip_suffix(MESH_NS_SEP) {
-            if namespace.is_empty() || namespace.contains(MESH_NS_SEP) {
-                return Err(ToolError::InvalidArgument(format!(
-                    "the namespace form is `<namespace>{MESH_NS_SEP}*` with a single, non-empty namespace"
-                )));
-            }
+            check_namespace(namespace)?;
             return Ok(Pattern::Namespace(namespace.to_string()));
         }
         // A prefix that NAMES a namespace is a qualified prefix. Splitting it
@@ -334,11 +389,17 @@ impl Pattern {
         // only patterns that can reach a federated tool are the two that carry a
         // namespace, and both got it from the author writing one down.
         if let Some((namespace, prefix)) = split_namespaced(head) {
+            check_namespace(namespace)?;
             return Ok(Pattern::NamespacedPrefix {
                 namespace: namespace.to_string(),
                 prefix: prefix.to_string(),
             });
         }
+        // Local prefix. `split_namespaced` found no usable split and the
+        // leading-separator case is gone, so `head` carries no separator at all
+        // — which is what makes this a LOCAL-only pattern by construction
+        // rather than by a rule applied later.
+        debug_assert!(!head.contains(MESH_NS_SEP));
         Ok(Pattern::Prefix(head.to_string()))
     }
 
@@ -427,6 +488,34 @@ impl Pattern {
             Pattern::Exact(name) => name.clone(),
         }
     }
+}
+
+/// A namespace must survive a round-trip through the splitter the MATCHER uses.
+///
+/// Checked by construction — build a namespaced name and split it again —
+/// rather than by a hand-derived character rule, so this cannot drift from
+/// [`split_namespaced`]'s actual behaviour. It rejects three shapes at once,
+/// all of which parse cleanly and then match NOTHING:
+///
+/// - **empty** (`__*`): absence of a namespace that compares equal to something
+///   is the absence-means-permission failure this whole item exists to prevent.
+/// - **an interior separator** (`a__b__*`): ambiguous about where the namespace
+///   ends, and the splitter would pick the first `__` regardless.
+/// - **a TRAILING underscore** (`foo___*` → namespace `foo_`): the subtle one,
+///   and not previously caught. `split_namespaced` always splits at the FIRST
+///   `__`, so an advertised `foo___bar` yields namespace `foo`, never `foo_`.
+///   A pattern naming `foo_` is therefore unmatchable — it stores cleanly,
+///   reads as meaningful, and silently grants nothing.
+fn check_namespace(namespace: &str) -> Result<(), ToolError> {
+    let probe = crate::mesh::merge::namespaced(namespace, "x");
+    if !namespace.is_empty() && split_namespaced(&probe) == Some((namespace, "x")) {
+        return Ok(());
+    }
+    Err(ToolError::InvalidArgument(format!(
+        "`{namespace}` is not a usable namespace: it must be non-empty, contain no \
+         `{MESH_NS_SEP}`, and not end in `_` — otherwise no advertised tool name can \
+         ever resolve to it"
+    )))
 }
 
 /// A group that has passed write-time validation. The store accepts only this,
@@ -1128,13 +1217,18 @@ mod tests {
             "",                      // matches nothing; a config error, not a grant
             "wea*her_*",             // interior star: reads as a glob, is not one
             "**",                    // ditto
-            "*weather",              // leading star is not supported syntax
+            "*weather",              // leading star: reads as a suffix match, is not one
+            "weather*foo",           // interior star with no trailing star at all
+            "*a*",                   // both at once
             "weather get",           // whitespace can never match a tool name
             "weather\u{200B}_*",     // invisible character
             "weather\n_*",           // control character
             "wéather_*",             // non-ASCII cannot match an ASCII registry
             "__*",                   // empty namespace
+            "__foo*",                // empty namespace in the split-prefix form
+            "__foo",                 // ...and in the exact form
             "a__b__*",               // ambiguous double namespace
+            "foo___*",               // namespace `foo_` — unmatchable, see check_namespace
         ] {
             assert!(
                 Pattern::parse(bad, GroupOwner::Operator).is_err(),
@@ -1143,6 +1237,72 @@ mod tests {
         }
         let too_long = "x".repeat(MAX_PATTERN_CHARS + 1);
         assert!(Pattern::parse(&too_long, GroupOwner::Operator).is_err());
+    }
+
+    /// The star rule is decided over the WHOLE string before any shape is
+    /// chosen, so a star that is not the single trailing character is refused as
+    /// such — it never falls through to another branch and gets accepted as
+    /// something else.
+    ///
+    /// `*weather` is the case worth naming: an author writing it means a SUFFIX
+    /// match. There is no suffix syntax, so the only honest answers are "refuse
+    /// it" or "silently store an exact pattern for a tool literally named
+    /// `*weather`", which exists nowhere and leaves a connector quietly missing
+    /// tools with no error to explain it. This asserts the first.
+    #[test]
+    fn a_star_anywhere_but_the_end_is_refused_whatever_the_shape() {
+        for bad in ["*weather", "weather*foo", "*a*", "**", "a*b*", "*"] {
+            let parsed = Pattern::parse(bad, GroupOwner::Operator);
+            if bad == "*" {
+                assert_eq!(parsed.unwrap(), Pattern::Everything, "the bare `*` is the one legal star");
+            } else {
+                assert!(parsed.is_err(), "{bad:?} must be refused, not reinterpreted");
+            }
+        }
+        // And it is refused as a STAR problem, not misreported as something else.
+        let err = Pattern::parse("*weather", GroupOwner::Operator).unwrap_err().to_string();
+        assert!(err.contains("LAST character"), "the error must name the real problem: {err}");
+    }
+
+    /// A namespace that cannot round-trip through `split_namespaced` is refused,
+    /// because it would store cleanly, read as meaningful, and match nothing.
+    ///
+    /// The trailing-underscore case (`foo___*` → namespace `foo_`) is the one
+    /// that was not previously caught: the splitter always cuts at the FIRST
+    /// `__`, so an advertised `foo___bar` resolves to namespace `foo`, and no
+    /// tool can ever resolve to `foo_`.
+    #[test]
+    fn an_unusable_namespace_is_refused_rather_than_stored_unmatchable() {
+        for bad in ["__*", "__foo*", "a__b__*", "foo___*", "__foo"] {
+            assert!(
+                Pattern::parse(bad, GroupOwner::Operator).is_err(),
+                "{bad:?} can never match a real tool and must be refused at write time"
+            );
+        }
+        // The usable forms still parse, including a bare name that legitimately
+        // contains the separator after a valid namespace.
+        assert_eq!(
+            Pattern::parse("a__b__c*", GroupOwner::Operator).unwrap(),
+            Pattern::NamespacedPrefix { namespace: "a".into(), prefix: "b__c".into() },
+            "a bare tool name may itself contain the separator"
+        );
+        assert_eq!(
+            Pattern::parse("_foo*", GroupOwner::Operator).unwrap(),
+            Pattern::Prefix("_foo".into()),
+            "a single leading underscore is not the separator"
+        );
+    }
+
+    /// An EXACT qualified name must stay EXACT. Splitting it into a namespaced
+    /// prefix would widen it — `peerhub__ledger_add` would start matching
+    /// `peerhub__ledger_add_v2` — which is the same "parses to something other
+    /// than what was written" defect, in the granting direction.
+    #[test]
+    fn an_exact_qualified_name_does_not_become_a_prefix() {
+        let p = Pattern::parse("peerhub__ledger_add", GroupOwner::Operator).unwrap();
+        assert_eq!(p, Pattern::Exact("peerhub__ledger_add".into()));
+        assert!(p.matches("peerhub__ledger_add"));
+        assert!(!p.matches("peerhub__ledger_add_v2"), "an exact pattern must not act as a prefix");
     }
 
     /// Matching is TOTAL: whatever a name looks like, matching answers

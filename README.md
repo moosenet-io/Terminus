@@ -1171,6 +1171,29 @@ Exactly these shapes parse. There is no glob, no regex, and no negation.
 | `namespace__prefix*` | tools from one upstream whose bare name starts with `prefix` | `peerhub__ledger*` |
 | `*` | every tool, **local and federated** — operator-owned groups only | |
 
+The full grammar, so the rejections are as unambiguous as the semantics:
+
+```text
+pattern   := "*"                        -- every tool (operator-owned groups only)
+           | namespace "__" "*"         -- one upstream, all of it
+           | namespace "__" bare "*"    -- one upstream, bare names starting with `bare`
+           | namespace "__" bare        -- one federated tool, exactly
+           | local "*"                  -- LOCAL tools starting with `local`
+           | local                      -- one local tool, exactly
+
+namespace := printable ASCII, no "*", must round-trip through the mesh splitter
+             (so: no "__" inside, no trailing "_")
+bare      := printable ASCII, no "*"    (may itself contain "__")
+local     := printable ASCII, no "*", no "__"
+```
+
+Rejected at write time, exhaustively: the empty pattern; anything over 96 characters; any
+non-printable-ASCII character; a `*` anywhere but as the single final character (`*weather`
+and `weather*foo` are errors, not suffix matches); a pattern beginning with `__`; and any
+namespace that cannot round-trip (`__*`, `a__b__*`, `foo___*`). Every one of those would
+otherwise parse to something the author did not write — usually a pattern that silently
+matches nothing, leaving a connector quietly missing tools with no error to explain it.
+
 **The rule in one sentence:** an unqualified *exact* or *prefix* pattern matches local
 tools only; a namespace-qualified pattern matches only within the namespace it names; and
 the bare `*` matches the whole merged catalog, bounded by the client's allowed namespaces
