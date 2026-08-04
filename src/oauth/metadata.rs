@@ -603,7 +603,13 @@ impl Discovery {
 /// as a host containing colons, and either the brackets get rejected or the
 /// port check misfires on the address's own colons.
 fn validate_authority(authority: &str) -> Result<(), &'static str> {
-    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+    // The two host FORMS are validated in their own branches and only the PORT
+    // check is shared. An earlier revision validated the IPv6 literal and then
+    // fell through into the hostname rules below, which reject a colon — so a
+    // perfectly good `[::1]:8443` was refused by the very check that had just
+    // accepted it. Caught by this function's own test, which is the argument
+    // for asserting the accept cases and not only the reject cases.
+    let port = if let Some(rest) = authority.strip_prefix('[') {
         // IPv6 literal. Everything up to `]` is the address; anything after it
         // must be a port or nothing at all.
         let Some((inner, after)) = rest.split_once(']') else {
@@ -625,32 +631,33 @@ fn validate_authority(authority: &str) -> Result<(), &'static str> {
         {
             return Err("has a malformed IPv6 literal");
         }
-        (inner, port)
+        port
     } else {
-        match authority.split_once(':') {
+        let (host, port) = match authority.split_once(':') {
             Some((host, port)) => (host, Some(port)),
             None => (authority, None),
-        }
-    };
+        };
 
-    if host.is_empty() {
-        return Err("has no host");
-    }
-    // A stray colon left in a non-bracketed host means either a second port
-    // separator or a bare IPv6 address that should have been bracketed. Both
-    // are malformed, and both would otherwise sail through.
-    if host.contains(':') {
-        return Err("has a malformed host (an IPv6 address must be bracketed)");
-    }
-    if !host
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
-    {
-        return Err("has a host containing characters that are not valid in a hostname");
-    }
-    if host.starts_with('.') || host.ends_with('.') || host.contains("..") {
-        return Err("has a host with an empty label");
-    }
+        if host.is_empty() {
+            return Err("has no host");
+        }
+        // A stray colon left in a non-bracketed host means either a second port
+        // separator or a bare IPv6 address that should have been bracketed.
+        // Both are malformed, and both would otherwise sail through.
+        if host.contains(':') {
+            return Err("has a malformed host (an IPv6 address must be bracketed)");
+        }
+        if !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+        {
+            return Err("has a host containing characters that are not valid in a hostname");
+        }
+        if host.starts_with('.') || host.ends_with('.') || host.contains("..") {
+            return Err("has a host with an empty label");
+        }
+        port
+    };
 
     if let Some(port) = port {
         if port.is_empty() {
