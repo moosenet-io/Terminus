@@ -92,10 +92,28 @@ changes is an env edit and a restart, not a release.
 | `RMCP_EDGE_BEHIND_PROXY` | Set when a reverse proxy fronts the edge. Empty trusted proxies then becomes a startup error. |
 | `RMCP_EDGE_RATE_LIMIT_BURST` / `RMCP_EDGE_RATE_LIMIT_REFILL_PER_SEC` | Per-resolved-address edge budget, independent of any per-account limit. |
 
-For the value to put in `RMCP_EDGE_ANTHROPIC_CIDRS`, see the prose note in
-`.env.example` and confirm it against Anthropic's own published egress
-documentation before you deploy. Note that Anthropic publishes an *inbound*
-range as well; only the **outbound** one is relevant to an inbound pinhole here.
+### Where the Anthropic range comes from
+
+`RMCP_EDGE_ANTHROPIC_CIDRS` has **no default and no value written down in this
+repository**, deliberately. Look it up at deploy time in **Anthropic's own
+published IP-address documentation**, under the heading for the OUTBOUND /
+egress ranges Claude uses when calling out to an external MCP server, and paste
+that range in.
+
+The range belongs to Anthropic and can change. A literal copied into our
+`.env.example` or into the binary would go stale silently, and a stale allowlist
+on this class does not fail loudly — it presents as a connector that simply
+stopped being reachable, with nothing in our logs pointing at the cause. So the
+lookup is a deploy step, and it is worth repeating if the connector ever goes
+quiet.
+
+Two traps on that page:
+
+- Anthropic publishes an **inbound** range as well. That is where Anthropic
+  *receives* connections; it is not what an inbound pinhole here wants. Use the
+  **outbound** one.
+- The outbound range is published for IPv4. Treat any IPv6 prefix as a
+  deliberate decision you are making, not something to paste in by default.
 
 ### Fail-closed rules worth knowing before you debug a 403
 

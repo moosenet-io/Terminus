@@ -62,10 +62,21 @@
 //!   (log and carry on with a default) means running under a policy nobody
 //!   understood, on the one listener that faces the internet.
 //!
-//! ## A note on names and fixtures (held review findings — read before re-raising)
-//! Three things in this file and its deploy assets have been raised as possible
-//! PII/infra disclosure and HELD, twice. They are deliberate; the reasoning
-//! lives at each site so a later round does not have to re-derive it:
+//! ## A note on names and fixtures (settled review findings — read before re-raising)
+//! Several things in this file and its deploy assets have been raised as
+//! possible "hardcoded infrastructure". One was CONCEDED and is now gone; the
+//! rest are deliberate and HELD, with the reasoning at each site so a later
+//! round does not have to re-derive it:
+//!
+//! - **CONCEDED (round 3): Anthropic's published egress range.** No literal for
+//!   it exists anywhere in this repository any more — not in the binary, not in
+//!   `.env.example`. [`ENV_ANTHROPIC_CIDRS`] has no default, and the operator
+//!   looks the current value up in Anthropic's own published IP-address
+//!   documentation at deploy time (`docs/networking/remote-mcp.md` says where
+//!   and warns about the inbound/outbound trap). That range is Anthropic's to
+//!   change, so a copy of it here would go stale silently — and a stale
+//!   allowlist on this class presents as a connector that just stopped working,
+//!   with nothing in our logs pointing at the cause.
 //!
 //! - **`terminus-primary` / `terminus_primary`** is this repository's SERVICE
 //!   and module name — it names the binary, the systemd units, the deploy
@@ -73,11 +84,15 @@
 //!   host identifier, which is what the standing rule targets; the PII gate's
 //!   own internal-host detector is a fixed list of node names and does not
 //!   include it. Every other module in the tree refers to itself the same way.
-//! - **The loopback default bind** — see [`DEFAULT_BIND`].
-//! - **RFC 5737/3849 documentation ranges in test fixtures** — see the note at
-//!   the fixture constants in this module's `tests`.
+//! - **The loopback default bind and the default port** — see [`DEFAULT_BIND`]
+//!   and [`DEFAULT_PORT`]. Both are DEFAULTS behind [`ENV_BIND`]/[`ENV_PORT`],
+//!   not values compiled into the binary that an operator has to live with.
+//! - **RFC 5737 TEST-NET / RFC 3849 documentation ranges in test fixtures** —
+//!   see the note at the fixture constants in this module's `tests`. These are
+//!   the sanctioned placeholders; inventing addresses instead would be worse,
+//!   because an invented address can collide with something real.
 //!
-//! In all three cases the repo's own `no_pii_in_own_source_tree` gate passes on
+//! In every case the repo's own `no_pii_in_own_source_tree` gate passes on
 //! these files, which is the mechanical check the rule is expressed through.
 //!
 //! ## TLS is not terminated here
@@ -139,6 +154,12 @@ const DEFAULT_RATE_LIMIT_BURST: u32 = 30;
 /// Default edge rate-limit refill, tokens/sec.
 const DEFAULT_RATE_LIMIT_REFILL_PER_SEC: f64 = 2.0;
 /// Default edge port, adjacent to the primary gateway's own default.
+///
+/// A DEFAULT, not a baked-in value: [`ENV_PORT`] overrides it, exactly as
+/// [`ENV_BIND`] overrides [`DEFAULT_BIND`]. Neither the port nor the interface
+/// is compiled into the binary as something an operator has to live with — see
+/// [`DEFAULT_BIND`] for why having a safe default here is better than requiring
+/// the variable.
 const DEFAULT_PORT: u16 = 8311;
 /// Default edge bind interface.
 ///
@@ -1178,8 +1199,10 @@ mod tests {
     use axum::routing::{get, post};
     use tower::ServiceExt;
 
-    // Fixture addresses are RFC 5737 (v4) and RFC 3849 (v6) DOCUMENTATION
-    // ranges. HELD from review round 1, deliberately, not an oversight:
+    // RFC 5737 TEST-NET (v4) and RFC 3849 (v6) documentation ranges — the
+    // sanctioned placeholder for exactly this, not real infrastructure.
+    //
+    // HELD through review rounds 1, 2 and 3, deliberately, not an oversight:
     //
     // These blocks exist in their RFCs precisely to be written down in examples
     // and tests. They are reserved, never routable, and describe no fleet
