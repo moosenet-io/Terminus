@@ -847,6 +847,11 @@ fails in a way the client cannot describe.
 | `RMCP_OAUTH_REQUIRED_SCOPE` | Scope an access token must carry to reach `/mcp`. Default `mcp`. |
 | `RMCP_OAUTH_DCR_ENABLED` | Advertise and accept RFC 7591 dynamic client registration. Default off. |
 
+Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` in any case; unset or
+empty means off. **An unrecognised value aborts startup** rather than reading as off — a
+typo is an instruction the operator believes is in force, and `RMCP_OAUTH_DCR_ENABLED`
+gates a security-relevant default.
+
 **The contract.** `RMCP_OAUTH_RESOURCE` is published verbatim as the `resource`
 field of the protected-resource metadata document, is echoed by the client as the
 RFC 8707 `resource` parameter, and becomes the audience of every issued token. Those

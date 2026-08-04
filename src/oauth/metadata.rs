@@ -799,18 +799,23 @@ fn validate_authority(authority: &str) -> Result<(), &'static str> {
 /// nothing here" is a different statement from "there is something here and I
 /// have quietly altered it".
 fn read_env(var: &str) -> Result<Option<String>, ToolError> {
-    // ONE rule, applied to every setting this module reads:
+    // ONE rule, applied to every setting this module reads — URIs, scope lists
+    // and booleans alike:
     //
     //   ABSENT   -> the feature is not configured. Unset, or set to the empty
     //               string, are both absent.
-    //   PRESENT  -> the value must be usable. Anything present-but-unusable is
+    //   PRESENT  -> the value must be USABLE. Anything present-but-unusable is
     //               malformed configuration and ABORTS startup.
     //
-    // The three arms below are that rule, not three special cases. What makes
-    // them one rule is the consequence: on this door, "not configured" disables
-    // an internet-facing surface, and disabling it on a gateway with no legacy
+    // The arms below are that rule, not a list of special cases, and neither is
+    // the boolean check in `read_flag` or the URI check in `CanonicalUri` —
+    // "usable" just means something different per type: parseable as a URI,
+    // well-formed as a scope list, recognisable as true or false. What makes it
+    // one rule is the consequence. On this door, "not configured" disables an
+    // internet-facing surface, and disabling it on a gateway with no legacy
     // `auth_token` restores an open `/mcp`. So every value that is not clearly
-    // an operator saying "off" must stop the process rather than be guessed at.
+    // an operator saying "off" must stop the process rather than be guessed at:
+    // a value nobody can read is not consent to any particular posture.
     let value = match std::env::var(var) {
         Ok(value) => value,
         // Not set at all. Absent.
@@ -970,23 +975,58 @@ impl OauthDoors {
     }
 }
 
-/// Read a boolean flag, applying [`read_env`]'s presence rules first.
+/// The boolean spellings this module accepts, in both directions.
 ///
-/// The VALUE is trimmed here even though the canonical URI's is not, and the
-/// asymmetry is deliberate: nothing compares a flag byte-for-byte against
-/// anything, so ` true` meaning `true` costs nothing, whereas refusing it would
-/// fail a deployment over an invisible character for no gain. The
-/// no-normalization rule this module enforces is about values that are
-/// PUBLISHED and COMPARED, not about every string it reads.
+/// Listed once, so the parser, the error message and the documentation cannot
+/// disagree about what is accepted.
+const TRUE_FORMS: &[&str] = &["1", "true", "yes", "on"];
+const FALSE_FORMS: &[&str] = &["0", "false", "no", "off"];
+
+/// Read a boolean flag, applying [`read_env`]'s presence rule.
+///
+/// # The same rule, not a smaller one
+///
+/// ABSENT (unset or empty) means not configured, and the flag takes its
+/// documented default. PRESENT means the value must be USABLE — and for a
+/// boolean, usable means it is recognisably true or false. Anything else aborts
+/// startup.
+///
+/// Review round 7 caught this reading an unrecognised value as `false`. That is
+/// the same fail-open as the whitespace and non-UTF-8 cases, in a smaller box: a
+/// typo is a legible instruction the operator believes is in force, and
+/// answering it with a silent `false` changes the configured posture without a
+/// word. It matters most on the knob where being wrong is cheapest to miss —
+/// [`DCR_ENABLED_ENV`] gates dynamic client registration, so `=ture` would
+/// quietly leave a security-relevant feature in a state nobody chose, and the
+/// operator's evidence that they set it is the line they are looking at.
+///
+/// # Why the value is trimmed when the canonical URI's is not
+///
+/// Nothing compares a flag byte-for-byte against anything, so ` true` meaning
+/// `true` costs nothing, whereas refusing it would fail a deployment over an
+/// invisible character for no gain. The no-normalization rule this module
+/// enforces is about values that are PUBLISHED and COMPARED, not about every
+/// string it reads. Trimming is not the same as guessing: a trimmed value still
+/// has to be one of the accepted spellings.
 fn read_flag(var: &str) -> Result<bool, ToolError> {
-    Ok(read_env(var)?
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false))
+    let Some(raw) = read_env(var)? else {
+        return Ok(false);
+    };
+    let value = raw.trim().to_ascii_lowercase();
+    if TRUE_FORMS.contains(&value.as_str()) {
+        return Ok(true);
+    }
+    if FALSE_FORMS.contains(&value.as_str()) {
+        return Ok(false);
+    }
+    Err(ToolError::InvalidArgument(format!(
+        "{var} is set to {raw:?}, which is not a recognised boolean. Accepted: {} for on, {} for \
+         off (any case); unset or empty means off. This is refused rather than read as \"off\" \
+         because a typo here is an instruction you believe is in force, and silently ignoring it \
+         would change the configured posture without saying so",
+        TRUE_FORMS.join("/"),
+        FALSE_FORMS.join("/")
+    )))
 }
 
 /// Split a space-separated scope list, rejecting any token that is not a valid
@@ -1300,6 +1340,77 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains(CANONICAL_RESOURCE_ENV), "{message}");
         assert!(message.contains("UTF-8"), "{message}");
+    }
+
+    /// REVIEW ROUND 7 — the same rule, applied to booleans.
+    ///
+    /// An unrecognised value used to read as `false`, silently choosing a
+    /// posture the operator did not. That matters most on [`DCR_ENABLED_ENV`],
+    /// which gates dynamic client registration: `=ture` would leave a
+    /// security-relevant feature in a state nobody picked, while the operator
+    /// looks at a line that says they set it.
+    #[test]
+    #[serial]
+    fn an_unrecognised_boolean_aborts_rather_than_defaulting_to_false() {
+        let with = |var: &str, value: &str| {
+            std::env::set_var(CANONICAL_RESOURCE_ENV, "https://connector.test/mcp");
+            std::env::set_var(var, value);
+            let result = Discovery::from_env();
+            std::env::remove_var(var);
+            std::env::remove_var(CANONICAL_RESOURCE_ENV);
+            result
+        };
+
+        // Both flags, because both are reached through the same reader and a
+        // regression in either is the same class of defect.
+        for var in [DCR_ENABLED_ENV, ISSUER_EXTERNALLY_SERVED_ENV] {
+            for garbage in ["garbage", "ture", "enabled", "2", "yes please", "-1"] {
+                assert!(
+                    with(var, garbage).is_err(),
+                    "{var}={garbage:?} must abort, not quietly read as false"
+                );
+            }
+        }
+
+        // And the refusal must name the variable, so an operator can act on it.
+        let err = with(DCR_ENABLED_ENV, "ture").expect_err("a typo must abort");
+        let message = err.to_string();
+        assert!(message.contains(DCR_ENABLED_ENV), "{message}");
+        assert!(message.contains("ture"), "the error must show what was read: {message}");
+        assert!(message.contains("true"), "and what is accepted: {message}");
+
+        // Every accepted spelling still works, in both directions and any case
+        // — a guard that refuses real configuration is worse than the gap it
+        // closes.
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            ("Yes", true),
+            ("on", true),
+            (" true ", true),
+            ("0", false),
+            ("false", false),
+            ("No", false),
+            ("OFF", false),
+        ] {
+            let discovery = with(DCR_ENABLED_ENV, value)
+                .unwrap_or_else(|e| panic!("{value:?} must be accepted: {e}"))
+                .expect("the door is enabled in this fixture");
+            assert_eq!(discovery.dcr_enabled(), expected, "for {value:?}");
+        }
+
+        // And ABSENT still means off, without an error — the other half of the
+        // one rule.
+        std::env::set_var(CANONICAL_RESOURCE_ENV, "https://connector.test/mcp");
+        std::env::remove_var(DCR_ENABLED_ENV);
+        let unset = Discovery::from_env();
+        std::env::set_var(DCR_ENABLED_ENV, "");
+        let empty = Discovery::from_env();
+        std::env::remove_var(DCR_ENABLED_ENV);
+        std::env::remove_var(CANONICAL_RESOURCE_ENV);
+        assert!(!unset.expect("unset is fine").expect("enabled").dcr_enabled());
+        assert!(!empty.expect("empty is fine").expect("enabled").dcr_enabled());
     }
 
     /// The other route to the same fail-open: the operator configured the
