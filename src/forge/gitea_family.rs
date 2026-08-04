@@ -1001,13 +1001,28 @@ mod tests {
     /// Both tests are now `#[serial]` (they cannot interleave with each other or
     /// with any other serial env-mutating test) AND each sets the value it needs
     /// EXPLICITLY rather than depending on the ambient environment.
-    struct MaxCrateBytesGuard(Option<String>);
+    /// The serial KEY both tests share. A keyed `#[serial]` only coordinates
+    /// tests using the SAME key, so this is only sufficient while every test
+    /// that mutates `CARGO_PUBLISH_MAX_CRATE_BYTES` carries it. Verified: these
+    /// two are the only writers in the tree (`rg CARGO_PUBLISH_MAX_CRATE_BYTES`
+    /// finds the reader in `src/gitea/mod.rs` and these two tests). A future test
+    /// that touches this variable MUST use this key — hence naming it once here
+    /// rather than repeating a bare string at each attribute.
+    ///
+    /// (gpt56 review, TERM #594.)
+    ///
+    /// The value is captured as an `OsString` via `var_os`, not `var().ok()`:
+    /// the latter silently reports a NON-UNICODE existing value as absent, and
+    /// the guard would then REMOVE the variable on drop instead of restoring it
+    /// — the exact leak it exists to prevent, in the one case it would be
+    /// hardest to notice.
+    struct MaxCrateBytesGuard(Option<std::ffi::OsString>);
 
     impl MaxCrateBytesGuard {
         const VAR: &'static str = "CARGO_PUBLISH_MAX_CRATE_BYTES";
 
         fn set(value: &str) -> Self {
-            let prev = std::env::var(Self::VAR).ok();
+            let prev = std::env::var_os(Self::VAR);
             std::env::set_var(Self::VAR, value);
             Self(prev)
         }
