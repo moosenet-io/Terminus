@@ -41,13 +41,38 @@
 //! full access.
 //!
 //! ## The namespace boundary, and the matcher RMCP-07 has to collapse onto
-//! An UNQUALIFIED pattern matches only UNQUALIFIED (local) tool names. A bare
-//! prefix does not span the mesh separator, so `peer*` cannot reach
-//! `peerhub__alerts_list` merely because the namespace shares its letters —
-//! reaching a federated tool takes a pattern that names the upstream. Absence
-//! of a namespace qualifier means "local only", never "anything that starts
-//! this way", which is the same fail-closed reading of absence this module
-//! applies everywhere else. [`Pattern::matches`] carries the full reasoning.
+//!
+//! **The rule, in one sentence covering all three pattern kinds: an unqualified
+//! EXACT or PREFIX pattern matches local (unqualified) tools only; a
+//! namespace-qualified pattern (`<ns>__*`, `<ns>__<prefix>*`) matches only
+//! within the namespace it names; and the bare `*` matches the whole merged
+//! catalog, local and federated alike, bounded by the client's allowed
+//! namespaces at RMCP-07's intersection rather than by this matcher.**
+//!
+//! The boundary exists because a bare prefix is letters, and letters collide:
+//! `peer*` cannot be allowed to reach `peerhub__alerts_list` merely because a
+//! namespace shares its opening characters. That is a widening the author
+//! cannot see in what they wrote, so absence of a qualifier means "local only",
+//! never "anything that starts this way" — the same fail-closed reading of
+//! absence this module applies everywhere else.
+//!
+//! **`*` is deliberately NOT local-only**, and the distinction is not an
+//! inconsistency. `*` has no letters, so there is no coincidence to fall foul
+//! of and no near-miss to mistake for a hit: an author who writes it has said
+//! "everything" and can mean nothing else. It is also the most heavily gated
+//! pattern here — operator-only at write time, and re-derived against the
+//! owner's CURRENT state on every resolution — so making it the one pattern
+//! that could not reach a federated tool would leave the strongest-gated shape
+//! weaker than shapes with fewer gates. It is what makes the namespace
+//! dimension of RMCP-07's intersection do real work: `namespaces(client)` is
+//! the thing that bounds a broad group, and if `*` stopped at the local
+//! registry that dimension would constrain only patterns that already name
+//! their own namespace. And operationally, "this connector gets what I get"
+//! has to be expressible without enumerating every upstream — otherwise it
+//! silently under-grants the moment a new one is federated, which is precisely
+//! the hand-authoring this item exists to remove.
+//!
+//! [`Pattern::matches`] carries the per-arm reasoning.
 //!
 //! RMCP-07 currently holds a SECOND copy of this matcher in its `scope.rs`,
 //! written before this item landed and marked in-file for deletion once it did.
@@ -180,7 +205,13 @@ impl CatalogTool {
 /// is what makes "validated at write time" structural rather than a convention.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Pattern {
-    /// `*` — every tool in the catalog. Operator-only (see [`GroupOwner`]).
+    /// `*` — every tool in the merged catalog, LOCAL AND FEDERATED.
+    ///
+    /// Operator-only at write time (see [`GroupOwner`]) and re-checked against
+    /// the owner's current state on every resolution. It is not subject to the
+    /// local-only rule that governs unqualified exact and prefix patterns: what
+    /// bounds it is the client's allowed namespaces at RMCP-07's intersection,
+    /// not this matcher.
     Everything,
     /// `<namespace>__*` — every tool advertised by one mesh upstream.
     Namespace(String),
@@ -319,9 +350,14 @@ impl Pattern {
     ///
     /// ## The namespace boundary
     /// Matching is against the ADVERTISED name (already namespaced for a
-    /// federated tool), and **an unqualified pattern matches only unqualified
-    /// names**. A bare [`Pattern::Prefix`] is checked against LOCAL tools alone;
-    /// it does not span [`MESH_NS_SEP`].
+    /// federated tool), and **an unqualified EXACT or PREFIX pattern matches
+    /// only unqualified names**. A bare [`Pattern::Prefix`] is checked against
+    /// LOCAL tools alone; it does not span [`MESH_NS_SEP`].
+    ///
+    /// [`Pattern::Everything`] is deliberately excluded from that rule and DOES
+    /// reach federated tools — see the module docs for why, and note the
+    /// wording: it is unqualified EXACT and PREFIX patterns that are local-only,
+    /// not "any bare pattern", which read literally would swallow `*` too.
     ///
     /// Review round 3 found why this has to be structural rather than
     /// incidental. The previous revision ran a plain `starts_with` over the
@@ -973,6 +1009,39 @@ mod tests {
             resolve_raw(&["peerhub__*"], GroupOwner::Operator),
             vec!["peerhub__alerts_list", "peerhub__ledger_add"]
         );
+    }
+
+    /// `*` REACHES FEDERATED TOOLS. This is the one pattern deliberately exempt
+    /// from the local-only rule, and RMCP-07's copy of the matcher must agree:
+    /// its `All` arm stays catalog-wide.
+    ///
+    /// The exemption is coherent rather than inconsistent. The local-only rule
+    /// exists because letters collide — a prefix can sweep in a namespace that
+    /// merely shares its opening characters, invisibly to the author. `*` has no
+    /// letters and so no coincidence to fall foul of; it is also the most
+    /// heavily gated pattern in the item (operator-only, re-derived on read), so
+    /// making it the ONLY shape that could not reach a federated tool would
+    /// leave the strongest-gated pattern weaker than weaker-gated ones.
+    ///
+    /// What bounds it is `namespaces(client)` at RMCP-07's intersection. If `*`
+    /// stopped at the local registry, that dimension would only ever constrain
+    /// patterns that already name their own namespace — nearly vestigial.
+    #[test]
+    fn the_bare_wildcard_reaches_federated_tools_and_is_bounded_elsewhere() {
+        let all = Pattern::parse("*", GroupOwner::Operator).unwrap();
+        assert!(all.matches("weather_get"), "local");
+        assert!(all.matches("peerhub__alerts_list"), "federated — NOT local-only");
+        assert!(all.matches("sensors__node_status"));
+
+        // Every advertised name in the fixture, both sides of the separator.
+        let cat = catalog();
+        assert_eq!(resolve(&[all], &cat).len(), cat.len());
+        assert!(cat.iter().any(|t| t.namespace.is_some()), "fixture must contain federated tools");
+
+        // The contrast that makes the rule unambiguous: same author, same
+        // group, one pattern local-only and one catalog-wide.
+        assert_eq!(resolve_raw(&["peer*"], GroupOwner::Operator), vec!["peer_status"]);
+        assert_eq!(resolve_raw(&["*"], GroupOwner::Operator).len(), catalog().len());
     }
 
     /// A qualified prefix is anchored to ONE namespace and to the bare name

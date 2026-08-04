@@ -1169,7 +1169,15 @@ Exactly these shapes parse. There is no glob, no regex, and no negation.
 | `prefix*` | every **local** tool whose name starts with `prefix` | `weather_*` |
 | `namespace__*` | every tool advertised by one mesh upstream | `peerhub__*` |
 | `namespace__prefix*` | tools from one upstream whose bare name starts with `prefix` | `peerhub__ledger*` |
-| `*` | every tool — **operator-owned groups only** | |
+| `*` | every tool, **local and federated** — operator-owned groups only | |
+
+**The rule in one sentence:** an unqualified *exact* or *prefix* pattern matches local
+tools only; a namespace-qualified pattern matches only within the namespace it names; and
+the bare `*` matches the whole merged catalog, bounded by the client's allowed namespaces
+at the RMCP-07 intersection rather than by the matcher. `*` is deliberately not local-only
+— it has no letters, so there is no prefix collision to guard against, it is the most
+heavily gated pattern here, and it is what gives the namespace dimension of the
+intersection something to bound.
 
 This is the same vocabulary the gateway's MESH-08 allow entries already use, deliberately,
 so an operator does not have to hold two pattern languages in their head.
