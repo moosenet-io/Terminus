@@ -765,6 +765,36 @@ mod tests {
         assert!(resolve_stored(vec![authorized(stored_group(vec!["*".into()]), owner)]).is_empty());
     }
 
+    /// The other revocation, end to end: DISABLING an operator collapses their
+    /// stored `*` to the empty set.
+    ///
+    /// Driven through [`crate::oauth::model::Account::group_owner_kind`] rather
+    /// than by naming `GroupOwner::Delegated` directly, so this test fails if
+    /// that conversion ever stops treating a disabled account as delegated —
+    /// which is precisely how the wildcard would come back to life while every
+    /// test that hardcodes the authority kept passing.
+    #[test]
+    fn disabling_an_operator_collapses_their_stored_wildcard() {
+        let disabled_operator = crate::oauth::model::Account {
+            id: Uuid::nil(),
+            name: "compromised".into(),
+            password_hash: "<REDACTED-SECRET>".into(),
+            totp_secret_enc: None,
+            disabled: true,
+            is_operator: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            resolve_stored(vec![authorized(
+                stored_group(vec!["*".into()]),
+                disabled_operator.group_owner_kind(),
+            )])
+            .is_empty(),
+            "a disabled operator's wildcard must reach the EMPTY set"
+        );
+    }
+
     /// Dropping an unauthorized `*` must not take the rest of the group with it,
     /// and must not leak across groups. Only the wildcard is revoked.
     #[test]

@@ -68,10 +68,22 @@ impl Account {
     /// expects it.
     ///
     /// The conversion lives here so there is exactly one place that turns the
-    /// stored boolean into a [`crate::oauth::groups::GroupOwner`], and no call
+    /// stored state into a [`crate::oauth::groups::GroupOwner`], and no call
     /// site can invent the privileged variant from nothing.
+    ///
+    /// **Requires `is_operator` AND `!disabled`**, deliberately matching
+    /// `(a.is_operator AND NOT a.disabled)` in
+    /// [`crate::oauth::store::OauthStore::client_authorized_groups`] term for
+    /// term. An earlier revision of this method read `is_operator` alone, which
+    /// made the two disagree for a DISABLED operator — the SQL path revoked
+    /// their wildcard, this one did not. Two expressions of one authorization
+    /// rule that can disagree is the same drift the rest of this item keeps
+    /// closing, and disabling an account is the most common revocation there is:
+    /// it is what an operator reaches for when an account is compromised, so it
+    /// must revoke everything that account's authority was propping up, not just
+    /// its ability to log in.
     pub fn group_owner_kind(&self) -> crate::oauth::groups::GroupOwner {
-        if self.is_operator {
+        if self.is_operator && !self.disabled {
             crate::oauth::groups::GroupOwner::Operator
         } else {
             crate::oauth::groups::GroupOwner::Delegated
@@ -470,28 +482,53 @@ mod tests {
         }
     }
 
-    fn account_with_operator_flag(is_operator: bool) -> Account {
+    fn account(is_operator: bool, disabled: bool) -> Account {
         Account {
             id: Uuid::nil(),
             name: "a".into(),
             password_hash: "<REDACTED-SECRET>".into(),
             totp_secret_enc: None,
-            disabled: false,
+            disabled,
             is_operator,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
     }
 
-    /// Operator authority is carried by the stored flag and nothing else. The
-    /// `false` case is the one that matters: it is what a caller claiming to be
-    /// an operator must not be able to talk its way past, and what an account
-    /// created before the flag existed degrades to.
+    /// Operator authority is carried by the stored state and nothing else. The
+    /// `false` case is what a caller claiming to be an operator must not be able
+    /// to talk its way past, and what an account created before the flag existed
+    /// degrades to.
     #[test]
     fn group_authority_follows_the_stored_flag() {
         use crate::oauth::groups::GroupOwner;
-        assert_eq!(account_with_operator_flag(true).group_owner_kind(), GroupOwner::Operator);
-        assert_eq!(account_with_operator_flag(false).group_owner_kind(), GroupOwner::Delegated);
+        assert_eq!(account(true, false).group_owner_kind(), GroupOwner::Operator);
+        assert_eq!(account(false, false).group_owner_kind(), GroupOwner::Delegated);
+    }
+
+    /// DISABLING an operator revokes their group authority, not merely their
+    /// ability to log in.
+    ///
+    /// This is the revocation an operator actually reaches for when an account
+    /// is compromised, and it must reach everything that account's authority was
+    /// propping up — otherwise a disabled operator's stored `*` keeps expanding
+    /// for every connector scoped to their groups.
+    ///
+    /// The assertion also pins this method to the SQL in
+    /// `client_authorized_groups`, which computes
+    /// `(a.is_operator AND NOT a.disabled)`. Two expressions of one
+    /// authorization rule are only safe while they agree; an earlier revision
+    /// read `is_operator` alone here and silently disagreed with the query for
+    /// exactly this account.
+    #[test]
+    fn disabling_an_operator_revokes_group_authority() {
+        use crate::oauth::groups::GroupOwner;
+        assert_eq!(
+            account(true, true).group_owner_kind(),
+            GroupOwner::Delegated,
+            "a disabled operator is not an operator for any purpose"
+        );
+        assert_eq!(account(false, true).group_owner_kind(), GroupOwner::Delegated);
     }
 
     fn group_with(patterns: Vec<String>) -> ToolGroup {
