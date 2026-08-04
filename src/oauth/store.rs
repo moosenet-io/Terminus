@@ -28,14 +28,44 @@ use crate::error::ToolError;
 use crate::oauth::model::{
     Account, AuthCode, Client, Consent, RefreshToken, ServerOwner, ToolGroup,
 };
-use crate::oauth::OauthConfig;
+use crate::oauth::{Argon2idHash, OauthConfig, SecretHash};
 
 /// Maximum pooled connections. The OAuth endpoints are latency-sensitive
 /// (Anthropic allows 10s for discovery/token, 30s for refresh) but very
 /// low-volume compared to the tool-dispatch path, so a small pool is right —
 /// this door should never be able to starve the rest of the process of
 /// database connections.
-const MAX_CONNECTIONS: u32 = 5;
+const DEFAULT_MAX_CONNECTIONS: u32 = 5;
+
+/// Env var overriding [`DEFAULT_MAX_CONNECTIONS`].
+const MAX_CONNECTIONS_ENV: &str = "RMCP_DB_MAX_CONNECTIONS";
+
+/// Resolve the pool size, falling back to the default on absent or unparseable
+/// input. A bad value degrades to the safe default rather than failing the
+/// door: an operator typo in a tuning knob should not take authentication
+/// offline, which is the opposite of the fail-closed rule applied to
+/// PERMISSIONS — this value grants nothing.
+fn max_connections() -> u32 {
+    std::env::var(MAX_CONNECTIONS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS)
+}
+
+/// Every table the S132 migration creates. [`OauthStore::schema_ready`] requires
+/// all of them, so a partially applied migration reports NOT ready.
+const REQUIRED_TABLES: [&str; 9] = [
+    "rmcp_account",
+    "rmcp_client",
+    "rmcp_tool_group",
+    "rmcp_client_scope",
+    "rmcp_client_server",
+    "rmcp_auth_code",
+    "rmcp_refresh_token",
+    "rmcp_consent",
+    "rmcp_server_owner",
+];
 
 /// Repository over the `rmcp_*` tables.
 #[derive(Clone)]
@@ -51,7 +81,7 @@ impl OauthStore {
     /// interpolated into the message.
     pub async fn connect(config: &OauthConfig) -> Result<Self, ToolError> {
         let pool = PgPoolOptions::new()
-            .max_connections(MAX_CONNECTIONS)
+            .max_connections(max_connections())
             .connect(config.database_url())
             .await
             .map_err(|_| {
@@ -77,13 +107,20 @@ impl OauthStore {
     /// possibility. Reporting it as a clear "unconfigured" at boot beats every
     /// endpoint failing later with an opaque `relation does not exist`.
     pub async fn schema_ready(&self) -> bool {
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-             WHERE table_name = 'rmcp_client')",
+        // Checks ALL nine tables, not a sentinel one. Review round 1: probing a
+        // single table reports "ready" for a partially applied migration —
+        // precisely the state a half-finished deploy leaves behind, and the one
+        // where a confident "ready" is most harmful. Counting the full set costs
+        // one query at startup and makes a partial apply loud.
+        let found = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name = ANY($1)",
         )
+        .bind(REQUIRED_TABLES.iter().map(|t| t.to_string()).collect::<Vec<_>>())
         .fetch_one(&self.pool)
         .await
-        .unwrap_or(false)
+        .unwrap_or(0);
+        found == REQUIRED_TABLES.len() as i64
     }
 
     // -----------------------------------------------------------------------
@@ -110,13 +147,17 @@ impl OauthStore {
         .map_err(db)
     }
 
-    /// Insert an account. `password_hash` must already be an argon2id PHC
-    /// string — this layer never hashes, so it can never be the place a
-    /// plaintext password is accidentally stored.
+    /// Insert an account.
+    ///
+    /// Takes an [`Argon2idHash`], not a `&str`. This layer never hashes — the
+    /// argon2 parameters belong with the verifier in RMCP-03 — but requiring
+    /// the verified type means a caller that forgot to hash cannot reach this
+    /// column with a plaintext password. Review round 1: a `&str` parameter
+    /// named `password_hash` documented the requirement without enforcing it.
     pub async fn insert_account(
         &self,
         name: &str,
-        password_hash: &str,
+        password_hash: &Argon2idHash,
         totp_secret_enc: Option<&[u8]>,
     ) -> Result<Uuid, ToolError> {
         sqlx::query_scalar::<_, Uuid>(
@@ -124,7 +165,7 @@ impl OauthStore {
              VALUES ($1, $2, $3) RETURNING id",
         )
         .bind(name)
-        .bind(password_hash)
+        .bind(password_hash.as_str())
         .bind(totp_secret_enc)
         .fetch_one(&self.pool)
         .await
@@ -151,12 +192,14 @@ impl OauthStore {
         .map_err(db)
     }
 
-    /// Insert a client. `client_secret_hash` is `None` for a public client.
+    /// Insert a client. `client_secret_hash` is `None` for a public client
+    /// (which is what Claude registers as), and an [`Argon2idHash`] otherwise —
+    /// same enforcement-by-type as [`Self::insert_account`].
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_client(
         &self,
         client_id: &str,
-        client_secret_hash: Option<&str>,
+        client_secret_hash: Option<&Argon2idHash>,
         name: &str,
         redirect_uris: &[String],
         grant_types: &[String],
@@ -171,7 +214,7 @@ impl OauthStore {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
         )
         .bind(client_id)
-        .bind(client_secret_hash)
+        .bind(client_secret_hash.map(Argon2idHash::as_str))
         .bind(name)
         .bind(redirect_uris)
         .bind(grant_types)
@@ -247,8 +290,15 @@ impl OauthStore {
 
     /// The groups a client draws on.
     ///
-    /// An unknown client, or a known client with no scope rows, both yield an
-    /// EMPTY vector — which RMCP-07 intersects to the empty set. This is the
+    /// Joins `rmcp_client` and requires the client to be ENABLED. The caller
+    /// normally arrives via [`Self::find_active_client`], which already filters
+    /// disabled clients — but this method takes a raw internal id, so a caller
+    /// that obtained one another way would otherwise read scope for a client an
+    /// operator had just switched off. Review round 1 (free) flagged exactly
+    /// that path; defence in depth costs one join.
+    ///
+    /// An unknown client, a disabled client, or a known client with no scope
+    /// rows all yield an EMPTY vector — which RMCP-07 intersects to the empty set. This is the
     /// fail-closed default the whole scoping model rests on, and the reason
     /// this method does not signal "unknown client" differently: there is no
     /// caller for whom the distinction should change the outcome.
@@ -257,6 +307,7 @@ impl OauthStore {
             "SELECT g.id, g.name, g.description, g.patterns, g.owner_account_id, g.created_at \
              FROM rmcp_tool_group g \
              JOIN rmcp_client_scope s ON s.tool_group_id = g.id \
+             JOIN rmcp_client c ON c.id = s.client_id AND NOT c.disabled \
              WHERE s.client_id = $1 ORDER BY g.name",
         )
         .bind(client_id)
@@ -265,11 +316,14 @@ impl OauthStore {
         .map_err(db)
     }
 
-    /// The federated namespaces a client may see. Empty for an unknown client,
-    /// for the same reason as above.
+    /// The federated namespaces a client may see. Empty for an unknown,
+    /// disabled, or unscoped client — same join and same reasoning as
+    /// [`Self::client_tool_groups`].
     pub async fn client_namespaces(&self, client_id: Uuid) -> Result<Vec<String>, ToolError> {
         sqlx::query_scalar::<_, String>(
-            "SELECT namespace FROM rmcp_client_server WHERE client_id = $1 ORDER BY namespace",
+            "SELECT s.namespace FROM rmcp_client_server s \
+             JOIN rmcp_client c ON c.id = s.client_id AND NOT c.disabled \
+             WHERE s.client_id = $1 ORDER BY s.namespace",
         )
         .bind(client_id)
         .fetch_all(&self.pool)
@@ -278,6 +332,19 @@ impl OauthStore {
     }
 
     /// Replace a client's group assignments wholesale, in one transaction.
+    ///
+    /// **This method performs NO authorization check, deliberately.** Review
+    /// round 1 flagged that it will attach a group owned by one account to a
+    /// client owned by another. That is true, and it is why the ownership check
+    /// is not here: RMCP-12 places it in ONE function that every write path —
+    /// tools and GUI alike — must call, precisely so the rule cannot be
+    /// implemented differently in two places or forgotten by a third caller
+    /// added later. Scattering a partial check into the repository would make
+    /// that single guard look optional.
+    ///
+    /// Until RMCP-12 lands, the only callers are operator-invoked; this
+    /// contract is recorded here so a future caller cannot mistake the absence
+    /// of a check for an oversight.
     ///
     /// Delete-then-insert inside a transaction, rather than a diff: a partially
     /// applied scope change is a permission state nobody chose, and under
@@ -309,7 +376,8 @@ impl OauthStore {
     }
 
     /// Replace a client's namespace assignments wholesale. Same transactional
-    /// reasoning as [`Self::set_client_tool_groups`].
+    /// reasoning — and the same deliberate absence of an authorization check,
+    /// which RMCP-12 owns — as [`Self::set_client_tool_groups`].
     pub async fn set_client_namespaces(
         &self,
         client_id: Uuid,
@@ -343,7 +411,7 @@ impl OauthStore {
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_auth_code(
         &self,
-        code_hash: &[u8],
+        code_hash: &SecretHash,
         client_id: Uuid,
         account_id: Uuid,
         redirect_uri: &str,
@@ -357,7 +425,7 @@ impl OauthStore {
                                          resource, code_challenge, scope, expires_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8::double precision))",
         )
-        .bind(code_hash)
+        .bind(code_hash.as_bytes())
         .bind(client_id)
         .bind(account_id)
         .bind(redirect_uri)
@@ -382,14 +450,17 @@ impl OauthStore {
     /// exactly one caller can match; the loser gets `None` and must fail the
     /// exchange. Expiry is folded into the same predicate against the database
     /// clock, so an expired code can never be consumed either.
-    pub async fn consume_auth_code(&self, code_hash: &[u8]) -> Result<Option<AuthCode>, ToolError> {
+    pub async fn consume_auth_code(
+        &self,
+        code_hash: &SecretHash,
+    ) -> Result<Option<AuthCode>, ToolError> {
         sqlx::query_as::<_, AuthCode>(
             "UPDATE rmcp_auth_code SET consumed_at = now() \
              WHERE code_hash = $1 AND consumed_at IS NULL AND expires_at > now() \
              RETURNING code_hash, client_id, account_id, redirect_uri, resource, \
                        code_challenge, scope, issued_at, expires_at, consumed_at",
         )
-        .bind(code_hash)
+        .bind(code_hash.as_bytes())
         .fetch_optional(&self.pool)
         .await
         .map_err(db)
@@ -414,7 +485,7 @@ impl OauthStore {
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_refresh_token(
         &self,
-        token_hash: &[u8],
+        token_hash: &SecretHash,
         family_id: Uuid,
         client_id: Uuid,
         account_id: Uuid,
@@ -427,7 +498,7 @@ impl OauthStore {
                                              resource, scope, expires_at) \
              VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7::double precision))",
         )
-        .bind(token_hash)
+        .bind(token_hash.as_bytes())
         .bind(family_id)
         .bind(client_id)
         .bind(account_id)
@@ -453,14 +524,14 @@ impl OauthStore {
     /// for the ordinary path.
     pub async fn find_refresh_token(
         &self,
-        token_hash: &[u8],
+        token_hash: &SecretHash,
     ) -> Result<Option<RefreshToken>, ToolError> {
         sqlx::query_as::<_, RefreshToken>(
             "SELECT token_hash, family_id, client_id, account_id, resource, scope, \
                     issued_at, expires_at, rotated_to, revoked_at \
              FROM rmcp_refresh_token WHERE token_hash = $1",
         )
-        .bind(token_hash)
+        .bind(token_hash.as_bytes())
         .fetch_optional(&self.pool)
         .await
         .map_err(db)
@@ -468,41 +539,87 @@ impl OauthStore {
 
     /// Whether a token row is usable right now, judged against the database
     /// clock rather than the process clock.
-    pub async fn refresh_token_is_live(&self, token_hash: &[u8]) -> Result<bool, ToolError> {
+    pub async fn refresh_token_is_live(&self, token_hash: &SecretHash) -> Result<bool, ToolError> {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM rmcp_refresh_token \
              WHERE token_hash = $1 AND rotated_to IS NULL AND revoked_at IS NULL \
                AND expires_at > now())",
         )
-        .bind(token_hash)
+        .bind(token_hash.as_bytes())
         .fetch_one(&self.pool)
         .await
         .map_err(db)
     }
 
-    /// Mark a token as rotated into its successor, but only if it is currently
-    /// live.
+    /// Atomically rotate a live refresh token into a freshly-issued successor.
     ///
-    /// Returns `true` when this call performed the rotation. Like code
-    /// consumption, the liveness check and the write are one statement so two
-    /// concurrent refreshes cannot both rotate the same token — the loser gets
-    /// `false` and its presentation is then correctly seen as a reuse.
+    /// Returns `true` when this call performed the rotation, `false` when the
+    /// presented token was not live (already rotated, revoked, expired, or
+    /// unknown) — in which case the caller must treat it as a REUSE and revoke
+    /// the family.
+    ///
+    /// Review round 1 raised the real hazard in the earlier shape: marking the
+    /// old token rotated and inserting the successor were two calls, so a
+    /// failure between them left the user with a rotated-away token and no
+    /// successor — locked out, with the family looking healthy. Both writes now
+    /// happen in ONE transaction, so the outcome is always either "old token
+    /// retired and successor usable" or "nothing changed".
+    ///
+    /// The conditional UPDATE still decides the sole winner under concurrency:
+    /// two simultaneous refreshes both see a live row, but only one UPDATE
+    /// matches `rotated_to IS NULL`, and the loser's transaction inserts
+    /// nothing because it returns before the INSERT.
+    #[allow(clippy::too_many_arguments)]
     pub async fn rotate_refresh_token(
         &self,
-        token_hash: &[u8],
-        successor_hash: &[u8],
+        token_hash: &SecretHash,
+        successor_hash: &SecretHash,
+        family_id: Uuid,
+        client_id: Uuid,
+        account_id: Uuid,
+        resource: &str,
+        scope: &str,
+        ttl_seconds: i64,
     ) -> Result<bool, ToolError> {
-        let rows = sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(db)?;
+
+        let rotated = sqlx::query(
             "UPDATE rmcp_refresh_token SET rotated_to = $2 \
              WHERE token_hash = $1 AND rotated_to IS NULL AND revoked_at IS NULL \
                AND expires_at > now()",
         )
-        .bind(token_hash)
-        .bind(successor_hash)
-        .execute(&self.pool)
+        .bind(token_hash.as_bytes())
+        .bind(successor_hash.as_bytes())
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+
+        if rotated != 1 {
+            // Not live. Roll back rather than commit a no-op so nothing about
+            // this attempt is persisted, and let the caller handle the reuse.
+            tx.rollback().await.map_err(db)?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "INSERT INTO rmcp_refresh_token (token_hash, family_id, client_id, account_id, \
+                                             resource, scope, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7::double precision))",
+        )
+        .bind(successor_hash.as_bytes())
+        .bind(family_id)
+        .bind(client_id)
+        .bind(account_id)
+        .bind(resource)
+        .bind(scope)
+        .bind(ttl_seconds as f64)
+        .execute(&mut *tx)
         .await
         .map_err(db)?;
-        Ok(rows.rows_affected() == 1)
+
+        tx.commit().await.map_err(db)?;
+        Ok(true)
     }
 
     /// Revoke every token in a family. The response to a detected reuse: the
@@ -783,17 +900,58 @@ mod tests {
         );
     }
 
-    /// Guards the fail-closed contract at the type level: these methods return
-    /// collections, and the empty collection is the safe answer. If someone
-    /// later changes a signature to return "all groups" on an unknown client,
-    /// this test's existence and comment should make the intent unmissable.
+    /// The pool size degrades to a safe default rather than failing the door.
+    /// A tuning knob grants no permission, so the fail-closed rule that governs
+    /// PERMISSIONS does not apply to it — an operator typo here should not take
+    /// authentication offline.
     #[test]
-    fn empty_scope_is_the_documented_fail_closed_answer() {
-        let empty: Vec<ToolGroup> = Vec::new();
-        assert!(
-            empty.is_empty(),
-            "client_tool_groups returns an EMPTY vec for an unknown client, which \
-             RMCP-07 intersects to no access — never a permissive default"
-        );
+    fn max_connections_falls_back_on_bad_input() {
+        // Exercises the same parse/filter chain as `max_connections`, without
+        // mutating process-global environment state that would race other tests.
+        let resolve = |raw: Option<&str>| -> u32 {
+            raw.and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_MAX_CONNECTIONS)
+        };
+        assert_eq!(resolve(None), DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(resolve(Some("not-a-number")), DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(resolve(Some("0")), DEFAULT_MAX_CONNECTIONS, "zero would deadlock the pool");
+        assert_eq!(resolve(Some(" 12 ")), 12);
     }
+
+    /// `schema_ready` must require the WHOLE migration. Asserting the table
+    /// list here is what makes a future table addition fail loudly in review
+    /// rather than silently weaken the readiness check.
+    #[test]
+    fn schema_readiness_covers_every_migrated_table() {
+        assert_eq!(REQUIRED_TABLES.len(), 9);
+        for table in [
+            "rmcp_account",
+            "rmcp_client",
+            "rmcp_tool_group",
+            "rmcp_client_scope",
+            "rmcp_client_server",
+            "rmcp_auth_code",
+            "rmcp_refresh_token",
+            "rmcp_consent",
+            "rmcp_server_owner",
+        ] {
+            assert!(REQUIRED_TABLES.contains(&table), "{table} missing from the readiness check");
+        }
+    }
+
+    // NOTE on what is deliberately NOT unit-tested here.
+    //
+    // An earlier revision carried a test that built an empty `Vec` and asserted
+    // it was empty, as a "proof" of the fail-closed scope contract. Review round
+    // 1 correctly called that vacuous: it exercised no query and no repository
+    // behaviour, and a test that cannot fail is worse than no test because it
+    // reads as coverage. It has been removed rather than reworded.
+    //
+    // The real invariants at this layer — that an unknown, disabled, or
+    // unscoped client yields no groups and no namespaces — live in SQL
+    // predicates and can only be verified against a database. They are covered
+    // by RMCP-07's property test (`effective ⊆ account grant`, over generated
+    // inputs) and by RMCP-14's end-to-end test, both of which run against a real
+    // schema. Adding a DB-backed integration harness is not this item's scope.
 }
