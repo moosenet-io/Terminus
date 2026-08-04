@@ -58,10 +58,20 @@
 //!   verification ([`jwt`]). It is a standalone router a binary merges in; it
 //!   is not mounted anywhere by this item.
 //!
-//! Still to land as their own items: resource-server validation (RMCP-05) and
-//! the scoping resolver (RMCP-07). Apart from RMCP-02's discovery documents —
-//! which are deliberately public and unauthenticated — none of this is
-//! reachable from the network until a listener mounts the relevant router.
+//! - **RMCP-07** — the scoping resolver ([`scope`]): the intersection above,
+//!   as one function ([`scope::decide`]) that backs BOTH the `tools/list`
+//!   filter and the `tools/call` guard, plus the resolver that reads a
+//!   client's scope rows and the cache that keeps it off the hot path. It is
+//!   wired into [`crate::gateway_framework`] and [`crate::mcp_server`], but it
+//!   only ever engages for a request that carries a
+//!   [`scope::RmcpClientScope`] — which nothing inserts until RMCP-05's
+//!   resource-server validation lands, so every existing mTLS and tailnet
+//!   caller is unaffected byte-for-byte.
+//!
+//! Still to land as its own item: resource-server validation (RMCP-05). Apart
+//! from RMCP-02's discovery documents — which are deliberately public and
+//! unauthenticated — none of this is reachable from the network until a
+//! listener mounts the relevant router.
 //!
 //! ## What RMCP-09 adds ([`edge`])
 //! The public door's NETWORK policy, and still no endpoints. [`edge`] is the
@@ -108,6 +118,7 @@ pub mod router;
 /// RMCP-05: resource-server validation — the half that turns a bearer token
 /// into a [`crate::mesh::Principal`] the existing gateway already authorizes.
 pub mod resource;
+pub mod scope;
 pub mod session;
 pub mod store;
 pub mod templates;
