@@ -1006,8 +1006,16 @@ mod tests {
     /// that mutates `CARGO_PUBLISH_MAX_CRATE_BYTES` carries it. Verified: these
     /// two are the only writers in the tree (`rg CARGO_PUBLISH_MAX_CRATE_BYTES`
     /// finds the reader in `src/gitea/mod.rs` and these two tests). A future test
-    /// that touches this variable MUST use this key — hence naming it once here
-    /// rather than repeating a bare string at each attribute.
+    /// that touches this variable MUST use the key
+    /// `cargo_publish_max_crate_bytes` spelled on the two `#[serial(...)]`
+    /// attributes below. (`serial_test` takes the key as a literal in the
+    /// attribute, so it cannot be a `const` — opus review corrected an earlier
+    /// version of this comment that claimed `Self::VAR` was that key; `Self::VAR`
+    /// is the ENV VAR name, which is a different string.)
+    ///
+    /// A non-serial test that only READS the variable can still observe the
+    /// mutation window. There is none today (the reader is library code, not a
+    /// test), and a future one must join this key.
     ///
     /// (gpt56 review, TERM #594.)
     ///
