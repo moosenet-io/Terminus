@@ -176,11 +176,13 @@ mod tests {
 
     /// The config's own description must not be a channel for the URL.
     ///
-    /// The fixture deliberately avoids a `<email>` shape: the repo's own
-    /// `no_pii_in_own_source_tree` self-check walks this file and its email
-    /// detector matches any `…@….tld`, so a realistic-looking DSN here fails
-    /// the PII gate rather than the assertion. A dotless host keeps the
-    /// credential-in-URL shape the test is about without tripping it.
+    /// The fixture deliberately uses a DOTLESS host. The repo's own
+    /// `no_pii_in_own_source_tree` self-check walks this file, and its email
+    /// detector fires on a user part, an at-sign, and a dotted domain — which
+    /// is exactly the shape of a realistic database DSN. So a natural-looking
+    /// connection string in a test fixture (or even in a comment describing
+    /// one) fails the PII gate rather than the assertion. A dotless host keeps
+    /// the credential-in-URL shape this test is actually about.
     #[test]
     fn describe_never_contains_the_url() {
         let cfg = OauthConfig {
