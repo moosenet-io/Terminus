@@ -295,7 +295,22 @@ impl OauthStore {
 
     /// The groups a client draws on.
     ///
-    /// Joins `rmcp_client` and requires the client to be ENABLED. The caller
+    /// Joins `rmcp_client` and requires the client to be ENABLED **and to share
+    /// the group's owner account**.
+    ///
+    /// The owner match is a READ-path re-check of what the write path already
+    /// enforces, and round 9 was right to ask for it: the write check is
+    /// point-in-time, so a scope row written legitimately and then followed by
+    /// an ownership TRANSFER would leave a group owned by one account still
+    /// attached to another account's client. Re-checking on read means such a
+    /// stale grant silently stops resolving rather than silently continuing to
+    /// work. Narrowing is always the safe direction to be wrong in.
+    ///
+    /// NOTE for RMCP-12: this makes cross-owner attachment unreadable, full
+    /// stop. If the delegation model introduces a legitimate operator override
+    /// (an operator-owned group attached to a delegated user's client), THIS
+    /// predicate is what must be widened, deliberately and with its own tests —
+    /// not quietly relaxed because a case stopped working. The caller
     /// normally arrives via [`Self::find_active_client`], which already filters
     /// disabled clients — but this method takes a raw internal id, so a caller
     /// that obtained one another way would otherwise read scope for a client an
@@ -313,6 +328,7 @@ impl OauthStore {
              FROM rmcp_tool_group g \
              JOIN rmcp_client_scope s ON s.tool_group_id = g.id \
              JOIN rmcp_client c ON c.id = s.client_id AND NOT c.disabled \
+                                AND c.owner_account_id = g.owner_account_id \
              WHERE s.client_id = $1 ORDER BY g.name",
         )
         .bind(client_id)
