@@ -260,6 +260,47 @@ impl McpServerState {
     pub fn swap_registry(&self, new: ToolRegistry) {
         self.registry.store(Arc::new(new));
     }
+
+    /// Whether this process serves ANY internet-facing OAuth surface.
+    ///
+    /// # This is the one place a door registers
+    ///
+    /// [`is_authorized`]'s open arm — "no shared token is configured, so admit
+    /// everyone" — is correct for a private loopback/mTLS host and catastrophic
+    /// for a public one. Which of those a process is depends on whether an
+    /// OAuth door is mounted, and that question is asked HERE and nowhere else,
+    /// so there is exactly one function deciding when an uncredentialed request
+    /// is admitted. Two pieces of code making that decision independently is a
+    /// dual-writer hazard: they drift, and the drift is silent because the
+    /// failure mode is a `200` that should have been a `401`.
+    ///
+    /// # Why a named question instead of a field test
+    ///
+    /// Review round 5 caught the reason this matters. The condition used to
+    /// read `state.rmcp_discovery.is_none()`, keyed on RMCP-02's own discovery
+    /// config. But discovery and the resource-server door are INDEPENDENT
+    /// switches — an operator can enable OAuth without configuring discovery —
+    /// so an anonymous, tokenless request reached dispatch through the second
+    /// switch. The identical `401`-vs-`200` defect this item had already fixed
+    /// once, arriving by a different route, because the test named a field
+    /// rather than asking the question.
+    ///
+    /// # Adding a door
+    ///
+    /// Add ONE clause below. That is the whole integration, and it is not
+    /// optional: `oauth_door_fields_are_all_registered` (in this module's
+    /// tests) scans this struct for OAuth-shaped fields and fails if any of
+    /// them is not named in this function's body. So a future door cannot
+    /// silently reopen the arm — forgetting to register it is a red gate, not a
+    /// production incident. That guard exists precisely because the honest
+    /// answer to "can someone forget?" was yes.
+    ///
+    /// RMCP-05's `oauth_resource` is the next clause to land here.
+    pub(crate) fn oauth_door_enabled(&self) -> bool {
+        // RMCP-02: the discovery surface. Its presence means this process is
+        // advertising itself to a hosted MCP client over public HTTPS.
+        self.rmcp_discovery.is_some()
+    }
 }
 
 /// MESH-07: resolve one request's [`Principal`] from its transport identity
@@ -950,6 +991,14 @@ async fn handle_metrics() -> impl IntoResponse {
 /// The JSON-RPC body is unchanged from the pre-RMCP-02 response, and no header
 /// is added when the door is unconfigured, so every existing deployment and
 /// every existing test sees exactly what it saw before.
+///
+/// Note the argument is DISCOVERY specifically, not
+/// [`McpServerState::oauth_door_enabled`], and that is correct rather than an
+/// oversight: the challenge's whole payload is a `resource_metadata` URL, so a
+/// process with a door but no discovery surface has nothing to point a client
+/// at and correctly emits a bare `401`. The status code — the part that decides
+/// whether the request was admitted — is gated on the predicate; only the
+/// advisory header is gated on discovery.
 fn unauthorized(discovery: Option<&crate::oauth::metadata::Discovery>) -> Response {
     let mut response = (
         StatusCode::UNAUTHORIZED,
@@ -1057,9 +1106,10 @@ pub(crate) fn insufficient_scope(
 /// is a far worse outcome than a client being told to authorize again.
 fn is_authorized(state: &McpServerState, headers: &HeaderMap, has_transport_identity: bool) -> bool {
     let Some(expected) = &state.auth_token else {
-        // No shared token configured. Open, UNLESS the OAuth door is on — see
-        // this function's doc for why that combination cannot stay open.
-        return state.rmcp_discovery.is_none() || has_transport_identity;
+        // No shared token configured. Open, UNLESS ANY OAuth door is on — see
+        // this function's doc, and [`McpServerState::oauth_door_enabled`] for
+        // why this asks a named question rather than naming a field.
+        return !state.oauth_door_enabled() || has_transport_identity;
     };
     let Some(got) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
         return false;
@@ -3175,6 +3225,131 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// REVIEW ROUND 5, and the structural answer to "can someone forget?".
+    ///
+    /// The open arm in `is_authorized` is gated on
+    /// `McpServerState::oauth_door_enabled`. If a future door adds a field to
+    /// `McpServerState` and does not register it there, the arm silently
+    /// reopens and an anonymous request reaches dispatch — the same
+    /// `401`-vs-`200` defect this item has now been bitten by twice, once
+    /// through discovery and once through the resource-server switch.
+    ///
+    /// So registration is enforced rather than remembered: every OAuth-shaped
+    /// field on the struct must be named in that function's body. This is a
+    /// source scan in the same idiom as the crate's other structural guards
+    /// (`github::pii`'s tree self-check, `hermeticity`'s ratchet) — a textual
+    /// lint, deliberately, because the alternative is trusting a reviewer to
+    /// notice an omission whose symptom only appears in production.
+    #[test]
+    fn oauth_door_fields_are_all_registered() {
+        let source = include_str!("mcp_server.rs");
+
+        // The struct body: from its declaration to the closing brace.
+        let struct_start = source
+            .find("pub struct McpServerState {")
+            .expect("McpServerState must be declared in this file");
+        let struct_body = &source[struct_start..];
+        let struct_end = struct_body
+            .find("\n}")
+            .expect("the struct must be brace-terminated");
+        let struct_body = &struct_body[..struct_end];
+
+        // The registration function's body.
+        let fn_start = source
+            .find("pub(crate) fn oauth_door_enabled(&self) -> bool {")
+            .expect("the registration point must exist");
+        let fn_body = &source[fn_start..];
+        let fn_end = fn_body
+            .find("\n    }")
+            .expect("the function must be brace-terminated");
+        let fn_body = &fn_body[..fn_end];
+
+        let mut unregistered = Vec::new();
+        for line in struct_body.lines() {
+            let line = line.trim();
+            // `pub <name>: <type>,` — skip doc comments and attributes.
+            let Some(rest) = line.strip_prefix("pub ") else {
+                continue;
+            };
+            let Some((name, ty)) = rest.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            // An OAuth-shaped field is one whose NAME or TYPE mentions the
+            // door. Deliberately generous: a false positive costs one clause or
+            // one rename, a false negative costs an open `/mcp`.
+            let haystack = format!("{name} {ty}").to_ascii_lowercase();
+            let is_oauth_shaped = haystack.contains("oauth") || haystack.contains("rmcp");
+            if is_oauth_shaped && !fn_body.contains(name) {
+                unregistered.push(name.to_string());
+            }
+        }
+
+        assert!(
+            unregistered.is_empty(),
+            "these OAuth-shaped McpServerState field(s) are not registered in \
+             `oauth_door_enabled`: {unregistered:?}.\n\nAdd a clause for each. That function is \
+             the single input to `is_authorized`'s open arm — a door that is not named there \
+             does not narrow the arm, so an uncredentialed request would reach dispatch with a \
+             `200` instead of the spec-shaped `401` challenge."
+        );
+
+        // The guard is only meaningful if it can actually see a registered
+        // field, so prove the positive case rather than trusting an empty
+        // result — an assertion that passes because it matched nothing is the
+        // classic way a scan-based guard rots into a no-op.
+        assert!(
+            struct_body.contains("pub rmcp_discovery:"),
+            "the scan must be looking at the real struct"
+        );
+        assert!(
+            fn_body.contains("rmcp_discovery"),
+            "the scan must be looking at the real registration point"
+        );
+
+        // And the decision point must ask the QUESTION, not name a field. This
+        // is the exact regression round 5 reported: `is_authorized` keyed on
+        // `rmcp_discovery`, so a door enabled by any other switch left the arm
+        // open. Pinned textually because the type system cannot express it.
+        let auth_start = source
+            .find("fn is_authorized(")
+            .expect("the decision point must exist");
+        let auth_body = &source[auth_start..];
+        let auth_body = &auth_body[..auth_body.find("\n}").expect("brace-terminated")];
+        assert!(
+            auth_body.contains("oauth_door_enabled()"),
+            "is_authorized must gate its open arm on the door predicate"
+        );
+        assert!(
+            !auth_body.contains("rmcp_discovery"),
+            "is_authorized must not test a single door's field directly — that is what let an \
+             independently-switched door reopen the open arm"
+        );
+    }
+
+    /// The behavioural pair the guard above protects: the open arm follows
+    /// `oauth_door_enabled`, in BOTH directions. Written against the predicate
+    /// rather than against `rmcp_discovery` so that when RMCP-05 registers
+    /// `oauth_resource`, this test covers that door too without being touched.
+    #[test]
+    fn the_open_arm_follows_the_door_predicate_not_a_single_field() {
+        let state = rmcp_state(None);
+        assert!(
+            state.oauth_door_enabled(),
+            "a configured discovery surface IS a door"
+        );
+        // Door on, no legacy token, no transport identity => refused, so the
+        // caller receives the challenge.
+        assert!(!is_authorized(&state, &HeaderMap::new(), false));
+        // Door on, but the listener vouched for the caller => unchanged.
+        assert!(is_authorized(&state, &HeaderMap::new(), true));
+
+        let no_door = test_state();
+        assert!(!no_door.oauth_door_enabled());
+        // No door and no token => the legacy open posture, untouched.
+        assert!(is_authorized(&no_door, &HeaderMap::new(), false));
     }
 
     /// Insufficient scope is a `403` with its own error code, not a `401`.
