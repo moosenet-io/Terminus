@@ -81,6 +81,7 @@ pub mod ledger;
 pub mod myelin;
 pub mod news;
 pub mod nexus;
+pub mod oauth; // RMCP-01: OAuth 2.1 remote-MCP connector door (S132)
 pub mod pg;
 pub mod pki;
 pub mod plane;

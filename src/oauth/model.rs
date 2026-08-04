@@ -1,0 +1,496 @@
+//! Row types for the RMCP OAuth store.
+//!
+//! These mirror `migrations/S132-rmcp01-oauth-core.sql` one-for-one. Two
+//! conventions run through the whole file and are worth stating once:
+//!
+//! 1. **No type here can hold a presentable credential**, and no type prints
+//!    its sensitive material. `password_hash` and `client_secret_hash` are
+//!    argon2id PHC strings; `code_hash` and `token_hash` are SHA-256 digests.
+//!    None of those can be replayed as-is.
+//!
+//!    An earlier revision concluded from that that `Debug` was safe to derive.
+//!    Round 3 of review pushed back, and was right to: "cannot be replayed" is
+//!    not "harmless in a log". A client-secret PHC string is an offline
+//!    cracking target with its own salt and cost parameters attached, and a
+//!    code or token digest is live authentication material that confirms which
+//!    token a log line concerns. So every type here that holds such a field
+//!    implements `Debug` BY HAND with that field redacted, rather than deriving
+//!    it — hand-written specifically so that adding a sensitive field later
+//!    cannot silently re-expose it, which a derive would.
+//!
+//! 2. **Absence is denial, never a default.** No type implements `Default`, and
+//!    no field is populated with a permissive fallback. An empty
+//!    `ToolGroup::patterns` matches nothing; a `Client` with no scope rows
+//!    reaches nothing. The natural refactor toward `unwrap_or_default()` is
+//!    precisely the widening bug this shape is meant to prevent.
+
+use chrono::{DateTime, Utc};
+use sqlx::postgres::PgRow;
+use sqlx::Row;
+use uuid::Uuid;
+
+/// A human who can authenticate and consent.
+///
+/// Distinct from [`crate::mesh::Principal`]: an account MAPS to a principal
+/// (RMCP-05), it does not replace one. That indirection is deliberate — it
+/// keeps the OAuth door from becoming a second way to mint fleet identity.
+///
+/// No `Debug` derive: `totp_secret_enc` is encrypted rather than hashed (it has
+/// to be recoverable to verify a code), so it is the one field in this module
+/// that a careless `{:?}` could put in a log with the key sitting next to it.
+#[derive(Clone)]
+pub struct Account {
+    pub id: Uuid,
+    pub name: String,
+    /// argon2id PHC string.
+    pub password_hash: String,
+    /// Encrypted TOTP seed, or `None` when this account has no second factor.
+    pub totp_secret_enc: Option<Vec<u8>>,
+    pub disabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// How a client came to exist. Not merely descriptive: a `Dcr` client is
+/// created with no scope and must be scoped by an operator before it can reach
+/// anything (RMCP-08).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistrationSource {
+    /// Minted by an operator in the GUI or CLI.
+    Operator,
+    /// Self-registered through RFC 7591 dynamic client registration.
+    Dcr,
+}
+
+impl RegistrationSource {
+    /// The stored representation. Kept next to [`Self::parse`] so the two can
+    /// never drift.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Dcr => "dcr",
+        }
+    }
+
+    /// Parse the stored representation, fail-closed.
+    ///
+    /// An unrecognised value reads as [`Self::Dcr`] — the LESS privileged of
+    /// the two — rather than as an error or as `Operator`. A corrupted or
+    /// future-valued row should degrade a client toward "needs explicit
+    /// scoping", never toward "operator-minted, trusted".
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "operator" => Self::Operator,
+            _ => Self::Dcr,
+        }
+    }
+}
+
+/// One connector. `client_id` is the public identifier pasted into the client
+/// application; `client_secret_hash` is `None` for a public client (which is
+/// what Claude registers as under both DCR and CIMD).
+#[derive(Clone)]
+pub struct Client {
+    pub id: Uuid,
+    pub client_id: String,
+    /// argon2id PHC string, or `None` for a public client.
+    pub client_secret_hash: Option<String>,
+    pub name: String,
+    pub redirect_uris: Vec<String>,
+    pub grant_types: Vec<String>,
+    pub token_endpoint_auth_method: String,
+    pub owner_account_id: Uuid,
+    pub registration_source: String,
+    pub disabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Client {
+    /// Typed view of [`Self::registration_source`].
+    pub fn source(&self) -> RegistrationSource {
+        RegistrationSource::parse(&self.registration_source)
+    }
+
+    /// Whether this client authenticates at the token endpoint.
+    ///
+    /// Derived from the presence of a secret hash rather than from
+    /// `token_endpoint_auth_method`, so a row whose method column says
+    /// `client_secret_post` but which holds no secret cannot be treated as
+    /// confidential — the check that matters is whether there is anything to
+    /// verify against.
+    pub fn is_confidential(&self) -> bool {
+        self.client_secret_hash.is_some()
+    }
+}
+
+/// A named set of tool-name patterns (RMCP-06 owns the matcher).
+///
+/// An empty `patterns` matches NOTHING. This is the single most important
+/// invariant in the type and is asserted by tests in both this module and the
+/// store, because "empty means unrestricted" is the intuitive-but-catastrophic
+/// reading.
+#[derive(Clone, Debug)]
+pub struct ToolGroup {
+    pub id: Uuid,
+    pub name: String,
+    pub description: String,
+    pub patterns: Vec<String>,
+    pub owner_account_id: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ToolGroup {
+    /// Whether this group can match anything at all.
+    ///
+    /// Exists so call sites read as `if group.is_empty() { deny }` rather than
+    /// `if group.patterns.is_empty() { ... }`, which invites the wrong default.
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+}
+
+/// A single-use authorization code, bound to everything needed to detect a
+/// replay or a substituted client, redirect, or resource.
+#[derive(Clone)]
+pub struct AuthCode {
+    pub code_hash: Vec<u8>,
+    pub client_id: Uuid,
+    pub account_id: Uuid,
+    pub redirect_uri: String,
+    pub resource: String,
+    pub code_challenge: String,
+    pub scope: String,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// A refresh token in a rotation family.
+#[derive(Clone)]
+pub struct RefreshToken {
+    pub token_hash: Vec<u8>,
+    pub family_id: Uuid,
+    pub client_id: Uuid,
+    pub account_id: Uuid,
+    pub resource: String,
+    pub scope: String,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    /// Set once this token has been exchanged for a successor. A presentation
+    /// of a token with this set is a REUSE event, and RMCP-04 revokes the whole
+    /// family on it.
+    pub rotated_to: Option<Vec<u8>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl RefreshToken {
+    /// Whether presenting this token is a reuse of an already-rotated one.
+    pub fn is_rotated(&self) -> bool {
+        self.rotated_to.is_some()
+    }
+}
+
+/// A recorded human approval of a client for a scope.
+#[derive(Clone, Debug)]
+pub struct Consent {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub client_id: Uuid,
+    pub scope: String,
+    pub granted_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Which account administers a federated namespace (RMCP-12).
+#[derive(Clone, Debug)]
+pub struct ServerOwner {
+    pub namespace: String,
+    pub owner_account_id: Uuid,
+    pub granted_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
+// Redacted Debug
+// ---------------------------------------------------------------------------
+//
+// Hand-written, not derived, for the three row types that carry hashed
+// credential material (see rule 1 in the module docs). Each prints every
+// non-sensitive field normally — the useful part for debugging — and replaces
+// the sensitive one with a marker. `Account` has no `Debug` at all, because its
+// encrypted TOTP seed is recoverable rather than hashed.
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("id", &self.id)
+            .field("client_id", &self.client_id)
+            // The PHC string is an offline cracking target; only its presence
+            // (which is what `is_confidential` turns on) is ever interesting.
+            .field("client_secret_hash", &self.client_secret_hash.as_ref().map(|_| "<redacted>"))
+            .field("name", &self.name)
+            .field("redirect_uris", &self.redirect_uris)
+            .field("grant_types", &self.grant_types)
+            .field("token_endpoint_auth_method", &self.token_endpoint_auth_method)
+            .field("owner_account_id", &self.owner_account_id)
+            .field("registration_source", &self.registration_source)
+            .field("disabled", &self.disabled)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for AuthCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthCode")
+            .field("code_hash", &"<redacted>")
+            .field("client_id", &self.client_id)
+            .field("account_id", &self.account_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("resource", &self.resource)
+            // The PKCE challenge is a digest of the verifier and is not secret,
+            // but it identifies the exchange; there is no debugging value in it
+            // that the code hash's presence does not already give.
+            .field("code_challenge", &"<redacted>")
+            .field("scope", &self.scope)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .field("consumed_at", &self.consumed_at)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RefreshToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshToken")
+            .field("token_hash", &"<redacted>")
+            .field("family_id", &self.family_id)
+            .field("client_id", &self.client_id)
+            .field("account_id", &self.account_id)
+            .field("resource", &self.resource)
+            .field("scope", &self.scope)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            // Whether it was rotated is the load-bearing fact for reuse
+            // detection; the successor's digest is not.
+            .field("rotated_to", &self.rotated_to.as_ref().map(|_| "<redacted>"))
+            .field("revoked_at", &self.revoked_at)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row decoding
+// ---------------------------------------------------------------------------
+//
+// Written by hand rather than derived: this workspace builds `sqlx` with
+// `default-features = false` and without the `macros`/`derive` feature, so
+// `#[derive(sqlx::FromRow)]` is not available (same constraint as
+// `crate::scribe::graph::rules_store` and `crate::intake::discovery::storage`,
+// which decode the same way). Each impl is keyed by COLUMN NAME, so it stays
+// correct if a `SELECT`'s column order changes — only a rename can break it,
+// and that breaks loudly at the first query rather than silently decoding the
+// wrong field into the right-typed slot.
+
+macro_rules! impl_from_row {
+    ($ty:ident, $($field:ident),+ $(,)?) => {
+        impl<'r> sqlx::FromRow<'r, PgRow> for $ty {
+            fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+                Ok(Self { $($field: row.try_get(stringify!($field))?),+ })
+            }
+        }
+    };
+}
+
+impl_from_row!(
+    Account,
+    id,
+    name,
+    password_hash,
+    totp_secret_enc,
+    disabled,
+    created_at,
+    updated_at
+);
+impl_from_row!(
+    Client,
+    id,
+    client_id,
+    client_secret_hash,
+    name,
+    redirect_uris,
+    grant_types,
+    token_endpoint_auth_method,
+    owner_account_id,
+    registration_source,
+    disabled,
+    created_at
+);
+impl_from_row!(
+    ToolGroup,
+    id,
+    name,
+    description,
+    patterns,
+    owner_account_id,
+    created_at
+);
+impl_from_row!(
+    AuthCode,
+    code_hash,
+    client_id,
+    account_id,
+    redirect_uri,
+    resource,
+    code_challenge,
+    scope,
+    issued_at,
+    expires_at,
+    consumed_at
+);
+impl_from_row!(
+    RefreshToken,
+    token_hash,
+    family_id,
+    client_id,
+    account_id,
+    resource,
+    scope,
+    issued_at,
+    expires_at,
+    rotated_to,
+    revoked_at
+);
+impl_from_row!(Consent, id, account_id, client_id, scope, granted_at, revoked_at);
+impl_from_row!(ServerOwner, namespace, owner_account_id, granted_at);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unknown stored value must degrade toward the LESS privileged source.
+    /// Reading it as `Operator` would let a corrupted row masquerade as
+    /// operator-minted and skip the "must be scoped first" rule.
+    #[test]
+    fn unknown_registration_source_reads_as_dcr() {
+        assert_eq!(RegistrationSource::parse("operator"), RegistrationSource::Operator);
+        assert_eq!(RegistrationSource::parse("dcr"), RegistrationSource::Dcr);
+        assert_eq!(RegistrationSource::parse(""), RegistrationSource::Dcr);
+        assert_eq!(RegistrationSource::parse("OPERATOR"), RegistrationSource::Dcr);
+        assert_eq!(RegistrationSource::parse("something-new"), RegistrationSource::Dcr);
+    }
+
+    /// Round-trip, so `as_str` and `parse` cannot drift apart.
+    #[test]
+    fn registration_source_round_trips() {
+        for source in [RegistrationSource::Operator, RegistrationSource::Dcr] {
+            assert_eq!(RegistrationSource::parse(source.as_str()), source);
+        }
+    }
+
+    fn group_with(patterns: Vec<String>) -> ToolGroup {
+        ToolGroup {
+            id: Uuid::nil(),
+            name: "g".into(),
+            description: String::new(),
+            patterns,
+            owner_account_id: Uuid::nil(),
+            created_at: Utc::now(),
+        }
+    }
+
+    /// The headline invariant: an empty group is empty, not unrestricted.
+    #[test]
+    fn empty_group_matches_nothing() {
+        assert!(group_with(vec![]).is_empty());
+        assert!(!group_with(vec!["weather_*".into()]).is_empty());
+    }
+
+    fn client_with_secret(hash: Option<&str>) -> Client {
+        Client {
+            id: Uuid::nil(),
+            client_id: "cid".into(),
+            client_secret_hash: hash.map(str::to_string),
+            name: "c".into(),
+            redirect_uris: vec![],
+            grant_types: vec![],
+            // Deliberately claims a confidential method while holding no secret.
+            token_endpoint_auth_method: "<REDACTED-SECRET>".into(),
+            owner_account_id: Uuid::nil(),
+            registration_source: "operator".into(),
+            disabled: false,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Confidentiality follows the stored secret, not the advertised method —
+    /// otherwise a row with a confidential method and no secret would be
+    /// "authenticated" by verifying against nothing.
+    #[test]
+    fn confidentiality_follows_the_stored_secret_not_the_method() {
+        assert!(!client_with_secret(None).is_confidential());
+        assert!(client_with_secret(Some("$argon2id$v=19$...")).is_confidential());
+    }
+
+    /// No hashed credential material may reach a log through `Debug`, while
+    /// the fields that make a log line useful must still be there.
+    #[test]
+    fn debug_redacts_hashes_but_keeps_context() {
+        let client = client_with_secret(Some("$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$ZGlnZXN0"));
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains("argon2id"), "the PHC string must not appear: {rendered}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("cid"), "the client_id is not secret and aids debugging");
+
+        let code = AuthCode {
+            code_hash: b"\xde\xad\xbe\xef".to_vec(),
+            client_id: Uuid::nil(),
+            account_id: Uuid::nil(),
+            redirect_uri: "https://example.test/cb".into(),
+            resource: "https://example.test/mcp".into(),
+            code_challenge: "a-pkce-challenge-value".into(),
+            scope: "mcp".into(),
+            issued_at: Utc::now(),
+            expires_at: Utc::now(),
+            consumed_at: None,
+        };
+        let rendered = format!("{code:?}");
+        assert!(!rendered.contains("dead"), "no digest bytes: {rendered}");
+        assert!(!rendered.contains("a-pkce-challenge-value"));
+        assert!(rendered.contains("https://example.test/mcp"), "the audience aids debugging");
+
+        let token = RefreshToken {
+            token_hash: vec![1, 2, 3],
+            family_id: Uuid::nil(),
+            client_id: Uuid::nil(),
+            account_id: Uuid::nil(),
+            resource: "https://example.test/mcp".into(),
+            scope: "mcp".into(),
+            issued_at: Utc::now(),
+            expires_at: Utc::now(),
+            rotated_to: Some(vec![4, 5, 6]),
+            revoked_at: None,
+        };
+        let rendered = format!("{token:?}");
+        assert!(!rendered.contains("[1, 2, 3]"), "no digest bytes: {rendered}");
+        assert!(!rendered.contains("[4, 5, 6]"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn rotated_refresh_token_is_detectable() {
+        let base = RefreshToken {
+            token_hash: vec![1],
+            family_id: Uuid::nil(),
+            client_id: Uuid::nil(),
+            account_id: Uuid::nil(),
+            resource: "https://example.test/mcp".into(),
+            scope: "mcp".into(),
+            issued_at: Utc::now(),
+            expires_at: Utc::now(),
+            rotated_to: None,
+            revoked_at: None,
+        };
+        assert!(!base.is_rotated());
+        assert!(RefreshToken { rotated_to: Some(vec![2]), ..base }.is_rotated());
+    }
+}
