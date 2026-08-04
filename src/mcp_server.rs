@@ -1598,11 +1598,19 @@ async fn handle_mcp(
             if let Some(gateway) = &state.gateway {
                 // RMCP-05 → RMCP-07 SEAM (visibility half), now closed.
                 // `client_scope` is `Some` exactly when `binding` carries a
-                // connector, and `decide` re-checks the account grant as its
-                // FIRST check — so this one pass is the whole intersection and
-                // the catalog a caller SEES is computed from the same inputs as
-                // the calls it may MAKE. A transport caller has no connector,
-                // and takes the account-grant-only path unchanged.
+                // connector, so the catalog a caller SEES is computed from the
+                // same inputs as the calls it may MAKE.
+                //
+                // An OAuth request takes ONE pass, not two.
+                // `filter_catalog_for_client` re-checks the account grant
+                // itself (it is `decide`'s first check), so the result is
+                // identical to running the principal filter first — but
+                // running that filter first would strip grant-denied tools
+                // BEFORE the connector filter ever saw them, and the aggregate
+                // audit record would then report `denied_by_grant=0` no matter
+                // what the grant did. The single pass is what makes the audit
+                // counts true. A transport caller has no connector and takes
+                // the account-grant-only path unchanged.
                 match client_scope.as_deref() {
                     Some(scope) => {
                         tools = gateway.filter_catalog_for_client(
@@ -1623,7 +1631,12 @@ async fn handle_mcp(
                 // this item exists to prevent, because a connector scope is
                 // only ever meaningful as the narrow side of an intersection.
                 //
-                // Audited, not merely logged (round 3).
+                // Audited, not merely logged. Round 3 found this branch
+                // substituting an empty catalog with no audit record — the same
+                // gap, in the same shape, as the gateway-less `tools/call`
+                // branch that round 1 found. A connector that suddenly sees
+                // nothing is the case an operator has to diagnose, so it emits
+                // the same aggregate record as every other filtered list.
                 let mut tally = crate::oauth::scope::ListFilterTally::default();
                 for _ in tools.iter() {
                     tally.record_no_account_grant();

@@ -597,8 +597,19 @@ without filtering the catalog leaks what exists — two *similar* functions is h
 apart, so there is only one. A property test asserts `effective ⊆ account grant` over
 generated grants, pattern sets, namespace sets and catalogs.
 
-Every denial is audited with a machine-readable reason, so a misconfiguration is diagnosable
-without guesswork:
+Denials are audited with a machine-readable reason, in two shapes — and the difference is
+deliberate:
+
+- **`tools/call`** emits one record per denied call, naming the tool and its exact reason.
+- **`tools/list`** emits **one aggregate record per evaluation**, carrying the client, the
+  principal, how many tools were considered and allowed, and the count per reason. It is
+  emitted only when something was hidden. Individual hidden tool **names are not enumerated**
+  on the list path: a 400-tool catalog would otherwise produce hundreds of records on every
+  list and bury the call-path denials that describe something a caller actually attempted.
+  The counts answer the question an operator actually has — *which dimension is eliminating
+  my tools* — and a call to any hidden tool still yields a per-tool record naming it.
+
+The reasons:
 
 | reason | meaning |
 |---|---|
@@ -606,6 +617,10 @@ without guesswork:
 | `no_namespace` | the tool belongs to a federated server this connector is not scoped to |
 | `no_group` | no tool group attached to this connector matches the name |
 | `no_account_grant` | the process has no gateway configured, so there is no account grant to intersect with — a configuration fault, denied rather than permitted |
+
+A connector that mysteriously sees nothing is the case this is for: one `tools/list` row with
+`allowed=0` and the counts alongside says immediately whether the account grant, the
+namespaces, the groups, or a missing gateway is responsible.
 
 **Revocation takes effect immediately, including mid-resolution.** Resolved scopes are
 cached, so every write against a scope-affecting table — a client's groups or namespaces, a

@@ -89,7 +89,7 @@ use crate::mesh::Principal;
 // module owns the ACCOUNT half and hands it to `oauth::scope` through the
 // `AccountGrant` adapter below; the intersection itself lives there so that
 // `tools/list` and `tools/call` share exactly one implementation of it.
-use crate::oauth::scope::{AccountGrant, ClientScope};
+use crate::oauth::scope::{AccountGrant, ClientScope, ListFilterTally};
 use audit::{AuditDecision, AuditEntry, AuditResult};
 use rate_limit::{rate_limit_key, InProcessRateLimiter, RateLimitDecision, RateLimiter};
 
@@ -2052,17 +2052,67 @@ impl GatewayFramework {
             return tools;
         };
         let grant = self.account_grant(principal);
-        tools
+        let mut tally = ListFilterTally::default();
+        let kept = tools
             .into_iter()
-            .filter(|tool| {
-                tool.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| {
-                        crate::oauth::scope::decide(&grant, scope, name).is_allowed()
-                    })
+            .filter(|tool| match tool.get("name").and_then(Value::as_str) {
+                Some(name) => {
+                    let decision = crate::oauth::scope::decide(&grant, scope, name);
+                    tally.record(decision);
+                    decision.is_allowed()
+                }
+                // A nameless entry is dropped without being tallied: it is a
+                // malformed catalog entry, not a scoping denial, and counting
+                // it would misattribute a producer bug to a permission.
+                None => false,
             })
-            .collect()
+            .collect();
+        audit_client_scope_list(principal, scope, &tally);
+        kept
     }
+}
+
+/// Audit one `tools/list` evaluation, as a single aggregate record.
+///
+/// Emits nothing when the connector could see everything it was offered —
+/// there is no denial to diagnose, and a row per successful list would be pure
+/// noise. Free function for the same reason as
+/// [`audit_client_scope_denial`]: the gateway-less list branch in
+/// [`crate::mcp_server`] has no [`GatewayFramework`] to call a method on, and
+/// that is exactly the branch that was forgotten on the `tools/call` path one
+/// round earlier.
+///
+/// The record is keyed on the action `tools/list`, so it can never be confused
+/// with a per-tool call denial, and it carries [`AuditResult::DeniedNotAllowlisted`]
+/// because it exists only when something WAS denied. Note that makes
+/// `is_denied()` true for a list where most tools were visible — the counts in
+/// the detail are what distinguish "hid three of four hundred" from "hid
+/// everything", and any metric summing these must read them rather than the
+/// result alone.
+pub fn audit_client_scope_list(
+    principal: Option<&Principal>,
+    scope: &ClientScope,
+    tally: &ListFilterTally,
+) {
+    if tally.denied() == 0 {
+        return;
+    }
+    let identity = principal
+        .map(|p| p.name().to_string())
+        .unwrap_or_else(|| ANONYMOUS_IDENTITY.to_string());
+    let detail = format!(
+        "rmcp connector list filtered: client_id={} {}",
+        scope.client_id(),
+        tally.summary()
+    );
+    AuditEntry::new(
+        &identity,
+        "tools/list",
+        ActionKind::Tool,
+        AuditResult::DeniedNotAllowlisted,
+        Some(&detail),
+    )
+    .log();
 }
 
 /// Audit one connector-scope denial and return the caller-facing text.
@@ -3240,6 +3290,95 @@ mod tests {
             .guard_client_scope(Some(&principal), Some(&scope), "peertwo__ledger_accounts")
             .expect_err("denied");
         assert_eq!(via_guard, federated);
+    }
+
+    /// Round 3 finding: a `tools/list` evaluation that hides tools must leave a
+    /// diagnosable trace. One AGGREGATE record per evaluation, carrying counts
+    /// per machine-readable reason — not one record per hidden tool, which on a
+    /// 400-tool catalog would bury the call-path denials that matter.
+    #[test]
+    fn a_filtered_list_is_audited_once_with_counts_per_reason() {
+        // Grant refuses `admin_*`; connector is scoped to `ledger_*` plus one
+        // peer, so all three reasons appear in a single evaluation.
+        let mut map = HashMap::new();
+        map.insert(
+            "dev-box".to_string(),
+            Grant::AllowDeny { allow: vec!["*".to_string()], deny: vec!["admin_".to_string()] },
+        );
+        let fw = framework_with(AllowlistPolicy::new(map), 10);
+        let principal = test_principal("dev-box");
+        let scope = connector_scope(&["ledger_*", "peerone::*"], &["peerone"]);
+
+        let catalog = vec![
+            tool_json("ledger_accounts"),        // allowed
+            tool_json("peerone__ledger_report"), // allowed
+            tool_json("admin_reset"),            // denied_by_grant
+            tool_json("peertwo__ledger_report"), // no_namespace
+            tool_json("vitals_summary"),         // no_group
+        ];
+        let kept = fw.filter_catalog_for_client(Some(&principal), Some(&scope), catalog);
+        let names: Vec<&str> = kept.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(names, vec!["ledger_accounts", "peerone__ledger_report"]);
+
+        // The tally the record is built from must attribute each denial to the
+        // right dimension — that attribution is the whole diagnostic value.
+        let grant = fw.account_grant(Some(&principal));
+        let mut tally = ListFilterTally::default();
+        for tool in [
+            "ledger_accounts",
+            "peerone__ledger_report",
+            "admin_reset",
+            "peertwo__ledger_report",
+            "vitals_summary",
+        ] {
+            tally.record(crate::oauth::scope::decide(&grant, &scope, tool));
+        }
+        let summary = tally.summary();
+        assert_eq!(tally.considered(), 5);
+        assert_eq!(tally.allowed(), 2);
+        assert_eq!(tally.denied(), 3);
+        assert!(summary.contains("denied_by_grant=1"), "{summary}");
+        assert!(summary.contains("no_namespace=1"), "{summary}");
+        assert!(summary.contains("no_group=1"), "{summary}");
+        // Every reason present even at zero, so a log query cannot silently
+        // miss a row whose count happened to be zero.
+        assert!(summary.contains("no_account_grant=0"), "{summary}");
+    }
+
+    /// A list that hides nothing emits no record — a row per successful list
+    /// would be noise, and the audit stream is for things worth reading.
+    #[test]
+    fn an_unfiltered_list_emits_no_record() {
+        let mut tally = ListFilterTally::default();
+        tally.record(crate::oauth::scope::Decision::Allow);
+        tally.record(crate::oauth::scope::Decision::Allow);
+        assert_eq!(tally.denied(), 0);
+
+        // Nothing to assert on the emitter beyond it being a no-op; the
+        // condition it keys on is the tally, so that is what is asserted.
+        let principal = test_principal("dev-box");
+        let scope = connector_scope(&["*"], &[]);
+        audit_client_scope_list(Some(&principal), &scope, &tally);
+    }
+
+    /// The gateway-less list branch — the one most likely to be forgotten,
+    /// exactly as its `tools/call` twin was a round earlier. Every considered
+    /// tool is attributed to `no_account_grant`, so "the connector suddenly
+    /// sees nothing" reads as a configuration fault rather than as a scoping
+    /// decision nobody made.
+    #[test]
+    fn the_gateway_less_list_branch_attributes_every_tool_to_no_account_grant() {
+        let mut tally = ListFilterTally::default();
+        for _ in 0..4 {
+            tally.record_no_account_grant();
+        }
+        assert_eq!(tally.considered(), 4);
+        assert_eq!(tally.allowed(), 0);
+        assert_eq!(tally.denied(), 4);
+        let summary = tally.summary();
+        assert!(summary.contains("no_account_grant=4"), "{summary}");
+        assert!(summary.contains("allowed=0"), "{summary}");
+        assert!(summary.contains("no_group=0"), "{summary}");
     }
 
     /// A namespace wildcard grant referencing a namespace with no live

@@ -128,6 +128,97 @@ impl Decision {
     }
 }
 
+/// Counts of one `tools/list` evaluation, for a single aggregate audit record.
+///
+/// ## Why counts and not one record per hidden tool
+/// Round 3 of review found that list-path denials never reached the audit
+/// stream at all: [`effective`] silently dropped everything [`decide`] refused,
+/// so the three reason codes existed internally and were emitted only on the
+/// call path. An operator diagnosing "my connector sees nothing" — the single
+/// most likely support question this feature will generate — had no trace to
+/// read.
+///
+/// The naive fix is one record per denied tool. That is the wrong shape: a
+/// 400-tool catalog would emit hundreds of records on EVERY list, burying the
+/// call-path denials that describe something a caller actually attempted, and
+/// turning the audit stream into a firehose nobody greps twice. One aggregate
+/// row per evaluation answers the real diagnostic question — *which dimension
+/// is eliminating my tools, and how many* — and answers it in a single line.
+///
+/// The deliberate cost: the NAMES of hidden tools are not enumerated on the
+/// list path. That is a real limitation, not an oversight, and the README says
+/// so rather than claiming completeness. The names are recoverable anyway — a
+/// call to any one of them emits a per-tool record with its exact reason.
+///
+/// Not a permission-bearing type, so unlike everything else in this module it
+/// may derive `Default`: a zeroed tally is an evaluation that has not counted
+/// anything yet, which is exactly right and grants nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListFilterTally {
+    considered: usize,
+    allowed: usize,
+    denied_by_grant: usize,
+    no_namespace: usize,
+    no_group: usize,
+    no_account_grant: usize,
+}
+
+impl ListFilterTally {
+    /// Count one tool's decision.
+    pub fn record(&mut self, decision: Decision) {
+        self.considered += 1;
+        match decision {
+            Decision::Allow => self.allowed += 1,
+            Decision::Deny(DenyReason::DeniedByGrant) => self.denied_by_grant += 1,
+            Decision::Deny(DenyReason::NoNamespace) => self.no_namespace += 1,
+            Decision::Deny(DenyReason::NoGroup) => self.no_group += 1,
+        }
+    }
+
+    /// Count one tool refused because the process has no gateway, and therefore
+    /// no account grant to intersect with ([`DENY_NO_ACCOUNT_GRANT`]).
+    /// [`decide`] never produces this, so it cannot arrive through
+    /// [`Self::record`].
+    pub fn record_no_account_grant(&mut self) {
+        self.considered += 1;
+        self.no_account_grant += 1;
+    }
+
+    /// How many tools were hidden.
+    pub fn denied(&self) -> usize {
+        self.considered.saturating_sub(self.allowed)
+    }
+
+    pub fn considered(&self) -> usize {
+        self.considered
+    }
+
+    pub fn allowed(&self) -> usize {
+        self.allowed
+    }
+
+    /// The machine-readable body of the audit record.
+    ///
+    /// `key=value` pairs so a log query can filter and sum without parsing
+    /// prose. Every reason is present even at zero — a query for
+    /// `no_namespace=` must not silently miss rows where the count happened to
+    /// be zero, and a reader comparing two lines should not have to work out
+    /// whether a missing key means zero or means an older format.
+    pub fn summary(&self) -> String {
+        format!(
+            "considered={} allowed={} denied={} denied_by_grant={} no_namespace={} \
+             no_group={} no_account_grant={}",
+            self.considered,
+            self.allowed,
+            self.denied(),
+            self.denied_by_grant,
+            self.no_namespace,
+            self.no_group,
+            self.no_account_grant,
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The account's own grant
 // ---------------------------------------------------------------------------
