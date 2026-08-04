@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::error::ToolError;
 use crate::oauth::groups::{
     normalize_description, validate_group, validate_patterns, AuthorizedGroup, GroupOwner, Pattern,
-    STARTER_GROUPS,
+    MAX_GROUPS_PER_CLIENT, STARTER_GROUPS,
 };
 use crate::oauth::model::{
     Account, AuthCode, Client, Consent, RefreshToken, ServerOwner, TokenFamily, ToolGroup,
@@ -787,6 +787,24 @@ impl OauthStore {
         client_id: Uuid,
         group_ids: &[Uuid],
     ) -> Result<(), ToolError> {
+        // Bound the client's total resolution cost at the point an operator is
+        // present to read the error. Every group here contributes up to
+        // MAX_PATTERNS_PER_GROUP patterns, and resolution walks the concatenated
+        // list once per catalog tool, so the group count is what turns a bounded
+        // per-group cap into an unbounded aggregate. Refused rather than
+        // truncated: silently dropping groups would store a scope different from
+        // the one the operator just asked for.
+        let distinct = group_ids.iter().collect::<std::collections::HashSet<_>>().len();
+        if distinct > MAX_GROUPS_PER_CLIENT {
+            return Err(ToolError::InvalidArgument(format!(
+                "a client may be scoped to at most {MAX_GROUPS_PER_CLIENT} tool groups \
+                 (requested {distinct}); combine patterns into fewer groups"
+            )));
+        }
+
+        // Established AFTER the cheap argument check: `ScopeWrite::begin` bumps
+        // the epoch immediately, so entering it only to reject the request would
+        // invalidate every cached resolution for a write that never happened.
         let _scope_write = ScopeWrite::begin();
         let mut tx = self.pool.begin().await.map_err(db)?;
 

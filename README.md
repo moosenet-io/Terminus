@@ -1183,9 +1183,17 @@ pattern   := "*"                        -- every tool (operator-owned groups onl
 
 namespace := printable ASCII, no "*", must round-trip through the mesh splitter
              (so: no "__" inside, no trailing "_")
-bare      := printable ASCII, no "*"    (may itself contain "__")
+bare      := printable ASCII, no "*", NOT ending in "__"
+             (may otherwise contain "__": `a__b__c*` is namespace `a`, bare prefix `b__c`)
 local     := printable ASCII, no "*", no "__"
 ```
+
+**Precedence:** a pattern whose head ends in the separator is always the *namespace* form.
+So `a__b__*` reads as namespace `a__b` — which cannot round-trip, so it is refused — and
+never as namespace `a` with bare prefix `b__`. That refusal is deliberate: both readings are
+reasonable, and an author who cannot predict which of two scopes they will get has written
+an ambiguous pattern. The unambiguous spellings both work (`a__b__c*`, `a__b*`), so nothing
+legitimate becomes inexpressible.
 
 Rejected at write time, exhaustively: the empty pattern; anything over 96 characters; any
 non-printable-ASCII character; a `*` anywhere but as the single final character (`*weather`
@@ -1230,6 +1238,15 @@ so an operator does not have to hold two pattern languages in their head.
   A wildcard written by someone since demoted — or stored before the flag column existed —
   resolves to the **empty set**. General rule for anything built on top of this: an
   authority that can be revoked must be re-derived on the read path, never cached in a row.
+
+### Bounds
+
+A group holds at most 128 patterns, a client is scoped to at most 32 groups, and resolution
+refuses outright above `32 x 128` patterns. The per-group cap alone bounds nothing that
+matters: resolution concatenates every group a client holds and walks that list once per
+catalog tool, so the group count is the unbounded factor. Over the limit, resolution is
+**refused, never truncated** — a truncated pattern list is a scope that silently differs
+from the configured one, and which patterns survived would depend on row ordering.
 
 ### What empty means
 

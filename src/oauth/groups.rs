@@ -155,6 +155,31 @@ pub const MAX_PATTERN_CHARS: usize = 96;
 /// can grow without limit. See [`resolve`].
 pub const MAX_PATTERNS_PER_GROUP: usize = 128;
 
+/// Most tool groups one client may be scoped to.
+///
+/// The per-group cap alone bounds nothing at the point that matters:
+/// [`resolve_groups`] concatenates the patterns of EVERY group a client holds,
+/// and [`resolve`] walks that whole list once per catalog tool, so the real cost
+/// is `tools x total_patterns` and the group count is the unbounded factor.
+/// RMCP-07 caches resolutions, but a cache MISS still pays the full cost and
+/// scoping writes invalidate the cache deliberately — so "the cache absorbs it"
+/// is not an answer; an operator with very many groups would make the first
+/// resolution after every scope edit expensive, on the request path.
+///
+/// Capping the group count is the cheaper half of the fix: it is checked once at
+/// write time, where the operator is present to read the error, rather than on
+/// every dispatch.
+pub const MAX_GROUPS_PER_CLIENT: usize = 32;
+
+/// Hard ceiling on the patterns [`resolve_groups`] will consider for one client.
+///
+/// Exactly the product of the two write-time caps, so a client scoped within
+/// them can never trip it. It exists because the write-time caps are
+/// POINT-IN-TIME — rows can predate a cap, and a cap can be lowered — which is
+/// the same reasoning that made this item re-derive operator authority on the
+/// read path rather than trust the write check.
+pub const MAX_RESOLVED_PATTERNS: usize = MAX_GROUPS_PER_CLIENT * MAX_PATTERNS_PER_GROUP;
+
 /// Who is authoring a group, for the one rule that depends on it.
 ///
 /// Not a general permission model — RMCP-12 owns delegation. This exists
@@ -285,9 +310,31 @@ impl Pattern {
     ///
     /// namespace := ASCII-graphic+, no "*", and must round-trip through
     ///              `split_namespaced` (so: no "__" inside it, no trailing "_")
-    /// bare      := ASCII-graphic+, no "*"   (may itself contain "__")
+    /// bare      := ASCII-graphic+, no "*", NOT ending in "__"
+    ///              (it may otherwise contain "__": `a__b__c*` is namespace `a`,
+    ///               bare prefix `b__c`)
     /// local     := ASCII-graphic+, no "*", no "__"
     /// ```
+    ///
+    /// ## Precedence, and why `bare` may not end in `__`
+    /// The two `"__"`-carrying prefix forms overlap on any pattern ending in
+    /// `__*`, and the grammar above is only unambiguous because ONE of them
+    /// wins. **A head ending in the separator is always the namespace form.**
+    /// `a__b__*` is therefore read as namespace `a__b` (which then fails
+    /// [`check_namespace`], so the pattern is REFUSED) and never as namespace
+    /// `a` with bare prefix `b__`.
+    ///
+    /// Refusing it is the point, not a side effect. Round 5 of review read that
+    /// same pattern the other way — namespace `a`, bare prefix `b__`, matching
+    /// an advertised `a__b__c` — and that reading is entirely reasonable. Two
+    /// careful readers disagreeing about what one pattern means IS the defect:
+    /// this module's whole discipline is that a pattern must never resolve to
+    /// something other than what its author wrote, and an author cannot write
+    /// `a__b__*` and know which of two scopes they will get. So the ambiguous
+    /// spelling is refused while both unambiguous ones keep working —
+    /// `a__b__c*` selects bare names under namespace `a`, and `a__b*` selects
+    /// bare names starting `b` under the same namespace. Nothing an operator
+    /// can legitimately want becomes inexpressible; only the coin-flip does.
     ///
     /// Rejected, exhaustively: the empty pattern; anything over
     /// [`MAX_PATTERN_CHARS`]; any non-ASCII-graphic character (whitespace,
@@ -756,10 +803,36 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for AuthorizedGroup {
 /// [`Pattern::parse_stored`]): it contributes nothing, the same direction. A
 /// group whose patterns ALL fail to parse, or whose only pattern is a
 /// now-unauthorized `*`, therefore behaves exactly like an empty group.
+///
+/// ## Why this returns a `Result` when matching is total
+/// [`Pattern::matches`] is still infallible, and that is the property that
+/// matters on the dispatch path: no tool name can make a match fail. The error
+/// here is not about a request at all — it is a fixed property of the stored
+/// CONFIGURATION (how many groups this client holds), so it cannot be triggered
+/// by traffic, cannot flap between two calls, and cannot depend on which tool is
+/// being called. A caller that hits it has a client an operator must re-scope,
+/// which is worth saying out loud rather than absorbing into a silent denial.
 pub fn resolve_groups<'a>(
     groups: &[AuthorizedGroup],
     catalog: &'a [CatalogTool],
-) -> Vec<&'a CatalogTool> {
+) -> Result<Vec<&'a CatalogTool>, ToolError> {
+    // Counted from the STORED rows before any parsing, so the bound is on the
+    // work this call is about to do rather than on what survives validation.
+    let declared: usize = groups.iter().map(|g| g.group.patterns.len()).sum();
+    if groups.len() > MAX_GROUPS_PER_CLIENT || declared > MAX_RESOLVED_PATTERNS {
+        // Refuse the whole resolution rather than truncating it. A truncated
+        // pattern list is a scope that silently differs from the configured one
+        // — and since the surviving prefix would depend on row ordering, two
+        // resolutions of the same configuration could differ from each other.
+        // Denying is the safe direction and, unlike a truncation, it is visible.
+        return Err(ToolError::InvalidArgument(format!(
+            "this client is scoped to {} group(s) holding {declared} pattern(s), over the \
+             limit of {MAX_GROUPS_PER_CLIENT} groups / {MAX_RESOLVED_PATTERNS} patterns; \
+             resolution is refused rather than truncated — reduce the client's groups",
+            groups.len()
+        )));
+    }
+
     let patterns: Vec<Pattern> = groups
         .iter()
         .flat_map(|authorized| {
@@ -776,7 +849,7 @@ pub fn resolve_groups<'a>(
             })
         })
         .collect();
-    resolve(&patterns, catalog)
+    Ok(resolve(&patterns, catalog))
 }
 
 /// A starter group: a name, a description, and prefix patterns over tool
@@ -880,7 +953,7 @@ mod tests {
 
     fn resolve_stored(groups: Vec<AuthorizedGroup>) -> Vec<String> {
         let cat = catalog();
-        names(&resolve_groups(&groups, &cat))
+        names(&resolve_groups(&groups, &cat).expect("within the aggregate bound"))
     }
 
     // ── The empty cases, first: this is the invariant the item is about ──────
@@ -895,7 +968,7 @@ mod tests {
 
         let group = stored_group(vec![]);
         assert!(group.is_empty());
-        assert!(resolve_groups(&[authorized(group, GroupOwner::Operator)], &cat).is_empty());
+        assert!(resolve_groups(&[authorized(group, GroupOwner::Operator)], &cat).unwrap().is_empty());
     }
 
     /// A well-formed pattern that matches no tool in the current catalog is the
@@ -914,7 +987,7 @@ mod tests {
         let cat = catalog();
         let group = stored_group(vec!["we*ther_*".into(), "".into()]);
         assert!(!group.is_empty(), "the row has patterns; they simply do not parse");
-        assert!(resolve_groups(&[authorized(group, GroupOwner::Operator)], &cat).is_empty());
+        assert!(resolve_groups(&[authorized(group, GroupOwner::Operator)], &cat).unwrap().is_empty());
     }
 
     // ── Revocation: authority is re-derived on the READ path ─────────────────
@@ -1293,6 +1366,54 @@ mod tests {
         );
     }
 
+    /// The round-5 case. `a__b__*` is refused, and this pins WHICH branch
+    /// refuses it and why — because a bare `is_err()` cannot distinguish "the
+    /// namespace form rejected `a__b`" from "something else happened to fail",
+    /// and the review disagreement was precisely about which path runs.
+    ///
+    /// Precedence: a head ending in the separator is ALWAYS the namespace form.
+    /// So `a__b__*` is namespace `a__b` — which cannot round-trip through
+    /// `split_namespaced` and is therefore rejected — and is never read as
+    /// namespace `a` with bare prefix `b__`.
+    ///
+    /// The refusal is deliberate. That second reading is reasonable enough that
+    /// a reviewer reached it, and an author who cannot predict which of two
+    /// scopes they will get has written an ambiguous pattern, which this module
+    /// refuses on principle. Both unambiguous spellings still work, asserted
+    /// below, so nothing legitimate becomes inexpressible.
+    #[test]
+    fn an_ambiguous_double_separator_prefix_is_refused_by_the_namespace_branch() {
+        let err = Pattern::parse("a__b__*", GroupOwner::Operator).unwrap_err().to_string();
+        assert!(
+            err.contains("a__b"),
+            "must be refused as the NAMESPACE `a__b`, naming it so the author can see \
+             which reading was taken: {err}"
+        );
+        assert!(err.contains("not a usable namespace"), "and by check_namespace: {err}");
+
+        // Both unambiguous spellings survive, and mean different things.
+        assert_eq!(
+            Pattern::parse("a__b__c*", GroupOwner::Operator).unwrap(),
+            Pattern::NamespacedPrefix { namespace: "a".into(), prefix: "b__c".into() },
+            "a bare name may contain the separator when the pattern is unambiguous"
+        );
+        assert_eq!(
+            Pattern::parse("a__b*", GroupOwner::Operator).unwrap(),
+            Pattern::NamespacedPrefix { namespace: "a".into(), prefix: "b".into() },
+        );
+
+        // And the precedence itself: `<ns>__*` beats `<ns>__<bare>*` whenever a
+        // head ends in the separator. `peerhub__*` must stay the namespace form.
+        assert_eq!(
+            Pattern::parse("peerhub__*", GroupOwner::Operator).unwrap(),
+            Pattern::Namespace("peerhub".into()),
+            "a head ending in the separator is the namespace form, not a bare prefix",
+        );
+
+        // The tests are not vacuous: a valid pattern parses through the same call.
+        assert!(Pattern::parse("a__b__c*", GroupOwner::Operator).is_ok());
+    }
+
     /// An EXACT qualified name must stay EXACT. Splitting it into a namespaced
     /// prefix would widen it — `peerhub__ledger_add` would start matching
     /// `peerhub__ledger_add_v2` — which is the same "parses to something other
@@ -1420,6 +1541,54 @@ mod tests {
         seen.sort();
         seen.dedup();
         assert_eq!(seen.len(), total);
+    }
+
+    /// The aggregate bound. A per-group cap does not bound resolution, because
+    /// resolution concatenates every group a client holds — so this refuses,
+    /// rather than truncating, when the total is over the ceiling.
+    ///
+    /// Truncation is the tempting alternative and the wrong one: the surviving
+    /// prefix would depend on row ordering, so two resolutions of one unchanged
+    /// configuration could hand back different scopes, and neither would be the
+    /// scope an operator configured. Denial is at least visible and stable.
+    #[test]
+    fn resolution_refuses_rather_than_truncates_past_the_aggregate_bound() {
+        let cat = catalog();
+
+        // At the ceiling: still resolves, and still resolves CORRECTLY.
+        let ok: Vec<AuthorizedGroup> = (0..MAX_GROUPS_PER_CLIENT)
+            .map(|_| authorized(stored_group(vec!["weather_*".into()]), GroupOwner::Delegated))
+            .collect();
+        let resolved = resolve_groups(&ok, &cat).expect("exactly at the bound must resolve");
+        assert_eq!(names(&resolved), vec!["weather_alerts", "weather_get"]);
+
+        // One group past it: refused, and the error says why and by how much.
+        let over: Vec<AuthorizedGroup> = (0..MAX_GROUPS_PER_CLIENT + 1)
+            .map(|_| authorized(stored_group(vec!["weather_*".into()]), GroupOwner::Delegated))
+            .collect();
+        let err = resolve_groups(&over, &cat).unwrap_err().to_string();
+        assert!(err.contains(&MAX_GROUPS_PER_CLIENT.to_string()), "names the limit: {err}");
+        assert!(err.contains("refused rather than truncated"), "and the disposition: {err}");
+
+        // The pattern total is bounded independently of the group count, so a
+        // few groups each holding a huge stored list cannot slip through.
+        let fat: Vec<AuthorizedGroup> = (0..4)
+            .map(|_| {
+                let pats: Vec<String> =
+                    (0..MAX_RESOLVED_PATTERNS / 3).map(|i| format!("t{i}_*")).collect();
+                authorized(stored_group(pats), GroupOwner::Delegated)
+            })
+            .collect();
+        assert!(fat.len() <= MAX_GROUPS_PER_CLIENT, "the group count alone is within bounds");
+        assert!(resolve_groups(&fat, &cat).is_err(), "the PATTERN total must bound it too");
+    }
+
+    /// The ceiling is exactly the product of the two write-time caps, so a
+    /// client scoped within them can never trip the read-time refusal. If a
+    /// future edit lowers a cap without thinking, this is what notices.
+    #[test]
+    fn the_read_bound_cannot_reject_a_write_bounded_client() {
+        assert_eq!(MAX_RESOLVED_PATTERNS, MAX_GROUPS_PER_CLIENT * MAX_PATTERNS_PER_GROUP);
     }
 
     // ── Scale ────────────────────────────────────────────────────────────────
