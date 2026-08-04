@@ -82,19 +82,86 @@ const HELPER_SUBCOMMANDS: &[&str] = &[
 /// workaround at the consumer for a defect at the producer, which every future
 /// consumer would have hit in turn. Fixing it here means no consumer has to.
 ///
-/// So: truncate `now` to a whole second BEFORE subtracting. For an unchanged
-/// process, `etimes` advances by exactly the number of whole seconds the clock
-/// advanced, so the derived start time is stable across passes.
+/// So: truncate `now` to a whole second BEFORE subtracting.
+///
+/// **This is the FALLBACK, and its residual is stated rather than hidden.**
+/// `etimes` is `floor(now - start)`, so the derived value is
+/// `floor(now) - floor(now - start)`, which for a process whose true start has a
+/// fractional part still ALTERNATES between two adjacent seconds depending on
+/// where the poll lands relative to that fraction. Truncation therefore reduces
+/// the jitter from arbitrary-subsecond to at most ONE SECOND — a real
+/// improvement, but not stability. (gpt56 review, TERM #605.)
+///
+/// The stable path is [`start_epoch_from_proc`], which reads the process's own
+/// `starttime` from `/proc` and depends on nothing that changes between polls.
+/// This helper is used only when that is unavailable (an unreadable `/proc`, a
+/// remote host that answered `ps` but not `cat`), where a bounded 1s wobble
+/// still beats an unbounded subsecond one.
 ///
 /// (`last_activity_at`, the other timestamp on a session, is NOT in this class:
 /// it comes from a transcript file's mtime read as whole seconds
 /// (`DateTime::from_timestamp(secs, 0)`), so it is already whole-second and
 /// stable for an unchanged file. Reviewed, not changed.)
+/// Linux exports `/proc/<pid>/stat`'s `starttime` in USER_HZ, which the kernel
+/// fixes at 100 for the procfs interface regardless of the configured CONFIG_HZ.
+const PROC_USER_HZ: u64 = 100;
+
+/// Parse a batched `cat /proc/stat /proc/<pid>/stat ...` into the boot time and
+/// each pid's `starttime` (field 22, in [`PROC_USER_HZ`] ticks since boot).
+///
+/// The lines are distinguishable without separators: `/proc/stat`'s lines all
+/// begin with a WORD (`cpu`, `btime`, `intr`, …) while a `/proc/<pid>/stat` line
+/// begins with the numeric pid.
+///
+/// The `comm` field (2nd) is the process name IN PARENTHESES and may itself
+/// contain spaces and parentheses, so fields are taken from after the LAST `)` —
+/// the standard way to parse this file. A naive whitespace split silently reads
+/// the wrong field for a process whose name contains a space.
+fn parse_proc_starttimes(stdout: &str) -> (Option<i64>, HashMap<i32, u64>) {
+    let mut btime = None;
+    let mut starts: HashMap<i32, u64> = HashMap::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("btime ") {
+            btime = rest.trim().parse::<i64>().ok();
+            continue;
+        }
+        let Some(pid) = line.split_whitespace().next().and_then(|t| t.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Some(close) = line.rfind(')') else { continue };
+        // After `) ` the fields are 3.. of the file, so `starttime` (field 22)
+        // is index 19 here.
+        if let Some(ticks) = line[close + 1..]
+            .split_whitespace()
+            .nth(19)
+            .and_then(|t| t.parse::<u64>().ok())
+        {
+            starts.insert(pid, ticks);
+        }
+    }
+    (btime, starts)
+}
+
+/// The EXACT, poll-independent start time of a process: boot time plus its
+/// `starttime` ticks. Depends on nothing that changes between polls, so it is
+/// stable by construction rather than by rounding.
+fn start_epoch_from_proc(btime: i64, ticks: u64) -> i64 {
+    btime.saturating_add((ticks / PROC_USER_HZ) as i64)
+}
+
 fn started_at_from_etimes(now: DateTime<Utc>, etimes: i64) -> DateTime<Utc> {
     // `with_nanosecond(0)` only returns None for an out-of-range value, which 0
     // never is; the fallback keeps this total rather than panicking.
     let whole_second_now = now.with_nanosecond(0).unwrap_or(now);
-    whole_second_now - Duration::seconds(etimes)
+    // TOTAL for any i64 (gpt56 review): `Duration::seconds` PANICS outside its
+    // range and `-` PANICS on date overflow. `etimes` is parsed from `ps`
+    // output, so a hostile or corrupt line must degrade, never abort the whole
+    // listing. A nonsensical value falls back to `now` — visibly wrong for that
+    // one session rather than fatal for every session on the host.
+    Duration::try_seconds(etimes)
+        .and_then(|d| whole_second_now.checked_sub_signed(d))
+        .unwrap_or(whole_second_now)
 }
 
 fn max_sessions() -> usize {
@@ -359,6 +426,32 @@ pub(crate) async fn discover(
     // were live, simply because they sorted beyond the cap — a filter that
     // silently hides matches is worse than no filter.
 
+    // ---- 1b. EXACT process start times (optional, TERM #605) --------------
+    // `ps -o etimes=` is whole-second ELAPSED time, so a start time derived from
+    // it is a function of WHEN THE POLL RAN and wobbles by up to a second for an
+    // unchanged process. `/proc/<pid>/stat`'s `starttime` plus `/proc/stat`'s
+    // `btime` is the process's OWN start, identical on every pass — the value
+    // consumers can safely diff (HARM #445).
+    //
+    // ONE batched `cat` for every candidate, not one probe per pid: this runs on
+    // every listing, including over ssh. A failure here is NOT fatal — it falls
+    // back to the etimes derivation, whose residual is documented on
+    // `started_at_from_etimes`.
+    let (boot_time, proc_starts) = {
+        let mut paths: Vec<String> = vec!["/proc/stat".to_string()];
+        paths.extend(candidates.iter().map(|(r, _)| format!("/proc/{}/stat", r.pid)));
+        let mut argv: Vec<&str> = vec!["cat"];
+        argv.extend(paths.iter().map(String::as_str));
+        match exec.run(&argv).await {
+            // `cat` exits non-zero when ANY file is missing (a process that
+            // exited between the two probes — routine), while still printing the
+            // rest. So the OUTPUT is used regardless of the exit status; only a
+            // hard exec failure gives up.
+            Ok(o) => parse_proc_starttimes(&o.stdout),
+            Err(_) => (None, HashMap::new()),
+        }
+    };
+
     // ---- 2. tmux panes (optional) ----------------------------------------
     let panes = match exec
         .run(&[
@@ -500,8 +593,17 @@ pub(crate) async fn discover(
             cwd,
             repo,
             attachment,
-            // TERM #605: whole-second resolution — see `started_at_from_etimes`.
-            started_at: Some(started_at_from_etimes(now, row.etimes)),
+            // TERM #605: an EXACT, poll-independent start time when /proc gave
+            // us one; otherwise the whole-second etimes derivation (see
+            // `started_at_from_etimes` for that path's stated residual).
+            started_at: Some(
+                boot_time
+                    .zip(proc_starts.get(&row.pid).copied())
+                    .and_then(|(b, ticks)| {
+                        chrono::DateTime::from_timestamp(start_epoch_from_proc(b, ticks), 0)
+                    })
+                    .unwrap_or_else(|| started_at_from_etimes(now, row.etimes)),
+            ),
             last_activity_at: transcript.as_ref().and_then(|t| {
                 chrono::DateTime::from_timestamp(t.2, 0).map(|d| {
                     // Clock skew must never surface as a negative age.
@@ -705,6 +807,77 @@ mod tests {
             );
             // And it is still the CORRECT second, not merely a round one.
             assert_eq!(started.timestamp(), now.timestamp() - 42);
+        }
+    }
+
+    /// The STABLE path (gpt56 review): the exact start time comes from the
+    /// process's own `/proc` record, so it is not a function of when the poll
+    /// ran at all. Parsing must survive a `comm` containing spaces AND
+    /// parentheses — a naive whitespace split silently reads the wrong field.
+    #[test]
+    fn proc_starttime_parsing_survives_a_hostile_comm_and_yields_a_stable_epoch() {
+        let sample = "\
+cpu  1 2 3 4
+btime 1700000000
+intr 99 1 2
+1402 (claude --dangerously) S 1 1402 1402 0 -1 4194304 1 2 3 4 5 6 7 8 20 0 1 0 360000 1 2 3
+2100 (weird (name) here) S 1 2100 2100 0 -1 4194304 1 2 3 4 5 6 7 8 20 0 1 0 720050 1 2 3
+";
+        let (btime, starts) = parse_proc_starttimes(sample);
+        assert_eq!(btime, Some(1_700_000_000));
+        assert_eq!(starts.get(&1402).copied(), Some(360_000));
+        assert_eq!(
+            starts.get(&2100).copied(),
+            Some(720_050),
+            "a comm with spaces and nested parens must not shift the field index"
+        );
+
+        // 360000 ticks / 100 Hz = 3600s after boot.
+        assert_eq!(
+            start_epoch_from_proc(btime.unwrap(), starts[&1402]),
+            1_700_003_600
+        );
+        // Poll-independent by construction: the same inputs on any later pass
+        // give the same answer, because `now` is not an input.
+        assert_eq!(
+            start_epoch_from_proc(btime.unwrap(), starts[&1402]),
+            start_epoch_from_proc(btime.unwrap(), starts[&1402])
+        );
+    }
+
+    /// The documented residual of the FALLBACK, pinned rather than hidden:
+    /// truncation bounds the wobble at one second, it does not remove it. A
+    /// process whose true start has a fractional part still alternates between
+    /// two adjacent seconds — which is exactly why `/proc` is the primary path.
+    #[test]
+    fn the_etimes_fallback_is_bounded_at_one_second_not_stable() {
+        // True start at t=100.4; etimes = floor(now - 100.4).
+        let base = "2026-08-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let start_frac_ms = 100_400i64;
+        let mut seen = std::collections::BTreeSet::new();
+        for poll_ms in [200_100i64, 200_600, 201_100, 201_600, 202_100] {
+            let now = base + Duration::milliseconds(poll_ms);
+            let etimes = (poll_ms - start_frac_ms) / 1000; // floor, as ps does
+            seen.insert(started_at_from_etimes(now, etimes));
+        }
+        assert!(
+            seen.len() > 1,
+            "if this ever becomes stable the doc comment is wrong and should be corrected"
+        );
+        let spread = *seen.iter().next_back().unwrap() - *seen.iter().next().unwrap();
+        assert!(
+            spread <= Duration::seconds(1),
+            "the fallback's wobble must stay bounded at one second, got {spread}"
+        );
+    }
+
+    /// The fallback must be TOTAL: a corrupt or hostile `etimes` degrades that
+    /// one session, never aborts the whole host listing (gpt56 review).
+    #[test]
+    fn the_etimes_fallback_never_panics_on_an_absurd_value() {
+        let now = "2026-08-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for etimes in [i64::MAX, i64::MIN, -1, 0] {
+            let _ = started_at_from_etimes(now, etimes);
         }
     }
 
