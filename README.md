@@ -590,6 +590,40 @@ There is deliberately no path by which a client scoping record grants a tool the
 own grant would have denied. A client with no scoping record reaches the **empty set**, not
 the account's full grant; a tool-group pattern matching nothing is empty, not a wildcard.
 
+**One function decides it, for both `tools/list` and `tools/call`.** `oauth::scope::decide`
+is the whole decision; the catalog filter is a `filter` over it and the call gate calls it
+directly. Filtering the catalog without gating the call is a disclosure bug, gating the call
+without filtering the catalog leaks what exists — two *similar* functions is how those drift
+apart, so there is only one. A property test asserts `effective ⊆ account grant` over
+generated grants, pattern sets, namespace sets and catalogs.
+
+Every denial is audited with a machine-readable reason, so a misconfiguration is diagnosable
+without guesswork:
+
+| reason | meaning |
+|---|---|
+| `denied_by_grant` | the **account's own** grant refuses the tool; no connector scoping can widen past it |
+| `no_namespace` | the tool belongs to a federated server this connector is not scoped to |
+| `no_group` | no tool group attached to this connector matches the name |
+| `no_account_grant` | the process has no gateway configured, so there is no account grant to intersect with — a configuration fault, denied rather than permitted |
+
+**Revocation takes effect immediately, including mid-resolution.** Resolved scopes are
+cached, so the store's own narrowing writes — regrouping, re-scoping, disabling a client,
+and reassigning or clearing a namespace delegation — bump a process-wide *generation*
+counter from **inside the store**, not from a wrapper a caller has to remember to use. A
+resolution may only populate the cache at the generation it began at, so a read that started
+before a revocation cannot repopulate a stale permit after it. A short TTL remains only as a
+backstop for an out-of-process edit (an operator changing the tables by hand); it is not what
+makes revocation correct. The distinction matters because a stale *denial* costs someone a
+retry, while a stale *permit* is revoked authority that still works.
+
+Pattern syntax inside a tool group is deliberately tiny — an exact tool name, a trailing-`*`
+prefix, or `<namespace>::*` — with no regex (a regex authored by a delegated federation owner
+is a denial-of-service on the dispatch path) and no negation (denial already has a layer,
+which composes on top and overrides unconditionally). Prefixes match the **advertised** name,
+so `a*` cannot reach `somepeer__anything`; the namespace forms are what address federated
+tools.
+
 **"Only I can link my account" is enforced at consent, not at registration.** Possession of
 a `client_id` gets a caller as far as a login screen. Issuing a token needs an argon2id
 password sign-in *and* an explicit approval of a named client and a named capability set. A
@@ -725,6 +759,17 @@ schema lives in `migrations/S132-rmcp01-oauth-core.sql` and
 `migrations/S132-rmcp03-login-session.sql` and is **not** applied at startup: apply it via
 `pg_ddl` as part of the deploy. Until it is, the store reports the door unconfigured rather
 than serving a silently dead auth surface.
+
+**The scoping intersection is wired but not yet reachable.** It is applied at both
+enforcement points in `mcp_server` and enforced by `gateway_framework`, but it engages only
+for a request carrying a resolved connector scope in its extensions — and nothing inserts
+that yet. RMCP-05's resource-server validation is what turns a verified access token into
+one. Until it lands, **every request takes the non-OAuth path and the connector scoping is
+inert**: it is not silently permitting anything (there is no OAuth request for it to permit),
+but neither is it an active control, and it should not be described to anyone as one. Absence
+of a connector scope means "this request did not come through the OAuth door", which is a
+statement about the *transport*; it is never read as "an unscoped connector", which is a
+statement about *data* and always resolves to the empty set.
 
 **Not yet complete.** An account with a TOTP second factor is currently **refused** at
 sign-in rather than admitted on its password alone: the stored seed is encrypted with a

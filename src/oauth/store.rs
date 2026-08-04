@@ -308,17 +308,28 @@ impl OauthStore {
         client_id: Uuid,
         disabled: bool,
     ) -> Result<(), ToolError> {
-        sqlx::query("UPDATE rmcp_client SET disabled = $2 WHERE id = $1")
+        let result = sqlx::query("UPDATE rmcp_client SET disabled = $2 WHERE id = $1")
             .bind(client_id)
             .bind(disabled)
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(db)
+            .map_err(db);
+        // Disabling is the fastest revocation an operator has; it must not wait
+        // out a resolver's cache TTL. See `bump_scope_generation`.
+        crate::oauth::scope::bump_scope_generation();
+        result
     }
 
     // -----------------------------------------------------------------------
     // Tool groups and client scoping
+    //
+    // INVARIANT for anything added below: every write that can NARROW what a
+    // connector reaches must call `crate::oauth::scope::bump_scope_generation()`
+    // before returning. That call — not any caller's discipline — is what
+    // invalidates RMCP-07's resolution cache, including resolutions already in
+    // flight. Omitting it on a new write leaves a revoked permission usable and
+    // nothing in the system will report it. See that function's docs.
     // -----------------------------------------------------------------------
 
     /// Insert a tool group. An empty `patterns` slice is permitted and stores a
@@ -515,7 +526,13 @@ impl OauthStore {
             .await
             .map_err(db)?;
         }
-        tx.commit().await.map_err(db)
+        let committed = tx.commit().await.map_err(db);
+        // Bumped on the ERROR path too: a commit that failed to report is not a
+        // commit that provably did not happen, and an unnecessary invalidation
+        // costs one store read while a missed one leaves a revoked permission
+        // live. See `crate::oauth::scope::bump_scope_generation`.
+        crate::oauth::scope::bump_scope_generation();
+        committed
     }
 
     /// Replace a client's namespace assignments wholesale, after verifying that
@@ -589,7 +606,13 @@ impl OauthStore {
             .await
             .map_err(db)?;
         }
-        tx.commit().await.map_err(db)
+        let committed = tx.commit().await.map_err(db);
+        // Bumped on the ERROR path too: a commit that failed to report is not a
+        // commit that provably did not happen, and an unnecessary invalidation
+        // costs one store read while a missed one leaves a revoked permission
+        // live. See `crate::oauth::scope::bump_scope_generation`.
+        crate::oauth::scope::bump_scope_generation();
+        committed
     }
 
     // -----------------------------------------------------------------------
@@ -1129,7 +1152,7 @@ impl OauthStore {
         namespace: &str,
         owner_account_id: Uuid,
     ) -> Result<(), ToolError> {
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO rmcp_server_owner (namespace, owner_account_id) VALUES ($1, $2) \
              ON CONFLICT (namespace) DO UPDATE SET owner_account_id = EXCLUDED.owner_account_id, \
                                                    granted_at = now()",
@@ -1139,7 +1162,12 @@ impl OauthStore {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(db)
+        .map_err(db);
+        // A delegation change narrows an arbitrary number of clients at once —
+        // `client_namespaces` re-joins ownership, so reassigning a namespace
+        // silently strips it from every client the previous owner scoped to it.
+        crate::oauth::scope::bump_scope_generation();
+        result
     }
 
     /// The namespaces an account owns. Empty for an account that owns none —
@@ -1175,12 +1203,16 @@ impl OauthStore {
 
     /// Remove a delegation.
     pub async fn clear_server_owner(&self, namespace: &str) -> Result<(), ToolError> {
-        sqlx::query("DELETE FROM rmcp_server_owner WHERE namespace = $1")
+        let result = sqlx::query("DELETE FROM rmcp_server_owner WHERE namespace = $1")
             .bind(namespace)
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(db)
+            .map_err(db);
+        // The most narrowing write in the schema: clearing a delegation removes
+        // that whole federated server from every client scoped to it.
+        crate::oauth::scope::bump_scope_generation();
+        result
     }
 }
 

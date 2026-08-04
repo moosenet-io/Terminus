@@ -1705,11 +1705,18 @@ async fn handle_mcp(
                     Some(gateway) => gateway
                         .guard_client_scope(binding.principal(), Some(scope), name)
                         .err(),
-                    None => Some(
-                        "rmcp connector scope denied: no gateway is configured, so there is no \
-                         account grant to intersect this connector's scope with"
-                            .to_string(),
-                    ),
+                    // No gateway means no account grant to intersect with, so
+                    // there is no safe answer but the empty one. Round 1
+                    // finding 3: this used to deny WITHOUT an audit record,
+                    // which made a real denial undiagnosable. It now emits the
+                    // same record as every other connector-scope denial, with
+                    // its own reason code.
+                    None => Some(crate::gateway_framework::audit_client_scope_denial(
+                        principal.as_ref(),
+                        scope,
+                        name,
+                        crate::oauth::scope::DENY_NO_ACCOUNT_GRANT,
+                    )),
                 };
                 if let Some(denial_text) = denial_text {
                     return sse_response(

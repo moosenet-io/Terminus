@@ -61,6 +61,7 @@
 //! pattern at write time so it never reaches storage; this is the second layer.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -478,8 +479,90 @@ pub const DEFAULT_CACHE_TTL_SECS: u64 = 15;
 /// endless stream of unknown `client_id`s cannot grow this map without limit.
 const MAX_CACHED_CLIENTS: usize = 1024;
 
+/// Audit reason for a denial [`decide`] can never produce: the process has no
+/// gateway, so there is no account grant to intersect a connector scope with.
+///
+/// Part of the audit vocabulary rather than a [`DenyReason`] variant precisely
+/// because it is NOT an outcome of the decision — it is the absence of one of
+/// the decision's inputs. Making it a `DenyReason` would imply `decide` could
+/// return it, and the next reader would go looking for the branch that does.
+pub const DENY_NO_ACCOUNT_GRANT: &str = "no_account_grant";
+
+// ---------------------------------------------------------------------------
+// The scope generation — the invalidation epoch
+// ---------------------------------------------------------------------------
+
+/// Monotone counter bumped by EVERY write that can narrow what some connector
+/// reaches.
+///
+/// ## Why this is process-global rather than owned by a resolver
+/// Round 1 of review (gpt56, HIGH) found that invalidation hung off
+/// [`ScopeResolver`]'s own write-through mutators, so a write made directly
+/// against [`crate::oauth::store::OauthStore`] — or an ownership/delegation
+/// change, which narrows an arbitrary number of clients at once — left a
+/// PERMITTING scope cached until the TTL expired. The finding is correct and
+/// the distinction it rests on is the important part: a stale DENIAL costs
+/// someone a retry, but a stale PERMIT is revoked authority that still works.
+/// A TTL is an acceptable backstop for the first and not for the second.
+///
+/// The fix is to stop making invalidation depend on the caller choosing the
+/// polite door. The counter lives here, next to the cache that reads it, and
+/// the STORE bumps it from inside its own write methods — so any code path
+/// that can narrow authority invalidates by construction, whether or not it
+/// went through a resolver.
+///
+/// Process-global is the right scope: it is monotone, a spurious bump costs
+/// only a re-read, and two resolvers in one process sharing one epoch is
+/// strictly safer than each keeping its own.
+///
+/// ## The obligation this places on future items
+/// **Any new write that can narrow what a client reaches must bump this.**
+/// RMCP-06 editing a group's patterns and RMCP-12 changing a delegation are
+/// both such writes. Adding one without a bump reintroduces exactly the defect
+/// this counter exists to close, and nothing will report it.
+///
+/// The one thing it cannot see is an out-of-process write (an operator editing
+/// the tables by hand). That is what the short TTL backstop remains for, and
+/// it is the only residual — stated plainly rather than left implied.
+static SCOPE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The current invalidation epoch.
+///
+/// `SeqCst` throughout. The cheaper orderings would be sufficient for a plain
+/// monotone counter, but the property being protected is an authorization
+/// invariant and the counter is read at most once per cache miss — this is not
+/// a hot path worth shaving, and a total order is the version of this that is
+/// obviously correct rather than the version that needs an argument.
+pub fn scope_generation() -> u64 {
+    SCOPE_GENERATION.load(Ordering::SeqCst)
+}
+
+/// Advance the epoch, invalidating every cached scope and — crucially — every
+/// resolution ALREADY IN FLIGHT that read an earlier value.
+///
+/// That second half is the whole point, and is what round 1 finding 2 was
+/// about: invalidating a map only AFTER an awaited write loses to a resolve
+/// that STARTED before the write. That resolve read the old rows, and it
+/// repopulates the cache after the invalidation has already run — reinserting
+/// the stale permit for a full TTL, with nothing in the system reporting
+/// anything wrong. A comment observing that the window is small would not be a
+/// fix: the window is exactly the moment a revocation is happening, which is
+/// the only moment that matters.
+///
+/// With an epoch, a resolve that began at generation *g* may only populate the
+/// cache AT generation *g*, and an entry is served only while its generation is
+/// current. A bump anywhere in between makes the in-flight result unusable
+/// rather than authoritative. The cost of losing the race is one extra store
+/// read; the cost of winning it the old way was a live revoked permission.
+pub fn bump_scope_generation() -> u64 {
+    SCOPE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
 struct CacheEntry {
     inserted: Instant,
+    /// The epoch this entry was resolved at. An entry whose generation is no
+    /// longer current is never served, however fresh its timestamp.
+    generation: u64,
     scope: Arc<ClientScope>,
 }
 
@@ -493,17 +576,47 @@ struct CacheEntry {
 struct ScopeCache {
     entries: RwLock<HashMap<String, CacheEntry>>,
     ttl: Duration,
+    /// The epoch this cache is keyed against.
+    ///
+    /// A `&'static AtomicU64` rather than a direct reference to
+    /// [`SCOPE_GENERATION`] for one reason: it lets a test give a cache its OWN
+    /// counter. The generation tests assert exact epoch transitions, and on the
+    /// process-global counter they would race every other test that performs a
+    /// scoping write — a guard against a race must not itself be racy.
+    generation: &'static AtomicU64,
 }
 
 impl ScopeCache {
+    /// A cache keyed against the process-global epoch — the only form used
+    /// outside tests.
     fn new(ttl: Duration) -> Self {
+        Self::with_counter(ttl, &SCOPE_GENERATION)
+    }
+
+    fn with_counter(ttl: Duration, generation: &'static AtomicU64) -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
             ttl,
+            generation,
         }
     }
 
-    /// A live entry, or `None` when absent or expired.
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    fn bump(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// A live entry, or `None` when absent, expired, or resolved at a
+    /// superseded epoch.
+    ///
+    /// The generation check is the guarantee, and it is deliberately on the
+    /// READ side: an entry that was inserted before a bump — or that raced a
+    /// bump and slipped past the write-side check below — is still never
+    /// served. Removing this check is what the
+    /// `a_stale_generation_entry_is_never_served` test exists to catch.
     ///
     /// A poisoned lock reads as a MISS rather than as an error: the caller then
     /// re-reads the store and gets the current answer, which is the safe
@@ -511,13 +624,31 @@ impl ScopeCache {
     fn get(&self, client_id: &str) -> Option<Arc<ClientScope>> {
         let entries = self.entries.read().ok()?;
         let entry = entries.get(client_id)?;
+        if entry.generation != self.generation() {
+            return None;
+        }
         if entry.inserted.elapsed() >= self.ttl {
             return None;
         }
         Some(Arc::clone(&entry.scope))
     }
 
-    fn put(&self, client_id: &str, scope: Arc<ClientScope>) {
+    /// Cache a scope that was resolved starting at `observed_generation`.
+    ///
+    /// Refuses to insert when the epoch has moved on since the resolve began —
+    /// the in-flight-resolve half of finding 2. This is the second layer, not
+    /// the guarantee: even if an entry does land at a superseded generation,
+    /// [`Self::get`] will not serve it.
+    fn put_at(&self, client_id: &str, scope: Arc<ClientScope>, observed_generation: u64) {
+        if self.generation() != observed_generation {
+            // A narrowing write landed while this resolve was reading. What it
+            // read may already be revoked, so it is dropped rather than cached.
+            return;
+        }
+        self.insert(client_id, scope, observed_generation);
+    }
+
+    fn insert(&self, client_id: &str, scope: Arc<ClientScope>, generation: u64) {
         let Ok(mut entries) = self.entries.write() else {
             // A poisoned lock means some thread panicked mid-update. Losing the
             // cache is a latency problem; guessing at its contents would be a
@@ -539,18 +670,30 @@ impl ScopeCache {
             client_id.to_string(),
             CacheEntry {
                 inserted: Instant::now(),
+                generation,
                 scope,
             },
         );
     }
 
+    /// Drop one client's entry AND advance the epoch.
+    ///
+    /// The epoch bump is what makes this race-safe, so the two are one
+    /// operation and there is no way to do the map removal without it. Bumping
+    /// globally for a single-client removal is deliberately conservative: it
+    /// costs other clients one store read each and removes any need to reason
+    /// about whether a given write could have affected a different client than
+    /// the one named — which, for an ownership change, it very much can.
     fn remove(&self, client_id: &str) {
+        self.bump();
         if let Ok(mut entries) = self.entries.write() {
             entries.remove(client_id);
         }
     }
 
+    /// Drop every entry AND advance the epoch.
     fn clear(&self) {
+        self.bump();
         if let Ok(mut entries) = self.entries.write() {
             entries.clear();
         }
@@ -559,6 +702,14 @@ impl ScopeCache {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.read().map(|e| e.len()).unwrap_or(0)
+    }
+
+    /// Insert bypassing the write-side generation check, to construct the state
+    /// that would exist if that check were absent. Lets the read-side guarantee
+    /// be tested on its own.
+    #[cfg(test)]
+    fn force_insert_at(&self, client_id: &str, scope: Arc<ClientScope>, generation: u64) {
+        self.insert(client_id, scope, generation);
     }
 }
 
@@ -588,12 +739,18 @@ impl ScopeCache {
 ///   that narrows after a token was issued takes effect on the next call.
 ///
 /// ## Invalidation
-/// Every scoping write goes through this type ([`Self::set_client_tool_groups`],
-/// [`Self::set_client_namespaces`], [`Self::set_client_disabled`]) and drops the
-/// affected entry before returning, so a narrowing edit is effective for the
-/// next request rather than up to a TTL later. A widening edit is subject to the
-/// same invalidation but would have been safe to delay; the ordering exists for
-/// the narrowing case, which is the one where lateness is a security bug.
+/// Invalidation is driven by the EPOCH ([`SCOPE_GENERATION`]), which the store
+/// bumps from inside its own narrowing writes. It therefore does not depend on
+/// a caller choosing to go through this type: a direct
+/// [`crate::oauth::store::OauthStore`] write, and an ownership or delegation
+/// change that narrows many clients at once, both invalidate by construction.
+/// Round 1 of review found the earlier design — invalidation coupled to this
+/// type's own mutators — left a stale PERMIT live until the TTL expired, which
+/// is revoked authority that still works.
+///
+/// The mutators below remain as conveniences that keep a write and its
+/// invalidation in one call, but they are no longer what makes invalidation
+/// correct, and nothing depends on a caller using them.
 ///
 /// A failed store read is NEVER cached: it resolves to the empty scope for that
 /// one request, so a transient database blip denies rather than poisoning the
@@ -630,6 +787,15 @@ impl ScopeResolver {
             return hit;
         }
 
+        // Read the epoch BEFORE the store round trip, never after. This value
+        // is what the result is allowed to be cached AT, so a narrowing write
+        // that lands while the load below is in flight makes the result
+        // uncacheable rather than authoritative. Reading it afterwards would
+        // reintroduce finding 2 exactly.
+        // Read through the CACHE's own counter, so the resolver and the cache
+        // can never end up reasoning about two different epochs.
+        let observed_generation = self.cache.generation();
+
         let scope = match self.load(client_id).await {
             Ok(scope) => Arc::new(scope),
             Err(err) => {
@@ -644,7 +810,8 @@ impl ScopeResolver {
             }
         };
 
-        self.cache.put(client_id, Arc::clone(&scope));
+        self.cache
+            .put_at(client_id, Arc::clone(&scope), observed_generation);
         scope
     }
 
@@ -680,12 +847,13 @@ impl ScopeResolver {
         self.cache.clear();
     }
 
-    /// Replace a client's tool groups, then invalidate.
+    /// Replace a client's tool groups.
     ///
-    /// Write-through rather than "remember to call `invalidate` afterwards":
-    /// the invalidation is the security-relevant half and a caller that forgets
-    /// it leaves a permission live that an operator believes they revoked.
-    /// Ownership enforcement lives in the store, inside the write transaction.
+    /// A convenience that keeps a write and its cache drop in one call. The
+    /// store bumps the epoch itself, so a caller that skips this method and
+    /// goes straight to the store is equally safe — that is the point of
+    /// finding 1's fix. Ownership enforcement lives in the store, inside the
+    /// write transaction.
     pub async fn set_client_tool_groups(
         &self,
         actor_account_id: Uuid,
@@ -704,8 +872,7 @@ impl ScopeResolver {
         result
     }
 
-    /// Replace a client's namespaces, then invalidate. See
-    /// [`Self::set_client_tool_groups`] for why this is write-through.
+    /// Replace a client's namespaces. See [`Self::set_client_tool_groups`].
     pub async fn set_client_namespaces(
         &self,
         actor_account_id: Uuid,
@@ -1137,14 +1304,29 @@ mod tests {
 
     // -- the cache ----------------------------------------------------------
 
+    /// A cache with its OWN epoch counter, so a generation test asserts exact
+    /// transitions without racing every other test in the binary that performs
+    /// a scoping write. Leaking one counter per test is a few bytes and buys a
+    /// guard against a race that is not itself racy.
+    fn isolated_cache(ttl: Duration) -> ScopeCache {
+        let counter: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
+        ScopeCache::with_counter(ttl, counter)
+    }
+
+    /// Cache a scope the way a resolve that started just now would.
+    fn put_now(cache: &ScopeCache, client_id: &str, scope: Arc<ClientScope>) {
+        let observed = cache.generation();
+        cache.put_at(client_id, scope, observed);
+    }
+
     /// The acceptance criterion "scoping writes invalidate cached decisions
     /// immediately", asserted on the mechanism itself: after an invalidation
     /// the old permission does not survive, so the next resolution re-reads.
     #[test]
     fn an_invalidation_drops_the_old_permission_immediately() {
-        let cache = ScopeCache::new(Duration::from_secs(3600));
+        let cache = isolated_cache(Duration::from_secs(3600));
         let permissive = Arc::new(scope(&["*"], &["peerone"]));
-        cache.put("cid", Arc::clone(&permissive));
+        put_now(&cache, "cid", Arc::clone(&permissive));
         assert!(
             cache.get("cid").is_some_and(|s| !s.is_empty()),
             "the permissive scope is cached"
@@ -1158,17 +1340,123 @@ mod tests {
         );
 
         // And the narrowed scope is what is served next.
-        cache.put("cid", Arc::new(ClientScope::empty("cid")));
+        put_now(&cache, "cid", Arc::new(ClientScope::empty("cid")));
         assert!(cache.get("cid").is_some_and(|s| s.is_empty()));
+    }
+
+    /// **Round 1 finding 2 — the race.** A resolve that STARTED before an
+    /// invalidation must not be able to repopulate the cache after it.
+    ///
+    /// The old design invalidated only after the awaited write, so this
+    /// interleaving reinserted the stale PERMIT and it lived for a full TTL
+    /// with nothing reporting anything wrong. Remove the generation check in
+    /// `put_at` and this test fails: the permitting scope becomes visible
+    /// again after the revocation.
+    #[test]
+    fn a_resolve_that_started_before_an_invalidation_cannot_populate() {
+        let cache = isolated_cache(Duration::from_secs(3600));
+        let permitting = Arc::new(scope(&["*"], &["peerone"]));
+
+        // T0: a resolve begins and reads the epoch, then blocks on the store.
+        let observed = cache.generation();
+
+        // T1: a narrowing write lands and invalidates while that load is in
+        // flight — the exact moment a revocation is happening.
+        cache.remove("cid");
+
+        // T2: the in-flight resolve returns with rows read BEFORE the write and
+        // tries to cache them.
+        cache.put_at("cid", Arc::clone(&permitting), observed);
+
+        assert!(
+            cache.get("cid").is_none(),
+            "a scope resolved before a revocation must never become cached after it"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "and it must not even be inserted — the epoch moved on while it was loading"
+        );
+
+        // A resolve that starts AFTER the write caches normally, so the fix
+        // closes the race without disabling the cache.
+        let fresh = cache.generation();
+        cache.put_at("cid", Arc::clone(&permitting), fresh);
+        assert!(cache.get("cid").is_some(), "a post-write resolve still caches");
+    }
+
+    /// The read-side half of the same guarantee, tested on its own: even if an
+    /// entry DID land at a superseded epoch (i.e. if `put_at`'s check were
+    /// removed), it is still never served. Remove the generation check in `get`
+    /// and this test fails.
+    #[test]
+    fn a_stale_generation_entry_is_never_served() {
+        let cache = isolated_cache(Duration::from_secs(3600));
+        let permitting = Arc::new(scope(&["*"], &["peerone"]));
+        let stale_generation = cache.generation();
+
+        // A narrowing write moves the epoch on.
+        cache.bump();
+
+        // Simulate the entry having been inserted anyway, at the old epoch.
+        cache.force_insert_at("cid", permitting, stale_generation);
+        assert_eq!(cache.len(), 1, "the entry is physically present");
+        assert!(
+            cache.get("cid").is_none(),
+            "an entry from a superseded epoch must never be served, however fresh its timestamp"
+        );
+    }
+
+    /// **Round 1 finding 1 — invalidation must not depend on the polite door.**
+    ///
+    /// A production cache is keyed against the process-global epoch, which the
+    /// STORE bumps from inside its own narrowing writes. So a write made
+    /// directly against `OauthStore` — bypassing `ScopeResolver` entirely —
+    /// still invalidates. This asserts that coupling: the same call the store
+    /// makes drops a cached permit from a default cache.
+    ///
+    /// Only the invalidation DIRECTION is asserted, never "it is still cached",
+    /// because the global counter is shared with the rest of the test binary
+    /// and only ever climbs — so a concurrent bump can make this test's
+    /// assertion more true, never less.
+    #[test]
+    fn a_store_side_bump_invalidates_a_default_cache() {
+        let cache = ScopeCache::new(Duration::from_secs(3600));
+        let permitting = Arc::new(scope(&["*"], &["peerone"]));
+        put_now(&cache, "cid", permitting);
+
+        // Exactly what `OauthStore::set_client_namespaces` and friends call.
+        bump_scope_generation();
+
+        assert!(
+            cache.get("cid").is_none(),
+            "a store write must invalidate without anyone calling the resolver's mutators"
+        );
+    }
+
+    /// The epoch only ever moves forward, and every invalidation moves it.
+    /// A counter that could repeat a value would let a stale entry become
+    /// current again.
+    #[test]
+    fn the_epoch_is_monotone_and_every_invalidation_advances_it() {
+        let cache = isolated_cache(Duration::from_secs(3600));
+        let before = cache.generation();
+        cache.remove("cid");
+        let after_remove = cache.generation();
+        assert!(after_remove > before, "a per-client drop advances the epoch");
+        cache.clear();
+        let after_clear = cache.generation();
+        assert!(after_clear > after_remove, "a whole-cache drop advances the epoch");
+        assert_eq!(cache.bump(), after_clear + 1, "and the counter only ever climbs");
     }
 
     /// A namespace delegation change can narrow many clients at once, so the
     /// whole-cache drop must actually drop everything.
     #[test]
     fn invalidate_all_drops_every_client() {
-        let cache = ScopeCache::new(Duration::from_secs(3600));
+        let cache = isolated_cache(Duration::from_secs(3600));
         for cid in ["a", "b", "c"] {
-            cache.put(cid, Arc::new(scope(&["*"], &["peerone"])));
+            put_now(&cache, cid, Arc::new(scope(&["*"], &["peerone"])));
         }
         assert_eq!(cache.len(), 3);
         cache.clear();
@@ -1182,8 +1470,8 @@ mod tests {
     /// still physically present.
     #[test]
     fn an_expired_entry_is_not_served() {
-        let cache = ScopeCache::new(Duration::ZERO);
-        cache.put("cid", Arc::new(scope(&["*"], &[])));
+        let cache = isolated_cache(Duration::ZERO);
+        put_now(&cache, "cid", Arc::new(scope(&["*"], &[])));
         assert!(
             cache.get("cid").is_none(),
             "a zero TTL means never serve from cache"
@@ -1195,9 +1483,9 @@ mod tests {
     /// bound — an unauthenticated caller can choose the key.
     #[test]
     fn the_cache_is_bounded() {
-        let cache = ScopeCache::new(Duration::from_secs(3600));
+        let cache = isolated_cache(Duration::from_secs(3600));
         for i in 0..(MAX_CACHED_CLIENTS * 2) {
-            cache.put(&format!("cid-{i}"), Arc::new(ClientScope::empty("x")));
+            put_now(&cache, &format!("cid-{i}"), Arc::new(ClientScope::empty("x")));
         }
         assert!(
             cache.len() <= MAX_CACHED_CLIENTS,
@@ -1211,7 +1499,7 @@ mod tests {
     /// `ScopeResolver::resolve`). Asserted here for the cache half.
     #[test]
     fn a_cache_miss_is_not_a_permit() {
-        let cache = ScopeCache::new(Duration::from_secs(3600));
+        let cache = isolated_cache(Duration::from_secs(3600));
         assert!(cache.get("never-inserted").is_none());
     }
 

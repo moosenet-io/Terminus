@@ -2025,43 +2025,10 @@ impl GatewayFramework {
             return Ok(());
         };
         let decision = crate::oauth::scope::decide(&self.account_grant(principal), scope, tool);
-        let Some(reason) = decision.deny_code() else {
-            return Ok(());
-        };
-
-        let identity = principal
-            .map(|p| p.name().to_string())
-            .unwrap_or_else(|| ANONYMOUS_IDENTITY.to_string());
-        // The reason code and the client_id are the whole point: an operator
-        // diagnosing "why can my connector not see this" needs to know WHICH
-        // dimension refused, without guessing. Neither value is a secret — a
-        // `client_id` is pasted into a connector form by hand.
-        let detail = format!(
-            "rmcp connector scope denied: reason={reason} client_id={} tool={tool}",
-            scope.client_id()
-        );
-        match crate::mesh::split_namespaced(tool) {
-            Some((namespace, bare)) => AuditEntry::new_federated(
-                &identity,
-                Some(namespace.to_string()),
-                tool,
-                bare,
-                ActionKind::Tool,
-                AuditResult::DeniedNotAllowlisted,
-                AuditDecision::Deny,
-                Some(&detail),
-            )
-            .log(),
-            None => AuditEntry::new(
-                &identity,
-                tool,
-                ActionKind::Tool,
-                AuditResult::DeniedNotAllowlisted,
-                Some(&detail),
-            )
-            .log(),
+        match decision.deny_code() {
+            None => Ok(()),
+            Some(reason) => Err(audit_client_scope_denial(principal, scope, tool, reason)),
         }
-        Err(detail)
     }
 
     /// The `tools/list` half of the RMCP-07 intersection.
@@ -2096,6 +2063,62 @@ impl GatewayFramework {
             })
             .collect()
     }
+}
+
+/// Audit one connector-scope denial and return the caller-facing text.
+///
+/// A FREE function, not a method, and that is the point of round 1's finding 3:
+/// there is a denial path that has no [`GatewayFramework`] to call a method on
+/// — an OAuth-scoped request reaching a process with no gateway configured.
+/// That call used to be refused without any audit record at all, which broke
+/// the acceptance criterion that every denial is diagnosable without guesswork.
+/// Both paths now emit the SAME record through this one function, so a denial
+/// can never be silent because of where it happened to be decided.
+///
+/// `reason` is a code from [`crate::oauth::scope`] — the three [`DenyReason`]
+/// codes, or [`crate::oauth::scope::DENY_NO_ACCOUNT_GRANT`] for the
+/// gateway-less case.
+///
+/// [`DenyReason`]: crate::oauth::scope::DenyReason
+pub fn audit_client_scope_denial(
+    principal: Option<&Principal>,
+    scope: &ClientScope,
+    tool: &str,
+    reason: &str,
+) -> String {
+    let identity = principal
+        .map(|p| p.name().to_string())
+        .unwrap_or_else(|| ANONYMOUS_IDENTITY.to_string());
+    // The reason code and the client_id are the whole point: an operator
+    // diagnosing "why can my connector not see this" needs to know WHICH
+    // dimension refused, without guessing. Neither value is a secret — a
+    // `client_id` is pasted into a connector form by hand.
+    let detail = format!(
+        "rmcp connector scope denied: reason={reason} client_id={} tool={tool}",
+        scope.client_id()
+    );
+    match crate::mesh::split_namespaced(tool) {
+        Some((namespace, bare)) => AuditEntry::new_federated(
+            &identity,
+            Some(namespace.to_string()),
+            tool,
+            bare,
+            ActionKind::Tool,
+            AuditResult::DeniedNotAllowlisted,
+            AuditDecision::Deny,
+            Some(&detail),
+        )
+        .log(),
+        None => AuditEntry::new(
+            &identity,
+            tool,
+            ActionKind::Tool,
+            AuditResult::DeniedNotAllowlisted,
+            Some(&detail),
+        )
+        .log(),
+    }
+    detail
 }
 
 /// Adapter exposing the existing [`AllowlistPolicy`] decision as an
@@ -3168,6 +3191,55 @@ mod tests {
                 vec![tool_json("secrets_read")]
             )
             .is_empty());
+    }
+
+    /// Round 1 finding 3: the gateway-less denial path must produce the SAME
+    /// diagnosable record as every other connector-scope denial, rather than
+    /// refusing silently. `audit_client_scope_denial` is a free function
+    /// precisely so that path — which has no `GatewayFramework` to call a
+    /// method on — can reach it.
+    #[test]
+    fn every_connector_denial_carries_a_machine_readable_reason() {
+        let principal = test_principal("dev-box");
+        let scope = connector_scope(&["ledger_*"], &["peerone"]);
+
+        // The gateway-less case, with its own reason code.
+        let detail = audit_client_scope_denial(
+            Some(&principal),
+            &scope,
+            "ledger_accounts",
+            crate::oauth::scope::DENY_NO_ACCOUNT_GRANT,
+        );
+        assert!(detail.contains("reason=no_account_grant"), "{detail}");
+        assert!(detail.contains("client_id=a-connector-client-id"), "{detail}");
+        assert!(detail.contains("tool=ledger_accounts"), "{detail}");
+
+        // A federated name is attributed to its upstream and still carries the
+        // reason — the namespaced branch must not lose it.
+        let federated = audit_client_scope_denial(
+            Some(&principal),
+            &scope,
+            "peertwo__ledger_accounts",
+            crate::oauth::scope::DenyReason::NoNamespace.code(),
+        );
+        assert!(federated.contains("reason=no_namespace"), "{federated}");
+
+        // And with no principal at all it is attributed to the anonymous label
+        // rather than panicking or inventing an identity.
+        let anon = audit_client_scope_denial(
+            None,
+            &scope,
+            "ledger_accounts",
+            crate::oauth::scope::DenyReason::NoGroup.code(),
+        );
+        assert!(anon.contains("reason=no_group"), "{anon}");
+
+        // The guarded path returns the identical text, so the two cannot drift.
+        let fw = framework_with(policy_allowing("dev-box", &["*"]), 10);
+        let via_guard = fw
+            .guard_client_scope(Some(&principal), Some(&scope), "peertwo__ledger_accounts")
+            .expect_err("denied");
+        assert_eq!(via_guard, federated);
     }
 
     /// A namespace wildcard grant referencing a namespace with no live
