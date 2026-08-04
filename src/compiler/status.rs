@@ -12,8 +12,10 @@
 //!      `.deployed_sha` marker (what the constellation-updater wrote), read over the
 //!      EXISTING host-reach path (ssh, BatchMode, no new creds). An unreachable host
 //!      or missing marker degrades to `unknown` / `undeployed`, never an error.
-//!   3. **queue / in-flight** — the compiler job scheduler surface. Until the job
-//!      queue (BLD-06) lands these are empty lists (stable shape, not an error).
+//!   3. **queue / in-flight** — the durable BLD-06 job queue: what is waiting and
+//!      what is building, each in-flight claim carrying WHEN it becomes
+//!      reconcile-eligible (TERM #611). A queue that cannot be read is reported
+//!      as degraded with a note — `unknown`, never a confident `empty`.
 //!
 //! ## Output shape (matches what BLD-16's fleet API reads)
 //! `harmony-server/src/fleet.rs::parse_compiler_status` reads, all optional:
@@ -640,6 +642,64 @@ pub fn assemble_matrix(
     rows
 }
 
+
+/// What [`collect_queue_rows`] resolved: the rendered rows, whether the queue
+/// could be read at all, and the note explaining a miss.
+pub struct QueueRows {
+    pub queue: Vec<Value>,
+    pub in_flight: Vec<Value>,
+    pub degraded: bool,
+    pub note: Option<String>,
+}
+
+/// TERM #611 — read the durable BLD-06 queue for `compiler_status`.
+///
+/// Takes the store as a trait object so the behaviour is testable against the
+/// in-memory queue with no Redis, and so the "queue is not configured" branch is
+/// a value rather than an environment.
+///
+/// **An unreadable queue is `unknown`, never `empty`.** Reporting a confident
+/// empty list when we could not read is precisely the false "nothing is blocking
+/// this module" that made a leaked in-flight claim invisible for hours.
+pub async fn collect_queue_rows(
+    store: Option<&dyn super::queue::QueueStore>,
+    stale_after: Duration,
+    now_ms: i64,
+) -> QueueRows {
+    let Some(store) = store else {
+        return QueueRows {
+            queue: Vec::new(),
+            in_flight: Vec::new(),
+            degraded: true,
+            note: Some(
+                "durable build queue not configured (Redis unavailable) — queue/in-flight NOT \
+                 shown (this is 'unknown', not 'empty')"
+                    .to_string(),
+            ),
+        };
+    };
+    match store.snapshot().await {
+        Ok(snapshot) => {
+            let (queue, in_flight) = super::render_status_rows(&snapshot, stale_after, now_ms);
+            QueueRows {
+                queue,
+                in_flight,
+                degraded: false,
+                note: None,
+            }
+        }
+        Err(e) => QueueRows {
+            queue: Vec::new(),
+            in_flight: Vec::new(),
+            degraded: true,
+            note: Some(format!(
+                "build queue unreachable ({e}) — queue/in-flight NOT shown (this is 'unknown', \
+                 not 'empty')"
+            )),
+        },
+    }
+}
+
 /// Assemble the full `compiler_status` payload (pure given its inputs, so the exact
 /// serialized shape — the contract BLD-16's fleet API parses — is unit-testable).
 #[allow(clippy::too_many_arguments)]
@@ -838,11 +898,35 @@ impl RustTool for CompilerStatus {
             })
             .collect();
 
-        // Queue / in-flight: the job scheduler (BLD-06) is not wired yet — a stable
-        // empty shape, explicitly noted, not an error.
-        let queue: Vec<Value> = Vec::new();
-        let in_flight: Vec<Value> = Vec::new();
-        notes.push("build queue/in-flight surface pending the job scheduler (BLD-06)".to_string());
+        // Queue / in-flight, from the durable BLD-06 queue.
+        //
+        // TERM #611: this used to be a hardcoded empty pair with the note "build
+        // queue/in-flight surface pending the job scheduler (BLD-06)" — long
+        // after BLD-06 shipped. The cost was not cosmetic: when a
+        // terminus-primary restart leaks an in-flight claim, every resubmission
+        // (`force:true` included) coalesces onto the dead job and the progress
+        // record expires, so `compiler_status` was the ONLY place an operator
+        // could have seen what was blocking the module — and it showed nothing.
+        // See `super::render_status_rows` for the full rationale, including why
+        // there is deliberately no cancel affordance.
+        //
+        // Fail-safe posture: an unconfigured or unreachable queue is reported as
+        // DEGRADED with a note, never as an error and never as a confident empty
+        // queue (which is exactly the false "nothing is blocking" this closes).
+        let queue_store = super::queue::RedisQueue::from_env();
+        let rows = collect_queue_rows(
+            queue_store.as_ref().map(|q| q as &dyn super::queue::QueueStore),
+            super::scheduler::SchedulerConfig::from_env().stale_after,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+        if rows.degraded {
+            degraded = true;
+        }
+        if let Some(note) = rows.note {
+            notes.push(note);
+        }
+        let (queue, in_flight) = (rows.queue, rows.in_flight);
 
         let generated_at = chrono::Utc::now().to_rfc3339();
         let payload = build_payload(
@@ -1283,5 +1367,57 @@ mod tests {
             panic!("expected Reachable");
         };
         assert!(parse_deploy_marker(&body).is_empty());
+    }
+
+    // ── TERM #611: an unreadable queue is UNKNOWN, never a confident empty ────
+
+    /// A queue we cannot read must NOT be reported as an empty queue. That false
+    /// "nothing is in flight" is exactly what hid a leaked in-flight claim after
+    /// a terminus-primary restart: every resubmission coalesced onto the dead
+    /// job, the progress record expired, and `compiler_status` showed nothing
+    /// wrong.
+    #[tokio::test]
+    async fn an_unconfigured_queue_is_reported_as_degraded_not_as_empty() {
+        let rows = collect_queue_rows(None, Duration::from_secs(9_000), 0).await;
+        assert!(rows.degraded, "an unreadable queue must degrade the status");
+        let note = rows.note.expect("it must SAY the queue could not be read");
+        assert!(note.contains("not 'empty'"), "{note}");
+        assert!(rows.queue.is_empty() && rows.in_flight.is_empty());
+    }
+
+    /// And when the queue IS readable, the rows are actually populated from it —
+    /// the surface used to be hardcoded empty with a note claiming the scheduler
+    /// was "pending", long after it shipped.
+    #[tokio::test]
+    async fn a_readable_queue_populates_the_rows_from_the_snapshot() {
+        use crate::compiler::queue::{fake::InMemoryQueue, JobRequest, Priority, QueueStore};
+
+        let q = InMemoryQueue::new();
+        q.enqueue(&JobRequest {
+            module: "harmony".into(),
+            git_ref: "main".into(),
+            priority: Priority::High,
+            heavy: true,
+            ready: true,
+            bin: None,
+            force: true,
+            mode: "build".into(),
+            resolved_sha: None,
+        })
+        .await
+        .expect("enqueue");
+
+        let rows = collect_queue_rows(
+            Some(&q as &dyn QueueStore),
+            Duration::from_secs(9_000),
+            0,
+        )
+        .await;
+
+        assert!(!rows.degraded, "a readable queue is not degraded");
+        assert!(rows.note.is_none());
+        assert_eq!(rows.queue.len(), 1, "the queued job must be visible");
+        assert_eq!(rows.queue[0]["module"], "harmony");
+        assert_eq!(rows.queue[0]["force"], true);
     }
 }
