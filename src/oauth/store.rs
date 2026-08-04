@@ -637,11 +637,25 @@ impl OauthStore {
 
     /// Whether a token row is usable right now, judged against the database
     /// clock rather than the process clock.
+    ///
+    /// **A revoked FAMILY kills every member, including rows inserted later.**
+    /// That is not merely a convenience: round 7 of review found a real race
+    /// without it. A concurrent `revoke_refresh_family` can take its snapshot
+    /// before a rotation inserts the successor, block on the predecessor's row
+    /// lock, and then revoke only the rows it could see — leaving the successor
+    /// live in a family that was supposed to be dead. Deciding liveness from
+    /// "does ANY row in this family carry a revocation" makes that ordering
+    /// irrelevant, with no lock and no possibility of a row being missed
+    /// because it did not exist yet. Family revocation is one-way and
+    /// permanent, which is exactly the intended meaning of revoking a family
+    /// after a detected token theft.
     pub async fn refresh_token_is_live(&self, token_hash: &SecretHash) -> Result<bool, ToolError> {
         sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM rmcp_refresh_token \
-             WHERE token_hash = $1 AND rotated_to IS NULL AND revoked_at IS NULL \
-               AND expires_at > now())",
+            "SELECT EXISTS (SELECT 1 FROM rmcp_refresh_token t \
+             WHERE t.token_hash = $1 AND t.rotated_to IS NULL AND t.revoked_at IS NULL \
+               AND t.expires_at > now() \
+               AND NOT EXISTS (SELECT 1 FROM rmcp_refresh_token r \
+                               WHERE r.family_id = t.family_id AND r.revoked_at IS NOT NULL))",
         )
         .bind(token_hash.as_bytes())
         .fetch_one(&self.pool)
@@ -676,6 +690,14 @@ impl OauthStore {
     ///   because a check can be skipped by a new call site and a missing
     ///   parameter cannot.
     ///
+    /// - **Round 7:** a concurrent family revocation could snapshot before the
+    ///   successor existed and therefore revoke only the predecessor, leaving
+    ///   the successor live in a dead family. Both this UPDATE and
+    ///   [`Self::refresh_token_is_live`] now treat ANY revoked row in a family
+    ///   as revoking the whole family, so a row that did not exist when the
+    ///   revocation ran is still dead. No lock is needed and no row can be
+    ///   missed for not existing yet.
+    ///
     /// The conditional UPDATE still decides the sole winner under concurrency:
     /// two simultaneous refreshes both see a live row, but only one UPDATE
     /// matches `rotated_to IS NULL`, and the loser returns before the INSERT.
@@ -688,9 +710,11 @@ impl OauthStore {
         let mut tx = self.pool.begin().await.map_err(db)?;
 
         let rotated = sqlx::query(
-            "UPDATE rmcp_refresh_token SET rotated_to = $2 \
-             WHERE token_hash = $1 AND rotated_to IS NULL AND revoked_at IS NULL \
-               AND expires_at > now()",
+            "UPDATE rmcp_refresh_token t SET rotated_to = $2 \
+             WHERE t.token_hash = $1 AND t.rotated_to IS NULL AND t.revoked_at IS NULL \
+               AND t.expires_at > now() \
+               AND NOT EXISTS (SELECT 1 FROM rmcp_refresh_token r \
+                               WHERE r.family_id = t.family_id AND r.revoked_at IS NOT NULL)",
         )
         .bind(token_hash.as_bytes())
         .bind(successor_hash.as_bytes())
