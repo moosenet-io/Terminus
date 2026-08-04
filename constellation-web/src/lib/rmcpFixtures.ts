@@ -124,12 +124,37 @@ function matchPattern(pattern: string, namespace: string, tool: string): boolean
   return full === pattern || tool === pattern;
 }
 
-/** A pattern the mock server refuses at write time (RMCP-06: rejection is a write-time
- *  decision, never a match-time one). */
-function patternRejection(pattern: string): string | null {
+/**
+ * Whether THIS fixture's principal is the operator.
+ *
+ * `false`: it is a DELEGATED owner (see the module header). That is not a detail — several rules
+ * are ownership-sensitive, and a fixture that quietly ran as the operator would satisfy all of
+ * them vacuously and teach the UI the most permissive branch of each.
+ */
+const FIXTURE_PRINCIPAL_IS_OPERATOR = false;
+
+/**
+ * A pattern the server refuses at WRITE time (RMCP-06: rejection is a write-time decision, never
+ * a match-time one). Exported so a test can pin both sides of the ownership-sensitive rule below
+ * without needing a second principal.
+ *
+ * `isOperator` is a parameter rather than a read of the constant because the interesting rule is
+ * conditional on it:
+ *
+ *   **A bare `*` is permitted only for an operator-owned group, and refused for a delegated
+ *   owner** (spec RMCP-06 edge case; RMCP-12 restates it). An earlier revision accepted `*`
+ *   unconditionally, which made the fixture LAXER than production for the single most powerful
+ *   pattern in the vocabulary — a delegated owner could mint a group matching the entire catalog
+ *   and the UI would show the preview confirming it. The one pattern that must never be waved
+ *   through is the one that matches everything.
+ */
+export function patternRejection(pattern: string, isOperator: boolean): string | null {
   const trimmed = pattern.trim();
   if (!trimmed) return 'empty pattern';
   if (trimmed !== pattern) return 'leading or trailing whitespace';
+  if (trimmed === '*' && !isOperator) {
+    return 'a bare * is operator-only — a delegated owner must name the namespaces or prefixes they own';
+  }
   if (/[^A-Za-z0-9_:*-]/.test(trimmed)) return 'unsupported characters — exact name, trailing * , or namespace::* only';
   if (trimmed.indexOf('*') !== -1 && trimmed.indexOf('*') !== trimmed.length - 1) {
     return 'a wildcard may only appear at the end';
@@ -143,7 +168,7 @@ function resolvePatterns(patterns: string[], groupName: string): RmcpResolvedToo
   for (const ns of FIXTURE_NAMESPACES) {
     for (const tool of ns.tools) {
       for (const pattern of patterns) {
-        if (patternRejection(pattern)) continue;
+        if (patternRejection(pattern, FIXTURE_PRINCIPAL_IS_OPERATOR)) continue;
         if (!matchPattern(pattern, ns.namespace, tool)) continue;
         const name = qualified(ns.namespace, tool);
         if (seen.has(name)) break;
@@ -343,6 +368,30 @@ function clientOr404(id: string, tool: RmcpToolName): FixtureClient {
   return found;
 }
 
+/**
+ * Optimistic-concurrency check, FAIL-CLOSED.
+ *
+ * The earlier form was `if (typeof args.version === 'number' && args.version !== current)`, which
+ * only enforced the check when a version happened to be supplied — so an update that OMITTED it
+ * sailed through and bumped the version anyway. That is the concurrency control failing open, and
+ * it fails open in the direction that matters: an unversioned write silently overwrites whatever
+ * another operator saved, which is the exact outcome the whole version field exists to prevent.
+ * A caller that cannot say which revision it edited has, by definition, not checked for a
+ * conflict.
+ *
+ * So a missing or non-numeric version is `invalid` (a malformed request), a stale one is
+ * `conflict` (a well-formed request that lost a race) — the two the UI already distinguishes, and
+ * both raised BEFORE anything mutates.
+ */
+function assertVersionMatches(raw: unknown, current: number, tool: RmcpToolName, noun: string): void {
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 0) {
+    throw new RmcpError('invalid', tool, `an update must state the ${noun} version it is based on`);
+  }
+  if (raw !== current) {
+    throw new RmcpError('conflict', tool, `${noun} was modified by another session`);
+  }
+}
+
 /** Namespaces this principal may attach — owned BY THIS PRINCIPAL. An unclaimed namespace is not
  *  in this set, mirroring `set_client_namespaces`' INNER JOIN on `rmcp_server_owner`. */
 function ownedNamespaces(): string[] {
@@ -508,11 +557,11 @@ export async function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string
 
     case RMCP_TOOLS.clientUpdate: {
       const client = clientOr404(String(args.id), tool);
+      // Every check precedes every mutation: existence/ownership, then concurrency, then
+      // assignability. A partially applied scope change is a permission state nobody chose.
+      assertVersionMatches(args.version, client.version, tool, 'client');
       assertNamespacesAssignable(args.namespaces as string[] | undefined, tool);
       assertGroupsAssignable(args.tool_group_ids as string[] | undefined, tool);
-      if (typeof args.version === 'number' && args.version !== client.version) {
-        throw new RmcpError('conflict', tool, 'client was modified by another session');
-      }
       const updated: FixtureClient = {
         ...client,
         enabled: typeof args.enabled === 'boolean' ? args.enabled : client.enabled,
@@ -549,7 +598,7 @@ export async function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string
 
     case RMCP_TOOLS.groupCreate: {
       const patterns = (args.patterns as string[] | undefined) ?? [];
-      const bad = patterns.map(p => ({ p, reason: patternRejection(p) })).filter(x => x.reason);
+      const bad = patterns.map(p => ({ p, reason: patternRejection(p, FIXTURE_PRINCIPAL_IS_OPERATOR) })).filter(x => x.reason);
       if (bad.length) {
         throw new RmcpError('invalid', tool, 'invalid pattern', bad.map(b => `${b.p}: ${b.reason}`));
       }
@@ -571,11 +620,9 @@ export async function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string
       if (!group) throw new RmcpError('not_found', tool, 'group not found');
       // Same non-oracle answer as the client path above.
       if (group.owner !== 'me') throw new RmcpError('not_found', tool, 'no such group for this account');
-      if (typeof args.version === 'number' && args.version !== group.version) {
-        throw new RmcpError('conflict', tool, 'group was modified by another session');
-      }
+      assertVersionMatches(args.version, group.version, tool, 'group');
       const patterns = (args.patterns as string[] | undefined) ?? group.patterns;
-      const bad = patterns.map(p => ({ p, reason: patternRejection(p) })).filter(x => x.reason);
+      const bad = patterns.map(p => ({ p, reason: patternRejection(p, FIXTURE_PRINCIPAL_IS_OPERATOR) })).filter(x => x.reason);
       if (bad.length) {
         throw new RmcpError('invalid', tool, 'invalid pattern', bad.map(b => `${b.p}: ${b.reason}`));
       }
@@ -593,7 +640,7 @@ export async function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string
     case RMCP_TOOLS.groupPreview: {
       const patterns = (args.patterns as string[] | undefined) ?? [];
       const invalid = patterns
-        .map(p => ({ pattern: p, reason: patternRejection(p) }))
+        .map(p => ({ pattern: p, reason: patternRejection(p, FIXTURE_PRINCIPAL_IS_OPERATOR) }))
         .filter((x): x is { pattern: string; reason: string } => x.reason !== null);
       const matched = resolvePatterns(patterns, 'preview');
       const limit = (args.limit as number | undefined) ?? matched.length;

@@ -907,6 +907,8 @@ clause by clause:
 | `JOIN rmcp_server_owner … AND o.owner_account_id = c.owner_account_id` | a cleared delegation, and an **unclaimed** namespace, resolve to nothing |
 | `set_client_namespaces` / `set_client_tool_groups` ownership checks | unowned/foreign servers and groups refused at write, with the store's deliberately unspecific message |
 | "Same answer for 'no such client' and 'not yours'" | cross-owner access answers `not_found`, never a distinguishable `forbidden` |
+| optimistic concurrency | an update stating **no** version (or a non-numeric one) is `invalid` and mutates nothing — the check is fail-**closed**, since a caller that cannot say which revision it edited has not checked for a conflict |
+| RMCP-06: bare `*` is operator-only | refused for the fixture's delegated-owner principal, at write time and in the live preview; `patternRejection(pattern, isOperator)` pins both sides of the rule |
 
 The through-line — and the reason each of those is a READ-path check rather than only a write-time
 one — is that **a scope row outlives the ownership that justified it**. Ownership is transferable

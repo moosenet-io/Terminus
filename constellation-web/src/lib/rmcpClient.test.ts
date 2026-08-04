@@ -393,6 +393,85 @@ describe('a delegated owner sees and touches only their own objects', () => {
   });
 });
 
+// ── Fixture/production parity (review round 5) ───────────────────────────────────────────────
+//
+// Both of these are the same failure: the mock being LAXER than the server it stands in for. A
+// fixture that waves something through teaches the UI a contract that does not exist, and the UI
+// is then written against the permissive branch.
+describe('the concurrency check is fail-CLOSED', () => {
+  it('refuses an update that states no version, and leaves the record untouched', async () => {
+    const { rmcpFixtureCall } = await import('./rmcpFixtures');
+    const before = (await listClients()).find(c => c.name === 'Reading assistant')!;
+
+    // Straight at the server boundary: the typed wrapper requires `version`, so this is only
+    // reachable from an untyped caller — which is exactly what a boundary is for.
+    await expect(
+      rmcpFixtureCall('rmcp_client_update', { id: before.id, enabled: false }),
+    ).rejects.toMatchObject({ kind: 'invalid' });
+
+    const after = (await listClients()).find(c => c.id === before.id)!;
+    expect(after.enabled).toBe(before.enabled);
+    // The version must NOT have been bumped: a refused write that still advanced the revision
+    // would invalidate every other editor's in-flight form for a change that never happened.
+    expect(after.version).toBe(before.version);
+  });
+
+  it('refuses a non-numeric version rather than ignoring it', async () => {
+    const { rmcpFixtureCall } = await import('./rmcpFixtures');
+    const client = (await listClients()).find(c => c.name === 'Reading assistant')!;
+    for (const version of ['3', null, {}, 1.5, -1]) {
+      await expect(
+        rmcpFixtureCall('rmcp_client_update', { id: client.id, version, enabled: false }),
+      ).rejects.toMatchObject({ kind: 'invalid' });
+    }
+    expect((await listClients()).find(c => c.id === client.id)!.version).toBe(client.version);
+  });
+
+  it('applies the same rule to a group update', async () => {
+    const { rmcpFixtureCall } = await import('./rmcpFixtures');
+    const group = (await listGroups()).find(g => g.name === 'media')!;
+    await expect(
+      rmcpFixtureCall('rmcp_group_update', { id: group.id, patterns: ['media::*'] }),
+    ).rejects.toMatchObject({ kind: 'invalid' });
+    expect((await listGroups()).find(g => g.id === group.id)!.version).toBe(group.version);
+  });
+
+  it('still distinguishes a STALE version (conflict) from a missing one (invalid)', async () => {
+    const client = (await listClients()).find(c => c.name === 'Reading assistant')!;
+    await expect(
+      updateClient({ id: client.id, version: client.version + 99, enabled: true }),
+    ).rejects.toMatchObject({ kind: 'conflict' });
+  });
+});
+
+describe('a bare * is operator-only, in the fixture as in production', () => {
+  it('refuses it for this DELEGATED-owner principal, at write time', async () => {
+    await expect(
+      createGroup({ name: 'everything', description: '', patterns: ['*'] }),
+    ).rejects.toMatchObject({ kind: 'invalid' });
+  });
+
+  it('reports it as rejected in the live preview, so the editor says so before saving', async () => {
+    const preview = await previewGroup(['*']);
+    expect(preview.invalidPatterns.map(p => p.pattern)).toEqual(['*']);
+    expect(preview.invalidPatterns[0].reason).toMatch(/operator-only/);
+    // And it matches nothing in the meantime — a refused pattern must not resolve.
+    expect(preview.tools).toEqual([]);
+  });
+
+  it('pins BOTH sides of the ownership rule, so the fixture is not merely strict', async () => {
+    const { patternRejection } = await import('./rmcpFixtures');
+    // Delegated owner: refused.
+    expect(patternRejection('*', false)).toMatch(/operator-only/);
+    // Operator: permitted — the rule is conditional, not a blanket ban, and a fixture that
+    // refused it for everyone would misstate it in the opposite direction.
+    expect(patternRejection('*', true)).toBeNull();
+    // Ownership changes nothing about the rest of the vocabulary.
+    expect(patternRejection('media::*', false)).toBeNull();
+    expect(patternRejection('ba*d', true)).toMatch(/wildcard may only appear at the end/);
+  });
+});
+
 describe('a revoke must name EXACTLY ONE target — at both ends', () => {
   it('the client refuses an AMBIGUOUS revoke rather than picking one by precedence', async () => {
     // Structurally valid against the union (an object with both fields satisfies either member),
