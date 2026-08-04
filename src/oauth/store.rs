@@ -337,13 +337,31 @@ impl OauthStore {
         .map_err(db)
     }
 
-    /// The federated namespaces a client may see. Empty for an unknown,
-    /// disabled, or unscoped client — same join and same reasoning as
-    /// [`Self::client_tool_groups`].
+    /// The federated namespaces a client may see.
+    ///
+    /// Empty for an unknown, disabled, or unscoped client — and, like
+    /// [`Self::client_tool_groups`], this RE-CHECKS ownership on the read path
+    /// rather than trusting the write-time check. Round 10 caught that the
+    /// previous revision had added that re-check for tool groups but left the
+    /// symmetric gap here, which is the more dangerous of the two: namespaces
+    /// are reassignable and REVOCABLE (`set_server_owner` / `clear_server_owner`),
+    /// so a `rmcp_client_server` row outlives the ownership that justified it.
+    /// Without the join, clearing a delegation would leave the former owner's
+    /// connector still reaching that whole federated server.
+    ///
+    /// Joining `rmcp_server_owner` means an UNOWNED namespace also resolves to
+    /// nothing, consistent with the write path's refusal to attach one: "nobody
+    /// has claimed this server" must never read as "everyone may reach it".
+    ///
+    /// Same note to RMCP-12 as on [`Self::client_tool_groups`]: if delegation
+    /// introduces a legitimate operator override, THIS is the predicate to
+    /// widen deliberately and with tests.
     pub async fn client_namespaces(&self, client_id: Uuid) -> Result<Vec<String>, ToolError> {
         sqlx::query_scalar::<_, String>(
             "SELECT s.namespace FROM rmcp_client_server s \
              JOIN rmcp_client c ON c.id = s.client_id AND NOT c.disabled \
+             JOIN rmcp_server_owner o ON o.namespace = s.namespace \
+                                     AND o.owner_account_id = c.owner_account_id \
              WHERE s.client_id = $1 ORDER BY s.namespace",
         )
         .bind(client_id)
