@@ -731,6 +731,159 @@ pub fn local_cache_dir(dataset_root: &str) -> String {
     format!("{root}/cache/sccache")
 }
 
+// ── TERM #610: the sccache SERVER's TMPDIR must not be a build job's ──────────
+
+/// TERM #610 — start the long-lived sccache SERVER explicitly, with a STABLE
+/// `TMPDIR`, instead of letting whichever build job first invokes the wrapper
+/// define it.
+///
+/// ## The failure this closes (observed live on <host>, 2026-08-02)
+/// `sccache` is a client/server pair: the first `RUSTC_WRAPPER=sccache` call
+/// that finds no running server SPAWNS one, and the daemon inherits that
+/// caller's environment — including the caller's PCON-10 per-job `TMPDIR`
+/// (`<BUILD_SCRATCH_ROOT>/<job>/tmp`). The daemon then outlives the job. When
+/// the job finishes and the reclaim guard deletes its scratch dir, the daemon's
+/// temp dir no longer exists and EVERY later compile through the wrapper dies:
+///
+/// ```text
+/// sccache: encountered fatal error
+/// sccache: error: Failed to create temp dir
+/// caused by: No such file or directory (os error 2)
+///   at path ".../terminus-bu-<hash>/tmp/sccacheXXXXXX"
+/// ```
+///
+/// Confirmed from `/proc/<sccache-pid>/environ`. It presents as the "build dies
+/// in the same second it started / 0 passed 0 failed, no summary" signature
+/// previously chased as TERM #548 — the THIRD distinct trigger of that class.
+/// One job's transient scratch had become a fleet-wide dependency.
+///
+/// ## Why a prestart rather than "don't put TMPDIR in the build env"
+/// There is exactly ONE `TMPDIR` per process, and rustc/linker/tempfile spill
+/// genuinely needs to be on the big-disk per-job scratch (PCON-10) and not on
+/// the small `/tmp` tmpfs — so the build env's `TMPDIR` must stay per-job. The
+/// asymmetry is that the DAEMON is long-lived and the JOB is not, so the daemon
+/// must simply never be born inside a job's scope. Starting it explicitly first,
+/// from a stable root, is the whole fix.
+///
+/// ## The daemon we start must not be replaced by a job-spawned one
+/// sccache servers self-exit after `SCCACHE_IDLE_TIMEOUT` (default 600s). If
+/// ours idles out, the NEXT client to need it is a cargo inside a job scope —
+/// and the bug is back. The prestart therefore also sets
+/// `SCCACHE_IDLE_TIMEOUT=0` (never exit), so the stably-rooted daemon persists
+/// and remains the one every build connects to.
+///
+/// ## Residual, stated rather than hidden (gpt56 review)
+/// `--start-server` is idempotent, which means it does NOT repair a daemon that
+/// is ALREADY running with a poisoned TMPDIR — it exits without changing it.
+/// Detecting that from outside would mean inspecting another process's
+/// environment and killing it on a heuristic, which is a worse failure mode than
+/// the one it fixes (a wrongly-killed daemon takes out concurrent builds). So
+/// the contract is: this PREVENTS poisoning, it does not CURE it. A host that
+/// already has a poisoned daemon at deploy time needs a one-time
+/// `sccache --stop-server` — exactly the ops mitigation already applied on <host>
+/// on 2026-08-02. With `SCCACHE_IDLE_TIMEOUT=0` plus a prestart before every
+/// build, there is no routine path back into the poisoned state afterwards.
+///
+/// ## Fail OPEN, always
+/// A prestart that fails (no `sccache` on PATH, a server already running — which
+/// exits non-zero — a busy port) must NEVER fail the build: sccache is a cache,
+/// and requirement 2 of this module is that a cache outage degrades to a slower
+/// cold build and never a broken one. Every caller ignores the outcome.
+///
+/// ## The backend must be wired at START time too
+/// A server started with only `TMPDIR` set and none of the backend variables
+/// would come up bound to the LOCAL DISK cache and stay that way for its whole
+/// life — silently downgrading every subsequent build from the shared Redis.
+/// That would trade a loud failure for a quiet one. So the prestart carries the
+/// same backend env the build would have handed it.
+pub struct ServerPrestart {
+    /// argv: `[<sccache binary>, "--start-server"]`.
+    pub argv: Vec<String>,
+    /// Env for the prestart process: the resolved backend vars, with `TMPDIR`
+    /// forced to the stable root. Contains secrets when the backend is Redis —
+    /// safe here because it is passed as a process env map, never on argv (S7).
+    pub env: BTreeMap<String, String>,
+}
+
+/// `[binary, "--start-server"]` — the explicit, idempotent server start.
+pub fn prestart_argv() -> Vec<String> {
+    vec![SccacheEnv::binary(), "--start-server".to_string()]
+}
+
+/// Build the LOCAL prestart (argv + env) for `sccache`, pinning `TMPDIR` to
+/// `stable_tmpdir` — a path that outlives any single build job (the scratch
+/// ROOT, never a per-job subdirectory of it).
+///
+/// `RUSTC_WRAPPER` is dropped: it is an instruction to CARGO, and leaving it in
+/// the daemon's own environment is meaningless at best.
+pub fn prestart_local(sccache: &SccacheEnv, stable_tmpdir: &str) -> ServerPrestart {
+    let mut env: BTreeMap<String, String> = sccache
+        .vars
+        .iter()
+        .filter(|(k, _)| k.as_str() != "RUSTC_WRAPPER")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    // Inserted AFTER the backend map is copied, so a backend var of the same
+    // name cannot override the pin (the remote path filters for the same
+    // reason — gpt56 review).
+    env.insert("TMPDIR".to_string(), stable_tmpdir.to_string());
+    // Never idle-exit: an idled-out daemon is re-spawned by whichever build
+    // needs it next, which is exactly how it gets a per-job TMPDIR.
+    env.insert("SCCACHE_IDLE_TIMEOUT".to_string(), "0".to_string());
+    ServerPrestart {
+        argv: prestart_argv(),
+        env,
+    }
+}
+
+/// The REMOTE (heavy, over-ssh) prestart, as a shell fragment to splice in FRONT
+/// of the remote build command — after the secret env file has been sourced, and
+/// crucially BEFORE `exec systemd-run`, so the daemon is started OUTSIDE the
+/// job's capped scope as well as outside its scratch.
+///
+/// Only the NON-SECRET backend vars are placed inline (they are inert config:
+/// endpoint, db, key prefix). Any secret var (the Redis password) is already
+/// exported into the remote shell by the wrapper's `set -a; . <file>` — it is
+/// NEVER written onto a command line (S7), which is exactly why this returns a
+/// fragment for that shell rather than an ssh command of its own.
+///
+/// Always returns a non-empty fragment: the TMPDIR and idle pins are the point
+/// of this function, so there is no "nothing to do" case even when the backend
+/// resolved to the local-disk fallback. (opus review corrected an earlier
+/// comment here that claimed an empty return.) `|| true` keeps it fail-open
+/// (see the type doc).
+pub fn prestart_remote_shell_prefix(
+    sccache: &SccacheEnv,
+    stable_tmpdir: &str,
+    quote: impl Fn(&str) -> String,
+) -> String {
+    // The FORCED pins are emitted LAST and their keys are filtered out of the
+    // backend vars (gpt56 review). In a shell assignment prefix the LAST
+    // assignment of a name wins, so emitting them first would let a backend map
+    // that happened to carry `TMPDIR` or `SCCACHE_IDLE_TIMEOUT` silently
+    // override the very safety pins this function exists to apply.
+    const FORCED: &[&str] = &["TMPDIR", "SCCACHE_IDLE_TIMEOUT"];
+    let mut assignments: Vec<String> = Vec::new();
+    for (k, v) in &sccache.vars {
+        if k == "RUSTC_WRAPPER"
+            || FORCED.contains(&k.as_str())
+            || crate::compiler::scope::is_secret_env_key(k)
+        {
+            continue;
+        }
+        assignments.push(format!("{k}={}", quote(v)));
+    }
+    assignments.push(format!("TMPDIR={}", quote(stable_tmpdir)));
+    // See `prestart_local`: never idle-exit, or a later build re-spawns it
+    // from inside its own scope.
+    assignments.push("SCCACHE_IDLE_TIMEOUT=0".to_string());
+    format!(
+        "{} {} --start-server || true; ",
+        assignments.join(" "),
+        quote(&SccacheEnv::binary())
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1558,5 +1711,135 @@ mod tests {
         // 127.0.0.1:1 — reserved, never listening.
         let parts = parse_redis_url("redis://default:placeholder-password@127.0.0.1:1").unwrap();
         assert!(!redis_usable(&parts, std::time::Duration::from_millis(200)));
+    }
+
+    // ── TERM #610: the server prestart ───────────────────────────────────────
+
+    fn redis_env_fixture() -> SccacheEnv {
+        let mut vars = BTreeMap::new();
+        vars.insert("RUSTC_WRAPPER".to_string(), "sccache".to_string());
+        vars.insert(
+            "SCCACHE_REDIS_ENDPOINT".to_string(),
+            "redis://cache.invalid:6380".to_string(),
+        );
+        vars.insert("SCCACHE_REDIS_DB".to_string(), "3".to_string());
+        vars.insert(
+            "SCCACHE_REDIS_KEY_PREFIX".to_string(),
+            KEY_PREFIX.to_string(),
+        );
+        vars.insert(
+            "SCCACHE_REDIS_PASSWORD".to_string(),
+            "placeholder-password".to_string(), // pii-test-fixture
+        );
+        SccacheEnv {
+            vars,
+            mode: SccacheMode::Redis,
+        }
+    }
+
+    /// The whole point of TERM #610: the daemon's `TMPDIR` is the STABLE root it
+    /// was given, never a per-job scratch dir that will be reclaimed under it.
+    #[test]
+    fn prestart_pins_tmpdir_to_the_stable_root() {
+        let sccache = redis_env_fixture();
+        let stable = "/opt/nvme-scratch/build-scratch";
+        let per_job = format!("{stable}/terminus-bu-12ea62eabf2c/tmp");
+
+        let p = prestart_local(&sccache, stable);
+
+        assert_eq!(
+            p.env.get("TMPDIR").map(String::as_str),
+            Some(stable),
+            "the server must be started with the stable root"
+        );
+        assert_ne!(
+            p.env.get("TMPDIR").map(String::as_str),
+            Some(per_job.as_str()),
+            "a per-job scratch dir is exactly what must never become the daemon's TMPDIR"
+        );
+        assert_eq!(p.argv, vec![SccacheEnv::binary(), "--start-server".to_string()]);
+    }
+
+    /// A daemon started with only `TMPDIR` and no backend config comes up bound
+    /// to the LOCAL DISK cache for its whole life — silently downgrading every
+    /// later build off the shared Redis. The prestart must carry the backend.
+    #[test]
+    fn prestart_carries_the_backend_so_the_daemon_is_not_silently_local_only() {
+        let sccache = redis_env_fixture();
+        let p = prestart_local(&sccache, "/scratch");
+
+        for key in [
+            "SCCACHE_REDIS_ENDPOINT",
+            "SCCACHE_REDIS_DB",
+            "SCCACHE_REDIS_KEY_PREFIX",
+            "SCCACHE_REDIS_PASSWORD",
+        ] {
+            assert!(
+                p.env.contains_key(key),
+                "{key} must reach the daemon at START time — the backend is fixed then"
+            );
+        }
+        // RUSTC_WRAPPER is an instruction to cargo, not to the daemon.
+        assert!(!p.env.contains_key("RUSTC_WRAPPER"));
+    }
+
+    /// gpt56 review: a backend map that happens to carry `TMPDIR` or
+    /// `SCCACHE_IDLE_TIMEOUT` must not be able to override the safety pins — in
+    /// a shell assignment prefix the LAST assignment wins, and in the env map
+    /// the last insert wins.
+    #[test]
+    fn the_safety_pins_win_over_a_backend_map_that_carries_the_same_keys() {
+        let mut sccache = redis_env_fixture();
+        sccache
+            .vars
+            .insert("TMPDIR".to_string(), "/some/per-job/scratch/tmp".to_string());
+        sccache
+            .vars
+            .insert("SCCACHE_IDLE_TIMEOUT".to_string(), "600".to_string());
+
+        let local = prestart_local(&sccache, "/stable/root");
+        assert_eq!(local.env.get("TMPDIR").map(String::as_str), Some("/stable/root"));
+        assert_eq!(local.env.get("SCCACHE_IDLE_TIMEOUT").map(String::as_str), Some("0"));
+
+        let frag = prestart_remote_shell_prefix(&sccache, "/stable/root", |s| {
+            format!("'{}'", s.replace('\'', "'\\''"))
+        });
+        assert!(
+            !frag.contains("/some/per-job/scratch/tmp"),
+            "a per-job TMPDIR from the backend map must not reach the daemon: {frag}"
+        );
+        // Last assignment wins in a shell prefix, so the pins must be last.
+        let tmp_at = frag.find("TMPDIR=").expect("pin present");
+        let idle_at = frag.find("SCCACHE_IDLE_TIMEOUT=0").expect("pin present");
+        let bin_at = frag.find("--start-server").expect("command present");
+        assert!(tmp_at < bin_at && idle_at < bin_at, "{frag}");
+        assert_eq!(frag.matches("TMPDIR=").count(), 1, "exactly one TMPDIR: {frag}");
+        assert_eq!(
+            frag.matches("SCCACHE_IDLE_TIMEOUT=").count(),
+            1,
+            "exactly one idle pin: {frag}"
+        );
+    }
+
+    /// S7: the remote prestart runs in a shell that has ALREADY sourced the
+    /// secret env file, so a secret must never be written onto the command line.
+    #[test]
+    fn remote_prestart_prefix_never_puts_a_secret_on_the_command_line() {
+        let sccache = redis_env_fixture();
+        let frag = prestart_remote_shell_prefix(&sccache, "/heavy/build", |s| {
+            format!("'{}'", s.replace('\'', "'\\''"))
+        });
+
+        assert!(
+            !frag.contains("placeholder-password"), // pii-test-fixture
+            "the Redis password must come from the sourced env file, never argv: {frag}"
+        );
+        assert!(!frag.contains("SCCACHE_REDIS_PASSWORD"), "{frag}");
+        assert!(frag.contains("TMPDIR='/heavy/build'"), "{frag}");
+        assert!(frag.contains("SCCACHE_REDIS_ENDPOINT="), "{frag}");
+        assert!(
+            frag.contains("--start-server") && frag.contains("|| true"),
+            "must be fail-open: {frag}"
+        );
     }
 }

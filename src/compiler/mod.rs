@@ -1217,6 +1217,82 @@ fn nearest_existing_ancestor_is_tmpfs(
     false
 }
 
+/// TERM #610 — explicitly start the local sccache SERVER with a STABLE `TMPDIR`
+/// before any per-job scope exists, so the daemon can never inherit a build
+/// job's transient scratch. See [`sccache::prestart_local`] for the full
+/// rationale and the live failure it closes.
+///
+/// FAIL-OPEN by construction: this returns `()`, not a `Result`. A server that
+/// is already running exits non-zero, `sccache` may be absent from PATH, and
+/// neither is a reason to fail a build — sccache is a cache. Anything unexpected
+/// is logged at debug and dropped.
+///
+/// Bounded by a short timeout: a hung/absent cache binary must not stall a build
+/// either. `run` owns the child's process GROUP and kills the whole tree on
+/// timeout (see its `process_group(0)` + `kill_on_drop`), so the bound is real
+/// and not merely a wait — a wedged `sccache` costs at most
+/// [`SCCACHE_PRESTART_TIMEOUT_SECS`] once per build, then the build proceeds.
+async fn prestart_sccache_server(
+    sccache_env: &sccache::SccacheEnv,
+    stable_tmpdir: &str,
+    redact: &[String],
+) {
+    let prestart = sccache::prestart_local(sccache_env, stable_tmpdir);
+    match run(
+        &prestart.argv,
+        None,
+        &prestart.env,
+        Duration::from_secs(SCCACHE_PRESTART_TIMEOUT_SECS),
+        redact,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(_) => tracing::debug!(
+            "sccache: server prestart issued with a stable TMPDIR ({stable_tmpdir})"
+        ),
+        // Overwhelmingly "server is already running", which is the desired end
+        // state anyway. Never surfaced as a build failure.
+        Err(e) => tracing::debug!(
+            "sccache: server prestart not needed or unavailable (TMPDIR {stable_tmpdir}): {e}"
+        ),
+    }
+}
+
+/// Seconds allowed for the fail-open sccache server prestart.
+const SCCACHE_PRESTART_TIMEOUT_SECS: u64 = 10;
+
+/// Compose the REMOTE (heavy, over-ssh) build wrapper.
+///
+/// Pure, so the ORDER — which is the whole safety property — is testable:
+///
+/// 1. `set -a; . <secret file>; rm -f <secret file>; set +a` when there is one,
+///    so the secret reaches the environment and the file's lifetime is one shot.
+/// 2. **The sccache server prestart (TERM #610)** — after the secrets it needs,
+///    and before `exec systemd-run`, so the long-lived daemon is started OUTSIDE
+///    the job's capped scope and outside its per-job scratch. Putting it after
+///    the `exec` would be impossible; putting it inside the scope would recreate
+///    the exact bug.
+/// 3. The BLD-444 web-build prefix, then the GAP-5 lockgen step, chained with
+///    `&&` so any failure short-circuits.
+/// 4. `exec <scoped cargo>` last, replacing this shell as the final process.
+fn render_remote_build_cmd(
+    secret_env_path: Option<&str>,
+    sccache_prestart: &str,
+    web_prefix: &str,
+    lockgen_cmd: &str,
+    scope_cmd: &str,
+) -> String {
+    match secret_env_path {
+        Some(path) => format!(
+            "set -a; . {f}; rm -f {f}; set +a; {sccache_prestart}{web_prefix}{lockgen_cmd} && exec {scope_cmd}",
+            f = shell_quote(path)
+        ),
+        None => format!("{sccache_prestart}{web_prefix}{lockgen_cmd} && exec {scope_cmd}"),
+    }
+}
+
 /// PCON-10: the resolved big-disk scratch ROOT for a local build (fail-closed).
 fn job_scratch_root() -> Result<PathBuf, ToolError> {
     resolve_scratch_root(
@@ -3800,6 +3876,20 @@ impl CompilerBuild {
                 ))
             })?;
 
+            // TERM #610: start the long-lived sccache SERVER *before* anything
+            // runs inside this job's scope, pinned to the STABLE scratch ROOT.
+            // Otherwise the first cargo invocation cold-starts the daemon, it
+            // inherits this job's per-job TMPDIR, and every LATER build on the
+            // host dies with `Failed to create temp dir .../sccacheXXXXXX` once
+            // this job's scratch is reclaimed. Fail-open: the outcome is logged
+            // and ignored — a cache that will not start must never fail a build.
+            prestart_sccache_server(
+                &sccache_env,
+                &scratch_root.to_string_lossy(),
+                &redact,
+            )
+            .await;
+
             let mut build_env = sccache_env.vars.clone();
             build_env.insert(
                 "CARGO_TARGET_DIR".to_string(),
@@ -3985,8 +4075,9 @@ impl CompilerBuild {
             // first. Derived through `job_scratch_base` — the SAME helper the
             // local path uses — so there is exactly one construction rule for a
             // per-job scratch base and the two paths cannot drift apart.
+            let remote_root_dir = heavy_local_target_dir()?;
             let remote_target =
-                job_scratch_base(&heavy_local_target_dir()?, &format!("{module}-{unit}"));
+                job_scratch_base(&remote_root_dir, &format!("{module}-{unit}"));
             // GUARD applies remotely too: the remote cargo target must be exec-safe,
             // never under the remote NFS dataset.
             scope::validate_target_dir(&remote_target, std::path::Path::new(&remote_root))?;
@@ -4389,14 +4480,33 @@ impl CompilerBuild {
                 None => String::new(),
             };
 
-            let remote_cmd = if have_secret {
-                format!(
-                    "set -a; . {f}; rm -f {f}; set +a; {web_prefix}{lockgen_cmd} && exec {scope_cmd}",
-                    f = shell_quote(&remote_env_path)
-                )
-            } else {
-                format!("{web_prefix}{lockgen_cmd} && exec {scope_cmd}")
-            };
+            // TERM #610 (remote leg): same fix as the local path, expressed as a
+            // shell fragment so it runs AFTER the secret env file is sourced
+            // (the Redis password must never cross argv — S7) and BEFORE
+            // `exec systemd-run`, i.e. outside the job's capped scope as well as
+            // outside its per-job scratch. Pinned to the heavy host's STABLE
+            // build-disk root, never `remote_tmp_str`. Fail-open via `|| true`.
+            //
+            // The heavy role is often a SELF-RELAY to the same host as the local
+            // path (`root@127.0.0.1`), so leaving this leg out would let the very
+            // same daemon be born inside a job scope by another route.
+            // Uses `remote_root_dir`, the SAME value already resolved above for
+            // `remote_target` — not a second `heavy_local_target_dir()?` call.
+            // Re-calling would introduce a fresh `?` on the prestart path, which
+            // would be the one non-fail-open step in an otherwise fail-open fix
+            // (opus review). Here it cannot fail: the build already depends on it.
+            let sccache_prestart = sccache::prestart_remote_shell_prefix(
+                &sccache_env,
+                &remote_root_dir.to_string_lossy(),
+                |s| shell_quote(s),
+            );
+            let remote_cmd = render_remote_build_cmd(
+                have_secret.then(|| remote_env_path.as_str()),
+                &sccache_prestart,
+                &web_prefix,
+                &lockgen_cmd,
+                &scope_cmd,
+            );
             // On timeout, tear down the REMOTE scope by its unit name too — the
             // local ssh process-group kill can't reach the remote build tree.
             let remote_kill = RemoteScopeKill {
@@ -6975,6 +7085,219 @@ Source:
             UnixListener::bind(over.join(&name)).is_err(),
             "the kernel must also refuse the over-budget socket — otherwise the \
              budget is too conservative and this test is wrong, not the code"
+        );
+    }
+
+    // ── TERM #610: sccache daemon must not inherit a per-job TMPDIR ─────────
+
+    /// The ORDER is the safety property. The prestart must land AFTER the secret
+    /// env file is sourced (it needs the Redis password, which may never cross
+    /// argv) and BEFORE `exec` (so the long-lived daemon is started outside the
+    /// job's capped systemd scope as well as outside its per-job scratch).
+    #[test]
+    fn remote_wrapper_prestarts_sccache_after_secrets_and_before_the_scoped_build() {
+        let cmd = render_remote_build_cmd(
+            Some("/heavy/x/.build.env"),
+            "TMPDIR='/heavy/build' sccache --start-server || true; ",
+            "",
+            "LOCKGEN",
+            "SCOPED_CARGO",
+        );
+
+        let sourced = cmd.find("set +a;").expect("secret file is sourced");
+        let prestart = cmd.find("--start-server").expect("sccache prestart present");
+        let exec_at = cmd.find("exec SCOPED_CARGO").expect("scoped build execs last");
+
+        assert!(
+            sourced < prestart,
+            "prestart must come AFTER the secret env is sourced: {cmd}"
+        );
+        assert!(
+            prestart < exec_at,
+            "prestart must come BEFORE `exec systemd-run`, or the daemon is born \
+             inside the job scope — the bug: {cmd}"
+        );
+        assert!(
+            cmd.contains("TMPDIR='/heavy/build'"),
+            "the daemon must get the STABLE build-disk root: {cmd}"
+        );
+    }
+
+    /// The same must hold on the no-secret path (local-disk sccache fallback):
+    /// the prestart still precedes the scoped build.
+    #[test]
+    fn remote_wrapper_prestarts_sccache_even_with_no_secret_env_file() {
+        let cmd = render_remote_build_cmd(
+            None,
+            "TMPDIR='/heavy/build' sccache --start-server || true; ",
+            "",
+            "LOCKGEN",
+            "SCOPED_CARGO",
+        );
+        let prestart = cmd.find("--start-server").expect("sccache prestart present");
+        let exec_at = cmd.find("exec SCOPED_CARGO").expect("scoped build execs last");
+        assert!(prestart < exec_at, "{cmd}");
+    }
+
+    /// End-to-end over a REAL child process: `prestart_sccache_server` must hand
+    /// the spawned daemon the stable TMPDIR. A fake `sccache` (via `SCCACHE_BIN`)
+    /// records the `TMPDIR` it was started with, so this asserts the environment
+    /// the daemon would actually inherit — not merely a map we built.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn prestart_spawns_the_server_with_the_stable_tmpdir() {
+        let dir = tempfile::Builder::new()
+            .prefix("sccpre")
+            .tempdir_in("/tmp")
+            .expect("tempdir");
+        let record = dir.path().join("tmpdir.txt");
+        let fake = dir.path().join("fake-sccache");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$TMPDIR\" > {}\n",
+                record.display()
+            ),
+        )
+        .expect("write fake sccache");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let prev = std::env::var_os("SCCACHE_BIN");
+        std::env::set_var("SCCACHE_BIN", &fake);
+
+        let sccache_env = sccache::SccacheEnv {
+            vars: BTreeMap::from([("RUSTC_WRAPPER".to_string(), "sccache".to_string())]),
+            mode: sccache::SccacheMode::LocalDir,
+        };
+        let stable = "/opt/nvme-scratch/build-scratch";
+        prestart_sccache_server(&sccache_env, stable, &[]).await;
+
+        match prev {
+            Some(v) => std::env::set_var("SCCACHE_BIN", v),
+            None => std::env::remove_var("SCCACHE_BIN"),
+        }
+
+        let got = std::fs::read_to_string(&record)
+            .expect("the prestart must actually have spawned the server binary");
+        assert_eq!(
+            got, stable,
+            "the sccache daemon must be started with the STABLE root, never a per-job scratch"
+        );
+    }
+
+    /// gpt56 review: the ordering tests above assert STRING POSITIONS. This one
+    /// EXECUTES the composed wrapper in a real `sh`, with a real 0600 secret env
+    /// file and a fake `sccache` that records what it was actually given — so it
+    /// proves the two things the string test only implies:
+    ///   1. the prestart really does inherit the sourced secret (it runs after
+    ///      `set -a; . <file>`), and
+    ///   2. it really does get the stable TMPDIR, not the per-job one.
+    /// It also proves the one-shot secret file is gone by the time the build
+    /// step would run.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_composed_remote_wrapper_actually_prestarts_sccache_with_the_secret_and_stable_tmpdir(
+    ) {
+        let dir = tempfile::Builder::new()
+            .prefix("sccwrap")
+            .tempdir_in("/tmp")
+            .expect("tempdir");
+        let record = dir.path().join("seen.txt");
+        let fake = dir.path().join("fake-sccache");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s|%s' \"$TMPDIR\" \"$SCCACHE_REDIS_PASSWORD\" \
+                 \"$SCCACHE_IDLE_TIMEOUT\" > {}\n",
+                record.display()
+            ),
+        )
+        .expect("write fake sccache");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // The secret env file the real wrapper sources — same renderer, so the
+        // quoting under test is the production one.
+        let env_file = dir.path().join("build.env");
+        let secret = BTreeMap::from([(
+            "SCCACHE_REDIS_PASSWORD".to_string(),
+            "placeholder-password".to_string(), // pii-test-fixture
+        )]);
+        std::fs::write(&env_file, scope::render_secret_env_file(&secret)).expect("env file");
+        {
+            // The production path rsyncs a 0600 file; `fs::write` uses the
+            // umask default (commonly 0644), so the test must set and ASSERT
+            // the mode rather than claim it (gpt56 review).
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let mode = std::fs::metadata(&env_file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the secret env file must be 0600");
+        }
+
+        let prev = std::env::var_os("SCCACHE_BIN");
+        std::env::set_var("SCCACHE_BIN", &fake);
+        let sccache_env = sccache::SccacheEnv {
+            vars: BTreeMap::from([
+                ("RUSTC_WRAPPER".to_string(), "sccache".to_string()),
+                (
+                    "SCCACHE_REDIS_ENDPOINT".to_string(),
+                    "redis://cache.invalid:6380".to_string(),
+                ),
+                (
+                    "SCCACHE_REDIS_PASSWORD".to_string(),
+                    "placeholder-password".to_string(), // pii-test-fixture
+                ),
+            ]),
+            mode: sccache::SccacheMode::Redis,
+        };
+        let stable = "/opt/heavy-build";
+        let prestart =
+            sccache::prestart_remote_shell_prefix(&sccache_env, stable, |v| shell_quote(v));
+        match prev {
+            Some(v) => std::env::set_var("SCCACHE_BIN", v),
+            None => std::env::remove_var("SCCACHE_BIN"),
+        }
+
+        // `true`/`:` stand in for the lockgen and scoped-build steps.
+        let cmd = render_remote_build_cmd(
+            Some(&env_file.to_string_lossy()),
+            &prestart,
+            "",
+            "true",
+            "true",
+        );
+        let out = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .await
+            .expect("run the composed wrapper");
+        assert!(
+            out.status.success(),
+            "wrapper failed: {cmd}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let seen = std::fs::read_to_string(&record)
+            .expect("the prestart must actually have run inside the wrapper");
+        let parts: Vec<&str> = seen.split('|').collect();
+        assert_eq!(
+            parts[0], stable,
+            "the daemon must be started with the STABLE root, never a per-job scratch"
+        );
+        assert_eq!(
+            parts[1], "placeholder-password", // pii-test-fixture
+            "the prestart must inherit the SOURCED secret — proving it runs after `set -a; . <file>`"
+        );
+        assert_eq!(parts[2], "0", "the daemon must never idle-exit and be respawned by a job");
+        assert!(
+            !env_file.exists(),
+            "the one-shot secret file must be gone by the time the build step runs"
         );
     }
 
