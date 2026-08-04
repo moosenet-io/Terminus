@@ -274,16 +274,28 @@ export async function listSessions(clientRowId?: string): Promise<RmcpSession[]>
   return r.sessions;
 }
 
-/** Revoke one session, or every session for one client. Exactly one of the two must be given.
+/** Revoke one session, or every session for one client — EXACTLY one (`RMCP_SELECTOR_RULE`).
  *
- *  The union types that at compile time, and the check below re-states it at RUNTIME — types are
- *  erased, and this call is reachable from untyped JS. The server enforces the same rule
- *  independently (see the contract note in `rmcpContract.ts`); this is the near end of a rule that
- *  has to hold at both ends, because the failure it prevents — a revoke that reports success
- *  having done nothing — reads to the operator as "access cut" and stops the investigation. */
+ *  The union expresses that at compile time; the check below re-states it at RUNTIME, because
+ *  types are erased and this is reachable from untyped JS. A union member is also not an
+ *  exclusive-or structurally: an object carrying BOTH fields satisfies `{sessionId: string}`, so
+ *  even a typed caller can pass one.
+ *
+ *  Neither ambiguous nor empty is resolved here. An earlier version took `'sessionId' in target`
+ *  first, which silently prioritised it — the operator asked for two revocations, got one, and was
+ *  told it succeeded, with no way to see which. On a control reached for mid-incident that is
+ *  worse than a refusal. The server enforces the same rule independently. */
 export function revokeSessions(target: { sessionId: string } | { clientRowId: string }): Promise<void> {
-  const sessionId = 'sessionId' in target ? target.sessionId : undefined;
-  const clientRowId = 'clientRowId' in target ? target.clientRowId : undefined;
+  const { sessionId, clientRowId } = target as { sessionId?: string; clientRowId?: string };
+  if (sessionId && clientRowId) {
+    return Promise.reject(
+      new RmcpError(
+        'invalid',
+        RMCP_TOOLS.sessionRevoke,
+        'a revoke must name either a session or a client, not both',
+      ),
+    );
+  }
   if (!sessionId && !clientRowId) {
     return Promise.reject(
       new RmcpError('invalid', RMCP_TOOLS.sessionRevoke, 'a revoke must name a session or a client'),

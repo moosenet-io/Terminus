@@ -393,7 +393,41 @@ describe('a delegated owner sees and touches only their own objects', () => {
   });
 });
 
-describe('a revoke must name a target — at both ends', () => {
+describe('a revoke must name EXACTLY ONE target — at both ends', () => {
+  it('the client refuses an AMBIGUOUS revoke rather than picking one by precedence', async () => {
+    // Structurally valid against the union (an object with both fields satisfies either member),
+    // so the type system does not catch this — which is the point.
+    await expect(
+      revokeSessions({ sessionId: 's-1', clientRowId: 'c-1' } as unknown as { sessionId: string }),
+    ).rejects.toMatchObject({ kind: 'invalid' });
+  });
+
+  it('the FIXTURE SERVER refuses an ambiguous revoke independently of the wrapper', async () => {
+    const { rmcpFixtureCall } = await import('./rmcpFixtures');
+    await expect(
+      rmcpFixtureCall('rmcp_session_revoke', { session_id: 's-1', client_id: 'c-1' }),
+    ).rejects.toMatchObject({ kind: 'invalid' });
+  });
+
+  it('an ambiguous revoke changes nothing — not even the selector it would have preferred', async () => {
+    // The failure this guards against is a PARTIAL success reported as a success: the operator
+    // asked for two revocations and got one.
+    //
+    // Targets s-3/c-3 deliberately. An earlier draft used s-1/c-1 and passed even against the
+    // pre-fix code — the `sessions` describe above revokes c-1's sessions before this runs, so
+    // "nothing changed" was true no matter what. A guard that cannot fail is not a guard; caught
+    // by running the non-vacuity check on this test rather than only on its neighbours. s-3
+    // belongs to c-3, which nothing else in this file touches.
+    const { rmcpFixtureCall } = await import('./rmcpFixtures');
+    const live = (await listSessions()).find(s => s.id === 's-3');
+    expect(live?.revokedAt).toBeNull(); // precondition, asserted so it cannot rot silently
+
+    await rmcpFixtureCall('rmcp_session_revoke', { session_id: 's-3', client_id: 'c-3' }).catch(() => undefined);
+
+    const after = (await listSessions()).find(s => s.id === 's-3');
+    expect(after?.revokedAt).toBeNull();
+  });
+
   it('the client refuses a targetless revoke at runtime, not only in the type system', async () => {
     // Types are erased; this call is reachable from untyped JS. The cast is the point of the test.
     await expect(revokeSessions({} as unknown as { sessionId: string })).rejects.toMatchObject({

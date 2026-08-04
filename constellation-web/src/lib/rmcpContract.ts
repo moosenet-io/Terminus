@@ -18,17 +18,35 @@ export const RMCP_TOOLS = {
   groupPreview: 'rmcp_group_preview',
   serverOwnerList: 'rmcp_server_owner_list',
   sessionList: 'rmcp_session_list',
-  // CONTRACT NOTE (review round 2) — `rmcp_session_revoke` MUST reject a call that names neither
-  // `session_id` nor `client_id`, with `invalid_argument`. It must NOT treat "no target" as "no
-  // rows matched" and answer success: a revocation that silently did nothing is the precise shape
-  // of failure that leaves an operator believing access was cut when it was not, and they stop
-  // looking. (The TypeScript wrapper's argument union already prevents a typed caller from
-  // sending one — that is not the point. This is a SERVER rule, because the server is the
-  // boundary, and a caller willing to send a malformed request is exactly what a boundary is for.)
   sessionRevoke: 'rmcp_session_revoke',
 } as const;
 
 export type RmcpToolName = (typeof RMCP_TOOLS)[keyof typeof RMCP_TOOLS];
+
+// ── Selector rule (contract, not implementation) ──────────────────────────────────────────────
+//
+// **Selectors are MUTUALLY EXCLUSIVE, and exactly one must be given.** A request naming none, or
+// more than one, is refused with `invalid_argument`. It is never resolved by precedence, and
+// never treated as "no rows matched".
+//
+// Stated here, once, as a property of the API rather than as an accident of some handler's `if`
+// order — which is exactly how the two failures below slipped in independently. Both are the same
+// bug wearing different hats, and both are worst on a destructive control reached for mid-incident:
+//
+//   • NO selector (round 2)   — revoked nothing, reported success. The operator believes access
+//                               was cut and stops investigating.
+//   • BOTH selectors (round 4) — asked for two things, got whichever the implementation happened
+//                               to test first, and was told it succeeded. "I did part of what you
+//                               asked and called it done" is worse than a refusal, because the
+//                               part that was skipped is invisible.
+//
+// Today this binds `rmcp_session_revoke` (`session_id` XOR `client_id`) — the only tool here that
+// accepts more than one selector. It is written as a general rule so the next multi-selector tool
+// inherits it instead of re-deriving it, and so the eventual server implements the same one: the
+// TypeScript wrapper's argument union is a compile-time courtesy, not a control, and the server
+// is the boundary that has to hold against callers that never saw it.
+export const RMCP_SELECTOR_RULE =
+  'exactly one selector must be given; none and more-than-one are both invalid_argument';
 
 /** Machine-readable failure kinds. Each maps to a distinct thing the operator should DO, which
  *  is the only reason to distinguish them:

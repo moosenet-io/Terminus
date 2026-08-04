@@ -625,11 +625,19 @@ export async function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string
       const now = new Date().toISOString();
       const sessionId = args.session_id as string | undefined;
       const clientRowId = args.client_id as string | undefined;
-      // A revoke naming NOTHING is refused, not answered with a cheerful success (review round 2).
-      // "Matched no rows" and "you never said what to revoke" are different facts, and reporting
-      // the second as the first tells an operator that access was cut when nothing was touched —
-      // after which they stop looking. The fixture enforces this itself precisely because it is a
-      // SERVER boundary: the caller's type signature is not a control the server may rely on.
+      // `RMCP_SELECTOR_RULE`: exactly one selector. Both refusals below are the same rule, and the
+      // fixture enforces it itself precisely because it is a SERVER boundary — the caller's type
+      // signature is not a control the server may rely on.
+      //
+      // BOTH (round 4): refused rather than resolved by precedence. Picking one and reporting
+      // success tells an operator that two revocations happened when one did, and which one they
+      // got would depend on the order of the tests below rather than on anything they can see.
+      if (sessionId && clientRowId) {
+        throw new RmcpError('invalid', tool, 'a revoke must name either a session_id or a client_id, not both');
+      }
+      // NEITHER (round 2): "matched no rows" and "you never said what to revoke" are different
+      // facts, and reporting the second as the first convinces an operator access was cut when
+      // nothing was touched — after which they stop looking.
       if (!sessionId && !clientRowId) {
         throw new RmcpError('invalid', tool, 'a revoke must name a session_id or a client_id');
       }
