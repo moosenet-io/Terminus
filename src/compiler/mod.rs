@@ -6814,16 +6814,35 @@ Source:
     /// separator and the NUL terminator, so it accepted directories whose
     /// sockets could not actually be created. A guard against a silent failure
     /// has to be proven against the real thing.
+    ///
+    /// TERM #594 — the fixture must NOT come from the ambient `TMPDIR`.
+    /// `tempfile::tempdir()` honours `TMPDIR`, and on a build host `TMPDIR` is
+    /// the compiler's own long per-job scratch path (PCON-10). That made the
+    /// fixture — a directory of a length this test CHOOSES — unbuildable, so the
+    /// test failed on the build host and passed everywhere else: it was asserting
+    /// something about the environment, not about the code. The property under
+    /// test is purely about path LENGTH, so the base must be a SHORT root the
+    /// test controls. `/tmp` is that root: it exists on every Linux host, is 4
+    /// bytes, and is used here only for a few empty directories and one socket
+    /// (never as a build target — the PCON-10 "never the /tmp tmpfs" rule is
+    /// about `CARGO_TARGET_DIR`/`TMPDIR` sizing, not about a byte-sized fixture).
     #[test]
     fn sun_path_budget_matches_the_kernel() {
         use std::os::unix::net::UnixListener;
 
-        // Build a directory whose path length is exactly TMPDIR_MAX_BYTES.
-        let base = tempfile::tempdir().expect("tempdir");
+        // Build a directory whose path length is exactly TMPDIR_MAX_BYTES,
+        // rooted at a SHORT, test-controlled base — never `std::env::temp_dir()`
+        // / `tempfile::tempdir()`, which read the ambient TMPDIR.
+        const SHORT_ROOT: &str = "/tmp";
+        let base = tempfile::Builder::new()
+            .prefix("sunpath")
+            .tempdir_in(SHORT_ROOT)
+            .expect("tempdir under a short, test-controlled root");
         let base_len = base.path().as_os_str().as_encoded_bytes().len();
         assert!(
             base_len + 2 <= TMPDIR_MAX_BYTES,
-            "tempdir {base_len} too long to build this fixture"
+            "fixture base {base_len} bytes is too long to build this fixture — \
+             {SHORT_ROOT} must stay short; this must never depend on TMPDIR"
         );
         let pad = TMPDIR_MAX_BYTES - base_len - 1; // -1 for the joining '/'
         let dir = base.path().join("d".repeat(pad));
