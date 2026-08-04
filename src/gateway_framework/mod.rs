@@ -3028,7 +3028,11 @@ mod tests {
     fn a_connector_scope_hides_and_blocks_the_same_tools() {
         let fw = framework_with(policy_allowing("dev-box", &["*"]), 10);
         let principal = test_principal("dev-box");
-        let scope = connector_scope(&["ledger_*"], &["peerone"]);
+        // Note `ledger_*` matches the ADVERTISED name, so it deliberately does
+        // NOT reach `peerone__ledger_accounts` — the namespace forms are what
+        // address federated tools. Both peers are in a group; only one is in
+        // the client's namespaces, which is the case this test is about.
+        let scope = connector_scope(&["ledger_*", "peerone::*", "peertwo::*"], &["peerone"]);
 
         let catalog = vec![
             tool_json("ledger_accounts"),
@@ -3054,6 +3058,12 @@ mod tests {
             );
         }
         assert_eq!(visible, vec!["ledger_accounts", "peerone__ledger_accounts"]);
+        // And the tool that a group DID match but the namespace refused names
+        // the namespace as the reason, not the group.
+        let denial = fw
+            .guard_client_scope(Some(&principal), Some(&scope), "peertwo__ledger_accounts")
+            .expect_err("an unscoped upstream is uncallable even when a group matches");
+        assert!(denial.contains("no_namespace"), "reason in denial: {denial}");
     }
 
     /// A connector with no scoping rows reaches nothing, even when the account

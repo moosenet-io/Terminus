@@ -885,12 +885,22 @@ mod tests {
         let catalog = ["weather_now", "peerone__weather_now", "media_search"];
         assert!(effective(&allow_all, &none, catalog).is_empty());
         for tool in catalog {
-            assert_eq!(
-                decide(&allow_all, &none, tool),
-                Decision::Deny(DenyReason::NoGroup),
-                "an unscoped client must reach nothing, even under an unrestricted grant"
+            assert!(
+                !decide(&allow_all, &none, tool).is_allowed(),
+                "an unscoped client must reach nothing, even under an unrestricted grant: {tool}"
             );
         }
+        // The reason differs by dimension, and BOTH dimensions are empty for an
+        // unscoped client: a local tool has no group, a federated one has no
+        // namespace (checked first, since it is the more specific refusal).
+        assert_eq!(
+            decide(&allow_all, &none, "weather_now").deny_code(),
+            Some("no_group")
+        );
+        assert_eq!(
+            decide(&allow_all, &none, "peerone__weather_now").deny_code(),
+            Some("no_namespace")
+        );
     }
 
     /// An empty group, and a group whose patterns match nothing, are both the
