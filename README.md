@@ -626,10 +626,14 @@ namespaces, the groups, or a missing gateway is responsible.
 cached, so every write against a scope-affecting table — a client's groups or namespaces, a
 group's own patterns, a client being disabled, a namespace delegation being reassigned or
 cleared — returns through one chokepoint in the store that bumps a process-wide *generation*
-counter. A resolution may only populate the cache at the generation it began at, so a read
-that started before a revocation cannot repopulate a stale permit after it. The distinction
-this protects is that a stale *denial* costs someone a retry, while a stale *permit* is
-revoked authority that still works.
+counter — **on both sides of the write**. Bumping before it means that from the instant a
+revocation begins, no resident cache entry can be served, so there is no interval in which a
+committed revocation is still being honoured from cache; bumping after it catches a
+resolution that read the old rows and is about to cache them, and covers a write that fails
+partway. A resolution may only populate the cache at the generation it began at. Concurrent
+readers re-derive for the duration of a write — a re-read, not a wrong answer. The
+distinction this protects is that a stale *denial* costs someone a retry, while a stale
+*permit* is revoked authority that still works.
 
 That rule is **enforced rather than documented**: a test reads the store's own source and
 fails, naming the function, if a mutation of any scope-affecting table is ever added outside

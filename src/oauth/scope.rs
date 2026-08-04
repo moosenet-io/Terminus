@@ -637,8 +637,7 @@ pub const DENY_NO_ACCOUNT_GRANT: &str = "no_account_grant";
 ///
 /// ## How future writes are held to this
 /// Not by asking them to remember. Every mutation of a table in
-/// [`SCOPE_AFFECTING_TABLES`] returns through the store's `scope_write`
-/// chokepoint, and
+/// [`SCOPE_AFFECTING_TABLES`] is bracketed by a held [`ScopeWrite`] guard, and
 /// `store::tests::every_scope_affecting_write_bumps_the_generation` reads the
 /// store's own source and fails if one ever appears outside it. Round 2 of
 /// review found that round 1 had left the tool-group DEFINITION writes
@@ -713,6 +712,69 @@ pub fn scope_generation() -> u64 {
 /// read; the cost of winning it the old way was a live revoked permission.
 pub fn bump_scope_generation() -> u64 {
     SCOPE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Brackets one scope-affecting write, advancing the epoch on BOTH sides of it.
+///
+/// ## Why both sides — the window a post-write bump leaves open
+/// Round 4 of review found that invalidating only AFTER the database operation
+/// is not linearizable with reads. Between the moment the write COMMITS and the
+/// moment the bump lands, a cache hit still finds an entry whose generation is
+/// current, so it is served without consulting the database — and a revocation
+/// that has already committed is not yet enforced. The read-side generation
+/// check cannot close this: the entry genuinely was valid a microsecond ago,
+/// and nothing has told the cache otherwise yet.
+///
+/// This is a DIFFERENT window from the one round 2 closed. That one was an
+/// in-flight resolve repopulating the cache after an invalidation; this one is
+/// a plain hit on a resident entry. Both are now closed, by the two bumps:
+///
+/// - **On `begin`** — from the instant the revocation starts, every resident
+///   entry is stale, so no cached answer can be served while the write is in
+///   progress. There is no interval in which a committed revocation is served
+///   from cache, because the invalidation precedes the commit rather than
+///   trailing it.
+/// - **On `drop`** — for the round-2 case: a resolve that read the OLD rows
+///   before the commit may still be in flight and about to cache them, and the
+///   trailing bump makes whatever it cached unusable. It also runs when the
+///   write fails or panics partway, so a half-applied write never leaves a
+///   cache the process believes is fresh.
+///
+/// The cost is re-derivation for concurrent readers for the duration of the
+/// write: a re-read, not a wrong answer. That is the correct direction of error
+/// for an authorization control and the same trade made everywhere else here.
+///
+/// `Drop` rather than an explicit trailing call so the guarantee survives the
+/// paths that are easy to forget — an early `return`, a `?` propagation, or a
+/// panic. `set_client_tool_groups` has two early returns that write nothing;
+/// they bump anyway, which costs a re-read and removes any need to reason about
+/// which exit paths matter.
+#[must_use = "the guard must be HELD for the duration of the write — binding it to `_` \
+              drops it immediately, so both bumps happen before the write and the \
+              post-write invalidation is lost"]
+pub(crate) struct ScopeWrite {
+    counter: &'static AtomicU64,
+}
+
+impl ScopeWrite {
+    /// Begin a scope-affecting write against the process-global epoch.
+    pub(crate) fn begin() -> Self {
+        Self::on(&SCOPE_GENERATION)
+    }
+
+    /// Begin against an explicit counter, so the ordering can be tested without
+    /// racing every other test in the binary — the same injection the cache
+    /// uses. This is the production code path; only the counter differs.
+    fn on(counter: &'static AtomicU64) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for ScopeWrite {
+    fn drop(&mut self) {
+        self.counter.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 struct CacheEntry {
@@ -1623,6 +1685,105 @@ mod tests {
         assert!(
             cache.get("cid").is_none(),
             "an entry from a superseded epoch must never be served, however fresh its timestamp"
+        );
+    }
+
+    /// **Round 4 finding — the commit-to-bump window.**
+    ///
+    /// A post-write-only bump leaves an interval that starts when the write
+    /// COMMITS and ends when the bump lands. In it, a plain cache hit finds an
+    /// entry whose generation is still current and serves it without touching
+    /// the database — so a revocation that has already committed is not yet
+    /// enforced. The read-side generation check cannot help: the entry really
+    /// was valid a moment ago.
+    ///
+    /// This interleaves the read at exactly that point: guard begun, write
+    /// committed, guard NOT yet dropped. Remove the bump in `ScopeWrite::on`
+    /// (the pre-write half) and this test fails — the cached permitting scope
+    /// is served after the revocation committed.
+    ///
+    /// It observes the PRODUCTION path: the guard constructed here is the same
+    /// `ScopeWrite` the store's seven write methods hold, with the same
+    /// pre-write bump and the same `Drop`. Only the counter is injected, which
+    /// is the same technique the cache tests use so a test of an ordering
+    /// property is not itself racing every other test in the binary.
+    #[test]
+    fn a_read_between_the_commit_and_the_post_write_bump_is_not_served() {
+        let counter: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
+        let cache = ScopeCache::with_counter(Duration::from_secs(3600), counter);
+
+        // A connector's scope is resolved and cached, permitting a tool.
+        let permitting = Arc::new(scope(&["media_*"], &[]));
+        put_now(&cache, "cid", Arc::clone(&permitting));
+        let hit = cache.get("cid").expect("precondition: the scope is cached");
+        assert!(decide(&allow_all, &hit, "media_search").is_allowed());
+
+        // An operator revokes it. The store method opens by taking the guard,
+        // and the database write then commits...
+        let guard = ScopeWrite::on(counter);
+
+        // ...and HERE, after the commit and before the guard drops, a
+        // concurrent request reads the cache. This is the window.
+        assert!(
+            cache.get("cid").is_none(),
+            "a revocation that has already committed must not be served from cache while the \
+             write is still in progress"
+        );
+
+        // The trailing bump still happens, for the in-flight-resolve case.
+        let before_drop = counter.load(Ordering::SeqCst);
+        drop(guard);
+        assert!(
+            counter.load(Ordering::SeqCst) > before_drop,
+            "dropping the guard must still advance the epoch"
+        );
+        assert!(cache.get("cid").is_none());
+    }
+
+    /// The guard advances the epoch on both sides, and the production
+    /// constructor is wired to the same logic as the injected one.
+    #[test]
+    fn the_write_guard_bumps_before_and_after() {
+        let counter: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
+        let start = counter.load(Ordering::SeqCst);
+
+        {
+            let _guard = ScopeWrite::on(counter);
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                start + 1,
+                "the epoch must advance BEFORE the write, not only after it"
+            );
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            start + 2,
+            "and again when the guard drops"
+        );
+
+        // The production entry point advances the global epoch the same way.
+        // Only the direction is asserted, because that counter is shared with
+        // the rest of the test binary and only ever climbs.
+        let global_before = scope_generation();
+        {
+            let _guard = ScopeWrite::begin();
+            assert!(scope_generation() > global_before);
+        }
+        assert!(scope_generation() > global_before + 1);
+    }
+
+    /// A guard dropped early — `let _ = ScopeWrite::begin()` — puts both bumps
+    /// before the write and loses the trailing invalidation. The source guard
+    /// in `store` rejects that binding; this pins why it matters.
+    #[test]
+    fn dropping_the_guard_early_collapses_both_bumps_to_the_front() {
+        let counter: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
+        let start = counter.load(Ordering::SeqCst);
+        let _ = ScopeWrite::on(counter); // dropped immediately
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            start + 2,
+            "both bumps land up front, so nothing invalidates work that lands later"
         );
     }
 

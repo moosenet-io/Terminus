@@ -28,6 +28,7 @@ use crate::error::ToolError;
 use crate::oauth::model::{
     Account, AuthCode, Client, Consent, RefreshToken, ServerOwner, ToolGroup,
 };
+use crate::oauth::scope::ScopeWrite;
 use crate::oauth::{Argon2idHash, OauthConfig, SecretHash};
 
 /// Maximum pooled connections. The OAuth endpoints are latency-sensitive
@@ -263,7 +264,8 @@ impl OauthStore {
         owner_account_id: Uuid,
         registration_source: &str,
     ) -> Result<Uuid, ToolError> {
-        let result = sqlx::query_scalar::<_, Uuid>(
+        let _scope_write = ScopeWrite::begin();
+        sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO rmcp_client (client_id, client_secret_hash, name, redirect_uris, \
                                       grant_types, token_endpoint_auth_method, \
                                       owner_account_id, registration_source) \
@@ -279,8 +281,7 @@ impl OauthStore {
         .bind(registration_source)
         .fetch_one(&self.pool)
         .await
-        .map_err(unique_aware("a client with that client_id already exists"));
-        scope_write(result)
+        .map_err(unique_aware("a client with that client_id already exists"))
     }
 
     /// List the clients an account owns.
@@ -309,31 +310,38 @@ impl OauthStore {
         client_id: Uuid,
         disabled: bool,
     ) -> Result<(), ToolError> {
-        let result = sqlx::query("UPDATE rmcp_client SET disabled = $2 WHERE id = $1")
+        let _scope_write = ScopeWrite::begin();
+        sqlx::query("UPDATE rmcp_client SET disabled = $2 WHERE id = $1")
             .bind(client_id)
             .bind(disabled)
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(db);
-        // Disabling is the fastest revocation an operator has; it must not wait
-        // out a resolver's cache TTL.
-        scope_write(result)
+            .map_err(db)
     }
 
     // -----------------------------------------------------------------------
     // Tool groups and client scoping
     //
-    // INVARIANT: every write touching a table in
-    // `crate::oauth::scope::SCOPE_AFFECTING_TABLES` returns through
-    // `scope_write`, which invalidates RMCP-07's resolution cache — including
-    // resolutions already in flight.
+    // INVARIANT: every method touching a table in
+    // `crate::oauth::scope::SCOPE_AFFECTING_TABLES` opens with
+    //
+    //     let _scope_write = ScopeWrite::begin();
+    //
+    // which invalidates RMCP-07's resolution cache on BOTH sides of the write —
+    // before it, so a committed revocation is never served from a cache hit
+    // while the write is still in progress, and again on drop, for a resolve
+    // that read the old rows and is about to cache them. See `ScopeWrite`.
+    //
+    // The binding must be NAMED. `let _ = ScopeWrite::begin()` drops the guard
+    // immediately, putting both bumps before the write and losing the trailing
+    // one entirely.
     //
     // This is ENFORCED, not merely stated: `every_scope_affecting_write_bumps_
     // the_generation` reads this file's own source and fails if a mutation of
-    // one of those tables ever appears in a function that does not go through
-    // the chokepoint. Add a group-pattern edit, a client-scope delete, or any
-    // future mutation without it and the build goes red naming the function.
+    // one of those tables ever appears in a method that does not hold the
+    // guard. Add a group-pattern edit, a client-scope delete, or any future
+    // mutation without it and the build goes red naming the method.
     // -----------------------------------------------------------------------
 
     /// Insert a tool group. An empty `patterns` slice is permitted and stores a
@@ -346,7 +354,8 @@ impl OauthStore {
         patterns: &[String],
         owner_account_id: Uuid,
     ) -> Result<Uuid, ToolError> {
-        let result = sqlx::query_scalar::<_, Uuid>(
+        let _scope_write = ScopeWrite::begin();
+        sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO rmcp_tool_group (name, description, patterns, owner_account_id) \
              VALUES ($1, $2, $3, $4) RETURNING id",
         )
@@ -356,8 +365,7 @@ impl OauthStore {
         .bind(owner_account_id)
         .fetch_one(&self.pool)
         .await
-        .map_err(unique_aware("a tool group with that name already exists"));
-        scope_write(result)
+        .map_err(unique_aware("a tool group with that name already exists"))
     }
 
     /// The groups a client draws on.
@@ -467,6 +475,7 @@ impl OauthStore {
         client_id: Uuid,
         group_ids: &[Uuid],
     ) -> Result<(), ToolError> {
+        let _scope_write = ScopeWrite::begin();
         let mut tx = self.pool.begin().await.map_err(db)?;
 
         // `FOR SHARE` locks the client row for the rest of the transaction, so
@@ -535,7 +544,7 @@ impl OauthStore {
         // not a commit that provably did not happen, and an unnecessary
         // invalidation costs one store read while a missed one leaves a revoked
         // permission live.
-        scope_write(tx.commit().await.map_err(db))
+        tx.commit().await.map_err(db)
     }
 
     /// Replace a client's namespace assignments wholesale, after verifying that
@@ -552,6 +561,7 @@ impl OauthStore {
         client_id: Uuid,
         namespaces: &[String],
     ) -> Result<(), ToolError> {
+        let _scope_write = ScopeWrite::begin();
         let mut tx = self.pool.begin().await.map_err(db)?;
 
         // `FOR SHARE`, exactly as in `set_client_tool_groups`. Round 8 caught
@@ -613,7 +623,7 @@ impl OauthStore {
         // not a commit that provably did not happen, and an unnecessary
         // invalidation costs one store read while a missed one leaves a revoked
         // permission live.
-        scope_write(tx.commit().await.map_err(db))
+        tx.commit().await.map_err(db)
     }
 
     // -----------------------------------------------------------------------
@@ -1153,7 +1163,8 @@ impl OauthStore {
         namespace: &str,
         owner_account_id: Uuid,
     ) -> Result<(), ToolError> {
-        let result = sqlx::query(
+        let _scope_write = ScopeWrite::begin();
+        sqlx::query(
             "INSERT INTO rmcp_server_owner (namespace, owner_account_id) VALUES ($1, $2) \
              ON CONFLICT (namespace) DO UPDATE SET owner_account_id = EXCLUDED.owner_account_id, \
                                                    granted_at = now()",
@@ -1163,11 +1174,7 @@ impl OauthStore {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(db);
-        // A delegation change narrows an arbitrary number of clients at once —
-        // `client_namespaces` re-joins ownership, so reassigning a namespace
-        // silently strips it from every client the previous owner scoped to it.
-        scope_write(result)
+        .map_err(db)
     }
 
     /// The namespaces an account owns. Empty for an account that owns none —
@@ -1203,51 +1210,14 @@ impl OauthStore {
 
     /// Remove a delegation.
     pub async fn clear_server_owner(&self, namespace: &str) -> Result<(), ToolError> {
-        let result = sqlx::query("DELETE FROM rmcp_server_owner WHERE namespace = $1")
+        let _scope_write = ScopeWrite::begin();
+        sqlx::query("DELETE FROM rmcp_server_owner WHERE namespace = $1")
             .bind(namespace)
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(db);
-        // The most narrowing write in the schema: clearing a delegation removes
-        // that whole federated server from every client scoped to it.
-        scope_write(result)
+            .map_err(db)
     }
-}
-
-/// The single chokepoint every scope-affecting write returns through.
-///
-/// Invalidates RMCP-07's resolution cache and hands the outcome straight back,
-/// so a write method's tail becomes `scope_write(result)` instead of the
-/// three-line remember-to-invalidate dance that round 1 shipped and round 2
-/// found holes in.
-///
-/// ## Why a function plus a source guard, rather than a type
-/// The instinct is to make this impossible to skip with a type — a `#[must_use]`
-/// token threaded through every write. That does not actually work here: any
-/// in-crate caller can mint such a token and claim an invalidation it never
-/// performed, which is the same "a data-free token proves nothing" objection
-/// review round 5 raised against exactly that shape in
-/// [`OauthStore::set_client_tool_groups`]. It would look like enforcement and be
-/// documentation.
-///
-/// What genuinely enforces the rule is
-/// `every_scope_affecting_write_bumps_the_generation`, which reads this file's
-/// own source, finds every mutation of a table in
-/// [`crate::oauth::scope::SCOPE_AFFECTING_TABLES`], and fails if the enclosing
-/// function does not route through here. That catches a NEW write added by an
-/// author who never read this comment — which is the failure mode that matters,
-/// and the one a comment cannot address. It is the same self-scanning idiom the
-/// repo already uses for `no_pii_in_own_source_tree` and the hermeticity
-/// ratchet.
-///
-/// Invalidating slightly too often is free (one extra store read); invalidating
-/// too rarely leaves revoked authority usable. So the rule is keyed on the
-/// TABLE, not on a judgement about whether a particular write could narrow
-/// anything — a judgement is exactly what gets made wrong.
-fn scope_write<T>(outcome: T) -> T {
-    crate::oauth::scope::bump_scope_generation();
-    outcome
 }
 
 /// Map a sqlx error to a [`ToolError`] without leaking connection details.
@@ -1338,6 +1308,14 @@ mod tests {
             if bodies.is_empty() {
                 bodies.push((current, String::new()));
             }
+            // COMMENTS ARE NOT CODE. The section comment above these methods
+            // quotes the guard verbatim as an example, and without this a
+            // method that lost its real guard could still be "covered" by a
+            // comment sitting in its span. A guard satisfied by prose is the
+            // exact failure mode this whole review thread has been about.
+            if trimmed.starts_with("//") {
+                continue;
+            }
             let last = bodies.last_mut().expect("seeded above");
             last.1.push_str(line);
             last.1.push('\n');
@@ -1360,10 +1338,20 @@ mod tests {
             if mutated.is_empty() {
                 continue;
             }
-            if !body.contains("scope_write(") {
-                mutated.sort_unstable();
-                mutated.dedup();
-                offenders.push(format!("  {name}: mutates {mutated:?} without scope_write"));
+            mutated.sort_unstable();
+            mutated.dedup();
+            if !body.contains("let _scope_write = ScopeWrite::begin();") {
+                offenders.push(format!(
+                    "  {name}: mutates {mutated:?} without holding the ScopeWrite guard"
+                ));
+            } else if body.contains("let _ = ScopeWrite::begin()") {
+                // The guard's whole value is being HELD across the write. Bound
+                // to `_` it drops immediately, so both bumps land before the
+                // write and the trailing invalidation is silently lost.
+                offenders.push(format!(
+                    "  {name}: binds ScopeWrite to `_`, which drops it immediately and loses \
+                     the post-write invalidation — bind it to a NAME"
+                ));
             }
         }
 
@@ -1373,7 +1361,7 @@ mod tests {
              resolution cache. A cached connector scope would keep permitting the OLD answer \
              until the TTL expired — narrowing a group's patterns or a client's scope is a \
              REVOCATION and must take effect on the next call. Return the outcome through \
-             `scope_write(..)`:\n{}",
+             `let _scope_write = ScopeWrite::begin();` as the method's first statement:\n{}",
             offenders.len(),
             offenders.join("\n")
         );
@@ -1382,7 +1370,7 @@ mod tests {
         // broke the function splitting would otherwise pass vacuously.
         let covered = bodies
             .iter()
-            .filter(|(_, body)| body.contains("scope_write("))
+            .filter(|(_, body)| body.contains("let _scope_write = ScopeWrite::begin();"))
             .count();
         assert!(
             covered >= 7,
