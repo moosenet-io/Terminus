@@ -102,12 +102,34 @@ const HELPER_SUBCOMMANDS: &[&str] = &[
 /// it comes from a transcript file's mtime read as whole seconds
 /// (`DateTime::from_timestamp(secs, 0)`), so it is already whole-second and
 /// stable for an unchanged file. Reviewed, not changed.)
-/// Linux exports `/proc/<pid>/stat`'s `starttime` in USER_HZ, which the kernel
-/// fixes at 100 for the procfs interface regardless of the configured CONFIG_HZ.
-const PROC_USER_HZ: u64 = 100;
+/// Fallback clock-tick rate when the observed host will not tell us its own.
+///
+/// `/proc/<pid>/stat`'s `starttime` is in the host's USER_HZ
+/// (`sysconf(_SC_CLK_TCK)`), which is 100 on every Linux the fleet runs but is
+/// NOT universally 100 — alpha uses 1024, and a wrong divisor silently yields a
+/// wrong start time rather than an error. So the rate is READ from the host
+/// (`getconf CLK_TCK`, which works identically over the local and ssh
+/// executors) and this constant is only the fallback when that probe fails.
+/// (gpt56/opus review, TERM #605.)
+const DEFAULT_USER_HZ: u64 = 100;
+
+/// Parse `getconf CLK_TCK` output into a usable tick rate.
+///
+/// Fails CLOSED to [`DEFAULT_USER_HZ`] on anything unparseable or non-positive:
+/// a zero would divide-by-zero and a negative is meaningless, and neither is
+/// worth failing a whole listing over when the fallback is right on every host
+/// the fleet actually has.
+fn parse_clock_ticks(stdout: &str) -> u64 {
+    stdout
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_USER_HZ)
+}
 
 /// Parse a batched `cat /proc/stat /proc/<pid>/stat ...` into the boot time and
-/// each pid's `starttime` (field 22, in [`PROC_USER_HZ`] ticks since boot).
+/// each pid's `starttime` (field 22, in the host's clock ticks since boot).
 ///
 /// The lines are distinguishable without separators: `/proc/stat`'s lines all
 /// begin with a WORD (`cpu`, `btime`, `intr`, …) while a `/proc/<pid>/stat` line
@@ -143,11 +165,24 @@ fn parse_proc_starttimes(stdout: &str) -> (Option<i64>, HashMap<i32, u64>) {
     (btime, starts)
 }
 
-/// The EXACT, poll-independent start time of a process: boot time plus its
-/// `starttime` ticks. Depends on nothing that changes between polls, so it is
-/// stable by construction rather than by rounding.
-fn start_epoch_from_proc(btime: i64, ticks: u64) -> i64 {
-    btime.saturating_add((ticks / PROC_USER_HZ) as i64)
+/// The process's start time to WHOLE-SECOND resolution: boot time plus its
+/// `starttime` ticks, floored to a second.
+///
+/// Not "exact" to the tick — the sub-second remainder is deliberately dropped,
+/// because a whole second is the resolution this field is contracted to report
+/// (see [`started_at_from_etimes`]) and keeping the fraction would put back
+/// precision consumers must not diff on. What matters is that it depends on
+/// NOTHING that changes between polls: boot time and the process's own start
+/// tick are both fixed for the life of the process, so the value is stable by
+/// construction rather than by rounding. (gpt56 review corrected an earlier
+/// "exact" framing here.)
+///
+/// `hz` is the host's clock-tick rate; a zero can never reach here
+/// ([`parse_clock_ticks`] floors it), but it is guarded anyway so a future
+/// caller cannot divide by zero.
+fn start_epoch_from_proc(btime: i64, ticks: u64, hz: u64) -> i64 {
+    let hz = hz.max(1);
+    btime.saturating_add((ticks / hz) as i64)
 }
 
 fn started_at_from_etimes(now: DateTime<Utc>, etimes: i64) -> DateTime<Utc> {
@@ -159,6 +194,13 @@ fn started_at_from_etimes(now: DateTime<Utc>, etimes: i64) -> DateTime<Utc> {
     // output, so a hostile or corrupt line must degrade, never abort the whole
     // listing. A nonsensical value falls back to `now` — visibly wrong for that
     // one session rather than fatal for every session on the host.
+    // A NEGATIVE elapsed time is nonsense — `ps` never emits one, so it means a
+    // corrupt or hostile line. Subtracting it would place the process's start in
+    // the FUTURE, which is worse than useless: it reads as a real fact. Degrade
+    // to `now` like any other unusable value (gpt56 review).
+    if etimes < 0 {
+        return whole_second_now;
+    }
     Duration::try_seconds(etimes)
         .and_then(|d| whole_second_now.checked_sub_signed(d))
         .unwrap_or(whole_second_now)
@@ -437,6 +479,12 @@ pub(crate) async fn discover(
     // every listing, including over ssh. A failure here is NOT fatal — it falls
     // back to the etimes derivation, whose residual is documented on
     // `started_at_from_etimes`.
+    // The host's own clock-tick rate; `getconf` is present on every Linux and
+    // the probe degrades to the fleet-correct default if it is not.
+    let user_hz = match exec.run(&["getconf", "CLK_TCK"]).await {
+        Ok(o) if o.ok() => parse_clock_ticks(&o.stdout),
+        _ => DEFAULT_USER_HZ,
+    };
     let (boot_time, proc_starts) = {
         let mut paths: Vec<String> = vec!["/proc/stat".to_string()];
         paths.extend(candidates.iter().map(|(r, _)| format!("/proc/{}/stat", r.pid)));
@@ -600,7 +648,10 @@ pub(crate) async fn discover(
                 boot_time
                     .zip(proc_starts.get(&row.pid).copied())
                     .and_then(|(b, ticks)| {
-                        chrono::DateTime::from_timestamp(start_epoch_from_proc(b, ticks), 0)
+                        chrono::DateTime::from_timestamp(
+                            start_epoch_from_proc(b, ticks, user_hz),
+                            0,
+                        )
                     })
                     .unwrap_or_else(|| started_at_from_etimes(now, row.etimes)),
             ),
@@ -834,15 +885,50 @@ intr 99 1 2
 
         // 360000 ticks / 100 Hz = 3600s after boot.
         assert_eq!(
-            start_epoch_from_proc(btime.unwrap(), starts[&1402]),
+            start_epoch_from_proc(btime.unwrap(), starts[&1402], 100),
             1_700_003_600
         );
         // Poll-independent by construction: the same inputs on any later pass
         // give the same answer, because `now` is not an input.
         assert_eq!(
-            start_epoch_from_proc(btime.unwrap(), starts[&1402]),
-            start_epoch_from_proc(btime.unwrap(), starts[&1402])
+            start_epoch_from_proc(btime.unwrap(), starts[&1402], 100),
+            start_epoch_from_proc(btime.unwrap(), starts[&1402], 100)
         );
+    }
+
+    /// gpt56/opus review: the tick rate is the HOST's, not a constant. A host
+    /// with a different USER_HZ must not be silently misconverted, and an
+    /// unusable `getconf` answer must fall back rather than divide by zero.
+    #[test]
+    fn the_clock_tick_rate_comes_from_the_host_and_fails_closed() {
+        assert_eq!(parse_clock_ticks("100\n"), 100);
+        assert_eq!(parse_clock_ticks(" 1024 "), 1024);
+        for bad in ["", "0", "-5", "not-a-number", "100 200"] {
+            assert_eq!(
+                parse_clock_ticks(bad),
+                DEFAULT_USER_HZ,
+                "unusable getconf output {bad:?} must fall back, never poison the divisor"
+            );
+        }
+        // The SAME ticks under a different host rate is a different instant —
+        // which is exactly why hardcoding 100 was wrong.
+        assert_eq!(start_epoch_from_proc(1_000, 1024, 1024), 1_001);
+        assert_eq!(start_epoch_from_proc(1_000, 1024, 100), 1_010);
+        // And a zero can never divide.
+        assert_eq!(start_epoch_from_proc(1_000, 1024, 0), 1_000 + 1024);
+    }
+
+    /// A negative `etimes` must never place a process's start in the FUTURE —
+    /// that reads as a real fact rather than as the corrupt input it is.
+    #[test]
+    fn a_negative_etimes_never_produces_a_future_start_time() {
+        let now = "2026-08-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for etimes in [-1i64, -3600, i64::MIN] {
+            assert!(
+                started_at_from_etimes(now, etimes) <= now,
+                "etimes {etimes} produced a start time in the future"
+            );
+        }
     }
 
     /// The documented residual of the FALLBACK, pinned rather than hidden:
