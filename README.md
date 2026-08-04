@@ -1161,13 +1161,14 @@ never frozen into a snapshot that has drifted from what the server actually serv
 
 ### Pattern syntax
 
-Exactly three shapes parse. There is no glob, no regex, and no negation.
+Exactly these shapes parse. There is no glob, no regex, and no negation.
 
 | Pattern | Meaning | Example |
 |---|---|---|
 | `tool_name` | that one tool, exactly | `weather_get` |
-| `prefix*` | every advertised name starting with `prefix` | `weather_*` |
+| `prefix*` | every **local** tool whose name starts with `prefix` | `weather_*` |
 | `namespace__*` | every tool advertised by one mesh upstream | `peerhub__*` |
+| `namespace__prefix*` | tools from one upstream whose bare name starts with `prefix` | `peerhub__ledger*` |
 | `*` | every tool — **operator-owned groups only** | |
 
 This is the same vocabulary the gateway's MESH-08 allow entries already use, deliberately,
@@ -1179,9 +1180,12 @@ so an operator does not have to hold two pattern languages in their head.
 - **No negation.** Subtraction is the existing deny layer's job
   (`DEFAULT_SENSITIVE_DENY_PREFIXES`). Two subtractive mechanisms in two files is how two
   authorization systems come to disagree.
-- **Patterns match the ADVERTISED name**, which is already namespaced for a federated
-  tool. So `a*` does **not** reach `peerhub__alerts_list`: a prefix stays on its own side of
-  the namespace boundary, and crossing it takes a pattern that names the upstream.
+- **An unqualified pattern matches only unqualified (local) names.** A bare prefix does
+  not span the `__` mesh separator, so `peer*` matches a local `peer_status` but **not**
+  `peerhub__alerts_list` — a namespace that merely shares the prefix's letters is not a
+  match. Reaching a federated tool takes a pattern that names the upstream, which an author
+  can only write deliberately. Absence of a namespace qualifier means "local only", never
+  "anything that happens to start this way".
 - **A bad pattern is refused when it is stored, never when it is matched.** Matching is
   pure and total; an error there would be an availability failure inside the authorization
   system rather than a safety property.

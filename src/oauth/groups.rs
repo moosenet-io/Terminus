@@ -40,6 +40,22 @@
 //! authorization bug where a scoping record that failed to load silently became
 //! full access.
 //!
+//! ## The namespace boundary, and the matcher RMCP-07 has to collapse onto
+//! An UNQUALIFIED pattern matches only UNQUALIFIED (local) tool names. A bare
+//! prefix does not span the mesh separator, so `peer*` cannot reach
+//! `peerhub__alerts_list` merely because the namespace shares its letters —
+//! reaching a federated tool takes a pattern that names the upstream. Absence
+//! of a namespace qualifier means "local only", never "anything that starts
+//! this way", which is the same fail-closed reading of absence this module
+//! applies everywhere else. [`Pattern::matches`] carries the full reasoning.
+//!
+//! RMCP-07 currently holds a SECOND copy of this matcher in its `scope.rs`,
+//! written before this item landed and marked in-file for deletion once it did.
+//! **These are the semantics that copy must adopt when it collapses onto this
+//! one.** Two matchers that disagree about whether a bare prefix crosses a
+//! namespace produce a permit nobody intended, and the disagreement is invisible
+//! from either side alone.
+//!
 //! ## This module has no caller yet, and that is the design
 //! [`resolve`] is not wired into `tools/list` or `tools/call`, and must not be
 //! wired in here. Enforcement is RMCP-07's single `effective()` function, which
@@ -168,7 +184,14 @@ pub enum Pattern {
     Everything,
     /// `<namespace>__*` — every tool advertised by one mesh upstream.
     Namespace(String),
-    /// `<prefix>*` — every advertised name starting with `prefix`.
+    /// `<namespace>__<prefix>*` — tools from ONE upstream whose bare name
+    /// starts with `prefix`. Reaching into a namespace requires naming it.
+    NamespacedPrefix { namespace: String, prefix: String },
+    /// `<prefix>*` with no separator — every LOCAL (unqualified) tool whose
+    /// name starts with `prefix`.
+    ///
+    /// Local only. See [`Pattern::matches`] for why an unqualified prefix must
+    /// not be allowed to span the mesh separator.
     Prefix(String),
     /// An exact advertised name.
     Exact(String),
@@ -274,6 +297,17 @@ impl Pattern {
             }
             return Ok(Pattern::Namespace(namespace.to_string()));
         }
+        // A prefix that NAMES a namespace is a qualified prefix. Splitting it
+        // here, rather than leaving it as a raw `starts_with` over the
+        // advertised name, is what makes the boundary explicit in the type: the
+        // only patterns that can reach a federated tool are the two that carry a
+        // namespace, and both got it from the author writing one down.
+        if let Some((namespace, prefix)) = split_namespaced(head) {
+            return Ok(Pattern::NamespacedPrefix {
+                namespace: namespace.to_string(),
+                prefix: prefix.to_string(),
+            });
+        }
         Ok(Pattern::Prefix(head.to_string()))
     }
 
@@ -283,34 +317,62 @@ impl Pattern {
     /// input on which this can fail, panic, or take super-linear time in the
     /// length of the name.
     ///
-    /// Matching is against the ADVERTISED name, never a bare tool name, and
-    /// that is what keeps a prefix inside its own namespace: `a*` cannot reach
-    /// `peerhub__alerts_list`, because that name starts with its namespace, not
-    /// with `a`. A pattern that means to cross into an upstream has to say so.
+    /// ## The namespace boundary
+    /// Matching is against the ADVERTISED name (already namespaced for a
+    /// federated tool), and **an unqualified pattern matches only unqualified
+    /// names**. A bare [`Pattern::Prefix`] is checked against LOCAL tools alone;
+    /// it does not span [`MESH_NS_SEP`].
     ///
-    /// A prefix that DOES span the separator (`peerhub__ledger*`) reaches into
-    /// that namespace, and that is intended — this is MESH-08's prefix
-    /// semantics, unchanged. The distinction worth being precise about is what
-    /// the boundary is FOR: it protects against a short bare prefix
-    /// ACCIDENTALLY sweeping in every federated tool whose namespace happens to
-    /// start with the same letters, which is a mistake an author cannot see in
-    /// the pattern they wrote. It is not a barrier against an author who
-    /// deliberately types an upstream's name — that author has said exactly
-    /// what they meant, the namespace is right there in the text, and the
-    /// client's own `rmcp_client_server` rows still have to permit that
-    /// namespace before any of it resolves (RMCP-07). Forbidding it would only
-    /// mean an operator scoping one upstream's ledger tools had to enumerate
-    /// them by hand — the very thing groups exist to avoid.
+    /// Review round 3 found why this has to be structural rather than
+    /// incidental. The previous revision ran a plain `starts_with` over the
+    /// advertised name and reasoned that a prefix therefore "stays on its own
+    /// side" — which is true only until a namespace happens to share the
+    /// prefix's letters. `peer*`, written to scope local `peer_*` tools,
+    /// silently matched `peerhub__alerts_list`: an entire federated server
+    /// swept in because of a string coincidence the author cannot see in what
+    /// they wrote. The reachable shape is a bare prefix that is a strict prefix
+    /// of a namespace NAME, and it widens authorization purely by accident.
+    ///
+    /// So absence of a namespace qualifier means "local only", never "anything
+    /// that happens to start this way" — the same fail-closed rule the rest of
+    /// this module applies: absence is the empty set, never a wider one.
+    /// Reaching a federated tool takes a pattern that NAMES the upstream
+    /// ([`Pattern::Namespace`] or [`Pattern::NamespacedPrefix`]), which an
+    /// author can only write deliberately, and which the client's own
+    /// `rmcp_client_server` rows must still permit before any of it resolves
+    /// (RMCP-07). Two patterns that look alike are now firmly different:
+    /// `peer*` is local-only, `peerhub__*` is that upstream.
+    ///
+    /// **RMCP-07 must adopt these semantics.** It currently carries its own
+    /// copy of this matcher in `scope.rs`, written before this item landed and
+    /// documented in-file as the thing to delete once it did. Until that
+    /// collapse happens the two must not disagree on this rule — a bare prefix
+    /// honoured by one matcher and refused by the other is exactly the split
+    /// that produces a permit nobody intended.
     pub fn matches(&self, advertised: &str) -> bool {
         match self {
             Pattern::Everything => true,
-            // Uses the mesh's own splitter rather than a `starts_with` on
-            // `"ns__"`, so `ns__*` means exactly what the merge layer means by
-            // "advertised by ns" and cannot drift if the separator changes.
+            // Every arm below uses the mesh's own splitter rather than a
+            // `starts_with` on `"ns__"`, so "advertised by ns" means exactly
+            // what the merge layer means by it and cannot drift if the
+            // separator ever changes.
             Pattern::Namespace(ns) => {
                 matches!(split_namespaced(advertised), Some((found, _)) if found == ns.as_str())
             }
-            Pattern::Prefix(prefix) => advertised.starts_with(prefix.as_str()),
+            Pattern::NamespacedPrefix { namespace, prefix } => {
+                matches!(
+                    split_namespaced(advertised),
+                    Some((found, bare)) if found == namespace.as_str() && bare.starts_with(prefix.as_str())
+                )
+            }
+            // The boundary. `split_namespaced` returning `None` IS the
+            // definition of a local name, so this cannot disagree with the
+            // arms above about where a namespace begins.
+            Pattern::Prefix(prefix) => {
+                split_namespaced(advertised).is_none() && advertised.starts_with(prefix.as_str())
+            }
+            // An exact pattern names the whole advertised string, separator and
+            // all, so it is already explicit about which side it is on.
             Pattern::Exact(name) => advertised == name.as_str(),
         }
     }
@@ -322,6 +384,9 @@ impl Pattern {
         match self {
             Pattern::Everything => "*".to_string(),
             Pattern::Namespace(ns) => format!("{ns}{MESH_NS_SEP}*"),
+            Pattern::NamespacedPrefix { namespace, prefix } => {
+                format!("{namespace}{MESH_NS_SEP}{prefix}*")
+            }
             Pattern::Prefix(prefix) => format!("{prefix}*"),
             Pattern::Exact(name) => name.clone(),
         }
@@ -649,6 +714,11 @@ mod tests {
             CatalogTool::local("weather_alerts"),
             CatalogTool::local("news_headlines"),
             CatalogTool::local("ledger_add"),
+            // The adversarial pair: a LOCAL tool whose name starts with `peer`,
+            // alongside a NAMESPACE that also starts with `peer`. Any matcher
+            // that treats a bare prefix as a raw `starts_with` over the
+            // advertised name conflates the two.
+            CatalogTool::local("peer_status"),
             CatalogTool::from_upstream("peerhub", "alerts_list"),
             CatalogTool::from_upstream("peerhub", "ledger_add"),
             CatalogTool::from_upstream("sensors", "node_status"),
@@ -871,6 +941,70 @@ mod tests {
             .matches("peerhub__ledger_add"));
     }
 
+    /// The round-3 finding, exactly as reported: a bare prefix that is a STRICT
+    /// PREFIX OF A NAMESPACE NAME. `peer*` was written for local `peer_*` tools
+    /// and silently swept in an entire federated server, because a raw
+    /// `starts_with` over the advertised name cannot tell `peer_status` from
+    /// `peerhub__alerts_list`. This is the shape that made the widening
+    /// reachable at all, so it is pinned literally.
+    ///
+    /// Both near-misses are asserted alongside it, because a fix that broke
+    /// either would be worse than the bug: the local tool must still match, and
+    /// the deliberately-qualified pattern must still reach the upstream.
+    #[test]
+    fn a_bare_prefix_that_is_a_prefix_of_a_namespace_stays_local() {
+        let bare = Pattern::parse("peer*", GroupOwner::Operator).unwrap();
+        assert!(bare.matches("peer_status"), "a LOCAL tool named peer... must still match");
+        assert!(
+            !bare.matches("peerhub__alerts_list"),
+            "a bare prefix must not cross the mesh separator into a namespace \
+             that merely shares its letters"
+        );
+        assert!(!bare.matches("peerhub__ledger_add"));
+
+        // Written deliberately, with the upstream named, it still reaches in.
+        let qualified = Pattern::parse("peerhub__*", GroupOwner::Operator).unwrap();
+        assert!(qualified.matches("peerhub__alerts_list"));
+        assert!(!qualified.matches("peer_status"), "and it does NOT reach back out to local");
+
+        // End to end through resolution, which is what actually authorizes.
+        assert_eq!(resolve_raw(&["peer*"], GroupOwner::Operator), vec!["peer_status"]);
+        assert_eq!(
+            resolve_raw(&["peerhub__*"], GroupOwner::Operator),
+            vec!["peerhub__alerts_list", "peerhub__ledger_add"]
+        );
+    }
+
+    /// A qualified prefix is anchored to ONE namespace and to the bare name
+    /// inside it — it is not a loose `starts_with` that happens to contain a
+    /// separator.
+    #[test]
+    fn a_qualified_prefix_is_anchored_to_its_namespace() {
+        let p = Pattern::parse("peerhub__ledger*", GroupOwner::Operator).unwrap();
+        assert!(p.matches("peerhub__ledger_add"));
+        assert!(!p.matches("sensors__ledger_add"), "a different upstream is a different namespace");
+        assert!(!p.matches("ledger_add"), "and it never matches the LOCAL tool of that name");
+        assert!(!p.matches("peerhub__alerts_list"));
+    }
+
+    /// Confirms the behaviour RMCP-07 observed independently: `ledger_*` does
+    /// NOT reach a federated `ledger_accounts`. It agreed with the old matcher
+    /// for the wrong reason (the advertised name started with the namespace);
+    /// it agrees with this one for the right reason (a bare prefix is local by
+    /// definition). Same verdict, and now it holds for every namespace name
+    /// rather than only the ones that happen not to share the prefix.
+    #[test]
+    fn a_bare_family_prefix_never_reaches_a_federated_tool_of_the_same_family() {
+        let p = Pattern::parse("ledger_*", GroupOwner::Operator).unwrap();
+        assert!(p.matches("ledger_add"), "the local tool");
+        assert!(!p.matches("peerone__ledger_accounts"));
+        assert!(!p.matches("peerhub__ledger_add"));
+        // The pathological namespace: one literally named after the family.
+        // `ledger___accounts` splits as namespace `ledger` + bare `_accounts`,
+        // so it is federated and a bare prefix must not reach it.
+        assert!(!p.matches("ledger___accounts"));
+    }
+
     /// A namespace pattern is anchored on the FIRST separator, so it cannot be
     /// satisfied by a namespace that merely starts with the same letters.
     #[test]
@@ -975,7 +1109,7 @@ mod tests {
 
     #[test]
     fn patterns_round_trip_through_their_stored_form() {
-        for raw in ["*", "peerhub__*", "weather_*", "weather_get"] {
+        for raw in ["*", "peerhub__*", "peerhub__ledger*", "weather_*", "weather_get"] {
             let parsed = Pattern::parse(raw, GroupOwner::Operator).unwrap();
             assert_eq!(parsed.render(), raw);
             assert_eq!(Pattern::parse_stored(&parsed.render()), Some(parsed));
