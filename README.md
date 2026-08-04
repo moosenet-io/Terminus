@@ -1185,6 +1185,11 @@ so an operator does not have to hold two pattern languages in their head.
 - **A bad pattern is refused when it is stored, never when it is matched.** Matching is
   pure and total; an error there would be an availability failure inside the authorization
   system rather than a safety property.
+- **Operator-ness is read from the database, not supplied by the caller.** The bare `*`
+  rule is enforced against `rmcp_account.is_operator`, read inside the same transaction as
+  the write it authorizes. A caller states *who* is writing; it never states what they are
+  allowed to write. Requires the `S132-rmcp06-account-operator-flag.sql` migration —
+  `schema_ready()` reports NOT ready without it.
 
 ### What empty means
 

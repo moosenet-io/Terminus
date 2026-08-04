@@ -47,8 +47,36 @@ pub struct Account {
     /// Encrypted TOTP seed, or `None` when this account has no second factor.
     pub totp_secret_enc: Option<Vec<u8>>,
     pub disabled: bool,
+    /// Whether this account holds fleet-operator authority (RMCP-06).
+    ///
+    /// The ONLY source of truth for that question. It exists as a column rather
+    /// than as an argument because the rule it backs — a delegated author may
+    /// not write a bare `*` tool-group pattern — is an authorization rule, and
+    /// an authorization rule whose input the caller supplies is advisory. The
+    /// store reads it inside the same transaction as the write it authorizes;
+    /// see [`crate::oauth::store::OauthStore::insert_tool_group`].
+    ///
+    /// Defaults to `false` in the schema, so an account nobody thought about is
+    /// delegated rather than privileged.
+    pub is_operator: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Account {
+    /// This account's authority for group authoring, as the pure validator
+    /// expects it.
+    ///
+    /// The conversion lives here so there is exactly one place that turns the
+    /// stored boolean into a [`crate::oauth::groups::GroupOwner`], and no call
+    /// site can invent the privileged variant from nothing.
+    pub fn group_owner_kind(&self) -> crate::oauth::groups::GroupOwner {
+        if self.is_operator {
+            crate::oauth::groups::GroupOwner::Operator
+        } else {
+            crate::oauth::groups::GroupOwner::Delegated
+        }
+    }
 }
 
 /// How a client came to exist. Not merely descriptive: a `Dcr` client is
@@ -348,6 +376,7 @@ impl_from_row!(
     password_hash,
     totp_secret_enc,
     disabled,
+    is_operator,
     created_at,
     updated_at
 );
@@ -439,6 +468,30 @@ mod tests {
         for source in [RegistrationSource::Operator, RegistrationSource::Dcr] {
             assert_eq!(RegistrationSource::parse(source.as_str()), source);
         }
+    }
+
+    fn account_with_operator_flag(is_operator: bool) -> Account {
+        Account {
+            id: Uuid::nil(),
+            name: "a".into(),
+            password_hash: "<REDACTED-SECRET>".into(),
+            totp_secret_enc: None,
+            disabled: false,
+            is_operator,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Operator authority is carried by the stored flag and nothing else. The
+    /// `false` case is the one that matters: it is what a caller claiming to be
+    /// an operator must not be able to talk its way past, and what an account
+    /// created before the flag existed degrades to.
+    #[test]
+    fn group_authority_follows_the_stored_flag() {
+        use crate::oauth::groups::GroupOwner;
+        assert_eq!(account_with_operator_flag(true).group_owner_kind(), GroupOwner::Operator);
+        assert_eq!(account_with_operator_flag(false).group_owner_kind(), GroupOwner::Delegated);
     }
 
     fn group_with(patterns: Vec<String>) -> ToolGroup {

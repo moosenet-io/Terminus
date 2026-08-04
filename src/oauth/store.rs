@@ -79,6 +79,14 @@ const REQUIRED_TABLES: [&str; 10] = [
     "rmcp_login_session_use",
 ];
 
+/// Columns added to an EXISTING table by a later S132 migration, which the
+/// table-level readiness check cannot detect on its own.
+///
+/// `rmcp_account.is_operator` (RMCP-06) is load-bearing for authorization, not
+/// merely for a feature: it is the only source of truth for whether an author
+/// may write a bare `*` pattern. A deploy missing it must report NOT ready.
+const REQUIRED_COLUMNS: [(&str, &str); 1] = [("rmcp_account", "is_operator")];
+
 /// Repository over the `rmcp_*` tables.
 #[derive(Clone)]
 pub struct OauthStore {
@@ -137,7 +145,32 @@ impl OauthStore {
         .fetch_one(&self.pool)
         .await
         .unwrap_or(0);
-        found == REQUIRED_TABLES.len() as i64
+        if found != REQUIRED_TABLES.len() as i64 {
+            return false;
+        }
+
+        // RMCP-06 adds a COLUMN to an existing table, which the table check
+        // above cannot see. Without this, a deploy that applied the RMCP-01
+        // migration but not the RMCP-06 one reports "ready" and then fails every
+        // account lookup — i.e. the whole authentication path — with an opaque
+        // "column does not exist". A schema check that misses the second
+        // migration is exactly the confident-but-wrong "ready" the check above
+        // exists to prevent.
+        for (table, column) in REQUIRED_COLUMNS {
+            let present = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM information_schema.columns \
+                 WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2",
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
+            if present != 1 {
+                return false;
+            }
+        }
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -155,7 +188,8 @@ impl OauthStore {
         name: &str,
     ) -> Result<Option<Account>, ToolError> {
         sqlx::query_as::<_, Account>(
-            "SELECT id, name, password_hash, totp_secret_enc, disabled, created_at, updated_at \
+            "SELECT id, name, password_hash, totp_secret_enc, disabled, is_operator, \
+                    created_at, updated_at \
              FROM rmcp_account WHERE name = $1 AND NOT disabled",
         )
         .bind(name)
@@ -350,15 +384,56 @@ impl OauthStore {
     // invalidating. `ScopeWrite` is `pub(crate)` precisely so it can comply.
     // -----------------------------------------------------------------------
 
+    /// Resolve an account's group-authoring authority FROM THE DATABASE, inside
+    /// the caller's transaction.
+    ///
+    /// ## Why this is not a parameter
+    /// The rule it feeds — a delegated author may not write a bare `*` pattern
+    /// — is an authorization rule. The first cut of RMCP-06 let the caller pass
+    /// its own `owner_kind`, which made the rule advisory: a delegated caller
+    /// passing `Operator` stored a `*`, and [`crate::oauth::groups::Pattern::parse_stored`]
+    /// then honours it for the life of the row, by design. Review (gpt56)
+    /// rejected that, and was right to — it is the same defect RMCP-01 argued
+    /// through five rounds, where a caller-minted marker token was thrown out
+    /// and the fix that landed was to check authority in SQL inside the write's
+    /// own transaction. This is that fix, for this rule.
+    ///
+    /// `FOR SHARE` locks the account row for the rest of the transaction, so
+    /// operator-ness cannot be granted or revoked in the window between this
+    /// read and the write it authorizes.
+    ///
+    /// A missing or DISABLED account yields [`ToolError::NotFound`] rather than
+    /// [`GroupOwner::Delegated`]: an account that cannot authenticate should not
+    /// be authoring scoping records at all, so this refuses the write outright
+    /// instead of quietly downgrading it to the less privileged path.
+    async fn authoring_authority(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        account_id: Uuid,
+    ) -> Result<GroupOwner, ToolError> {
+        let is_operator = sqlx::query_scalar::<_, bool>(
+            "SELECT is_operator FROM rmcp_account WHERE id = $1 AND NOT disabled FOR SHARE",
+        )
+        .bind(account_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db)?
+        .ok_or_else(|| ToolError::NotFound("no such active account".into()))?;
+        Ok(if is_operator { GroupOwner::Operator } else { GroupOwner::Delegated })
+    }
+
     /// Insert a tool group, VALIDATING it first (RMCP-06).
     ///
     /// This is the write-time gate the matcher depends on. Every pattern is
-    /// parsed here — under `owner_kind`, which is what refuses a bare `*` from a
-    /// delegated author — and the name is normalised, so no row can hold
-    /// something [`crate::oauth::groups::Pattern::matches`] would have to cope
-    /// with at dispatch time. Storing the CANONICAL rendering rather than the
-    /// author's literal text means the round-trip is stable and two spellings of
-    /// one pattern cannot both sit in the same row.
+    /// parsed here and the name is normalised, so no row can hold something
+    /// [`crate::oauth::groups::Pattern::matches`] would have to cope with at
+    /// dispatch time. Storing the CANONICAL rendering rather than the author's
+    /// literal text means the round-trip is stable and two spellings of one
+    /// pattern cannot both sit in the same row.
+    ///
+    /// The authority that decides whether a bare `*` is acceptable is read from
+    /// `owner_account_id`'s own row, in this transaction — see
+    /// [`Self::authoring_authority`]. There is deliberately no parameter for it:
+    /// the caller states WHO is writing, never WHAT they are allowed to write.
     ///
     /// An empty `patterns` slice is permitted and stores a group that matches
     /// nothing — a legitimate state (a group being built up), and one the
@@ -369,12 +444,13 @@ impl OauthStore {
         description: &str,
         patterns: &[String],
         owner_account_id: Uuid,
-        owner_kind: GroupOwner,
     ) -> Result<Uuid, ToolError> {
         let _scope_write = ScopeWrite::begin();
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let owner_kind = Self::authoring_authority(&mut tx, owner_account_id).await?;
         let group = validate_group(name, description, patterns, owner_kind)?;
         let rendered = group.rendered_patterns();
-        sqlx::query_scalar::<_, Uuid>(
+        let id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO rmcp_tool_group (name, description, patterns, owner_account_id) \
              VALUES ($1, $2, $3, $4) RETURNING id",
         )
@@ -382,9 +458,11 @@ impl OauthStore {
         .bind(&group.description)
         .bind(rendered.as_slice())
         .bind(owner_account_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(unique_aware("a tool group with that name already exists"))
+        .map_err(unique_aware("a tool group with that name already exists"))?;
+        tx.commit().await.map_err(db)?;
+        Ok(id)
     }
 
     /// Every group owned by one account, name-ordered.
@@ -404,14 +482,15 @@ impl OauthStore {
         .map_err(db)
     }
 
-    /// Rewrite a group's description and patterns, after validating them and
-    /// confirming `actor` owns the group.
+    /// Rewrite a group's description and patterns, after validating them under
+    /// the actor's DERIVED authority and confirming the actor owns the group.
     ///
-    /// The ownership predicate is part of the UPDATE's `WHERE` rather than a
-    /// preceding `SELECT`: one statement cannot race itself, so there is no
-    /// window in which ownership could change between check and write — the
-    /// same property [`Self::set_client_tool_groups`] buys with a row lock,
-    /// obtained here for free because this is a single statement.
+    /// Two separate checks, and they are not redundant. Owning the group decides
+    /// whether this row may be touched at all; being an operator decides whether
+    /// a bare `*` may be written into it. An edit path that checked only the
+    /// first would be the obvious way to launder a wildcard into a group that
+    /// was created without one — create it clean as a delegated user, then edit
+    /// it. Both run inside one transaction, so neither can be raced.
     ///
     /// Patterns are replaced wholesale, never merged. A partially applied
     /// permission change is a state nobody chose.
@@ -425,8 +504,9 @@ impl OauthStore {
         group_id: Uuid,
         description: &str,
         patterns: &[String],
-        owner_kind: GroupOwner,
     ) -> Result<(), ToolError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let owner_kind = Self::authoring_authority(&mut tx, actor_account_id).await?;
         // The name is not editable here (renaming would have to contend with the
         // fleet-wide UNIQUE constraint, which is RMCP-08's surface to own), so
         // only the two editable fields are validated.
@@ -441,13 +521,13 @@ impl OauthStore {
         .bind(actor_account_id)
         .bind(&description)
         .bind(patterns.as_slice())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(db)?;
         if updated.rows_affected() == 0 {
             return Err(ToolError::NotFound("no such tool group for this account".into()));
         }
-        Ok(())
+        tx.commit().await.map_err(db)
     }
 
     /// Delete a group the actor owns.
@@ -487,8 +567,19 @@ impl OauthStore {
     /// exactly why this is not called automatically from anywhere yet. RMCP-08
     /// owns when it runs.
     ///
+    /// The target account must actually BE an operator — verified against its
+    /// row, not asserted by the caller. Seeding is an operator action, and
+    /// letting it run for a delegated account would hand that account a set of
+    /// broad prefix groups it never authored.
+    ///
     /// Returns the number of groups actually created.
     pub async fn seed_starter_groups(&self, owner_account_id: Uuid) -> Result<u64, ToolError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        if Self::authoring_authority(&mut tx, owner_account_id).await? != GroupOwner::Operator {
+            return Err(ToolError::InvalidArgument(
+                "starter groups may only be seeded onto an operator account".into(),
+            ));
+        }
         let mut created = 0u64;
         for starter in STARTER_GROUPS {
             let patterns: Vec<String> = starter.patterns.iter().map(|p| (*p).to_string()).collect();
@@ -506,11 +597,12 @@ impl OauthStore {
             .bind(&group.description)
             .bind(rendered.as_slice())
             .bind(owner_account_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(db)?;
             created += inserted.rows_affected();
         }
+        tx.commit().await.map_err(db)?;
         Ok(created)
     }
 
@@ -2027,6 +2119,19 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
         }
     }
 
+    /// The operator flag is an AUTHORIZATION input, so a deploy that is missing
+    /// it must report NOT ready rather than run with every account silently
+    /// unable to be an operator. Asserted here because the table-level check
+    /// cannot see a column, which is how this migration could otherwise ship
+    /// unapplied and unnoticed.
+    #[test]
+    fn schema_readiness_covers_the_operator_flag_column() {
+        assert!(
+            REQUIRED_COLUMNS.contains(&("rmcp_account", "is_operator")),
+            "the RMCP-06 operator flag must be part of the readiness check"
+        );
+    }
+
     // NOTE on what is deliberately NOT unit-tested here.
     //
     // An earlier revision carried a test that built an empty `Vec` and asserted
@@ -2041,4 +2146,13 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
     // by RMCP-07's property test (`effective ⊆ account grant`, over generated
     // inputs) and by RMCP-14's end-to-end test, both of which run against a real
     // schema. Adding a DB-backed integration harness is not this item's scope.
+    //
+    // The same applies to `authoring_authority`: that a delegated account cannot
+    // write a bare `*` is now enforced by a SQL read of `rmcp_account.is_operator`
+    // inside the write's transaction, which is only meaningfully testable against
+    // a database. What IS unit-testable — that the flag, and nothing else,
+    // decides the authority, and that the pure validator refuses `*` for a
+    // delegated author — is covered in `model` and `groups` respectively. A test
+    // here that constructed a `GroupOwner` by hand and asserted the validator
+    // agreed would be testing the thing that was never in doubt.
 }

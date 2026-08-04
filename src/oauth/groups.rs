@@ -39,6 +39,26 @@
 //! intuitive reading and the catastrophic one — it is the shape of every
 //! authorization bug where a scoping record that failed to load silently became
 //! full access.
+//!
+//! ## This module has no caller yet, and that is the design
+//! [`resolve`] is not wired into `tools/list` or `tools/call`, and must not be
+//! wired in here. Enforcement is RMCP-07's single `effective()` function, which
+//! intersects the account's own grant with the client's groups and its visible
+//! namespaces, and which backs BOTH the list filter and the call guard from one
+//! definition. Calling this resolver directly from a dispatch path would create
+//! a SECOND enforcement point — which is precisely the thing RMCP-07 exists to
+//! prevent, because two authorization sites over one decision is how they come
+//! to disagree, silently, in the widening direction. So this item ships the
+//! matcher and the store and stops there, deliberately caller-less.
+//!
+//! ## Where authority comes from
+//! [`GroupOwner`] is an input to PURE validation here; it is not a claim a
+//! caller gets to make. The store derives it from the authoring account's own
+//! row inside the transaction that performs the write — see
+//! [`crate::oauth::store::OauthStore::insert_tool_group`]. An earlier revision
+//! took it as a store parameter, which made the delegated-wildcard rule
+//! advisory: a caller that passed [`GroupOwner::Operator`] stored a `*` that the
+//! read path then honours for the life of the row.
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -240,6 +260,20 @@ impl Pattern {
     /// that is what keeps a prefix inside its own namespace: `a*` cannot reach
     /// `peerhub__alerts_list`, because that name starts with its namespace, not
     /// with `a`. A pattern that means to cross into an upstream has to say so.
+    ///
+    /// A prefix that DOES span the separator (`peerhub__ledger*`) reaches into
+    /// that namespace, and that is intended — this is MESH-08's prefix
+    /// semantics, unchanged. The distinction worth being precise about is what
+    /// the boundary is FOR: it protects against a short bare prefix
+    /// ACCIDENTALLY sweeping in every federated tool whose namespace happens to
+    /// start with the same letters, which is a mistake an author cannot see in
+    /// the pattern they wrote. It is not a barrier against an author who
+    /// deliberately types an upstream's name — that author has said exactly
+    /// what they meant, the namespace is right there in the text, and the
+    /// client's own `rmcp_client_server` rows still have to permit that
+    /// namespace before any of it resolves (RMCP-07). Forbidding it would only
+    /// mean an operator scoping one upstream's ledger tools had to enumerate
+    /// them by hand — the very thing groups exist to avoid.
     pub fn matches(&self, advertised: &str) -> bool {
         match self {
             Pattern::Everything => true,
