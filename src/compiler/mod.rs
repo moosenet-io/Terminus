@@ -5749,7 +5749,8 @@ pub fn render_queue_status(snapshot: &queue::QueueSnapshot) -> Value {
 /// `state=building` with no worker. Every resubmission — INCLUDING `force:true`,
 /// which only bypasses the heavy window/quiet gate, not the claim — coalesces
 /// onto that dead job id, and once the ephemeral progress record expires
-/// `compiler_progress` answers `not_found`. Observed live on <host> 2026-08-02
+/// `compiler_progress` answers `not_found`. Observed live on the primary build
+/// host, 2026-08-02
 /// (`harmony@main`, heavy, 286/310 when the gateway restarted).
 ///
 /// **It is a long-TTL recovery, not a permanent wedge**: the scheduler's

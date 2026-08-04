@@ -737,7 +737,7 @@ pub fn local_cache_dir(dataset_root: &str) -> String {
 /// `TMPDIR`, instead of letting whichever build job first invokes the wrapper
 /// define it.
 ///
-/// ## The failure this closes (observed live on <host>, 2026-08-02)
+/// ## The failure this closes (observed live on the primary build host, 2026-08-02)
 /// `sccache` is a client/server pair: the first `RUSTC_WRAPPER=sccache` call
 /// that finds no running server SPAWNS one, and the daemon inherits that
 /// caller's environment — including the caller's PCON-10 per-job `TMPDIR`
@@ -780,7 +780,7 @@ pub fn local_cache_dir(dataset_root: &str) -> String {
 /// the one it fixes (a wrongly-killed daemon takes out concurrent builds). So
 /// the contract is: this PREVENTS poisoning, it does not CURE it. A host that
 /// already has a poisoned daemon at deploy time needs a one-time
-/// `sccache --stop-server` — exactly the ops mitigation already applied on <host>
+/// `sccache --stop-server` — exactly the ops mitigation already applied by hand
 /// on 2026-08-02. With `SCCACHE_IDLE_TIMEOUT=0` plus a prestart before every
 /// build, there is no routine path back into the poisoned state afterwards.
 ///
