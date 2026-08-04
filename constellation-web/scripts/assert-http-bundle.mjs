@@ -82,4 +82,38 @@ if (buildMode === undefined) {
   console.log(`[assert-http-bundle] explicit VITE_AGG_MODE build — runtime seams intentionally DCE'd, skipping seam check.`);
 }
 
+// ── 3. RMCP-13 (TERM-624): the connector FIXTURE SERVER must not be in any shipped asset ──────
+//
+// `src/lib/rmcpFixtures.ts` is a mock server for the Connectors page. Its data is fabricated
+// AUTHORIZATION data — which tools a connector can reach — so an operator shown it while making
+// real scoping decisions would be misled about access in the most consequential place in the app.
+// `rmcpClient.ts` therefore reaches it only through a dynamic import behind a literal
+// `!import.meta.env.PROD` guard, which Vite folds away at build time.
+//
+// This asserts that folding actually happened, in EVERY emitted asset (a dynamic import that
+// survived would land in its own chunk, not in index-*.js). Review round 1's point stands: the
+// property has to be checked, not documented — a future top-level import would silently undo it,
+// and this is what turns that into a failed build.
+{
+  const ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..');
+  const ASSETS = join(ROOT, 'dist', 'assets');
+  // Must match RMCP_FIXTURE_MARKER in src/lib/rmcpFixtures.ts. It is referenced in a thrown
+  // message there, so a minifier cannot keep the module while dropping the string.
+  const FIXTURE_MARKER = 'rmcp-fixture-server-must-never-ship';
+  let offenders = [];
+  try {
+    offenders = readdirSync(ASSETS)
+      .filter(f => f.endsWith('.js'))
+      .filter(f => readFileSync(join(ASSETS, f), 'utf8').includes(FIXTURE_MARKER));
+  } catch (e) {
+    fail(e.message);
+  }
+  if (offenders.length > 0) {
+    fail(`the RMCP connector fixture server is present in shipped asset(s): ${offenders.join(', ')} — `
+      + `it must be dead-code-eliminated (see the !import.meta.env.PROD guard in src/lib/rmcpClient.ts). `
+      + `Shipping it risks showing fabricated authorization data on the Connectors page.`);
+  }
+  console.log(`  [ok] RMCP connector fixture server absent from all ${readdirSync(ASSETS).filter(f => f.endsWith('.js')).length} shipped JS asset(s)`);
+}
+
 console.log('\n[assert-http-bundle] OK — resolved default is the real-backend (http) adapter.');

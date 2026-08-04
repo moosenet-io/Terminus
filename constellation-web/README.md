@@ -798,6 +798,137 @@ pattern, in `src/panels/terminus/`:
 All three are registered under the existing `terminus` module in `registerPanels.ts` alongside
 the pre-existing `Config` panel (`terminus.fleet` / `terminus.tools` / `terminus.activity`).
 
+## Connectors page (`terminus.connectors`, RMCP-13 / TERM-624)
+
+`/terminus/connectors` (`src/pages/Connectors.tsx` + `src/panels/connectors/`) is the operator
+surface for the S132 OAuth/MCP connector door: who may connect, what each connector is scoped to
+reach, and which live grants to cut off. Three tabs — **Connectors**, **Tool groups**,
+**Sessions**.
+
+### The resolved preview is the point
+
+The most valuable element on the page is the per-client **resolved preview**: the concrete list
+of tools that connector can reach right now, each row carrying the group and the pattern that
+put it there. It turns "2 groups × 1 server" — an abstraction a human cannot verify — into a
+list they can read before handing out credentials.
+
+It is **the server's answer, always**. `ResolvedToolPreview` calls `rmcp_client_resolve`
+(RMCP-07's single `effective(principal, client, catalog)`, the same function that gates
+`tools/list` and `tools/call`), and the group editor's live preview calls `rmcp_group_preview`
+(RMCP-06's matcher). **There is no pattern matching anywhere in `src/` outside the mock server**,
+and a unit test in `src/lib/rmcpClient.test.ts` asserts that nothing under `src/panels/` or
+`src/pages/` imports the fixture module. A TypeScript matcher that agrees with the server today
+drifts tomorrow, and a preview that can disagree with enforcement is worse than none — an
+operator would trust it and be wrong.
+
+### One door, server-side authorization
+
+All reads and writes go through `src/lib/rmcpClient.ts`, which calls the same `rmcp_*` Terminus
+tools the CLI does, over ONE endpoint — `POST /api/terminus/rmcp/call` `{tool, args}`, reached
+via the app's single backend seam (`getAggregationClient().request('terminus', …)`). No second
+REST surface, no direct DB access from the web layer.
+
+Authorization is entirely server-side. Records carry `editable` / `ownedByMe` flags (RMCP-12
+ownership) and the UI uses them to avoid offering a control that would 403 — a **courtesy, never
+an enforcement point**. Reads are already scoped server-side, so a delegated owner never receives
+another owner's objects to hide in the first place, and a write is refused whether or not a
+button was rendered. Mutating controls additionally sit behind `RoleGate` (viewer sessions), the
+same cosmetic-plus-server-enforced pattern as every other panel.
+
+### Behaviours worth knowing
+
+- **Empty state guides creation.** No connectors ⇒ an explanation of what a connector is plus a
+  "create the first connector" action, not a blank table.
+- **The client secret is shown exactly once.** It lives only in `ClientCreateDialog`'s component
+  state, for the life of the created step, with a copy control, an explicit "this is the only
+  time you will see this", and an acknowledgement checkbox gating the Done button. No read tool
+  returns it (the store holds only an argon2id hash), and it never touches the `prefs` seam —
+  see the no-secrets-in-browser rule above.
+- **Absence is denial, and the UI says so in those words.** A client with no groups, no servers,
+  or neither reads as "reaches nothing"; `scopeSummary` never renders an unscoped client as
+  "all" or "unrestricted" (unit-tested).
+- **A down upstream is a STATE, not an error.** A namespace whose upstream is not answering
+  renders as `unavailable` (amber), with its tools still listed as in-scope. The config is
+  correct and the mesh is not; painting that red sends the operator to fix the wrong thing.
+- **Concurrent edits surface as a conflict.** Every write carries the `version` the form was
+  loaded at. On `version_conflict` the editor shows the conflict and offers a reload — it does
+  **not** retry with a fresh version, because that is exactly how one operator silently reverts
+  another.
+- **Large catalogs are bounded twice.** The resolve call takes `limit`/`offset` (bounded on the
+  wire) and the table pages 25 rows at a time (bounded in the DOM); a server-capped result is
+  labelled as capped rather than implying the connector reaches only that many tools.
+- **Revocation is per-row and bulk**, from the Sessions tab or from inside a connector, with a
+  confirmation that names what stops working and states that it takes effect at the next
+  dispatch (not at token expiry). Revoked rows stay visible, marked — the list is an audit
+  surface as much as a control. **Selectors are mutually exclusive and exactly one is required**
+  (`RMCP_SELECTOR_RULE` in `rmcpContract.ts`, enforced at the client wrapper and independently at
+  the server boundary): a revoke naming **none** is refused rather than reported as a success that
+  changed nothing, and a revoke naming **both** is refused rather than resolved by precedence.
+  Same bug, opposite hats — one convinces an operator that access was cut when it was not, the
+  other does part of what was asked and calls it done, with the skipped part invisible. Neither is
+  acceptable on a control reached for mid-incident.
+- **A cancelled creation leaves nothing behind.** The dialog clears on every close route (it is
+  render-guarded, not unmounted) and a create that resolves after the close is discarded, so a
+  one-time secret never survives an abandoned flow or reappears on reopen. Covered by
+  `ClientCreateDialog.interaction.test.tsx`, which fails against the pre-fix component.
+
+### Backend readiness (`src/lib/rmcpFixtures.ts` — the one mocked boundary)
+
+The backing `rmcp_*` tools land in RMCP-05/06/07/08/11/12, in parallel with this page. Until
+they are deployed, every call answers `tool_unavailable` and the page renders an explanatory
+"not live on this server yet" state — the posture `ActivityPanel` took toward CONST-26's
+endpoint — never an error page and never invented data.
+
+`rmcpFixtures.ts` is a **fixture SERVER**, reached only from `rmcpClient.ts`'s single dispatch.
+It exists so the page could be built and tested before its tools; its pattern matcher is the mock
+server's, which is why it is allowed to exist at all. Swapping to the live tools requires no code
+change.
+
+**It cannot ship.** Not by convention — structurally. The only reference to it is a dynamic
+`import()` behind a literal `!import.meta.env.PROD` guard, which Vite folds to `false` at build
+time, so the module never enters a production bundle's graph. `scripts/assert-http-bundle.mjs`
+(the last step of `npm run build`, so there is no unguarded build path) then asserts the fixture's
+marker string is absent from every emitted JS asset and **fails the build** if it reappears —
+verified by deliberately re-introducing a top-level import and confirming the build fails.
+
+The consequence is deliberate: in a production bundle a runtime `?mock` opt-in gives the rest of
+the app fixtures but gives this page nothing — its calls go to the real endpoint and report
+`tool_unavailable` if it is not there. Connector scoping is the one surface where plausible-looking
+fake data is worse than an empty page, because the data *is* the authorization answer.
+
+**The fixture mirrors the merged store, predicate for predicate.** Since RMCP-01 landed on `main`,
+`src/oauth/store.rs` is the authority, and `resolveForClient` cites the SQL it stands in for
+clause by clause:
+
+| Real store (`client_tool_groups` / `client_namespaces`) | Fixture |
+|---|---|
+| `NOT c.disabled` on both scope reads | a disabled client resolves to nothing |
+| `c.owner_account_id = g.owner_account_id` | a group transferred away stops resolving |
+| `JOIN rmcp_server_owner … AND o.owner_account_id = c.owner_account_id` | a cleared delegation, and an **unclaimed** namespace, resolve to nothing |
+| `set_client_namespaces` / `set_client_tool_groups` ownership checks | unowned/foreign servers and groups refused at write, with the store's deliberately unspecific message |
+| "Same answer for 'no such client' and 'not yours'" | cross-owner access answers `not_found`, never a distinguishable `forbidden` |
+| optimistic concurrency | an update stating **no** version (or a non-numeric one) is `invalid` and mutates nothing — the check is fail-**closed**, since a caller that cannot say which revision it edited has not checked for a conflict |
+| RMCP-06: bare `*` is operator-only | refused for the fixture's delegated-owner principal, at write time and in the live preview; `patternRejection(pattern, isOperator)` pins both sides of the rule |
+
+The through-line — and the reason each of those is a READ-path check rather than only a write-time
+one — is that **a scope row outlives the ownership that justified it**. Ownership is transferable
+and delegation is revocable, so any authority that can be taken away has to be re-derived on read;
+a resolver that trusted the write would keep showing a grant that no longer exists. That lesson
+cost RMCP-01 two review rounds and recurred in RMCP-06, so the fixture embodies it rather than
+leaving the next reader to relearn it. Each clause has a test that fails against the pre-fix
+resolver.
+
+**The fixture is at least as strict as the real server, never laxer.** Its principal is a
+*delegated owner* (it owns the `media`/`home`/`workshop`/`notes` namespaces and the objects built
+on them, and does not own `studio` or the client, group, and session behind it), and it enforces
+RMCP-12 ownership on every read and write: another owner's clients/groups/sessions are not
+enumerated at all, a direct call naming one is refused, and scoping a client to an unowned
+namespace is refused at write — and an **unclaimed** server is refused as firmly as someone
+else's, with different wording, because "ask the owner" is useless advice when there is no owner.
+That is what makes the delegated-owner tests meaningful — they
+assert the *fixture* refuses, not that the UI hid something. An early version that only hid would
+have let a UI-only "enforcement" pass its own tests.
+
 ## Lumina Memory browser (LGUI-08)
 
 `lumina.memory` (route `/lumina/memory`, spec §3.3 "Engram browser") — the operator-facing
