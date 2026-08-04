@@ -267,6 +267,42 @@ const NAMESPACE_SUFFIX: &str = "::*";
 
 /// One entry in a tool group.
 ///
+/// ## The agreed semantics (RMCP-06's ruling, recorded here verbatim in intent)
+/// This matcher is a temporary second copy — RMCP-06 owns groups, and when its
+/// `groups.rs` lands this collapses onto its version. So the target is written
+/// down rather than left to be re-derived:
+///
+/// > An unqualified **exact** or **prefix** pattern matches local (unqualified)
+/// > tools only; a namespace-qualified pattern matches only within the
+/// > namespace it names; and the bare `*` matches the whole merged catalog,
+/// > local and federated alike, bounded by the client's allowed namespaces at
+/// > RMCP-07's intersection rather than by the matcher.
+///
+/// ## Why `*` is exempt rather than inconsistent
+/// This is the part someone will later be tempted to "fix", so the reasoning
+/// belongs next to the code. The local-only rule exists because **letters
+/// collide**: `peer*` sweeping in `peerhub__*` is a widening the author cannot
+/// see in what they wrote. `*` has no letters, so there is no coincidence to
+/// fall foul of and no near-miss to mistake for a hit. It is also already the
+/// most heavily gated pattern in the system — operator-only at write time, and
+/// re-derived against the owner's current state on every resolution — so making
+/// it the one shape that could not reach a federated tool would leave the
+/// strongest-gated pattern weaker than shapes with fewer gates.
+///
+/// ## The division of labour this implies
+/// **The matcher does not bound `*`; the intersection does.** That is precisely
+/// why `namespaces(client)` is applied on the list path and the call path
+/// alike — see [`decide`]. If `*` stopped at the local registry instead,
+/// `namespaces(client)` would only ever constrain patterns that already name
+/// their own namespace, and the whole federated dimension would be vestigial.
+///
+/// ## Where a namespace begins
+/// Never decided here. Every arm defers to [`crate::mesh::split_namespaced`],
+/// the merge layer's own function, so this file holds no second opinion about
+/// separators. Two definitions of "where does the namespace end" is the same
+/// dual-writer hazard in miniature, and it is the kind that shows up as a
+/// silent widening rather than as a compile error.
+///
 /// The grammar is deliberately tiny — three forms and nothing else. No regex
 /// (a regex authored by a delegated federation owner is a denial-of-service
 /// against the dispatch path) and no negation (denial already has a layer, in
@@ -1567,8 +1603,8 @@ mod tests {
             Box::new(|_| true),
             Box::new(|t: &str| t.starts_with("weather_")),
             Box::new(|t: &str| !t.contains("admin")),
-            Box::new(|t: &str| t.contains("__")),
-            Box::new(|t: &str| !t.contains("__")),
+            Box::new(|t: &str| split_namespaced(t).is_some()),
+            Box::new(|t: &str| split_namespaced(t).is_none()),
             Box::new(|t: &str| t.len() % 2 == 0),
         ];
 
