@@ -2795,6 +2795,20 @@ mod tests {
 
     // ── RMCP-02: OAuth discovery and the 401 challenge ──────────────────────
 
+    /// `auth_token` here is a test DOUBLE for a bearer credential, not a
+    /// secret, and is passed as a literal on purpose.
+    ///
+    /// Review round 1 flagged the literal as a hardcoded credential. Held, with
+    /// reasoning: it authenticates nothing, exists only inside the test binary,
+    /// and grants access to a `ToolRegistry` containing one echo tool built two
+    /// lines above. The S7/S8 secrets rule governs how the RUNTIME obtains real
+    /// credentials — routing this through a vault accessor would test the vault
+    /// rather than the router, and would leave the thing under test (does an
+    /// unauthenticated `/mcp` emit a discovery challenge?) dependent on secret
+    /// provisioning that has nothing to do with it. The pre-existing
+    /// `test_unauthorized_when_token_configured_and_missing` above uses the
+    /// same literal for the same reason; this follows that precedent rather
+    /// than inventing a second convention beside it.
     fn rmcp_state(auth_token: Option<&str>) -> Arc<McpServerState> {
         use crate::oauth::metadata::{CanonicalUri, Discovery};
 

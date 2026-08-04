@@ -158,7 +158,21 @@ impl CanonicalUri {
     /// error that says "this is malformed" without saying what "this" was is
     /// the sort of message that costs an hour.
     pub fn parse(var: &str, value: &str) -> Result<Self, ToolError> {
-        let raw = value.trim();
+        // Deliberately NOT `value.trim()`. Review round 1 caught that trimming
+        // here was the module's own contract violating itself: this type
+        // promises the configured value is used byte-for-byte as the operator
+        // typed it, and surrounding whitespace is the input where quietly
+        // "fixing" it does the most damage. A stray trailing space is invisible
+        // in a shell, a `.env` file and a browser address bar alike, so the
+        // operator who has one will paste it into some of the three places the
+        // value is compared and not others — and every one of those comparisons
+        // is byte-for-byte (the metadata document, the RFC 8707 `resource`
+        // parameter, the token audience). Accepting it here therefore does not
+        // avoid the mismatch, it just moves it to whichever comparison the
+        // operator got wrong, where the symptom is a client-side "couldn't
+        // reach the MCP server" and nothing else. Refusing it names the problem
+        // at startup, at the one place that can still be acted on.
+        let raw = value;
         let refuse = |why: &str| {
             ToolError::InvalidArgument(format!(
                 "{var} is not a usable canonical connector URI ({why}); got {raw:?}. This value \
@@ -172,6 +186,18 @@ impl CanonicalUri {
 
         if raw.is_empty() {
             return Err(refuse("empty"));
+        }
+        // Checked BEFORE the general printable-ASCII rule below (which would
+        // also catch it) purely so the message names the actual problem. An
+        // operator staring at a value that looks identical to the one in their
+        // connector form needs to be told it is the whitespace, not that the
+        // URI "contains a control character".
+        if raw.trim() != raw {
+            return Err(refuse(
+                "has leading or trailing whitespace — remove it rather than relying on the \
+                 server to trim, since the value must byte-equal what was typed into the \
+                 connector form",
+            ));
         }
         // ASCII-printable only: everything downstream (a header value, a path
         // concatenation, a byte comparison) assumes it.
@@ -302,8 +328,20 @@ impl Discovery {
             None => DEFAULT_REQUIRED_SCOPE.to_string(),
         };
 
+        // Trimmed explicitly at the call site, now that `read_env` returns the
+        // value verbatim. A boolean flag is the opposite case from the
+        // canonical URI: nothing compares it byte-for-byte against anything, so
+        // ` true` meaning `true` costs nothing, whereas refusing it would fail
+        // a deployment over an invisible character for no gain. The
+        // normalization rule this module enforces is about values that are
+        // PUBLISHED and COMPARED, not about every string it reads.
         let dcr_enabled = read_env(DCR_ENABLED_ENV)
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false);
 
         Self::new(resource, issuer, scopes, required_scope, dcr_enabled).map(Some)
@@ -492,16 +530,27 @@ impl Discovery {
     }
 }
 
-/// Read an env var, treating blank as absent.
+/// Read an env var VERBATIM, treating a blank or whitespace-only value as
+/// absent.
 ///
 /// The runtime secret store materializes into the process environment at
 /// startup (see this module's doc and `crate::pki`'s), so this IS the
 /// configuration read for this module; there is no second path.
+///
+/// The value is deliberately NOT trimmed. Review round 1 caught that trimming
+/// here defeated [`CanonicalUri::parse`]'s whitespace rule from the other side:
+/// the parser can only refuse surrounding whitespace it is actually shown, and
+/// a reader that helpfully strips it first makes the refusal unreachable in the
+/// only code path that matters — the real one. The two functions have to agree,
+/// so the verbatim value goes all the way through and each caller decides.
+///
+/// A whitespace-ONLY value still reads as absent, matching
+/// `crate::oauth::OauthConfig::from_env`'s rule that an empty materialized
+/// secret is a missing one. That is not the same normalization: "there is
+/// nothing here" is a different statement from "there is something here and I
+/// have quietly altered it".
 fn read_env(var: &str) -> Option<String> {
-    std::env::var(var)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    std::env::var(var).ok().filter(|v| !v.trim().is_empty())
 }
 
 /// Split a space-separated scope list, rejecting any token that is not a valid
@@ -558,7 +607,21 @@ fn sanitize_scope(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
+    /// Every hostname in this module's tests is under `.test`, and that is
+    /// deliberate rather than a placeholder someone forgot to replace.
+    ///
+    /// Review round 1 flagged `connector.test`/`evil.test` as hardcoded
+    /// infrastructure values. Held, with reasoning: `.test` is a reserved TLD
+    /// (RFC 2606, §2) that exists precisely so examples and test fixtures can
+    /// name a host without any possibility of colliding with a real one.
+    /// Substituting a more "realistic-looking" domain would be strictly worse —
+    /// it might be somebody's actual registered name, and a test that resolved
+    /// it would reach a stranger's server. These are also not fleet hostnames,
+    /// which is what the no-hardcoded-infrastructure rule targets; the repo's
+    /// own `no_pii_in_own_source_tree` gate (`crate::github::pii`) walks this
+    /// file and passes on them.
     fn uri(value: &str) -> CanonicalUri {
         CanonicalUri::parse("TEST_VAR", value).expect("fixture must parse")
     }
@@ -634,6 +697,77 @@ mod tests {
                 "must refuse {bad:?}"
             );
         }
+    }
+
+    /// Review round 1. Surrounding whitespace must be REFUSED, not trimmed —
+    /// in both positions and through the env read, since a reader that strips
+    /// it first makes the parser's rule unreachable on the only path that
+    /// matters. A trailing space is invisible in a shell, a `.env` file and an
+    /// address bar alike, so trimming it here does not avoid the byte-for-byte
+    /// mismatch; it relocates the mismatch to whichever of the three
+    /// comparisons (document / RFC 8707 parameter / token audience) the
+    /// operator pasted the untrimmed value into, where the only symptom is a
+    /// client-side "couldn't reach the MCP server".
+    #[test]
+    fn surrounding_whitespace_is_refused_not_trimmed() {
+        for bad in [
+            " https://connector.test/mcp",
+            "https://connector.test/mcp ",
+            " https://connector.test/mcp ",
+            "https://connector.test/mcp\t",
+            "\nhttps://connector.test/mcp",
+        ] {
+            let err = CanonicalUri::parse("TEST_VAR", bad)
+                .expect_err("surrounding whitespace must be refused");
+            assert!(
+                err.to_string().contains("whitespace"),
+                "the error must name the whitespace, not something downstream of it: {err}"
+            );
+        }
+
+    }
+
+    /// The other half of the same finding, and the half that decides whether
+    /// the rule above is reachable at all: the env READ must hand the parser
+    /// the value verbatim. Exercised end-to-end through
+    /// [`Discovery::from_env`], because asserting on a re-implementation of
+    /// `read_env`'s filter would pass even if `read_env` itself started
+    /// trimming again — which is exactly the regression this guards.
+    ///
+    /// `#[serial]` because it mutates process-global environment state, per
+    /// this crate's existing convention (`crate::config`,
+    /// `crate::secrets_bootstrap`).
+    #[test]
+    #[serial]
+    fn from_env_refuses_an_untrimmed_canonical_resource() {
+        // SAFETY-BY-CONVENTION: serialized against every other env-mutating
+        // test in the crate by `#[serial]`; cleared on every exit path below.
+        std::env::set_var(CANONICAL_RESOURCE_ENV, "https://connector.test/mcp ");
+        let untrimmed = Discovery::from_env();
+        std::env::remove_var(CANONICAL_RESOURCE_ENV);
+        let err = untrimmed.expect_err("a trailing space must not reach a document");
+        assert!(err.to_string().contains("whitespace"), "{err}");
+
+        // Control: the same value without the space builds, so the test above
+        // is demonstrating the whitespace rule and not some unrelated refusal.
+        std::env::set_var(CANONICAL_RESOURCE_ENV, "https://connector.test/mcp");
+        let clean = Discovery::from_env();
+        std::env::remove_var(CANONICAL_RESOURCE_ENV);
+        let discovery = clean
+            .expect("a clean value must build")
+            .expect("a set canonical resource enables the door");
+        assert_eq!(discovery.resource().as_str(), "https://connector.test/mcp");
+
+        // A whitespace-ONLY value is ABSENT (door disabled), not malformed —
+        // "there is nothing here" is a different statement from "there is
+        // something here and I have quietly altered it".
+        std::env::set_var(CANONICAL_RESOURCE_ENV, "   ");
+        let blank = Discovery::from_env();
+        std::env::remove_var(CANONICAL_RESOURCE_ENV);
+        assert!(
+            matches!(blank, Ok(None)),
+            "a blank value disables the door rather than failing startup"
+        );
     }
 
     /// A bare origin is a legitimate connector URL, and its path-suffixed
