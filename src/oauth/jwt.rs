@@ -314,13 +314,50 @@ impl JwtSigner {
     /// wrong audience, malformed — collapses into one error. A resource server
     /// only needs valid-or-not, and distinguishing the reasons to an
     /// unauthenticated caller is an oracle.
+    ///
+    /// RMCP-05 needs two of those reasons for its OWN bookkeeping — never for
+    /// the wire — so it calls [`Self::verify_with_reason`], of which this is a
+    /// thin wrapper. There is still exactly one verification implementation;
+    /// only the error channel is richer.
     pub fn verify(&self, token: &str, expected_audience: &str) -> Result<AccessClaims, ToolError> {
+        self.verify_with_reason(token, expected_audience)
+            .map_err(|_| ToolError::InvalidArgument("access token is not valid".into()))
+    }
+
+    /// [`Self::verify`] with the failure CLASSIFIED.
+    ///
+    /// Same decision, same code path — the classification changes nothing about
+    /// which tokens are accepted. It exists because a resource server has two
+    /// obligations this one error cannot serve:
+    ///
+    /// - **An expired token must be answerable with a challenge that tells a
+    ///   hosted client to REFRESH**, not to start a fresh authorization. Both
+    ///   are `invalid_token` on the wire (RFC 6750 gives no separate code), so
+    ///   the difference lives in the description — and getting it wrong strands
+    ///   a user in a re-consent loop for a token that only needed renewing.
+    /// - **A wrong AUDIENCE is the single most important thing to be able to
+    ///   find in an audit log.** It is the signal that someone is replaying a
+    ///   federated peer's token here, and it is indistinguishable from an
+    ///   ordinary bad signature once both have collapsed to "not valid".
+    ///
+    /// The oracle concern in [`Self::verify`]'s doc still governs the WIRE:
+    /// `crate::oauth::resource` maps every one of these to the same coarse
+    /// client-facing description and keeps the distinction for the operator.
+    pub fn verify_with_reason(
+        &self,
+        token: &str,
+        expected_audience: &str,
+    ) -> Result<AccessClaims, VerifyFailure> {
+        self.verify_inner(token, expected_audience)
+    }
+
+    fn verify_inner(&self, token: &str, expected_audience: &str) -> Result<AccessClaims, VerifyFailure> {
         if expected_audience.trim().is_empty() {
-            return Err(ToolError::InvalidArgument(
-                "refusing to verify an access token against an empty audience — a missing \
-                 resource configuration must deny, not match everything"
-                    .into(),
-            ));
+            // Unchanged refusal, unchanged reason (see this method's doc): a
+            // caller with no resource configured must deny, not match
+            // everything. Classified as `Invalid` because it is a fault on THIS
+            // side — nothing about the presented token is known to be wrong.
+            return Err(VerifyFailure::Invalid);
         }
         let mut validation = Validation::new(Algorithm::HS256);
         validation.set_audience(&[expected_audience]);
@@ -337,16 +374,59 @@ impl JwtSigner {
 
         let mut keys = vec![self.current_key.as_str()];
         keys.extend(self.previous_key.as_deref());
+        // The LAST failure is what gets classified, and the key order makes
+        // that the right one: a token signed by neither key fails identically
+        // under both, while a token signed by one of them fails under the other
+        // for signature reasons only — so whichever key actually matched
+        // decides the reported reason.
+        let mut failure = VerifyFailure::Invalid;
         for key in keys {
-            if let Ok(data) = decode::<AccessClaims>(
+            match decode::<AccessClaims>(
                 token,
                 &DecodingKey::from_secret(key.as_bytes()),
                 &validation,
             ) {
-                return Ok(data.claims);
+                Ok(data) => return Ok(data.claims),
+                Err(e) => {
+                    let classified = VerifyFailure::classify(&e);
+                    // Never let a mere signature mismatch against the FIRST key
+                    // overwrite a substantive reason learned from another.
+                    if !matches!(classified, VerifyFailure::Invalid) {
+                        failure = classified;
+                    }
+                }
             }
         }
-        Err(ToolError::InvalidArgument("access token is not valid".into()))
+        Err(failure)
+    }
+}
+
+/// Why [`JwtSigner::verify_with_reason`] refused a token.
+///
+/// Three variants, not ten: only the two that a resource server must ACT on
+/// differently are named, and everything else stays collapsed. Adding a variant
+/// here is adding a distinction someone can leak, so it should need an argument
+/// as concrete as the two below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyFailure {
+    /// Signature and issuer were fine; the token is past `exp` (allowing for
+    /// the configured leeway). The one failure a client can fix by REFRESHING.
+    Expired,
+    /// The token names a different audience — most importantly, a federated
+    /// peer's. This is the replay signal, and the reason it is worth naming.
+    Audience,
+    /// Everything else: bad signature, wrong issuer, not yet valid, malformed,
+    /// missing a required claim. Deliberately undifferentiated.
+    Invalid,
+}
+
+impl VerifyFailure {
+    fn classify(e: &jsonwebtoken::errors::Error) -> Self {
+        match e.kind() {
+            jsonwebtoken::errors::ErrorKind::ExpiredSignature => Self::Expired,
+            jsonwebtoken::errors::ErrorKind::InvalidAudience => Self::Audience,
+            _ => Self::Invalid,
+        }
     }
 }
 

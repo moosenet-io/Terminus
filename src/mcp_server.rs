@@ -66,7 +66,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::federation::PersonalFederationClient;
 use crate::gateway_framework::audit::{AuditDecision, AuditEntry, AuditResult};
@@ -76,7 +76,10 @@ use crate::inference_proxy::{
     INFER_PATH,
 };
 use crate::broker::routes::RouteTable;
-use crate::mesh::{CallRoute, MergedCatalog, Principal, PrincipalResolver, TailnetIdentity, UpstreamPool};
+use crate::mesh::{
+    CallRoute, CallerBinding, MergedCatalog, Principal, PrincipalResolver, TailnetIdentity,
+    UpstreamPool,
+};
 use crate::pki::mtls::ClientIdentity;
 use crate::registry::ToolRegistry;
 
@@ -255,6 +258,20 @@ pub struct McpServerState {
     /// it both missed a door that is switched on somewhere else.
     /// `OauthDoors::none()` is the pre-RMCP-02 posture and changes nothing.
     pub oauth_doors: crate::oauth::metadata::OauthDoors,
+    /// RMCP-05: when set, a request that presents NO mTLS cert and NO tailnet
+    /// identity may instead authenticate with an OAuth 2.1 bearer token, which
+    /// resolves through the SAME principal map to the SAME kind of
+    /// [`Principal`] every other door produces (see
+    /// `crate::oauth::resource`). `None` — the default everywhere, including
+    /// `terminus_personal` — means the fourth door does not exist at all: no
+    /// bearer token is inspected, no challenge is emitted, and every request
+    /// path below behaves byte-for-byte as it did before this item.
+    ///
+    /// Deliberately an `Option` on the state rather than a router-level layer,
+    /// matching `gateway`/`mesh_pool` above: the same handler must be able to
+    /// serve a cert caller and an OAuth caller, and precedence between them is
+    /// a per-request decision, not a per-route one.
+    pub oauth_resource: Option<Arc<crate::oauth::resource::OauthResourceServer>>,
 }
 
 impl McpServerState {
@@ -1133,6 +1150,122 @@ fn is_authorized(state: &McpServerState, headers: &HeaderMap, has_transport_iden
     got.strip_prefix("Bearer ") == Some(expected.as_str())
 }
 
+/// RMCP-05: the OAuth rejection rendered as a response — the same JSON-RPC
+/// error body [`unauthorized`] produces, plus the `WWW-Authenticate` challenge
+/// that makes the failure ACTIONABLE.
+///
+/// The challenge is what turns an expired token from a dead end into a
+/// refresh: a hosted client re-authorizes reactively off this header, so
+/// omitting it would strand the user until they noticed and reconnected by
+/// hand. It is deliberately absent for exactly one rejection — see
+/// `ResourceRejection::Unavailable`.
+fn oauth_unauthorized(
+    server: &crate::oauth::resource::OauthResourceServer,
+    rejection: crate::oauth::resource::ResourceRejection,
+) -> Response {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": Value::Null,
+        "error": {"code": -32001, "message": "Unauthorized"}
+    })
+    .to_string();
+    let mut response = (rejection.status(), body).into_response();
+    let headers = response.headers_mut();
+    headers.insert("content-type", axum::http::HeaderValue::from_static("application/json"));
+    if let Some(challenge) = server.config().challenge(rejection) {
+        // The challenge is built entirely from fixed strings and a
+        // startup-validated URI (see `ResourceServerConfig::challenge`), so
+        // this cannot fail; if it somehow did, dropping the header is the
+        // right degradation — the request is still refused.
+        if let Ok(value) = axum::http::HeaderValue::from_str(&challenge) {
+            headers.insert(axum::http::header::WWW_AUTHENTICATE, value);
+        }
+    }
+    response
+}
+
+/// RMCP-05: whether this request is a candidate for OAuth bearer validation.
+///
+/// Four conditions, each ruling out a different way the new door could have
+/// changed something that already worked:
+/// - the resource server is configured at all (otherwise the door does not
+///   exist and nothing here runs);
+/// - NO transport identity was presented. A cert or tailnet caller resolves
+///   through the established path, whether or not it also happens to carry a
+///   bearer token — the precedence rule in `crate::mesh::principal`, enforced
+///   here a second time so a bearer token is not even LOOKED AT when a
+///   stronger identity is present;
+/// - an `Authorization` header is present at all — with nothing to validate,
+///   the legacy posture decides the request exactly as it did before;
+/// - the credential is not the legacy shared `auth_token`. That token is this
+///   server's pre-existing static credential, not an OAuth access token, and
+///   running it through JWT verification would turn every legacy caller into a
+///   401.
+///
+/// A header that IS present but is not a well-formed single Bearer credential
+/// is still this door's business (`None` from
+/// [`crate::oauth::resource::bearer_credential`] ⇒ candidate). Letting it fall
+/// through to the legacy check would mean a malformed credential is decided by
+/// whatever posture that path happens to have — which, on a host with no
+/// static token configured, is "admit everyone".
+///
+/// Takes the two pieces of state it needs rather than the whole
+/// `McpServerState`, so the precedence and case-matching rules are unit-testable
+/// without standing up a server. Review round 1 found a case-sensitivity seam
+/// here that a test would have caught; making it testable is half the fix, and
+/// routing BOTH paths through
+/// [`crate::oauth::resource::bearer_credential`] — one definition of what a
+/// bearer header is, not two — is the other half.
+fn oauth_is_candidate(
+    oauth_configured: bool,
+    legacy_token: Option<&str>,
+    headers: &HeaderMap,
+    cert: Option<&ClientIdentity>,
+    tailnet: Option<&TailnetIdentity>,
+) -> bool {
+    if !oauth_configured || cert.is_some() || tailnet.is_some() {
+        return false;
+    }
+    if !crate::oauth::resource::authorization_header_present(headers) {
+        return false;
+    }
+    match crate::oauth::resource::bearer_credential(headers) {
+        Some(presented) => legacy_token != Some(presented),
+        None => true,
+    }
+}
+
+/// RMCP-05: combine the transport-resolved principal and the OAuth-resolved
+/// caller into the ONE [`CallerBinding`] every authorization decision for this
+/// request is made from.
+///
+/// The precedence is the third statement of the same rule (the resolver
+/// enforces it, `oauth_is_candidate` refuses to even look at a token when a
+/// transport identity is present, and this refuses to let one win): a
+/// transport-resolved principal is kept AS IS, and the OAuth caller is used
+/// only when there is none. So a bearer token cannot displace a stronger
+/// identity even if some future call site forgets one of the other two checks.
+///
+/// Extracted from the handler so the rule is unit-testable. The property that
+/// matters most — the connector is carried but is NOT the identity — is
+/// invisible while this is spelled inline, and an untested separation is a
+/// separation by assertion only.
+pub(crate) fn caller_binding(
+    principal: Option<Principal>,
+    oauth: Option<crate::oauth::resource::OauthCaller>,
+) -> CallerBinding {
+    match oauth {
+        Some(caller) if principal.is_none() => {
+            let client_id = caller.client_id().to_string();
+            CallerBinding::oauth(caller.into_principal(), client_id)
+        }
+        // Includes the both-present case: the transport identity wins and the
+        // OAuth caller is dropped entirely rather than contributing a
+        // connector ceiling to somebody else's identity.
+        _ => CallerBinding::transport(principal),
+    }
+}
+
 async fn handle_mcp(
     State(state): State<Arc<McpServerState>>,
     headers: HeaderMap,
@@ -1145,6 +1278,9 @@ async fn handle_mcp(
     // listener connection whose WhoIs lookup resolved -- see
     // `TailnetIdentityLayer`'s doc.
     tailnet: Option<Extension<TailnetIdentity>>,
+    // RMCP-05: needed ONLY to detect — and refuse — an access token in the
+    // query string. Nothing in this handler ever reads a credential from it.
+    uri: axum::http::Uri,
     body: Bytes,
 ) -> Response {
     // RMCP-02: the two transport identities are read here, BEFORE dispatch,
@@ -1152,7 +1288,73 @@ async fn handle_mcp(
     // real resolution. Both are listener-inserted extensions, never headers, so
     // a public-internet caller cannot manufacture either one.
     let has_transport_identity = identity.is_some() || tailnet.is_some();
-    if !is_authorized(&state, &headers, has_transport_identity) {
+
+    // RMCP-05: FIRST, before any identity source is even selected — a
+    // credential in the URL is refused and audited for EVERY request, whatever
+    // door it came through and whether or not it would otherwise have been
+    // authenticated. The harm is that the token has already been written to
+    // access logs, `Referer` headers, proxy caches and shell history by the
+    // time it arrives; a client certificate on the same request does not
+    // un-leak it. Gating this on the OAuth branch (as the first revision of
+    // this item did) silently exempted exactly the callers that took a
+    // different door.
+    if let Err(rejection) = crate::oauth::resource::refuse_query_string_token(uri.query()) {
+        return match state.oauth_resource.as_deref() {
+            Some(server) => oauth_unauthorized(server, rejection),
+            // No OAuth door configured, so there is no challenge to issue and
+            // nothing to discover — but the refusal and its audit record still
+            // stand. A leaked credential is not less leaked on a host that
+            // does not speak OAuth.
+            None => unauthorized(state.rmcp_discovery.as_deref()),
+        };
+    }
+
+    let cert = identity.as_ref().map(|Extension(i)| i);
+    let tailnet_identity = tailnet.as_ref().map(|Extension(t)| t);
+
+    // RMCP-05: the fourth door. Attempted only for a request that presented no
+    // transport identity at all (see `oauth_is_candidate`), so an mTLS or
+    // tailnet caller reaches the unchanged path below without a bearer token
+    // ever being inspected — a token can therefore never displace, or be
+    // needed alongside, a stronger identity.
+    let mut oauth_caller = None;
+    if oauth_is_candidate(
+        state.oauth_resource.is_some(),
+        state.auth_token.as_deref(),
+        &headers,
+        cert,
+        tailnet_identity,
+    ) {
+        let server = state.oauth_resource.clone().expect("candidate implies configured");
+        match server
+            .authenticate(&state.principal_resolver, &headers, uri.query())
+            .await
+        {
+            Ok(caller) => oauth_caller = Some(caller),
+            // A presented-but-refused OAuth credential is refused HERE rather
+            // than falling through to the legacy check. Falling through would
+            // mean a token that failed the audience check could still be
+            // admitted by whatever posture the legacy path happens to have —
+            // which, on a host with no static token configured, is "admit
+            // everyone". A failed authentication must never resolve to a
+            // weaker authentication.
+            Err(rejection) => return oauth_unauthorized(&server, rejection),
+        }
+    }
+
+    // RMCP-02 owns the admission decision, including the narrowing that closes
+    // the tokenless open arm once ANY OAuth door is configured. This item does
+    // not restate it — there is one `is_authorized`, called once, here.
+    //
+    // Two things about the placement. It runs AFTER the OAuth attempt because
+    // an OAuth caller is precisely the case RMCP-02's narrowing refuses: with a
+    // door enabled and no transport identity, `is_authorized` returns false, so
+    // checking first would 401 the very callers this item exists to admit. And
+    // `oauth_caller.is_none()` is a SKIP for callers already authenticated by
+    // this item, never a widening — a request that failed OAuth authentication
+    // returned above and never reaches this line, so the only way to get past
+    // it without a validated token is to satisfy RMCP-02's own rule.
+    if oauth_caller.is_none() && !is_authorized(&state, &headers, has_transport_identity) {
         return unauthorized(state.rmcp_discovery.as_deref());
     }
 
@@ -1177,11 +1379,30 @@ async fn handle_mcp(
     // site and the personal-federation dispatch below all use this SAME
     // resolved principal, so a client cannot elevate identity by presenting
     // a header the server doesn't consult in the first place.
-    let principal = resolve_principal(
-        &state.principal_resolver,
-        identity.as_ref().map(|Extension(i)| i),
-        tailnet.as_ref().map(|Extension(t)| t),
-    );
+    let principal = resolve_principal(&state.principal_resolver, cert, tailnet_identity);
+
+    // RMCP-05: fold the transport identity and the OAuth caller into the ONE
+    // `CallerBinding` that every authorization decision below is made from —
+    // the `tools/list` catalog filter and the `tools/call` gate both take it,
+    // so RMCP-07's intersection has a single value to read and cannot end up
+    // gating on one axis while filtering on the other.
+    let binding = caller_binding(principal, oauth_caller);
+    if let Some(client_id) = binding.oauth_client_id() {
+        // Recorded as soon as it is known: which CONNECTOR a call arrived
+        // through is exactly what an operator reviewing an internet-facing
+        // door needs, and it is the input RMCP-07 will intersect against.
+        debug!(
+            target: "gateway_audit",
+            principal = binding.principal().map(Principal::name).unwrap_or("<none>"),
+            oauth_client_id = client_id,
+            "oauth caller authenticated"
+        );
+    }
+    // Borrowed FROM the binding, not cloned out of it: the binding owns the
+    // request's identity for the rest of this handler, so there is no second
+    // copy that could drift from it and no path that reaches a gate with the
+    // connector quietly stripped off.
+    let principal = binding.principal();
 
     // TERM #595: and WHICH HUMAN this turn is being run for, if a trusted
     // principal said so. Resolved ONCE per request from the same server-verified
@@ -1208,7 +1429,7 @@ async fn handle_mcp(
     // LOCREG-01 and this item exist to rule out. An attempted identity that
     // cannot be honoured must never be indistinguishable from no identity.
     let asserted =
-        asserted_person_for_mcp(state.gateway.as_ref(), principal.as_ref(), &headers);
+        asserted_person_for_mcp(state.gateway.as_ref(), principal, &headers);
 
     let parsed: Result<Value, _> = serde_json::from_slice(&body);
     let req = match parsed {
@@ -1328,7 +1549,14 @@ async fn handle_mcp(
             // `terminus_personal`, every pre-TGW-04 deployment) preserves
             // the exact pre-MESH-08 behavior: no filtering at all.
             if let Some(gateway) = &state.gateway {
-                tools = gateway.filter_catalog_for_principal(principal.as_ref(), tools);
+                // RMCP-05 → RMCP-07 SEAM (visibility half). Today the decision
+                // is the account's grant alone. RMCP-07 intersects it with
+                // `binding.oauth_client_id()`'s tool groups and namespaces —
+                // which is why the whole `binding` is in scope here and not
+                // just a principal: the same value reaches the `tools/call`
+                // gate below, so the catalog a caller SEES and the calls it may
+                // MAKE cannot end up computed from different inputs.
+                tools = gateway.filter_catalog_for_principal(binding.principal(), tools);
             }
             // TAVAIL-01: availability filter — COMPOSES WITH the authorization filter
             // above, never replaces it. Authorization answers "may THIS principal use
@@ -1366,7 +1594,7 @@ async fn handle_mcp(
             // can't supply this from a `CallRoute`) and the post-dispatch
             // audit below can attribute a federated call to its upstream.
             let audit_principal =
-                principal.as_ref().map(|p| p.name().to_string()).unwrap_or_else(|| ANONYMOUS_IDENTITY.to_string());
+                principal.map(|p| p.name().to_string()).unwrap_or_else(|| ANONYMOUS_IDENTITY.to_string());
             let audit_upstream_ns = crate::mesh::split_namespaced(name).map(|(ns, _)| ns.to_string());
 
             // TGW-04: gate every tool call -- core (local) AND
@@ -1382,7 +1610,14 @@ async fn handle_mcp(
             // sanitized audit entry are identical to the inference-proxy
             // path's real `403`/`429` HTTP responses.
             let gate_ctx = if let Some(gateway) = &state.gateway {
-                match gateway.guard(principal.as_ref(), name, ActionKind::Tool).await {
+                // RMCP-05 → RMCP-07 SEAM (enforcement half), the twin of the
+                // `tools/list` filter above and fed from the SAME `binding`.
+                // The connector is deliberately NOT part of the identity passed
+                // here: `binding.principal()` is the same value whether this
+                // caller arrived through one client or another, so a connector
+                // can only ever narrow (RMCP-07) and never widen what the
+                // account itself was granted.
+                match gateway.guard(binding.principal(), name, ActionKind::Tool).await {
                     Ok(ctx) => Some(ctx),
                     Err(denial) => {
                         let denial_text = response_body_text(denial).await;
@@ -1716,7 +1951,7 @@ async fn handle_mcp(
                     // strips it below the service identity. See
                     // `GatewayFramework::caller_context_for_person`.
                     match &state.gateway {
-                        Some(gw) => gw.caller_context_for_person(principal.as_ref(), &asserted),
+                        Some(gw) => gw.caller_context_for_person(principal, &asserted),
                         // No gateway: no grant map, so nothing could have been
                         // verified. An unevaluated assertion must land BELOW the
                         // service default, not on it.
@@ -1739,7 +1974,7 @@ async fn handle_mcp(
                     // direction. No key means `Lookup::Denied`, which is the
                     // only safe answer to "who is this?" when the answer failed
                     // verification.
-                    caller_key_for(principal.as_ref(), &asserted),
+                    caller_key_for(principal, &asserted),
                 )
                 .await
             {
@@ -1832,7 +2067,7 @@ async fn handle_mcp(
                         // backward compatibility with the existing
                         // personal/Chord relay) is populated from the same
                         // source -- see `crate::federation`'s module doc.
-                        match client.call_tool(name, arguments, principal.as_ref()).await {
+                        match client.call_tool(name, arguments, principal).await {
                             Ok(outcome) => (
                                 sse_response(
                                     id,
@@ -2294,6 +2529,7 @@ mod tests {
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         })
     }
 
@@ -2455,6 +2691,7 @@ mod tests {
             broker_routes,
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         })
     }
 
@@ -2591,6 +2828,7 @@ mod tests {
                 broker_routes,
                 rmcp_discovery: None,
                 oauth_doors: crate::oauth::metadata::OauthDoors::none(),
+                oauth_resource: None,
             })
         };
         let router = build_router(state);
@@ -2655,6 +2893,7 @@ mod tests {
             broker_routes,
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         });
 
         // tools/list: the colliding name is advertised exactly ONCE, as the
@@ -2734,6 +2973,7 @@ mod tests {
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -2807,6 +3047,7 @@ mod tests {
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -2859,6 +3100,7 @@ mod tests {
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -2891,6 +3133,7 @@ mod tests {
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -2955,6 +3198,7 @@ mod tests {
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: Some(Arc::new(discovery)),
             oauth_doors: doors,
+            oauth_resource: None,
         })
     }
 
@@ -3092,6 +3336,7 @@ mod tests {
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         });
         let router = build_router(state);
 
@@ -3324,6 +3569,7 @@ mod tests {
             // Discovery is DELIBERATELY unset. This is the whole point.
             rmcp_discovery: None,
             oauth_doors: doors,
+            oauth_resource: None,
         });
 
         assert!(
@@ -3586,6 +3832,7 @@ mod tests {
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         })
     }
 
@@ -3761,6 +4008,7 @@ mod tests {
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
+            oauth_resource: None,
         })
     }
 
@@ -4014,5 +4262,503 @@ mod tests {
              once `_approval_code` was stripped: {body}"
         );
         assert_eq!(body["result"]["content"][0]["text"], "echo: hi");
+    }
+
+    // ── RMCP-05: the OAuth door, end to end ──────────────────────────────
+
+    use crate::oauth::resource::{OauthResourceServer, ResourceServerConfig, TokenState};
+
+    // pii-test-fixture: invented connector URIs, an invented HMAC key and an
+    // invented client id — none of them name a real host or credential.
+    const OA_RESOURCE: &str = "https://connector.example.test/mcp"; // pii-test-fixture
+    const OA_ISSUER: &str = "https://connector.example.test"; // pii-test-fixture
+    const OA_KEY: &str = "mcp-server-test-signing-key-32-bytes"; // pii-test-fixture
+    const OA_CLIENT: &str = "client-abc";
+    /// The account UUID RMCP-04 puts in `sub`; `AlwaysLive` resolves it to the
+    /// name `operator`, which the principal map below sends to `lumina`.
+    const OA_ACCOUNT_ID: &str = "11111111-2222-3333-4444-555555555555";
+
+    /// Live OAuth state that always says yes. The point of these tests is the
+    /// wiring in `handle_mcp`, not the store — the store's own fail-closed
+    /// branches are asserted in `crate::oauth::resource`.
+    struct AlwaysLive;
+
+    #[async_trait::async_trait]
+    impl TokenState for AlwaysLive {
+        async fn active_client_row(&self, _: &str) -> Result<Option<uuid::Uuid>, crate::error::ToolError> {
+            Ok(Some(uuid::Uuid::nil()))
+        }
+        async fn active_account_name(&self, _: uuid::Uuid) -> Result<Option<String>, crate::error::ToolError> {
+            Ok(Some("operator".to_string()))
+        }
+        async fn consent_is_live(&self, _: uuid::Uuid, _: uuid::Uuid) -> Result<bool, crate::error::ToolError> {
+            Ok(true)
+        }
+        async fn any_session_is_live(&self, _: uuid::Uuid, _: uuid::Uuid) -> Result<bool, crate::error::ToolError> {
+            Ok(true)
+        }
+    }
+
+    fn oauth_server() -> Arc<OauthResourceServer> {
+        let signer = crate::oauth::jwt::JwtSigner::new(
+            OA_KEY.to_string(),
+            None,
+            OA_ISSUER.to_string(),
+            900,
+            30,
+        )
+        .expect("valid signer");
+        let config = ResourceServerConfig::new(OA_RESOURCE, signer)
+            .expect("valid resource-server config");
+        Arc::new(OauthResourceServer::with_state(config, Arc::new(AlwaysLive)))
+    }
+
+    /// A token this server would itself have issued: account `operator`,
+    /// connector `client-abc`, audienced at this exact resource.
+    fn oauth_token() -> String {
+        let now = chrono::Utc::now().timestamp();
+        let claims = json!({
+            "iss": OA_ISSUER,
+            "sub": OA_ACCOUNT_ID,
+            "aud": OA_RESOURCE,
+            "client_id": OA_CLIENT,
+            "scope": "mcp",
+            "jti": "jti-mcp-1",
+            "iat": now,
+            "nbf": now - 1,
+            "exp": now + 900,
+        });
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(OA_KEY.as_bytes()),
+        )
+        .expect("mint")
+    }
+
+    fn state_with_oauth(gateway: GatewayFramework) -> Arc<McpServerState> {
+        state_with_oauth_and_discovery(gateway, None)
+    }
+
+    /// As above, plus RMCP-02's discovery surface — which is what gives a `401`
+    /// something to point at.
+    fn state_with_oauth_and_discovery(
+        gateway: GatewayFramework,
+        discovery: Option<crate::oauth::metadata::Discovery>,
+    ) -> Arc<McpServerState> {
+        let resolver = PrincipalResolver::new(
+            serde_json::from_value::<PrincipalMap>(json!({
+                "oauth_account": {"operator": "lumina"}
+            }))
+            .unwrap(),
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoHealthTool)).unwrap();
+        Arc::new(McpServerState {
+            registry: ArcSwap::from_pointee(registry),
+            server_name: "terminus-rmcp05-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            auth_token: None,
+            personal_federation: None,
+            inference_proxy: None,
+            tool_cache: Default::default(),
+            gateway: Some(gateway),
+            mesh_pool: None,
+            principal_resolver: resolver,
+            broker_routes: crate::broker::routes::RouteTable::new(),
+            rmcp_discovery: discovery.map(Arc::new),
+            // The door is on, so `OauthDoors` must say so — in production that
+            // is automatic, because `RMCP_OAUTH_ENABLED` is an `RMCP_OAUTH_*`
+            // name and `detect_from_env` keys on the prefix. Registering it
+            // here keeps the fixture honest rather than accidentally testing a
+            // combination (a resource server with no door detected) that no
+            // configuration can produce.
+            oauth_doors: {
+                let mut doors = crate::oauth::metadata::OauthDoors::none();
+                doors.register(crate::oauth::resource::ENABLED_ENV);
+                doors
+            },
+            oauth_resource: Some(oauth_server()),
+        })
+    }
+
+    /// `post_mcp_with_identity`'s sibling with a settable request URI, so the
+    /// query-string refusal can be driven through the real handler.
+    async fn post_mcp_to(
+        router: Router,
+        uri: &str,
+        body: Value,
+        identity: Option<ClientIdentity>,
+        extra_headers: &[(&str, &str)],
+    ) -> (StatusCode, Value, HeaderMap) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        for (k, v) in extra_headers {
+            builder = builder.header(*k, *v);
+        }
+        let mut req = builder.body(Body::from(body.to_string())).unwrap();
+        if let Some(id) = identity {
+            req.extensions_mut().insert(id);
+        }
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let raw = String::from_utf8(bytes.to_vec()).unwrap();
+        let json_str = raw
+            .lines()
+            .find(|l| l.starts_with("data:"))
+            .map(|l| l.trim_start_matches("data:").trim())
+            .unwrap_or(&raw);
+        let value: Value = if json_str.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(json_str).unwrap()
+        };
+        (status, value, headers)
+    }
+
+    fn bearer_header(token: &str) -> String {
+        format!("Bearer {token}")
+    }
+
+    /// POSITIVE CONTROL for everything below: a real token, through the real
+    /// handler, reaches dispatch and is authorized under the principal its
+    /// ACCOUNT maps to.
+    #[tokio::test]
+    async fn rmcp05_a_valid_token_reaches_dispatch_as_its_mapped_principal() {
+        let router = build_router(state_with_oauth(gateway_allowing("lumina", &["health"])));
+        let auth = bearer_header(&oauth_token());
+        let (status, body, _) = post_mcp_to(
+            router,
+            "/mcp",
+            health_call(70),
+            None,
+            &[("authorization", auth.as_str())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], false, "mapped OAuth principal must be granted: {body}");
+    }
+
+    /// FINDING 3, the half that proves the connector is NOT the identity.
+    ///
+    /// Identical request to the test above; the ONLY difference is that the
+    /// grant is keyed on the `client_id` rather than on the account's mapped
+    /// principal. It must be DENIED — if the connector had been folded into
+    /// the principal (or used as a fallback identity) this would succeed, and
+    /// a connector would then be able to GRANT what the account never had.
+    #[tokio::test]
+    async fn rmcp05_the_connector_is_carried_to_dispatch_but_is_never_the_identity() {
+        let router = build_router(state_with_oauth(gateway_allowing(OA_CLIENT, &["health"])));
+        let auth = bearer_header(&oauth_token());
+        let (status, body, _) = post_mcp_to(
+            router,
+            "/mcp",
+            health_call(71),
+            None,
+            &[("authorization", auth.as_str())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["result"]["isError"], true,
+            "a grant keyed on the client_id must NOT authorize the caller — the connector is a \
+             ceiling, not an identity: {body}"
+        );
+    }
+
+    /// FINDING 3, the half that proves it is carried rather than dropped: the
+    /// binding that reaches the dispatch boundary holds BOTH axes, and they
+    /// are different values.
+    #[test]
+    fn rmcp05_the_binding_handed_to_dispatch_holds_both_axes() {
+        let principal = Principal::new("lumina", crate::mesh::PrincipalSource::OAuth);
+        let oauth = crate::oauth::resource::OauthCaller::for_test(principal, OA_CLIENT, "operator");
+        let binding = caller_binding(None, Some(oauth));
+
+        assert_eq!(binding.principal().map(Principal::name), Some("lumina"));
+        assert_eq!(binding.oauth_client_id(), Some(OA_CLIENT));
+        assert_ne!(binding.principal().map(Principal::name), binding.oauth_client_id());
+    }
+
+    /// PRECEDENCE at the binding: a cert-resolved principal wins and the OAuth
+    /// caller is dropped WHOLE — it does not get to contribute a connector
+    /// ceiling to an identity it did not establish.
+    #[test]
+    fn rmcp05_a_transport_principal_wins_and_drops_the_oauth_caller_entirely() {
+        let cert_principal = Principal::new("harmony", crate::mesh::PrincipalSource::MtlsCert);
+        let oauth = crate::oauth::resource::OauthCaller::for_test(
+            Principal::new("lumina", crate::mesh::PrincipalSource::OAuth),
+            OA_CLIENT,
+            "operator",
+        );
+        let binding = caller_binding(Some(cert_principal), Some(oauth));
+
+        assert_eq!(binding.principal().map(Principal::name), Some("harmony"));
+        assert_eq!(binding.oauth_client_id(), None);
+    }
+
+    /// FINDING 1: a token in the URL is refused even when a CLIENT CERTIFICATE
+    /// authenticated the request, and even though the call would otherwise
+    /// have succeeded. The credential has already been written to logs and
+    /// proxy caches by the time it arrives; which door the request took does
+    /// not un-leak it.
+    #[tokio::test]
+    async fn rmcp05_a_query_string_token_is_refused_even_with_a_cert_identity() {
+        let resolver = PrincipalResolver::new(
+            serde_json::from_value::<PrincipalMap>(json!({
+                "cert_cn": {"harmony-primary.example.test": "harmony"}
+            }))
+            .unwrap(),
+        );
+        let cert_identity = || ClientIdentity("harmony-primary.example.test".to_string());
+
+        // POSITIVE CONTROL: the same cert, same call, no query string — allowed.
+        let router = build_router(state_with(gateway_allowing("harmony", &["health"]), resolver.clone()));
+        let (status, body, _) =
+            post_mcp_to(router, "/mcp", health_call(72), Some(cert_identity()), &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], false, "control must pass: {body}");
+
+        // Same request with a token in the URL — refused outright, before any
+        // identity source is selected.
+        let router = build_router(state_with(gateway_allowing("harmony", &["health"]), resolver));
+        let (status, _, _) = post_mcp_to(
+            router,
+            "/mcp?access_token=leaked.jwt.value", // pii-test-fixture: invented token value
+            health_call(73),
+            Some(cert_identity()),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a URL-borne credential must be refused whatever door authenticated the request"
+        );
+    }
+
+    /// ...and on an OAuth-configured host it is refused WITH the challenge,
+    /// even when a perfectly valid header credential is also present. The
+    /// header would have authenticated; the URL is what fails the request.
+    #[tokio::test]
+    async fn rmcp05_a_query_string_token_is_refused_even_beside_a_valid_header() {
+        let router = build_router(state_with_oauth(gateway_allowing("lumina", &["health"])));
+        let auth = bearer_header(&oauth_token());
+        let (status, _, headers) = post_mcp_to(
+            router,
+            "/mcp?access_token=leaked.jwt.value", // pii-test-fixture: invented token value
+            health_call(74),
+            None,
+            &[("authorization", auth.as_str())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let challenge = headers
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(challenge.contains("invalid_request"), "challenge was {challenge:?}");
+    }
+
+    /// An expired token is refused WITH the challenge, which is how a hosted
+    /// client knows to refresh rather than to give up.
+    #[tokio::test]
+    async fn rmcp05_an_expired_token_is_401_with_a_challenge() {
+        let now = chrono::Utc::now().timestamp();
+        let claims = json!({
+            "iss": OA_ISSUER, "sub": OA_ACCOUNT_ID, "aud": OA_RESOURCE,
+            "client_id": OA_CLIENT, "scope": "mcp", "jti": "jti-mcp-2",
+            "iat": now - 7200, "nbf": now - 7200, "exp": now - 3600,
+        });
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(OA_KEY.as_bytes()),
+        )
+        .unwrap();
+
+        let router = build_router(state_with_oauth(gateway_allowing("lumina", &["health"])));
+        let auth = bearer_header(&token);
+        let (status, _, headers) = post_mcp_to(
+            router,
+            "/mcp",
+            health_call(75),
+            None,
+            &[("authorization", auth.as_str())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let challenge = headers
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(challenge.contains("invalid_token"), "challenge was {challenge:?}");
+        assert!(challenge.contains("resource_metadata="), "challenge was {challenge:?}");
+    }
+
+    /// The acceptance criterion this item could not meet on its own: with the
+    /// resource-server door ENABLED and NO credential of any kind — no bearer
+    /// token, no client certificate, no tailnet identity — `/mcp` must answer
+    /// `401` carrying the discovery challenge, not `200`.
+    ///
+    /// ## Why this test lives here and not in RMCP-02
+    ///
+    /// The two items own different halves and only a test from THIS side pins
+    /// that they compose. RMCP-02 owns the narrowing — its `is_authorized` is
+    /// the single place that decides an uncredentialed request is refused once
+    /// any OAuth door is configured — and its own test deliberately asserts a
+    /// BARE `401`, because with no discovery surface configured there is no
+    /// `resource_metadata` to point a client at.
+    ///
+    /// This item owns the door that makes the narrowing apply, and a deployment
+    /// running it has a discovery surface. So the end state a Claude client
+    /// actually meets is the one asserted here: the `401` AND the spec-shaped
+    /// challenge that tells it where to authorize. Discovery is entirely
+    /// `401`-driven and a `WWW-Authenticate` on a `200` is discarded, so status
+    /// and header have to be right together — asserting either alone would pass
+    /// while the connector still failed with a generic "couldn't reach the MCP
+    /// server".
+    ///
+    /// Note this item writes NO admission logic of its own. It is a consumer
+    /// here, and the test is the proof that consuming was enough.
+    #[tokio::test]
+    async fn rmcp05_an_uncredentialed_request_to_an_enabled_door_is_401_with_the_challenge() {
+        let discovery = crate::oauth::metadata::Discovery::new(
+            crate::oauth::metadata::CanonicalUri::parse(
+                crate::oauth::authorize::RESOURCE_ENV,
+                OA_RESOURCE,
+            )
+            .expect("resource fixture"),
+            crate::oauth::metadata::CanonicalUri::parse(
+                crate::oauth::authorize::ISSUER_ENV,
+                OA_ISSUER,
+            )
+            .expect("issuer fixture"),
+            false,
+            vec!["mcp".to_string()],
+            "mcp".to_string(),
+            false,
+        )
+        .expect("discovery fixture must build");
+
+        let state = state_with_oauth_and_discovery(
+            gateway_allowing("lumina", &["health"]),
+            Some(discovery),
+        );
+        // The precondition the whole assertion rests on: this host has no
+        // legacy shared token, so before RMCP-02's narrowing the open arm would
+        // have admitted this request outright.
+        assert!(state.auth_token.is_none());
+
+        let router = build_router(state);
+        // No Authorization header, no ClientIdentity extension, no tailnet
+        // identity — exactly what arrives from the public internet.
+        let (status, _, headers) =
+            post_mcp_to(router, "/mcp", health_call(76), None, &[]).await;
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an enabled door must refuse an uncredentialed request rather than dispatch it"
+        );
+        let challenge = headers
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            challenge.starts_with("Bearer "),
+            "the challenge must name the Bearer scheme: {challenge:?}"
+        );
+        assert!(
+            challenge.contains("resource_metadata="),
+            "a 401 a client cannot act on is why this item exists: {challenge:?}"
+        );
+    }
+
+    /// The control for the test above, and the reason it proves anything: with
+    /// the door CLOSED, the identical uncredentialed request is still served.
+    /// Every pre-RMCP-05 loopback and mTLS deployment depends on that, so the
+    /// narrowing must be a consequence of opening the door and of nothing else.
+    #[tokio::test]
+    async fn rmcp05_an_uncredentialed_request_to_a_closed_door_is_unchanged() {
+        let state = state_with(gateway_allowing("anonymous", &["health"]), PrincipalResolver::default());
+        assert!(state.oauth_resource.is_none() && !state.oauth_door_enabled());
+
+        let router = build_router(state);
+        let (status, _, headers) =
+            post_mcp_to(router, "/mcp", health_call(77), None, &[]).await;
+
+        assert_eq!(status, StatusCode::OK, "a closed door must change nothing");
+        assert!(headers.get("www-authenticate").is_none());
+    }
+
+    /// FINDING 2: the candidate check and the credential parser must agree
+    /// about what a Bearer header IS. They now share one matcher, so every
+    /// case form is recognised — a `bearer …` header used to fall through to
+    /// the legacy path, which on a host with no static token means "admit".
+    #[test]
+    fn rmcp05_the_candidate_check_matches_the_bearer_scheme_case_insensitively() {
+        for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("{scheme} a.b.c").parse().unwrap());
+            assert!(
+                oauth_is_candidate(true, None, &headers, None, None),
+                "{scheme:?} must be recognised as a bearer credential"
+            );
+        }
+    }
+
+    /// The rest of the candidate rule, each clause asserted on its own.
+    #[test]
+    fn rmcp05_candidate_selection_never_overrides_a_transport_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer a.b.c".parse().unwrap());
+
+        let cert = ClientIdentity("harmony-primary.example.test".to_string());
+        // Synthetic: the node keeps the `<host>.<tailnet>.ts.net` shape the
+        // parser needs, with a tailnet segment that is deliberately a non-name.
+        let tailnet = crate::mesh::TailnetIdentity {
+            login: "operator-login".to_string(), // pii-test-fixture
+            node: "test-node.not-a-real-tailnet.ts.net".to_string(),  // pii-test-fixture
+            tags: vec![],
+        };
+
+        assert!(
+            !oauth_is_candidate(true, None, &headers, Some(&cert), None),
+            "a cert caller's token must not even be inspected"
+        );
+        assert!(
+            !oauth_is_candidate(true, None, &headers, None, Some(&tailnet)),
+            "a tailnet caller's token must not even be inspected"
+        );
+        assert!(
+            !oauth_is_candidate(false, None, &headers, None, None),
+            "with no resource server configured the door does not exist"
+        );
+        assert!(
+            !oauth_is_candidate(true, None, &HeaderMap::new(), None, None),
+            "no Authorization header means nothing for this door to validate"
+        );
+
+        // The legacy shared token is not an OAuth credential and must not be
+        // run through JWT verification.
+        let mut legacy = HeaderMap::new();
+        legacy.insert("authorization", "Bearer legacy-static".parse().unwrap());
+        assert!(!oauth_is_candidate(true, Some("legacy-static"), &legacy, None, None));
+
+        // ...but a DIFFERENT credential on the same host still is one.
+        assert!(oauth_is_candidate(true, Some("legacy-static"), &headers, None, None));
+
+        // A present-but-malformed Authorization header is this door's business
+        // too: falling through would let the legacy posture (on a host with no
+        // static token, "admit everyone") decide a broken credential.
+        let mut malformed = HeaderMap::new();
+        malformed.insert("authorization", "Basic abc".parse().unwrap());
+        assert!(oauth_is_candidate(true, None, &malformed, None, None));
     }
 }

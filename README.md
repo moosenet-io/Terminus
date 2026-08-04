@@ -640,9 +640,88 @@ load-bearing rather than incidental:
   claimed by an `INSERT … ON CONFLICT DO NOTHING`, so a replayed consent post loses the race
   **across every replica**, not merely within one process.
 
+**Presenting the token: what `/mcp` does with it.** Everything above mints a token; the
+resource-server half checks one on every call. It resolves to an ordinary `Principal` and
+then stops — an OAuth caller gets no new entitlement channel, and a `CallerContext` is still
+constructible only inside `gateway_framework`, from that principal's grants.
+
+> **Status: built, not yet enforcing end to end (TERM #631).** The behaviour described in
+> this section is implemented and tested, and the `/mcp` request path calls it. But the OAuth
+> subsystem as a whole is not finished being wired: the authorization-server routers are not
+> mounted. (Session state IS now consulted from this dispatch path, with the exact guarantee
+> and its per-session gap stated below.) Read what
+> follows as the contract the code implements, not as a control you can currently rely on in
+> production. Until that wiring lands, do not treat this door as an enforcement boundary.
+
+- **The audience check is the load-bearing one, not the signature.** A valid signature proves
+  only that *someone holding the key* minted the token. A token whose `aud` names a federated
+  peer is refused here even though it verifies perfectly, and a **multi-audience** token is
+  refused outright rather than searched for our own name — a token valid at two audiences is
+  replayable at the second by whoever holds it at the first, which is the property
+  audience-binding exists to remove.
+- **Header only.** A token in a query string is refused *and audited* before any identity
+  source is selected — for every request, whatever door it came through, and whether or not
+  it would otherwise have authenticated. By the time such a request arrives the credential
+  has already been written to access logs, `Referer` headers, proxy caches and shell history;
+  a client certificate on the same request does not un-leak it.
+- **An issued token still resolves to nobody by default.** The account maps to a canonical
+  principal through the *same* `TERMINUS_MESH_PRINCIPAL_MAP_JSON` every other transport uses,
+  via a new `oauth_account` table. An unmapped account fails closed exactly as an unmapped
+  mTLS CN does, so the door is inert until an operator writes an entry: minting a token is an
+  authentication decision, and being somebody here is a separate one, made on purpose.
+- **A certificate still wins, exclusively.** OAuth is the weakest of the four doors — the only
+  internet-reachable one, and the only one whose credential is replayable by whoever holds it
+  — so it is consulted only when no cert and no tailnet identity is present. That ordering is
+  enforced in three independent places, and a bearer token is not even *inspected* when a
+  stronger identity is on the request.
+- **Revocation takes effect on the next call — for everything that removes ALL of a caller's
+  sessions.** The client row, the account row, the consent row and the pair's session state are
+  re-read per request, because a signature is a point-in-time authority and revocation happens
+  after it was issued. The guarantee, stated so an operator can act on it:
+
+  > Disabling a client, disabling an account, revoking consent, or revoking every session for
+  > an (account, client) pair denies that caller's **next** request. Revoking **one** session
+  > while another is still active does **not** — a token minted for the revoked session keeps
+  > working until it expires, up to `RMCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS` (default 15 minutes).
+  > To cut off a caller immediately today, revoke consent or disable the client.
+
+  The gap is not a policy choice: nothing in an access token identifies a session. The claims
+  are `iss`, `sub`, `aud`, `client_id`, `scope`, `jti`, `exp`, `iat`, `nbf` — `sub` is the
+  account, `client_id` is the client, and the `jti` is generated at mint time and stored
+  nowhere, because there is no access-token table. Closing it means putting the refresh
+  family in the token, which is tracked as **TERM #635**.
+- **The connector rides alongside the principal, never inside it.** `client_id` is the second
+  axis of the intersection above; folding it into the principal name would make one human a
+  different principal per client, turning a ceiling into an independent grant.
+- Failure shapes: an expired token is `401` **with** the challenge, which is how a hosted
+  client refreshes reactively; an unreachable store is `503` **without** one, because telling
+  a client its credential is bad would send the user through a full re-authorization for a
+  server-side outage.
+
+**Opening the door.** It is shut unless `RMCP_OAUTH_ENABLED` is set — an explicit switch, not
+"configured means enabled", because which hosts expose a public door should be a sentence an
+operator wrote rather than a side effect of an env file being copied. Once it *is* set, every
+remaining failure (a malformed canonical resource, a missing signing key, an unreachable OAuth
+database, an unapplied migration) refuses the process at startup. That is deliberate and has a
+real cost — it couples the gateway's startup to Postgres on hosts that opt in — but the
+alternative is worse than an outage: a door that is configured, believed open and silently
+shut produces no error anywhere, and presents to the operator as a connector that mysteriously
+never links.
+
 **Configuration** (names only — values are materialized from the runtime secret store, never
 authored by hand): `RMCP_DATABASE_URL`, `RMCP_OAUTH_SIGNING_KEY`, `RMCP_OAUTH_ISSUER`,
-`RMCP_OAUTH_RESOURCE`. The schema lives in `migrations/S132-rmcp01-oauth-core.sql` and
+`RMCP_OAUTH_RESOURCE`. The resource server adds exactly **one** name of its own,
+`RMCP_OAUTH_ENABLED` (the switch) — everything else it needs it reads through the code that
+already owns it. `RMCP_OAUTH_RESOURCE` is the connector URL exactly as typed into the client
+(an absolute `https` URI, no trailing slash, no fragment) and is compared byte for byte
+against a token's `aud`; the signing key, issuer, optional
+`RMCP_OAUTH_SIGNING_KEY_PREVIOUS` rotation window and `RMCP_OAUTH_CLOCK_SKEW_SECONDS` leeway
+are the token endpoint's, and the *same* verifier that mints tokens is the one that checks
+them here. That is deliberate and was learned the hard way: an earlier revision of the
+resource server read its own `RMCP_CANONICAL_RESOURCE` for the audience, which under the
+documented configuration would have rejected every token the fleet issued — a door that fails
+silently, which is the failure mode this whole subsystem keeps having to design against. The
+schema lives in `migrations/S132-rmcp01-oauth-core.sql` and
 `migrations/S132-rmcp03-login-session.sql` and is **not** applied at startup: apply it via
 `pg_ddl` as part of the deploy. Until it is, the store reports the door unconfigured rather
 than serving a silently dead auth surface.

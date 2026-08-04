@@ -71,6 +71,13 @@
 //! purpose: the exposure surface of a public door is worth reviewing on its own,
 //! before there is anything behind it to be distracted by.
 //!
+//! ## What RMCP-05 adds
+//! [`resource`] — the first REACHABLE surface here: it validates a bearer
+//! token on `/mcp` and resolves it to a [`crate::mesh::Principal`]. It is the
+//! consuming half of the tokens RMCP-04 will mint, and it deliberately landed
+//! first: a verifier written before an issuer cannot be quietly shaped around
+//! whatever the issuer happened to emit.
+//!
 //! ## Credential storage — nothing here is presentable
 //! No table in this schema stores a usable credential:
 //! - Authorization codes and refresh tokens are high-entropy machine-generated
@@ -98,6 +105,9 @@ pub mod metadata;
 pub mod model;
 pub mod password;
 pub mod router;
+/// RMCP-05: resource-server validation — the half that turns a bearer token
+/// into a [`crate::mesh::Principal`] the existing gateway already authorizes.
+pub mod resource;
 pub mod session;
 pub mod store;
 pub mod templates;
