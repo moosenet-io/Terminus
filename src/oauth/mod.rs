@@ -252,6 +252,15 @@ impl Argon2idHash {
         b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'.' | b'-' | b'_')
     }
 
+    /// Decode a segment as unpadded standard base64, or `None` when it uses
+    /// characters outside that alphabet (see [`Self::is_segment_char`]) and so
+    /// cannot be decoded that way.
+    fn decode_standard_b64(segment: &str) -> Option<Vec<u8>> {
+        use base64::engine::general_purpose::STANDARD_NO_PAD;
+        use base64::Engine as _;
+        STANDARD_NO_PAD.decode(segment).ok()
+    }
+
     /// Accept a PHC string, rejecting anything not structurally argon2id.
     ///
     /// Expected layout, six `$`-separated fields (the leading `$` produces an
@@ -329,6 +338,28 @@ impl Argon2idHash {
         }
         if !segment_ok(fields[5], Self::MIN_DIGEST_LEN) {
             return Err(refuse("digest is too short or not base64"));
+        }
+
+        // Round 7 asked this parser to "establish that the value is an actual
+        // argon2id hash". That is not achievable and is not what this guard
+        // claims: whether a digest is the CORRECT output for some password is
+        // unknowable without the password, and argon2 output is
+        // indistinguishable from random bytes. What is achievable is raising
+        // the bar from "looks base64-ish" to "decodes as base64 to a
+        // cryptographically plausible length", which is done here for segments
+        // written in the standard alphabet. A segment using the wider accepted
+        // alphabet is length-checked only, deliberately: rejecting a genuine
+        // hash would break authentication, and this guard's job is to catch a
+        // plaintext password, not to adjudicate encodings.
+        if let Some(salt) = Self::decode_standard_b64(fields[4]) {
+            if salt.len() < 8 {
+                return Err(refuse("salt decodes to fewer than argon2's 8 minimum bytes"));
+            }
+        }
+        if let Some(digest) = Self::decode_standard_b64(fields[5]) {
+            if digest.len() < 16 {
+                return Err(refuse("digest decodes to an implausibly short length"));
+            }
         }
 
         Ok(Self(phc.to_string()))
