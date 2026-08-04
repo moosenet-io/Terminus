@@ -24,7 +24,7 @@ import { MultiSelect } from './MultiSelect';
 import type { MultiSelectOption } from './MultiSelect';
 import { ResolvedToolPreview } from './ResolvedToolPreview';
 import { SessionList } from './SessionList';
-import { parseLines, redirectUriHints, sameSet } from './connectorForm';
+import { parseLines, redirectUriHints, sameSet, serverUnassignableReason } from './connectorForm';
 
 const mono = { fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)' } as const;
 
@@ -113,7 +113,7 @@ export function ClientEditor({ client, groups, servers, onSaved, onRevoked, onBa
     unavailable: !s.available,
     // Assigning a namespace you do not own is refused server-side (RMCP-12); saying so here is
     // the difference between "broken" and "ask for the delegation".
-    disabledReason: s.ownedByMe ? undefined : 'you do not own this server',
+    disabledReason: serverUnassignableReason(s),
   }));
 
   const save = () => {

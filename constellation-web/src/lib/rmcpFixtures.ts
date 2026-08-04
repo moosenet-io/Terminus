@@ -49,46 +49,57 @@ import type {
  *  cannot drop it while keeping the module: if the fixture ships, this string ships with it. */
 export const RMCP_FIXTURE_MARKER = 'rmcp-fixture-server-must-never-ship';
 
+/** Whose row it is. `null` (namespaces only) means UNCLAIMED — no ownership row exists, which
+ *  the real store treats as "attachable by nobody", not "attachable by anyone". */
+type Owner = 'me' | 'other';
+
 
 // ── Fixture catalog ─────────────────────────────────────────────────────────
 // A merged, namespaced catalog shaped like the real one: a few namespaces, one of them down.
 
-const FIXTURE_NAMESPACES: { namespace: string; available: boolean; ownedByMe: boolean; tools: string[] }[] = [
+const FIXTURE_NAMESPACES: { namespace: string; available: boolean; owner: Owner | null; tools: string[] }[] = [
   {
     namespace: 'media',
     available: true,
-    ownedByMe: true,
+    owner: 'me',
     tools: ['media_search', 'media_play', 'media_queue_add', 'media_library_scan', 'media_stats'],
   },
   {
     namespace: 'home',
     available: true,
-    ownedByMe: true,
+    owner: 'me',
     tools: ['home_light_set', 'home_scene_run', 'home_sensor_read', 'home_thermostat_set'],
   },
   {
-    // Owned by the fixture principal but currently DOWN — the "scoped to an unavailable upstream"
-    // state, which must read as a condition of the mesh, not as an error or a refusal.
+    // Mine, but the upstream is DOWN — a condition of the mesh, not a refusal.
     namespace: 'workshop',
     available: false,
-    ownedByMe: true,
+    owner: 'me',
     tools: ['workshop_job_list', 'workshop_job_start'],
   },
   {
     namespace: 'notes',
     available: true,
-    ownedByMe: true,
+    owner: 'me',
     // Padded so the resolved preview's paging is exercisable without a live 400-tool catalog.
     tools: Array.from({ length: 60 }, (_, i) => `notes_entry_${String(i + 1).padStart(3, '0')}`),
   },
   {
-    // Someone ELSE's namespace: visible (its tools are in the merged catalog either way) but not
-    // assignable by this principal. Scoping a client to it is refused at write, which is the
-    // spec's headline delegated-owner test.
+    // Someone ELSE's namespace: visible, not assignable by this principal.
     namespace: 'studio',
     available: true,
-    ownedByMe: false,
+    owner: 'other',
     tools: ['studio_render', 'studio_asset_list'],
+  },
+  {
+    // UNCLAIMED — no row in `rmcp_server_owner` at all. The real store refuses to attach it and
+    // resolves it to nothing (`client_namespaces` INNER JOINs the ownership table): "nobody has
+    // claimed this server" must never read as "everyone may reach it". A fixture that allowed it
+    // would teach the UI the opposite of the rule.
+    namespace: 'lab',
+    available: true,
+    owner: null,
+    tools: ['lab_run', 'lab_status'],
   },
 ];
 
@@ -157,7 +168,6 @@ function resolvePatterns(patterns: string[], groupName: string): RmcpResolvedToo
 // answers accordingly, so the fixture has to know too. It is stripped from every response —
 // leaking "this belongs to someone else" would itself be the disclosure the model forbids.
 
-type Owner = 'me' | 'other';
 type FixtureClient = RmcpClient & { owner: Owner };
 type FixtureGroup = RmcpToolGroup & { owner: Owner };
 
@@ -175,6 +185,12 @@ let groups: FixtureGroup[] = [
   // Another owner's group. Never returned by `rmcp_group_list` for this principal — enumeration
   // is itself a disclosure — and refused on direct access by id.
   { id: 'g-studio', name: 'studio', description: 'Rendering', patterns: ['studio::*'], editable: false, version: 1, owner: 'other' },
+  // A group that WAS this principal's when c-5 was scoped to it and has since been transferred
+  // away. The scope row survives the ownership that justified it — which is exactly why the real
+  // store re-checks `c.owner_account_id = g.owner_account_id` on the READ path and not only at
+  // write time. It resolves to nothing now.
+  { id: 'g-legacy', name: 'legacy media', description: 'Transferred to another owner', patterns: ['media::*'], editable: false, version: 1, owner: 'other' },
+  { id: 'g-lab', name: 'lab', description: 'Lab tools', patterns: ['lab::*'], editable: true, version: 1, owner: 'me' },
 ];
 
 let clients: FixtureClient[] = [
@@ -241,6 +257,58 @@ let clients: FixtureClient[] = [
     editable: false,
     owner: 'other',
   },
+  {
+    // Scoped, but DISABLED. The real store's scope reads both require `NOT c.disabled`, so this
+    // resolves to nothing — the preview must not show a fabricated grant for a client the rest of
+    // the UI simultaneously describes as denied.
+    id: 'c-5',
+    clientId: 'cnx_suspended',
+    name: 'Suspended assistant',
+    registrationSource: 'operator',
+    enabled: false,
+    confidential: false,
+    redirectUris: ['https://example.invalid/suspended'],
+    toolGroupIds: ['g-media'],
+    namespaces: ['media'],
+    createdAt: '2026-07-20T09:00:00Z',
+    version: 1,
+    editable: true,
+    owner: 'me',
+  },
+  {
+    // Enabled, correctly scoped — but its only group was transferred to another owner after the
+    // assignment. Read-time ownership re-check ⇒ resolves to nothing.
+    id: 'c-6',
+    clientId: 'cnx_transferred',
+    name: 'Transferred-group console',
+    registrationSource: 'operator',
+    enabled: true,
+    confidential: false,
+    redirectUris: ['https://example.invalid/transferred'],
+    toolGroupIds: ['g-legacy'],
+    namespaces: ['media'],
+    createdAt: '2026-07-21T09:00:00Z',
+    version: 1,
+    editable: true,
+    owner: 'me',
+  },
+  {
+    // Enabled, group owned by this principal, matching patterns — but the namespace has NO owner
+    // (delegation cleared, or never granted). Read-time ownership re-check ⇒ resolves to nothing.
+    id: 'c-7',
+    clientId: 'cnx_unclaimed',
+    name: 'Unclaimed-server console',
+    registrationSource: 'operator',
+    enabled: true,
+    confidential: false,
+    redirectUris: ['https://example.invalid/unclaimed'],
+    toolGroupIds: ['g-lab'],
+    namespaces: ['lab'],
+    createdAt: '2026-07-22T09:00:00Z',
+    version: 1,
+    editable: true,
+    owner: 'me',
+  },
 ];
 
 let sessions: RmcpSession[] = [
@@ -262,41 +330,101 @@ function clientOr404(id: string, tool: RmcpToolName): FixtureClient {
   const found = clients.find(c => c.id === id);
   if (!found) throw new RmcpError('not_found', tool, 'client not found');
   // Ownership is checked on the READ path too, not only before a write. A resolve or a revoke
-  // that names another owner's client id must be REFUSED, not merely absent from a list — the
-  // UI's hiding is a courtesy, and a fixture that only hid would let a UI-only "enforcement"
-  // pass its tests. `forbidden` (rather than `not_found`) matches how the real store audits the
-  // attempt; a deployment that prefers strict non-disclosure may answer `not_found` instead, and
-  // the UI treats both as "you cannot have this".
-  if (found.owner !== 'me') throw new RmcpError('forbidden', tool, 'not owned by this account');
+  // naming another owner's client must be REFUSED, not merely absent from a list — the UI's
+  // hiding is a courtesy, and a fixture that only hid would let a UI-only "enforcement" pass its
+  // tests.
+  //
+  // The KIND is `not_found`, matching the merged store verbatim ("Same answer for 'no such
+  // client' and 'not yours': distinguishing them would confirm the existence of another account's
+  // client"). Round 2 of this item picked `forbidden` on my own judgement; with the real store
+  // now merged there is an authority, and it says the two answers must be indistinguishable — a
+  // `forbidden` that a `not_found` would not have produced IS the enumeration oracle.
+  if (found.owner !== 'me') throw new RmcpError('not_found', tool, 'no such client for this account');
   return found;
 }
 
-/** Every namespace this principal may scope a client to (RMCP-12). */
+/** Namespaces this principal may attach — owned BY THIS PRINCIPAL. An unclaimed namespace is not
+ *  in this set, mirroring `set_client_namespaces`' INNER JOIN on `rmcp_server_owner`. */
 function ownedNamespaces(): string[] {
-  return FIXTURE_NAMESPACES.filter(n => n.ownedByMe).map(n => n.namespace);
+  return FIXTURE_NAMESPACES.filter(n => n.owner === 'me').map(n => n.namespace);
 }
 
-/** The delegated-owner headline rule: a client may only be scoped to namespaces its editor owns.
- *  Enforced on the write, because that is where the real server enforces it — a UI that merely
- *  disables the checkbox has enforced nothing. */
-function assertNamespacesOwned(namespaces: string[] | undefined, tool: RmcpToolName): void {
+/**
+ * Mirrors `OauthStore::set_client_namespaces`' ownership check. An UNOWNED namespace is REFUSED,
+ * not allowed — the store's own words: "nobody has claimed this server" must mean "no delegated
+ * owner may attach it", never "it is free for anyone". The refusal is deliberately unspecific
+ * about WHICH namespace failed, exactly as the store is, so the error is not an enumeration
+ * oracle for another account's servers.
+ */
+function assertNamespacesAssignable(namespaces: string[] | undefined, tool: RmcpToolName): void {
   if (!namespaces) return;
   const owned = new Set(ownedNamespaces());
-  const foreign = namespaces.filter(ns => !owned.has(ns));
-  if (foreign.length > 0) {
-    throw new RmcpError('forbidden', tool, `not owned by this account: ${foreign.join(', ')}`);
+  if (namespaces.some(ns => !owned.has(ns))) {
+    throw new RmcpError('invalid', tool, 'one or more servers are not owned by this account');
   }
 }
 
-function resolveForClient(client: RmcpClient, limit?: number, offset?: number): RmcpResolvedScope {
-  const assignedGroups = groups.filter(g => client.toolGroupIds.includes(g.id));
+/**
+ * Mirrors `OauthStore::set_client_tool_groups`' ownership check — the symmetric rule that was
+ * missing here entirely: every assigned group must belong to the actor. Same unspecific error,
+ * same reason.
+ */
+function assertGroupsAssignable(groupIds: string[] | undefined, tool: RmcpToolName): void {
+  if (!groupIds) return;
+  const owned = new Set(groups.filter(g => g.owner === 'me').map(g => g.id));
+  if (groupIds.some(id => !owned.has(id))) {
+    throw new RmcpError('invalid', tool, 'one or more tool groups do not belong to this account');
+  }
+}
+
+/**
+ * The fixture's effective-scope resolution, mirrored PREDICATE FOR PREDICATE from the merged
+ * `OauthStore::client_tool_groups` / `client_namespaces` (`src/oauth/store.rs` on main). Each
+ * clause below cites the SQL it stands in for, because the value of this function is entirely in
+ * agreeing with that one:
+ *
+ *   groups:     JOIN rmcp_client c ON c.id = s.client_id AND NOT c.disabled
+ *                                  AND c.owner_account_id = g.owner_account_id
+ *   namespaces: JOIN rmcp_client c ON c.id = s.client_id AND NOT c.disabled
+ *               JOIN rmcp_server_owner o ON o.namespace = s.namespace
+ *                                       AND o.owner_account_id = c.owner_account_id
+ *
+ * The through-line in all three added clauses: **a write-time check is point-in-time, and any
+ * revocable authority has to be re-derived on READ.** Ownership can be transferred and a
+ * delegation can be cleared, but the `rmcp_client_scope` / `rmcp_client_server` row outlives
+ * both — so a resolver that trusted the write would keep reporting a grant that no longer
+ * exists. That lesson cost RMCP-01 two review rounds (10 and 11) and recurred in RMCP-06; a
+ * fixture that did not embody it would quietly re-teach the mistake to whoever reads it next.
+ */
+function resolveForClient(client: FixtureClient, limit?: number, offset?: number): RmcpResolvedScope {
+  // `NOT c.disabled`, on BOTH scope reads. A disabled client resolves to nothing — not to a
+  // preview of what it would reach if re-enabled, which would be a fabricated grant shown next
+  // to a "disabled" badge.
+  const enabled = client.enabled;
+
+  // `c.owner_account_id = g.owner_account_id`, re-checked at read time: a group transferred to
+  // another owner stops resolving even though the assignment row remains.
+  const assignedGroups = enabled
+    ? groups.filter(g => client.toolGroupIds.includes(g.id) && g.owner === client.owner)
+    : [];
+
+  // The `rmcp_server_owner` join, re-checked at read time: the namespace must still be owned, and
+  // owned BY THIS CLIENT'S OWNER. An unclaimed namespace (no ownership row) resolves to nothing —
+  // "nobody has claimed this server" is not "everyone may reach it".
+  const effectiveNamespaces = enabled
+    ? client.namespaces.filter(ns => {
+        const row = FIXTURE_NAMESPACES.find(n => n.namespace === ns);
+        return row !== undefined && row.owner !== null && row.owner === client.owner;
+      })
+    : [];
+
   const all: RmcpResolvedTool[] = [];
   const seen = new Set<string>();
   for (const g of assignedGroups) {
     for (const t of resolvePatterns(g.patterns, g.name)) {
-      // Namespace scoping gates the mesh dimension: a tool from an upstream not assigned to the
-      // client is invisible regardless of group matches (RMCP-07 rule 4).
-      if (!client.namespaces.includes(t.namespace)) continue;
+      // Namespace scoping gates the mesh dimension: a tool from an upstream not in the client's
+      // EFFECTIVE namespaces is invisible regardless of group matches (RMCP-07 rule 4).
+      if (!effectiveNamespaces.includes(t.namespace)) continue;
       if (seen.has(t.name)) continue;
       seen.add(t.name);
       all.push(t);
@@ -308,7 +436,9 @@ function resolveForClient(client: RmcpClient, limit?: number, offset?: number): 
   return {
     clientId: client.id,
     tools: all.slice(start, end),
-    unavailableNamespaces: client.namespaces.filter(
+    // Only namespaces that actually resolve can be "in scope but down" — one that fails the
+    // ownership predicate is not unavailable, it is not in scope at all.
+    unavailableNamespaces: effectiveNamespaces.filter(
       ns => FIXTURE_NAMESPACES.find(n => n.namespace === ns)?.available === false,
     ),
     truncated: end < all.length,
@@ -318,8 +448,10 @@ function resolveForClient(client: RmcpClient, limit?: number, offset?: number): 
 
 const servers: RmcpServer[] = FIXTURE_NAMESPACES.map(ns => ({
   namespace: ns.namespace,
-  ownerName: ns.ownedByMe ? 'delegated-owner' : 'studio-owner',
-  ownedByMe: ns.ownedByMe,
+  // `null` distinguishes UNCLAIMED from "someone else's" — different facts with different
+  // remedies (claim it vs ask its owner), and the UI says which.
+  ownerName: ns.owner === null ? null : ns.owner === 'me' ? 'delegated-owner' : 'studio-owner',
+  ownedByMe: ns.owner === 'me',
   available: ns.available,
   toolCount: ns.available ? ns.tools.length : null,
 }));
@@ -348,7 +480,8 @@ export async function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string
       return delay({ clients: clients.filter(c => c.owner === 'me').map(wire) } as unknown as T);
 
     case RMCP_TOOLS.clientCreate: {
-      assertNamespacesOwned(args.namespaces as string[] | undefined, tool);
+      assertNamespacesAssignable(args.namespaces as string[] | undefined, tool);
+      assertGroupsAssignable(args.tool_group_ids as string[] | undefined, tool);
       const created: FixtureClient = {
         id: nextId('c'),
         clientId: `cnx_${String(args.name ?? 'connector').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'connector'}`,
@@ -375,7 +508,8 @@ export async function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string
 
     case RMCP_TOOLS.clientUpdate: {
       const client = clientOr404(String(args.id), tool);
-      assertNamespacesOwned(args.namespaces as string[] | undefined, tool);
+      assertNamespacesAssignable(args.namespaces as string[] | undefined, tool);
+      assertGroupsAssignable(args.tool_group_ids as string[] | undefined, tool);
       if (typeof args.version === 'number' && args.version !== client.version) {
         throw new RmcpError('conflict', tool, 'client was modified by another session');
       }
@@ -435,7 +569,8 @@ export async function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string
     case RMCP_TOOLS.groupUpdate: {
       const group = groups.find(g => g.id === String(args.id));
       if (!group) throw new RmcpError('not_found', tool, 'group not found');
-      if (group.owner !== 'me') throw new RmcpError('forbidden', tool, 'not owned by this account');
+      // Same non-oracle answer as the client path above.
+      if (group.owner !== 'me') throw new RmcpError('not_found', tool, 'no such group for this account');
       if (typeof args.version === 'number' && args.version !== group.version) {
         throw new RmcpError('conflict', tool, 'group was modified by another session');
       }

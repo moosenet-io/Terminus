@@ -141,6 +141,69 @@ describe('client list + resolved scope', () => {
   });
 });
 
+// ── Read-path predicates, mirrored from the merged `OauthStore` (src/oauth/store.rs) ─────────
+//
+// Each of these asserts a clause of the REAL store's scope queries, because the preview is only
+// worth anything if it agrees with them. The shared lesson: a write-time check is point-in-time,
+// so every revocable authority is re-derived on READ — the scope row outlives the ownership that
+// justified it.
+describe('the resolver re-derives authority on read, exactly as the store does', () => {
+  it('a DISABLED client resolves to nothing, however well scoped (NOT c.disabled)', async () => {
+    const suspended = (await listClients()).find(c => c.name === 'Suspended assistant')!;
+    // Scoped on paper...
+    expect(suspended.toolGroupIds).toContain('g-media');
+    expect(suspended.namespaces).toContain('media');
+    expect(suspended.enabled).toBe(false);
+    // ...and reaching nothing in fact. A preview showing this client's would-be grant next to a
+    // "disabled" badge would be a fabricated authorization answer.
+    const scope = await resolveClientScope(suspended.id);
+    expect(scope.tools).toEqual([]);
+    expect(scope.unavailableNamespaces).toEqual([]);
+  });
+
+  it('a group transferred to another owner stops resolving (c.owner = g.owner, at read time)', async () => {
+    const client = (await listClients()).find(c => c.name === 'Transferred-group console')!;
+    // The assignment row survives — that is the whole point; only the ownership moved.
+    expect(client.toolGroupIds).toContain('g-legacy');
+    expect(client.enabled).toBe(true);
+    expect(client.namespaces).toContain('media');
+    expect((await resolveClientScope(client.id)).tools).toEqual([]);
+  });
+
+  it('an UNCLAIMED namespace resolves to nothing (the rmcp_server_owner join)', async () => {
+    const client = (await listClients()).find(c => c.name === 'Unclaimed-server console')!;
+    expect(client.namespaces).toEqual(['lab']);
+    const servers = await listServers();
+    expect(servers.find(s => s.namespace === 'lab')!.ownerName).toBeNull();
+    // "Nobody has claimed this server" must never read as "everyone may reach it".
+    expect((await resolveClientScope(client.id)).tools).toEqual([]);
+  });
+
+  it('refuses to ATTACH an unclaimed namespace too — read and write agree', async () => {
+    const client = (await listClients()).find(c => c.name === 'Reading assistant')!;
+    await expect(
+      updateClient({ id: client.id, version: client.version, namespaces: ['lab'] }),
+    ).rejects.toMatchObject({ kind: 'invalid' });
+  });
+
+  it('refuses to assign a tool group this account does not own', async () => {
+    const client = (await listClients()).find(c => c.name === 'Reading assistant')!;
+    await expect(
+      updateClient({ id: client.id, version: client.version, toolGroupIds: ['g-studio'] }),
+    ).rejects.toMatchObject({ kind: 'invalid' });
+    await expect(
+      createClient({ name: 'Borrowed', redirectUris: [], confidential: false, toolGroupIds: ['g-studio'], namespaces: [] }),
+    ).rejects.toMatchObject({ kind: 'invalid' });
+  });
+
+  it('names neither the group nor the server that failed — not an enumeration oracle', async () => {
+    const client = (await listClients()).find(c => c.name === 'Reading assistant')!;
+    const err = await updateClient({ id: client.id, version: client.version, namespaces: ['studio'] }).catch(e => e);
+    expect(err.message).not.toContain('studio');
+    expect(err.message).toBe('one or more servers are not owned by this account');
+  });
+});
+
 describe('scoping edits round-trip, and the preview follows them', () => {
   it('saving a namespace change changes what the server says the client reaches', async () => {
     const before = (await listClients()).find(c => c.name === 'Reading assistant')!;
@@ -175,7 +238,7 @@ describe('scoping edits round-trip, and the preview follows them', () => {
     const client = (await listClients()).find(c => c.name === 'Reading assistant')!;
     await expect(
       updateClient({ id: client.id, version: client.version, namespaces: ['studio'] }),
-    ).rejects.toMatchObject({ kind: 'forbidden' });
+    ).rejects.toMatchObject({ kind: 'invalid' });
     // And the refusal is a refusal, not a partial apply.
     const after = (await listClients()).find(c => c.id === client.id)!;
     expect(after.namespaces).not.toContain('studio');
@@ -185,7 +248,7 @@ describe('scoping edits round-trip, and the preview follows them', () => {
   it('refuses creating a client scoped to a namespace this session does not own', async () => {
     await expect(
       createClient({ name: 'Sneaky', redirectUris: [], confidential: false, toolGroupIds: [], namespaces: ['studio'] }),
-    ).rejects.toMatchObject({ kind: 'forbidden' });
+    ).rejects.toMatchObject({ kind: 'invalid' });
   });
 });
 
@@ -302,27 +365,29 @@ describe('a delegated owner sees and touches only their own objects', () => {
   });
 
   it('refuses to RESOLVE another owner\'s client, rather than just omitting it from a list', async () => {
-    await expect(resolveClientScope('c-4')).rejects.toMatchObject({ kind: 'forbidden' });
+    // `not_found`, not `forbidden` — the merged store answers "no such client for this account"
+    // precisely so the two are indistinguishable (see rmcpFixtures' clientOr404 note).
+    await expect(resolveClientScope('c-4')).rejects.toMatchObject({ kind: 'not_found' });
   });
 
   it('refuses to edit or revoke another owner\'s client', async () => {
     await expect(updateClient({ id: 'c-4', version: 1, enabled: false })).rejects.toMatchObject({
-      kind: 'forbidden',
+      kind: 'not_found',
     });
     await expect(updateGroup({ id: 'g-studio', version: 1, patterns: ['*'] })).rejects.toMatchObject({
-      kind: 'forbidden',
+      kind: 'not_found',
     });
   });
 
   it('does not list another owner\'s sessions, and refuses one asked for by client id', async () => {
     const all = await listSessions();
     expect(all.find(s => s.clientRowId === 'c-4')).toBeUndefined();
-    await expect(listSessions('c-4')).rejects.toMatchObject({ kind: 'forbidden' });
+    await expect(listSessions('c-4')).rejects.toMatchObject({ kind: 'not_found' });
   });
 
   it('refuses to revoke another owner\'s session, by session id or by client id', async () => {
-    await expect(revokeSessions({ sessionId: 's-4' })).rejects.toMatchObject({ kind: 'forbidden' });
-    await expect(revokeSessions({ clientRowId: 'c-4' })).rejects.toMatchObject({ kind: 'forbidden' });
+    await expect(revokeSessions({ sessionId: 's-4' })).rejects.toMatchObject({ kind: 'not_found' });
+    await expect(revokeSessions({ clientRowId: 'c-4' })).rejects.toMatchObject({ kind: 'not_found' });
     // Still live: a refused revoke must not half-apply.
     expect((await listSessions()).find(s => s.id === 's-4')).toBeUndefined();
   });

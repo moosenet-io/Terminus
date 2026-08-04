@@ -6,6 +6,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   assignmentIncomplete,
+  serverUnassignableReason,
   pageCount,
   pageSlice,
   parseLines,
@@ -100,6 +101,24 @@ describe('assignmentIncomplete — a presentation flag about the record, not abo
 
   it('is false for a complete, enabled assignment', () => {
     expect(assignmentIncomplete({ enabled: true, toolGroupIds: ['g'], namespaces: ['n'] })).toBe(false);
+  });
+});
+
+describe('serverUnassignableReason — three states, three remedies', () => {
+  it('permits an owned server', () => {
+    expect(serverUnassignableReason({ ownedByMe: true, ownerName: 'me' })).toBeUndefined();
+  });
+
+  it('names the owner when there is one to ask', () => {
+    expect(serverUnassignableReason({ ownedByMe: false, ownerName: 'someone-else' })).toContain('someone-else');
+  });
+
+  it('says UNCLAIMED when nobody owns it — not "you do not own this"', () => {
+    // The store refuses an unclaimed namespace exactly as it refuses someone else's, but the
+    // remedies differ: "ask the owner" is useless advice when there is no owner.
+    const reason = serverUnassignableReason({ ownedByMe: false, ownerName: null })!;
+    expect(reason).toMatch(/unclaimed/i);
+    expect(reason).not.toMatch(/you do not own/i);
   });
 });
 

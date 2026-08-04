@@ -27,7 +27,7 @@ import { describeRmcpError, createClient } from '../../lib/rmcpClient';
 import type { RmcpClient, RmcpServer, RmcpToolGroup } from '../../types/rmcp';
 import { MultiSelect } from './MultiSelect';
 import type { MultiSelectOption } from './MultiSelect';
-import { parseLines, redirectUriHints } from './connectorForm';
+import { parseLines, redirectUriHints, serverUnassignableReason } from './connectorForm';
 
 const mono = { fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)' } as const;
 
@@ -169,7 +169,7 @@ export function ClientCreateDialog({ open, groups, servers, onDone, onCancel }: 
     label: s.namespace,
     detail: s.available ? `${s.toolCount ?? 0} tools` : 'upstream not answering',
     unavailable: !s.available,
-    disabledReason: s.ownedByMe ? undefined : 'you do not own this server',
+    disabledReason: serverUnassignableReason(s),
   }));
 
   return (

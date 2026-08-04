@@ -893,12 +893,34 @@ the app fixtures but gives this page nothing — its calls go to the real endpoi
 `tool_unavailable` if it is not there. Connector scoping is the one surface where plausible-looking
 fake data is worse than an empty page, because the data *is* the authorization answer.
 
+**The fixture mirrors the merged store, predicate for predicate.** Since RMCP-01 landed on `main`,
+`src/oauth/store.rs` is the authority, and `resolveForClient` cites the SQL it stands in for
+clause by clause:
+
+| Real store (`client_tool_groups` / `client_namespaces`) | Fixture |
+|---|---|
+| `NOT c.disabled` on both scope reads | a disabled client resolves to nothing |
+| `c.owner_account_id = g.owner_account_id` | a group transferred away stops resolving |
+| `JOIN rmcp_server_owner … AND o.owner_account_id = c.owner_account_id` | a cleared delegation, and an **unclaimed** namespace, resolve to nothing |
+| `set_client_namespaces` / `set_client_tool_groups` ownership checks | unowned/foreign servers and groups refused at write, with the store's deliberately unspecific message |
+| "Same answer for 'no such client' and 'not yours'" | cross-owner access answers `not_found`, never a distinguishable `forbidden` |
+
+The through-line — and the reason each of those is a READ-path check rather than only a write-time
+one — is that **a scope row outlives the ownership that justified it**. Ownership is transferable
+and delegation is revocable, so any authority that can be taken away has to be re-derived on read;
+a resolver that trusted the write would keep showing a grant that no longer exists. That lesson
+cost RMCP-01 two review rounds and recurred in RMCP-06, so the fixture embodies it rather than
+leaving the next reader to relearn it. Each clause has a test that fails against the pre-fix
+resolver.
+
 **The fixture is at least as strict as the real server, never laxer.** Its principal is a
 *delegated owner* (it owns the `media`/`home`/`workshop`/`notes` namespaces and the objects built
 on them, and does not own `studio` or the client, group, and session behind it), and it enforces
 RMCP-12 ownership on every read and write: another owner's clients/groups/sessions are not
 enumerated at all, a direct call naming one is refused, and scoping a client to an unowned
-namespace is refused at write. That is what makes the delegated-owner tests meaningful — they
+namespace is refused at write — and an **unclaimed** server is refused as firmly as someone
+else's, with different wording, because "ask the owner" is useless advice when there is no owner.
+That is what makes the delegated-owner tests meaningful — they
 assert the *fixture* refuses, not that the UI hid something. An early version that only hid would
 have let a UI-only "enforcement" pass its own tests.
 

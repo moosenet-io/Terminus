@@ -6,7 +6,7 @@
 // functions exist so the operator sees the likely problem while typing instead of after a
 // round trip; a value this file is happy with can still be refused, and that refusal is
 // surfaced verbatim. Nothing here ever *permits* anything.
-import type { RmcpClient } from '../../types/rmcp';
+import type { RmcpClient, RmcpServer } from '../../types/rmcp';
 
 /** Split a textarea's contents into non-empty, trimmed lines. */
 export function parseLines(text: string): string[] {
@@ -102,6 +102,23 @@ export function patternHint(pattern: string): string | null {
   const star = pattern.indexOf('*');
   if (star !== -1 && star !== pattern.length - 1) return 'a wildcard may only appear at the end';
   return null;
+}
+
+/**
+ * Why a server cannot be assigned by this session, or null if it can.
+ *
+ * Two refusals with different remedies, so they get different words: a namespace owned by someone
+ * else needs that owner's agreement, while an UNCLAIMED one (no ownership row at all) cannot be
+ * attached by anybody until it is claimed. The real store refuses both — its `set_client_namespaces`
+ * INNER JOINs `rmcp_server_owner`, and its own comment is explicit that "nobody has claimed this
+ * server" must never read as "everyone may reach it". Rendering the unclaimed case as "you do not
+ * own this" would send an operator to ask a person who does not exist.
+ */
+export function serverUnassignableReason(server: Pick<RmcpServer, 'ownedByMe' | 'ownerName'>): string | undefined {
+  if (server.ownedByMe) return undefined;
+  return server.ownerName === null
+    ? 'unclaimed server — no owner, so it cannot be assigned to anything'
+    : `owned by ${server.ownerName} — not yours to assign`;
 }
 
 /** Slice one page out of a resolved list. Kept pure (and tested) so the preview's paging cannot
