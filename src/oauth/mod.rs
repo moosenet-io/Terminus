@@ -177,37 +177,117 @@ impl std::fmt::Debug for SecretHash {
     }
 }
 
-/// The PHC-string prefix every password and client-secret hash must carry.
-const ARGON2ID_PREFIX: &str = "$argon2id$";
+/// The PHC identifier every password and client-secret hash must carry.
+const ARGON2ID_ID: &str = "argon2id";
 
-/// A verified argon2id PHC string.
+/// A structurally-validated argon2id PHC string.
 ///
 /// The counterpart to [`SecretHash`] for the attacker-chosen secrets
 /// (passwords, client secrets), which must be stretched rather than merely
-/// digested. This type cannot hash — the hashing itself lands with the
-/// verification path in RMCP-03/RMCP-08, which owns the argon2 parameters — but
-/// it does enforce that whatever reaches the store is at least SHAPED like an
-/// argon2id PHC string, so a plaintext password can never be written into the
-/// `password_hash` column by a caller that forgot to hash.
+/// digested. This type does not hash — the argon2 parameters belong with the
+/// verifier in RMCP-03/RMCP-08, which has to read them back out anyway — but it
+/// does enforce that whatever reaches the store is genuinely PHC-shaped, so a
+/// plaintext password can never be written into a `*_hash` column by a caller
+/// that forgot to hash.
 ///
-/// A prefix check is not proof of a well-formed hash, and is not claimed to be.
-/// It is a cheap, total guard against the specific catastrophic mistake
-/// (storing plaintext); full PHC parsing belongs with the verifier that has to
-/// read the parameters back out anyway.
+/// Round 2 of review caught that an earlier revision checked only the
+/// `$argon2id$` PREFIX, which accepts `$argon2id$plaintext` — a value that is
+/// effectively the plaintext with a decorative prefix, and exactly the mistake
+/// the guard exists to stop. Validation is now structural: the full PHC layout
+/// per the [PHC string format], with the version and all three cost parameters
+/// present and numeric, and non-trivial salt and hash segments.
+///
+/// This deliberately does NOT verify that the digest is *correct* for any
+/// password — that is not knowable here and is not the point. It rules out
+/// "this is not a hash at all", which is the failure that loses a password
+/// database.
+///
+/// [PHC string format]: https://github.com/P-H-C/phc-string-format/blob/master/phc-sf-spec.md
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Argon2idHash(String);
 
 impl Argon2idHash {
-    /// Accept a PHC string, rejecting anything not shaped like argon2id.
+    /// Shortest plausible base64 (no padding) for a salt or digest segment.
+    /// argon2's own minimums are 8 bytes of salt and 4 bytes of output, both of
+    /// which encode to more than this; the bound only has to be tight enough to
+    /// reject a human-typed string.
+    const MIN_SEGMENT_LEN: usize = 8;
+
+    /// Accept a PHC string, rejecting anything not structurally argon2id.
+    ///
+    /// Expected layout, six `$`-separated fields (the leading `$` produces an
+    /// empty first field):
+    ///
+    /// ```text
+    /// $argon2id$v=19$m=19456,t=2,p=1$<salt-b64>$<hash-b64>
+    /// ```
     pub fn parse(phc: &str) -> Result<Self, ToolError> {
-        if phc.starts_with(ARGON2ID_PREFIX) {
-            Ok(Self(phc.to_string()))
-        } else {
-            Err(ToolError::InvalidArgument(
-                "password/client-secret hashes must be argon2id PHC strings; refusing to store                  a value that is not one (a plaintext secret reaching this column is the                  failure this check exists to prevent)"
-                    .into(),
+        let refuse = |why: &str| {
+            // The message never echoes the input: if a caller really did pass a
+            // plaintext password, repeating it into an error string (and from
+            // there into a log) would turn this guard into the leak it prevents.
+            ToolError::InvalidArgument(format!(
+                "password/client-secret hashes must be argon2id PHC strings ({why}); refusing                  to store a value that is not one — a plaintext secret reaching this column is                  the failure this check exists to prevent"
             ))
+        };
+
+        let fields: Vec<&str> = phc.split('$').collect();
+        if fields.len() != 6 || !fields[0].is_empty() {
+            return Err(refuse("expected $argon2id$v=..$m=..,t=..,p=..$salt$hash"));
         }
+        if fields[1] != ARGON2ID_ID {
+            return Err(refuse("algorithm is not argon2id"));
+        }
+
+        // Version: `v=<digits>`.
+        let version = fields[2]
+            .strip_prefix("v=")
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()));
+        if version.is_none() {
+            return Err(refuse("missing or non-numeric version"));
+        }
+
+        // Cost parameters: exactly m, t and p, each numeric. Checked by NAME
+        // rather than by position so a reordered-but-valid PHC string is still
+        // accepted.
+        let mut seen_m = false;
+        let mut seen_t = false;
+        let mut seen_p = false;
+        for param in fields[3].split(',') {
+            let (key, value) = match param.split_once('=') {
+                Some(kv) => kv,
+                None => return Err(refuse("malformed cost parameter")),
+            };
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(refuse("non-numeric cost parameter"));
+            }
+            match key {
+                "m" => seen_m = true,
+                "t" => seen_t = true,
+                "p" => seen_p = true,
+                _ => return Err(refuse("unknown cost parameter")),
+            }
+        }
+        if !(seen_m && seen_t && seen_p) {
+            return Err(refuse("missing one of the m/t/p cost parameters"));
+        }
+
+        // Salt and digest: non-trivial, and drawn from the base64 alphabet PHC
+        // uses (unpadded standard base64).
+        let segment_ok = |segment: &str| {
+            segment.len() >= Self::MIN_SEGMENT_LEN
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+        };
+        if !segment_ok(fields[4]) {
+            return Err(refuse("salt is too short or not base64"));
+        }
+        if !segment_ok(fields[5]) {
+            return Err(refuse("digest is too short or not base64"));
+        }
+
+        Ok(Self(phc.to_string()))
     }
 
     /// The PHC string, for binding into a query.
@@ -273,24 +353,57 @@ mod tests {
         assert!(!rendered.contains("some-secret"));
     }
 
-    /// The specific catastrophic mistake this guard exists for: a caller that
-    /// forgot to hash and passed the plaintext password straight through.
-    #[test]
-    fn argon2id_hash_rejects_anything_not_argon2id() {
-        assert!(Argon2idHash::parse("hunter2").is_err(), "plaintext must be refused");
-        assert!(Argon2idHash::parse("").is_err());
-        assert!(
-            Argon2idHash::parse("$2b$12$abcdefghijklmnopqrstuv").is_err(),
-            "bcrypt is not argon2id"
-        );
-        assert!(
-            Argon2idHash::parse("$argon2i$v=19$m=1,t=1,p=1$c2FsdA$aGFzaA").is_err(),
-            "argon2i is not argon2id"
-        );
+    const VALID_PHC: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g";
 
-        let valid = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g";
-        let parsed = Argon2idHash::parse(valid).expect("a real argon2id PHC string is accepted");
-        assert_eq!(parsed.as_str(), valid);
+    /// A genuine argon2id PHC string must still be accepted — the guard is
+    /// worthless if it is so strict that the real hasher's output fails it.
+    #[test]
+    fn argon2id_hash_accepts_a_real_phc_string() {
+        let parsed =
+            Argon2idHash::parse(VALID_PHC).expect("a real argon2id PHC string must be accepted");
+        assert_eq!(parsed.as_str(), VALID_PHC);
+        // Parameter order is not significant in PHC.
+        assert!(Argon2idHash::parse("$argon2id$v=19$t=2,m=19456,p=1$c2FsdHNhbHQ$aGFzaGhhc2g").is_ok());
+    }
+
+    /// The specific catastrophic mistake this guard exists for: a caller that
+    /// forgot to hash and passed the plaintext straight through. The
+    /// `$argon2id$plaintext` case is the one round 2 of review found slipping
+    /// past a prefix-only check — it is the whole reason validation is
+    /// structural.
+    #[test]
+    fn argon2id_hash_rejects_anything_not_structurally_argon2id() {
+        for bad in [
+            "",
+            "hunter2",
+            "$argon2id$plaintext",
+            "$argon2id$",
+            "$2b$12$abcdefghijklmnopqrstuv",
+            "$argon2i$v=19$m=1,t=1,p=1$c2FsdHNhbHQ$aGFzaGhhc2g",
+            "$argon2id$v=$m=1,t=1,p=1$c2FsdHNhbHQ$aGFzaGhhc2g",
+            "$argon2id$v=xx$m=1,t=1,p=1$c2FsdHNhbHQ$aGFzaGhhc2g",
+            "$argon2id$v=19$m=1,t=1$c2FsdHNhbHQ$aGFzaGhhc2g",
+            "$argon2id$v=19$m=a,t=1,p=1$c2FsdHNhbHQ$aGFzaGhhc2g",
+            "$argon2id$v=19$m=1,t=1,p=1,q=9$c2FsdHNhbHQ$aGFzaGhhc2g",
+            "$argon2id$v=19$m=1,t=1,p=1$short$aGFzaGhhc2g",
+            "$argon2id$v=19$m=1,t=1,p=1$c2FsdHNhbHQ$sh",
+            "$argon2id$v=19$m=1,t=1,p=1$c2FsdHNhbHQ$has h$extra",
+        ] {
+            assert!(
+                Argon2idHash::parse(bad).is_err(),
+                "must refuse a non-argon2id value"
+            );
+        }
+    }
+
+    /// The refusal must not echo the rejected value: if a caller really did
+    /// pass a plaintext password, repeating it into an error (and thence a log)
+    /// would make this guard the leak it exists to prevent.
+    #[test]
+    fn argon2id_refusal_never_echoes_the_input() {
+        let err = Argon2idHash::parse("correct-horse-battery-staple")
+            .expect_err("plaintext must be refused");
+        assert!(!err.to_string().contains("correct-horse-battery-staple"));
     }
 
     /// The config's own description must not be a channel for the URL.

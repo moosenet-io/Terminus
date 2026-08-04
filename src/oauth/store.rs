@@ -333,24 +333,29 @@ impl OauthStore {
 
     /// Replace a client's group assignments wholesale, in one transaction.
     ///
-    /// **This method performs NO authorization check, deliberately.** Review
-    /// round 1 flagged that it will attach a group owned by one account to a
-    /// client owned by another. That is true, and it is why the ownership check
-    /// is not here: RMCP-12 places it in ONE function that every write path —
-    /// tools and GUI alike — must call, precisely so the rule cannot be
-    /// implemented differently in two places or forgotten by a third caller
-    /// added later. Scattering a partial check into the repository would make
-    /// that single guard look optional.
+    /// **`_unchecked`: this method performs NO authorization check, and the
+    /// caller MUST have performed one.** It will attach a group owned by one
+    /// account to a client owned by another if asked to.
     ///
-    /// Until RMCP-12 lands, the only callers are operator-invoked; this
-    /// contract is recorded here so a future caller cannot mistake the absence
-    /// of a check for an oversight.
+    /// Raised in both review rounds, and the resolution is deliberate rather
+    /// than deferred. The ownership rule belongs in ONE function that every
+    /// write path — tools and GUI alike — calls (RMCP-12), so it cannot be
+    /// implemented two different ways or forgotten by a caller added later; a
+    /// partial check scattered into the repository would make that single guard
+    /// look optional and is how the two copies drift apart.
+    ///
+    /// What round 2 correctly objected to was not the location of the check but
+    /// the SURFACE: a bare `pub fn` with an inviting name is a footgun no doc
+    /// comment closes. So the method is now `pub(crate)` (unreachable outside
+    /// this crate) and carries `_unchecked` in its name, which puts the
+    /// obligation at every call site instead of only in this doc block —
+    /// the standard Rust idiom for exactly this contract.
     ///
     /// Delete-then-insert inside a transaction, rather than a diff: a partially
     /// applied scope change is a permission state nobody chose, and under
     /// concurrent edits a diff can interleave into exactly that. Wholesale
     /// replacement makes the outcome always one of the two intended states.
-    pub async fn set_client_tool_groups(
+    pub(crate) async fn set_client_tool_groups_unchecked(
         &self,
         client_id: Uuid,
         group_ids: &[Uuid],
@@ -377,8 +382,8 @@ impl OauthStore {
 
     /// Replace a client's namespace assignments wholesale. Same transactional
     /// reasoning — and the same deliberate absence of an authorization check,
-    /// which RMCP-12 owns — as [`Self::set_client_tool_groups`].
-    pub async fn set_client_namespaces(
+    /// which RMCP-12 owns — as [`Self::set_client_tool_groups_unchecked`].
+    pub(crate) async fn set_client_namespaces_unchecked(
         &self,
         client_id: Uuid,
         namespaces: &[String],
@@ -551,34 +556,40 @@ impl OauthStore {
         .map_err(db)
     }
 
-    /// Atomically rotate a live refresh token into a freshly-issued successor.
+    /// Atomically rotate a live refresh token into a freshly-issued successor,
+    /// with the successor's binding COPIED FROM the row being rotated.
     ///
     /// Returns `true` when this call performed the rotation, `false` when the
     /// presented token was not live (already rotated, revoked, expired, or
     /// unknown) — in which case the caller must treat it as a REUSE and revoke
     /// the family.
     ///
-    /// Review round 1 raised the real hazard in the earlier shape: marking the
-    /// old token rotated and inserting the successor were two calls, so a
-    /// failure between them left the user with a rotated-away token and no
-    /// successor — locked out, with the family looking healthy. Both writes now
-    /// happen in ONE transaction, so the outcome is always either "old token
-    /// retired and successor usable" or "nothing changed".
+    /// Two review rounds shaped this signature, and both changes matter:
+    ///
+    /// - **Round 1:** retiring the old token and inserting the successor were
+    ///   separate calls, so a failure between them left the user with a
+    ///   rotated-away token and no successor — locked out, with the family
+    ///   looking healthy. Both writes are now one transaction: the outcome is
+    ///   always either "old token retired and successor usable" or "nothing
+    ///   changed".
+    ///
+    /// - **Round 2:** the successor's `family_id`, `client_id`, `account_id`,
+    ///   `resource` and `scope` were caller-supplied. That let a caller rotate a
+    ///   live token into a successor bound to a DIFFERENT client, account, or
+    ///   scope — laundering a narrow token into a broad one through what looks
+    ///   like an ordinary refresh. They are now selected from the rotated row
+    ///   itself (`INSERT … SELECT`), so a refresh can only ever reproduce the
+    ///   binding it already had. The parameters are gone rather than validated,
+    ///   because a check can be skipped by a new call site and a missing
+    ///   parameter cannot.
     ///
     /// The conditional UPDATE still decides the sole winner under concurrency:
     /// two simultaneous refreshes both see a live row, but only one UPDATE
-    /// matches `rotated_to IS NULL`, and the loser's transaction inserts
-    /// nothing because it returns before the INSERT.
-    #[allow(clippy::too_many_arguments)]
+    /// matches `rotated_to IS NULL`, and the loser returns before the INSERT.
     pub async fn rotate_refresh_token(
         &self,
         token_hash: &SecretHash,
         successor_hash: &SecretHash,
-        family_id: Uuid,
-        client_id: Uuid,
-        account_id: Uuid,
-        resource: &str,
-        scope: &str,
         ttl_seconds: i64,
     ) -> Result<bool, ToolError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
@@ -602,17 +613,17 @@ impl OauthStore {
             return Ok(false);
         }
 
+        // The successor inherits its binding from the predecessor row. Only the
+        // token hash and the expiry are new.
         sqlx::query(
             "INSERT INTO rmcp_refresh_token (token_hash, family_id, client_id, account_id, \
                                              resource, scope, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7::double precision))",
+             SELECT $2, family_id, client_id, account_id, resource, scope, \
+                    now() + make_interval(secs => $3::double precision) \
+             FROM rmcp_refresh_token WHERE token_hash = $1",
         )
+        .bind(token_hash.as_bytes())
         .bind(successor_hash.as_bytes())
-        .bind(family_id)
-        .bind(client_id)
-        .bind(account_id)
-        .bind(resource)
-        .bind(scope)
         .bind(ttl_seconds as f64)
         .execute(&mut *tx)
         .await
