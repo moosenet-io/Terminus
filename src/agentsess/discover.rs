@@ -468,7 +468,7 @@ pub(crate) async fn discover(
     // were live, simply because they sorted beyond the cap — a filter that
     // silently hides matches is worse than no filter.
 
-    // ---- 1b. EXACT process start times (optional, TERM #605) --------------
+    // ---- 1b. STABLE process start times (optional, TERM #605) -------------
     // `ps -o etimes=` is whole-second ELAPSED time, so a start time derived from
     // it is a function of WHEN THE POLL RAN and wobbles by up to a second for an
     // unchanged process. `/proc/<pid>/stat`'s `starttime` plus `/proc/stat`'s
@@ -641,8 +641,10 @@ pub(crate) async fn discover(
             cwd,
             repo,
             attachment,
-            // TERM #605: an EXACT, poll-independent start time when /proc gave
-            // us one; otherwise the whole-second etimes derivation (see
+            // TERM #605: a STABLE, poll-independent WHOLE-SECOND start time
+            // when /proc gave us one (not tick-exact — the sub-second remainder
+            // is deliberately dropped, see `start_epoch_from_proc`); otherwise
+            // the whole-second etimes derivation (see
             // `started_at_from_etimes` for that path's stated residual).
             started_at: Some(
                 boot_time
