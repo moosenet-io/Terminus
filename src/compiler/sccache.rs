@@ -823,6 +823,9 @@ pub fn prestart_local(sccache: &SccacheEnv, stable_tmpdir: &str) -> ServerPresta
         .filter(|(k, _)| k.as_str() != "RUSTC_WRAPPER")
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    // Inserted AFTER the backend map is copied, so a backend var of the same
+    // name cannot override the pin (the remote path filters for the same
+    // reason — gpt56 review).
     env.insert("TMPDIR".to_string(), stable_tmpdir.to_string());
     // Never idle-exit: an idled-out daemon is re-spawned by whichever build
     // needs it next, which is exactly how it gets a per-job TMPDIR.
@@ -851,18 +854,26 @@ pub fn prestart_remote_shell_prefix(
     stable_tmpdir: &str,
     quote: impl Fn(&str) -> String,
 ) -> String {
-    let mut assignments = vec![
-        format!("TMPDIR={}", quote(stable_tmpdir)),
-        // See `prestart_local`: never idle-exit, or a later build re-spawns it
-        // from inside its own scope.
-        "SCCACHE_IDLE_TIMEOUT=0".to_string(),
-    ];
+    // The FORCED pins are emitted LAST and their keys are filtered out of the
+    // backend vars (gpt56 review). In a shell assignment prefix the LAST
+    // assignment of a name wins, so emitting them first would let a backend map
+    // that happened to carry `TMPDIR` or `SCCACHE_IDLE_TIMEOUT` silently
+    // override the very safety pins this function exists to apply.
+    const FORCED: &[&str] = &["TMPDIR", "SCCACHE_IDLE_TIMEOUT"];
+    let mut assignments: Vec<String> = Vec::new();
     for (k, v) in &sccache.vars {
-        if k == "RUSTC_WRAPPER" || crate::compiler::scope::is_secret_env_key(k) {
+        if k == "RUSTC_WRAPPER"
+            || FORCED.contains(&k.as_str())
+            || crate::compiler::scope::is_secret_env_key(k)
+        {
             continue;
         }
         assignments.push(format!("{k}={}", quote(v)));
     }
+    assignments.push(format!("TMPDIR={}", quote(stable_tmpdir)));
+    // See `prestart_local`: never idle-exit, or a later build re-spawns it
+    // from inside its own scope.
+    assignments.push("SCCACHE_IDLE_TIMEOUT=0".to_string());
     format!(
         "{} {} --start-server || true; ",
         assignments.join(" "),
@@ -1767,6 +1778,44 @@ mod tests {
         }
         // RUSTC_WRAPPER is an instruction to cargo, not to the daemon.
         assert!(!p.env.contains_key("RUSTC_WRAPPER"));
+    }
+
+    /// gpt56 review: a backend map that happens to carry `TMPDIR` or
+    /// `SCCACHE_IDLE_TIMEOUT` must not be able to override the safety pins — in
+    /// a shell assignment prefix the LAST assignment wins, and in the env map
+    /// the last insert wins.
+    #[test]
+    fn the_safety_pins_win_over_a_backend_map_that_carries_the_same_keys() {
+        let mut sccache = redis_env_fixture();
+        sccache
+            .vars
+            .insert("TMPDIR".to_string(), "/some/per-job/scratch/tmp".to_string());
+        sccache
+            .vars
+            .insert("SCCACHE_IDLE_TIMEOUT".to_string(), "600".to_string());
+
+        let local = prestart_local(&sccache, "/stable/root");
+        assert_eq!(local.env.get("TMPDIR").map(String::as_str), Some("/stable/root"));
+        assert_eq!(local.env.get("SCCACHE_IDLE_TIMEOUT").map(String::as_str), Some("0"));
+
+        let frag = prestart_remote_shell_prefix(&sccache, "/stable/root", |s| {
+            format!("'{}'", s.replace('\'', "'\\''"))
+        });
+        assert!(
+            !frag.contains("/some/per-job/scratch/tmp"),
+            "a per-job TMPDIR from the backend map must not reach the daemon: {frag}"
+        );
+        // Last assignment wins in a shell prefix, so the pins must be last.
+        let tmp_at = frag.find("TMPDIR=").expect("pin present");
+        let idle_at = frag.find("SCCACHE_IDLE_TIMEOUT=0").expect("pin present");
+        let bin_at = frag.find("--start-server").expect("command present");
+        assert!(tmp_at < bin_at && idle_at < bin_at, "{frag}");
+        assert_eq!(frag.matches("TMPDIR=").count(), 1, "exactly one TMPDIR: {frag}");
+        assert_eq!(
+            frag.matches("SCCACHE_IDLE_TIMEOUT=").count(),
+            1,
+            "exactly one idle pin: {frag}"
+        );
     }
 
     /// S7: the remote prestart runs in a shell that has ALREADY sourced the

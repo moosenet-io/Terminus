@@ -7110,6 +7110,15 @@ Source:
             "placeholder-password".to_string(), // pii-test-fixture
         )]);
         std::fs::write(&env_file, scope::render_secret_env_file(&secret)).expect("env file");
+        {
+            // The production path rsyncs a 0600 file; `fs::write` uses the
+            // umask default (commonly 0644), so the test must set and ASSERT
+            // the mode rather than claim it (gpt56 review).
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let mode = std::fs::metadata(&env_file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the secret env file must be 0600");
+        }
 
         let prev = std::env::var_os("SCCACHE_BIN");
         std::env::set_var("SCCACHE_BIN", &fake);
