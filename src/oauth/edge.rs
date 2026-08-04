@@ -1729,14 +1729,19 @@ mod tests {
     #[tokio::test]
     async fn refused_requests_consume_edge_budget() {
         let router = edge_router(default_policy(), 2);
+        // Two refusals from ONE address — the budget is per resolved client, so
+        // they have to come from the same source to exhaust the same bucket.
         assert_eq!(
             request(router.clone(), "GET", "/admin/workers", "203.0.113.7", None).await,
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            request(router.clone(), "POST", "/mcp", "198.51.100.7", None).await,
-            StatusCode::FORBIDDEN
+            request(router.clone(), "GET", "/healthz", "203.0.113.7", None).await,
+            StatusCode::NOT_FOUND
         );
+        // A third request that the policy WOULD have allowed is now shed: the
+        // two refusals spent the budget, which is the point — scanning the door
+        // costs the scanner exactly what using it costs.
         assert_eq!(
             request(router, "POST", "/mcp", "203.0.113.7", None).await,
             StatusCode::TOO_MANY_REQUESTS
