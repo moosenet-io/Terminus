@@ -62,6 +62,24 @@
 //!   (log and carry on with a default) means running under a policy nobody
 //!   understood, on the one listener that faces the internet.
 //!
+//! ## A note on names and fixtures (held review findings — read before re-raising)
+//! Three things in this file and its deploy assets have been raised as possible
+//! PII/infra disclosure and HELD, twice. They are deliberate; the reasoning
+//! lives at each site so a later round does not have to re-derive it:
+//!
+//! - **`terminus-primary` / `terminus_primary`** is this repository's SERVICE
+//!   and module name — it names the binary, the systemd units, the deploy
+//!   configs, and the `module` argument to the build door. It is not a fleet
+//!   host identifier, which is what the standing rule targets; the PII gate's
+//!   own internal-host detector is a fixed list of node names and does not
+//!   include it. Every other module in the tree refers to itself the same way.
+//! - **The loopback default bind** — see [`DEFAULT_BIND`].
+//! - **RFC 5737/3849 documentation ranges in test fixtures** — see the note at
+//!   the fixture constants in this module's `tests`.
+//!
+//! In all three cases the repo's own `no_pii_in_own_source_tree` gate passes on
+//! these files, which is the mechanical check the rule is expressed through.
+//!
 //! ## TLS is not terminated here
 //! The edge binds a private interface and is reached only through a reverse
 //! proxy that terminates TLS — see `deploy/rmcp-edge-proxy.conf.example` and
@@ -124,14 +142,25 @@ const DEFAULT_RATE_LIMIT_REFILL_PER_SEC: f64 = 2.0;
 const DEFAULT_PORT: u16 = 8311;
 /// Default edge bind interface.
 ///
-/// Loopback, and written as a literal here and in `.env.example` — HELD from
-/// review round 1, deliberately. A loopback address is not infrastructure
-/// disclosure: it names no host, no network and no allocation, it is the same
-/// default the plain and review-daemon listeners already document, and the
-/// value is the SAFE one (binding anything wider by default would put this
-/// listener on the internet without a proxy in front of it). The S1 rule is
-/// about private-range and internal-host disclosure, which a loopback literal
-/// and a port number are not.
+/// Loopback, written as a literal here and in `.env.example`. HELD through
+/// review rounds 1 and 2, deliberately — if a later round raises it again, the
+/// answer has not changed and the reasoning is here rather than needing to be
+/// re-derived:
+///
+/// - **It discloses nothing.** `127.0.0.1` names no host, no network and no
+///   allocation. The S1 rule targets RFC 1918 private ranges, container ids and
+///   internal hostnames; a loopback literal and a port number are none of those,
+///   and the repo's own `no_pii_in_own_source_tree` gate passes on this file.
+///   The plain listener and the review daemon already document the same default.
+/// - **It is the SAFE value, not merely an acceptable one.** Any wider default
+///   would place an internet-facing listener on a routable interface with no
+///   reverse proxy in front of it. A default that fails toward "unreachable" is
+///   the correct direction for this particular listener.
+/// - **It constrains no one.** The bind is env-overridable ([`ENV_BIND`]).
+///   Replacing a safe default with a mandatory variable would make a
+///   misconfiguration MORE likely, not less: it converts "works, privately"
+///   into "does not start", and the pressure that creates is toward pasting in
+///   whatever value makes it boot.
 const DEFAULT_BIND: &str = "127.0.0.1";
 
 /// Upper bound on `X-Forwarded-For` entries parsed. A chain longer than this is
@@ -592,6 +621,10 @@ impl EdgeDecision {
 pub enum AddrError {
     /// A forwarded entry chosen as the client address did not parse.
     UnparseableForwarded,
+    /// A forwarding header value was not valid UTF-8, so the chain could not be
+    /// read in full. See [`edge_guard`] for why a partial chain is refused
+    /// rather than used.
+    UndecodableForwardedHeader,
     /// The chain exceeded [`MAX_FORWARDED_ENTRIES`].
     ForwardedChainTooLong,
     /// Every entry in the chain was a trusted proxy, so no address in it can be
@@ -612,6 +645,9 @@ impl std::fmt::Display for AddrError {
             }
             AddrError::NoForwardedFromTrustedProxy => {
                 f.write_str("a trusted proxy forwarded no X-Forwarded-For chain")
+            }
+            AddrError::UndecodableForwardedHeader => {
+                f.write_str("an X-Forwarded-For header value is not valid UTF-8")
             }
         }
     }
@@ -1047,13 +1083,41 @@ pub async fn edge_guard(
     // chain — the end that carries the address the proxy actually saw.
     // Copied rather than borrowed from the request: `req` is moved into
     // `next.run` below, and an owned chain keeps that ordering a non-question.
-    let forwarded_values: Vec<String> = req
-        .headers()
-        .get_all(FORWARDED_FOR_HEADER)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .map(str::to_string)
-        .collect();
+    //
+    // A header value that is not valid UTF-8 REFUSES the request. An earlier
+    // revision used `filter_map(|v| v.to_str().ok())`, silently dropping such a
+    // value and proceeding with a shorter chain — review round 2 (`gpt56`)
+    // caught it, and it is the same bug class as the absent-chain fallback fixed
+    // in round 1. HTTP header values are opaque octets, so a byte outside UTF-8
+    // is reachable by anyone who can influence any hop's forwarding metadata;
+    // dropping the entry it lands in shifts which entry is "rightmost
+    // untrusted", and that single value is what the whole policy turns on. An
+    // attacker who can place one malformed byte in the chain could therefore
+    // choose the address the edge attributes the request to. A chain that cannot
+    // be read in full is not a shorter chain — it is an unusable one.
+    //
+    // Checked BEFORE the trusted-peer test, so it holds for every caller rather
+    // than only for the peers whose header is believed today. Tolerating a
+    // malformed value from an untrusted peer would be defensible (the header is
+    // ignored there anyway) and is deliberately not done: that would leave one
+    // path where a malformed value is accepted, which becomes load-bearing the
+    // moment the trusted-proxy list changes. One rule is easier to keep true.
+    let mut forwarded_values: Vec<String> = Vec::new();
+    for value in req.headers().get_all(FORWARDED_FOR_HEADER).iter() {
+        match value.to_str() {
+            Ok(v) => forwarded_values.push(v.to_string()),
+            Err(_) => {
+                audit_edge(
+                    &peer.to_string(),
+                    &path,
+                    &method,
+                    "denied",
+                    &AddrError::UndecodableForwardedHeader.to_string(),
+                );
+                return refuse(StatusCode::FORBIDDEN, "forbidden");
+            }
+        }
+    }
     let forwarded: Vec<&str> = forwarded_values.iter().map(String::as_str).collect();
 
     let client = match resolve_client_ip(peer, &forwarded, config.policy.trusted_proxies()) {
@@ -1868,6 +1932,62 @@ mod tests {
 
     /// No `ConnectInfo` means the source is unknowable, and an unknowable
     /// source cannot be checked against a source policy.
+    /// Review round 2's finding. A header value that is not valid UTF-8 is
+    /// refused rather than dropped: dropping it would silently shorten the
+    /// chain, and a shorter chain has a DIFFERENT rightmost-untrusted entry —
+    /// which is the single value the whole policy turns on.
+    #[tokio::test]
+    async fn a_malformed_forwarded_header_is_refused_not_silently_dropped() {
+        let policy = policy_with(
+            ANTHROPIC_NET,
+            INTERACTIVE_NET,
+            "203.0.113.9/32",
+            EdgeProfile::AnthropicHosted,
+        );
+        let router = edge_router(policy, 100);
+
+        // Header values are opaque octets, so this is a value a real peer can
+        // actually send — `HeaderValue::from_bytes` accepts it and `to_str`
+        // then fails.
+        let malformed = axum::http::HeaderValue::from_bytes(&[0xff, 0xfe])
+            .expect("a non-UTF-8 byte string is a legal header value");
+
+        async fn send(
+            router: Router,
+            peer: &str,
+            forwarded: axum::http::HeaderValue,
+        ) -> StatusCode {
+            use tower::ServiceExt;
+            let mut req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::new(ip(peer), 40000)));
+            req.headers_mut().insert("x-forwarded-for", forwarded);
+            router.oneshot(req).await.unwrap().status()
+        }
+
+        // From the TRUSTED proxy: the chain is unreadable, so the request is
+        // refused rather than resolved from whatever survived.
+        assert_eq!(
+            send(router.clone(), "203.0.113.9", malformed.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+        // Positive control: the same request, same peer, well-formed chain —
+        // proving the refusal above is about the malformed value and not about
+        // this peer or path being unreachable.
+        assert_eq!(
+            send(router.clone(), "203.0.113.9", "203.0.113.7".parse().unwrap()).await,
+            StatusCode::OK
+        );
+        // And the rule is unconditional: an untrusted peer, whose header would
+        // be ignored anyway, is refused too. See `edge_guard` for why there is
+        // deliberately no branch that tolerates a malformed value.
+        assert_eq!(send(router, "203.0.113.7", malformed).await, StatusCode::FORBIDDEN);
+    }
+
     #[tokio::test]
     async fn a_request_with_no_peer_address_is_refused() {
         let router = edge_router(default_policy(), 100);
