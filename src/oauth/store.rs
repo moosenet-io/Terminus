@@ -28,7 +28,7 @@ use crate::error::ToolError;
 use crate::oauth::model::{
     Account, AuthCode, Client, Consent, RefreshToken, ServerOwner, ToolGroup,
 };
-use crate::oauth::{Argon2idHash, OauthConfig, ScopeWriteAuthorization, SecretHash};
+use crate::oauth::{Argon2idHash, OauthConfig, SecretHash};
 
 /// Maximum pooled connections. The OAuth endpoints are latency-sensitive
 /// (Anthropic allows 10s for discovery/token, 30s for refresh) but very
@@ -331,42 +331,75 @@ impl OauthStore {
         .map_err(db)
     }
 
-    /// Replace a client's group assignments wholesale, in one transaction.
+    /// Replace a client's group assignments wholesale, in one transaction,
+    /// after verifying that `actor` owns both the client and every group.
     ///
-    /// **`_unchecked`: this method performs NO authorization check, and the
-    /// caller MUST have performed one.** It will attach a group owned by one
-    /// account to a client owned by another if asked to.
+    /// ## Why the check is HERE, after four rounds of argument about it
+    /// Earlier revisions left this method unchecked and documented the
+    /// obligation, then narrowed its visibility, then demanded a marker token.
+    /// Review round 5 correctly observed that a data-free token proves nothing:
+    /// any in-crate caller can mint one and claim an audit it never did.
     ///
-    /// Raised in both review rounds, and the resolution is deliberate rather
-    /// than deferred. The ownership rule belongs in ONE function that every
-    /// write path — tools and GUI alike — calls (RMCP-12), so it cannot be
-    /// implemented two different ways or forgotten by a caller added later; a
-    /// partial check scattered into the repository would make that single guard
-    /// look optional and is how the two copies drift apart.
+    /// The check is expressible right here, so it is done right here. Ownership
+    /// is already in this schema — `rmcp_client.owner_account_id` and
+    /// `rmcp_tool_group.owner_account_id` — and both are read inside the SAME
+    /// transaction as the write, so there is no window in which ownership could
+    /// change between the check and the mutation.
     ///
-    /// What rounds 2-4 correctly objected to was not the location of the check
-    /// but the SURFACE: a doc comment and an `_unchecked` suffix are advisory,
-    /// and a caller added later can simply not do the check. So the method is
-    /// `pub(crate)`, is named `_unchecked`, AND requires a
-    /// [`ScopeWriteAuthorization`] — a token whose only constructor is
-    /// `ownership_verified()`. "Forgot to authorize" is now inexpressible: the
-    /// worst a caller can do is claim an audit it did not perform, which names
-    /// itself at the call site and is findable by grepping one constructor.
+    /// RMCP-12 still owns the DELEGATION model on top of this (operator
+    /// override, namespace delegation, the UI's read scoping). What it inherits
+    /// is a repository that already refuses a cross-account write, rather than
+    /// one that trusts it was called correctly.
     ///
-    /// There are currently NO callers at all — this item ships no HTTP surface —
-    /// so nothing is exposed today either way.
-    ///
-    /// Delete-then-insert inside a transaction, rather than a diff: a partially
-    /// applied scope change is a permission state nobody chose, and under
-    /// concurrent edits a diff can interleave into exactly that. Wholesale
-    /// replacement makes the outcome always one of the two intended states.
-    pub(crate) async fn set_client_tool_groups_unchecked(
+    /// Returns [`ToolError::NotFound`] when the client is not the actor's, and
+    /// [`ToolError::InvalidArgument`] when any group is not — deliberately
+    /// without naming which, so this is not an enumeration oracle for another
+    /// account's group ids.
+    pub async fn set_client_tool_groups(
         &self,
+        actor_account_id: Uuid,
         client_id: Uuid,
         group_ids: &[Uuid],
-        _authorized: ScopeWriteAuthorization,
     ) -> Result<(), ToolError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
+
+        let owns_client = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM rmcp_client WHERE id = $1 AND owner_account_id = $2)",
+        )
+        .bind(client_id)
+        .bind(actor_account_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        if !owns_client {
+            // Same answer for "no such client" and "not yours": distinguishing
+            // them would confirm the existence of another account's client.
+            return Err(ToolError::NotFound("no such client for this account".into()));
+        }
+
+        // Every requested group must belong to the actor. Counting DISTINCT ids
+        // means a duplicate in the input cannot inflate the count past the
+        // check.
+        let owned_groups = sqlx::query_scalar::<_, i64>(
+            "SELECT count(DISTINCT id) FROM rmcp_tool_group \
+             WHERE id = ANY($1) AND owner_account_id = $2",
+        )
+        .bind(group_ids)
+        .bind(actor_account_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        let requested = group_ids.iter().collect::<std::collections::HashSet<_>>().len() as i64;
+        if owned_groups != requested {
+            return Err(ToolError::InvalidArgument(
+                "one or more tool groups do not belong to this account".into(),
+            ));
+        }
+
+        // Delete-then-insert rather than a diff: a partially applied scope
+        // change is a permission state nobody chose, and under concurrent edits
+        // a diff can interleave into exactly that. Wholesale replacement makes
+        // the outcome always one of the two intended states.
         sqlx::query("DELETE FROM rmcp_client_scope WHERE client_id = $1")
             .bind(client_id)
             .execute(&mut *tx)
@@ -386,16 +419,50 @@ impl OauthStore {
         tx.commit().await.map_err(db)
     }
 
-    /// Replace a client's namespace assignments wholesale. Same transactional
-    /// reasoning — and the same deliberate absence of an authorization check,
-    /// which RMCP-12 owns — as [`Self::set_client_tool_groups_unchecked`].
-    pub(crate) async fn set_client_namespaces_unchecked(
+    /// Replace a client's namespace assignments wholesale, after verifying that
+    /// `actor` owns the client and every namespace.
+    ///
+    /// Namespace ownership comes from `rmcp_server_owner`. An UNOWNED namespace
+    /// is refused rather than allowed: "nobody has claimed this server" must
+    /// mean "no delegated owner may attach it", never "it is free for anyone".
+    /// Same transaction, same reasoning, and the same deliberately unspecific
+    /// error as [`Self::set_client_tool_groups`].
+    pub async fn set_client_namespaces(
         &self,
+        actor_account_id: Uuid,
         client_id: Uuid,
         namespaces: &[String],
-        _authorized: ScopeWriteAuthorization,
     ) -> Result<(), ToolError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
+
+        let owns_client = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM rmcp_client WHERE id = $1 AND owner_account_id = $2)",
+        )
+        .bind(client_id)
+        .bind(actor_account_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        if !owns_client {
+            return Err(ToolError::NotFound("no such client for this account".into()));
+        }
+
+        let owned_namespaces = sqlx::query_scalar::<_, i64>(
+            "SELECT count(DISTINCT namespace) FROM rmcp_server_owner \
+             WHERE namespace = ANY($1) AND owner_account_id = $2",
+        )
+        .bind(namespaces)
+        .bind(actor_account_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        let requested = namespaces.iter().collect::<std::collections::HashSet<_>>().len() as i64;
+        if owned_namespaces != requested {
+            return Err(ToolError::InvalidArgument(
+                "one or more servers are not owned by this account".into(),
+            ));
+        }
+
         sqlx::query("DELETE FROM rmcp_client_server WHERE client_id = $1")
             .bind(client_id)
             .execute(&mut *tx)

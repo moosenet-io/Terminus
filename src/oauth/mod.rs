@@ -119,46 +119,6 @@ impl OauthConfig {
     }
 }
 
-/// Proof that a caller has performed the ownership check before writing a
-/// client's scope.
-///
-/// ## Why this type exists
-/// Three review rounds objected — reasonably — that
-/// [`store::OauthStore::set_client_tool_groups_unchecked`] and its namespace
-/// counterpart will attach one account's tool groups, or an arbitrary
-/// namespace, to another account's client. The reviewers' point was that a doc
-/// comment and an `_unchecked` suffix are advisory: a caller added later can
-/// still simply not do the check.
-///
-/// The ownership RULE still belongs in one place — RMCP-12 puts it in a single
-/// guard that every write path calls, so it cannot be implemented two ways or
-/// drift. What this type fixes is the other half: the scope-writing methods now
-/// REQUIRE a value that can only be produced by explicitly claiming the check
-/// was done. "Forgot to authorize" is no longer expressible; the worst a caller
-/// can do is lie in a way that names itself at the call site and shows up in a
-/// grep for the constructor.
-///
-/// This is the same idiom as [`crate::tool::CallerContext`]'s entitlement
-/// constructors, which exist because the compiler is a better enforcer of an
-/// authorization contract than a comment.
-///
-/// The field is private and carries no data: the value IS the claim.
-#[derive(Debug, Clone, Copy)]
-pub struct ScopeWriteAuthorization(());
-
-impl ScopeWriteAuthorization {
-    /// Assert that the caller has verified the actor owns both the client being
-    /// scoped and every namespace and tool group being attached.
-    ///
-    /// RMCP-12's single ownership guard is the intended — and, once it lands,
-    /// the only — caller. Anything else calling this is claiming an audit it
-    /// did not perform, which is a reviewable defect rather than an accident.
-    #[must_use]
-    pub fn ownership_verified() -> Self {
-        Self(())
-    }
-}
-
 /// Hash a high-entropy machine-generated secret (an authorization code or a
 /// refresh token) for storage and lookup.
 ///
