@@ -340,7 +340,16 @@ mod tests {
         assert!(c.content.chars().all(|ch| ch == '€'));
     }
 
+    /// TERM #594 (4th test-gate residual, found while working the other three).
+    /// This was NOT flaky — it lost a PROCESS-GLOBAL env race, deterministically.
+    /// It reads the capture caps (`AGENTSESS_CAPTURE_MAX_LINES`/`_MAX_BYTES`)
+    /// that its `#[serial]` siblings above set to tiny values; interleaved, the
+    /// tiny byte cap truncated the output before `<REDACTED-SECRET>` and the
+    /// assertion failed for a reason that had nothing to do with redaction.
+    /// Every test in this module that reads those caps must be `#[serial]` —
+    /// the sibling that MUTATES being serial is only half of the contract.
     #[tokio::test]
+    #[serial]
     async fn captured_text_is_redacted() {
         let exec = FakeExecutor::new()
             .with_stdout("tmux", "$ export SOME_API_TOKEN=abcdefghijklmnop0123\n"); // pii-test-fixture
@@ -354,6 +363,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn a_missing_pane_is_a_clear_error_not_empty_success() {
         let exec = FakeExecutor::new().with_exit("tmux", 1, "can't find pane: build:0.9");
         let err = capture(&exec, "build:0.9", None).await.unwrap_err();
@@ -364,6 +374,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn tmux_absent_is_reported_rather_than_read_as_an_empty_pane() {
         let exec = FakeExecutor::new(); // `tmux` unregistered => NotFound
         assert!(capture(&exec, "build:0.1", None).await.is_err());
