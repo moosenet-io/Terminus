@@ -15,7 +15,8 @@
 //!
 //! **1. The syntax is deliberately minimal, and it is the syntax MESH-08
 //! already uses.** An exact name, a trailing-`*` prefix, or a namespace form
-//! (`<namespace>__*`, the separator [`crate::mesh::merge::MESH_NS_SEP`]).
+//! (`<namespace>::*`, delimiter [`PATTERN_NS_SEP`] — deliberately NOT the `__`
+//! that separates the halves of an advertised name; see [`Pattern::parse`]).
 //! Nothing else parses. No regex: a pattern here may be authored by a DELEGATED
 //! federation user (RMCP-12), and a regex from an untrusted author is a
 //! denial-of-service against the dispatch path, which runs the matcher on every
@@ -40,11 +41,11 @@
 //! authorization bug where a scoping record that failed to load silently became
 //! full access.
 //!
-//! ## The namespace boundary, and the matcher RMCP-07 has to collapse onto
+//! ## The namespace boundary, and the two separators
 //!
 //! **The rule, in one sentence covering all three pattern kinds: an unqualified
 //! EXACT or PREFIX pattern matches local (unqualified) tools only; a
-//! namespace-qualified pattern (`<ns>__*`, `<ns>__<prefix>*`) matches only
+//! namespace-qualified pattern (`<ns>::*`, `<ns>::<prefix>*`) matches only
 //! within the namespace it names; and the bare `*` matches the whole merged
 //! catalog, local and federated alike, bounded by the client's allowed
 //! namespaces at RMCP-07's intersection rather than by this matcher.**
@@ -74,12 +75,13 @@
 //!
 //! [`Pattern::matches`] carries the per-arm reasoning.
 //!
-//! RMCP-07 currently holds a SECOND copy of this matcher in its `scope.rs`,
-//! written before this item landed and marked in-file for deletion once it did.
-//! **These are the semantics that copy must adopt when it collapses onto this
-//! one.** Two matchers that disagree about whether a bare prefix crosses a
-//! namespace produce a permit nobody intended, and the disagreement is invisible
-//! from either side alone.
+//! RMCP-07 holds a SECOND copy of this matcher in its `scope.rs`, and it is the
+//! copy wired into `decide()`. The two used DIFFERENT namespace delimiters —
+//! this one `__`, that one `::` — which meant every namespace-qualified pattern
+//! written here resolved to nothing there, while a `::` pattern written here
+//! passed validation as an innocuous local prefix and was expanded by the
+//! enforcer into a whole federated namespace. That is TERM #637; the resolution
+//! was to standardise on `::`, which is what this module now uses.
 //!
 //! ## This module has no caller yet, and that is the design
 //! [`resolve`] is not wired into `tools/list` or `tools/call`, and must not be
@@ -126,6 +128,14 @@ use sqlx::FromRow;
 
 use crate::error::ToolError;
 use crate::mesh::merge::{split_namespaced, MESH_NS_SEP};
+
+/// The delimiter between a namespace and a tool WITHIN A PATTERN.
+///
+/// Deliberately NOT [`MESH_NS_SEP`], which separates the two halves of an
+/// advertised NAME. Keeping them distinct is what makes `a::b__*` unambiguous;
+/// see the grammar on [`Pattern::parse`] for the full reasoning, and TERM #637
+/// for the divergence that settled it.
+pub const PATTERN_NS_SEP: &str = "::";
 use crate::oauth::model::ToolGroup;
 
 /// Longest accepted group name, in CHARS.
@@ -238,18 +248,20 @@ pub enum Pattern {
     /// bounds it is the client's allowed namespaces at RMCP-07's intersection,
     /// not this matcher.
     Everything,
-    /// `<namespace>__*` — every tool advertised by one mesh upstream.
+    /// `<namespace>::*` — every tool advertised by one mesh upstream.
     Namespace(String),
-    /// `<namespace>__<prefix>*` — tools from ONE upstream whose bare name
+    /// `<namespace>::<prefix>*` — tools from ONE upstream whose bare name
     /// starts with `prefix`. Reaching into a namespace requires naming it.
     NamespacedPrefix { namespace: String, prefix: String },
-    /// `<prefix>*` with no separator — every LOCAL (unqualified) tool whose
+    /// `<prefix>*` with no `::` — every LOCAL (unqualified) tool whose
     /// name starts with `prefix`.
     ///
     /// Local only. See [`Pattern::matches`] for why an unqualified prefix must
     /// not be allowed to span the mesh separator.
     Prefix(String),
-    /// An exact advertised name.
+    /// One exact ADVERTISED name. A qualified pattern (`<ns>::<bare>`) is
+    /// stored in advertised form (`<ns>__<bare>`), so matching is a plain
+    /// comparison against the name a caller actually invokes.
     Exact(String),
 }
 
@@ -302,54 +314,60 @@ impl Pattern {
     ///
     /// ```text
     /// pattern   := "*"                        -- Everything (operator-only)
-    ///            | namespace "__" "*"         -- Namespace
-    ///            | namespace "__" bare "*"    -- NamespacedPrefix
-    ///            | namespace "__" bare        -- Exact, qualified
+    ///            | namespace "::" "*"         -- Namespace
+    ///            | namespace "::" bare "*"    -- NamespacedPrefix
+    ///            | namespace "::" bare        -- Exact, qualified
     ///            | local "*"                  -- Prefix, LOCAL ONLY
     ///            | local                      -- Exact, local
     ///
-    /// namespace := ASCII-graphic+, no "*", and must round-trip through
+    /// namespace := ASCII-graphic+, no "*", no "::", and must round-trip through
     ///              `split_namespaced` (so: no "__" inside it, no trailing "_")
-    /// bare      := ASCII-graphic+, no "*", NOT ending in "__"
-    ///              (it may otherwise contain "__": `a__b__c*` is namespace `a`,
-    ///               bare prefix `b__c`)
-    /// local     := ASCII-graphic+, no "*", no "__"
+    /// bare      := ASCII-graphic+, no "*", no "::"
+    ///              (it MAY contain and even end with "__" — see below)
+    /// local     := ASCII-graphic+, no "*", no "::", no "__"
     /// ```
     ///
-    /// ## Precedence, and why `bare` may not end in `__`
-    /// The two `"__"`-carrying prefix forms overlap on any pattern ending in
-    /// `__*`, and the grammar above is only unambiguous because ONE of them
-    /// wins. **A head ending in the separator is always the namespace form.**
-    /// `a__b__*` is therefore read as namespace `a__b` (which then fails
-    /// [`check_namespace`], so the pattern is REFUSED) and never as namespace
-    /// `a` with bare prefix `b__`.
+    /// ## Two separators, and why they are different characters
+    /// `::` delimits a PATTERN; `__` ([`MESH_NS_SEP`]) separates an ADVERTISED
+    /// NAME. They are deliberately not the same character, and this is the
+    /// second vocabulary this item has had.
     ///
-    /// Refusing it is the point, not a side effect. Round 5 of review read that
-    /// same pattern the other way — namespace `a`, bare prefix `b__`, matching
-    /// an advertised `a__b__c` — and that reading is entirely reasonable. Two
-    /// careful readers disagreeing about what one pattern means IS the defect:
-    /// this module's whole discipline is that a pattern must never resolve to
-    /// something other than what its author wrote, and an author cannot write
-    /// `a__b__*` and know which of two scopes they will get. So the ambiguous
-    /// spelling is refused while both unambiguous ones keep working —
-    /// `a__b__c*` selects bare names under namespace `a`, and `a__b*` selects
-    /// bare names starting `b` under the same namespace. Nothing an operator
-    /// can legitimately want becomes inexpressible; only the coin-flip does.
+    /// The first used `__` for both, matching MESH-08's allow-entry syntax. That
+    /// looked like the conservative choice — reuse the vocabulary rather than
+    /// invent one — but it made `a__b__*` genuinely ambiguous: namespace `a__b`,
+    /// or namespace `a` with bare prefix `b__`? Both readings are reasonable,
+    /// two careful readers reached different ones, and the tie could only be
+    /// broken by declaring a precedence rule. A pattern whose meaning depends on
+    /// a precedence rule is a pattern an author cannot read.
+    ///
+    /// A distinct delimiter dissolves it rather than adjudicating it. `a::b__*`
+    /// is namespace `a`, bare prefix `b__`, and there is no second reading — so
+    /// a bare name may contain `__`, and may even END with it, harmlessly. The
+    /// precedence rule is not documented here because it no longer needs to
+    /// exist. (See also TERM #637: the enforcing matcher in RMCP-07 already used
+    /// `::`, so this also makes the two agree.)
+    ///
+    /// ## `__` in an unqualified pattern is REFUSED, not reinterpreted
+    /// A local pattern containing `__` can never match anything: any advertised
+    /// name carrying `__` splits into a namespace, and is therefore not local.
+    /// It is also exactly what a pattern written under the OLD vocabulary looks
+    /// like (`peerhub__*`). Silently treating it as an unmatchable local prefix
+    /// would turn a previously-working scope into one that grants nothing, with
+    /// no error to explain it — so it is refused, and the error names the `::`
+    /// form it should have been.
     ///
     /// Rejected, exhaustively: the empty pattern; anything over
     /// [`MAX_PATTERN_CHARS`]; any non-ASCII-graphic character (whitespace,
     /// control bytes, homoglyphs); a `*` anywhere but as the single FINAL
-    /// character; a pattern beginning with the separator; and any namespace
-    /// that cannot round-trip.
+    /// character; `__` in an unqualified pattern; an empty or repeated `::`
+    /// section; and any namespace that cannot round-trip.
     ///
     /// ## Why every rejection is a rejection
     /// Each one is a shape that would otherwise parse to something the author
     /// did not write. The direction is usually UNDER-granting — a pattern that
     /// silently matches nothing, so a connector is quietly missing tools with no
     /// error to explain it — but "means something other than what was written"
-    /// is the defect either way, and the next person to add suffix matching
-    /// should be adding it to a parser that refused the syntax rather than one
-    /// that already accepted it and did something else with it.
+    /// is the defect either way.
     fn parse_syntax_checked(raw: &str) -> Result<Self, ToolError> {
         // ---- whole-string checks, before any shape is considered ----
         if raw.is_empty() {
@@ -372,14 +390,11 @@ impl Pattern {
                     .into(),
             ));
         }
-        // `*` is understood ONLY as the single trailing character. This is
-        // counted over the WHOLE string and decided before any shape is chosen,
-        // so a leading (`*weather`) or interior (`weather*foo`, `**`) star is
-        // refused as such rather than falling through to some other branch and
-        // being accepted as, say, an exact name that no tool could ever have.
-        // Both read to a human as globs; there is no glob syntax here, so they
-        // are refused rather than quietly reinterpreted — the same fail-closed
-        // stance `gateway_framework`'s grant validation takes on this character.
+        // `*` is understood ONLY as the single trailing character. Counted over
+        // the WHOLE string and decided before any shape is chosen, so a leading
+        // (`*weather`) or interior (`weather*foo`, `**`) star is refused as such
+        // rather than falling through to some other branch and being accepted as
+        // an exact name no tool could ever have.
         let stars = raw.matches('*').count();
         let trailing_star = raw.ends_with('*');
         if stars > 1 || (stars == 1 && !trailing_star) {
@@ -389,65 +404,61 @@ impl Pattern {
                     .into(),
             ));
         }
-
-        // ---- shape ----
-        //
-        // An EXACT pattern is a literal advertised name and is decided first,
-        // before any namespace splitting. It has to be: `peerhub__ledger_add`
-        // as an exact name must stay exact. Running it through the qualified
-        // split would turn it into a PREFIX over that namespace — matching
-        // `peerhub__ledger_add_v2` as well — which is a widening, and precisely
-        // the "parses to something other than what was written" class this
-        // function exists to close.
-        let head = if trailing_star { &raw[..raw.len() - 1] } else { raw };
-        if head.is_empty() {
-            // Only reachable as the bare `*`; the empty string was rejected above.
+        if raw == "*" {
             return Ok(Pattern::Everything);
         }
-        // A leading separator can never denote anything: `split_namespaced`
-        // treats an empty namespace half as no split at all, so `__foo*` would
-        // otherwise fall through to a LOCAL prefix beginning with `__` — one
-        // that no advertised name can match, since any name starting with `__`
-        // has that same empty half. Silently storing an unmatchable pattern is
-        // the same "means something other than what was written" defect as an
-        // unsupported glob, so it is refused where an author can still fix it.
-        if head.starts_with(MESH_NS_SEP) {
+
+        // ---- qualified vs local, decided on the PATTERN delimiter ----
+        let Some((namespace, rest)) = raw.split_once(PATTERN_NS_SEP) else {
+            return Self::parse_local(raw, trailing_star);
+        };
+        check_namespace(namespace)?;
+        if rest.contains(PATTERN_NS_SEP) {
             return Err(ToolError::InvalidArgument(format!(
-                "a pattern may not begin with `{MESH_NS_SEP}`; write `<namespace>{MESH_NS_SEP}...` \
-                 to name an upstream, or drop the separator for a local tool"
+                "a pattern names at most one namespace: `{PATTERN_NS_SEP}` may appear once"
             )));
         }
-
-        if !trailing_star {
-            return Ok(Pattern::Exact(head.to_string()));
+        if rest.is_empty() {
+            return Err(ToolError::InvalidArgument(format!(
+                "`{namespace}{PATTERN_NS_SEP}` names a namespace but no tool; write \
+                 `{namespace}{PATTERN_NS_SEP}*` for all of it"
+            )));
         }
-
-        // `ns__*` is the namespace form. Recognising it here (rather than
-        // leaving it as a prefix that happens to end in the separator) is what
-        // lets it render back identically and lets the matcher use the mesh's
-        // own splitter instead of a second, parallel notion of "namespaced".
-        if let Some(namespace) = head.strip_suffix(MESH_NS_SEP) {
-            check_namespace(namespace)?;
+        if !trailing_star {
+            // A qualified EXACT pattern is stored as the ADVERTISED name it
+            // denotes, so matching stays a plain string comparison and cannot
+            // drift from how the merge layer builds that name. `render` splits
+            // it back for display.
+            return Ok(Pattern::Exact(crate::mesh::merge::namespaced(namespace, rest)));
+        }
+        let prefix = &rest[..rest.len() - 1];
+        if prefix.is_empty() {
             return Ok(Pattern::Namespace(namespace.to_string()));
         }
-        // A prefix that NAMES a namespace is a qualified prefix. Splitting it
-        // here, rather than leaving it as a raw `starts_with` over the
-        // advertised name, is what makes the boundary explicit in the type: the
-        // only patterns that can reach a federated tool are the two that carry a
-        // namespace, and both got it from the author writing one down.
-        if let Some((namespace, prefix)) = split_namespaced(head) {
-            check_namespace(namespace)?;
-            return Ok(Pattern::NamespacedPrefix {
-                namespace: namespace.to_string(),
-                prefix: prefix.to_string(),
-            });
+        Ok(Pattern::NamespacedPrefix {
+            namespace: namespace.to_string(),
+            prefix: prefix.to_string(),
+        })
+    }
+
+    /// An unqualified pattern: local tools only.
+    fn parse_local(raw: &str, trailing_star: bool) -> Result<Self, ToolError> {
+        // The old-vocabulary migration guard, and the unmatchable-pattern rule,
+        // are the same check: see the `__` note in `parse_syntax_checked`.
+        if raw.contains(MESH_NS_SEP) {
+            let suggestion = raw.replacen(MESH_NS_SEP, PATTERN_NS_SEP, 1);
+            return Err(ToolError::InvalidArgument(format!(
+                "`{MESH_NS_SEP}` separates an advertised NAME, not a pattern, and no local tool \
+                 name contains it — to name an upstream write `{suggestion}`"
+            )));
         }
-        // Local prefix. `split_namespaced` found no usable split and the
-        // leading-separator case is gone, so `head` carries no separator at all
-        // — which is what makes this a LOCAL-only pattern by construction
-        // rather than by a rule applied later.
-        debug_assert!(!head.contains(MESH_NS_SEP));
-        Ok(Pattern::Prefix(head.to_string()))
+        let head = if trailing_star { &raw[..raw.len() - 1] } else { raw };
+        // `head` cannot be empty: the bare `*` was handled by the caller.
+        if trailing_star {
+            Ok(Pattern::Prefix(head.to_string()))
+        } else {
+            Ok(Pattern::Exact(head.to_string()))
+        }
     }
 
     /// Whether this pattern covers `advertised` — the name a caller invokes.
@@ -485,7 +496,7 @@ impl Pattern {
     /// author can only write deliberately, and which the client's own
     /// `rmcp_client_server` rows must still permit before any of it resolves
     /// (RMCP-07). Two patterns that look alike are now firmly different:
-    /// `peer*` is local-only, `peerhub__*` is that upstream.
+    /// `peer*` is local-only, `peerhub::*` is that upstream.
     ///
     /// **RMCP-07 must adopt these semantics.** It currently carries its own
     /// copy of this matcher in `scope.rs`, written before this item landed and
@@ -527,12 +538,19 @@ impl Pattern {
     pub fn render(&self) -> String {
         match self {
             Pattern::Everything => "*".to_string(),
-            Pattern::Namespace(ns) => format!("{ns}{MESH_NS_SEP}*"),
+            Pattern::Namespace(ns) => format!("{ns}{PATTERN_NS_SEP}*"),
             Pattern::NamespacedPrefix { namespace, prefix } => {
-                format!("{namespace}{MESH_NS_SEP}{prefix}*")
+                format!("{namespace}{PATTERN_NS_SEP}{prefix}*")
             }
             Pattern::Prefix(prefix) => format!("{prefix}*"),
-            Pattern::Exact(name) => name.clone(),
+            // An exact pattern stores the ADVERTISED name. A qualified one is
+            // split back onto the pattern delimiter so it round-trips; a local
+            // one carries no `__` at all (the parser refuses that), so this
+            // cannot mangle it.
+            Pattern::Exact(name) => match split_namespaced(name) {
+                Some((namespace, bare)) => format!("{namespace}{PATTERN_NS_SEP}{bare}"),
+                None => name.clone(),
+            },
         }
     }
 }
@@ -544,24 +562,27 @@ impl Pattern {
 /// [`split_namespaced`]'s actual behaviour. It rejects three shapes at once,
 /// all of which parse cleanly and then match NOTHING:
 ///
-/// - **empty** (`__*`): absence of a namespace that compares equal to something
+/// - **empty** (`::*`): absence of a namespace that compares equal to something
 ///   is the absence-means-permission failure this whole item exists to prevent.
-/// - **an interior separator** (`a__b__*`): ambiguous about where the namespace
-///   ends, and the splitter would pick the first `__` regardless.
-/// - **a TRAILING underscore** (`foo___*` → namespace `foo_`): the subtle one,
-///   and not previously caught. `split_namespaced` always splits at the FIRST
-///   `__`, so an advertised `foo___bar` yields namespace `foo`, never `foo_`.
+/// - **an embedded name separator** (`a__b::*`): no advertised name resolves to
+///   a namespace containing `__`, since the splitter cuts at the first one.
+/// - **a TRAILING underscore** (`foo_::*` → namespace `foo_`): the subtle one.
+///   `split_namespaced` always splits at the FIRST `__`, so an advertised
+///   `foo___bar` yields namespace `foo`, never `foo_`.
 ///   A pattern naming `foo_` is therefore unmatchable — it stores cleanly,
 ///   reads as meaningful, and silently grants nothing.
 fn check_namespace(namespace: &str) -> Result<(), ToolError> {
     let probe = crate::mesh::merge::namespaced(namespace, "x");
-    if !namespace.is_empty() && split_namespaced(&probe) == Some((namespace, "x")) {
+    if !namespace.is_empty()
+        && !namespace.contains(PATTERN_NS_SEP)
+        && split_namespaced(&probe) == Some((namespace, "x"))
+    {
         return Ok(());
     }
     Err(ToolError::InvalidArgument(format!(
         "`{namespace}` is not a usable namespace: it must be non-empty, contain no \
-         `{MESH_NS_SEP}`, and not end in `_` — otherwise no advertised tool name can \
-         ever resolve to it"
+         `{MESH_NS_SEP}` or `{PATTERN_NS_SEP}`, and not end in `_` — otherwise no advertised \
+         tool name can ever resolve to it"
     )))
 }
 
@@ -977,7 +998,7 @@ mod tests {
     fn a_pattern_matching_nothing_resolves_to_the_empty_set() {
         assert!(resolve_raw(&["no_such_tool"], GroupOwner::Operator).is_empty());
         assert!(resolve_raw(&["nothing_starts_with_this_*"], GroupOwner::Operator).is_empty());
-        assert!(resolve_raw(&["absent_namespace__*"], GroupOwner::Operator).is_empty());
+        assert!(resolve_raw(&["absent_namespace::*"], GroupOwner::Operator).is_empty());
     }
 
     /// A stored pattern that no longer parses must contribute nothing, rather
@@ -1116,7 +1137,7 @@ mod tests {
     #[test]
     fn namespace_pattern_matches_exactly_one_upstream() {
         assert_eq!(
-            resolve_raw(&["peerhub__*"], GroupOwner::Operator),
+            resolve_raw(&["peerhub::*"], GroupOwner::Operator),
             vec!["peerhub__alerts_list", "peerhub__ledger_add"]
         );
     }
@@ -1134,7 +1155,7 @@ mod tests {
             .unwrap()
             .matches("peerhub__ledger_add"));
         // Reaching an upstream tool takes a pattern that names the upstream.
-        assert!(Pattern::parse("peerhub__ledger*", GroupOwner::Operator)
+        assert!(Pattern::parse("peerhub::ledger*", GroupOwner::Operator)
             .unwrap()
             .matches("peerhub__ledger_add"));
     }
@@ -1161,14 +1182,14 @@ mod tests {
         assert!(!bare.matches("peerhub__ledger_add"));
 
         // Written deliberately, with the upstream named, it still reaches in.
-        let qualified = Pattern::parse("peerhub__*", GroupOwner::Operator).unwrap();
+        let qualified = Pattern::parse("peerhub::*", GroupOwner::Operator).unwrap();
         assert!(qualified.matches("peerhub__alerts_list"));
         assert!(!qualified.matches("peer_status"), "and it does NOT reach back out to local");
 
         // End to end through resolution, which is what actually authorizes.
         assert_eq!(resolve_raw(&["peer*"], GroupOwner::Operator), vec!["peer_status"]);
         assert_eq!(
-            resolve_raw(&["peerhub__*"], GroupOwner::Operator),
+            resolve_raw(&["peerhub::*"], GroupOwner::Operator),
             vec!["peerhub__alerts_list", "peerhub__ledger_add"]
         );
     }
@@ -1211,7 +1232,7 @@ mod tests {
     /// separator.
     #[test]
     fn a_qualified_prefix_is_anchored_to_its_namespace() {
-        let p = Pattern::parse("peerhub__ledger*", GroupOwner::Operator).unwrap();
+        let p = Pattern::parse("peerhub::ledger*", GroupOwner::Operator).unwrap();
         assert!(p.matches("peerhub__ledger_add"));
         assert!(!p.matches("sensors__ledger_add"), "a different upstream is a different namespace");
         assert!(!p.matches("ledger_add"), "and it never matches the LOCAL tool of that name");
@@ -1240,7 +1261,7 @@ mod tests {
     /// satisfied by a namespace that merely starts with the same letters.
     #[test]
     fn namespace_pattern_is_not_a_loose_prefix() {
-        let p = Pattern::parse("peerhub__*", GroupOwner::Operator).unwrap();
+        let p = Pattern::parse("peerhub::*", GroupOwner::Operator).unwrap();
         assert!(p.matches("peerhub__anything"));
         assert!(!p.matches("peerhub0__anything"), "a longer namespace is a different namespace");
         assert!(!p.matches("peerhub_local_tool"), "a single underscore is not the separator");
@@ -1271,7 +1292,7 @@ mod tests {
             if order {
                 cat.reverse();
             }
-            let patterns = vec![Pattern::parse("peerhub__*", GroupOwner::Operator).unwrap()];
+            let patterns = vec![Pattern::parse("peerhub::*", GroupOwner::Operator).unwrap()];
             let resolved = resolve(&patterns, &cat);
             assert_eq!(resolved.len(), 1, "one advertised name is one entry");
             assert_eq!(
@@ -1297,11 +1318,16 @@ mod tests {
             "weather\u{200B}_*",     // invisible character
             "weather\n_*",           // control character
             "wéather_*",             // non-ASCII cannot match an ASCII registry
-            "__*",                   // empty namespace
-            "__foo*",                // empty namespace in the split-prefix form
-            "__foo",                 // ...and in the exact form
-            "a__b__*",               // ambiguous double namespace
-            "foo___*",               // namespace `foo_` — unmatchable, see check_namespace
+            "::*",                   // empty namespace
+            "::foo*",                // empty namespace in the split-prefix form
+            "::foo",                 // ...and in the exact form
+            "peerhub::",             // a namespace naming no tool
+            "a::b::c*",              // more than one namespace
+            "a__b::*",               // `__` inside a namespace: unresolvable
+            "foo_::*",               // namespace `foo_` — unmatchable, see check_namespace
+            "peerhub__*",            // OLD vocabulary; `__` is not a pattern delimiter
+            "peerhub__ledger_add",   // ...in the exact form too
+            "a__b__*",               // the formerly-ambiguous shape, now simply not a pattern
         ] {
             assert!(
                 Pattern::parse(bad, GroupOwner::Operator).is_err(),
@@ -1346,72 +1372,114 @@ mod tests {
     /// tool can ever resolve to `foo_`.
     #[test]
     fn an_unusable_namespace_is_refused_rather_than_stored_unmatchable() {
-        for bad in ["__*", "__foo*", "a__b__*", "foo___*", "__foo"] {
+        for bad in ["::*", "::foo*", "a__b::*", "foo_::*", "::foo", "a::b::c*", "peerhub::"] {
             assert!(
                 Pattern::parse(bad, GroupOwner::Operator).is_err(),
                 "{bad:?} can never match a real tool and must be refused at write time"
             );
         }
-        // The usable forms still parse, including a bare name that legitimately
-        // contains the separator after a valid namespace.
+        // The usable forms still parse. A bare name may contain the ADVERTISED
+        // separator freely now that the pattern delimiter is a different
+        // character — including ending with it, which the old vocabulary could
+        // not express at all.
         assert_eq!(
-            Pattern::parse("a__b__c*", GroupOwner::Operator).unwrap(),
+            Pattern::parse("a::b__c*", GroupOwner::Operator).unwrap(),
             Pattern::NamespacedPrefix { namespace: "a".into(), prefix: "b__c".into() },
-            "a bare tool name may itself contain the separator"
+        );
+        assert_eq!(
+            Pattern::parse("a::b__*", GroupOwner::Operator).unwrap(),
+            Pattern::NamespacedPrefix { namespace: "a".into(), prefix: "b__".into() },
+            "a bare prefix may END with `__`: there is no second reading to collide with"
         );
         assert_eq!(
             Pattern::parse("_foo*", GroupOwner::Operator).unwrap(),
             Pattern::Prefix("_foo".into()),
-            "a single leading underscore is not the separator"
+            "a single leading underscore is not a separator"
         );
     }
 
-    /// The round-5 case. `a__b__*` is refused, and this pins WHICH branch
-    /// refuses it and why — because a bare `is_err()` cannot distinguish "the
-    /// namespace form rejected `a__b`" from "something else happened to fail",
-    /// and the review disagreement was precisely about which path runs.
+    /// The round-5 ambiguity is GONE, not adjudicated.
     ///
-    /// Precedence: a head ending in the separator is ALWAYS the namespace form.
-    /// So `a__b__*` is namespace `a__b` — which cannot round-trip through
-    /// `split_namespaced` and is therefore rejected — and is never read as
-    /// namespace `a` with bare prefix `b__`.
-    ///
-    /// The refusal is deliberate. That second reading is reasonable enough that
-    /// a reviewer reached it, and an author who cannot predict which of two
-    /// scopes they will get has written an ambiguous pattern, which this module
-    /// refuses on principle. Both unambiguous spellings still work, asserted
-    /// below, so nothing legitimate becomes inexpressible.
+    /// Under the old `__` vocabulary `a__b__*` had two honest readings —
+    /// namespace `a__b`, or namespace `a` with bare prefix `b__` — and two
+    /// careful readers reached different ones. A distinct pattern delimiter
+    /// dissolves it: `a::b__*` can only be namespace `a`, bare prefix `b__`.
+    /// The precedence rule that used to settle it no longer exists, which is
+    /// the point — a pattern whose meaning depends on a precedence rule is a
+    /// pattern an author cannot read.
     #[test]
-    fn an_ambiguous_double_separator_prefix_is_refused_by_the_namespace_branch() {
-        let err = Pattern::parse("a__b__*", GroupOwner::Operator).unwrap_err().to_string();
-        assert!(
-            err.contains("a__b"),
-            "must be refused as the NAMESPACE `a__b`, naming it so the author can see \
-             which reading was taken: {err}"
-        );
-        assert!(err.contains("not a usable namespace"), "and by check_namespace: {err}");
-
-        // Both unambiguous spellings survive, and mean different things.
+    fn the_pattern_delimiter_removes_the_double_separator_ambiguity() {
         assert_eq!(
-            Pattern::parse("a__b__c*", GroupOwner::Operator).unwrap(),
-            Pattern::NamespacedPrefix { namespace: "a".into(), prefix: "b__c".into() },
-            "a bare name may contain the separator when the pattern is unambiguous"
+            Pattern::parse("a::b__*", GroupOwner::Operator).unwrap(),
+            Pattern::NamespacedPrefix { namespace: "a".into(), prefix: "b__".into() },
         );
         assert_eq!(
-            Pattern::parse("a__b*", GroupOwner::Operator).unwrap(),
-            Pattern::NamespacedPrefix { namespace: "a".into(), prefix: "b".into() },
+            Pattern::parse("a__b::*", GroupOwner::Operator).ok(),
+            None,
+            "the other reading is not a rival parse, it is an unresolvable namespace"
         );
+        // And it matches the tool the reading implies.
+        let p = Pattern::parse("a::b__*", GroupOwner::Operator).unwrap();
+        assert!(p.matches("a__b__c"), "namespace `a`, bare name `b__c`");
+        assert!(!p.matches("a__c"));
+    }
 
-        // And the precedence itself: `<ns>__*` beats `<ns>__<bare>*` whenever a
-        // head ends in the separator. `peerhub__*` must stay the namespace form.
-        assert_eq!(
-            Pattern::parse("peerhub__*", GroupOwner::Operator).unwrap(),
-            Pattern::Namespace("peerhub".into()),
-            "a head ending in the separator is the namespace form, not a bare prefix",
-        );
+    /// CARRY-OVER 1 from TERM #637: the over-grant hole must stay closed.
+    ///
+    /// Under the old vocabulary `peerhub::*` passed write-time validation as an
+    /// innocuous LOCAL prefix — not a bare `*`, so the operator-only rule never
+    /// fired — while RMCP-07's enforcing matcher read the same string as a whole
+    /// federated namespace. A delegated author could grant themselves an
+    /// upstream through a pattern this validator called harmless.
+    ///
+    /// It is closed by CLASSIFICATION: `peerhub::*` is now a namespace pattern
+    /// on both sides, so whatever rules apply to namespace patterns apply to it.
+    /// This asserts the classification, because that is the thing that was
+    /// wrong — an `is_err`/`is_ok` check would not have caught it.
+    #[test]
+    fn a_namespace_pattern_is_never_classified_as_a_local_prefix() {
+        let p = Pattern::parse("peerhub::*", GroupOwner::Delegated).unwrap();
+        assert_eq!(p, Pattern::Namespace("peerhub".into()), "NOT Prefix(\"peerhub::\")");
+        assert!(p.matches("peerhub__alerts_list"), "it means the upstream, and says so");
+        assert!(!p.matches("peerhub_local_tool"), "and not a local tool of a similar name");
 
-        // The tests are not vacuous: a valid pattern parses through the same call.
-        assert!(Pattern::parse("a__b__c*", GroupOwner::Operator).is_ok());
+        // No pattern can be a local prefix that carries the pattern delimiter,
+        // so there is no spelling left that hides a namespace inside a local
+        // classification.
+        for sneaky in ["peerhub::", "peerhub::*", "::*"] {
+            match Pattern::parse(sneaky, GroupOwner::Delegated) {
+                Ok(parsed) => assert!(
+                    !matches!(parsed, Pattern::Prefix(_) | Pattern::Exact(_)),
+                    "{sneaky:?} parsed as an unqualified pattern: {parsed:?}"
+                ),
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// CARRY-OVER 2 from TERM #637: an OLD-vocabulary pattern is refused, and
+    /// the error names the form it should have been.
+    ///
+    /// A stored `peerhub__*` must not quietly become a local prefix that matches
+    /// nothing — that would turn a scope which used to grant an upstream into
+    /// one granting zero tools, with no error anywhere. Refusing is the
+    /// deliberate choice over migrating: an operator sees it at the point of
+    /// edit, and the suggestion tells them exactly what to write.
+    #[test]
+    fn an_old_vocabulary_pattern_is_refused_with_the_correct_form_named() {
+        let err = Pattern::parse("peerhub__*", GroupOwner::Operator).unwrap_err().to_string();
+        assert!(err.contains("peerhub::*"), "the error must name the correct form: {err}");
+
+        let err = Pattern::parse("peerhub__ledger_add", GroupOwner::Operator).unwrap_err().to_string();
+        assert!(err.contains("peerhub::ledger_add"), "including for an exact name: {err}");
+
+        // Only the FIRST `__` is the one that should have been a delimiter, so
+        // the suggestion keeps a bare name's own separators intact.
+        let err = Pattern::parse("a__b__c*", GroupOwner::Operator).unwrap_err().to_string();
+        assert!(err.contains("a::b__c*"), "the suggestion preserves the bare name: {err}");
+
+        // A local pattern with no `__` is unaffected.
+        assert!(Pattern::parse("weather_*", GroupOwner::Operator).is_ok());
     }
 
     /// An EXACT qualified name must stay EXACT. Splitting it into a namespaced
@@ -1420,7 +1488,7 @@ mod tests {
     /// than what was written" defect, in the granting direction.
     #[test]
     fn an_exact_qualified_name_does_not_become_a_prefix() {
-        let p = Pattern::parse("peerhub__ledger_add", GroupOwner::Operator).unwrap();
+        let p = Pattern::parse("peerhub::ledger_add", GroupOwner::Operator).unwrap();
         assert_eq!(p, Pattern::Exact("peerhub__ledger_add".into()));
         assert!(p.matches("peerhub__ledger_add"));
         assert!(!p.matches("peerhub__ledger_add_v2"), "an exact pattern must not act as a prefix");
@@ -1459,7 +1527,7 @@ mod tests {
 
     #[test]
     fn patterns_round_trip_through_their_stored_form() {
-        for raw in ["*", "peerhub__*", "peerhub__ledger*", "weather_*", "weather_get"] {
+        for raw in ["*", "peerhub::*", "peerhub::ledger*", "weather_*", "weather_get"] {
             let parsed = Pattern::parse(raw, GroupOwner::Operator).unwrap();
             assert_eq!(parsed.render(), raw);
             assert_eq!(Pattern::parse_stored(&parsed.render()), Some(parsed));
@@ -1603,7 +1671,7 @@ mod tests {
 
         let patterns = vec![
             Pattern::parse("fam7_*", GroupOwner::Operator).unwrap(),
-            Pattern::parse("up__*", GroupOwner::Operator).unwrap(),
+            Pattern::parse("up::*", GroupOwner::Operator).unwrap(),
         ];
         let resolved = resolve(&patterns, &cat);
         let local_hits = cat.iter().filter(|t| t.name.starts_with("fam7_")).count();

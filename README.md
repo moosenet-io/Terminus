@@ -1167,33 +1167,39 @@ Exactly these shapes parse. There is no glob, no regex, and no negation.
 |---|---|---|
 | `tool_name` | that one tool, exactly | `weather_get` |
 | `prefix*` | every **local** tool whose name starts with `prefix` | `weather_*` |
-| `namespace__*` | every tool advertised by one mesh upstream | `peerhub__*` |
-| `namespace__prefix*` | tools from one upstream whose bare name starts with `prefix` | `peerhub__ledger*` |
+| `namespace::*` | every tool advertised by one mesh upstream | `peerhub::*` |
+| `namespace::prefix*` | tools from one upstream whose bare name starts with `prefix` | `peerhub::ledger*` |
 | `*` | every tool, **local and federated** — operator-owned groups only | |
 
 The full grammar, so the rejections are as unambiguous as the semantics:
 
 ```text
 pattern   := "*"                        -- every tool (operator-owned groups only)
-           | namespace "__" "*"         -- one upstream, all of it
-           | namespace "__" bare "*"    -- one upstream, bare names starting with `bare`
-           | namespace "__" bare        -- one federated tool, exactly
+           | namespace "::" "*"         -- one upstream, all of it
+           | namespace "::" bare "*"    -- one upstream, bare names starting with `bare`
+           | namespace "::" bare        -- one federated tool, exactly
            | local "*"                  -- LOCAL tools starting with `local`
            | local                      -- one local tool, exactly
 
-namespace := printable ASCII, no "*", must round-trip through the mesh splitter
+namespace := printable ASCII, no "*", no "::", must round-trip through the mesh splitter
              (so: no "__" inside, no trailing "_")
-bare      := printable ASCII, no "*", NOT ending in "__"
-             (may otherwise contain "__": `a__b__c*` is namespace `a`, bare prefix `b__c`)
-local     := printable ASCII, no "*", no "__"
+bare      := printable ASCII, no "*", no "::"   (may contain and even end with "__")
+local     := printable ASCII, no "*", no "::", no "__"
 ```
 
-**Precedence:** a pattern whose head ends in the separator is always the *namespace* form.
-So `a__b__*` reads as namespace `a__b` — which cannot round-trip, so it is refused — and
-never as namespace `a` with bare prefix `b__`. That refusal is deliberate: both readings are
-reasonable, and an author who cannot predict which of two scopes they will get has written
-an ambiguous pattern. The unambiguous spellings both work (`a__b__c*`, `a__b*`), so nothing
-legitimate becomes inexpressible.
+**Two separators, deliberately different characters.** `::` delimits a *pattern*; `__`
+separates the halves of an *advertised name*. Keeping them distinct is what makes
+`a::b__*` unambiguous — namespace `a`, bare prefix `b__`, with no second reading. An
+earlier revision used `__` for both, which made `a__b__*` genuinely ambiguous (namespace
+`a__b`, or namespace `a` with prefix `b__`?) and could only be settled by declaring a
+precedence rule; a pattern whose meaning depends on a precedence rule is one an author
+cannot read. `::` also matches what the enforcing matcher in RMCP-07 already used — the two
+had diverged, which is TERM #637.
+
+**`__` in an unqualified pattern is refused**, not reinterpreted. It can never match (any
+advertised name carrying `__` is namespaced, hence not local), and it is exactly what an
+old-vocabulary pattern looks like — so `peerhub__*` errors with the correct form named
+(`peerhub::*`) rather than silently becoming a local prefix that grants nothing.
 
 Rejected at write time, exhaustively: the empty pattern; anything over 96 characters; any
 non-printable-ASCII character; a `*` anywhere but as the single final character (`*weather`
