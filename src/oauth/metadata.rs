@@ -46,6 +46,39 @@
 //! database is down" are wildly different operator problems and must not
 //! present identically.
 //!
+//! ## The advertised endpoints are not mounted yet (TERM #631)
+//! `authorization_endpoint`, `token_endpoint` and — when DCR is enabled —
+//! `registration_endpoint` name paths that no binary currently serves. That is
+//! not a defect in this module: it is the cross-item gap tracked as
+//! **TERM #631** ("merged OAuth routers are unreachable in a running binary"),
+//! which covers RMCP-03's `authorize` router, RMCP-04's token endpoint and
+//! RMCP-11's revoke handler identically. Nothing is mounted here to close it,
+//! because a private fix would be a second mechanism to unpick when #631 lands.
+//!
+//! Review round 4 asked specifically whether `registration_endpoint` should be
+//! withheld until it is mounted, given this module's own argument that an
+//! advertised-but-refusing endpoint is worse than an absent one. Deliberate
+//! decision: **keep advertising it, gated only on DCR being enabled.** Three
+//! reasons, in order of weight:
+//!
+//! 1. Gating only `registration_endpoint` would be arbitrary. The
+//!    authorization and token endpoints are advertised unconditionally and are
+//!    equally unmounted; if "not yet mounted" is disqualifying, it disqualifies
+//!    the entire document, and a resource server that publishes no endpoints is
+//!    not a resource server.
+//! 2. DCR is OFF by default, so no deployment advertises an unmounted
+//!    registration endpoint unless an operator explicitly turns it on. The
+//!    default-off flag already IS the gate, and it is the one an operator
+//!    controls.
+//! 3. Detecting "is it mounted?" from here would mean plumbing router state
+//!    into a document builder that deliberately has no dependencies — the exact
+//!    coupling #631 exists to resolve once, globally.
+//!
+//! The document describes the contract this server commits to; #631 is the work
+//! that makes it true. If #631 is deferred rather than done, the right response
+//! is to stop advertising the door at all (leave `RMCP_OAUTH_RESOURCE` unset),
+//! not to publish a document with selective holes in it.
+//!
 //! ## Secret access (S7/S8)
 //! Nothing here is a secret — a canonical connector URL and an issuer are
 //! public by construction (they are handed to a third-party client). The env
@@ -329,12 +362,48 @@ impl Discovery {
     /// half-configured discovery surface fails at the client with a message
     /// that names nothing.
     pub fn from_env() -> Result<Option<Self>, ToolError> {
-        let Some(raw_resource) = read_env(CANONICAL_RESOURCE_ENV) else {
+        let Some(raw_resource) = read_env(CANONICAL_RESOURCE_ENV)? else {
+            // The door is not configured. Before accepting that, check that the
+            // operator did not configure the REST of it and miss this one — a
+            // half-configured door reads as "feature off", and "feature off" on
+            // a gateway with no legacy `auth_token` is an open `/mcp`. The same
+            // fail-open the whitespace rule above closes, reached by a
+            // different mistake, so it gets the same answer.
+            //
+            // Only the discovery-OWNED settings are consulted. `ISSUER_ENV` is
+            // deliberately excluded: it is shared with RMCP-03/04, which set it
+            // for the authorization server's own purposes, so its presence is
+            // not evidence that anyone intended to enable discovery.
+            let mut orphans: Vec<&str> = Vec::new();
+            for var in [
+                SCOPES_SUPPORTED_ENV,
+                REQUIRED_SCOPE_ENV,
+                DCR_ENABLED_ENV,
+                ISSUER_EXTERNALLY_SERVED_ENV,
+            ] {
+                // `?`, not `.ok()`: a whitespace-only value on one of THESE
+                // must abort too. Swallowing the error here would reinstate the
+                // fail-open through a side door — the variable would read as
+                // absent, the orphan check would not fire, and the door would
+                // go quietly off.
+                if read_env(var)?.is_some() {
+                    orphans.push(var);
+                }
+            }
+            if !orphans.is_empty() {
+                return Err(ToolError::InvalidArgument(format!(
+                    "{} configured, but {CANONICAL_RESOURCE_ENV} is not set — the OAuth door \
+                     would be silently DISABLED despite being partly configured. Set \
+                     {CANONICAL_RESOURCE_ENV} to the connector URL, or clear the other \
+                     settings if the door is meant to be off",
+                    orphans.join(", ")
+                )));
+            }
             return Ok(None);
         };
         let resource = CanonicalUri::parse(CANONICAL_RESOURCE_ENV, &raw_resource)?;
 
-        let issuer = match read_env(ISSUER_ENV) {
+        let issuer = match read_env(ISSUER_ENV)? {
             Some(raw) => CanonicalUri::parse(ISSUER_ENV, &raw)?,
             // Default to the resource's ORIGIN rather than to the resource
             // itself: an issuer with a path forces the path-suffixed RFC 8414
@@ -343,43 +412,22 @@ impl Discovery {
             None => CanonicalUri::parse(ISSUER_ENV, resource.origin())?,
         };
 
-        let scopes = match read_env(SCOPES_SUPPORTED_ENV) {
+        let scopes = match read_env(SCOPES_SUPPORTED_ENV)? {
             Some(raw) => parse_scope_list(SCOPES_SUPPORTED_ENV, &raw)?,
             None => DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect(),
         };
 
-        let required_scope = match read_env(REQUIRED_SCOPE_ENV) {
-            Some(raw) => {
-                let parsed = parse_scope_list(REQUIRED_SCOPE_ENV, &raw)?;
-                parsed.join(" ")
-            }
+        let required_scope = match read_env(REQUIRED_SCOPE_ENV)? {
+            // `join(" ")` after a STRICT parse is now an identity round-trip,
+            // not a normalization: the parser accepts only single-space
+            // separators, so the joined string is byte-equal to the configured
+            // one. Asserted by a test, because that is the whole claim.
+            Some(raw) => parse_scope_list(REQUIRED_SCOPE_ENV, &raw)?.join(" "),
             None => DEFAULT_REQUIRED_SCOPE.to_string(),
         };
 
-        // Trimmed explicitly at the call site, now that `read_env` returns the
-        // value verbatim. A boolean flag is the opposite case from the
-        // canonical URI: nothing compares it byte-for-byte against anything, so
-        // ` true` meaning `true` costs nothing, whereas refusing it would fail
-        // a deployment over an invisible character for no gain. The
-        // normalization rule this module enforces is about values that are
-        // PUBLISHED and COMPARED, not about every string it reads.
-        let dcr_enabled = read_env(DCR_ENABLED_ENV)
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
-
-        let issuer_externally_served = read_env(ISSUER_EXTERNALLY_SERVED_ENV)
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
+        let dcr_enabled = read_flag(DCR_ENABLED_ENV)?;
+        let issuer_externally_served = read_flag(ISSUER_EXTERNALLY_SERVED_ENV)?;
 
         Self::new(
             resource,
@@ -750,8 +798,70 @@ fn validate_authority(authority: &str) -> Result<(), &'static str> {
 /// secret is a missing one. That is not the same normalization: "there is
 /// nothing here" is a different statement from "there is something here and I
 /// have quietly altered it".
-fn read_env(var: &str) -> Option<String> {
-    std::env::var(var).ok().filter(|v| !v.trim().is_empty())
+fn read_env(var: &str) -> Result<Option<String>, ToolError> {
+    let Ok(value) = std::env::var(var) else {
+        // Unset, or not UTF-8. Nothing here.
+        return Ok(None);
+    };
+    if value.is_empty() {
+        // Set to the EMPTY string. Still "nothing here".
+        //
+        // This is not a normalization, it is what an empty value MEANS in this
+        // fleet. Nothing in this process parses a `.env` file (there is no
+        // `dotenv` dependency); variables arrive through systemd's
+        // `EnvironmentFile=`, where a bare `KEY=` line sets the variable to the
+        // empty string. That is precisely how `.env.example` ships every
+        // optional key, so "present and empty" is the ordinary, deliberate way
+        // an operator says "I am not configuring this". Aborting on it would
+        // fail to boot every deployment that materializes the full template —
+        // and it is the same rule `crate::oauth::OauthConfig::from_env` already
+        // documents for an empty materialized secret.
+        return Ok(None);
+    }
+    if value.trim().is_empty() {
+        // Set to WHITESPACE. This is the case round 4 of review caught, and it
+        // is categorically different from the two above.
+        //
+        // A `KEY=` line cannot produce spaces; only a typo, a botched template
+        // substitution, or a quoted value gone wrong can. So there is no
+        // deployment that means "unconfigured" by writing spaces — and the
+        // consequence of guessing that it does is severe and silent. Treated as
+        // absent, a whitespace-only canonical resource switches the entire
+        // OAuth door OFF, and on a gateway with no legacy `auth_token` that
+        // restores exactly the open `/mcp` posture round 2 closed. A fail-open
+        // reachable by an invisible character.
+        //
+        // "There is nothing here" and "there is something here and it is
+        // unusable" must not lead to the same outcome. The first disables a
+        // feature; the second is a broken configuration and stops the process.
+        return Err(ToolError::InvalidArgument(format!(
+            "{var} is set to whitespace. That is not the same as leaving it unset or empty \
+             (either of which means \"not configured\" and is fine) — a whitespace value can \
+             only come from a typo or a botched substitution, and silently reading it as \
+             \"unset\" would disable the OAuth door without saying so. Set a real value or \
+             clear the variable"
+        )));
+    }
+    Ok(Some(value))
+}
+
+/// Read a boolean flag, applying [`read_env`]'s presence rules first.
+///
+/// The VALUE is trimmed here even though the canonical URI's is not, and the
+/// asymmetry is deliberate: nothing compares a flag byte-for-byte against
+/// anything, so ` true` meaning `true` costs nothing, whereas refusing it would
+/// fail a deployment over an invisible character for no gain. The
+/// no-normalization rule this module enforces is about values that are
+/// PUBLISHED and COMPARED, not about every string it reads.
+fn read_flag(var: &str) -> Result<bool, ToolError> {
+    Ok(read_env(var)?
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false))
 }
 
 /// Split a space-separated scope list, rejecting any token that is not a valid
@@ -763,15 +873,38 @@ fn read_env(var: &str) -> Option<String> {
 /// believes — which then shows up as an unexplained `403` on a call that ought
 /// to work.
 fn parse_scope_list(var: &str, raw: &str) -> Result<Vec<String>, ToolError> {
-    let mut out = Vec::new();
-    for token in raw.split_whitespace() {
-        // Same validator `Discovery::new` uses, so the reader and the publisher
-        // cannot disagree about what a scope may contain.
+    let mut out: Vec<String> = Vec::new();
+    // `split(' ')`, NOT `split_whitespace`. Round 4 of review caught that this
+    // reader still used the lenient form while `Discovery::new` had been
+    // tightened to the strict one — which made the constructor's rule
+    // unreachable for the only values that actually matter, the configured
+    // ones. RFC 6749 delimits a scope list with a SINGLE space, so a tab, a
+    // newline, a double space or a leading/trailing space is a malformed list,
+    // not an alternative spelling of a valid one. `split_whitespace` would
+    // absorb all of them and publish a list the operator did not write.
+    //
+    // Every one of those cases now surfaces as an empty token or a bad
+    // character, both of which `validate_scope_token` refuses — so this
+    // function and the constructor genuinely cannot drift, which is what the
+    // shared validator was introduced for.
+    for token in raw.split(' ') {
         validate_scope_token(var, token)?;
-        if !out.iter().any(|s: &String| s == token) {
-            out.push(token.to_string());
+        // A REPEATED scope is refused rather than silently collapsed, for the
+        // same reason the separators are: de-duplicating would publish a list
+        // that differs from the configured one, and a duplicate can only be a
+        // typo. Refusing it says so; collapsing it hides it.
+        if out.iter().any(|s| s == token) {
+            return Err(ToolError::InvalidArgument(format!(
+                "{var} lists the scope {token:?} more than once — a duplicate is a typo, and \
+                 silently collapsing it would publish a scope list that differs from the \
+                 configured one"
+            )));
         }
+        out.push(token.to_string());
     }
+    // Unreachable in practice: `split(' ')` always yields at least one item, and
+    // an empty one is refused above. Kept as a total match rather than an
+    // `unwrap`-shaped assumption about `split`'s behavior.
     if out.is_empty() {
         return Err(ToolError::InvalidArgument(format!(
             "{var} is present but contains no scope tokens"
@@ -987,15 +1120,60 @@ mod tests {
             .expect("a set canonical resource enables the door");
         assert_eq!(discovery.resource().as_str(), "https://connector.test/mcp");
 
-        // A whitespace-ONLY value is ABSENT (door disabled), not malformed —
-        // "there is nothing here" is a different statement from "there is
-        // something here and I have quietly altered it".
+        // ROUND 4, and the reason this assertion is the exact opposite of what
+        // it used to be. A whitespace-only value previously read as "absent",
+        // which switched the OAuth door OFF — and on a gateway with no legacy
+        // `auth_token` that restores the open `/mcp` posture round 2 closed. A
+        // fail-open reachable by an invisible character. It must ABORT.
         std::env::set_var(CANONICAL_RESOURCE_ENV, "   ");
-        let blank = Discovery::from_env();
+        let whitespace = Discovery::from_env();
+        std::env::remove_var(CANONICAL_RESOURCE_ENV);
+        let err = whitespace.expect_err("whitespace must abort, never disable the door");
+        assert!(err.to_string().contains("whitespace"), "{err}");
+
+        // But the EMPTY string is still "not configured", and must stay that
+        // way: systemd's `EnvironmentFile=` turns a bare `KEY=` line — how
+        // `.env.example` ships every optional key — into an empty value, so
+        // aborting on it would fail to boot every deployment that materializes
+        // the full template.
+        std::env::set_var(CANONICAL_RESOURCE_ENV, "");
+        let empty = Discovery::from_env();
         std::env::remove_var(CANONICAL_RESOURCE_ENV);
         assert!(
-            matches!(blank, Ok(None)),
-            "a blank value disables the door rather than failing startup"
+            matches!(empty, Ok(None)),
+            "an empty value means 'not configured', not 'malformed'"
+        );
+
+        // And unset is the same as empty.
+        std::env::remove_var(CANONICAL_RESOURCE_ENV);
+        assert!(matches!(Discovery::from_env(), Ok(None)));
+    }
+
+    /// The other route to the same fail-open: the operator configured the
+    /// discovery knobs and missed the one that enables the door. "Feature off"
+    /// on a gateway with no legacy `auth_token` is an open `/mcp`, so a
+    /// half-configured door is refused rather than silently ignored.
+    #[test]
+    #[serial]
+    fn a_half_configured_door_is_refused_rather_than_disabled() {
+        std::env::remove_var(CANONICAL_RESOURCE_ENV);
+        std::env::set_var(REQUIRED_SCOPE_ENV, "mcp");
+        let orphaned = Discovery::from_env();
+        std::env::remove_var(REQUIRED_SCOPE_ENV);
+        let err = orphaned.expect_err("a partly-configured door must not read as 'off'");
+        assert!(err.to_string().contains(CANONICAL_RESOURCE_ENV), "{err}");
+        assert!(err.to_string().contains(REQUIRED_SCOPE_ENV), "{err}");
+
+        // The shared issuer is deliberately NOT evidence of intent: RMCP-03/04
+        // set it for the authorization server's own purposes, so its presence
+        // must not force the discovery door on.
+        std::env::remove_var(CANONICAL_RESOURCE_ENV);
+        std::env::set_var(ISSUER_ENV, "https://connector.test");
+        let issuer_only = Discovery::from_env();
+        std::env::remove_var(ISSUER_ENV);
+        assert!(
+            matches!(issuer_only, Ok(None)),
+            "a shared variable owned by another item must not enable this one"
         );
     }
 
@@ -1369,14 +1547,49 @@ mod tests {
     /// silently narrowing what the resource advertises.
     #[test]
     fn scope_list_parsing_is_fail_closed() {
+        // A well-formed list parses to itself, in order.
         assert_eq!(
-            parse_scope_list("V", "  mcp   offline_access  mcp ").expect("valid"),
+            parse_scope_list("V", "mcp offline_access").expect("valid"),
             vec!["mcp".to_string(), "offline_access".to_string()],
-            "duplicates collapse, order is preserved"
         );
+
+        // ROUND 4: every separator that is not a SINGLE space is a malformed
+        // list, not an alternative spelling. `split_whitespace` used to absorb
+        // all of these and publish a list the operator did not write — which
+        // also made the constructor's strict rule unreachable for the only
+        // values that matter, the configured ones.
+        for bad in [
+            "  mcp offline_access",   // leading
+            "mcp offline_access ",    // trailing
+            "mcp  offline_access",    // repeated
+            "mcp\toffline_access",    // tab
+            "mcp\noffline_access",    // newline
+            "   ",                    // whitespace only
+            "",                       // empty
+            "mcp mcp",                // duplicate: a typo, not a shorthand
+        ] {
+            assert!(parse_scope_list("V", bad).is_err(), "must refuse {bad:?}");
+        }
+
+        // Charset rules still hold.
         assert!(parse_scope_list("V", "mcp \"admin\"").is_err());
         assert!(parse_scope_list("V", "back\\slash").is_err());
-        assert!(parse_scope_list("V", "   ").is_err());
+    }
+
+    /// The claim the strict parser exists to make good: parsing a configured
+    /// scope list and re-joining it reproduces the configured string BYTE FOR
+    /// BYTE. If that ever stops holding, the reader is normalizing again and
+    /// `required_scope` is publishing something nobody wrote.
+    #[test]
+    fn parsing_a_scope_list_is_an_identity_round_trip() {
+        for configured in ["mcp", "mcp offline_access", "a b c"] {
+            let parsed = parse_scope_list("V", configured).expect("valid");
+            assert_eq!(
+                parsed.join(" "),
+                configured,
+                "the strict parser must not alter a valid list"
+            );
+        }
     }
 
     /// The request-path sanitizer drops rather than fails, because no header at

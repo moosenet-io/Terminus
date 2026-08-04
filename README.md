@@ -843,7 +843,7 @@ fails in a way the client cannot describe.
 | `RMCP_OAUTH_RESOURCE` | **The connector URL, byte-for-byte as typed into the client's connector form.** Enables the door. Shared with the authorization and token endpoints. |
 | `RMCP_OAUTH_ISSUER` | OAuth issuer identifier. Defaults to the canonical resource's origin. Must be on that **same origin** unless the flag below is set. |
 | `RMCP_OAUTH_ISSUER_EXTERNALLY_SERVED` | Acknowledges that a cross-origin `RMCP_OAUTH_ISSUER` publishes its own RFC 8414 metadata. Default off. |
-| `RMCP_OAUTH_SCOPES_SUPPORTED` | Space-separated advertised scopes. Default `mcp offline_access`. |
+| `RMCP_OAUTH_SCOPES_SUPPORTED` | Advertised scopes, separated by a **single space** each. Default `mcp offline_access`. |
 | `RMCP_OAUTH_REQUIRED_SCOPE` | Scope an access token must carry to reach `/mcp`. Default `mcp`. |
 | `RMCP_OAUTH_DCR_ENABLED` | Advertise and accept RFC 7591 dynamic client registration. Default off. |
 
@@ -870,6 +870,16 @@ error. That combination is **refused at startup**. If the issuer genuinely is a 
 authorization server that publishes its own RFC 8414 document, set
 `RMCP_OAUTH_ISSUER_EXTERNALLY_SERVED=1` to say so explicitly. An issuer with a *path* on the
 same origin needs no flag — the path-suffixed well-known covers it and is served here.
+
+**Unset and empty mean "off"; whitespace is an error.** Leaving `RMCP_OAUTH_RESOURCE`
+unset — or set to the empty string, which is what a bare `KEY=` line in an
+`EnvironmentFile` produces — disables the door, and nothing changes. A value of
+*whitespace* aborts startup instead of disabling it: a `KEY=` line cannot produce
+spaces, so they only come from a typo or a botched substitution, and reading them as
+"unset" would silently switch the door off. Configuring any other `RMCP_OAUTH_*`
+discovery setting while leaving `RMCP_OAUTH_RESOURCE` unset aborts for the same
+reason — a half-configured door that reads as "off" is a fail-open on a gateway with
+no `auth_token`.
 
 A malformed value **aborts startup**. That is deliberate: a *nearly* correct value
 starts fine, serves a document the client fetches happily, and then fails at token
