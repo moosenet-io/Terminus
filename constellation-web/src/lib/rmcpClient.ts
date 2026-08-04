@@ -31,8 +31,27 @@
 // dispatch endpoint exists, every call here resolves to the `tool_unavailable` error code and
 // the page renders an explanatory "not live yet" state — the same posture `ActivityPanel` took
 // against CONST-26's endpoint. It never renders an error page, and it never invents data.
+//
+// THE FIXTURE SERVER IS NOT IN THE PRODUCTION BUNDLE, STRUCTURALLY.
+// ------------------------------------------------------------------------------------------
+// An earlier revision imported `rmcpFixtures.ts` at the top level and let `resolveMode()` decide
+// at RUNTIME whether it ran. Review round 1 rejected that, correctly: "a production build always
+// resolves to http" was a claim in a comment, and the failure it guards against is a UI showing
+// FABRICATED authorization data to an operator making real scoping decisions. That claim has to
+// be structural.
+//
+// So the fixture is now reached only through a dynamic `import()` behind a literal
+// `!import.meta.env.PROD` guard. Vite replaces that text with `false` at transform time, the
+// branch folds away, and the module is never referenced from a production build's graph — no
+// chunk is emitted for it. `scripts/assert-http-bundle.mjs` (the last step of `npm run build`,
+// so there is no unguarded build path) asserts the fixture's marker string is absent from every
+// shipped asset, which fails the build if that ever stops being true.
+//
+// The consequence is worth stating: in a production bundle, a runtime `?mock` opt-in gives the
+// REST of the app fixtures but gives this page nothing — its calls go to the real endpoint and
+// report `tool_unavailable` if it is not there. That asymmetry is deliberate. Connector scoping
+// is the one surface where plausible-looking fake data is worse than an empty page.
 import { getAggregationClient, resolveMode } from './aggregationClient';
-import { rmcpFixtureCall } from './rmcpFixtures';
 import { RMCP_TOOLS, RmcpError } from './rmcpContract';
 import type { RmcpErrorKind, RmcpToolName } from './rmcpContract';
 import type {
@@ -98,11 +117,13 @@ function kindFromTransport(message: string): RmcpErrorKind {
  * funnels through here, so the transport, the error mapping, and the mock seam each exist once.
  */
 async function callTool<T>(tool: RmcpToolName, args: Record<string, unknown> = {}): Promise<T> {
-  // THE ONE MOCK BOUNDARY (see rmcpFixtures.ts). `resolveMode()` is the app-wide adapter switch
-  // — mock is reached only by an explicit build flag, an explicit server injection, or an
-  // explicit per-session opt-in, and unit tests (no `window`) resolve to it. A production
-  // bundle is always `http` and therefore always talks to the real tools.
-  if (resolveMode() === 'mock') {
+  // THE ONE MOCK BOUNDARY (see rmcpFixtures.ts and the module doc above). Two conditions, in
+  // this order, and the order is the point: `import.meta.env.PROD` is a literal Vite replaces at
+  // BUILD time, so in a production build this whole branch — including the `import()` and
+  // therefore the fixture module itself — is folded away before the bundle exists. The runtime
+  // `resolveMode()` check only ever narrows further, inside dev/test builds.
+  if (!import.meta.env.PROD && resolveMode() === 'mock') {
+    const { rmcpFixtureCall } = await import('./rmcpFixtures');
     return rmcpFixtureCall<T>(tool, args);
   }
 

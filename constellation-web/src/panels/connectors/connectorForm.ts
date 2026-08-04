@@ -48,28 +48,34 @@ export function redirectUriHints(uris: string[]): { uri: string; hint: string }[
 }
 
 /**
- * The one-line answer to "what does this connector reach?", used in the list so an unscoped
- * client is obvious without opening it.
+ * A one-line DESCRIPTION of what a connector is assigned, for the list column.
  *
- * Absence is denial: a client with no groups OR no namespaces reaches NOTHING, and this says so
- * in those words. It deliberately never renders as "all" or "unrestricted" — the reading that
- * would make an unscoped client look powerful is the one that gets someone hurt.
+ * Note what it deliberately is not: a claim about what the connector can reach. That question is
+ * answered only by the server, in the resolved preview (review round 1 — the same reasoning that
+ * removed the preview's local pre-check applies to any local reachability claim, including a
+ * conservative one, because a claim that is right today diverges silently when the server's rules
+ * grow). So this reports assignment — "no tool groups assigned" — and the detail view's preview
+ * reports reach.
+ *
+ * It still never renders an unassigned connector as "all" or "unrestricted": that reading is the
+ * one that gets someone hurt, and no wording here should invite it.
  */
 export function scopeSummary(client: Pick<RmcpClient, 'toolGroupIds' | 'namespaces' | 'enabled'>): string {
-  if (!client.enabled) return 'disabled — reaches nothing';
-  if (client.toolGroupIds.length === 0 && client.namespaces.length === 0) {
-    return 'unscoped — reaches nothing';
-  }
-  if (client.toolGroupIds.length === 0) return 'no tool groups — reaches nothing';
-  if (client.namespaces.length === 0) return 'no servers — reaches nothing';
-  const g = `${client.toolGroupIds.length} group${client.toolGroupIds.length === 1 ? '' : 's'}`;
-  const n = `${client.namespaces.length} server${client.namespaces.length === 1 ? '' : 's'}`;
-  return `${g} × ${n}`;
+  const parts: string[] = [];
+  if (client.toolGroupIds.length === 0) parts.push('no tool groups assigned');
+  else parts.push(`${client.toolGroupIds.length} group${client.toolGroupIds.length === 1 ? '' : 's'}`);
+  if (client.namespaces.length === 0) parts.push('no servers assigned');
+  else parts.push(`${client.namespaces.length} server${client.namespaces.length === 1 ? '' : 's'}`);
+  const summary = parts.join(' · ');
+  return client.enabled ? summary : `disabled · ${summary}`;
 }
 
-/** Whether a client is scoped such that the server could return anything at all. Used to skip a
- *  pointless resolve call and render the explicit "reaches nothing" state instead. */
-export function reachesNothing(client: Pick<RmcpClient, 'toolGroupIds' | 'namespaces' | 'enabled'>): boolean {
+/** Whether a summary describes an INCOMPLETE assignment (missing groups, missing servers, or
+ *  disabled) — used only to colour the list cell as needing attention. It is a presentation
+ *  decision about the connector's own record, not a statement about what it can reach. */
+export function assignmentIncomplete(
+  client: Pick<RmcpClient, 'toolGroupIds' | 'namespaces' | 'enabled'>,
+): boolean {
   return !client.enabled || client.toolGroupIds.length === 0 || client.namespaces.length === 0;
 }
 

@@ -34,7 +34,7 @@ import { ClientCreateDialog } from '../panels/connectors/ClientCreateDialog';
 import { ClientEditor } from '../panels/connectors/ClientEditor';
 import { GroupEditor } from '../panels/connectors/GroupEditor';
 import { SessionList } from '../panels/connectors/SessionList';
-import { scopeSummary } from '../panels/connectors/connectorForm';
+import { assignmentIncomplete, scopeSummary } from '../panels/connectors/connectorForm';
 
 type TabId = 'clients' | 'groups' | 'sessions';
 
@@ -115,18 +115,17 @@ export function Connectors() {
     },
     {
       key: 'scope',
-      header: 'Scope',
+      header: 'Assigned',
       sortable: true,
       sortValue: c => scopeSummary(c),
-      render: c => {
-        const summary = scopeSummary(c);
-        const nothing = summary.includes('reaches nothing');
-        return (
-          <span style={{ fontSize: 'var(--fs-sm)', color: nothing ? 'var(--status-warning)' : 'var(--text-200)' }}>
-            {summary}
-          </span>
-        );
-      },
+      // Assignment, not reach: what this connector actually resolves to is the server's answer,
+      // shown in the detail view's preview. Amber marks an incomplete assignment as needing
+      // attention without asserting what it can or cannot call.
+      render: c => (
+        <span style={{ fontSize: 'var(--fs-sm)', color: assignmentIncomplete(c) ? 'var(--status-warning)' : 'var(--text-200)' }}>
+          {scopeSummary(c)}
+        </span>
+      ),
     },
     {
       key: 'state',

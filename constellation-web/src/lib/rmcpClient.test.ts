@@ -16,6 +16,7 @@ import {
   resolveClientScope,
   revokeSessions,
   updateClient,
+  updateGroup,
   describeRmcpError,
   RmcpError,
 } from './rmcpClient';
@@ -38,12 +39,21 @@ describe('no UI module resolves scope locally', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('only the client and the fixture server itself reference the fixture module', () => {
+  it('only the client references the fixture module, and only behind the build-time guard', () => {
     const referencing = Object.entries(RAW_SOURCES)
-      .filter(([, text]) => /from '\.\/rmcpFixtures'|from '\.\.\/lib\/rmcpFixtures'/.test(text))
+      .filter(([, text]) => /rmcpFixtures'/.test(text))
       .map(([path]) => path)
       .sort();
     expect(referencing).toEqual(['/src/lib/rmcpClient.ts']);
+
+    // Structural, not documentary (review round 1): the only reference is a dynamic import
+    // guarded by a literal `!import.meta.env.PROD`, which Vite folds to `false` in a production
+    // build so the module never enters that bundle's graph. A top-level `import … from
+    // './rmcpFixtures'` would defeat that, so assert there isn't one.
+    const client = RAW_SOURCES['/src/lib/rmcpClient.ts'];
+    expect(client).not.toMatch(/^import .*rmcpFixtures/m);
+    expect(client).toMatch(/!import\.meta\.env\.PROD && resolveMode\(\) === 'mock'/);
+    expect(client).toMatch(/await import\('\.\/rmcpFixtures'\)/);
   });
 });
 
@@ -124,12 +134,21 @@ describe('scoping edits round-trip, and the preview follows them', () => {
     expect(unchanged.enabled).toBe(true);
   });
 
-  it('refuses an edit to a client this session does not own', async () => {
-    const other = (await listClients()).find(c => c.name === 'Workshop console')!;
-    expect(other.editable).toBe(false);
-    await expect(updateClient({ id: other.id, version: other.version, enabled: false })).rejects.toMatchObject({
-      kind: 'forbidden',
-    });
+  it('refuses scoping a client to a namespace this session does not own — the headline rule', async () => {
+    const client = (await listClients()).find(c => c.name === 'Reading assistant')!;
+    await expect(
+      updateClient({ id: client.id, version: client.version, namespaces: ['studio'] }),
+    ).rejects.toMatchObject({ kind: 'forbidden' });
+    // And the refusal is a refusal, not a partial apply.
+    const after = (await listClients()).find(c => c.id === client.id)!;
+    expect(after.namespaces).not.toContain('studio');
+    expect(after.version).toBe(client.version);
+  });
+
+  it('refuses creating a client scoped to a namespace this session does not own', async () => {
+    await expect(
+      createClient({ name: 'Sneaky', redirectUris: [], confidential: false, toolGroupIds: [], namespaces: ['studio'] }),
+    ).rejects.toMatchObject({ kind: 'forbidden' });
   });
 });
 
@@ -197,12 +216,14 @@ describe('group preview is the server’s match', () => {
     });
   });
 
-  it('lists groups and servers, marking an unreachable upstream as unavailable', async () => {
-    expect((await listGroups()).length).toBeGreaterThan(0);
+  it('lists servers, distinguishing "down" from "not mine" — they are different problems', async () => {
     const servers = await listServers();
     const down = servers.find(s => s.namespace === 'workshop')!;
     expect(down.available).toBe(false);
-    expect(down.ownedByMe).toBe(false);
+    expect(down.ownedByMe).toBe(true);
+    const foreign = servers.find(s => s.namespace === 'studio')!;
+    expect(foreign.available).toBe(true);
+    expect(foreign.ownedByMe).toBe(false);
   });
 });
 
@@ -225,6 +246,48 @@ describe('sessions', () => {
     await revokeSessions({ clientRowId: client.id });
     const after = await listSessions(client.id);
     expect(after.every(s => s.revokedAt !== null)).toBe(true);
+  });
+});
+
+// ── Delegated ownership (RMCP-12) ────────────────────────────────────────────
+//
+// These run against the FIXTURE's own enforcement, deliberately. The UI hiding another owner's
+// objects proves nothing — the question is whether the server refuses, and a mock laxer than the
+// server would let a UI-only "enforcement" pass its tests (review round 1). The fixture principal
+// is a delegated owner: it owns media/home/workshop/notes and neither `studio` nor the client,
+// group, and session behind it.
+describe('a delegated owner sees and touches only their own objects', () => {
+  it('does not enumerate another owner\'s clients or groups — enumeration is disclosure', async () => {
+    const clients = await listClients();
+    expect(clients.find(c => c.name === 'Studio console')).toBeUndefined();
+    const groups = await listGroups();
+    expect(groups.find(g => g.name === 'studio')).toBeUndefined();
+  });
+
+  it('refuses to RESOLVE another owner\'s client, rather than just omitting it from a list', async () => {
+    await expect(resolveClientScope('c-4')).rejects.toMatchObject({ kind: 'forbidden' });
+  });
+
+  it('refuses to edit or revoke another owner\'s client', async () => {
+    await expect(updateClient({ id: 'c-4', version: 1, enabled: false })).rejects.toMatchObject({
+      kind: 'forbidden',
+    });
+    await expect(updateGroup({ id: 'g-studio', version: 1, patterns: ['*'] })).rejects.toMatchObject({
+      kind: 'forbidden',
+    });
+  });
+
+  it('does not list another owner\'s sessions, and refuses one asked for by client id', async () => {
+    const all = await listSessions();
+    expect(all.find(s => s.clientRowId === 'c-4')).toBeUndefined();
+    await expect(listSessions('c-4')).rejects.toMatchObject({ kind: 'forbidden' });
+  });
+
+  it('refuses to revoke another owner\'s session, by session id or by client id', async () => {
+    await expect(revokeSessions({ sessionId: 's-4' })).rejects.toMatchObject({ kind: 'forbidden' });
+    await expect(revokeSessions({ clientRowId: 'c-4' })).rejects.toMatchObject({ kind: 'forbidden' });
+    // Still live: a refused revoke must not half-apply.
+    expect((await listSessions()).find(s => s.id === 's-4')).toBeUndefined();
   });
 });
 

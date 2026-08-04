@@ -22,6 +22,17 @@
 //     preview stops being the server's answer and starts being a plausible guess.
 //  2. **Nothing here is infrastructure.** Namespaces, tool names, and account names are generic
 //     placeholders; there are no hosts, addresses, or real identities in this file.
+//  3. **It is at least as strict as the real server, never laxer.** Review round 1 caught the
+//     opposite: an early version listed every session and skipped ownership on resolve/revoke. A
+//     mock that is more permissive than the server trains the UI against a contract that does not
+//     exist, and it is the surface the delegated-owner tests run against — so the one check that
+//     matters most (a delegated owner cannot see or touch another owner's objects) could not be
+//     exercised at all. Ownership is now enforced here on every read and every write.
+//
+// THE FIXTURE PRINCIPAL is a DELEGATED OWNER, not the operator: it owns the `media`, `home`,
+// `workshop` and `notes` namespaces and the clients/groups built on them, and owns neither the
+// `studio` namespace nor the client and group behind it. Modelling it that way is what makes the
+// cross-owner refusals testable; an operator principal would own everything and prove nothing.
 import { RMCP_TOOLS, RmcpError } from './rmcpContract';
 import type { RmcpToolName } from './rmcpContract';
 import type {
@@ -33,32 +44,51 @@ import type {
   RmcpToolGroup,
 } from '../types/rmcp';
 
+/** Identifiable content, asserted ABSENT from every production asset by
+ *  `scripts/assert-http-bundle.mjs`. It is referenced in a thrown message below so a minifier
+ *  cannot drop it while keeping the module: if the fixture ships, this string ships with it. */
+export const RMCP_FIXTURE_MARKER = 'rmcp-fixture-server-must-never-ship';
+
+
 // ── Fixture catalog ─────────────────────────────────────────────────────────
 // A merged, namespaced catalog shaped like the real one: a few namespaces, one of them down.
 
-const FIXTURE_NAMESPACES: { namespace: string; available: boolean; tools: string[] }[] = [
+const FIXTURE_NAMESPACES: { namespace: string; available: boolean; ownedByMe: boolean; tools: string[] }[] = [
   {
     namespace: 'media',
     available: true,
+    ownedByMe: true,
     tools: ['media_search', 'media_play', 'media_queue_add', 'media_library_scan', 'media_stats'],
   },
   {
     namespace: 'home',
     available: true,
+    ownedByMe: true,
     tools: ['home_light_set', 'home_scene_run', 'home_sensor_read', 'home_thermostat_set'],
   },
   {
-    // Deliberately down, so the "scoped to an unavailable upstream" state is exercisable
-    // offline. Its tools resolve as in-scope-but-unavailable, never as an error.
+    // Owned by the fixture principal but currently DOWN — the "scoped to an unavailable upstream"
+    // state, which must read as a condition of the mesh, not as an error or a refusal.
     namespace: 'workshop',
     available: false,
+    ownedByMe: true,
     tools: ['workshop_job_list', 'workshop_job_start'],
   },
   {
     namespace: 'notes',
     available: true,
+    ownedByMe: true,
     // Padded so the resolved preview's paging is exercisable without a live 400-tool catalog.
     tools: Array.from({ length: 60 }, (_, i) => `notes_entry_${String(i + 1).padStart(3, '0')}`),
+  },
+  {
+    // Someone ELSE's namespace: visible (its tools are in the merged catalog either way) but not
+    // assignable by this principal. Scoping a client to it is refused at write, which is the
+    // spec's headline delegated-owner test.
+    namespace: 'studio',
+    available: true,
+    ownedByMe: false,
+    tools: ['studio_render', 'studio_asset_list'],
   },
 ];
 
@@ -122,15 +152,32 @@ function resolvePatterns(patterns: string[], groupName: string): RmcpResolvedToo
 }
 
 // ── Mutable fixture state (per page load) ───────────────────────────────────
+//
+// Rows carry an `owner` the wire types do not have: the real store knows who owns each row and
+// answers accordingly, so the fixture has to know too. It is stripped from every response —
+// leaking "this belongs to someone else" would itself be the disclosure the model forbids.
 
-let groups: RmcpToolGroup[] = [
-  { id: 'g-media', name: 'media', description: 'Library search and playback', patterns: ['media::*'], editable: true, version: 1 },
-  { id: 'g-home', name: 'home automation', description: 'Lights, scenes, sensors', patterns: ['home_light_*', 'home_scene_run'], editable: true, version: 1 },
-  { id: 'g-notes', name: 'notes', description: 'Note entries', patterns: ['notes::*'], editable: true, version: 1 },
-  { id: 'g-workshop', name: 'workshop', description: 'Build jobs (upstream currently down)', patterns: ['workshop::*'], editable: false, version: 1 },
+type Owner = 'me' | 'other';
+type FixtureClient = RmcpClient & { owner: Owner };
+type FixtureGroup = RmcpToolGroup & { owner: Owner };
+
+/** Drop the fixture-only ownership field before answering. */
+function wire<T extends { owner: Owner }>(row: T): Omit<T, 'owner'> {
+  const { owner: _owner, ...rest } = row;
+  return rest;
+}
+
+let groups: FixtureGroup[] = [
+  { id: 'g-media', name: 'media', description: 'Library search and playback', patterns: ['media::*'], editable: true, version: 1, owner: 'me' },
+  { id: 'g-home', name: 'home automation', description: 'Lights, scenes, sensors', patterns: ['home_light_*', 'home_scene_run'], editable: true, version: 1, owner: 'me' },
+  { id: 'g-notes', name: 'notes', description: 'Note entries', patterns: ['notes::*'], editable: true, version: 1, owner: 'me' },
+  { id: 'g-workshop', name: 'workshop', description: 'Build jobs (upstream currently down)', patterns: ['workshop::*'], editable: true, version: 1, owner: 'me' },
+  // Another owner's group. Never returned by `rmcp_group_list` for this principal — enumeration
+  // is itself a disclosure — and refused on direct access by id.
+  { id: 'g-studio', name: 'studio', description: 'Rendering', patterns: ['studio::*'], editable: false, version: 1, owner: 'other' },
 ];
 
-let clients: RmcpClient[] = [
+let clients: FixtureClient[] = [
   {
     id: 'c-1',
     clientId: 'cnx_reader',
@@ -144,6 +191,7 @@ let clients: RmcpClient[] = [
     createdAt: '2026-07-30T09:12:00Z',
     version: 3,
     editable: true,
+    owner: 'me',
   },
   {
     id: 'c-2',
@@ -159,6 +207,7 @@ let clients: RmcpClient[] = [
     createdAt: '2026-08-02T18:40:00Z',
     version: 1,
     editable: true,
+    owner: 'me',
   },
   {
     id: 'c-3',
@@ -172,15 +221,35 @@ let clients: RmcpClient[] = [
     namespaces: ['workshop'],
     createdAt: '2026-07-11T11:00:00Z',
     version: 2,
-    // Owned by another account in the fixture — exercises the read-only rendering path.
+    editable: true,
+    owner: 'me',
+  },
+  {
+    // Another owner's connector. Invisible to every read this principal makes, and refused —
+    // not merely hidden — on any direct call naming its id.
+    id: 'c-4',
+    clientId: 'cnx_studio',
+    name: 'Studio console',
+    registrationSource: 'operator',
+    enabled: true,
+    confidential: false,
+    redirectUris: ['https://example.invalid/studio'],
+    toolGroupIds: ['g-studio'],
+    namespaces: ['studio'],
+    createdAt: '2026-06-02T08:00:00Z',
+    version: 1,
     editable: false,
+    owner: 'other',
   },
 ];
 
 let sessions: RmcpSession[] = [
-  { id: 's-1', accountName: 'operator', clientRowId: 'c-1', clientName: 'Reading assistant', scope: 'mcp', grantedAt: '2026-07-30T09:20:00Z', lastUsedAt: '2026-08-04T07:55:00Z', activeFamilies: 2, revokedAt: null },
-  { id: 's-2', accountName: 'operator', clientRowId: 'c-1', clientName: 'Reading assistant', scope: 'mcp', grantedAt: '2026-08-01T14:02:00Z', lastUsedAt: null, activeFamilies: 1, revokedAt: null },
-  { id: 's-3', accountName: 'workshop-owner', clientRowId: 'c-3', clientName: 'Workshop console', scope: 'mcp', grantedAt: '2026-07-12T08:00:00Z', lastUsedAt: '2026-07-28T19:31:00Z', activeFamilies: 0, revokedAt: '2026-07-29T10:00:00Z' },
+  { id: 's-1', accountName: 'delegated-owner', clientRowId: 'c-1', clientName: 'Reading assistant', scope: 'mcp', grantedAt: '2026-07-30T09:20:00Z', lastUsedAt: '2026-08-04T07:55:00Z', activeFamilies: 2, revokedAt: null },
+  { id: 's-2', accountName: 'delegated-owner', clientRowId: 'c-1', clientName: 'Reading assistant', scope: 'mcp', grantedAt: '2026-08-01T14:02:00Z', lastUsedAt: null, activeFamilies: 1, revokedAt: null },
+  { id: 's-3', accountName: 'delegated-owner', clientRowId: 'c-3', clientName: 'Workshop console', scope: 'mcp', grantedAt: '2026-07-12T08:00:00Z', lastUsedAt: '2026-07-28T19:31:00Z', activeFamilies: 1, revokedAt: null },
+  // Another owner's session. Must never appear in a list this principal makes, and must not be
+  // revocable by id — a revoke is a read of "does this exist" as much as a write.
+  { id: 's-4', accountName: 'studio-owner', clientRowId: 'c-4', clientName: 'Studio console', scope: 'mcp', grantedAt: '2026-06-03T08:00:00Z', lastUsedAt: '2026-08-01T10:00:00Z', activeFamilies: 1, revokedAt: null },
 ];
 
 let seq = 0;
@@ -189,16 +258,34 @@ function nextId(prefix: string): string {
   return `${prefix}-${seq}`;
 }
 
-function clientOr404(id: string, tool: RmcpToolName): RmcpClient {
+function clientOr404(id: string, tool: RmcpToolName): FixtureClient {
   const found = clients.find(c => c.id === id);
   if (!found) throw new RmcpError('not_found', tool, 'client not found');
+  // Ownership is checked on the READ path too, not only before a write. A resolve or a revoke
+  // that names another owner's client id must be REFUSED, not merely absent from a list — the
+  // UI's hiding is a courtesy, and a fixture that only hid would let a UI-only "enforcement"
+  // pass its tests. `forbidden` (rather than `not_found`) matches how the real store audits the
+  // attempt; a deployment that prefers strict non-disclosure may answer `not_found` instead, and
+  // the UI treats both as "you cannot have this".
+  if (found.owner !== 'me') throw new RmcpError('forbidden', tool, 'not owned by this account');
   return found;
 }
 
-/** The fixture server's ownership check — the same shape the real one has (RMCP-12), so the
- *  read-only rendering path is exercised offline instead of only in production. */
-function assertEditable(client: RmcpClient, tool: RmcpToolName): void {
-  if (!client.editable) throw new RmcpError('forbidden', tool, 'not owned by this account');
+/** Every namespace this principal may scope a client to (RMCP-12). */
+function ownedNamespaces(): string[] {
+  return FIXTURE_NAMESPACES.filter(n => n.ownedByMe).map(n => n.namespace);
+}
+
+/** The delegated-owner headline rule: a client may only be scoped to namespaces its editor owns.
+ *  Enforced on the write, because that is where the real server enforces it — a UI that merely
+ *  disables the checkbox has enforced nothing. */
+function assertNamespacesOwned(namespaces: string[] | undefined, tool: RmcpToolName): void {
+  if (!namespaces) return;
+  const owned = new Set(ownedNamespaces());
+  const foreign = namespaces.filter(ns => !owned.has(ns));
+  if (foreign.length > 0) {
+    throw new RmcpError('forbidden', tool, `not owned by this account: ${foreign.join(', ')}`);
+  }
 }
 
 function resolveForClient(client: RmcpClient, limit?: number, offset?: number): RmcpResolvedScope {
@@ -231,8 +318,8 @@ function resolveForClient(client: RmcpClient, limit?: number, offset?: number): 
 
 const servers: RmcpServer[] = FIXTURE_NAMESPACES.map(ns => ({
   namespace: ns.namespace,
-  ownerName: ns.namespace === 'workshop' ? 'workshop-owner' : 'operator',
-  ownedByMe: ns.namespace !== 'workshop',
+  ownerName: ns.ownedByMe ? 'delegated-owner' : 'studio-owner',
+  ownedByMe: ns.ownedByMe,
   available: ns.available,
   toolCount: ns.available ? ns.tools.length : null,
 }));
@@ -250,10 +337,13 @@ function delay<T>(value: T): Promise<T> {
 export function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string, unknown>): Promise<T> {
   switch (tool) {
     case RMCP_TOOLS.clientList:
-      return delay({ clients: clients.map(c => ({ ...c })) } as unknown as T);
+      // Scoped read: another owner's clients are not listed at all. Enumeration is itself a
+      // disclosure, so this filters rather than returning them marked non-editable.
+      return delay({ clients: clients.filter(c => c.owner === 'me').map(wire) } as unknown as T);
 
     case RMCP_TOOLS.clientCreate: {
-      const created: RmcpClient = {
+      assertNamespacesOwned(args.namespaces as string[] | undefined, tool);
+      const created: FixtureClient = {
         id: nextId('c'),
         clientId: `cnx_${String(args.name ?? 'connector').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'connector'}`,
         name: String(args.name ?? 'connector'),
@@ -266,10 +356,11 @@ export function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string, unkn
         createdAt: new Date().toISOString(),
         version: 1,
         editable: true,
+        owner: 'me',
       };
       clients = [...clients, created];
       return delay({
-        client: created,
+        client: wire(created),
         // Shown exactly once by the creation flow and never returned by any read tool. This is a
         // fixture value, not a credential: it is generated in-browser and authenticates nothing.
         clientSecret: created.confidential ? `fixture-secret-${created.id}-not-a-real-credential` : null,
@@ -278,11 +369,11 @@ export function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string, unkn
 
     case RMCP_TOOLS.clientUpdate: {
       const client = clientOr404(String(args.id), tool);
-      assertEditable(client, tool);
+      assertNamespacesOwned(args.namespaces as string[] | undefined, tool);
       if (typeof args.version === 'number' && args.version !== client.version) {
         throw new RmcpError('conflict', tool, 'client was modified by another session');
       }
-      const updated: RmcpClient = {
+      const updated: FixtureClient = {
         ...client,
         enabled: typeof args.enabled === 'boolean' ? args.enabled : client.enabled,
         redirectUris: (args.redirect_uris as string[] | undefined) ?? client.redirectUris,
@@ -291,12 +382,11 @@ export function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string, unkn
         version: client.version + 1,
       };
       clients = clients.map(c => (c.id === updated.id ? updated : c));
-      return delay({ client: updated } as unknown as T);
+      return delay({ client: wire(updated) } as unknown as T);
     }
 
     case RMCP_TOOLS.clientRevoke: {
       const client = clientOr404(String(args.id), tool);
-      assertEditable(client, tool);
       clients = clients.filter(c => c.id !== client.id);
       sessions = sessions.map(s =>
         s.clientRowId === client.id && !s.revokedAt
@@ -314,7 +404,8 @@ export function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string, unkn
     }
 
     case RMCP_TOOLS.groupList:
-      return delay({ groups: groups.map(g => ({ ...g })) } as unknown as T);
+      // Same scoped read as clients: another owner's groups are not enumerated.
+      return delay({ groups: groups.filter(g => g.owner === 'me').map(wire) } as unknown as T);
 
     case RMCP_TOOLS.groupCreate: {
       const patterns = (args.patterns as string[] | undefined) ?? [];
@@ -322,22 +413,23 @@ export function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string, unkn
       if (bad.length) {
         throw new RmcpError('invalid', tool, 'invalid pattern', bad.map(b => `${b.p}: ${b.reason}`));
       }
-      const created: RmcpToolGroup = {
+      const created: FixtureGroup = {
         id: nextId('g'),
         name: String(args.name ?? ''),
         description: String(args.description ?? ''),
         patterns,
         editable: true,
         version: 1,
+        owner: 'me',
       };
       groups = [...groups, created];
-      return delay({ group: created } as unknown as T);
+      return delay({ group: wire(created) } as unknown as T);
     }
 
     case RMCP_TOOLS.groupUpdate: {
       const group = groups.find(g => g.id === String(args.id));
       if (!group) throw new RmcpError('not_found', tool, 'group not found');
-      if (!group.editable) throw new RmcpError('forbidden', tool, 'not owned by this account');
+      if (group.owner !== 'me') throw new RmcpError('forbidden', tool, 'not owned by this account');
       if (typeof args.version === 'number' && args.version !== group.version) {
         throw new RmcpError('conflict', tool, 'group was modified by another session');
       }
@@ -346,7 +438,7 @@ export function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string, unkn
       if (bad.length) {
         throw new RmcpError('invalid', tool, 'invalid pattern', bad.map(b => `${b.p}: ${b.reason}`));
       }
-      const updated: RmcpToolGroup = {
+      const updated: FixtureGroup = {
         ...group,
         name: args.name === undefined ? group.name : String(args.name),
         description: args.description === undefined ? group.description : String(args.description),
@@ -354,7 +446,7 @@ export function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string, unkn
         version: group.version + 1,
       };
       groups = groups.map(g => (g.id === updated.id ? updated : g));
-      return delay({ group: updated } as unknown as T);
+      return delay({ group: wire(updated) } as unknown as T);
     }
 
     case RMCP_TOOLS.groupPreview: {
@@ -376,8 +468,15 @@ export function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string, unkn
 
     case RMCP_TOOLS.sessionList: {
       const filter = args.client_id as string | undefined;
+      // A named client is authorized first (so asking about someone else's is REFUSED, not
+      // silently empty — an empty answer and a refusal say different things, and only one of
+      // them is honest). An unfiltered list is scoped to this principal's own clients.
+      if (filter) clientOr404(filter, tool);
+      const mine = new Set(clients.filter(c => c.owner === 'me').map(c => c.id));
       return delay({
-        sessions: sessions.filter(s => !filter || s.clientRowId === filter).map(s => ({ ...s })),
+        sessions: sessions
+          .filter(s => (filter ? s.clientRowId === filter : mine.has(s.clientRowId)))
+          .map(s => ({ ...s })),
       } as unknown as T);
     }
 
@@ -385,6 +484,14 @@ export function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string, unkn
       const now = new Date().toISOString();
       const sessionId = args.session_id as string | undefined;
       const clientRowId = args.client_id as string | undefined;
+      // Authorize the target before touching anything: a revoke names an object, so an
+      // unauthorized revoke is both a write attempt AND an existence oracle.
+      if (clientRowId) clientOr404(clientRowId, tool);
+      if (sessionId) {
+        const target = sessions.find(s => s.id === sessionId);
+        if (!target) throw new RmcpError('not_found', tool, 'session not found');
+        clientOr404(target.clientRowId, tool);
+      }
       sessions = sessions.map(s => {
         const hit = sessionId ? s.id === sessionId : clientRowId ? s.clientRowId === clientRowId : false;
         return hit && !s.revokedAt ? { ...s, revokedAt: now, activeFamilies: 0 } : s;
@@ -395,6 +502,6 @@ export function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string, unkn
     default:
       // An unmapped tool reads as "not deployed", the same as the live server's answer for a
       // tool it does not register — never as a success.
-      throw new RmcpError('tool_unavailable', tool, `${tool} is not available in fixture mode`);
+      throw new RmcpError('tool_unavailable', tool, `${tool} is not available in ${RMCP_FIXTURE_MARKER}`);
   }
 }

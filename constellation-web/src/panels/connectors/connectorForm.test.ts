@@ -5,11 +5,11 @@
 // that waves through something the server will (rightly) refuse.
 import { describe, it, expect } from 'vitest';
 import {
+  assignmentIncomplete,
   pageCount,
   pageSlice,
   parseLines,
   patternHint,
-  reachesNothing,
   redirectUriHint,
   redirectUriHints,
   sameSet,
@@ -65,33 +65,41 @@ describe('redirectUriHint', () => {
   });
 });
 
-describe('scopeSummary / reachesNothing — absence is denial', () => {
+describe('scopeSummary — describes assignment, never claims reach', () => {
   const enabled = { enabled: true, toolGroupIds: ['g'], namespaces: ['n'] };
 
-  it('says "reaches nothing" when there are no groups', () => {
-    expect(scopeSummary({ ...enabled, toolGroupIds: [] })).toMatch(/reaches nothing/);
-    expect(reachesNothing({ ...enabled, toolGroupIds: [] })).toBe(true);
+  it('names a missing group or server as UNASSIGNED, not as a reachability verdict', () => {
+    // Reach is the server's answer (the resolved preview). A local claim about it — even a
+    // conservative one — diverges silently the day the server's rules grow.
+    expect(scopeSummary({ ...enabled, toolGroupIds: [] })).toContain('no tool groups assigned');
+    expect(scopeSummary({ ...enabled, namespaces: [] })).toContain('no servers assigned');
+    expect(scopeSummary({ ...enabled, toolGroupIds: [] })).not.toMatch(/reach/i);
   });
 
-  it('says "reaches nothing" when there are no namespaces, even with groups', () => {
-    expect(scopeSummary({ ...enabled, namespaces: [] })).toMatch(/reaches nothing/);
-    expect(reachesNothing({ ...enabled, namespaces: [] })).toBe(true);
+  it('marks a disabled connector without asserting what it can call', () => {
+    expect(scopeSummary({ ...enabled, enabled: false })).toMatch(/^disabled/);
   });
 
-  it('says "reaches nothing" for a disabled client regardless of scope', () => {
-    expect(scopeSummary({ ...enabled, enabled: false })).toMatch(/reaches nothing/);
-    expect(reachesNothing({ ...enabled, enabled: false })).toBe(true);
-  });
-
-  it('never renders an unscoped client as unrestricted', () => {
+  it('never renders an unassigned connector as unrestricted', () => {
     const summary = scopeSummary({ enabled: true, toolGroupIds: [], namespaces: [] });
     expect(summary).not.toMatch(/all|every|unrestricted/i);
-    expect(summary).toMatch(/reaches nothing/);
+    expect(summary).toBe('no tool groups assigned · no servers assigned');
   });
 
-  it('summarises a real scope as groups × servers', () => {
-    expect(scopeSummary({ enabled: true, toolGroupIds: ['a', 'b'], namespaces: ['n'] })).toBe('2 groups × 1 server');
-    expect(reachesNothing({ enabled: true, toolGroupIds: ['a'], namespaces: ['n'] })).toBe(false);
+  it('summarises a complete assignment by count', () => {
+    expect(scopeSummary({ enabled: true, toolGroupIds: ['a', 'b'], namespaces: ['n'] })).toBe('2 groups · 1 server');
+  });
+});
+
+describe('assignmentIncomplete — a presentation flag about the record, not about access', () => {
+  it('is true when groups, servers, or the enabled flag are missing', () => {
+    expect(assignmentIncomplete({ enabled: true, toolGroupIds: [], namespaces: ['n'] })).toBe(true);
+    expect(assignmentIncomplete({ enabled: true, toolGroupIds: ['g'], namespaces: [] })).toBe(true);
+    expect(assignmentIncomplete({ enabled: false, toolGroupIds: ['g'], namespaces: ['n'] })).toBe(true);
+  });
+
+  it('is false for a complete, enabled assignment', () => {
+    expect(assignmentIncomplete({ enabled: true, toolGroupIds: ['g'], namespaces: ['n'] })).toBe(false);
   });
 });
 

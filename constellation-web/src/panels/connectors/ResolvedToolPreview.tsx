@@ -12,11 +12,21 @@
 // wrong — so the only implementation allowed to produce it is the one that also enforces it.
 //
 // Three states this deliberately distinguishes, because collapsing them loses the diagnosis:
-//   • reaches nothing      — a real, valid, fail-closed configuration (no groups, or no servers)
+//   • reaches nothing      — a real, valid, fail-closed configuration. Rendered from the SERVER
+//                             answering with an empty set, never predicted locally (see below).
 //   • in scope, UNAVAILABLE — the tool is granted but its upstream is down. NOT an error: the
 //                             config is correct and the mesh is not. Shown as a state, and the
 //                             page does not paint red for it.
 //   • could not resolve     — the call itself failed. Shown as a failure with its reason.
+//
+// NO LOCAL PRE-CHECK. An earlier revision skipped the resolve call when the client was disabled
+// or had no groups/namespaces — "it obviously reaches nothing". Review round 1 rejected that, and
+// it was the sharper of the two catches: the shortcut is locally-computed authorization, and it
+// is the insidious kind BECAUSE IT IS CORRECT TODAY. The moment `effective()` grows a rule this
+// component does not know about — an operator override is already anticipated in RMCP-12 — the
+// preview and the enforcement diverge, and the preview is the thing a human trusts. Saving one
+// round trip is not worth a divergence risk in the one component whose whole purpose is to be
+// verifiable. So: always ask, always render the server's answer.
 import { useCallback, useEffect, useState } from 'react';
 import { Badge } from '../../components/Badge';
 import { Button } from '../../components/Button';
@@ -27,7 +37,6 @@ import type { SortableColumn } from '../../components/SortableTable';
 import { SearchInput, Toolbar, ResultCount } from '../../components/Toolbar';
 import { describeRmcpError, resolveClientScope } from '../../lib/rmcpClient';
 import type { RmcpClient, RmcpResolvedScope, RmcpResolvedTool } from '../../types/rmcp';
-import { reachesNothing } from './connectorForm';
 
 /** Rows per page. The server is also asked for a bounded window (see PAGE_FETCH below), so a
  *  very large catalog is bounded on the wire as well as in the DOM. */
@@ -52,15 +61,8 @@ export function ResolvedToolPreview({ client, refreshKey = 0 }: ResolvedToolPrev
   const [query, setQuery] = useState('');
   const [offset, setOffset] = useState(0);
 
-  const empty = reachesNothing(client);
-
   const load = useCallback(
     (nextOffset: number) => {
-      if (empty) {
-        setScope(null);
-        setFailure(null);
-        return () => {};
-      }
       let cancelled = false;
       setLoading(true);
       setFailure(null);
@@ -81,7 +83,7 @@ export function ResolvedToolPreview({ client, refreshKey = 0 }: ResolvedToolPrev
         cancelled = true;
       };
     },
-    [client.id, empty],
+    [client.id],
   );
 
   useEffect(() => {
@@ -150,25 +152,28 @@ export function ResolvedToolPreview({ client, refreshKey = 0 }: ResolvedToolPrev
         )}
       </div>
 
-      {empty && (
+      {failure && (
+        <EmptyState title="Could not resolve" message={failure} tone="var(--status-warning)" compact />
+      )}
+
+      {!failure && loading && !scope && <SkeletonList rows={5} />}
+
+      {/* The server resolved this client to nothing. That is a real, valid, fail-closed
+          configuration — and it is the SERVER saying so, which is why the explanation below is
+          phrased as likely causes rather than as a diagnosis this component computed. */}
+      {!failure && scope && scope.tools.length === 0 && offset === 0 && (
         <EmptyState
           title="Reaches nothing"
           message={
             client.enabled
-              ? 'This connector has no tool groups, no servers, or neither. A connector with an incomplete scope reaches nothing at all — assign both to give it access.'
-              : 'This connector is disabled, so it reaches nothing regardless of its scope.'
+              ? 'The server resolved this connector to no tools. Usually that means it has no tool groups, no servers, or groups whose patterns match nothing in the current catalog — a connector needs both a matching group and the server that publishes the tool.'
+              : 'The server resolved this connector to no tools. It is currently disabled, which denies it everything regardless of its scope.'
           }
           compact
         />
       )}
 
-      {!empty && failure && (
-        <EmptyState title="Could not resolve" message={failure} tone="var(--status-warning)" compact />
-      )}
-
-      {!empty && !failure && loading && !scope && <SkeletonList rows={5} />}
-
-      {!empty && !failure && scope && (
+      {!failure && scope && (scope.tools.length > 0 || offset > 0) && (
         <>
           {scope.unavailableNamespaces.length > 0 && (
             <div

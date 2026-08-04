@@ -869,12 +869,31 @@ they are deployed, every call answers `tool_unavailable` and the page renders an
 "not live on this server yet" state — the posture `ActivityPanel` took toward CONST-26's
 endpoint — never an error page and never invented data.
 
-`rmcpFixtures.ts` is a **fixture SERVER**, reached only from `rmcpClient.ts`'s single dispatch
-and only when the app-wide adapter mode is `mock` (explicit build flag, explicit server
-injection, explicit per-session opt-in, or a unit test — a production bundle is always `http`).
-It exists so the page could be built and tested before its tools; its pattern matcher is the
-mock server's, which is why it is allowed to exist at all. Swapping to the live tools requires
-no code change — the mode switch already does it.
+`rmcpFixtures.ts` is a **fixture SERVER**, reached only from `rmcpClient.ts`'s single dispatch.
+It exists so the page could be built and tested before its tools; its pattern matcher is the mock
+server's, which is why it is allowed to exist at all. Swapping to the live tools requires no code
+change.
+
+**It cannot ship.** Not by convention — structurally. The only reference to it is a dynamic
+`import()` behind a literal `!import.meta.env.PROD` guard, which Vite folds to `false` at build
+time, so the module never enters a production bundle's graph. `scripts/assert-http-bundle.mjs`
+(the last step of `npm run build`, so there is no unguarded build path) then asserts the fixture's
+marker string is absent from every emitted JS asset and **fails the build** if it reappears —
+verified by deliberately re-introducing a top-level import and confirming the build fails.
+
+The consequence is deliberate: in a production bundle a runtime `?mock` opt-in gives the rest of
+the app fixtures but gives this page nothing — its calls go to the real endpoint and report
+`tool_unavailable` if it is not there. Connector scoping is the one surface where plausible-looking
+fake data is worse than an empty page, because the data *is* the authorization answer.
+
+**The fixture is at least as strict as the real server, never laxer.** Its principal is a
+*delegated owner* (it owns the `media`/`home`/`workshop`/`notes` namespaces and the objects built
+on them, and does not own `studio` or the client, group, and session behind it), and it enforces
+RMCP-12 ownership on every read and write: another owner's clients/groups/sessions are not
+enumerated at all, a direct call naming one is refused, and scoping a client to an unowned
+namespace is refused at write. That is what makes the delegated-owner tests meaningful — they
+assert the *fixture* refuses, not that the UI hid something. An early version that only hid would
+have let a UI-only "enforcement" pass its own tests.
 
 ## Lumina Memory browser (LGUI-08)
 
