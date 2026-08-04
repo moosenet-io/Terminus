@@ -765,6 +765,25 @@ pub fn local_cache_dir(dataset_root: &str) -> String {
 /// must simply never be born inside a job's scope. Starting it explicitly first,
 /// from a stable root, is the whole fix.
 ///
+/// ## The daemon we start must not be replaced by a job-spawned one
+/// sccache servers self-exit after `SCCACHE_IDLE_TIMEOUT` (default 600s). If
+/// ours idles out, the NEXT client to need it is a cargo inside a job scope —
+/// and the bug is back. The prestart therefore also sets
+/// `SCCACHE_IDLE_TIMEOUT=0` (never exit), so the stably-rooted daemon persists
+/// and remains the one every build connects to.
+///
+/// ## Residual, stated rather than hidden (gpt56 review)
+/// `--start-server` is idempotent, which means it does NOT repair a daemon that
+/// is ALREADY running with a poisoned TMPDIR — it exits without changing it.
+/// Detecting that from outside would mean inspecting another process's
+/// environment and killing it on a heuristic, which is a worse failure mode than
+/// the one it fixes (a wrongly-killed daemon takes out concurrent builds). So
+/// the contract is: this PREVENTS poisoning, it does not CURE it. A host that
+/// already has a poisoned daemon at deploy time needs a one-time
+/// `sccache --stop-server` — exactly the ops mitigation already applied on <host>
+/// on 2026-08-02. With `SCCACHE_IDLE_TIMEOUT=0` plus a prestart before every
+/// build, there is no routine path back into the poisoned state afterwards.
+///
 /// ## Fail OPEN, always
 /// A prestart that fails (no `sccache` on PATH, a server already running — which
 /// exits non-zero — a busy port) must NEVER fail the build: sccache is a cache,
@@ -805,6 +824,9 @@ pub fn prestart_local(sccache: &SccacheEnv, stable_tmpdir: &str) -> ServerPresta
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     env.insert("TMPDIR".to_string(), stable_tmpdir.to_string());
+    // Never idle-exit: an idled-out daemon is re-spawned by whichever build
+    // needs it next, which is exactly how it gets a per-job TMPDIR.
+    env.insert("SCCACHE_IDLE_TIMEOUT".to_string(), "0".to_string());
     ServerPrestart {
         argv: prestart_argv(),
         env,
@@ -829,7 +851,12 @@ pub fn prestart_remote_shell_prefix(
     stable_tmpdir: &str,
     quote: impl Fn(&str) -> String,
 ) -> String {
-    let mut assignments = vec![format!("TMPDIR={}", quote(stable_tmpdir))];
+    let mut assignments = vec![
+        format!("TMPDIR={}", quote(stable_tmpdir)),
+        // See `prestart_local`: never idle-exit, or a later build re-spawns it
+        // from inside its own scope.
+        "SCCACHE_IDLE_TIMEOUT=0".to_string(),
+    ];
     for (k, v) in &sccache.vars {
         if k == "RUSTC_WRAPPER" || crate::compiler::scope::is_secret_env_key(k) {
             continue;
