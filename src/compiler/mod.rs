@@ -5708,7 +5708,12 @@ pub fn render_status_rows(
             // Round the countdown UP: with floor, a claim 400ms from eligible
             // reported "0 seconds" while `reconcile_eligible` was still false,
             // which reads as a contradiction. `0` now means exactly "eligible".
-            let remaining_secs = (remaining_ms + 999) / 1000;
+            //
+            // Ceiling WITHOUT the `+ 999` (gpt56 review): `remaining_ms` reaches
+            // `i64::MAX` when `stale_ms` saturates, and `+ 999` would then panic
+            // in a debug build and wrap in release — turning an absurd config
+            // into a crash or a nonsense countdown instead of a large number.
+            let remaining_secs = remaining_ms / 1000 + i64::from(remaining_ms % 1000 != 0);
             json!({
                 "job_id": l.job_id,
                 "module": l.module,
@@ -7010,6 +7015,17 @@ Source:
             in_flight[0]["reconcile_eligible_in_secs"], 0,
             "a passed deadline counts down to zero, never negative"
         );
+    }
+
+    /// An absurd configured stale window must produce a large number, never a
+    /// panic (debug) or a wrapped nonsense countdown (release) — gpt56 review.
+    #[test]
+    fn an_absurd_stale_window_saturates_instead_of_overflowing() {
+        let (_q, in_flight) =
+            render_status_rows(&lease_fixture(0), Duration::from_secs(u64::MAX), 0);
+        let remaining = in_flight[0]["reconcile_eligible_in_secs"].as_i64().unwrap();
+        assert!(remaining > 0, "must not wrap negative, got {remaining}");
+        assert_eq!(in_flight[0]["reconcile_eligible"], false);
     }
 
     /// A clock that jumps backwards must not produce a negative age or a
