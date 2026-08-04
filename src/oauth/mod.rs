@@ -323,6 +323,21 @@ impl Argon2idHash {
                 return Err(refuse("duplicate cost parameter"));
             }
             *slot = true;
+
+            // Numeric is not enough: argon2 requires t >= 1, p >= 1 and
+            // m >= 8*p, so `m=0,t=0,p=0` parses as digits but is not a
+            // configuration any implementation can have produced. Round 8
+            // flagged it. Only the floors are enforced — an UPPER bound would
+            // start rejecting hashes from a future, stronger configuration,
+            // which is the failure mode this guard must never have.
+            let numeric: u64 = value.parse().map_err(|_| refuse("cost parameter out of range"))?;
+            let floor = match key {
+                "m" => 8,
+                _ => 1,
+            };
+            if numeric < floor {
+                return Err(refuse("cost parameter below argon2's minimum"));
+            }
         }
         if !(seen_m && seen_t && seen_p) {
             return Err(refuse("missing one of the m/t/p cost parameters"));
@@ -469,20 +484,24 @@ mod tests {
             "$argon2id$plaintext",
             "$argon2id$",
             "$2b$12$abcdefghijklmnopqrstuv",
-            "$argon2i$v=19$m=1,t=1,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
-            "$argon2id$v=$m=1,t=1,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
-            "$argon2id$v=xx$m=1,t=1,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2i$v=19$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2id$v=$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2id$v=xx$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
             "$argon2id$v=19$m=1,t=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
             "$argon2id$v=19$m=a,t=1,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
-            "$argon2id$v=19$m=1,t=1,p=1,q=9$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2id$v=19$m=19456,t=2,p=1,q=9$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            // Round 8: numeric but impossible cost parameters.
+            "$argon2id$v=19$m=0,t=0,p=0$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2id$v=19$m=19456,t=0,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2id$v=19$m=4,t=2,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
             // Round 4: a repeated cost parameter must not be last-write-wins.
             "$argon2id$v=19$m=1,m=99999,t=1,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
             // Round 4: only argon2's two published versions are real.
             "$argon2id$v=99$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
             "$argon2id$v=0$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
-            "$argon2id$v=19$m=1,t=1,p=1$short$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
-            "$argon2id$v=19$m=1,t=1,p=1$c29tZXNhbHRzYWx0$sh",
-            "$argon2id$v=19$m=1,t=1,p=1$c29tZXNhbHRzYWx0$has h$extra",
+            "$argon2id$v=19$m=19456,t=2,p=1$short$RdescudvJCsgt3ubXbXdWRWJTmaaJObG",
+            "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$sh",
+            "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$has h$extra",
         ] {
             assert!(
                 Argon2idHash::parse(bad).is_err(),

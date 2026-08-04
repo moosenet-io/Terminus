@@ -449,14 +449,20 @@ impl OauthStore {
     ) -> Result<(), ToolError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
 
-        let owns_client = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM rmcp_client WHERE id = $1 AND owner_account_id = $2)",
+        // `FOR SHARE`, exactly as in `set_client_tool_groups`. Round 8 caught
+        // that this copy had been left as an unlocked `SELECT EXISTS` while its
+        // own doc comment claimed the same locking guarantee — a documented
+        // promise the code did not keep, which is worse than an undocumented
+        // gap because it stops the next reader looking.
+        let owns_client = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM rmcp_client WHERE id = $1 AND owner_account_id = $2 FOR SHARE",
         )
         .bind(client_id)
         .bind(actor_account_id)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(db)?;
+        .map_err(db)?
+        .is_some();
         if !owns_client {
             return Err(ToolError::NotFound("no such client for this account".into()));
         }
