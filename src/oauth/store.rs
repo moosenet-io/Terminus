@@ -514,6 +514,10 @@ impl OauthStore {
         let description = normalize_description(description)?;
         let patterns: Vec<String> =
             validate_patterns(patterns, owner_kind)?.iter().map(Pattern::render).collect();
+        // Editing a group's patterns changes what every client scoped to it
+        // resolves to, so the resolver's cache must see this write. Held to the
+        // end of the function, past the commit.
+        let _scope_write = ScopeWrite::begin();
         let updated = sqlx::query(
             "UPDATE rmcp_tool_group SET description = $3, patterns = $4 \
              WHERE id = $1 AND owner_account_id = $2",
@@ -542,6 +546,10 @@ impl OauthStore {
         actor_account_id: Uuid,
         group_id: Uuid,
     ) -> Result<(), ToolError> {
+        // Deleting cascades `rmcp_client_scope`, so it REVOKES the group from
+        // every client that drew on it — the direction where a stale cache
+        // entry is authority that still works.
+        let _scope_write = ScopeWrite::begin();
         let deleted = sqlx::query("DELETE FROM rmcp_tool_group WHERE id = $1 AND owner_account_id = $2")
             .bind(group_id)
             .bind(actor_account_id)
@@ -581,6 +589,8 @@ impl OauthStore {
                 "starter groups may only be seeded onto an operator account".into(),
             ));
         }
+        // After the authority check, so a refused seed does not flush the cache.
+        let _scope_write = ScopeWrite::begin();
         let mut created = 0u64;
         for starter in STARTER_GROUPS {
             let patterns: Vec<String> = starter.patterns.iter().map(|p| (*p).to_string()).collect();
