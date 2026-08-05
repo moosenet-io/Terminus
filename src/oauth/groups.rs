@@ -61,6 +61,11 @@
 //! never "anything that starts this way" — the same fail-closed reading of
 //! absence this module applies everywhere else.
 //!
+//! **Which side of the boundary a tool is on is read from the catalog, never
+//! inferred from its name.** [`Pattern::matches`] takes a [`CatalogTool`] and
+//! consults [`CatalogTool::namespace`]; a name is a string and can lie about its
+//! provenance, and round 7 found both directions in which it did.
+//!
 //! **`*` is deliberately NOT local-only**, and the distinction is not an
 //! inconsistency. `*` has no letters, so there is no coincidence to fall foul
 //! of and no near-miss to mistake for a hit: an author who writes it has said
@@ -251,6 +256,25 @@ impl CatalogTool {
         Self { name: name.into(), namespace: None }
     }
 
+    /// This tool's name WITHIN its own namespace — what a qualified pattern's
+    /// `bare` half is compared against.
+    ///
+    /// For a local tool that is simply its name. For a federated one it is the
+    /// advertised name with its `<namespace>__` prefix removed. A federated
+    /// entry whose name does not carry that prefix is MALFORMED (nothing built
+    /// through [`Self::from_upstream`] can be), and yields the full name — which
+    /// no bare pattern will equal, so the failure direction is a non-match.
+    pub fn bare_name(&self) -> &str {
+        match &self.namespace {
+            Some(namespace) => self
+                .name
+                .strip_prefix(namespace.as_str())
+                .and_then(|rest| rest.strip_prefix(MESH_NS_SEP))
+                .unwrap_or(&self.name),
+            None => &self.name,
+        }
+    }
+
     /// A tool contributed by mesh upstream `namespace`, under its advertised
     /// (namespaced) name — built through [`crate::mesh::merge::namespaced`] so
     /// this cannot drift from how the merge layer names things.
@@ -285,9 +309,12 @@ pub enum Pattern {
     /// Local only. See [`Pattern::matches`] for why an unqualified prefix must
     /// not be allowed to span the mesh separator.
     Prefix(String),
-    /// One exact ADVERTISED name. A qualified pattern (`<ns>::<bare>`) is
-    /// stored in advertised form (`<ns>__<bare>`), so matching is a plain
-    /// comparison against the name a caller actually invokes.
+    /// `<namespace>::<bare>` — one federated tool, exactly. Holds the two
+    /// halves separately (as RMCP-07's enforcing matcher does), because the
+    /// namespace must be compared against the catalog entry's PROVENANCE, not
+    /// recovered by splitting its name.
+    NamespacedExact { namespace: String, bare: String },
+    /// One exact LOCAL tool name.
     Exact(String),
 }
 
@@ -451,11 +478,10 @@ impl Pattern {
             )));
         }
         if !trailing_star {
-            // A qualified EXACT pattern is stored as the ADVERTISED name it
-            // denotes, so matching stays a plain string comparison and cannot
-            // drift from how the merge layer builds that name. `render` splits
-            // it back for display.
-            return Ok(Pattern::Exact(crate::mesh::merge::namespaced(namespace, rest)));
+            return Ok(Pattern::NamespacedExact {
+                namespace: namespace.to_string(),
+                bare: rest.to_string(),
+            });
         }
         let prefix = &rest[..rest.len() - 1];
         if prefix.is_empty() {
@@ -487,74 +513,53 @@ impl Pattern {
         }
     }
 
-    /// Whether this pattern covers `advertised` — the name a caller invokes.
+    /// Whether this pattern covers `tool`.
     ///
     /// Total by construction: every arm is a string comparison, so there is no
-    /// input on which this can fail, panic, or take super-linear time in the
-    /// length of the name.
+    /// input on which this can fail, panic, or take super-linear time.
     ///
-    /// ## The namespace boundary
-    /// Matching is against the ADVERTISED name (already namespaced for a
-    /// federated tool), and **an unqualified EXACT or PREFIX pattern matches
-    /// only unqualified names**. A bare [`Pattern::Prefix`] is checked against
-    /// LOCAL tools alone; it does not span [`MESH_NS_SEP`].
+    /// ## It takes a CATALOG ENTRY, not a name — this is the fix for round 7
+    /// The namespace boundary is a fact about a tool's PROVENANCE, and the only
+    /// place that fact exists is [`CatalogTool::namespace`]. An earlier revision
+    /// matched against the advertised name alone and inferred provenance from
+    /// its shape, via `split_namespaced`. That inference is not sound in either
+    /// direction, because `split_namespaced` is purely syntactic:
     ///
-    /// [`Pattern::Everything`] is deliberately excluded from that rule and DOES
-    /// reach federated tools — see the module docs for why, and note the
-    /// wording: it is unqualified EXACT and PREFIX patterns that are local-only,
-    /// not "any bare pattern", which read literally would swallow `*` too.
+    /// - A LOCAL tool literally named `peerhub__tool` splits to
+    ///   `("peerhub", "tool")`, so it satisfied `peerhub::tool`, `peerhub::*`
+    ///   and `peerhub::t*` — a qualified pattern reaching a tool from no
+    ///   namespace at all, contradicting this module's central rule. [`resolve`]
+    ///   masked it whenever a real federated entry of the same advertised name
+    ///   existed, since the de-duplication prefers the federated one; with no
+    ///   such entry, the local tool matched.
+    /// - The mirror image: that same local tool was UNREACHABLE by `peer*`,
+    ///   because the local arm required `split_namespaced` to return `None`.
     ///
-    /// Review round 3 found why this has to be structural rather than
-    /// incidental. The previous revision ran a plain `starts_with` over the
-    /// advertised name and reasoned that a prefix therefore "stays on its own
-    /// side" — which is true only until a namespace happens to share the
-    /// prefix's letters. `peer*`, written to scope local `peer_*` tools,
-    /// silently matched `peerhub__alerts_list`: an entire federated server
-    /// swept in because of a string coincidence the author cannot see in what
-    /// they wrote. The reachable shape is a bare prefix that is a strict prefix
-    /// of a namespace NAME, and it widens authorization purely by accident.
+    /// Both disappear once provenance is read rather than guessed. Note that
+    /// holding the two halves separately (as RMCP-07 does) does NOT by itself
+    /// fix this — `split_namespaced` gives that same false `Some` to a
+    /// split-halves comparison. Only the catalog's own `namespace` field can
+    /// answer the question, so that is what every arm below consults.
     ///
-    /// So absence of a namespace qualifier means "local only", never "anything
-    /// that happens to start this way" — the same fail-closed rule the rest of
-    /// this module applies: absence is the empty set, never a wider one.
-    /// Reaching a federated tool takes a pattern that NAMES the upstream
-    /// ([`Pattern::Namespace`] or [`Pattern::NamespacedPrefix`]), which an
-    /// author can only write deliberately, and which the client's own
-    /// `rmcp_client_server` rows must still permit before any of it resolves
-    /// (RMCP-07). Two patterns that look alike are now firmly different:
-    /// `peer*` is local-only, `peerhub::*` is that upstream.
-    ///
-    /// **RMCP-07 must adopt these semantics.** It currently carries its own
-    /// copy of this matcher in `scope.rs`, written before this item landed and
-    /// documented in-file as the thing to delete once it did. Until that
-    /// collapse happens the two must not disagree on this rule — a bare prefix
-    /// honoured by one matcher and refused by the other is exactly the split
-    /// that produces a permit nobody intended.
-    pub fn matches(&self, advertised: &str) -> bool {
+    /// A local tool whose name contains `__` is not something this crate's write
+    /// path controls: patterns are refused for it, catalogs are not.
+    pub fn matches(&self, tool: &CatalogTool) -> bool {
+        let namespace = tool.namespace.as_deref();
         match self {
             Pattern::Everything => true,
-            // Every arm below uses the mesh's own splitter rather than a
-            // `starts_with` on `"ns__"`, so "advertised by ns" means exactly
-            // what the merge layer means by it and cannot drift if the
-            // separator ever changes.
-            Pattern::Namespace(ns) => {
-                matches!(split_namespaced(advertised), Some((found, _)) if found == ns.as_str())
+            Pattern::Namespace(ns) => namespace == Some(ns.as_str()),
+            Pattern::NamespacedPrefix { namespace: ns, prefix } => {
+                namespace == Some(ns.as_str()) && tool.bare_name().starts_with(prefix.as_str())
             }
-            Pattern::NamespacedPrefix { namespace, prefix } => {
-                matches!(
-                    split_namespaced(advertised),
-                    Some((found, bare)) if found == namespace.as_str() && bare.starts_with(prefix.as_str())
-                )
+            Pattern::NamespacedExact { namespace: ns, bare } => {
+                namespace == Some(ns.as_str()) && tool.bare_name() == bare.as_str()
             }
-            // The boundary. `split_namespaced` returning `None` IS the
-            // definition of a local name, so this cannot disagree with the
-            // arms above about where a namespace begins.
+            // The local arms. `namespace.is_none()` IS the definition of local,
+            // replacing the string-shape guess that used to stand in for it.
             Pattern::Prefix(prefix) => {
-                split_namespaced(advertised).is_none() && advertised.starts_with(prefix.as_str())
+                namespace.is_none() && tool.name.starts_with(prefix.as_str())
             }
-            // An exact pattern names the whole advertised string, separator and
-            // all, so it is already explicit about which side it is on.
-            Pattern::Exact(name) => advertised == name.as_str(),
+            Pattern::Exact(name) => namespace.is_none() && tool.name == name.as_str(),
         }
     }
 
@@ -569,14 +574,10 @@ impl Pattern {
                 format!("{namespace}{PATTERN_NS_SEP}{prefix}*")
             }
             Pattern::Prefix(prefix) => format!("{prefix}*"),
-            // An exact pattern stores the ADVERTISED name. A qualified one is
-            // split back onto the pattern delimiter so it round-trips; a local
-            // one carries no `__` at all (the parser refuses that), so this
-            // cannot mangle it.
-            Pattern::Exact(name) => match split_namespaced(name) {
-                Some((namespace, bare)) => format!("{namespace}{PATTERN_NS_SEP}{bare}"),
-                None => name.clone(),
-            },
+            Pattern::NamespacedExact { namespace, bare } => {
+                format!("{namespace}{PATTERN_NS_SEP}{bare}")
+            }
+            Pattern::Exact(name) => name.clone(),
         }
     }
 }
@@ -789,7 +790,7 @@ pub fn resolve<'a>(patterns: &[Pattern], catalog: &'a [CatalogTool]) -> Vec<&'a 
 
     index
         .into_values()
-        .filter(|tool| patterns.iter().any(|p| p.matches(&tool.name)))
+        .filter(|tool| patterns.iter().any(|p| p.matches(tool)))
         .collect()
 }
 
@@ -983,6 +984,17 @@ mod tests {
 
     /// A stored row, as it comes back from the database — patterns as text,
     /// with no authority attached to them.
+    /// A LOCAL catalog entry. Note the name is taken verbatim: a local tool may
+    /// legitimately contain `__`, which is the shape round 7 turned on.
+    fn loc(name: &str) -> CatalogTool {
+        CatalogTool::local(name)
+    }
+
+    /// A FEDERATED catalog entry, built the way the merge layer builds one.
+    fn fed(namespace: &str, bare: &str) -> CatalogTool {
+        CatalogTool::from_upstream(namespace, bare)
+    }
+
     fn stored_group(patterns: Vec<String>) -> ToolGroup {
         ToolGroup {
             id: Uuid::nil(),
@@ -1176,14 +1188,14 @@ mod tests {
         assert!(resolve_raw(&["a*"], GroupOwner::Operator).is_empty());
         assert!(!Pattern::parse("a*", GroupOwner::Operator)
             .unwrap()
-            .matches("peerhub__alerts_list"));
+            .matches(&fed("peerhub", "alerts_list")));
         assert!(!Pattern::parse("ledger_*", GroupOwner::Operator)
             .unwrap()
-            .matches("peerhub__ledger_add"));
+            .matches(&fed("peerhub", "ledger_add")));
         // Reaching an upstream tool takes a pattern that names the upstream.
         assert!(Pattern::parse("peerhub::ledger*", GroupOwner::Operator)
             .unwrap()
-            .matches("peerhub__ledger_add"));
+            .matches(&fed("peerhub", "ledger_add")));
     }
 
     /// The round-3 finding, exactly as reported: a bare prefix that is a STRICT
@@ -1199,18 +1211,18 @@ mod tests {
     #[test]
     fn a_bare_prefix_that_is_a_prefix_of_a_namespace_stays_local() {
         let bare = Pattern::parse("peer*", GroupOwner::Operator).unwrap();
-        assert!(bare.matches("peer_status"), "a LOCAL tool named peer... must still match");
+        assert!(bare.matches(&loc("peer_status")), "a LOCAL tool named peer... must still match");
         assert!(
-            !bare.matches("peerhub__alerts_list"),
+            !bare.matches(&fed("peerhub", "alerts_list")),
             "a bare prefix must not cross the mesh separator into a namespace \
              that merely shares its letters"
         );
-        assert!(!bare.matches("peerhub__ledger_add"));
+        assert!(!bare.matches(&fed("peerhub", "ledger_add")));
 
         // Written deliberately, with the upstream named, it still reaches in.
         let qualified = Pattern::parse("peerhub::*", GroupOwner::Operator).unwrap();
-        assert!(qualified.matches("peerhub__alerts_list"));
-        assert!(!qualified.matches("peer_status"), "and it does NOT reach back out to local");
+        assert!(qualified.matches(&fed("peerhub", "alerts_list")));
+        assert!(!qualified.matches(&loc("peer_status")), "and it does NOT reach back out to local");
 
         // End to end through resolution, which is what actually authorizes.
         assert_eq!(resolve_raw(&["peer*"], GroupOwner::Operator), vec!["peer_status"]);
@@ -1238,9 +1250,9 @@ mod tests {
     #[test]
     fn the_bare_wildcard_reaches_federated_tools_and_is_bounded_elsewhere() {
         let all = Pattern::parse("*", GroupOwner::Operator).unwrap();
-        assert!(all.matches("weather_get"), "local");
-        assert!(all.matches("peerhub__alerts_list"), "federated — NOT local-only");
-        assert!(all.matches("sensors__node_status"));
+        assert!(all.matches(&loc("weather_get")), "local");
+        assert!(all.matches(&fed("peerhub", "alerts_list")), "federated — NOT local-only");
+        assert!(all.matches(&fed("sensors", "node_status")));
 
         // Every advertised name in the fixture, both sides of the separator.
         let cat = catalog();
@@ -1259,10 +1271,10 @@ mod tests {
     #[test]
     fn a_qualified_prefix_is_anchored_to_its_namespace() {
         let p = Pattern::parse("peerhub::ledger*", GroupOwner::Operator).unwrap();
-        assert!(p.matches("peerhub__ledger_add"));
-        assert!(!p.matches("sensors__ledger_add"), "a different upstream is a different namespace");
-        assert!(!p.matches("ledger_add"), "and it never matches the LOCAL tool of that name");
-        assert!(!p.matches("peerhub__alerts_list"));
+        assert!(p.matches(&fed("peerhub", "ledger_add")));
+        assert!(!p.matches(&fed("sensors", "ledger_add")), "a different upstream is a different namespace");
+        assert!(!p.matches(&loc("ledger_add")), "and it never matches the LOCAL tool of that name");
+        assert!(!p.matches(&fed("peerhub", "alerts_list")));
     }
 
     /// Confirms the behaviour RMCP-07 observed independently: `ledger_*` does
@@ -1274,13 +1286,13 @@ mod tests {
     #[test]
     fn a_bare_family_prefix_never_reaches_a_federated_tool_of_the_same_family() {
         let p = Pattern::parse("ledger_*", GroupOwner::Operator).unwrap();
-        assert!(p.matches("ledger_add"), "the local tool");
-        assert!(!p.matches("peerone__ledger_accounts"));
-        assert!(!p.matches("peerhub__ledger_add"));
+        assert!(p.matches(&loc("ledger_add")), "the local tool");
+        assert!(!p.matches(&fed("peerone", "ledger_accounts")));
+        assert!(!p.matches(&fed("peerhub", "ledger_add")));
         // The pathological namespace: one literally named after the family.
         // `ledger___accounts` splits as namespace `ledger` + bare `_accounts`,
         // so it is federated and a bare prefix must not reach it.
-        assert!(!p.matches("ledger___accounts"));
+        assert!(!p.matches(&fed("ledger", "_accounts")));
     }
 
     /// A namespace pattern is anchored on the FIRST separator, so it cannot be
@@ -1288,10 +1300,10 @@ mod tests {
     #[test]
     fn namespace_pattern_is_not_a_loose_prefix() {
         let p = Pattern::parse("peerhub::*", GroupOwner::Operator).unwrap();
-        assert!(p.matches("peerhub__anything"));
-        assert!(!p.matches("peerhub0__anything"), "a longer namespace is a different namespace");
-        assert!(!p.matches("peerhub_local_tool"), "a single underscore is not the separator");
-        assert!(!p.matches("peerhub"));
+        assert!(p.matches(&fed("peerhub", "anything")));
+        assert!(!p.matches(&fed("peerhub0", "anything")), "a longer namespace is a different namespace");
+        assert!(!p.matches(&loc("peerhub_local_tool")), "a single underscore is not the separator");
+        assert!(!p.matches(&loc("peerhub")));
     }
 
     /// Several patterns union, and a tool matched twice appears once.
@@ -1446,8 +1458,8 @@ mod tests {
         );
         // And it matches the tool the reading implies.
         let p = Pattern::parse("a::b__*", GroupOwner::Operator).unwrap();
-        assert!(p.matches("a__b__c"), "namespace `a`, bare name `b__c`");
-        assert!(!p.matches("a__c"));
+        assert!(p.matches(&fed("a", "b__c")), "namespace `a`, bare name `b__c`");
+        assert!(!p.matches(&fed("a", "c")));
     }
 
     /// TERM #637B symmetry: the AUTHORING matcher here and the ENFORCING
@@ -1455,41 +1467,107 @@ mod tests {
     /// pattern this validator accepts. Mirrors 637B's own qualified-forms test,
     /// case for case, so a divergence shows up on whichever side changes first.
     ///
-    /// The representations differ deliberately and are equivalent: 637B holds
-    /// `NamespacedExact(ns, bare)` and compares the split halves; this side
-    /// stores the ADVERTISED name and compares it whole. Those agree because
-    /// `split_namespaced` cuts at the FIRST `__`, so exactly one advertised
-    /// string splits to any given `(ns, bare)` — the mapping is a bijection, not
-    /// an approximation.
+    /// Both sides now hold the two halves separately. They still differ in the
+    /// question they ask: 637B recovers the namespace by SPLITTING the
+    /// advertised name, while this side reads [`CatalogTool::namespace`]. Those
+    /// agree for every FEDERATED entry — the mapping between `(ns, bare)` and an
+    /// advertised name is a bijection — and disagree for a LOCAL entry whose
+    /// name merely looks namespaced, which is the hole recorded on TERM #637 and
+    /// still open on the enforcing side.
     #[test]
     fn qualified_forms_agree_with_the_enforcing_matcher() {
         let exact = Pattern::parse("peerone::weather_now", GroupOwner::Operator).unwrap();
-        assert_eq!(exact, Pattern::Exact("peerone__weather_now".into()));
-        assert!(exact.matches("peerone__weather_now"));
-        assert!(!exact.matches("peertwo__weather_now"), "not another namespace");
-        assert!(!exact.matches("weather_now"), "not the local tool of the same name");
-        assert!(!exact.matches("peerone__weather_forecast"), "not a sibling");
+        assert_eq!(
+            exact,
+            Pattern::NamespacedExact { namespace: "peerone".into(), bare: "weather_now".into() }
+        );
+        assert!(exact.matches(&fed("peerone", "weather_now")));
+        assert!(!exact.matches(&fed("peertwo", "weather_now")), "not another namespace");
+        assert!(!exact.matches(&loc("weather_now")), "not the local tool of the same name");
+        assert!(!exact.matches(&fed("peerone", "weather_forecast")), "not a sibling");
 
         let prefix = Pattern::parse("peerone::weather_*", GroupOwner::Operator).unwrap();
         assert_eq!(
             prefix,
             Pattern::NamespacedPrefix { namespace: "peerone".into(), prefix: "weather_".into() }
         );
-        assert!(prefix.matches("peerone__weather_now"));
-        assert!(prefix.matches("peerone__weather_forecast"));
-        assert!(!prefix.matches("peertwo__weather_now"), "cannot leak across the boundary");
-        assert!(!prefix.matches("weather_now"), "and does not reach local tools");
-        assert!(!prefix.matches("peerone__media_search"));
+        assert!(prefix.matches(&fed("peerone", "weather_now")));
+        assert!(prefix.matches(&fed("peerone", "weather_forecast")));
+        assert!(!prefix.matches(&fed("peertwo", "weather_now")), "cannot leak across the boundary");
+        assert!(!prefix.matches(&loc("weather_now")), "and does not reach local tools");
+        assert!(!prefix.matches(&fed("peerone", "media_search")));
 
         // The qualified prefix matches the BARE name, so a prefix equal to the
         // namespace's own text does not match by accident.
         let bare = Pattern::parse("peerone::peer*", GroupOwner::Operator).unwrap();
-        assert!(bare.matches("peerone__peer_status"));
-        assert!(!bare.matches("peerone__weather_now"));
+        assert!(bare.matches(&fed("peerone", "peer_status")));
+        assert!(!bare.matches(&fed("peerone", "weather_now")));
 
         // And the exact form round-trips back to `::` for display.
         assert_eq!(exact.render(), "peerone::weather_now");
         assert_eq!(Pattern::parse_stored(&exact.render()), Some(exact));
+    }
+
+    /// ROUND 7: a qualified pattern must not match a LOCAL tool, even one whose
+    /// literal name looks namespaced.
+    ///
+    /// The catalog here holds ONLY the local `peerhub__tool` — no federated
+    /// entry at all. That absence is the whole point: `resolve` de-duplicates by
+    /// advertised name and prefers a federated entry, so with both present the
+    /// federated one won and the bug was invisible. The de-dup is a tie-breaker,
+    /// and a rule that holds only when a tie exists is not a rule.
+    ///
+    /// Every qualified form is checked, because they shared one root cause —
+    /// provenance was inferred from the NAME via `split_namespaced` rather than
+    /// read from the catalog entry.
+    #[test]
+    fn a_qualified_pattern_never_matches_a_local_tool_that_looks_namespaced() {
+        let sneaky = loc("peerhub__tool");
+        assert!(sneaky.namespace.is_none(), "it is local; only its name looks otherwise");
+        assert_eq!(sneaky.bare_name(), "peerhub__tool", "a local tool's bare name is its name");
+
+        for pattern in ["peerhub::tool", "peerhub::*", "peerhub::t*"] {
+            let p = Pattern::parse(pattern, GroupOwner::Operator).unwrap();
+            assert!(
+                !p.matches(&sneaky),
+                "{pattern:?} must not reach a tool from no namespace at all"
+            );
+        }
+
+        // End to end, with NO federated entry to mask it.
+        let catalog = vec![sneaky.clone()];
+        for pattern in ["peerhub::tool", "peerhub::*", "peerhub::t*"] {
+            let p = Pattern::parse(pattern, GroupOwner::Operator).unwrap();
+            assert!(
+                resolve(&[p], &catalog).is_empty(),
+                "{pattern:?} resolved to a local tool with no federated entry present"
+            );
+        }
+
+        // The genuine federated tool of that advertised name still matches.
+        let real = fed("peerhub", "tool");
+        assert_eq!(real.name, "peerhub__tool", "same advertised name, different provenance");
+        for pattern in ["peerhub::tool", "peerhub::*", "peerhub::t*"] {
+            let p = Pattern::parse(pattern, GroupOwner::Operator).unwrap();
+            assert!(p.matches(&real), "{pattern:?} must still reach the real federated tool");
+        }
+    }
+
+    /// The mirror image of the same root cause: a LOCAL tool whose name contains
+    /// `__` was UNREACHABLE by local patterns, because the local arms required
+    /// `split_namespaced` to return `None` and it does not for such a name.
+    ///
+    /// Reading provenance instead of guessing it fixes both directions at once.
+    #[test]
+    fn a_local_tool_whose_name_contains_the_separator_is_still_reachable_locally() {
+        let sneaky = loc("peerhub__tool");
+        assert!(Pattern::parse("peer*", GroupOwner::Operator).unwrap().matches(&sneaky));
+        assert!(Pattern::parse("peerhub_*", GroupOwner::Operator).unwrap().matches(&sneaky));
+        // And an exact local pattern for it — which no pattern grammar can
+        // spell, since `__` is refused in an unqualified pattern. Constructed
+        // directly to show the matcher itself is provenance-correct.
+        assert!(Pattern::Exact("peerhub__tool".into()).matches(&sneaky));
+        assert!(!Pattern::Exact("peerhub__tool".into()).matches(&fed("peerhub", "tool")));
     }
 
     /// CARRY-OVER 1 from TERM #637: the over-grant hole must stay closed.
@@ -1508,8 +1586,8 @@ mod tests {
     fn a_namespace_pattern_is_never_classified_as_a_local_prefix() {
         let p = Pattern::parse("peerhub::*", GroupOwner::Delegated).unwrap();
         assert_eq!(p, Pattern::Namespace("peerhub".into()), "NOT Prefix(\"peerhub::\")");
-        assert!(p.matches("peerhub__alerts_list"), "it means the upstream, and says so");
-        assert!(!p.matches("peerhub_local_tool"), "and not a local tool of a similar name");
+        assert!(p.matches(&fed("peerhub", "alerts_list")), "it means the upstream, and says so");
+        assert!(!p.matches(&loc("peerhub_local_tool")), "and not a local tool of a similar name");
 
         // No pattern can be a local prefix that carries the pattern delimiter,
         // so there is no spelling left that hides a namespace inside a local
@@ -1557,9 +1635,12 @@ mod tests {
     #[test]
     fn an_exact_qualified_name_does_not_become_a_prefix() {
         let p = Pattern::parse("peerhub::ledger_add", GroupOwner::Operator).unwrap();
-        assert_eq!(p, Pattern::Exact("peerhub__ledger_add".into()));
-        assert!(p.matches("peerhub__ledger_add"));
-        assert!(!p.matches("peerhub__ledger_add_v2"), "an exact pattern must not act as a prefix");
+        assert_eq!(
+            p,
+            Pattern::NamespacedExact { namespace: "peerhub".into(), bare: "ledger_add".into() }
+        );
+        assert!(p.matches(&fed("peerhub", "ledger_add")));
+        assert!(!p.matches(&fed("peerhub", "ledger_add_v2")), "an exact pattern must not act as a prefix");
     }
 
     /// Matching is TOTAL: whatever a name looks like, matching answers
@@ -1569,10 +1650,12 @@ mod tests {
         let p = Pattern::parse("weather_*", GroupOwner::Operator).unwrap();
         let long = "w".repeat(4096);
         for name in ["", "__", "___", "*", "weather_", "wéather_x", "\u{200B}", long.as_str()] {
-            let _ = p.matches(name);
+            // Both provenances, since matching now branches on it.
+            let _ = p.matches(&loc(name));
+            let _ = p.matches(&CatalogTool { name: name.to_string(), namespace: Some("ns".into()) });
         }
-        assert!(p.matches("weather_"), "the prefix itself is covered");
-        assert!(!p.matches(""));
+        assert!(p.matches(&loc("weather_")), "the prefix itself is covered");
+        assert!(!p.matches(&loc("")));
     }
 
     /// A federation user must not be able to grant themselves the fleet.

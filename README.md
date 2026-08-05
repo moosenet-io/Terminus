@@ -1203,6 +1203,12 @@ precedence rule; a pattern whose meaning depends on a precedence rule is one an 
 cannot read. `::` also matches what the enforcing matcher in RMCP-07 already used — the two
 had diverged, which is TERM #637.
 
+**Which side of the boundary a tool is on is read from the catalog, not guessed from its
+name.** A local tool may legitimately be named with `__` in it — that is not something the
+pattern grammar controls — and such a name splits like a namespaced one. Matching therefore
+consults the catalog entry's provenance, so a qualified pattern like `peerhub::tool` reaches
+the federated tool and never a local tool that merely looks federated (TERM #637).
+
 **`__` in an unqualified pattern is refused**, not reinterpreted. It can never match (any
 advertised name carrying `__` is namespaced, hence not local), and it is exactly what an
 old-vocabulary pattern looks like — so `peerhub__*` errors with the correct form named
