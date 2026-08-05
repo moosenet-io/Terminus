@@ -444,25 +444,38 @@ mod tests {
         assert_eq!(transient_unit("llama-gpu"), "chord-llama-gpu.service");
     }
 
-    /// SOURCE-LEVEL RATCHET (CHRD #112 / TERM #650).
+    /// SOURCE-LEVEL RATCHET (CHRD #112 / TERM #650), in two halves.
     ///
     /// The type guard makes it impossible to *ask* `free_gpu` to stop an
-    /// always-on backend. It cannot, on its own, stop someone adding a FOURTH
-    /// place in this file that shells out `systemctl stop` against a name pulled
+    /// always-on backend. It cannot, on its own, stop someone adding a NEW place
+    /// in this file that shells out `systemctl stop` against a name pulled
     /// straight from the registry — which is exactly how the original defect was
-    /// written. So this pins the set of functions here that may issue a stop:
+    /// written. Hence a ratchet. It has two halves because neither is sufficient:
     ///
+    /// **1. Attribution** — which functions issue a `systemctl stop`. Informative:
+    /// it names the offender. Allowed here:
     /// - `ensure_up` — clears a stale transient `chord-<name>` unit for the
     ///   backend it is about to start; it has already returned early for
     ///   always-on/ollama/daemon backends, so that name is an on-demand one.
     /// - `stop` — gated by [`gpu_stop_guard::may_stop`].
     /// - `free_gpu` — can only iterate values the guard constructed.
     ///
-    /// Reads the REAL source of this file (never a copy), so it cannot drift from
-    /// what ships. The scanner itself is tested in `gpu_stop_guard`.
+    /// **2. Census** — how many `"systemctl"` string literals exist at all.
+    /// Syntax-independent, and the answer to the arms race two review rounds
+    /// exposed: a lexical scanner will never attribute every legal spelling of a
+    /// function header, and it cannot see `let verb = "stop"` at all — but every
+    /// such bypass still has to name `systemctl`, so the count moves. It also
+    /// fires on a legitimate new invocation, which is precisely when a human
+    /// should be looking at this file.
+    ///
+    /// Both read the REAL source of this file, so neither can drift from what
+    /// ships. The scanners themselves are unit-tested in `gpu_stop_guard`.
     #[test]
     fn every_systemctl_stop_in_this_module_lives_in_a_guarded_function() {
-        let owners = gpu_stop_guard::stop_call_site_owners(include_str!("lifecycle.rs"));
+        const SRC: &str = include_str!("lifecycle.rs");
+
+        // Half 1: attribution.
+        let owners = gpu_stop_guard::stop_call_site_owners(SRC);
         assert!(
             !owners.is_empty(),
             "the ratchet found no `systemctl stop` call sites at all — it has \
@@ -476,6 +489,19 @@ mod tests {
             "new `systemctl stop` call site(s) in {unexpected:?} — every stop in \
              this module must go through the gpu_stop_guard-gated path (CHRD #112). \
              All sites found: {owners:?}"
+        );
+
+        // Half 2: census. 7 today = 1 `start` in `ensure_up`, 1 stale-transient
+        // `stop` in `ensure_up`, 2 in `stop`, 2 in `free_gpu`, 1 `Command::new`
+        // in the unit-liveness probe.
+        assert_eq!(
+            gpu_stop_guard::systemctl_literal_count(SRC),
+            7,
+            "the number of `systemctl` invocations in this module changed. That is \
+             not automatically wrong — but a new one must be justified: it has to be \
+             unreachable for an always-on backend, either because the guard type \
+             gates it or because it cannot target a registry-named unit. Update this \
+             count in the same commit that adds it (CHRD #112)."
         );
     }
 

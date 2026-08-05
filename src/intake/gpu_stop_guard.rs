@@ -136,46 +136,155 @@ pub fn stoppable_gpu_backends_from_json(raw: &str, keep: &str) -> Vec<StoppableG
 ///
 /// It lives here, pure and separately tested, because a ratchet whose own parser
 /// is wrong is worse than no ratchet: it reports "no new stop sites" forever.
+/// Test-only: strip comments and normalise whitespace, keeping a map from each
+/// retained byte back to its offset in `src`.
+///
+/// Comments are removed with a small string-aware state machine rather than a
+/// regex: round 2 of review showed that `pub /* c */ fn rogue()` and
+/// `fn /* c */ rogue()` are valid Rust the previous scanner could not see, so the
+/// stop inside them was attributed to the previous allow-listed function. Removing
+/// comments before scanning deletes that whole class rather than adding another
+/// special case. A naive strip would eat `"http://…"`, hence the string tracking.
+///
+/// Raw strings (`r#"…"#`) are treated as ordinary strings. That is deliberately
+/// conservative: it can only RETAIN text, never hide it.
 #[cfg(test)]
-pub fn stop_call_site_owners(src: &str) -> Vec<String> {
-    // Whitespace is normalised FIRST, keeping a map back to original offsets, so
-    // the scan does not depend on formatting. Review round 1 (codex, gpt56, agy
-    // independently) showed the naive line-based version missed a multi-line
-    // `run([\n  "systemctl",\n  "stop", …])` entirely.
-    let mut norm = String::with_capacity(src.len());
+fn strip_comments_and_normalize(src: &str) -> (String, Vec<usize>) {
+    #[derive(PartialEq)]
+    enum St {
+        Code,
+        Str,
+        Line,
+        Block,
+    }
+    let bytes: Vec<(usize, char)> = src.char_indices().collect();
+    let mut out = String::with_capacity(src.len());
     let mut map: Vec<usize> = Vec::with_capacity(src.len());
+    let mut st = St::Code;
     let mut in_ws = false;
-    for (i, c) in src.char_indices() {
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let (off, c) = bytes[i];
+        let next = bytes.get(i + 1).map(|(_, c)| *c);
+        match st {
+            St::Code => {
+                if c == '/' && next == Some('/') {
+                    st = St::Line;
+                    i += 2;
+                    in_ws = true;
+                    continue;
+                }
+                if c == '/' && next == Some('*') {
+                    st = St::Block;
+                    i += 2;
+                    in_ws = true;
+                    continue;
+                }
+                if c == '"' {
+                    st = St::Str;
+                }
+            }
+            St::Str => {
+                if c == '\\' {
+                    // Escape: copy both chars verbatim, never end the string on `\"`.
+                    for k in 0..2 {
+                        if let Some((o, ch)) = bytes.get(i + k) {
+                            out.push(*ch);
+                            map.push(*o);
+                        }
+                    }
+                    i += 2;
+                    in_ws = false;
+                    continue;
+                }
+                if c == '"' {
+                    st = St::Code;
+                }
+            }
+            St::Line => {
+                if c == '\n' {
+                    st = St::Code;
+                }
+                i += 1;
+                continue;
+            }
+            St::Block => {
+                if c == '*' && next == Some('/') {
+                    st = St::Code;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+        }
         if c.is_whitespace() {
             in_ws = true;
+            i += 1;
             continue;
         }
-        if in_ws && !norm.is_empty() {
+        if in_ws && !out.is_empty() {
             // A space after a comma carries no meaning in an argv literal; drop it
             // so `"systemctl", "stop"` and `"systemctl","stop"` scan identically.
-            if !norm.ends_with(',') {
-                norm.push(' ');
-                map.push(i);
+            if !out.ends_with(',') {
+                out.push(' ');
+                map.push(off);
             }
         }
         in_ws = false;
-        norm.push(c);
-        map.push(i);
+        out.push(c);
+        map.push(off);
+        i += 1;
     }
+    (out, map)
+}
+
+/// Test-only: how many `"systemctl"` STRING LITERALS the source contains.
+///
+/// The formatting/syntax-independent half of the ratchet, and the answer to the
+/// arms race round 2 exposed. A lexical scanner will never attribute every legal
+/// Rust spelling of a function header, and it cannot see
+/// `let verb = "stop"; run(["systemctl", verb, u])` at all. But every one of those
+/// bypasses still has to name `systemctl` somewhere, so pinning the COUNT catches
+/// them all — including ones nobody has thought of — at the cost of also firing on
+/// a legitimate new invocation, which is exactly when a human should look.
+#[cfg(test)]
+pub fn systemctl_literal_count(src: &str) -> usize {
+    let (norm, _) = strip_comments_and_normalize(src);
+    norm.matches("\"systemctl\"").count()
+}
+
+/// Test-only source scanner backing the ratchet in
+/// [`crate::intake::lifecycle`]'s test module: which functions issue a
+/// `systemctl stop`.
+///
+/// This is the INFORMATIVE half — it names the offending function. It is paired
+/// with [`systemctl_literal_count`], which is the half that cannot be evaded by
+/// clever syntax. Neither is sufficient alone; a change that slips past one trips
+/// the other.
+#[cfg(test)]
+pub fn stop_call_site_owners(src: &str) -> Vec<String> {
+    let (norm, map) = strip_comments_and_normalize(src);
 
     // Item-level `fn` headers, in source order: (name, ORIGINAL byte offset).
-    let mut fns: Vec<(&str, usize)> = Vec::new();
+    let mut fns: Vec<(String, usize)> = Vec::new();
     for (nidx, _) in norm.match_indices("fn ") {
         let orig = map[nidx];
         let line_start = src[..orig].rfind('\n').map(|p| p + 1).unwrap_or(0);
-        if !is_item_fn_prefix(&src[line_start..orig]) {
+        // The prefix is taken from the NORMALISED text back to the start of the
+        // line, so a comment between modifiers is already gone.
+        let raw_prefix = &src[line_start..orig];
+        let (norm_prefix, _) = strip_comments_and_normalize(raw_prefix);
+        if !is_item_fn_prefix(&norm_prefix) {
             continue;
         }
-        let rest = &src[orig + 3..];
+        // The NAME is read from the normalised text too, so `fn /* c */ rogue()`
+        // still yields `rogue`.
+        let rest = &norm[nidx + 3..];
         let name_end = rest
             .find(|c: char| !(c.is_alphanumeric() || c == '_'))
             .unwrap_or(rest.len());
-        let name = rest[..name_end].trim();
+        let name = rest[..name_end].trim().to_string();
         if !name.is_empty() {
             fns.push((name, orig));
         }
@@ -192,7 +301,7 @@ pub fn stop_call_site_owners(src: &str) -> Vec<String> {
             .iter()
             .rev()
             .find(|(_, start)| *start < orig)
-            .map(|(name, _)| (*name).to_string())
+            .map(|(name, _)| name.clone())
             .unwrap_or_else(|| "<top level>".to_string());
         if !owners.contains(&owner) {
             owners.push(owner);
@@ -211,6 +320,8 @@ pub fn stop_call_site_owners(src: &str) -> Vec<String> {
 /// `unsafe fn`, `extern "C" fn` and `#[inline] fn` were all invisible to it — and
 /// a stop site inside such a function was silently attributed to the previous,
 /// allow-listed function. Three reviewers found this independently; it was real.
+///
+/// Expects COMMENT-STRIPPED input (see [`strip_comments_and_normalize`]).
 #[cfg(test)]
 fn is_item_fn_prefix(prefix: &str) -> bool {
     let mut p = prefix.trim();
@@ -396,6 +507,72 @@ pub async fn ensure_up(b: &B) {
                  an allow-listed function; got {owners:?}"
             );
         }
+    }
+
+    /// Round-2 review (codex, gpt56) found these: valid Rust with a COMMENT
+    /// between the modifiers and the name, which the previous scanner could not
+    /// see — so the stop inside was attributed to the previous, allow-listed
+    /// function and the ratchet stayed green.
+    #[test]
+    fn ratchet_sees_through_comments_in_a_function_header() {
+        for header in [
+            "pub /* ordinary comment */ fn rogue()",
+            "fn /* c */ rogue()",
+            "pub(crate) /* why */ fn rogue()",
+        ] {
+            let src = format!(
+                "{SAMPLE}\n{header} {{\n    let _ = run([\"systemctl\", \"stop\", u]);\n}}\n"
+            );
+            let owners = stop_call_site_owners(&src);
+            assert!(
+                owners.contains(&"rogue".to_string()),
+                "`{header}` must be attributed, not absorbed into an allow-listed \
+                 function; got {owners:?}"
+            );
+        }
+    }
+
+    /// Comment stripping must not eat a `//` that lives inside a STRING — the
+    /// classic way a naive comment stripper corrupts a file full of URLs.
+    #[test]
+    fn comment_stripping_respects_string_literals() {
+        // The `//` lives inside a STRING, on the SAME LINE as the stop site and
+        // BEFORE it. A stripper without string tracking treats it as a comment
+        // opener and deletes the rest of the line — losing a real stop site
+        // entirely. That is the direction that matters: a ratchet that drops sites
+        // is worse than no ratchet.
+        let src = "fn f() {\n    let u = \"http://host/x\"; let _ = run([\"systemctl\", \"stop\", u]);\n}\n";
+        assert_eq!(stop_call_site_owners(src), vec!["f".to_string()]);
+        assert_eq!(systemctl_literal_count(src), 1);
+    }
+
+    /// The census is the half that syntax cannot evade. Every bypass round 2
+    /// raised — a comment in the header, a non-literal verb — still has to name
+    /// `systemctl`, so the count moves.
+    #[test]
+    fn the_census_counts_every_systemctl_literal_however_the_call_is_spelled() {
+        let base = "fn a() {\n    let _ = run([\"systemctl\", \"stop\", u]);\n}\n";
+        assert_eq!(systemctl_literal_count(base), 1);
+
+        // The exact evasion codex named: the verb is not a literal, so the
+        // attribution scan cannot see it — but the census can.
+        let non_literal = format!(
+            "{base}pub /* hide me */ fn b() {{\n    let verb = \"stop\";\n    let _ = run([\"systemctl\", verb, u]);\n}}\n"
+        );
+        assert!(
+            stop_call_site_owners(&non_literal).iter().all(|o| o != "b"),
+            "documented limit: a non-literal verb is invisible to the ATTRIBUTION half"
+        );
+        assert_eq!(
+            systemctl_literal_count(&non_literal),
+            2,
+            "...which is exactly why the CENSUS half exists"
+        );
+
+        // A `systemctl` mention in a comment is not an invocation and must not
+        // inflate the census.
+        let commented = format!("{base}// see run([\"systemctl\", \"stop\", u]) above\n");
+        assert_eq!(systemctl_literal_count(&commented), 1);
     }
 
     /// A stop site written with different spacing must still be seen — the
