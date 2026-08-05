@@ -2412,7 +2412,7 @@ mod tests {
             .execute_structured(json!({"providers": ["opus", "agy"]}))
             .await
             .unwrap();
-        let v = out.structured.unwrap();
+        let v: Value = serde_json::from_str(&out.text).unwrap();
         let names: Vec<&str> =
             v["providers"].as_array().unwrap().iter().map(|p| p["provider"].as_str().unwrap()).collect();
         assert_eq!(names, vec!["opus", "agy"], "{v}");
@@ -2427,7 +2427,7 @@ mod tests {
             .execute_structured(json!({"providers": ["opus", "not_a_provider"]}))
             .await
             .unwrap();
-        let v = out.structured.unwrap();
+        let v: Value = serde_json::from_str(&out.text).unwrap();
         assert_eq!(v["unknown_providers"], json!(["not_a_provider"]), "{v}");
         assert_eq!(v["providers"].as_array().unwrap().len(), 1, "{v}");
     }
@@ -2439,7 +2439,7 @@ mod tests {
     async fn an_empty_provider_scope_reports_nothing_rather_than_everything() {
         let out =
             ReviewProviderStatus.execute_structured(json!({"providers": []})).await.unwrap();
-        let v = out.structured.unwrap();
+        let v: Value = serde_json::from_str(&out.text).unwrap();
         assert_eq!(v["providers"].as_array().unwrap().len(), 0, "{v}");
     }
 
@@ -2451,7 +2451,7 @@ mod tests {
             .execute_structured(json!({"providers": ["opus"]}))
             .await
             .unwrap();
-        let v = out.structured.unwrap();
+        let v: Value = serde_json::from_str(&out.text).unwrap();
         let p = &v["providers"][0];
         assert_eq!(p["ever_observed"], true, "{v}");
         assert!(p["observation_age_secs"].is_number(), "age must be reported: {v}");
@@ -2469,7 +2469,7 @@ mod tests {
             .execute_structured(json!({"providers": ["opus"], "probe": true, "ttl_secs": 3600}))
             .await
             .unwrap();
-        let v = out.structured.unwrap();
+        let v: Value = serde_json::from_str(&out.text).unwrap();
         assert_eq!(v["providers"][0]["probe_action"], "skipped_fresh", "{v}");
     }
 
