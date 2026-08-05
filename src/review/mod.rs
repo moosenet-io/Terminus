@@ -2628,6 +2628,36 @@ mod tests {
         assert!(outcome.is_voting());
     }
 
+    /// RVXAGY-01, raised by the review panel: the parse-level regression in
+    /// `prompt.rs` asserts only that the captured off-topic reply parses to
+    /// `Unknown`. The stated risk, though, is a seat being COUNTED -- so pin the
+    /// consequence at the outcome layer too, with the same captured bytes.
+    ///
+    /// This is the verbatim reply the `agy` seat returned on three consecutive
+    /// Terminus review rounds while the daemon's argv let agy's value-taking
+    /// `-p` swallow `--dangerously-skip-permissions` as the prompt. It is
+    /// fluent, confident, and exit-0: the ONLY thing separating it from a real
+    /// review is the absent `VERDICT:` token.
+    #[test]
+    fn the_captured_off_topic_agy_reply_is_a_non_voting_seat() {
+        let captured = "It looks like you've provided the flag \
+            `--dangerously-skip-permissions`. Could you please provide more context? \
+            Are you trying to run a specific command with this flag, or is there a \
+            script you'd like me to modify? Let me know how I can help!";
+        let (verdict, _) = parse_verdict(captured);
+        assert_eq!(verdict, Verdict::Unknown);
+        let outcome = if verdict == Verdict::Unknown { Outcome::NoVerdict } else { Outcome::Voted };
+        assert_eq!(
+            outcome,
+            Outcome::NoVerdict,
+            "an off-topic answer must never be a panel seat's judgement"
+        );
+        assert!(
+            !outcome.is_voting(),
+            "a seat that reviewed the wrong content must not vote in EITHER direction"
+        );
+    }
+
     #[test]
     fn escalation_is_degraded_when_the_added_seat_replied_without_a_verdict() {
         let decision = EscalationDecision {

@@ -657,6 +657,38 @@ mod tests {
         assert_eq!(reasoning, "I have thoughts but no marker.");
     }
 
+    /// RVXAGY-01: the CAPTURED, verbatim reply the `agy` seat returned on three
+    /// consecutive Terminus review rounds, when the daemon's argv let agy's
+    /// value-taking `-p` swallow `--dangerously-skip-permissions` as the
+    /// prompt. The transport fix (provider.rs) stops this being produced; this
+    /// test pins the second half of the contract -- that IF a seat ever again
+    /// returns a fluent, confident, entirely off-topic answer, it is classified
+    /// `Unknown` and therefore (per RVXR-02's
+    /// `Verdict::Unknown -> Outcome::NoVerdict`) NON-VOTING.
+    ///
+    /// The hazard being guarded is specifically that this text is not
+    /// error-shaped: nothing failed, nothing timed out, the exit code was 0.
+    /// The ONLY thing distinguishing it from a real review is the absent
+    /// `VERDICT:` token, so that token is load-bearing and must stay so.
+    #[test]
+    fn an_off_topic_reviewer_answer_is_never_counted_as_a_review() {
+        let captured = "It looks like you've provided the flag \
+            `--dangerously-skip-permissions`. Could you please provide more context? \
+            Are you trying to run a specific command with this flag, or is there a \
+            script you'd like me to modify? Let me know how I can help!";
+        let (v, _) = parse_verdict(captured);
+        assert_eq!(
+            v,
+            Verdict::Unknown,
+            "an off-topic answer with no VERDICT token must not be read as a judgement"
+        );
+        // And it must not be coerced into either direction by accident -- note
+        // the text contains neither token, but assert both explicitly so a
+        // future looser parser cannot quietly turn this into a vote.
+        assert_ne!(v, Verdict::Approve);
+        assert_ne!(v, Verdict::RequestChanges);
+    }
+
     #[test]
     fn parse_verdict_handles_non_length_preserving_uppercase_chars_without_panicking() {
         // U+01F0 'ǰ' (2 bytes in UTF-8) uppercases via `str::to_uppercase()` to
