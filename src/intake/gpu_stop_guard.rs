@@ -116,6 +116,19 @@ pub fn transient_unit(backend: &str) -> String {
     format!("chord-{backend}.service")
 }
 
+/// Is `unit` inside Chord's OWN unit namespace — a transient `chord-*.service`?
+///
+/// Used as the fail-closed fallback when the registry is unavailable and the
+/// protected set therefore cannot be computed. A `chord-*` unit is one this crate
+/// created for a backend of its own; an arbitrary declared unit name could be any
+/// system service, including the assistant's engine. So with nothing to consult,
+/// only our own namespace may be stopped (gpt56, review round 6: an absent or
+/// unparseable registry made `protected_units()` empty, which made
+/// `lifecycle::stop` permissive for a caller-supplied `unit: "ollama.service"`).
+pub fn is_chord_namespaced_unit(unit: &str) -> bool {
+    unit.starts_with("chord-") && unit.ends_with(".service")
+}
+
 /// Every systemd unit that must never be stopped, given the raw registry text:
 /// for each backend this guard refuses to stop, both its DECLARED unit and its
 /// TRANSIENT unit.
@@ -247,39 +260,74 @@ pub fn stoppable_gpu_backends_from_json(raw: &str, keep: &str) -> Vec<StoppableG
 /// comments before scanning deletes that whole class rather than adding another
 /// special case. A naive strip would eat `"http://…"`, hence the string tracking.
 ///
-/// Raw strings (`r#"…"#`) are treated as ordinary strings. That is deliberately
-/// conservative: it can only RETAIN text, never hide it.
+/// Raw strings (`r#"…"#`, `r"…"`) are parsed as raw strings, hashes and all.
+/// Treating them as ordinary strings was NOT conservative, contrary to an earlier
+/// note here: `r#"quote" // x"#` exits the ordinary-string state at the embedded
+/// quote, and the `//` then eats the rest of the line — deleting code the scan
+/// needed to see (codex, review round 6).
 #[cfg(test)]
 fn strip_comments_and_normalize(src: &str) -> (String, Vec<usize>) {
-    #[derive(PartialEq)]
     enum St {
         Code,
+        /// An ordinary `"…"` string.
         Str,
+        /// A raw string `r#*"…"#*`, carrying its hash count.
+        Raw(usize),
         Line,
         Block,
     }
-    let bytes: Vec<(usize, char)> = src.char_indices().collect();
+    let chars: Vec<(usize, char)> = src.char_indices().collect();
+    let at = |i: usize| chars.get(i).map(|(_, c)| *c);
     let mut out = String::with_capacity(src.len());
     let mut map: Vec<usize> = Vec::with_capacity(src.len());
     let mut st = St::Code;
     let mut in_ws = false;
     let mut i = 0usize;
-    while i < bytes.len() {
-        let (off, c) = bytes[i];
-        let next = bytes.get(i + 1).map(|(_, c)| *c);
+    let mut push = |out: &mut String, map: &mut Vec<usize>, o: usize, c: char| {
+        out.push(c);
+        map.push(o);
+    };
+    while i < chars.len() {
+        let (off, c) = chars[i];
         match st {
             St::Code => {
-                if c == '/' && next == Some('/') {
+                if c == '/' && at(i + 1) == Some('/') {
                     st = St::Line;
                     i += 2;
                     in_ws = true;
                     continue;
                 }
-                if c == '/' && next == Some('*') {
+                if c == '/' && at(i + 1) == Some('*') {
                     st = St::Block;
                     i += 2;
                     in_ws = true;
                     continue;
+                }
+                // Raw string opener: `r` followed by N `#` then `"`. Round-6
+                // (codex): the previous version treated `r#"quote" // x"#` as an
+                // ordinary string, exited at the embedded quote, then read the
+                // `//` as a comment and DROPPED the rest of the line — which could
+                // hide a real stop site. A stripper that can delete code is worse
+                // than one that keeps too much, so raw strings are now parsed
+                // properly rather than approximated.
+                if c == 'r' {
+                    let mut j = i + 1;
+                    let mut hashes = 0usize;
+                    while at(j) == Some('#') {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if at(j) == Some('"') {
+                        // Emit `r`, the hashes and the opening quote verbatim.
+                        for k in i..=j {
+                            let (o, ch) = chars[k];
+                            push(&mut out, &mut map, o, ch);
+                        }
+                        st = St::Raw(hashes);
+                        in_ws = false;
+                        i = j + 1;
+                        continue;
+                    }
                 }
                 if c == '"' {
                     st = St::Str;
@@ -289,9 +337,8 @@ fn strip_comments_and_normalize(src: &str) -> (String, Vec<usize>) {
                 if c == '\\' {
                     // Escape: copy both chars verbatim, never end the string on `\"`.
                     for k in 0..2 {
-                        if let Some((o, ch)) = bytes.get(i + k) {
-                            out.push(*ch);
-                            map.push(*o);
+                        if let Some((o, ch)) = chars.get(i + k) {
+                            push(&mut out, &mut map, *o, *ch);
                         }
                     }
                     i += 2;
@@ -302,6 +349,20 @@ fn strip_comments_and_normalize(src: &str) -> (String, Vec<usize>) {
                     st = St::Code;
                 }
             }
+            St::Raw(hashes) => {
+                // Closes only on `"` followed by exactly `hashes` `#`. No escapes.
+                if c == '"' && (1..=hashes).all(|k| at(i + k) == Some('#')) {
+                    for k in i..=(i + hashes) {
+                        if let Some((o, ch)) = chars.get(k) {
+                            push(&mut out, &mut map, *o, *ch);
+                        }
+                    }
+                    st = St::Code;
+                    in_ws = false;
+                    i += hashes + 1;
+                    continue;
+                }
+            }
             St::Line => {
                 if c == '\n' {
                     st = St::Code;
@@ -310,7 +371,7 @@ fn strip_comments_and_normalize(src: &str) -> (String, Vec<usize>) {
                 continue;
             }
             St::Block => {
-                if c == '*' && next == Some('/') {
+                if c == '*' && at(i + 1) == Some('/') {
                     st = St::Code;
                     i += 2;
                 } else {
@@ -328,13 +389,11 @@ fn strip_comments_and_normalize(src: &str) -> (String, Vec<usize>) {
             // A space after a comma carries no meaning in an argv literal; drop it
             // so `"systemctl", "stop"` and `"systemctl","stop"` scan identically.
             if !out.ends_with(',') {
-                out.push(' ');
-                map.push(off);
+                push(&mut out, &mut map, off, ' ');
             }
         }
         in_ws = false;
-        out.push(c);
-        map.push(off);
+        push(&mut out, &mut map, off, c);
         i += 1;
     }
     (out, map)
@@ -678,6 +737,19 @@ mod tests {
         assert_eq!(transient_unit("llama-gpu"), "chord-llama-gpu.service");
     }
 
+    /// Round-6 (gpt56): with no registry to consult, `stop` must not be permissive.
+    /// The namespace rule is what makes fail-closed possible without breaking
+    /// chord's own transient-unit teardown.
+    #[test]
+    fn only_chord_namespaced_units_are_stoppable_without_a_registry() {
+        assert!(is_chord_namespaced_unit("chord-llama-gpu.service"));
+        assert!(is_chord_namespaced_unit(&transient_unit("anything")));
+        assert!(!is_chord_namespaced_unit("ollama.service"));
+        assert!(!is_chord_namespaced_unit("lemonade-coder.service"));
+        assert!(!is_chord_namespaced_unit("chord-llama-gpu"), "must be a .service");
+        assert!(!is_chord_namespaced_unit("notchord-x.service"));
+    }
+
     #[test]
     fn unmanaged_kind_is_the_ollama_rule() {
         assert!(is_unmanaged_kind(Some("ollama")));
@@ -796,6 +868,42 @@ pub async fn ensure_up(b: &B) {
     /// The census is the half that syntax cannot evade. Every bypass round 2
     /// raised — a comment in the header, a non-literal verb — still has to name
     /// `systemctl`, so the count moves.
+    /// Round-6 (codex): a raw string containing a `"` and a `//` made the previous
+    /// stripper exit string state early, read the `//` as a comment, and DROP the
+    /// rest of the line — hiding a real stop site from BOTH halves of the ratchet.
+    /// The direction matters: a stripper that deletes code is worse than one that
+    /// keeps too much.
+    #[test]
+    fn raw_strings_cannot_hide_a_stop_site() {
+        let src = concat!(
+            "fn rogue() {\n",
+            "    let note = r#\"quote\" // not a comment\"#; ",
+            "let _ = run([\"systemctl\", \"stop\", unit]);\n",
+            "}\n"
+        );
+        assert_eq!(
+            stop_call_site_owners(src),
+            vec!["rogue".to_string()],
+            "a raw string must not swallow the stop site that follows it"
+        );
+        assert_eq!(systemctl_literal_count(src), 1);
+    }
+
+    /// Raw-string forms, including a nested-hash one, must all close correctly.
+    #[test]
+    fn raw_string_delimiters_of_every_arity_close_correctly() {
+        for note in [r####"r"a""####, r####"r#"a"#"####, r####"r##"a"#b"##"####] {
+            let src = format!(
+                "fn f() {{\n    let n = {note}; let _ = run([\"systemctl\", \"stop\", u]);\n}}\n"
+            );
+            assert_eq!(
+                stop_call_site_owners(&src),
+                vec!["f".to_string()],
+                "raw string {note} broke the scan"
+            );
+        }
+    }
+
     #[test]
     fn the_census_counts_every_systemctl_literal_however_the_call_is_spelled() {
         let base = "fn a() {\n    let _ = run([\"systemctl\", \"stop\", u]);\n}\n";

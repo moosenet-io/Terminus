@@ -180,13 +180,33 @@ pub fn stop(backend: &ResolvedBackend) {
 /// It re-reads the registry per stop — a few hundred bytes, on a path that is
 /// already spawning `systemctl`, in exchange for the check being unskippable.
 fn stop_unit_unless_protected(unit: &str) {
-    if infer::protected_units().contains(unit) {
-        tracing::warn!(
-            unit = %unit,
-            "refusing to stop a protected unit: it belongs to an always-on or \
-             unmanaged backend in the model registry (CHRD #112)"
-        );
-        return;
+    match infer::protected_units() {
+        Some(protected) => {
+            if protected.contains(unit) {
+                tracing::warn!(
+                    unit = %unit,
+                    "refusing to stop a protected unit: it belongs to an always-on \
+                     or unmanaged backend in the model registry (CHRD #112)"
+                );
+                return;
+            }
+        }
+        // FAIL CLOSED. No registry ⇒ no way to know whether this unit is the
+        // assistant's engine, so only Chord's OWN namespace may be stopped. An
+        // arbitrary declared unit name could be any system service — which is
+        // exactly the path a caller-supplied `unit: "ollama.service"` took when
+        // this returned an empty set instead of "cannot know" (gpt56, round 6).
+        None => {
+            if !gpu_stop_guard::is_chord_namespaced_unit(unit) {
+                tracing::warn!(
+                    unit = %unit,
+                    "refusing to stop a unit outside chord's own namespace: the \
+                     model registry is unavailable, so protected units cannot be \
+                     determined (CHRD #112)"
+                );
+                return;
+            }
+        }
     }
     let _ = run(["systemctl", "stop", unit]);
 }

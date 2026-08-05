@@ -307,18 +307,17 @@ pub fn resolve_backend_at(
 /// guard type covers `free_gpu`, but `stop` could be handed a hand-built backend
 /// with `always_on: false` and `unit: "ollama.service"`.
 ///
-/// Registry unset / unreadable / unparseable ⇒ empty. That is the same
-/// graceful-degrade posture as the rest of this module, and it fails in the
-/// direction the ORIGINAL code already had: nothing extra is protected, nothing
-/// extra is stopped either, because `free_gpu`'s candidate list is empty too.
-pub fn protected_units() -> std::collections::BTreeSet<String> {
-    let Some(path) = registry_path() else {
-        return Default::default();
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Default::default();
-    };
-    gpu_stop_guard::protected_units_from_json(&text)
+/// Registry unset / unreadable / unparseable ⇒ `None`, meaning "cannot know" —
+/// NOT an empty set. Reporting an empty set there would say "nothing is
+/// protected", which is exactly the wrong answer to give a caller that is about
+/// to stop something; `lifecycle::stop` fails closed on `None` instead.
+pub fn protected_units() -> Option<std::collections::BTreeSet<String>> {
+    let text = std::fs::read_to_string(registry_path()?).ok()?;
+    // A registry that PARSES to no protected units is a real answer (`Some(empty)`);
+    // one that could not be read or parsed is NOT, and must not be reported as
+    // "nothing is protected". Absence is never read as zero.
+    serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    Some(gpu_stop_guard::protected_units_from_json(&text))
 }
 
 pub fn stoppable_gpu_backends(keep: &str) -> Vec<StoppableGpuBackend> {
