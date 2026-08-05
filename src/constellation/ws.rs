@@ -459,6 +459,7 @@ mod tests {
             principal_resolver: crate::mesh::PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,

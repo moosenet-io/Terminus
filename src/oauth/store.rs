@@ -26,8 +26,9 @@ use uuid::Uuid;
 
 use crate::error::ToolError;
 use crate::oauth::model::{
-    Account, AuthCode, Client, Consent, RefreshToken, ServerOwner, ToolGroup,
+    Account, AuthCode, Client, Consent, RefreshToken, ServerOwner, TokenFamily, ToolGroup,
 };
+use crate::oauth::revoke::{DispatchState, SessionStore};
 use crate::oauth::scope::ScopeWrite;
 use crate::oauth::{Argon2idHash, OauthConfig, SecretHash};
 
@@ -1143,11 +1144,26 @@ impl OauthStore {
     /// One transaction because the two halves must not be separable: a revoked
     /// consent whose refresh tokens still work is not a revocation, and an
     /// operator who saw "revoked" would reasonably believe it was.
+    ///
+    /// Returns the number of consents revoked. RMCP-11 needed the token count
+    /// too, so the implementation moved to
+    /// [`Self::revoke_consent_and_tokens`] and this signature was left exactly
+    /// as it was rather than widened — there is one transaction, one set of SQL,
+    /// and no second way to revoke a consent that could drift from this one.
     pub async fn revoke_consent(
         &self,
         account_id: Uuid,
         client_id: Uuid,
     ) -> Result<u64, ToolError> {
+        self.revoke_consent_and_tokens(account_id, client_id).await.map(|(consents, _)| consents)
+    }
+
+    /// [`Self::revoke_consent`], also reporting how many token rows it killed.
+    pub async fn revoke_consent_and_tokens(
+        &self,
+        account_id: Uuid,
+        client_id: Uuid,
+    ) -> Result<(u64, u64), ToolError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
         let consents = sqlx::query(
             "UPDATE rmcp_consent SET revoked_at = now() \
@@ -1160,7 +1176,7 @@ impl OauthStore {
         .map_err(db)?
         .rows_affected();
 
-        sqlx::query(
+        let tokens = sqlx::query(
             "UPDATE rmcp_refresh_token SET revoked_at = now() \
              WHERE account_id = $1 AND client_id = $2 AND revoked_at IS NULL",
         )
@@ -1168,10 +1184,218 @@ impl OauthStore {
         .bind(client_id)
         .execute(&mut *tx)
         .await
-        .map_err(db)?;
+        .map_err(db)?
+        .rows_affected();
 
         tx.commit().await.map_err(db)?;
-        Ok(consents)
+        Ok((consents, tokens))
+    }
+
+    /// Revoke EVERY consent and EVERY refresh token an account holds, across
+    /// all of its clients, in one transaction. Returns `(consents, tokens)`.
+    ///
+    /// The "somebody has my laptop" control. One transaction for the same
+    /// reason [`Self::revoke_consent_and_tokens`] is one: a partial revocation
+    /// here — some clients cut off, others still live — is a state nobody chose
+    /// and one an operator would have no way to notice.
+    pub async fn revoke_account_sessions(&self, account_id: Uuid) -> Result<(u64, u64), ToolError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let consents = sqlx::query(
+            "UPDATE rmcp_consent SET revoked_at = now() \
+             WHERE account_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+
+        let tokens = sqlx::query(
+            "UPDATE rmcp_refresh_token SET revoked_at = now() \
+             WHERE account_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+
+        tx.commit().await.map_err(db)?;
+        Ok((consents, tokens))
+    }
+
+    // -----------------------------------------------------------------------
+    // Sessions (RMCP-11)
+    // -----------------------------------------------------------------------
+
+    /// Refresh-token families, aggregated into sessions, filtered by any
+    /// combination of account, client and family.
+    ///
+    /// Every filter is `NULL`-tolerant in SQL (`$n IS NULL OR col = $n`) so one
+    /// statement serves every selector. The aggregate follows
+    /// [`Self::refresh_token_is_live`]'s family-wide rule exactly:
+    /// `min(revoked_at)` means ANY revoked row dates the family's death, and
+    /// `live` is computed with the DATABASE clock so a process with a drifted
+    /// clock cannot show a dead session as live. Deriving liveness in Rust from
+    /// the returned timestamps would reintroduce the multi-clock problem
+    /// RMCP-01's module docs rule out.
+    ///
+    /// `resource` and `scope` are safe to group by because
+    /// [`Self::rotate_refresh_token`] copies them from the predecessor row —
+    /// a family cannot contain two different bindings by construction.
+    pub async fn list_token_families(
+        &self,
+        account_id: Option<Uuid>,
+        client_id: Option<Uuid>,
+        family_id: Option<Uuid>,
+    ) -> Result<Vec<TokenFamily>, ToolError> {
+        sqlx::query_as::<_, TokenFamily>(
+            "SELECT t.family_id, t.client_id, t.account_id, t.resource, t.scope, \
+                    min(t.issued_at)   AS issued_at, \
+                    max(t.issued_at)   AS last_issued_at, \
+                    max(t.expires_at)  AS expires_at, \
+                    count(*)           AS token_count, \
+                    min(t.revoked_at)  AS revoked_at, \
+                    COALESCE(min(t.revoked_at) IS NULL AND max(t.expires_at) > now(), false) AS live \
+             FROM rmcp_refresh_token t \
+             WHERE ($1::uuid IS NULL OR t.account_id = $1) \
+               AND ($2::uuid IS NULL OR t.client_id = $2) \
+               AND ($3::uuid IS NULL OR t.family_id = $3) \
+             GROUP BY t.family_id, t.client_id, t.account_id, t.resource, t.scope \
+             ORDER BY min(t.issued_at) DESC",
+        )
+        .bind(account_id)
+        .bind(client_id)
+        .bind(family_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)
+    }
+
+    /// The family a presented refresh token belongs to, whatever its state.
+    ///
+    /// Unfiltered for the same reason [`Self::find_refresh_token`] is: RFC 7009
+    /// revocation of an already-dead token must still answer `200`, and reuse
+    /// detection needs to see rotated and revoked rows. A filtered lookup would
+    /// make a stolen token indistinguishable from a token that never existed.
+    pub async fn family_of_refresh_token(
+        &self,
+        token_hash: &SecretHash,
+    ) -> Result<Option<TokenFamily>, ToolError> {
+        let family_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT family_id FROM rmcp_refresh_token WHERE token_hash = $1",
+        )
+        .bind(token_hash.as_bytes())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?;
+        match family_id {
+            Some(id) => Ok(self.list_token_families(None, None, Some(id)).await?.into_iter().next()),
+            None => Ok(None),
+        }
+    }
+
+    /// Resolve an account NAME to its id, including a disabled account.
+    ///
+    /// Deliberately distinct from [`Self::find_active_account_by_name`], which
+    /// hides disabled accounts so the authentication path cannot become an
+    /// existence oracle. That rule protects authentication; applying it here
+    /// would mean an operator could not revoke the sessions of an account they
+    /// had just disabled — exactly when they most want to. This method is
+    /// reachable only from the revocation path, which can only ever narrow
+    /// access, so it never widens anything.
+    pub async fn resolve_account_id(&self, name: &str) -> Result<Option<Uuid>, ToolError> {
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM rmcp_account WHERE name = $1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)
+    }
+
+    /// Resolve a public `client_id` to its internal id, including a disabled
+    /// client — same reasoning as [`Self::resolve_account_id`].
+    pub async fn resolve_client_id(&self, client_id: &str) -> Result<Option<Uuid>, ToolError> {
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM rmcp_client WHERE client_id = $1")
+            .bind(client_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)
+    }
+
+    /// Whether a request carrying this account, client and (optional) session
+    /// may dispatch RIGHT NOW.
+    ///
+    /// One statement, four independent predicates, evaluated against live rows
+    /// on every call. This is what makes revocation effective at the next
+    /// dispatch rather than at the next token expiry: a validated JWT signature
+    /// proves only that this server minted the token at some point in the past,
+    /// and nothing about whether the authorization behind it still stands.
+    ///
+    /// The session predicate requires the family to be BOUND to this account and
+    /// client, not merely to exist and be unrevoked. A token quoting a family id
+    /// that belongs to some other binding is refused rather than accepted on the
+    /// strength of the family being healthy — the same anti-substitution
+    /// discipline [`Self::rotate_refresh_token`] applies to a successor's
+    /// binding.
+    ///
+    /// `family_id` is mandatory and the SQL has NO null-tolerant arm. An earlier
+    /// revision accepted `Option<Uuid>` and wrote `$3::uuid IS NULL OR (…)`,
+    /// which made a request that named no session automatically session-valid —
+    /// so revoking a family left an access token arriving without one still
+    /// dispatching. Deciding absence is
+    /// [`crate::oauth::revoke::RevocationService::dispatch_state`]'s job, and it
+    /// denies; by the time this query runs there is no absent case left, so
+    /// there is no null branch for a later edit to make permissive again.
+    pub async fn dispatch_state(
+        &self,
+        account_id: Uuid,
+        client_id: Uuid,
+        family_id: Uuid,
+    ) -> Result<crate::oauth::revoke::DispatchState, ToolError> {
+
+        // Decoded by COLUMN NAME off a raw row rather than into a tuple: this
+        // workspace builds sqlx without the derive/macros features (see
+        // `crate::oauth::model`'s row-decoding note), and a positional tuple
+        // decode would silently swap two `bool` columns if the SELECT were ever
+        // reordered — which here would mean reporting the wrong denial reason,
+        // or worse, the wrong decision.
+        use sqlx::Row as _;
+        let row = sqlx::query(
+            "SELECT \
+               EXISTS (SELECT 1 FROM rmcp_client WHERE id = $2 AND NOT disabled)  AS client_ok, \
+               EXISTS (SELECT 1 FROM rmcp_account WHERE id = $1 AND NOT disabled) AS account_ok, \
+               EXISTS (SELECT 1 FROM rmcp_consent \
+                       WHERE account_id = $1 AND client_id = $2 AND revoked_at IS NULL) AS consent_ok, \
+                   EXISTS (SELECT 1 FROM rmcp_refresh_token \
+                           WHERE family_id = $3 AND account_id = $1 AND client_id = $2) \
+               AND NOT EXISTS (SELECT 1 FROM rmcp_refresh_token \
+                               WHERE family_id = $3 AND revoked_at IS NOT NULL) AS family_ok",
+        )
+        .bind(account_id)
+        .bind(client_id)
+        .bind(family_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)?;
+
+        // A decode failure denies. `unwrap_or(false)` here is the fail-CLOSED
+        // direction on every one of these columns — an unreadable answer to
+        // "may this dispatch?" is not permission.
+        let ok = |name: &str| row.try_get::<bool, _>(name).unwrap_or(false);
+
+        // Ordered from the coarsest lever to the finest, so an operator reading
+        // the audit trail sees the outermost reason a request was refused.
+        Ok(if !ok("client_ok") {
+            DispatchState::ClientDisabled
+        } else if !ok("account_ok") {
+            DispatchState::AccountDisabled
+        } else if !ok("consent_ok") {
+            DispatchState::ConsentRevoked
+        } else if !ok("family_ok") {
+            DispatchState::SessionRevoked
+        } else {
+            DispatchState::Allowed
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1239,6 +1463,69 @@ impl OauthStore {
             .await
             .map(|_| ())
             .map_err(db)
+    }
+}
+
+/// RMCP-11: the revocation/session seam, satisfied by the real repository.
+///
+/// A thin forwarding impl on purpose. The trait exists so
+/// [`crate::oauth::revoke::RevocationService`]'s logic — idempotence, the
+/// verify-after-write step, the RFC 7009 client-ownership rule — is testable
+/// without a database; putting any behaviour in this impl rather than in the
+/// service would put it back out of reach of those tests.
+#[async_trait::async_trait]
+impl SessionStore for OauthStore {
+    async fn resolve_account(&self, name: &str) -> Result<Option<Uuid>, ToolError> {
+        self.resolve_account_id(name).await
+    }
+
+    async fn resolve_client(&self, client_id: &str) -> Result<Option<Uuid>, ToolError> {
+        self.resolve_client_id(client_id).await
+    }
+
+    async fn list_families(
+        &self,
+        account_id: Option<Uuid>,
+        client_id: Option<Uuid>,
+        family_id: Option<Uuid>,
+    ) -> Result<Vec<TokenFamily>, ToolError> {
+        self.list_token_families(account_id, client_id, family_id).await
+    }
+
+    async fn family_of_refresh_token(
+        &self,
+        token_hash: &SecretHash,
+    ) -> Result<Option<TokenFamily>, ToolError> {
+        OauthStore::family_of_refresh_token(self, token_hash).await
+    }
+
+    async fn revoke_family(&self, family_id: Uuid) -> Result<u64, ToolError> {
+        self.revoke_refresh_family(family_id).await
+    }
+
+    async fn revoke_client_tokens(&self, client_id: Uuid) -> Result<u64, ToolError> {
+        self.revoke_client_refresh_tokens(client_id).await
+    }
+
+    async fn revoke_consent_and_tokens(
+        &self,
+        account_id: Uuid,
+        client_id: Uuid,
+    ) -> Result<(u64, u64), ToolError> {
+        OauthStore::revoke_consent_and_tokens(self, account_id, client_id).await
+    }
+
+    async fn revoke_account_everything(&self, account_id: Uuid) -> Result<(u64, u64), ToolError> {
+        self.revoke_account_sessions(account_id).await
+    }
+
+    async fn dispatch_state(
+        &self,
+        account_id: Uuid,
+        client_id: Uuid,
+        family_id: Uuid,
+    ) -> Result<DispatchState, ToolError> {
+        OauthStore::dispatch_state(self, account_id, client_id, family_id).await
     }
 }
 

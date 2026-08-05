@@ -68,7 +68,9 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::error::ToolError;
+use crate::oauth::audit::{AuditDetail, DenialReason, OauthAuditRecord, OauthEvent};
 use crate::oauth::jwt::JwtSigner;
+use crate::oauth::limits::OauthEndpoint;
 use crate::oauth::model::Client;
 use crate::oauth::store::OauthStore;
 use crate::oauth::SecretHash;
@@ -186,6 +188,27 @@ impl OauthError {
 
     fn invalid_client(description: &'static str) -> Self {
         Self::new(OauthErrorCode::InvalidClient, description)
+    }
+
+    /// The OAuth-audit reason this error is recorded under.
+    ///
+    /// A mapping into the audit's closed vocabulary rather than logging the
+    /// error's own `description`: that description is a `&'static str` today,
+    /// but it is also the thing most likely to grow a caller-derived detail
+    /// later, and the audit record is where that would become a leak. Mapping
+    /// to a variant makes the trail's vocabulary independent of the wire text.
+    fn audit_reason(&self) -> DenialReason {
+        match self.code {
+            OauthErrorCode::InvalidClient => DenialReason::UnknownOrDisabledClient,
+            OauthErrorCode::InvalidGrant => DenialReason::RefreshNotUsable,
+            OauthErrorCode::UnsupportedGrantType | OauthErrorCode::UnauthorizedClient => {
+                DenialReason::UnsupportedGrant
+            }
+            OauthErrorCode::InvalidScope | OauthErrorCode::InvalidRequest => {
+                DenialReason::MalformedRequest
+            }
+            OauthErrorCode::ServerError => DenialReason::MalformedRequest,
+        }
     }
 
     /// Mark this as answerable with a `WWW-Authenticate: Basic` challenge.
@@ -575,6 +598,11 @@ pub struct TokenEndpoint {
     store: OauthStore,
     signer: JwtSigner,
     refresh_ttl_seconds: i64,
+    /// The one VERIFIED revocation path (RMCP-11). Built over the same store, so
+    /// a family revocation triggered here goes through the same
+    /// snapshot-write-reread as an operator's `rmcp_session_revoke` — see
+    /// [`Self::revoke_family`].
+    revocation: crate::oauth::revoke::RevocationService,
 }
 
 impl TokenEndpoint {
@@ -589,7 +617,13 @@ impl TokenEndpoint {
                 "{REFRESH_TTL_ENV} must be between 1 and {MAX_REFRESH_TTL_SECONDS} seconds"
             )));
         }
-        Ok(Self { store, signer, refresh_ttl_seconds })
+        // The verified revocation path, over the SAME store this endpoint
+        // reads through, so a reuse-triggered revocation and an operator's
+        // `rmcp_session_revoke` are the same code against the same rows.
+        let revocation = crate::oauth::revoke::RevocationService::new(
+            std::sync::Arc::new(store.clone()),
+        );
+        Ok(Self { store, signer, refresh_ttl_seconds, revocation })
     }
 
     /// Build from the environment (see [`crate::oauth`] on why an env read is
@@ -612,12 +646,92 @@ impl TokenEndpoint {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<TokenResponse, OauthError> {
+        // TWO stages, each with exactly one place that sees every outcome.
+        //
+        // It used to be one function whose first five steps were `?`, so a
+        // wrong content type, an undecodable body, an UNKNOWN CLIENT or a
+        // FAILED CLIENT SECRET returned before reaching the audit at the grant
+        // boundary — unaudited pre-auth refusals on an internet-facing
+        // endpoint, and the last two are exactly what an operator wants to see.
+        // Round 14 (`gpt56`) named the same class on `/oauth/revoke`; this is
+        // where it was widest.
+        //
+        // Splitting at "is there an authenticated client yet" is what makes a
+        // single emission point possible on each side: before it there is no
+        // client to name, after it every record can carry one.
+        let (params, client) = match self.authenticate_request(headers, body).await {
+            Ok(authenticated) => authenticated,
+            Err(e) => {
+                OauthAuditRecord::new(OauthEvent::TokenDenied)
+                    .endpoint(OauthEndpoint::Token)
+                    .reason(e.audit_reason())
+                    .emit();
+                return Err(e);
+            }
+        };
+
+        // Read back for the emission below rather than borrowed across the
+        // grant call, so `run_grant` can take `&params` without a borrow that
+        // outlives it.
+        let grant_type = params.get("grant_type").unwrap_or_default().to_string();
+        let outcome = self.run_grant(&client, &params).await;
+
+        match (&outcome, grant_type.as_str()) {
+            (Ok(_), GRANT_AUTHORIZATION_CODE) => {
+                OauthAuditRecord::new(OauthEvent::TokenIssued)
+                    .endpoint(OauthEndpoint::Token)
+                    .client_uuid(client.id)
+                    .detail(AuditDetail::TokensIssuedForCode)
+                    .emit();
+            }
+            (Ok(_), _) => {
+                OauthAuditRecord::new(OauthEvent::TokenRefreshed)
+                    .endpoint(OauthEndpoint::Token)
+                    .client_uuid(client.id)
+                    .detail(AuditDetail::TokensRefreshed {
+                        scope_narrowed: params.get("scope").is_some(),
+                    })
+                    .emit();
+            }
+            (Err(e), _) => {
+                OauthAuditRecord::new(OauthEvent::TokenDenied)
+                    .endpoint(OauthEndpoint::Token)
+                    .client_uuid(client.id)
+                    .reason(e.audit_reason())
+                    .emit();
+            }
+        }
+        outcome
+    }
+
+    /// Everything before an authenticated client exists: content type, form
+    /// decoding, and client authentication.
+    ///
+    /// Every failure in here is a refusal with no client to attribute it to,
+    /// which is why it is one function with one caller — the caller audits its
+    /// `Err` once, and no step inside can `?` past that.
+    async fn authenticate_request(
+        &self,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<(TokenParams, Client), OauthError> {
         require_form_content_type(headers)?;
         let params = parse_form(body)?;
-
         let presented = extract_client_auth(headers, &params)?;
         let client = self.authenticate_client(&presented).await?;
+        Ok((params, client))
+    }
 
+    /// Everything after the client is known: which grant, whether this client
+    /// may use it, and running it.
+    ///
+    /// The two refusals before dispatch used to `return Err` past the audit
+    /// too; folding them in here means the caller's single `match` sees them.
+    async fn run_grant(
+        &self,
+        client: &Client,
+        params: &TokenParams,
+    ) -> Result<TokenResponse, OauthError> {
         let grant_type = params.require("grant_type", "grant_type is required")?;
         // Whether the CLIENT may use this grant is checked before the grant
         // runs. An empty `grant_types` column denies everything, per the
@@ -628,10 +742,9 @@ impl TokenEndpoint {
                 "this client is not registered for the requested grant type",
             ));
         }
-
         match grant_type {
-            GRANT_AUTHORIZATION_CODE => self.authorization_code_grant(&client, &params).await,
-            GRANT_REFRESH_TOKEN => self.refresh_token_grant(&client, &params).await,
+            GRANT_AUTHORIZATION_CODE => self.authorization_code_grant(client, params).await,
+            GRANT_REFRESH_TOKEN => self.refresh_token_grant(client, params).await,
             _ => Err(OauthError::new(
                 OauthErrorCode::UnsupportedGrantType,
                 "supported grant types are authorization_code and refresh_token",
@@ -821,14 +934,22 @@ impl TokenEndpoint {
             // leaked credential; the holder cannot be distinguished from a
             // thief, so the family goes. The alternative — a bare rejection —
             // leaves a token known to be in the wrong hands still live.
-            self.revoke_family(record.family_id, "refresh token presented by a different client")
+            self.revoke_family(
+                record.family_id,
+                FamilyRevocationCause::SuspectedTheft,
+                "refresh token presented by a different client",
+            )
                 .await?;
             return Err(dead());
         }
         if record.is_rotated() {
             // THE reuse case. The legitimate holder and the thief cannot be
             // told apart, so both are cut off and the human re-authorizes.
-            self.revoke_family(record.family_id, "rotated refresh token was presented again")
+            self.revoke_family(
+                record.family_id,
+                FamilyRevocationCause::SuspectedTheft,
+                "rotated refresh token was presented again",
+            )
                 .await?;
             return Err(dead());
         }
@@ -836,7 +957,12 @@ impl TokenEndpoint {
             return Err(dead());
         }
         if !self.account_is_active(record.account_id).await? {
-            self.revoke_family(record.family_id, "account is disabled").await?;
+            self.revoke_family(
+                record.family_id,
+                FamilyRevocationCause::AccountDisabled,
+                "account is disabled",
+            )
+            .await?;
             return Err(dead());
         }
         if record.resource.trim().is_empty() {
@@ -888,10 +1014,26 @@ impl TokenEndpoint {
             // against the database clock, or a concurrent request rotated it
             // first. The second case is indistinguishable from a thief racing
             // the legitimate client, so it is treated as one.
-            self.revoke_family(record.family_id, "refresh token was not live at rotation")
+            self.revoke_family(
+                record.family_id,
+                FamilyRevocationCause::SuspectedTheft,
+                "refresh token was not live at rotation",
+            )
                 .await?;
             return Err(dead());
         }
+
+        // Rotation is its own event, distinct from the refresh that caused it:
+        // a family's rotation count is what tells an operator a session is
+        // genuinely in use, and a rotation with no matching refresh would be the
+        // signature of something replaying against it.
+        OauthAuditRecord::new(OauthEvent::TokenRotated)
+            .endpoint(OauthEndpoint::Token)
+            .account(record.account_id)
+            .client_uuid(record.client_id)
+            .family(record.family_id)
+            .detail(AuditDetail::RefreshRotated)
+            .emit();
 
         let access = self
             .signer
@@ -925,18 +1067,50 @@ impl TokenEndpoint {
     ///
     /// The rejection is still what a caller sees on the SUCCESS path — this
     /// returns `Ok(())` and the caller then answers `invalid_grant`.
-    async fn revoke_family(&self, family_id: Uuid, why: &str) -> Result<(), OauthError> {
-        match self.store.revoke_refresh_family(family_id).await {
-            Ok(count) => {
+    async fn revoke_family(
+        &self,
+        family_id: Uuid,
+        cause: FamilyRevocationCause,
+        why: &str,
+    ) -> Result<(), OauthError> {
+        // Emitted BEFORE the write is attempted, so the detection is on the
+        // record even when the revocation then fails — the failure case is
+        // precisely the one an operator most needs to see, and an audit line
+        // that only appears on success would omit it.
+        if cause == FamilyRevocationCause::SuspectedTheft {
+            OauthAuditRecord::new(OauthEvent::RefreshReuseDetected)
+                .endpoint(OauthEndpoint::Token)
+                .family(family_id)
+                .reason(DenialReason::RefreshReused)
+                .detail(AuditDetail::RefreshReuse)
+                .emit();
+        }
+
+        // Through the SERVICE, never the store. `RevocationService` re-reads the
+        // affected families after the write and errors if any is still live;
+        // the direct `store.revoke_refresh_family` call this replaced reported
+        // success on the strength of an UPDATE returning. Two ways to revoke a
+        // family, only one of which checked its work — and the unchecked one was
+        // on the theft path.
+        //
+        // `revoke_on_reuse` also emits the reuse record, so the theft arm above
+        // deliberately does NOT use it: this endpoint emits its own with the
+        // `Token` endpoint attached, and a second identical record would just be
+        // noise. Both entry points land on the same verified primitive.
+        match self.revocation.revoke_family_verified(family_id).await {
+            Ok(report) => {
                 tracing::warn!(
-                    "oauth::token: revoked refresh family {family_id} ({count} tokens): {why}"
+                    "oauth::token: revoked refresh family {family_id} \
+                     ({} token(s), verified): {why}",
+                    report.tokens_revoked
                 );
                 Ok(())
             }
             Err(e) => {
                 tracing::error!(
                     "oauth::token: FAILED to revoke refresh family {family_id} after detecting \
-                     {why} — refusing to report a clean rejection while the family is still live"
+                     {why} — refusing to report a clean rejection while the family may still be \
+                     live"
                 );
                 Err(OauthError::internal("refresh family revocation failed", e))
             }
@@ -954,6 +1128,22 @@ impl TokenEndpoint {
             .await
             .map_err(|e| OauthError::internal("account lookup failed", e))
     }
+}
+
+/// Why the token endpoint is revoking a refresh family.
+///
+/// Exists so the audit vocabulary stays accurate. All four of this endpoint's
+/// family revocations used to emit [`OauthEvent::RefreshReuseDetected`], which
+/// is right for three of them and wrong for the fourth: a family revoked because
+/// its ACCOUNT was disabled is not a theft signal, and labelling it as one would
+/// have an operator hunting a stolen credential that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FamilyRevocationCause {
+    /// A refresh token was replayed, presented by the wrong client, or lost a
+    /// rotation race — all indistinguishable from theft, so all treated as it.
+    SuspectedTheft,
+    /// The authorizing account is disabled. A revocation, not a theft signal.
+    AccountDisabled,
 }
 
 /// Build the standalone token router, for a binary to merge into whatever it

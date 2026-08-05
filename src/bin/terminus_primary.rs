@@ -285,7 +285,42 @@ async fn main() {
     // item happens to own is what let an anonymous, token-less request through
     // twice. See `terminus_rs::oauth::metadata::OauthDoors` for why this
     // detects "OAuth is configured at all" instead of listing doors.
-    let oauth_doors = terminus_rs::oauth::metadata::OauthDoors::detect_from_env();
+    let mut oauth_doors = terminus_rs::oauth::metadata::OauthDoors::detect_from_env();
+
+    // RMCP-11 (TERM #631): build the OAuth ENDPOINTS. Until this item, every
+    // OAuth router in the tree shipped as a `Router` nothing ever bound, so the
+    // whole door was unreachable in a running binary while each individual item
+    // passed its own tests.
+    //
+    // A PRESENT-but-broken configuration aborts startup, exactly like the
+    // discovery configuration above and the edge policy below, and for a
+    // sharper version of the same reason: a half-built auth surface that serves
+    // `/oauth/authorize` and then fails at `/oauth/token` sends the operator
+    // looking at the client, because that is where the error appears.
+    let rmcp_endpoints = match terminus_rs::oauth::mount::OauthEndpoints::from_env().await {
+        Ok(Some(endpoints)) => {
+            tracing::info!("terminus_primary: {}", endpoints.describe());
+            // Registered as a door so RMCP-02's `/mcp` challenge knows an OAuth
+            // surface exists on this process. Without this, a deployment
+            // serving the endpoints but not discovery would answer an
+            // unauthenticated `/mcp` as though no OAuth door existed at all.
+            oauth_doors.register("oauth endpoints (authorize/token/revoke)");
+            Some(std::sync::Arc::new(endpoints))
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "terminus_primary: RMCP OAuth endpoints not configured -- none mounted"
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("FATAL: {e}");
+            eprintln!(
+                "Refusing to start: the RMCP OAuth door is configured but could not be built.                  Serving a partial auth surface is worse than serving none, because the failure                  shows up as a client-side error that names neither the field nor this process.                  Fix the RMCP_* configuration (or unset RMCP_DATABASE_URL) and restart."
+            );
+            std::process::exit(1);
+        }
+    };
     tracing::info!("terminus_primary: {}", oauth_doors.describe());
 
     if let Some(discovery) = &rmcp_discovery {
@@ -337,6 +372,7 @@ async fn main() {
         gateway,
         mesh_pool: mesh_pool.clone(),
         rmcp_discovery: rmcp_discovery.map(std::sync::Arc::new),
+        rmcp_endpoints: rmcp_endpoints.clone(),
         oauth_doors: oauth_doors.clone(),
         oauth_resource,
         // RMCP-07: not wired here yet. The resolver needs its own handle on the
@@ -564,6 +600,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -592,6 +629,7 @@ mod tests {
             gateway: Some(gateway),
             mesh_pool: None,
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -618,6 +656,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -646,6 +685,7 @@ mod tests {
             gateway: Some(gateway),
             mesh_pool: None,
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -799,6 +839,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -1138,6 +1179,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: terminus_rs::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,

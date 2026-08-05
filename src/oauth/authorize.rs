@@ -58,7 +58,7 @@
 //! anywhere in this file or its tests.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -74,9 +74,9 @@ use uuid::Uuid;
 
 use crate::error::ToolError;
 use crate::gateway_framework::audit::{AuditEntry, AuditResult};
-use crate::gateway_framework::rate_limit::{
-    rate_limit_key, InProcessRateLimiter, RateLimiter,
-};
+use crate::oauth::audit::{AuditDetail, DenialReason, OauthAuditRecord, OauthEvent};
+use crate::oauth::edge::ResolvedClientIp;
+use crate::oauth::limits::{throttled_response, OauthEndpoint, OauthRateLimiter};
 use crate::gateway_framework::ActionKind;
 use crate::oauth::model::Client;
 use crate::oauth::password;
@@ -132,15 +132,18 @@ const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
 const CHALLENGE_MIN_LEN: usize = 43;
 const CHALLENGE_MAX_LEN: usize = 128;
 
-/// Burst of login attempts allowed per key before throttling.
-const LOGIN_BURST: u32 = 5;
-
-/// Login attempts refilled per second — one every twenty seconds.
-///
-/// Deliberately slow. Password guessing is the attack this bounds, and a human
-/// who genuinely mistyped twice does not need a third attempt within twenty
-/// seconds. The burst above absorbs the honest case.
-const LOGIN_REFILL_PER_SEC: f64 = 0.05;
+// The login budget used to live here as a private `LOGIN_BURST` /
+// `LOGIN_REFILL_PER_SEC` pair with its own `InProcessRateLimiter`. TERM #633
+// converged it onto `crate::oauth::limits::OauthRateLimiter`, which owns the
+// budget for every OAuth endpoint.
+//
+// The move is not tidying. Two budget definitions for one door drift, and this
+// one drifted in the direction that matters: a lone `InProcessRateLimiter`
+// has no notion of the subject-budget-larger-than-address-budget invariant, so
+// the per-account and per-source buckets here were sized IDENTICALLY — which
+// means one source address exhausting its own budget also exhausted the named
+// account's, and could hold any account whose name it could guess locked out
+// for free. The shared limiter refuses that configuration at construction.
 
 /// Rate-limit / audit action label for a login attempt.
 ///
@@ -149,11 +152,37 @@ const LOGIN_REFILL_PER_SEC: f64 = 0.05;
 /// `Tool`-kind one that happens to share a name.
 const LOGIN_ACTION: &str = "admin:rmcp_oauth_login";
 
-/// The identity recorded for a rate-limited or failed attempt whose source
-/// address is not available. Every such request shares one bucket, which is
-/// STRICTER than per-address, not weaker — the failure direction is more
-/// throttling, never less.
-const UNKNOWN_SOURCE: &str = "unknown-source";
+/// The address attributed to a request whose source cannot be determined.
+///
+/// Every such request shares ONE bucket, which is stricter than per-address,
+/// not weaker — the failure direction here is more throttling, never less. It
+/// is the unspecified address rather than a loopback literal so it cannot be
+/// confused with a real caller in the audit trail.
+const UNATTRIBUTED_SOURCE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+/// The source address to gate and audit on, in priority order.
+///
+/// 1. [`ResolvedClientIp`] — the address RMCP-09's edge resolved and admitted.
+///    This is the only value that agrees with the source policy, so when it is
+///    present nothing else is consulted.
+/// 2. The socket peer, for a request that reached a private listener directly
+///    with no edge in front of it.
+/// 3. [`UNATTRIBUTED_SOURCE`], which still consumes budget.
+///
+/// Note what is NOT here: `X-Forwarded-For`. Reading it in a handler would let
+/// a caller choose its own rate-limit key, and would disagree with the edge —
+/// which has already decided, from the trusted-proxy set, which hop may be
+/// attributed.
+pub fn resolved_source_for(extensions: &axum::http::Extensions) -> IpAddr {
+    if let Some(ResolvedClientIp(ip)) = extensions.get::<ResolvedClientIp>() {
+        return *ip;
+    }
+    if let Some(ConnectInfo(addr)) = extensions.get::<ConnectInfo<SocketAddr>>() {
+        return addr.ip();
+    }
+    UNATTRIBUTED_SOURCE
+}
+
 
 /// The one message shown for every authentication failure.
 ///
@@ -998,7 +1027,10 @@ pub struct AuthorizeState {
     store: OauthStore,
     config: AuthorizeConfig,
     session_key: SessionKey,
-    limiter: Arc<dyn RateLimiter>,
+    /// The door-wide limiter (TERM #633). Shared with every other OAuth
+    /// endpoint, so the login budget is defined in exactly one place and
+    /// inherits the subject-over-address invariant.
+    limiter: Arc<OauthRateLimiter>,
 }
 
 /// How long a spent login-session claim is retained — comfortably longer than
@@ -1007,14 +1039,9 @@ pub struct AuthorizeState {
 const CLAIM_RETENTION_SECONDS: i64 = 900;
 
 impl AuthorizeState {
-    /// Build the endpoint state with the default login rate limiter.
+    /// Build the endpoint state with the door's default budgets.
     pub fn new(store: OauthStore, config: AuthorizeConfig, session_key: SessionKey) -> Self {
-        Self::with_limiter(
-            store,
-            config,
-            session_key,
-            Arc::new(InProcessRateLimiter::new(LOGIN_BURST, LOGIN_REFILL_PER_SEC)),
-        )
+        Self::with_limiter(store, config, session_key, Arc::new(OauthRateLimiter::with_defaults()))
     }
 
     /// Build with an injected limiter, for tests and for a future shared
@@ -1024,7 +1051,7 @@ impl AuthorizeState {
         store: OauthStore,
         config: AuthorizeConfig,
         session_key: SessionKey,
-        limiter: Arc<dyn RateLimiter>,
+        limiter: Arc<OauthRateLimiter>,
     ) -> Self {
         Self { store, config, session_key, limiter }
     }
@@ -1108,9 +1135,26 @@ async fn get_authorize(
     State(state): State<Arc<AuthorizeState>>,
     RawQuery(query): RawQuery,
 ) -> Response {
+    // No rate-limit call here: `crate::oauth::mount`'s `charge_address_budget`
+    // layer has already charged this request's per-address budget, before this
+    // handler ran and before anything was parsed. This endpoint names no
+    // subject (the `client_id` is in the query, which is not yet read), so the
+    // address dimension is the whole of its limiting — see the mounted-route
+    // contract in that module.
     let fields = match FormFields::parse(query.as_deref().unwrap_or("")) {
         Ok(fields) => fields,
         Err(reason) => {
+            // A refusal before anything is attributed. Audited for the same
+            // reason the token and revoke endpoints audit theirs: an
+            // unaudited pre-auth denial is one an operator cannot see. The
+            // record carries no part of the query — it is caller-controlled
+            // text, and the endpoint plus the reason is the whole operational
+            // signal.
+            OauthAuditRecord::new(OauthEvent::AuthorizationDenied)
+                .endpoint(OauthEndpoint::Authorize)
+                .reason(DenialReason::MalformedRequest)
+                .detail(AuditDetail::RefusedBeforeParsing)
+                .emit();
             // A malformed query cannot be attributed to a client, so it gets an
             // error page and no redirect.
             return html_response(
@@ -1160,13 +1204,19 @@ fn parse_body(headers: &HeaderMap, body: &str) -> Result<FormFields, &'static st
 
 async fn post_login(
     State(state): State<Arc<AuthorizeState>>,
-    connect: Option<ConnectInfo<SocketAddr>>,
+    cleared: crate::oauth::limits::AddressCleared,
+    extensions: axum::http::Extensions,
     headers: HeaderMap,
     body: String,
 ) -> Response {
     let fields = match parse_body(&headers, &body) {
         Ok(fields) => fields,
         Err(reason) => {
+            OauthAuditRecord::new(OauthEvent::LoginDenied)
+                .endpoint(OauthEndpoint::Login)
+                .reason(DenialReason::MalformedRequest)
+                .detail(AuditDetail::RefusedBeforeParsing)
+                .emit();
             return html_response(
                 StatusCode::BAD_REQUEST,
                 templates::error_page("Malformed request", reason),
@@ -1186,48 +1236,46 @@ async fn post_login(
     let submitted_account = fields.get("account").unwrap_or("").to_string();
     let submitted_pw = fields.get("pw").unwrap_or("").to_string();
 
-    // Source address for the per-address budget. Taken from the CONNECTION,
-    // never from `X-Forwarded-For`: a header the caller controls is a
-    // rate-limit key the caller can rotate at will, which is the same as having
-    // no per-address limit. An edge that terminates TLS in front of this
-    // endpoint must therefore preserve the peer address at the socket, which
-    // RMCP-09 owns.
-    let source = connect
-        .map(|ConnectInfo(addr)| addr.ip().to_string())
-        .unwrap_or_else(|| UNKNOWN_SOURCE.to_string());
+    // Source address for the per-address budget. Resolved by RMCP-09's edge
+    // and handed down as `ResolvedClientIp`, falling back to the socket peer
+    // when this process is reached on a private listener with no edge in front.
+    // Never from `X-Forwarded-For` read here: a header the caller controls is a
+    // rate-limit key the caller can rotate at will. The edge is the ONE place
+    // that decides which hop of a forwarded chain may be attributed, and
+    // re-deciding it here would be a second, divergent answer behind the same
+    // door.
+    let source = resolved_source_for(&extensions);
 
-    // BOTH budgets are consumed, and both before any credential work, so the
-    // limiter cannot itself become an oracle (an unknown account consumes
-    // budget exactly like a known one).
-    let account_key = rate_limit_key(&format!("account:{submitted_account}"), LOGIN_ACTION);
-    let source_key = rate_limit_key(&format!("source:{source}"), LOGIN_ACTION);
-    let account_decision = state.limiter.check(&account_key).await;
-    let source_decision = state.limiter.check(&source_key).await;
-    if account_decision.is_over_budget() || source_decision.is_over_budget() {
-        let degraded = account_decision.is_degraded() || source_decision.is_degraded();
+    // The SUBJECT dimension only. The address dimension was charged by
+    // `mount::charge_address_budget` before this handler ran — before the body
+    // was parsed, which is the property round 9 established: a malformed login
+    // post must cost budget too, and this handler cannot charge earlier than its
+    // own first line.
+    //
+    // Charged here, before any credential work, so the limiter cannot itself
+    // become an oracle: an unknown account consumes subject budget exactly like
+    // a known one. Reached only when the address check ALLOWED, which preserves
+    // the short-circuit — a flood from one address cannot drain the named
+    // account's budget beyond that address's own, the property the old
+    // same-sized pair of buckets did not have.
+    let outcome = state.limiter.check_subject(&cleared, &submitted_account).await;
+    if outcome.is_limited() {
+        // The OAuth-vocabulary record. `limits` emits its own RateLimited entry
+        // for the throttle itself; this one ties it to the login decision.
+        OauthAuditRecord::new(OauthEvent::LoginDenied)
+            .endpoint(OauthEndpoint::Login)
+            .from_address(source)
+            .reason(DenialReason::RateLimited)
+            .emit();
         AuditEntry::new(
             submitted_account.as_str(),
             LOGIN_ACTION,
             ActionKind::Admin,
-            if degraded {
-                AuditResult::DeniedRateLimiterDegraded
-            } else {
-                AuditResult::DeniedRateLimited
-            },
-            Some(&format!("login throttled from {source}")),
+            AuditResult::DeniedRateLimited,
+            Some("login throttled"),
         )
         .log();
-        return html_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            templates::login_page(&LoginContext {
-                client_name: &request.client_name,
-                redirect_host: &request.redirect_authority,
-                loopback_only: request.loopback_only,
-                notice: Some("Too many sign-in attempts. Wait a little and try again."),
-                hidden: &request.hidden_fields(),
-            }),
-            Some(session::clear_cookie()),
-        );
+        return throttled_response(&outcome);
     }
 
     // The account lookup. `find_active_account_by_name` returns `None` for
@@ -1251,6 +1299,16 @@ async fn post_login(
     let authenticated = password_ok && account.is_some();
 
     if !authenticated {
+        // The OAuth-vocabulary record. `BadCredentials` collapses "no such
+        // account" and "wrong password" into one reason for the same reason the
+        // response does — a trail that separates them is an existence oracle
+        // for anyone who can read it, and one refactor away from becoming one
+        // in the response too.
+        OauthAuditRecord::new(OauthEvent::LoginDenied)
+            .endpoint(OauthEndpoint::Login)
+            .from_address(source)
+            .reason(DenialReason::BadCredentials)
+            .emit();
         AuditEntry::new(
             submitted_account.as_str(),
             LOGIN_ACTION,
@@ -1311,6 +1369,15 @@ async fn post_login(
         );
     }
 
+    // Identified by ACCOUNT ID, not by name: the id is what correlates with
+    // every other record in this trail, and the name is the human's login
+    // identifier.
+    OauthAuditRecord::new(OauthEvent::LoginSucceeded)
+        .endpoint(OauthEndpoint::Login)
+        .account(account.id)
+        .from_address(source)
+        .detail(AuditDetail::LoginAccepted)
+        .emit();
     AuditEntry::new(
         submitted_account.as_str(),
         LOGIN_ACTION,
@@ -1356,9 +1423,20 @@ async fn post_consent(
     headers: HeaderMap,
     body: String,
 ) -> Response {
+    // Charged by the `charge_address_budget` layer before this handler ran —
+    // under the `Authorize` budget rather than one of its own, because consent
+    // and the page that leads to it are one human action, and separate budgets
+    // would let a flood of consent posts proceed while that page was throttled.
+    // This handler names no subject, so the address dimension is the whole of
+    // its limiting.
     let fields = match parse_body(&headers, &body) {
         Ok(fields) => fields,
         Err(reason) => {
+            OauthAuditRecord::new(OauthEvent::AuthorizationDenied)
+                .endpoint(OauthEndpoint::Authorize)
+                .reason(DenialReason::MalformedRequest)
+                .detail(AuditDetail::RefusedBeforeParsing)
+                .emit();
             return html_response(
                 StatusCode::BAD_REQUEST,
                 templates::error_page("Malformed request", reason),
@@ -1540,6 +1618,17 @@ async fn issue_code(
     {
         return internal_error();
     }
+
+    // The authorization DECISION, in OAuth vocabulary. The code itself never
+    // appears — the record names the account, the client row, and the fact that
+    // a code was issued, which is what an operator reconstructing "who granted
+    // this connector access, and when" actually needs.
+    OauthAuditRecord::new(OauthEvent::AuthorizationGranted)
+        .endpoint(OauthEndpoint::Authorize)
+        .account(account.id)
+        .client_uuid(request.client_row_id)
+        .detail(AuditDetail::AuthorizationCodeIssued)
+        .emit();
 
     redirect_response(&success_redirect(
         &request.redirect_uri,
