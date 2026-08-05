@@ -651,10 +651,11 @@ impl ClientService {
     /// model.
     pub async fn mint(
         &self,
+        actor: Uuid,
         owner: Uuid,
         metadata: &ValidatedMetadata,
     ) -> Result<MintedClient, ToolError> {
-        self.create(owner, metadata, RegistrationSource::Operator).await
+        self.create(actor, owner, metadata, RegistrationSource::Operator).await
     }
 
     /// RFC 7591 registration, having already spent an initial access token.
@@ -662,18 +663,24 @@ impl ClientService {
     /// Takes the issuing account as the owner: whoever minted the invitation
     /// owns what walks through it. The client lands with no scope rows, which
     /// is what "reaches nothing until an operator scopes it" means here.
+    /// The authorization here is the INITIAL ACCESS TOKEN, already spent by the
+    /// caller — an operator-minted, single-use, expiring invitation. The issuing
+    /// account is therefore both the actor and the owner: whoever minted the
+    /// invitation owns what walks through it, and no third party's name can be
+    /// attached to the result.
     pub async fn register_dynamic(
         &self,
         issued_by: Uuid,
         metadata: &ValidatedMetadata,
     ) -> Result<MintedClient, ToolError> {
-        self.create(issued_by, metadata, RegistrationSource::Dcr).await
+        self.create(issued_by, issued_by, metadata, RegistrationSource::Dcr).await
     }
 
     /// The one creation path. Both public entry points reach it, so a rule
     /// added here cannot apply to only one way in.
     async fn create(
         &self,
+        actor: Uuid,
         owner: Uuid,
         metadata: &ValidatedMetadata,
         source: RegistrationSource,
@@ -700,6 +707,7 @@ impl ClientService {
         let id = self
             .store
             .insert_client(
+                actor,
                 &client_id,
                 hash.as_ref(),
                 &metadata.name,

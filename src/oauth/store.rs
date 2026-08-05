@@ -320,8 +320,21 @@ impl OauthStore {
     /// (which is what Claude registers as), and an [`Argon2idHash`] otherwise —
     /// same enforcement-by-type as [`Self::insert_account`].
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// `actor_account_id` is the account CREATING the client, and it is
+    /// authorized inside this transaction: an operator may create a connector
+    /// owned by anyone, and anyone else only one owned by themselves (RMCP-08
+    /// review round 2).
+    ///
+    /// Without that check, naming another account as `owner` would be enough to
+    /// mint a connector in their name and then scope it to THEIR groups and
+    /// namespaces — because the scoping write authorizes against the client's
+    /// owner. It is the same defect class as the unauthorized edit, reached
+    /// through creation rather than through modification.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_client(
         &self,
+        actor_account_id: Uuid,
         client_id: &str,
         client_secret_hash: Option<&Argon2idHash>,
         name: &str,
@@ -332,7 +345,17 @@ impl OauthStore {
         registration_source: &str,
     ) -> Result<Uuid, ToolError> {
         let _scope_write = ScopeWrite::begin();
-        sqlx::query_scalar::<_, Uuid>(
+        let mut tx = self.pool.begin().await.map_err(db)?;
+
+        // `authorize_client_write` reads exactly this rule — operator, or the
+        // owner themselves — so creation and modification are decided by ONE
+        // function rather than two that could drift. The "client owner" it is
+        // given is the owner the caller asked for, which is what makes
+        // "creating a connector for somebody else" the operator-only case.
+        let actor = Self::actor_authority(&mut tx, actor_account_id).await?;
+        authorize_client_write(&actor, owner_account_id)?;
+
+        let id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO rmcp_client (client_id, client_secret_hash, name, redirect_uris, \
                                       grant_types, token_endpoint_auth_method, \
                                       owner_account_id, registration_source) \
@@ -346,9 +369,12 @@ impl OauthStore {
         .bind(token_endpoint_auth_method)
         .bind(owner_account_id)
         .bind(registration_source)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(unique_aware("a client with that client_id already exists"))
+        .map_err(unique_aware("a client with that client_id already exists"))?;
+
+        tx.commit().await.map_err(db)?;
+        Ok(id)
     }
 
     /// List the clients an account owns.

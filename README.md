@@ -1015,7 +1015,10 @@ sits on the cosmetic list, where forgetting an entry produces a **loud refusal**
 silent acceptance of a member whose meaning nobody checked.
 
 **Every administrative write is authorized, against RMCP-12's machinery rather than a second copy
-of it.** Each mutating tool names an `actor`; the store derives that account's `ActorAuthority`
+of it.** That includes creation: an operator may mint a connector owned by anyone, anyone else only
+one owned by themselves — without which, naming someone else as `owner` would mint a connector in
+their name and then scope it to *their* groups and namespaces, since the scoping write authorizes
+against the client's owner. Each mutating tool names an `actor`; the store derives that account's `ActorAuthority`
 inside the writing transaction under `FOR SHARE`, reads the client's owner under the same lock,
 and lets `authorize_client_write` decide — the operator may administer any connector, anyone else
 only their own. Minting or revoking an initial access token is operator-only

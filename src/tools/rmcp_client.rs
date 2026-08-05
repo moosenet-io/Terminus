@@ -235,6 +235,7 @@ impl RustTool for RmcpClientCreate {
         json!({
             "type": "object",
             "properties": {
+                "actor": { "type": "string", "description": "Account creating the connector. Creating one owned by a DIFFERENT account requires an operator." },
                 "owner": { "type": "string", "description": "Account name that will own this connector. Required — there is no default owner." },
                 "name": { "type": "string", "description": "Display name, shown to the human on the consent page." },
                 "redirect_uris": { "type": "array", "items": { "type": "string" }, "description": "Absolute https URIs, or RFC 8252 http loopback URIs. At least one." },
@@ -242,7 +243,7 @@ impl RustTool for RmcpClientCreate {
                 "tool_group_ids": { "type": "array", "items": { "type": "string" }, "description": "Tool groups to scope the connector to. Omit or leave empty and it reaches nothing." },
                 "namespaces": { "type": "array", "items": { "type": "string" }, "description": "Mesh namespaces the connector may see. Omit or leave empty and it reaches nothing." }
             },
-            "required": ["owner", "name", "redirect_uris"],
+            "required": ["actor", "owner", "name", "redirect_uris"],
             "additionalProperties": false
         })
     }
@@ -253,6 +254,7 @@ impl RustTool for RmcpClientCreate {
 
     async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let owner_name = required_str(&args, "owner")?;
+        let actor_name = required_str(&args, "actor")?;
         let confidential = args.get("confidential").and_then(Value::as_bool).unwrap_or(false);
         let submitted = SubmittedMetadata {
             name: args.get("name").and_then(Value::as_str).map(str::to_string),
@@ -269,7 +271,12 @@ impl RustTool for RmcpClientCreate {
 
         let service = self.source.service().await?;
         let owner = service.resolve_owner(&owner_name).await?;
-        let minted = service.mint(owner, &metadata).await?;
+        let actor = service.resolve_owner(&actor_name).await?;
+        // Authorized in the store's own transaction: an operator may create a
+        // connector owned by anyone, anyone else only one owned by themselves.
+        // Without that, naming another account as `owner` would mint a
+        // connector in their name and then scope it to THEIR groups.
+        let minted = service.mint(actor, owner, &metadata).await?;
         let id = minted.client.id;
 
         // Scoping is applied AFTER creation, through the same store methods the
@@ -281,7 +288,7 @@ impl RustTool for RmcpClientCreate {
         if group_ids.is_some() || namespaces.is_some() {
             if let Err(error) = service
                 .update(
-                    owner,
+                    actor,
                     id,
                     minted.client.version,
                     None,
@@ -620,7 +627,7 @@ impl RustTool for RmcpRegistrationTokenMint {
         json!({
             "type": "object",
             "properties": {
-                "owner": { "type": "string", "description": "Account that issues the token and will own whatever registers through it." },
+                "owner": { "type": "string", "description": "OPERATOR account that issues the token and will own whatever registers through it." },
                 "label": { "type": "string", "description": "A note for your own records, e.g. what it was minted for." },
                 "uses": { "type": "integer", "description": "How many registrations it may authorize. Defaults to 1." },
                 "ttl_seconds": { "type": "integer", "description": "Lifetime in seconds. Defaults to 3600." }
@@ -821,6 +828,7 @@ mod tests {
         let tool = RmcpClientCreate { source: source() };
         let error = tool
             .execute_structured(json!({
+                "actor": "an-operator",
                 "owner": "an-operator",
                 "name": "A connector",
                 "redirect_uris": ["http://distinctive-marker.test/cb"]
@@ -890,6 +898,15 @@ mod tests {
                 json!({ "id": client_id }),
             ),
             (
+                "rmcp_client_create",
+                Box::new(RmcpClientCreate { source: s.clone() }),
+                json!({
+                    "owner": "somebody-else",
+                    "name": "A connector",
+                    "redirect_uris": ["https://connector.test/cb"]
+                }),
+            ),
+            (
                 "rmcp_registration_token_mint",
                 Box::new(RmcpRegistrationTokenMint { source: s.clone() }),
                 json!({ "label": "x" }),
@@ -948,8 +965,8 @@ mod tests {
         // argument, on every mutating path.
         assert_eq!(
             src.matches("resolve_owner(&actor_name)").count(),
-            3,
-            "update, revoke and revoke-all must each resolve the actor the CALLER named"
+            4,
+            "create, update, revoke and revoke-all must each resolve the actor the CALLER named"
         );
     }
 
