@@ -1256,7 +1256,7 @@ pub struct Widget;
         // A UUID: the other key space, mapped to nothing.
         let out = KgFileSymbols
             .execute_structured(json!({
-                "project_id": "<uuid>",
+                "project_id": "<uuid>", // pii-test-fixture (fabricated uuid shape)
                 "path": "src/w.rs"
             }))
             .await

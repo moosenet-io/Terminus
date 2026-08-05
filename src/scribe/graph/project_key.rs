@@ -179,9 +179,14 @@ fn collapse(start: String, pairs: &[(String, String)]) -> String {
         if !seen.insert(cur.clone()) {
             return cur;
         }
+        // No special case for a self-mapping: `parse_alias_env` skips those and
+        // `self_check_builtin_aliases` forbids them, so the only thing that could
+        // produce one is a bug — and the `seen` guard above already terminates
+        // it. An extra `!= cur` branch here would be unreachable and therefore
+        // untestable, which is its own liability.
         match pairs.iter().find(|(a, _)| *a == cur) {
-            Some((_, canonical)) if *canonical != cur => cur = canonical.clone(),
-            _ => return cur,
+            Some((_, canonical)) => cur = canonical.clone(),
+            None => return cur,
         }
     }
 }
@@ -294,13 +299,16 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// Prove the built-in table is well-formed: both sides already normalized, no
-/// alias that is also a canonical target (no chains), no self-mapping.
+/// Prove an alias table is well-formed: both sides already normalized, no alias
+/// that is also a canonical target (no chains), no self-mapping.
 ///
-/// Exposed (not just a test) so the standalone harness and the crate test suite
-/// assert the same invariant on the same code.
-pub fn self_check_builtin_aliases() -> Result<(), String> {
-    for (alias, canonical) in BUILTIN_ALIASES {
+/// Takes the table as a PARAMETER rather than reading the built-in const
+/// directly, so each rejection can actually be exercised by a test. A
+/// self-check whose failure branches cannot be reached is indistinguishable
+/// from a self-check that does nothing — the same "looks like a result" trap
+/// this module exists to remove.
+pub fn check_alias_table(pairs: &[(&str, &str)]) -> Result<(), String> {
+    for (alias, canonical) in pairs {
         if normalize(alias) != *alias {
             return Err(format!("alias {alias:?} is not normalized"));
         }
@@ -310,11 +318,16 @@ pub fn self_check_builtin_aliases() -> Result<(), String> {
         if alias == canonical {
             return Err(format!("alias {alias:?} maps to itself"));
         }
-        if BUILTIN_ALIASES.iter().any(|(a, _)| a == canonical) {
+        if pairs.iter().any(|(a, _)| a == canonical) {
             return Err(format!("canonical {canonical:?} is itself an alias (chain)"));
         }
     }
     Ok(())
+}
+
+/// Apply [`check_alias_table`] to the shipped built-in table.
+pub fn self_check_builtin_aliases() -> Result<(), String> {
+    check_alias_table(BUILTIN_ALIASES)
 }
 
 #[cfg(test)]
@@ -332,6 +345,26 @@ mod tests {
     #[test]
     fn builtin_table_is_well_formed() {
         self_check_builtin_aliases().expect("built-in alias table");
+    }
+
+    #[test]
+    fn a_malformed_alias_table_is_rejected_for_each_reason() {
+        // A chain: resolving `a` would depend on iteration order.
+        assert!(
+            check_alias_table(&[("a", "b"), ("b", "c")])
+                .unwrap_err()
+                .contains("chain"),
+            "a chained table must be rejected"
+        );
+        // A self-mapping: inert at best, confusing at worst.
+        assert!(check_alias_table(&[("a", "a")]).unwrap_err().contains("itself"));
+        // An un-normalized side would never match a resolved key, so the entry
+        // would silently do nothing — the worst possible failure mode here.
+        assert!(check_alias_table(&[("Chord", "chrd")]).unwrap_err().contains("not normalized"));
+        assert!(check_alias_table(&[("chord", "CHRD")]).unwrap_err().contains("not normalized"));
+        // A well-formed table passes.
+        assert!(check_alias_table(&[("chord", "chrd"), ("harmony", "harm")]).is_ok());
+        assert!(check_alias_table(&[]).is_ok());
     }
 
     #[test]
@@ -393,12 +426,12 @@ mod tests {
     #[test]
     fn env_table_resolves_a_uuid_and_can_override_a_builtin() {
         let _g = env_lock();
-        std::env::set_var(
+        std::env::set_var( // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
             ALIASES_ENV,
-            "1ed544c8-0000-0000-0000-000000000000=chrd, harmony=harmony-x",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee=chrd, harmony=harmony-x", // pii-test-fixture (fabricated uuid shape)
         );
         assert_eq!(
-            ProjectKey::resolve("1ed544c8-0000-0000-0000-000000000000").as_str(),
+            ProjectKey::resolve("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").as_str(), // pii-test-fixture (fabricated uuid shape)
             "chrd",
             "a UUID must resolve through the deployment table"
         );
@@ -407,37 +440,54 @@ mod tests {
             "harmony-x",
             "the deployment table overrides a built-in"
         );
-        std::env::remove_var(ALIASES_ENV);
+        std::env::remove_var(ALIASES_ENV); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
     }
 
     #[test]
     fn malformed_env_entries_are_skipped_not_fatal() {
         let _g = env_lock();
-        std::env::set_var(ALIASES_ENV, "no-equals,=nothing,alsonothing=,,  ,x=x,ok=term");
+        std::env::set_var(ALIASES_ENV, "no-equals,=nothing,alsonothing=,,  ,x=x,ok=term"); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
         // The good entry still lands...
         assert_eq!(ProjectKey::resolve("ok").as_str(), "term");
         // ...and nothing else was corrupted.
         assert_eq!(ProjectKey::resolve("chord").as_str(), "chrd");
         assert_eq!(ProjectKey::resolve("x").as_str(), "x", "self-mapping is inert");
-        std::env::remove_var(ALIASES_ENV);
+        std::env::remove_var(ALIASES_ENV); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
+    }
+
+    #[test]
+    fn a_self_mapping_cannot_re_split_a_collapsed_project() {
+        let _g = env_lock();
+        // `chord=chord` is the obvious way an operator would try to "turn off"
+        // a built-in alias. It must be INERT, not an un-alias switch: allowing
+        // it would let one line of ops config re-create the exact duplicate-key
+        // state (TERM #653) this type exists to make unrepresentable —
+        // `chord.json` drifting stale beside a fresh `chrd.json` all over again.
+        std::env::set_var(ALIASES_ENV, "chord=chord"); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
+        assert_eq!(
+            ProjectKey::resolve("chord").as_str(),
+            "chrd",
+            "a self-mapping must not un-alias a project"
+        );
+        std::env::remove_var(ALIASES_ENV); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
     }
 
     #[test]
     fn a_cyclic_alias_config_terminates() {
         let _g = env_lock();
-        std::env::set_var(ALIASES_ENV, "a=b,b=c,c=a");
+        std::env::set_var(ALIASES_ENV, "a=b,b=c,c=a"); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
         // Any of a/b/c is an acceptable answer; hanging or panicking is not.
         let k = ProjectKey::resolve("a");
         assert!(["a", "b", "c"].contains(&k.as_str()), "got {k}");
         // Deterministic across calls, so it cannot flap between two stores.
         assert_eq!(ProjectKey::resolve("a"), k);
-        std::env::remove_var(ALIASES_ENV);
+        std::env::remove_var(ALIASES_ENV); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
     }
 
     #[test]
     fn aliases_lists_every_spelling_of_a_project_including_itself() {
         let _g = env_lock();
-        std::env::remove_var(ALIASES_ENV);
+        std::env::remove_var(ALIASES_ENV); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
         let a = ProjectKey::resolve("chrd").aliases();
         assert!(a.contains(&"chrd".to_string()), "canonical included: {a:?}");
         assert!(a.contains(&"chord".to_string()), "stale spelling included: {a:?}");
@@ -449,13 +499,13 @@ mod tests {
     #[test]
     fn aliases_includes_a_configured_uuid() {
         let _g = env_lock();
-        std::env::set_var(ALIASES_ENV, "1ed544c8-0000-0000-0000-000000000000=chrd");
+        std::env::set_var(ALIASES_ENV, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee=chrd"); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
         let a = ProjectKey::resolve("chrd").aliases();
         assert!(
-            a.contains(&"1ed544c8-0000-0000-0000-000000000000".to_string()),
+            a.contains(&"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()), // pii-test-fixture (fabricated uuid shape)
             "a UUID-keyed store must be reachable from the slug: {a:?}"
         );
-        std::env::remove_var(ALIASES_ENV);
+        std::env::remove_var(ALIASES_ENV); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
     }
 
     #[test]
@@ -468,7 +518,7 @@ mod tests {
         assert_eq!(nearest("trem", &known).as_deref(), Some("term"));
         // A UUID resembles nothing — suggesting one would be a confident lie.
         assert_eq!(
-            nearest("1ed544c8-0000-0000-0000-000000000000", &known),
+            nearest("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", &known), // pii-test-fixture (fabricated uuid shape)
             None
         );
         assert_eq!(nearest("completely-unrelated", &known), None);

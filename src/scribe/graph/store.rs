@@ -273,6 +273,20 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The part of a source file BEFORE its `#[cfg(test)]` module.
+    ///
+    /// Both ratchets below scan production code only. Test code legitimately
+    /// mentions the very things they ban — the slugify-equivalence test calls
+    /// `slugify` on purpose, and the key-miss test asserts the banned sentence
+    /// is ABSENT by naming it. Scanning tests too would make the ratchets fire
+    /// on the tests that prove they work.
+    fn non_test_source(body: &str) -> &str {
+        match body.find("#[cfg(test)]") {
+            Some(i) => &body[..i],
+            None => body,
+        }
+    }
+
     // ── TERM #652 / #653: one canonical key per project ────────────────────
 
     /// The normalization that names graph files MUST stay byte-identical to the
@@ -287,8 +301,7 @@ mod tests {
         for input in [
             "TERM", "term", "CHRD", "chrd", "chord", "Chord", "harmony", "harm",
             "lumina", "lum", "terminus", "muse", "rail", "aptr",
-            "1ed544c8-0000-0000-0000-000000000000",
-            "39dde959-dc91-43de-8bb4-e679e79c710e",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", // pii-test-fixture (fabricated uuid shape)
             "My Proj", "  Foo   Bar  ", "S91-scribe-knowledge-infrastructure",
             "../../etc/passwd", "a/b", "..", ".", "Hello, World!",
             "Модуль", "🎉🎊", "",
@@ -314,7 +327,7 @@ mod tests {
             if path.extension().map(|e| e != "rs").unwrap_or(true) {
                 continue;
             }
-            let body = fs::read_to_string(&path).expect("read kg source");
+            let body = non_test_source(&fs::read_to_string(&path).expect("read kg source"));
             for (i, line) in body.lines().enumerate() {
                 let code = line.split("//").next().unwrap_or("");
                 if code.contains("slugify(") {
@@ -341,7 +354,7 @@ mod tests {
             if path.extension().map(|e| e != "rs").unwrap_or(true) {
                 continue;
             }
-            let body = fs::read_to_string(&path).expect("read kg source");
+            let body = non_test_source(&fs::read_to_string(&path).expect("read kg source"));
             for (i, line) in body.lines().enumerate() {
                 let code = line.split("//").next().unwrap_or("");
                 if code.contains("no knowledge graph for this project") {
@@ -412,6 +425,7 @@ mod tests {
     /// A UUID resolves to the project's graph once the deployment alias table
     /// maps it — this is TERM #652's headline case.
     #[test]
+    #[serial_test::serial]
     fn a_configured_uuid_reads_the_projects_graph() {
         use crate::scribe::graph::project_key::ALIASES_ENV;
         let root = tmp_root("uuid");
@@ -419,7 +433,7 @@ mod tests {
         let store = GraphStore::new(&root);
         store.save("chrd", &sample("chrd")).unwrap();
 
-        let uuid = "1ed544c8-0000-0000-0000-000000000000";
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"; // pii-test-fixture (fabricated uuid shape)
         assert!(store.load(uuid).unwrap().is_none(), "unmapped UUID: honest miss");
 
         std::env::set_var(ALIASES_ENV, format!("{uuid}=chrd"));
