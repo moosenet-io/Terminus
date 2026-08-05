@@ -541,13 +541,18 @@ built, and which visual artifacts exist. Returns found:false if no graph has bee
             // Never say "no graph for this project" — say which KEY missed and
             // which keys exist (TERM #652).
             let key = ProjectKey::resolve(&project_id);
-            let known = store.stored_keys();
+            let known = store.canonical_stored_keys();
             let suggestion = super::project_key::nearest(&project_id, &known);
             return Ok(structured(json!({
                 "project_id": project_id, "found": false,
                 "graph_key": key.to_string(),
+                "error": format!(
+                    "unknown project key '{project_id}' (resolved to '{key}') — no graph is stored under that key"
+                ),
+                "message": "the KEY did not resolve to a stored graph; this does NOT mean the project has no knowledge graph. Retry with one of known_keys, or set SCRIBE_KG_PROJECT_ALIASES to map this identifier to its canonical key.",
                 "known_keys": known,
                 "did_you_mean": suggestion,
+                "orphaned_alias_graphs": store.orphaned_alias_keys(),
             })));
         };
         let slug = ProjectKey::resolve(&project_id).to_string();

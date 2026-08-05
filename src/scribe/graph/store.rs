@@ -75,6 +75,16 @@ impl GraphStore {
             .and_then(|m| m.modified().ok())
     }
 
+    /// The stored keys that are canonical — i.e. the keys a caller can retry
+    /// with and actually get an answer. Suggesting anything else reproduces the
+    /// same miss.
+    pub fn canonical_stored_keys(&self) -> Vec<String> {
+        self.stored_keys()
+            .into_iter()
+            .filter(|k| ProjectKey::resolve(k).as_str() == k)
+            .collect()
+    }
+
     /// Store files whose name is NOT its own canonical key — i.e. graphs left
     /// behind by a spelling that now collapses elsewhere (`chord.json` after
     /// `chord` began resolving to `chrd`).
@@ -90,12 +100,14 @@ impl GraphStore {
             .collect()
     }
 
-    /// Every canonical key that currently has a stored graph, sorted.
+    /// Every stored graph FILE's key, sorted — canonical entries AND any
+    /// orphaned alias files. This is the raw on-disk inventory; use
+    /// [`Self::canonical_stored_keys`] for the set a caller can usefully retry
+    /// with. (The docstring previously claimed "every canonical key", which it
+    /// never filtered for — caught in review.)
     ///
-    /// Used to answer a key miss with the truth ("these keys exist") instead of
-    /// the falsehood TERM #652 was filed for ("no knowledge graph for this
-    /// project"). An unreadable store root yields an EMPTY list, never an
-    /// error — a diagnostic must not itself fail.
+    /// An unreadable store root yields an EMPTY list, never an error — a
+    /// diagnostic must not itself fail.
     pub fn stored_keys(&self) -> Vec<String> {
         let Ok(rd) = fs::read_dir(&self.root) else {
             return Vec::new();
@@ -116,15 +128,39 @@ impl GraphStore {
     /// Load a project's graph, or `None` if it has never been saved. A missing
     /// file is not an error.
     pub fn load(&self, project_id: &str) -> Result<Option<KnowledgeGraph>, ToolError> {
+        Ok(self.load_with_mtime(project_id)?.map(|(g, _)| g))
+    }
+
+    /// Load a graph together with the modification time OF THE VERY FILE THE
+    /// CONTENTS CAME FROM.
+    ///
+    /// Contents and timestamp are taken from ONE open handle, not from a read
+    /// followed by a separate `stat`. Review finding (codex): saves are atomic
+    /// renames, so a concurrent rebuild between a read and a later stat would
+    /// pair OLD contents with the NEW file's timestamp — reporting stale data
+    /// as fresh. Freshness metadata that can lie is worse than none, since the
+    /// entire point of it is to make staleness visible.
+    pub fn load_with_mtime(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<(KnowledgeGraph, Option<std::time::SystemTime>)>, ToolError> {
         let path = self.path_for(&ProjectKey::resolve(project_id));
-        match fs::read_to_string(&path) {
-            Ok(s) => KnowledgeGraph::from_json(&s).map(Some),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(ToolError::Execution(format!(
-                "read graph {}: {e}",
-                path.display()
-            ))),
-        }
+        let mut file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(ToolError::Execution(format!(
+                    "open graph {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        let mtime = file.metadata().ok().and_then(|m| m.modified().ok());
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut file, &mut buf).map_err(|e| {
+            ToolError::Execution(format!("read graph {}: {e}", path.display()))
+        })?;
+        Ok(Some((KnowledgeGraph::from_json(&buf)?, mtime)))
     }
 
     /// Save a project's graph atomically (temp file in the same dir + rename, so
@@ -393,6 +429,48 @@ mod tests {
         assert!(s2.orphaned_alias_keys().is_empty());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&root2);
+    }
+
+    /// A key miss must never suggest a key that reproduces the same miss.
+    #[test]
+    fn a_suggestion_is_only_ever_a_key_that_actually_answers() {
+        let root = tmp_root("suggest");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let store = GraphStore::new(&root);
+        // ONLY an orphaned alias file exists — no canonical graph at all.
+        fs::write(root.join("chord.json"), sample("chord").to_json_pretty().unwrap()).unwrap();
+
+        assert_eq!(store.stored_keys(), vec!["chord".to_string()], "raw inventory");
+        assert!(
+            store.canonical_stored_keys().is_empty(),
+            "an orphan is not a key anyone can usefully retry"
+        );
+        assert_eq!(store.orphaned_alias_keys(), vec!["chord".to_string()]);
+        // And it genuinely does not answer, so offering it would be a loop.
+        assert!(store.load("chord").unwrap().is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Freshness metadata must describe the bytes actually returned.
+    #[test]
+    fn load_reports_the_mtime_of_the_file_the_contents_came_from() {
+        let root = tmp_root("mtime");
+        let _ = fs::remove_dir_all(&root);
+        let store = GraphStore::new(&root);
+        store.save("chrd", &sample("chrd")).unwrap();
+
+        let (g, mtime) = store.load_with_mtime("chrd").unwrap().expect("graph");
+        assert_eq!(g.node_count(), 2);
+        let mtime = mtime.expect("mtime present alongside contents");
+        // It matches the canonical file, and is reachable via the alias too.
+        let direct = fs::metadata(root.join("chrd.json")).unwrap().modified().unwrap();
+        assert_eq!(mtime, direct);
+        let (_, via_alias) = store.load_with_mtime("chord").unwrap().expect("via alias");
+        assert_eq!(via_alias.unwrap(), direct);
+        // A missing graph yields no pair at all — never a fabricated timestamp.
+        assert!(store.load_with_mtime("no-such-project").unwrap().is_none());
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// SOURCE-LEVEL RATCHET. The duplicate-key bug is only fixed for as long as

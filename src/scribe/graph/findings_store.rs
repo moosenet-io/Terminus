@@ -369,7 +369,7 @@ impl FindingsStore {
         let mut sql = String::from(
             "SELECT id, project_id, category, severity, scope_kind, scope_ref, description, \
              provenance, first_seen, last_seen, occurrences, crystallize_state \
-             FROM kg_findings WHERE project_id = ANY($1)",
+             FROM kg_findings WHERE project_id = ANY($1) OR lower(project_id) = ANY($1)",
         );
 
         let mut idx = 1;
@@ -397,6 +397,16 @@ impl FindingsStore {
         // includes the caller's RAW string, so whatever `= $1` used to match is
         // still matched. Binding only the normalized aliases silently dropped
         // every row recorded under "TERM" — caught in review.
+        //
+        // The `lower(project_id)` arm closes the remaining asymmetry (round 3):
+        // rows recorded under `"TERM"` were reachable from `list("TERM")` but
+        // NOT from `list("term")`, `list("terminus")`, or a UUID mapped to
+        // `term` — so "both key spaces answer" only held if you happened to
+        // guess the historical spelling. The alias set is already normalized
+        // (lowercase), and real project ids are ASCII alphanumeric or UUIDs, so
+        // comparing the row's lowercased id against that set makes the match
+        // symmetric. It is still purely additive: the `= ANY($1)` arm alone
+        // preserves every row the original `= $1` found.
         let keys = super::project_key::lookup_keys(project_id);
         let mut query = sqlx::query(&sql).bind(keys);
         if let Some(sk) = scope_kind {

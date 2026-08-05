@@ -79,10 +79,24 @@ impl LoadedGraph {
         // to whoever introduces it.
         let mut out = Value::Object(obj.clone());
         for key in PROVENANCE_FIELDS {
-            debug_assert!(
-                !obj.contains_key(*key),
-                "kg_* payload must not define the provenance field {key:?}"
-            );
+            if obj.contains_key(*key) {
+                // Report it, do not panic. This was a `debug_assert!`, which
+                // made the behaviour PROFILE-DEPENDENT: a debug `cargo test`
+                // aborted while the release build silently corrected — and the
+                // compiler gate builds release, so the gate could not see that
+                // the accompanying test aborts under a normal `cargo test`
+                // (verified: identical code panics in debug, returns in
+                // release). A guard whose behaviour differs between the profile
+                // you gate on and the profile a developer runs is exactly the
+                // "signal that stopped discriminating" defect this change is
+                // about, so the behaviour is now identical everywhere:
+                // provenance wins, and the collision is surfaced in the log.
+                tracing::warn!(
+                    field = *key,
+                    tool_key = %self.key,
+                    "kg_* payload defined a provenance field; provenance takes precedence"
+                );
+            }
         }
         out["project_id"] = json!(self.requested);
         out["graph_key"] = json!(self.key.to_string());
@@ -129,12 +143,16 @@ fn age_seconds(t: std::time::SystemTime) -> Option<u64> {
 fn load_graph(project_id: &str) -> Result<Option<LoadedGraph>, ToolError> {
     let store = GraphStore::from_config(&ScribeConfig::from_env());
     let key = GraphStore::key_for(project_id);
-    Ok(store.load(project_id)?.map(|graph| LoadedGraph {
-        requested: project_id.to_string(),
-        key,
-        graph,
-        built_at: store.built_at(project_id),
-    }))
+    // ONE open: contents and mtime come from the same inode, so a concurrent
+    // atomic save can never pair old contents with a new timestamp.
+    Ok(store
+        .load_with_mtime(project_id)?
+        .map(|(graph, built_at)| LoadedGraph {
+            requested: project_id.to_string(),
+            key,
+            graph,
+            built_at,
+        }))
 }
 
 /// Pull a required non-empty string argument.
@@ -161,7 +179,12 @@ fn req_str(args: &Value, key: &str) -> Result<String, ToolError> {
 fn key_miss(project_id: &str) -> Value {
     let store = GraphStore::from_config(&ScribeConfig::from_env());
     let key = GraphStore::key_for(project_id);
-    let known = store.stored_keys();
+    // Suggest only CANONICAL keys. Review finding (codex, verified): with only
+    // an orphaned `chord.json` present, `known_keys`/`did_you_mean` offered
+    // "chord" — but retrying "chord" resolves to the missing "chrd" and misses
+    // again. A suggestion that reproduces the same miss is worse than none.
+    let known = store.canonical_stored_keys();
+    let orphaned = store.orphaned_alias_keys();
     let suggestion = project_key::nearest(project_id, &known);
     json!({
         "project_id": project_id,
@@ -172,7 +195,8 @@ fn key_miss(project_id: &str) -> Value {
         ),
         "known_keys": known,
         "did_you_mean": suggestion,
-        "orphaned_alias_graphs": store.orphaned_alias_keys(),
+        "orphaned_alias_graphs": orphaned,
+        "rejected_alias_config": project_key::invalid_alias_entries(),
         "message": "the KEY did not resolve to a stored graph; this does NOT mean the project has no knowledge graph. Retry with one of known_keys, or set SCRIBE_KG_PROJECT_ALIASES to map this identifier to its canonical key.",
     })
 }
@@ -1380,11 +1404,13 @@ pub struct Widget;
             .unwrap();
         let v = val(out);
         assert_eq!(v["graph_key"], "clobber");
-        // Directly exercise the choke point with a hostile payload.
+        // Directly exercise the choke point with a hostile payload. This must
+        // behave IDENTICALLY under debug and release — it previously aborted
+        // under debug_assertions, which the release-profile gate could not see.
         let loaded = load_graph("CLOBBER").unwrap().expect("graph");
         let out = loaded
             .ok(json!({"graph_key": "WRONG", "found": false, "project_id": "WRONG", "count": 1}))
-            .unwrap();
+            .expect("a colliding payload must be corrected, never abort");
         let v = val(out);
         assert_eq!(v["graph_key"], "clobber", "provenance must win: {v}");
         assert_eq!(v["project_id"], "CLOBBER", "provenance must win: {v}");

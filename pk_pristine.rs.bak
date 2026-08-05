@@ -335,15 +335,9 @@ pub fn invalid_alias_entries() -> Vec<String> {
 /// Parse `alias=canonical` pairs separated by `,` or whitespace.
 ///
 /// Fail-soft: an entry with no `=`, an empty side, or a side that normalizes
-/// away entirely is SKIPPED. Both sides are normalized so an operator can write
-/// `Chord=CHRD` and get the same table as `chord=chrd`.
-///
-/// A self-mapping (`x=x`) is deliberately NOT special-cased here: it is a
-/// 1-cycle, and `drop_cyclic_components` already discards it by the same rule
-/// that discards any other cycle. A dedicated skip was redundant once cycles
-/// were dropped — a mutant proved no test could distinguish it — and it also
-/// suppressed the entry from `invalid_alias_entries`, hiding a bad config line
-/// from the operator who wrote it.
+/// away entirely is SKIPPED. A self-mapping (`x=x`) is skipped too — it is
+/// inert, and keeping it would only add a no-op hop. Both sides are normalized
+/// so an operator can write `Chord=CHRD` and get the same table as `chord=chrd`.
 pub fn parse_alias_env(raw: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for entry in raw.split(|c: char| c == ',' || c.is_whitespace()) {
@@ -361,6 +355,9 @@ pub fn parse_alias_env(raw: &str) -> Vec<(String, String)> {
         let canonical = normalize(canonical);
         if alias.starts_with("untitled-") || canonical.starts_with("untitled-") {
             // Nothing alphanumeric on one side — not a usable key.
+            continue;
+        }
+        if alias == canonical {
             continue;
         }
         out.push((alias, canonical));
@@ -597,42 +594,6 @@ mod tests {
         // ...and nothing else was corrupted.
         assert_eq!(ProjectKey::resolve("chord").as_str(), "chrd");
         assert_eq!(ProjectKey::resolve("x").as_str(), "x", "self-mapping is inert");
-        std::env::remove_var(ALIASES_ENV); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
-    }
-
-    #[test]
-    fn collapse_terminates_on_a_cyclic_table_reached_by_any_other_route() {
-        // `alias_pairs` discards cycles, so this cannot arrive through config —
-        // but `collapse` must still be non-looping on its own terms, because a
-        // hang in key resolution takes down every kg_* read. Exercised directly
-        // rather than left as an unreachable, untestable backstop (a mutant
-        // showed the public API could no longer distinguish it).
-        let cyclic: Vec<(String, String)> = [("a", "b"), ("b", "c"), ("c", "a")]
-            .iter()
-            .map(|(x, y)| (x.to_string(), y.to_string()))
-            .collect();
-        let got = collapse("a".to_string(), &cyclic);
-        assert!(["a", "b", "c"].contains(&got.as_str()), "terminates, got {got}");
-        // Deterministic, and it does not invent a key outside the cycle.
-        assert_eq!(collapse("a".to_string(), &cyclic), got);
-
-        // A self-mapping is a 1-cycle and must also terminate.
-        let selfmap = vec![("x".to_string(), "x".to_string())];
-        assert_eq!(collapse("x".to_string(), &selfmap), "x");
-    }
-
-    #[test]
-    fn a_self_mapping_is_discarded_as_a_cycle_and_reported() {
-        let _g = env_lock();
-        // Not a built-in, so it reaches the cycle logic rather than the
-        // built-in-immutability guard.
-        std::env::set_var(ALIASES_ENV, "solo=solo"); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
-        assert_eq!(ProjectKey::resolve("solo").as_str(), "solo", "inert");
-        let bad = invalid_alias_entries();
-        assert!(
-            bad.iter().any(|e| e.starts_with("solo=") && e.contains("cycle")),
-            "a self-mapping must be reported, not silently swallowed: {bad:?}"
-        );
         std::env::remove_var(ALIASES_ENV); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
     }
 
