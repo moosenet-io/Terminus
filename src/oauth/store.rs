@@ -26,8 +26,8 @@ use uuid::Uuid;
 
 use crate::error::ToolError;
 use crate::oauth::delegation::{
-    authorize_client_write, authorize_namespace_scoping, ActorAuthority, DelegationChange,
-    DelegationGrant, DelegationRevocation, DelegationStore,
+    authorize_client_write, authorize_namespace_scoping, reverify_delegation_change,
+    ActorAuthority, DelegationChange, DelegationGrant, DelegationRevocation, DelegationStore,
 };
 use crate::oauth::groups::{
     normalize_description, validate_group, validate_patterns, AuthorizedGroup, Pattern,
@@ -428,14 +428,7 @@ impl OauthStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         account_id: Uuid,
     ) -> Result<ActorAuthority, ToolError> {
-        let is_operator = sqlx::query_scalar::<_, bool>(
-            "SELECT is_operator FROM rmcp_account WHERE id = $1 AND NOT disabled FOR SHARE",
-        )
-        .bind(account_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(db)?
-        .ok_or_else(|| ToolError::NotFound("no such active account".into()))?;
+        let is_operator = Self::locked_active_account(tx, account_id).await?;
         let owned = sqlx::query_scalar::<_, String>(
             "SELECT namespace FROM rmcp_server_owner WHERE owner_account_id = $1 \
              ORDER BY namespace FOR SHARE",
@@ -445,6 +438,31 @@ impl OauthStore {
         .await
         .map_err(db)?;
         Ok(ActorAuthority::from_live_state(account_id, is_operator, owned))
+    }
+
+    /// Read an account's operator flag, requiring it to be ACTIVE, and hold the
+    /// row for the rest of the transaction.
+    ///
+    /// `FOR SHARE` is the whole point: it is what makes the answer true at
+    /// COMMIT and not merely true when it was read. Every authorization that
+    /// depends on account state goes through here, so there is one place where
+    /// "is this account allowed, right now, and will it still be when this
+    /// write lands" is answered.
+    ///
+    /// A missing or disabled account is [`ToolError::NotFound`] with one shared
+    /// message — not two, and not a downgrade to a less privileged authority.
+    async fn locked_active_account(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        account_id: Uuid,
+    ) -> Result<bool, ToolError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT is_operator FROM rmcp_account WHERE id = $1 AND NOT disabled FOR SHARE",
+        )
+        .bind(account_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db)?
+        .ok_or_else(|| ToolError::NotFound("no such active account".into()))
     }
 
     /// The authority of the account that OWNS a client, derived in the same
@@ -1867,6 +1885,23 @@ impl OauthStore {
         let owner_account_id = grant.grantee();
         let _scope_write = ScopeWrite::begin();
         let mut tx = self.pool.begin().await.map_err(db)?;
+
+        // RE-VERIFY, under lock, inside the writing transaction (round 2).
+        // The proof establishes that the check ran; these two reads establish
+        // that it still HOLDS at commit. Without them an operator demoted or
+        // disabled between minting the proof and this statement could still
+        // complete the grant — and that window is exactly the moment an
+        // operator is racing to cut off a compromised account.
+        let live_actor = Self::actor_authority(&mut tx, grant.actor()).await?;
+        reverify_delegation_change(grant.actor(), &live_actor)?;
+        // The GRANTEE's active status is equally point-in-time: the service
+        // checked it before the transaction opened. Locked here so a delegation
+        // cannot land on an account that was disabled in the meantime — the
+        // read path would refuse it anyway (`client_namespaces` joins the
+        // owner's account), so this stops the row existing rather than stopping
+        // it working.
+        Self::locked_active_account(&mut tx, owner_account_id).await?;
+
         let previous = sqlx::query_scalar::<_, Uuid>(
             "SELECT owner_account_id FROM rmcp_server_owner WHERE namespace = $1 FOR UPDATE",
         )
@@ -1982,6 +2017,15 @@ impl OauthStore {
         let namespace = revocation.namespace();
         let _scope_write = ScopeWrite::begin();
         let mut tx = self.pool.begin().await.map_err(db)?;
+
+        // Re-verified under lock, exactly as in `set_server_owner` and for the
+        // same reason. There is no "but this one only narrows" exemption: a
+        // revocation is an administrative action on someone else's access, and
+        // an account that has just been disabled must not be able to complete
+        // one on a proof it minted a moment earlier.
+        let live_actor = Self::actor_authority(&mut tx, revocation.actor()).await?;
+        reverify_delegation_change(revocation.actor(), &live_actor)?;
+
         sqlx::query("DELETE FROM rmcp_server_owner WHERE namespace = $1")
             .bind(namespace)
             .execute(&mut *tx)
@@ -2701,6 +2745,67 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
                  matching nothing and would pass whatever it was given"
             );
         }
+    }
+
+    /// **Both delegation mutators must RE-VERIFY the actor inside their own
+    /// transaction** (round 2).
+    ///
+    /// The proof value they take establishes that the operator check ran; it
+    /// cannot establish that it still holds at commit, because an account can be
+    /// demoted or disabled in between. The re-read is the thing that closes
+    /// that, and it is precisely the kind of code a later reader deletes as
+    /// redundant — it looks like a second copy of a check that already happened.
+    ///
+    /// A text guard for the same reason the disabled-owner guard is one: the
+    /// property is "this SQL ran under a lock in this transaction", which no
+    /// unit test can observe without a database. `delegation`'s own tests prove
+    /// the RULE refuses a stale proof; this proves the mutators actually ask it.
+    ///
+    /// Mutation-verify: delete either `reverify_delegation_change` call and this
+    /// goes red naming that function.
+    #[test]
+    fn both_delegation_mutators_re_verify_the_actor_under_lock() {
+        let file = include_str!("store.rs");
+        let production = file.split("#[cfg(test)]").next().expect("file has a production half");
+
+        for function in ["set_server_owner", "clear_server_owner"] {
+            let start = production
+                .find(&format!("async fn {function}("))
+                .unwrap_or_else(|| panic!("fn {function} not found; has it been renamed?"));
+            // The body runs to the next `\n    async fn ` / `\n    pub ` at the
+            // same indentation, which is enough to bound one method.
+            let rest = &production[start..];
+            let end = rest[1..]
+                .find("\n    /// ")
+                .map(|i| i + 1)
+                .unwrap_or(rest.len());
+            let body: String = rest[..end]
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            assert!(
+                body.contains("Self::actor_authority(&mut tx,"),
+                "fn {function} must re-read the actor's authority INSIDE its transaction — a \
+                 proof minted before a demotion must not authorize a write after it"
+            );
+            assert!(
+                body.contains("reverify_delegation_change("),
+                "fn {function} must re-verify the proof against that live authority; the proof \
+                 alone only establishes that the check RAN, never that it still holds"
+            );
+        }
+
+        // The grantee's active status is re-read under lock too, and only the
+        // grant path has a grantee.
+        let grant_start = production.find("async fn set_server_owner(").unwrap();
+        let grant_body = &production[grant_start..(grant_start + 4000).min(production.len())];
+        assert!(
+            grant_body.contains("Self::locked_active_account(&mut tx, owner_account_id)"),
+            "set_server_owner must re-check the GRANTEE under lock; its active status was \
+             established before the transaction opened and can change under it"
+        );
     }
 
     /// The operator flag is an AUTHORIZATION input, so a deploy that is missing

@@ -328,6 +328,53 @@ pub fn authorize_delegation_change(actor: &ActorAuthority) -> Result<(), ToolErr
     ))
 }
 
+/// Re-verify a delegation proof against the actor's LIVE authority, read inside
+/// the writing transaction.
+///
+/// ## Why a proof is not enough on its own
+///
+/// Round 2 of review found the gap, and it is this item's own defect class
+/// arriving inside the mechanism built to prevent it. A [`DelegationGrant`]
+/// proves the check RAN; it does not prove the check still HOLDS. Between
+/// [`ActorAuthority::resolve`] and the store's commit, the actor can be demoted
+/// or disabled — and that window is not hypothetical, it is precisely the
+/// moment someone is racing an operator who is cutting off a compromised
+/// account.
+///
+/// A value that proves "authorized at some earlier point" is exactly the
+/// stale-snapshot shape this module refuses everywhere else. RMCP-01 hit the
+/// identical shape on namespace ownership and closed it the same way: re-read
+/// under `FOR SHARE` inside the writing transaction, so the authority cannot
+/// move between the check and the commit.
+///
+/// Two things are asserted, and both matter:
+///
+/// 1. **The live authority is for the SAME account the proof names.** Otherwise
+///    a proof minted by an operator could be re-verified against some other
+///    account that happens to be an operator, which would make the re-check a
+///    formality.
+/// 2. **That account is STILL an operator and still enabled** — the same
+///    predicate as the mint, via [`authorize_delegation_change`], so there is
+///    one rule, evaluated twice against two different reads, rather than two
+///    rules that could drift.
+///
+/// The store passes an authority derived by its own locking helper, so "live"
+/// here means locked-for-the-rest-of-the-transaction, not merely recent.
+pub fn reverify_delegation_change(
+    proof_actor: Uuid,
+    live: &ActorAuthority,
+) -> Result<(), ToolError> {
+    if live.account_id() != proof_actor {
+        // Not an authorization failure so much as a wiring failure, and it is
+        // refused rather than tolerated: a re-check against the wrong account
+        // proves nothing at all.
+        return Err(ToolError::InvalidArgument(
+            "the delegation authorization does not belong to the account being re-verified".into(),
+        ));
+    }
+    authorize_delegation_change(live)
+}
+
 /// Emit the one audit shape a refusal produces. Closed vocabulary, no free
 /// text, no namespace, no client id — the reason and the actor, nothing else.
 fn refusal(actor: &ActorAuthority, reason: ScopingRefusal) {
@@ -773,6 +820,75 @@ mod tests {
         let err = DelegationGrant::authorize(&delegated, "peerone", Uuid::from_u128(3))
             .expect_err("a delegated owner must not be able to mint a grant proof");
         assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    // ── The proof is re-verified at write time, not trusted ──────────────────
+
+    /// **The round-2 assertion.** A proof minted by an operator who is DEMOTED
+    /// before the write lands must not complete the mutation.
+    ///
+    /// This is the one a happy-path test cannot make, and the one that fails if
+    /// someone later removes the "redundant-looking" second read inside the
+    /// store's transaction.
+    #[test]
+    fn a_proof_minted_before_a_demotion_does_not_survive_the_re_check() {
+        let operator = operator();
+        let grant = DelegationGrant::authorize(&operator, "peerone", Uuid::from_u128(9))
+            .expect("minted while still an operator");
+
+        // Same account, live state re-read inside the writing transaction —
+        // no longer an operator.
+        let demoted = ActorAuthority::from_live_state(
+            operator.account_id(),
+            false,
+            Vec::<String>::new(),
+        );
+        assert!(
+            reverify_delegation_change(grant.actor(), &demoted).is_err(),
+            "a stale proof must not authorize a write after the actor was demoted"
+        );
+
+        // And the same proof against the still-operator state is fine, so the
+        // re-check refuses the CHANGE rather than refusing everything.
+        assert!(reverify_delegation_change(grant.actor(), &operator).is_ok());
+    }
+
+    /// A disabled account is caught too — though by a different mechanism, and
+    /// this asserts the mechanism rather than assuming it.
+    ///
+    /// The store's `locked_active_account` filters `NOT disabled` in SQL, so a
+    /// disabled actor never yields an `ActorAuthority` at all and this function
+    /// is never reached. That is the fail-closed direction, but it means the
+    /// coverage lives in the query, not here — stated so nobody reads this
+    /// module's tests as proving something they do not.
+    #[test]
+    fn the_re_check_is_bound_to_the_account_the_proof_names() {
+        let operator = operator();
+        let grant = DelegationGrant::authorize(&operator, "peerone", Uuid::from_u128(9)).unwrap();
+
+        // A DIFFERENT account that happens to be an operator must not satisfy
+        // the re-check: otherwise the second read would be a formality that any
+        // live operator anywhere could pass.
+        let other_operator =
+            ActorAuthority::from_live_state(Uuid::from_u128(42), true, Vec::<String>::new());
+        assert!(
+            reverify_delegation_change(grant.actor(), &other_operator).is_err(),
+            "the live authority must be for the SAME account the proof names"
+        );
+    }
+
+    /// The revocation half, so neither path can be hardened alone.
+    #[test]
+    fn a_revocation_proof_is_re_checked_the_same_way() {
+        let operator = operator();
+        let revocation = DelegationRevocation::authorize(&operator, "peerone").unwrap();
+        let demoted = ActorAuthority::from_live_state(
+            operator.account_id(),
+            false,
+            Vec::<String>::new(),
+        );
+        assert!(reverify_delegation_change(revocation.actor(), &demoted).is_err());
+        assert!(reverify_delegation_change(revocation.actor(), &operator).is_ok());
     }
 
     // ── The service, against a fake store ────────────────────────────────────

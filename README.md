@@ -1404,6 +1404,13 @@ check — so there is no polite path and impolite path, there is one path. A sou
 test pins the callers, because that is the half a test exercising the authorized path cannot
 observe.
 
+The proof is then **re-verified inside the writing transaction**, under `FOR SHARE` locks, for
+both the acting operator and the grantee. A proof establishes that the check *ran*; it cannot
+establish that it still *holds*, and the gap between them is exactly the moment an operator is
+racing to disable a compromised account. So an operator demoted or disabled after minting a
+proof cannot complete the mutation, and a delegation cannot land on an account disabled in the
+meantime.
+
 ## Quick Start
 
 ```sh

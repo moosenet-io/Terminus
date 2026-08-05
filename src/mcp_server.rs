@@ -5049,7 +5049,7 @@ mod tests {
         /// ABSENT here is the unscoped case, and — exactly as
         /// `ScopeResolver::load` does for a client the store does not return —
         /// resolves to the empty scope rather than to anything else.
-        rows: HashMap<String, (Vec<crate::oauth::model::ToolGroup>, Vec<String>)>,
+        rows: HashMap<String, (Vec<crate::oauth::groups::AuthorizedGroup>, Vec<String>)>,
     }
 
     #[async_trait::async_trait]
@@ -5069,15 +5069,26 @@ mod tests {
         }
     }
 
-    /// A tool group as RMCP-06 stores one.
-    fn scoped_group(name: &str, patterns: &[&str]) -> crate::oauth::model::ToolGroup {
-        crate::oauth::model::ToolGroup {
-            id: uuid::Uuid::new_v4(),
-            name: name.to_string(),
-            description: String::new(),
-            patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
-            owner_account_id: uuid::Uuid::nil(),
-            created_at: chrono::Utc::now(),
+    /// A tool group as RMCP-06 stores one, paired with its owner's authority as
+    /// `client_authorized_groups` projects it.
+    ///
+    /// RMCP-12 is why the authority is here rather than the bare row: a group's
+    /// patterns are filtered by its owner's CURRENT authority at resolution, so
+    /// a source that composed "exactly as `load` does" without it would be
+    /// composing as `load` USED to, before the read-path fix. Operator-owned,
+    /// which is what these local (`health`) patterns require — a delegated
+    /// owner may hold only namespace-qualified ones.
+    fn scoped_group(name: &str, patterns: &[&str]) -> crate::oauth::groups::AuthorizedGroup {
+        crate::oauth::groups::AuthorizedGroup {
+            group: crate::oauth::model::ToolGroup {
+                id: uuid::Uuid::new_v4(),
+                name: name.to_string(),
+                description: String::new(),
+                patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
+                owner_account_id: uuid::Uuid::nil(),
+                created_at: chrono::Utc::now(),
+            },
+            owner: crate::oauth::groups::GroupOwner::Operator,
         }
     }
 
