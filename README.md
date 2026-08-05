@@ -924,16 +924,19 @@ schema lives in `migrations/S132-rmcp01-oauth-core.sql` and
 `pg_ddl` as part of the deploy. Until it is, the store reports the door unconfigured rather
 than serving a silently dead auth surface.
 
-**The scoping intersection is wired but not yet reachable.** It is applied at both
-enforcement points in `mcp_server` and enforced by `gateway_framework`, but it engages only
-for a request carrying a resolved connector scope in its extensions — and nothing inserts
-that yet. RMCP-05's resource-server validation is what turns a verified access token into
-one. Until it lands, **every request takes the non-OAuth path and the connector scoping is
-inert**: it is not silently permitting anything (there is no OAuth request for it to permit),
-but neither is it an active control, and it should not be described to anyone as one. Absence
-of a connector scope means "this request did not come through the OAuth door", which is a
-statement about the *transport*; it is never read as "an unscoped connector", which is a
-statement about *data* and always resolves to the empty set.
+**The scoping intersection is applied at both enforcement points** in `mcp_server` and
+enforced by `gateway_framework`, engaging for any request that carries a resolved connector
+scope. For whether it is reachable in a running binary — and for the operator prerequisite
+that currently keeps the door from booting at all — see *Exactly what is wired today* below,
+which is this file's single account of that state; this note deliberately does not restate it.
+
+One distinction is worth keeping here, because it is a property of the code rather than of the
+deployment: the **absence** of a connector scope means "this request did not come through the
+OAuth door", which is a statement about the *transport*, and it leaves the account grant to
+decide alone. It is never read as "an unscoped connector", which is a statement about *data*
+and always resolves to the empty set. Conflating the two in either direction is a bug — read
+as empty it would deny every mTLS and tailnet caller in the fleet, and the reverse is a
+silent widening.
 
 **Not yet complete.** An account with a TOTP second factor is currently **refused** at
 sign-in rather than admitted on its password alone: the stored seed is encrypted with a
@@ -971,14 +974,46 @@ token working until it expires; its refresh token is already dead, so the sessio
 extended. **TERM #635** adds the claim, and RMCP-05 carries a tripwire test asserting today's
 permissive outcome so it fails loudly when the fix lands.
 
-**Scope resolution: NOT wired — a connector that authenticates currently reaches nothing.**
-RMCP-07's resolver is not yet wired into `terminus_primary` (TERM #631, item 5), so an
-authenticated connector resolves the **empty** scope and no tool is reachable through it. The
-door authenticates correctly and then grants nothing. This is stated as plainly as the
-enforcement gaps above because a README describing a working connector, while the assembled
-system permits nothing, is the same class of error as the contradiction that produced this
-section: an operator would conclude the connector was broken, or that scoping had silently
-failed open somewhere else, rather than that the last wire is missing.
+**Scope resolution: wired (TERM #631, item 5).** `terminus_primary` derives its scope source
+from the door itself: the resource server keeps its `OauthStore` handle and the resolver
+shares that same handle, so there is one connection pool and one answer to whether the
+database is reachable. A connector therefore reaches exactly
+
+```text
+what the ACCOUNT may do  ∩  the connector's tool groups  ∩  the connector's namespaces
+```
+
+re-derived per request, so a group or namespace an operator takes away stops working at the
+next call rather than at the next token expiry. Both enforcement points — the `tools/list`
+catalog filter and the `tools/call` guard — run the *same* decision function, so a tool the
+listing hides is never callable and a tool it advertises is never refused.
+
+**What that means in practice: a connector still reaches nothing until it is scoped.** Every
+one of these resolves to the **empty scope**, and the empty scope permits zero tools:
+
+| Situation | Resolves to |
+|---|---|
+| Client has no tool-group rows | empty |
+| Client is unknown, or disabled | empty |
+| Store read fails (database unreachable) | empty, for that request only — never cached |
+| A stored pattern does not parse | dropped; it matches nothing |
+| Process has no door, or a door with no store | empty |
+| Process has no account grant to intersect with | empty |
+
+The difference between those cases is **observability — a warning line and an audit reason
+code (`no_group`, `no_namespace`, `denied_by_grant`, `no_account_grant`) — never permission.**
+There is deliberately no default that widens: absence is the empty set at every level, a
+failed store read denies for one request rather than poisoning the cache with either answer,
+and nothing reads a missing row as consent. An operator seeing a freshly linked connector with
+no tools is looking at the designed behaviour of an unscoped client, not at a fault; assign it
+a tool group and the tools appear.
+
+> **Operator prerequisite — the connector will not work until this is done.** The three S132
+> migrations are **not applied on any live host**, and they are not applied at startup (see
+> *Opening the door* above). Until an operator applies them, `schema_ready()` fails and
+> `resource_server_from_env` refuses the process at startup, so the door never boots — and the
+> scope resolver is consequently `None` because the *door* is, not because the wiring is
+> missing. The wiring above is correct and inert until the schema exists.
 
 **Audit trail: emitting.** Every authorization decision, login outcome, issuance, refresh and
 rotation emits the OAuth record, alongside every rate-limit refusal, revocation, RFC 7009
@@ -1161,7 +1196,7 @@ existing pattern needs no config edit.
 > **Everything below describes how groups are authored, validated and stored — not what
 > authorizes a request.** Two pointers rather than a third account of either: for the
 > assembled system's wiring state see *Exactly what is wired today* above, which is this
-> file's single account of it and already records that scope resolution is not wired; for
+> file's single account of it and records what scope resolution reaches today; for
 > which matcher owns these pattern semantics until TERM #637 collapses the two, see the
 > `Status` section of the `src/oauth/groups.rs` module docs.
 
