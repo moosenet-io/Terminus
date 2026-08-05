@@ -4595,14 +4595,25 @@ mod tests {
         discovery: Option<crate::oauth::metadata::Discovery>,
         scope_resolver: Option<Arc<dyn crate::oauth::scope::ClientScopeSource>>,
     ) -> Arc<McpServerState> {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoHealthTool)).unwrap();
+        state_with_oauth_scoped_registry(gateway, discovery, scope_resolver, registry)
+    }
+
+    /// [`state_with_oauth_scoped`] over a caller-supplied registry, so a test
+    /// can put a tool of its own choosing behind the OAuth door.
+    fn state_with_oauth_scoped_registry(
+        gateway: GatewayFramework,
+        discovery: Option<crate::oauth::metadata::Discovery>,
+        scope_resolver: Option<Arc<dyn crate::oauth::scope::ClientScopeSource>>,
+        registry: ToolRegistry,
+    ) -> Arc<McpServerState> {
         let resolver = PrincipalResolver::new(
             serde_json::from_value::<PrincipalMap>(json!({
                 "oauth_account": {"operator": "lumina"}
             }))
             .unwrap(),
         );
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(EchoHealthTool)).unwrap();
         Arc::new(McpServerState {
             registry: ArcSwap::from_pointee(registry),
             server_name: "terminus-rmcp05-test".to_string(),
@@ -5264,6 +5275,97 @@ mod tests {
             called["result"]["isError"], true,
             "an unscoped connector must not be able to CALL what it cannot see — and it \
              cannot reach it by naming it directly either: {called}"
+        );
+    }
+
+    /// A LOCAL tool whose registered name happens to contain the mesh
+    /// separator. Nothing stops one existing: the pattern grammar refuses `__`,
+    /// but the tool REGISTRY has no such rule.
+    struct LocalLookalikeTool;
+
+    #[async_trait]
+    impl RustTool for LocalLookalikeTool {
+        fn name(&self) -> &str {
+            "peerhub__probe"
+        }
+        fn description(&self) -> &str {
+            "A locally registered tool whose name looks federated"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: Value) -> Result<String, ToolError> {
+            Ok("ok".to_string())
+        }
+    }
+
+    /// TERM #643 end to end, through the real handler: a connector holding the
+    /// `peerhub` namespace and a `peerhub::*` group must NOT reach a tool the
+    /// LOCAL registry owns, however much its name looks like `peerhub`'s.
+    ///
+    /// Every other dimension is deliberately open, so the provenance read is
+    /// the only thing that can refuse it: the account grant permits the tool by
+    /// name, the client holds the namespace, and the group's pattern matches
+    /// the string exactly. This process has no mesh pool, so the merge layer's
+    /// answer is `CatalogSource::AllLocal` on the list path and
+    /// `CallRoute::Local` on the call path — and the wiring that carries those
+    /// two answers into `decide()` is what this test covers. Reverting either
+    /// one to a `split_namespaced` of the name makes both halves pass.
+    #[tokio::test]
+    async fn term643_a_qualified_group_cannot_reach_a_local_lookalike_end_to_end() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(LocalLookalikeTool)).unwrap();
+        let mut rows = HashMap::new();
+        rows.insert(
+            OA_CLIENT.to_string(),
+            (
+                vec![scoped_group("peerhub-ops", &["peerhub::*", "peerhub::probe"])],
+                vec!["peerhub".to_string()],
+            ),
+        );
+        let state = state_with_oauth_scoped_registry(
+            // The ACCOUNT may call it — so a denial can only come from the
+            // connector half of the intersection.
+            gateway_allowing("lumina", &["peerhub__probe"]),
+            None,
+            Some(Arc::new(ScopedClients { rows })),
+            registry,
+        );
+        let auth = bearer_header(&oauth_token_for_client(OA_CLIENT, "jti-term643"));
+
+        let (status, listed, _) = post_mcp_to(
+            build_router(Arc::clone(&state)),
+            "/mcp",
+            json!({"jsonrpc": "2.0", "id": 643, "method": "tools/list"}),
+            None,
+            &[("authorization", auth.as_str())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .expect("a tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(
+            names.is_empty(),
+            "a namespace-qualified group must not reveal a LOCAL tool: {listed}"
+        );
+
+        let (status, called, _) = post_mcp_to(
+            build_router(state),
+            "/mcp",
+            json!({"jsonrpc": "2.0", "id": 644, "method": "tools/call",
+                   "params": {"name": "peerhub__probe", "arguments": {}}}),
+            None,
+            &[("authorization", auth.as_str())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            called["result"]["isError"], true,
+            "and it must not be callable by naming it directly either: {called}"
         );
     }
 }

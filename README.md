@@ -1409,11 +1409,11 @@ small list of patterns over the tool catalog — so an operator scopes a connect
 live catalog rather than expanded once and stored, so a newly registered tool matching an
 existing pattern needs no config edit.
 
-> **Everything below describes how groups are authored, validated and stored — not what
-> authorizes a request.** Two pointers rather than a third account of either: for the
-> assembled system's wiring state see *Exactly what is wired today* above, which is this
-> file's single account of it and records what scope resolution reaches today; for
-> which matcher owns these pattern semantics until TERM #637 collapses the two, see the
+> **Everything below describes how groups are authored, validated and stored — and, since
+> TERM #637 collapsed the two matchers, the same pattern semantics now decide a request.**
+> For the assembled system's wiring state see *Exactly what is wired today* above, which is
+> this file's single account of it and records what scope resolution reaches today; for
+> where the one surviving matcher sits relative to the one enforcement site, see the
 > `Status` section of the `src/oauth/groups.rs` module docs.
 
 ### Pattern syntax
@@ -1451,7 +1451,10 @@ earlier revision used `__` for both, which made `a__b__*` genuinely ambiguous (n
 `a__b`, or namespace `a` with prefix `b__`?) and could only be settled by declaring a
 precedence rule; a pattern whose meaning depends on a precedence rule is one an author
 cannot read. `::` also matches what the enforcing matcher in RMCP-07 already used — the two
-had diverged, which is TERM #637.
+had diverged, which is TERM #637. That divergence is now closed the only way it stays closed:
+there is ONE matcher. RMCP-07's copy was deleted (its enforcement tests re-pointed, not
+deleted with it) once TERM #643 found the SECOND divergence between them — that copy was
+still guessing provenance from a name's shape after this one had stopped.
 
 **Which side of the boundary a tool is on is read from the catalog, not guessed from its
 name.** A local tool may legitimately be named with `__` in it — that is not something the
@@ -1527,8 +1530,8 @@ from the configured one, and which patterns survived would depend on row orderin
 happens to match no tool in the current catalog grants nothing. Neither is ever read as
 "unrestricted". A group can only ever *narrow*: RMCP-07 intersects the group set with the
 account's own grant and the client's visible namespaces, so no group can grant a tool the
-human behind it could not already call. That intersection is RMCP-07's, and today it runs
-against RMCP-07's matcher — see the status note above.
+human behind it could not already call. That intersection is RMCP-07's, and it runs against
+this matcher — see the status note above.
 
 ### Starter groups
 
