@@ -2538,14 +2538,30 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
         for (function, marker) in [
             ("client_tool_groups / client_authorized_groups",
              "JOIN rmcp_account a ON a.id = g.owner_account_id AND NOT a.disabled"),
+            // RMCP-12 moved this join from `o.owner_account_id` to
+            // `c.owner_account_id`, and the guard was updated with it rather
+            // than around it. The two are the SAME account in the delegated
+            // branch, because that branch requires
+            // `o.owner_account_id = c.owner_account_id` — which is asserted
+            // separately below, since without it this join would no longer
+            // cover the delegated owner at all and this marker alone would pass
+            // a genuinely weakened query.
             ("client_namespaces",
-             "JOIN rmcp_account a ON a.id = o.owner_account_id AND NOT a.disabled"),
+             "JOIN rmcp_account a ON a.id = c.owner_account_id AND NOT a.disabled"),
         ] {
             assert!(
                 src.contains(marker),
                 "{function} must exclude a disabled owner in its join: missing {marker:?}"
             );
         }
+
+        // The other half of that one rule. Delete it and a namespace delegated
+        // to ANY account would resolve for ANY other account's client.
+        assert!(
+            src.contains("AND (a.is_operator OR o.owner_account_id = c.owner_account_id)"),
+            "client_namespaces must bind the delegation to the CLIENT's own owner, with the \
+             operator override as the only alternative branch"
+        );
         // BOTH group queries, not just one — the regression was exactly that the
         // display query had it and the resolution query did not.
         assert_eq!(
