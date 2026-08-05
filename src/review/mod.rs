@@ -1697,7 +1697,9 @@ impl RustTool for ReviewProviderStatus {
             args.get("ttl_secs").and_then(Value::as_u64).unwrap_or(DEFAULT_PROBE_TTL_SECS),
         );
 
-        let now = std::time::SystemTime::now();
+        // Freshness is decided at the moment we choose whether to spend a
+        // dispatch...
+        let decided_at = std::time::SystemTime::now();
         let mut probe_actions: std::collections::HashMap<String, &'static str> =
             std::collections::HashMap::new();
         if probe {
@@ -1705,7 +1707,7 @@ impl RustTool for ReviewProviderStatus {
             for provider in &requested {
                 // Reuse a young reading rather than spending a dispatch. Fail
                 // STALE: a provider never observed is never "fresh".
-                if capacity::registry().get(provider).is_fresh(now, ttl) {
+                if capacity::registry().get(provider).is_fresh(decided_at, ttl) {
                     probe_actions.insert(provider.clone(), "skipped_fresh");
                     continue;
                 }
@@ -1719,6 +1721,12 @@ impl RustTool for ReviewProviderStatus {
             }
         }
 
+        // ...but AGE is reported against a clock read AFTER the probes have
+        // run. Reusing the pre-probe instant would make a just-completed probe
+        // have `observed_at > now`, so `duration_since` errs and the age comes
+        // back NULL -- reporting the freshest possible reading as unknown,
+        // which is precisely the distinction RVXR-03 exists to provide.
+        let now = std::time::SystemTime::now();
         let providers: Vec<Value> = requested
             .iter()
             .map(|name| {
@@ -2461,6 +2469,30 @@ mod tests {
 
     /// The TTL is what makes probing-every-run affordable: a reading taken
     /// moments ago is reused instead of spending another real dispatch.
+    /// Regression, found by `codex` on the RVXR-03/04/05 review (PR #338).
+    ///
+    /// The reporting clock used to be read BEFORE awaiting the probes, so a
+    /// just-completed probe had `observed_at > now`, `duration_since` erred,
+    /// and the age came back NULL -- the freshest possible reading reported as
+    /// unknown, defeating the very distinction RVXR-03 adds.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_just_probed_provider_reports_a_real_age_not_null() {
+        // ttl 0 forces an actual probe rather than a fresh-skip.
+        let out = ReviewProviderStatus
+            .execute_structured(json!({"providers": ["diffusion"], "probe": true, "ttl_secs": 0}))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.text).unwrap();
+        let p = &v["providers"][0];
+        assert_eq!(p["probe_action"], "probed", "{v}");
+        assert_eq!(p["ever_observed"], true, "{v}");
+        assert!(
+            p["observation_age_secs"].is_number(),
+            "a provider probed moments ago must report a real age, not null: {v}"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn a_fresh_reading_is_reused_instead_of_reprobed() {

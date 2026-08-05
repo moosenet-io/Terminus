@@ -399,9 +399,15 @@ pub fn is_rate_limit_error(msg: &str) -> bool {
 /// exactly the stale-capability-note failure the panel rules warn about.
 pub fn is_permanent_error(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
-    // A 404 on the MODEL is permanent; a 404 on some other path is not
-    // something we claim to understand, so require the model signal too.
-    let model_404 = m.contains("404") && (m.contains("model") || m.contains("not found"));
+    // A 404 on the MODEL is permanent; a 404 on some other path (a
+    // misconfigured route, a proxy hop) is NOT -- so require the model signal.
+    //
+    // The `not found` alternative that used to sit here DEFEATED that
+    // requirement: HTTP 404's standard reason phrase is literally "Not Found",
+    // so every 404 response line matched and a transient
+    // `chord http 404: route not found` would permanently bench a healthy
+    // local seat -- the exact direction this classifier is supposed to avoid.
+    let model_404 = m.contains("404") && m.contains("model");
     // An explicitly non-free/paid-only model id is permanent for a free seat.
     let unavailable_for_free = m.contains("unavailable for free");
     model_404 || unavailable_for_free
@@ -697,6 +703,32 @@ mod tests {
         assert!(!super::is_permanent_error("http 429 Too Many Requests"));
         assert!(!super::is_permanent_error("connection refused"));
         assert!(!super::is_permanent_error("timed out after 300s"));
+    }
+
+    /// Regression, found by `codex` on the RVXR-03/04/05 review (PR #338).
+    ///
+    /// The classifier used to accept `404 && ("model" || "not found")`. HTTP
+    /// 404's standard reason phrase IS "Not Found", so EVERY 404 line matched
+    /// and the model-signal requirement its own doc comment claimed was
+    /// vacuous -- a transient `chord http 404: route not found` would
+    /// permanently bench a healthy local seat. That is the wrong direction:
+    /// wrongly shelving a working reviewer is the worse failure.
+    #[test]
+    fn a_non_model_404_is_transient_not_permanent() {
+        for transient in [
+            "unavailable: chord http 404: route not found",
+            "unavailable: http 404 Not Found",
+            "unavailable: openrouter http 404 Not Found",
+            "unavailable: gateway 404 not found",
+        ] {
+            assert!(
+                !super::is_permanent_error(transient),
+                "a 404 without a MODEL signal must stay transient: {transient}"
+            );
+            let mut st = super::ReviewerStatus::new("gemma3");
+            st.mark_error(transient);
+            assert!(st.available, "a healthy seat was wrongly shelved by: {transient}");
+        }
     }
 
     #[test]
