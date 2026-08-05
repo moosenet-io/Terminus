@@ -343,35 +343,105 @@ fn registration_response(minted: &MintedClient) -> Response {
 /// A JSON `null` reads as ABSENT throughout, matching the crate-wide rule that
 /// a blank value is an unset one — a client that serializes its whole struct
 /// must not be refused for the fields it left empty.
+/// What a JSON body says about one metadata member.
+///
+/// **The three-way rule, stated once.** Every reader below branches on exactly
+/// these three cases, so no call site re-decides what `null` or `""` means:
+///
+/// | Body | Meaning | Outcome |
+/// |---|---|---|
+/// | key not present | not configured | the documented default applies |
+/// | key present, value usable | the client said this | the submitted value |
+/// | key present, anything else | present-but-unusable | **refused** |
+///
+/// This is RMCP-02's rule — *ABSENT means not configured; PRESENT means the
+/// value must be USABLE* — applied to JSON members rather than environment
+/// variables. In JSON a `null` is a PRESENT key with a null value: the client
+/// sent the member. A blank string is more obviously present still.
+///
+/// ## Why this needed a round 5
+///
+/// Round 2 fixed wrong-TYPED values (`grant_types: "password"`,
+/// `token_endpoint_auth_method: 42`) falling through to defaults, and I stated
+/// at the time that "`null` still reads as absent" as though that were settled.
+/// It was not, and it is not defensible: treating `42` as malformed while
+/// treating `null` as absent draws a line the rule does not draw. The
+/// consequence was the same one round 2 had just removed —
+/// `token_endpoint_auth_method: null` and `""` both selected `"none"`, so a
+/// client that submitted something meaningless was registered as PUBLIC, with
+/// no client authentication at all.
+enum Member<'a> {
+    /// The key is not in the object.
+    Absent,
+    /// The key is present with a value worth examining.
+    Present(&'a Value),
+    /// The key is present and carries `null` — the client named the member and
+    /// gave nothing usable for it.
+    Unusable,
+}
+
+/// Classify one member. The ONLY place `null` is interpreted.
+fn member<'a>(body: &'a Value, name: &str) -> Member<'a> {
+    match body.get(name) {
+        None => Member::Absent,
+        Some(Value::Null) => Member::Unusable,
+        Some(present) => Member::Present(present),
+    }
+}
+
+/// Read submitted metadata out of a JSON body.
+///
+/// Nothing here judges the CONTENT; every such rule lives in [`validate`]. What
+/// this decides is presence and usability — see [`Member`] for the rule — and
+/// how a member is classified:
+///
+/// - **Members this server READS** ([`SUPPORTED_METADATA`]): the three-way rule
+///   applies in full. Absent takes the default; present must be usable;
+///   `null`, blank, wrong type, or a wrong-typed array element are all
+///   malformed.
+/// - **Members it REFUSES** ([`UNIMPLEMENTED_CRITICAL_METADATA`]): presence
+///   alone refuses, whatever the value — including `null`. The refusal is not
+///   about the value, it is that this server cannot honour the member at all,
+///   so a null one is still the client naming it. Omit the key.
+/// - **Members it IGNORES** ([`COSMETIC_METADATA`]): the value is never
+///   examined, so "usable" has no meaning for it. This is the one class where
+///   `null` changes nothing, and it is a named exception with a reason rather
+///   than a general one: we already ignore every other value these carry, so
+///   singling out `null` would be incoherent.
+/// - **Anything else**: unrecognised, and refused — contributing a BOOLEAN, not
+///   the key, because an unrecognised name is caller-chosen text and this value
+///   is on the path to an error body.
 fn submitted_from_json(value: &Value) -> SubmittedMetadata {
     let mut malformed_members: Vec<&'static str> = Vec::new();
 
-    // `present` distinguishes the three states this function must keep apart:
-    // absent (and null), present-and-well-typed, present-and-wrong-typed.
-    let present = |name: &str| -> Option<&Value> {
-        value.get(name).filter(|v| !v.is_null())
-    };
-
     let mut string_array = |name: &'static str| -> Option<Vec<String>> {
-        let raw = present(name)?;
-        let Some(items) = raw.as_array() else {
-            malformed_members.push(name);
-            return None;
-        };
-        // An element of the wrong type makes the MEMBER malformed. The earlier
-        // placeholder-string approach turned a type error into a value error,
-        // which produced a confusing fault and — for `redirect_uris` — could
-        // read as "no redirect URIs" rather than "that is not a list of URIs".
-        if items.iter().any(|item| !item.is_string()) {
-            malformed_members.push(name);
-            return None;
+        match member(value, name) {
+            Member::Absent => None,
+            Member::Unusable => {
+                malformed_members.push(name);
+                None
+            }
+            Member::Present(raw) => {
+                let Some(items) = raw.as_array() else {
+                    malformed_members.push(name);
+                    return None;
+                };
+                // A wrong-typed ELEMENT makes the MEMBER malformed. Turning a
+                // type error into a value error produced a confusing fault and
+                // — for `redirect_uris` — could read as "no redirect URIs"
+                // rather than "that is not a list of URIs".
+                if items.iter().any(|item| !item.is_string()) {
+                    malformed_members.push(name);
+                    return None;
+                }
+                Some(
+                    items
+                        .iter()
+                        .map(|item| item.as_str().unwrap_or_default().to_string())
+                        .collect(),
+                )
+            }
         }
-        Some(
-            items
-                .iter()
-                .map(|item| item.as_str().unwrap_or_default().to_string())
-                .collect(),
-        )
     };
 
     let redirect_uris = string_array("redirect_uris");
@@ -379,29 +449,42 @@ fn submitted_from_json(value: &Value) -> SubmittedMetadata {
     let response_types = string_array("response_types");
 
     let mut string = |name: &'static str| -> Option<String> {
-        let raw = present(name)?;
-        match raw.as_str() {
-            Some(text) => Some(text.to_string()),
-            None => {
+        match member(value, name) {
+            Member::Absent => None,
+            Member::Unusable => {
                 malformed_members.push(name);
                 None
             }
+            Member::Present(raw) => match raw.as_str() {
+                // A BLANK string is present-but-unusable, not absent. This is
+                // the arm that stops `token_endpoint_auth_method: ""` selecting
+                // `none` — the weakest method — on behalf of a client that said
+                // nothing meaningful.
+                Some(text) if !text.trim().is_empty() => Some(text.to_string()),
+                _ => {
+                    malformed_members.push(name);
+                    None
+                }
+            },
         }
     };
     let name = string("client_name");
     let token_endpoint_auth_method = string("token_endpoint_auth_method");
 
-    // Classification of every member actually sent.
+    // Classification of every member actually sent. Note there is no
+    // null-skipping here: a `null` critical member is still the client naming
+    // a member this server cannot honour.
     let mut critical_members_present: Vec<&'static str> = Vec::new();
     let mut unrecognised_member_present = false;
     if let Some(members) = value.as_object() {
         for key in members.keys() {
-            if members.get(key).is_some_and(Value::is_null) {
+            // Read by the readers above, which already applied the rule.
+            if SUPPORTED_METADATA.contains(&key.as_str()) {
                 continue;
             }
-            if SUPPORTED_METADATA.contains(&key.as_str())
-                || COSMETIC_METADATA.contains(&key.as_str())
-            {
+            // Never examined at all — see this function's doc for why `null` is
+            // not special here.
+            if COSMETIC_METADATA.contains(&key.as_str()) {
                 continue;
             }
             // The `&'static str` from OUR constant, never the key as it
@@ -533,25 +616,144 @@ mod tests {
         }
     }
 
-    /// A JSON `null` is ABSENT, matching the crate-wide rule that a blank value
-    /// is an unset one. Refusing over an explicit null would break clients that
-    /// serialize their whole struct — and it must hold for every class of
-    /// member, not just the critical ones.
+    /// **A `null` member is PRESENT and unusable — refused, not defaulted.**
+    ///
+    /// This test replaces one that asserted the opposite. Round 2 fixed
+    /// wrong-TYPED values falling through to defaults and I recorded "`null`
+    /// still reads as absent" as settled; round 5 (`gpt56`) reopened it and was
+    /// right. In JSON a `null` is a present key — the client sent the member —
+    /// so RMCP-02's rule, which this item applies everywhere else, refuses it.
+    ///
+    /// The consequence was concrete: `token_endpoint_auth_method: null`
+    /// selected `"none"`, registering a client as PUBLIC with no client
+    /// authentication because it had said nothing meaningful.
     #[test]
-    fn a_null_member_is_absent_rather_than_present() {
-        let body = json!({
+    fn a_null_member_is_present_and_unusable_rather_than_absent() {
+        for name in SUPPORTED_METADATA {
+            let mut body = serde_json::Map::new();
+            body.insert("client_name".into(), json!("A connector"));
+            body.insert("redirect_uris".into(), json!(["https://connector.test/cb"]));
+            body.insert((*name).to_string(), Value::Null);
+            let submitted = submitted_from_json(&Value::Object(body));
+
+            assert!(
+                submitted.malformed_members.contains(name),
+                "{name}: null was read as absent instead of present-and-unusable"
+            );
+            assert!(
+                validate(&submitted).is_err(),
+                "{name}: a null member must be refused"
+            );
+        }
+    }
+
+    /// **A BLANK string is present and unusable too** — the other half of the
+    /// round-5 finding, and the one that reached `"none"` most easily.
+    #[test]
+    fn a_blank_string_member_is_refused_rather_than_defaulted() {
+        for name in ["client_name", "token_endpoint_auth_method"] {
+            for blank in [json!(""), json!("   "), json!("\t")] {
+                let mut body = serde_json::Map::new();
+                body.insert("client_name".into(), json!("A connector"));
+                body.insert("redirect_uris".into(), json!(["https://connector.test/cb"]));
+                body.insert(name.to_string(), blank.clone());
+                let submitted = submitted_from_json(&Value::Object(body));
+
+                assert!(
+                    submitted.malformed_members.contains(&name),
+                    "{name} = {blank} was read as absent"
+                );
+                assert!(validate(&submitted).is_err(), "{name} = {blank} must be refused");
+            }
+        }
+    }
+
+    /// The specific consequence, pinned on its own: a meaningless auth method
+    /// must never register a PUBLIC client.
+    ///
+    /// The mutation target for the whole finding — restore either the
+    /// null-is-absent reading or the `filter(|m| !m.is_empty())` and this goes
+    /// red, because the client would come away registered with no client
+    /// authentication it never asked to drop.
+    #[test]
+    fn a_meaningless_auth_method_never_registers_a_public_client() {
+        for meaningless in [json!(Value::Null), json!(""), json!("  "), json!(42), json!([])] {
+            let body = json!({
+                "client_name": "A connector",
+                "redirect_uris": ["https://connector.test/cb"],
+                "token_endpoint_auth_method": meaningless,
+            });
+            let submitted = submitted_from_json(&body);
+            assert!(
+                submitted.token_endpoint_auth_method.is_none(),
+                "{meaningless} produced a usable auth method"
+            );
+            assert!(
+                validate(&submitted).is_err(),
+                "{meaningless} was accepted and would register a PUBLIC client"
+            );
+        }
+
+        // …while a genuinely ABSENT member still takes the documented default,
+        // which is the behaviour that had to survive the fix.
+        let absent = json!({
             "client_name": "A connector",
             "redirect_uris": ["https://connector.test/cb"],
-            "jwks_uri": Value::Null,
-            "some_future_member": Value::Null,
-            "grant_types": Value::Null,
         });
-        let submitted = submitted_from_json(&body);
-        assert!(submitted.critical_members_present.is_empty());
-        assert!(!submitted.unrecognised_member_present);
-        assert!(submitted.malformed_members.is_empty());
-        assert!(submitted.grant_types.is_none());
-        assert!(validate(&submitted).is_ok());
+        let validated = validate(&submitted_from_json(&absent)).expect("absent is fine");
+        assert_eq!(
+            validated.token_endpoint_auth_method,
+            crate::oauth::clients::DEFAULT_AUTH_METHOD
+        );
+        assert!(!validated.wants_secret());
+    }
+
+    /// A `null` on a CRITICAL member is still the client naming a member this
+    /// server cannot honour, so it is refused like any other value of it.
+    #[test]
+    fn a_null_critical_member_is_still_refused() {
+        for critical in UNIMPLEMENTED_CRITICAL_METADATA {
+            let mut body = serde_json::Map::new();
+            body.insert("client_name".into(), json!("A connector"));
+            body.insert("redirect_uris".into(), json!(["https://connector.test/cb"]));
+            body.insert((*critical).to_string(), Value::Null);
+            let submitted = submitted_from_json(&Value::Object(body));
+            assert!(
+                submitted.critical_members_present.contains(critical),
+                "{critical}: a null value let it through"
+            );
+            assert!(validate(&submitted).is_err());
+        }
+    }
+
+    /// **The one named exception: a COSMETIC member's value is never examined,
+    /// so `null` changes nothing for it.**
+    ///
+    /// Stated as its own test rather than left implicit, because a general
+    /// null-is-absent exception is what created the round-5 finding. The reason
+    /// this class is different is narrow and checkable: we already ignore every
+    /// value these members carry, so singling out `null` would be incoherent
+    /// rather than stricter.
+    #[test]
+    fn a_null_cosmetic_member_is_ignored_because_its_value_is_never_read() {
+        for cosmetic in COSMETIC_METADATA {
+            for value in [Value::Null, json!(""), json!(42), json!({"nested": true})] {
+                let mut body = serde_json::Map::new();
+                body.insert("client_name".into(), json!("A connector"));
+                body.insert("redirect_uris".into(), json!(["https://connector.test/cb"]));
+                body.insert((*cosmetic).to_string(), value.clone());
+                let submitted = submitted_from_json(&Value::Object(body));
+                assert!(
+                    submitted.malformed_members.is_empty()
+                        && !submitted.unrecognised_member_present,
+                    "{cosmetic} = {value} must be ignored, not classified"
+                );
+                assert!(
+                    validate(&submitted).is_ok(),
+                    "{cosmetic} = {value} must not refuse the registration"
+                );
+            }
+        }
     }
 
     /// **Understood and cosmetic members pass; everything else is refused.**

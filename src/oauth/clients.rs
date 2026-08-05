@@ -78,6 +78,19 @@ pub const SUPPORTED_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_toke
 /// refuses everywhere else.
 pub const DEFAULT_GRANT_TYPE: &str = "authorization_code";
 
+/// What an ABSENT `token_endpoint_auth_method` means: a PUBLIC client.
+///
+/// RFC 7591's own default is `client_secret_basic`; this server departs from it
+/// deliberately, because the connector this door exists for is a public client
+/// and defaulting to a confidential method would mint a secret nobody asked for
+/// and hand it out in a response. Choosing to hold a credential should be
+/// something a caller SAID.
+///
+/// It applies to an ABSENT member only. A member that is present but unusable
+/// — `null`, blank, wrong type — is refused, never defaulted here: that is how
+/// a meaningless submission used to land on the weakest method.
+pub const DEFAULT_AUTH_METHOD: &str = "none";
+
 /// The token-endpoint authentication methods this server supports, matching
 /// what the metadata advertises. `none` is a public client (PKCE only), which
 /// is what Claude registers as.
@@ -517,13 +530,29 @@ pub fn validate(submitted: &SubmittedMetadata) -> Result<ValidatedMetadata, Vec<
     // PUBLIC client, and defaulting to a confidential method would mint a
     // secret nobody asked for and hand it out in a response. Choosing to hold a
     // credential should be something a caller SAID.
-    let token_endpoint_auth_method = submitted
-        .token_endpoint_auth_method
-        .as_deref()
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .unwrap_or("none")
-        .to_string();
+    //
+    // ABSENT takes the default; PRESENT must be usable. Round 5 (`gpt56`): the
+    // `.filter(|m| !m.is_empty())` that used to sit here turned a blank value
+    // into an absent one, so `token_endpoint_auth_method: ""` selected `none`
+    // — registering as PUBLIC, with no client authentication, a client that
+    // had said nothing meaningful. `register`'s reader now refuses blanks
+    // before this point; the arm below is what makes the same true for the
+    // TOOL path, which builds `SubmittedMetadata` directly and never passes
+    // through that reader.
+    let token_endpoint_auth_method = match submitted.token_endpoint_auth_method.as_deref() {
+        None => DEFAULT_AUTH_METHOD.to_string(),
+        Some(raw) if raw.trim().is_empty() => {
+            faults.push(fault(
+                "token_endpoint_auth_method",
+                None,
+                MetadataFault::MalformedMember,
+            ));
+            // Never used — `faults` is non-empty, so this returns `Err` below.
+            // Present so the binding has a value without an `unwrap`.
+            DEFAULT_AUTH_METHOD.to_string()
+        }
+        Some(raw) => raw.trim().to_string(),
+    };
     if !SUPPORTED_AUTH_METHODS.contains(&token_endpoint_auth_method.as_str()) {
         faults.push(fault(
             "token_endpoint_auth_method",

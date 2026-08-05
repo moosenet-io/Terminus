@@ -1020,11 +1020,20 @@ Refusals name a field and an index (`redirect_uris[1]: must not contain a fragme
 echo the submitted value — the same rule the audit vocabulary enforces, applied to the error
 body, because on a public endpoint that body reaches logs on both sides.
 
-**A present-but-wrong-typed member is malformed, never absent.** RMCP-02's rule applies one level
-down: *absent* means not configured, *present* means the value must be usable, and
-present-but-unusable is refused. Without that, `grant_types: "password"` reads as absence and
-takes the supported default, and `token_endpoint_auth_method: 42` lands silently on the weakest
-method — a client registered with semantics it never submitted.
+**A present-but-unusable member is malformed, never absent.** RMCP-02's rule applies one level
+down, and applies to *presence*, not to type: **key absent** means not configured; **key present**
+means the value must be usable; **key present with anything else** is refused. That last case
+covers a wrong type (`grant_types: "password"`), a wrong-typed array element, a blank string, and
+`null` — because in JSON a `null` is a present key, and the client sent the member.
+
+The `null` half took two attempts. Round 2 fixed the wrong-typed cases and recorded "`null` still
+reads as absent" as settled; round 5 reopened it, correctly. Treating `42` as malformed while
+treating `null` as absent draws a line the rule does not draw, and the consequence was the same one
+round 2 had just removed — `token_endpoint_auth_method` of `null` or `""` selected `none`,
+registering as a **public client with no client authentication** something that had said nothing
+meaningful. There is one named exception, with a reason rather than a general one: a *cosmetic*
+member's value is never examined at all, so `null` is neither usable nor unusable for it, and
+singling it out would be incoherent rather than stricter.
 
 **Metadata handling is an allowlist.** Members this server understands are acted on; a short list
 of deliberately *cosmetic* ones (`client_uri`, `logo_uri`, `contacts`, `scope`, …) is ignored per
