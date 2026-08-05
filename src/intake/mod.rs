@@ -34,6 +34,7 @@ pub mod coder_sweep;
 mod context;
 pub mod discovery;
 pub mod gpu_authority;
+pub mod gpu_stop_guard;
 pub mod infer;
 pub mod jobs;
 pub mod lifecycle;

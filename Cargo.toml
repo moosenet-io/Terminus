@@ -18,7 +18,7 @@ members = ["terminus-client", "terminus-worker-sdk"]
 
 [package]
 name = "terminus-rs"
-version = "1.3.1"
+version = "1.3.2"
 edition = "2021"
 license = "MIT"
 description = "Rust fallback tool implementations for the Chord proxy"

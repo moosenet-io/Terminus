@@ -21,6 +21,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::intake::context;
+use crate::intake::gpu_stop_guard::{self, StoppableGpuBackend};
 
 /// Normalized per-inference metrics, backend-agnostic.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -287,26 +288,48 @@ pub fn resolve_backend_at(
     }
 }
 
-/// All GPU-hardware backends defined in the registry, as `(name, unit)` pairs
-/// (unit `None` ⇒ spawned as a transient `chord-<name>` unit). Used by lifecycle
-/// GPU arbitration to free the single GPU before starting another GPU backend.
-pub fn gpu_backends() -> Vec<(String, Option<String>)> {
+/// The GPU-hardware backends that may be **stopped** to free the single GPU
+/// before starting `keep`. Used by lifecycle GPU arbitration.
+///
+/// This REPLACES the former `gpu_backends()`, which returned every GPU backend —
+/// including the always-on primary Ollama serve, i.e. the live assistant's own
+/// engine. `free_gpu` stopped whatever it was handed, so that list was a loaded
+/// gun (CHRD #112). The guard now lives in the value's construction rather than
+/// in each caller: see [`crate::intake::gpu_stop_guard`].
+///
+/// Registry unset / unreadable / unparseable ⇒ empty ⇒ nothing is stopped.
+/// Every systemd unit that must never be stopped, per the live registry file:
+/// the declared and transient units of every backend the guard refuses to stop.
+///
+/// Exists so [`crate::intake::lifecycle::stop`] — which is PUBLIC and takes a
+/// caller-supplied `ResolvedBackend`, not a guarded value — can refuse a target
+/// that belongs to a protected backend. Raised in review (gpt56, round 5): the
+/// guard type covers `free_gpu`, but `stop` could be handed a hand-built backend
+/// with `always_on: false` and `unit: "ollama.service"`.
+///
+/// Registry unset / unreadable / unparseable ⇒ `None`, meaning "cannot know" —
+/// NOT an empty set. Reporting an empty set there would say "nothing is
+/// protected", which is exactly the wrong answer to give a caller that is about
+/// to stop something; `lifecycle::stop` fails closed on `None` instead.
+pub fn protected_units() -> Option<std::collections::BTreeSet<String>> {
+    let text = std::fs::read_to_string(registry_path()?).ok()?;
+    // A registry that PARSES to no protected units is a real answer (`Some(empty)`);
+    // one that could not be read or parsed is NOT, and must not be reported as
+    // "nothing is protected". The parse happens ONCE, inside the guard, and its
+    // `None` propagates — an earlier version pre-validated the text as generic JSON
+    // here and let the guard's STRICT parse failure fall through to an empty set,
+    // which was a fail-open (gpt56, review round 7).
+    gpu_stop_guard::protected_units_from_json(&text)
+}
+
+pub fn stoppable_gpu_backends(keep: &str) -> Vec<StoppableGpuBackend> {
     let Some(path) = registry_path() else {
         return Vec::new();
     };
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return Vec::new(),
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
     };
-    let reg: RegFile = match serde_json::from_str(&text) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    reg.backends
-        .into_iter()
-        .filter(|(_, b)| b.hardware.as_deref() == Some("gpu"))
-        .map(|(name, b)| (name, b.unit))
-        .collect()
+    gpu_stop_guard::stoppable_gpu_backends_from_json(&text, keep)
 }
 
 /// Current GPU VRAM-in-use (MB) from sysfs (`mem_info_vram_used`). Best-effort;

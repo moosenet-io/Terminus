@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use crate::intake::gpu_stop_guard;
 use crate::intake::infer::{self, ResolvedBackend};
 
 /// Ensure `backend` is running and ready to serve `model`. Returns `Ok(())` when
@@ -63,7 +64,7 @@ pub async fn ensure_up(backend: &ResolvedBackend, model: &str) -> Result<(), Str
                 .ok_or_else(|| format!("could not resolve GGUF blob for '{model}' under {local}"))?
         };
         let unit_name = transient_unit(&backend.name);
-        let _ = run(["systemctl", "stop", &unit_name]); // clear any stale unit
+        stop_unit_unless_protected(&unit_name, StopOrigin::Internal); // clear any stale unit
         let mut argv: Vec<String> = vec![
             format!("--unit={unit_name}"),
             "--collect".to_string(),
@@ -141,36 +142,119 @@ pub fn idle_secs(backend: &str) -> Option<u64> {
 
 /// Stop an on-demand backend (its unit, or its transient `chord-<name>` unit).
 /// Best-effort; always-on/ollama/daemon backends are left running.
+///
+/// The `always_on` half of that refusal is the shared safety rule
+/// ([`gpu_stop_guard::may_stop`]), not a second copy of it — a rule written twice
+/// drifts. The `ollama`/`daemon` kind refusal is this function's own lifecycle
+/// concern (those kinds have no process for this crate to manage).
 pub fn stop(backend: &ResolvedBackend) {
-    if backend.always_on || backend.kind == "ollama" || backend.kind == "daemon" {
+    if !gpu_stop_guard::may_stop(backend.always_on)
+        || gpu_stop_guard::is_unmanaged_kind(Some(&backend.kind))
+        || backend.kind == "daemon"
+    {
         return;
     }
-    match &backend.unit {
-        Some(unit) => {
-            let _ = run(["systemctl", "stop", unit]);
+    let target = backend
+        .unit
+        .clone()
+        .unwrap_or_else(|| transient_unit(&backend.name));
+    stop_unit_unless_protected(&target, StopOrigin::Caller);
+}
+
+/// **The ONLY place this module issues `systemctl stop`.**
+///
+/// Every stop path funnels here, and here the target is checked against the
+/// registry-derived protected set — the declared AND transient units of every
+/// backend the guard refuses to stop. Two review findings made this the right
+/// shape rather than three separate guarded call sites:
+/// - `stop` is PUBLIC and takes a caller-supplied `ResolvedBackend`, so it has no
+///   guarded value to lean on: a hand-built backend with `always_on: false` and
+///   `unit: "ollama.service"` passed its field checks (gpt56, round 5).
+/// - `free_gpu` stops a candidate's TRANSIENT unit as well as its declared one, so
+///   an always-on backend declaring `unit: "chord-evict.service"` could be stopped
+///   as on-demand backend `evict`'s transient unit — with nothing misdescribed at
+///   all (codex, round 5). `ensure_up`'s stale-transient clear had the same shape.
+///
+/// The guard already excludes such candidates at construction; this is the second,
+/// independent line, placed at the point of action where it cannot be forgotten.
+/// It re-reads the registry per stop — a few hundred bytes, on a path that is
+/// already spawning `systemctl`, in exchange for the check being unskippable.
+/// Where a stop target came from — the only thing that distinguishes a name this
+/// module derived from a backend it verified, from one a caller handed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopOrigin {
+    /// Derived inside this module from an already-verified on-demand backend.
+    Internal,
+    /// Supplied by a caller, whose `always_on`/`kind` claims are unverified.
+    Caller,
+}
+
+fn stop_unit_unless_protected(unit: &str, origin: StopOrigin) {
+    match infer::protected_units() {
+        Some(protected) => {
+            if protected.contains(unit) {
+                tracing::warn!(
+                    unit = %unit,
+                    "refusing to stop a protected unit: it belongs to an always-on \
+                     or unmanaged backend in the model registry (CHRD #112)"
+                );
+                return;
+            }
         }
+        // FAIL CLOSED. No registry ⇒ no way to know whether this unit is the
+        // assistant's engine (gpt56, round 6). How closed depends on WHERE the
+        // target came from, which is what `origin` records:
+        //
+        // - `Internal` — the target was derived from a backend this module already
+        //   proved is on-demand: `free_gpu`'s guard-approved candidates, and
+        //   `ensure_up`'s stale-transient clear for the backend it is about to
+        //   start (which returned early for always-on/ollama/daemon). Chord's own
+        //   `chord-*` namespace is still stoppable, so teardown keeps working
+        //   without a registry.
+        // - `Caller` — `stop`'s `ResolvedBackend` came from outside and asserts its
+        //   own always_on/kind. With no registry to check it against, NOTHING is
+        //   stopped. Round 8 (codex): the namespace fallback alone let a caller
+        //   name `chord-<always-on-backend>.service` and have it stopped. A caller
+        //   assertion we cannot verify is not a basis for stopping a unit.
         None => {
-            let _ = run(["systemctl", "stop", &transient_unit(&backend.name)]);
+            let permitted = matches!(origin, StopOrigin::Internal)
+                && gpu_stop_guard::is_chord_namespaced_unit(unit);
+            if !permitted {
+                tracing::warn!(
+                    unit = %unit,
+                    origin = ?origin,
+                    "refusing to stop: the model registry is unavailable, so \
+                     protected units cannot be determined (CHRD #112)"
+                );
+                return;
+            }
         }
     }
+    let _ = run(["systemctl", "stop", unit]);
 }
 
-/// Stop every GPU backend except `keep` (frees the single GPU). Stops both
-/// declared units and transient `chord-<name>` units.
+/// Stop every **stoppable** GPU backend except `keep` (frees the single GPU).
+/// Stops both declared units and transient `chord-<name>` units.
+///
+/// This function cannot stop an always-on backend, and not because it remembers
+/// to check: [`infer::stoppable_gpu_backends`] is the only source of
+/// [`gpu_stop_guard::StoppableGpuBackend`], and it applies the guard while parsing the registry.
+/// The old shape — iterate every GPU backend, `systemctl stop` each — could
+/// stop `ollama.service`, the live assistant's own engine (CHRD #112).
 fn free_gpu(keep: &str) {
-    for (name, unit) in infer::gpu_backends() {
-        if name == keep {
-            continue;
+    for backend in infer::stoppable_gpu_backends(keep) {
+        if let Some(unit) = backend.unit() {
+            stop_unit_unless_protected(unit, StopOrigin::Internal);
         }
-        if let Some(unit) = unit {
-            let _ = run(["systemctl", "stop", &unit]);
-        }
-        let _ = run(["systemctl", "stop", &transient_unit(&name)]);
+        stop_unit_unless_protected(&transient_unit(backend.name()), StopOrigin::Internal);
     }
 }
 
+/// Re-exported from the guard, which owns the definition: the guard has to reason
+/// about transient units to decide what may be stopped, and two copies of this
+/// format string would be two chances for the guard and the effect to disagree.
 fn transient_unit(backend: &str) -> String {
-    format!("chord-{backend}.service")
+    gpu_stop_guard::transient_unit(backend)
 }
 
 // ── GGUF blob resolution ────────────────────────────────────────────────────
@@ -430,6 +514,59 @@ mod tests {
     #[test]
     fn transient_unit_name() {
         assert_eq!(transient_unit("llama-gpu"), "chord-llama-gpu.service");
+    }
+
+    /// SOURCE-LEVEL RATCHET (CHRD #112 / TERM #650), in two halves.
+    ///
+    /// The type guard makes it impossible to *ask* `free_gpu` to stop an
+    /// always-on backend, and `stop_unit_unless_protected` re-checks the target at
+    /// the point of action. Neither can stop someone adding a NEW place in this
+    /// file that shells out `systemctl stop` directly — which is exactly how the
+    /// original defect was written. Hence a ratchet, in two halves:
+    ///
+    /// **1. Attribution** — which functions issue a `systemctl stop`. Exactly ONE
+    /// is allowed: `stop_unit_unless_protected`, the single chokepoint every stop
+    /// path funnels through. A second is a design change, not a detail.
+    ///
+    /// **2. Census** — how many `"systemctl"` string literals exist at all.
+    /// Syntax-independent, and the answer to the arms race the review rounds
+    /// exposed: a lexical scanner will never attribute every legal spelling of a
+    /// function header, and it cannot see `let verb = "stop"` at all — but every
+    /// such bypass still has to name `systemctl`, so the count moves. It also
+    /// fires on a legitimate new invocation, which is precisely when a human
+    /// should be looking at this file.
+    ///
+    /// Both read the REAL source of this file, so neither can drift from what
+    /// ships. The scanners themselves are unit-tested in `gpu_stop_guard`.
+    #[test]
+    fn every_systemctl_stop_in_this_module_lives_in_one_guarded_chokepoint() {
+        const SRC: &str = include_str!("lifecycle.rs");
+
+        // Half 1: attribution.
+        let owners = gpu_stop_guard::stop_call_site_owners(SRC);
+        assert!(
+            !owners.is_empty(),
+            "the ratchet found no `systemctl stop` call sites at all — it has \
+             stopped measuring anything; fix the scanner rather than deleting it"
+        );
+        assert_eq!(
+            owners,
+            vec!["stop_unit_unless_protected".to_string()],
+            "every stop in this module must funnel through the single \
+             protected-unit-checked chokepoint (CHRD #112); found {owners:?}"
+        );
+
+        // Half 2: census. 3 today = 1 `start` in `ensure_up`, 1 `stop` in
+        // `stop_unit_unless_protected`, 1 `Command::new` in the unit-liveness probe.
+        assert_eq!(
+            gpu_stop_guard::systemctl_literal_count(SRC),
+            3,
+            "the number of `systemctl` invocations in this module changed. That is \
+             not automatically wrong — but a new one must be justified: it has to be \
+             unreachable for a protected unit, either because the guard type gates \
+             it or because it routes through stop_unit_unless_protected. Update this \
+             count in the same commit that adds it (CHRD #112)."
+        );
     }
 
     #[test]
