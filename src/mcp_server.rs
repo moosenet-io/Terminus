@@ -1607,10 +1607,23 @@ async fn handle_mcp(
             // `None` unless this process is explicitly configured to
             // federate a mesh, so this is a no-op for every deployment that
             // predates MESH-03 (byte-for-byte the tools built above).
+            // TERM #643: the routing table is KEPT, not discarded with the
+            // build. It is the catalog's own record of which entries came from
+            // an upstream, and the connector-scope filter below reads it
+            // instead of guessing provenance from each name's shape.
+            let mut mesh_routing: Option<crate::mesh::RoutingTable> = None;
             if let Some(pool) = &state.mesh_pool {
                 let merged = MergedCatalog::build(tools, pool).await;
                 tools = merged.tools;
+                mesh_routing = Some(merged.routing);
             }
+            // `AllLocal` is a CLAIM, made only where it is true: with no mesh
+            // pool this process federates nothing, so every advertised name is
+            // local. See `CatalogSource` for why this is not an `Option`.
+            let catalog_source = match &mesh_routing {
+                Some(routing) => crate::mesh::CatalogSource::Routed(routing),
+                None => crate::mesh::CatalogSource::AllLocal,
+            };
             // MESH-08: filter the merged catalog down to exactly what the
             // resolved caller `Principal` may CALL, per
             // `crate::gateway_framework::AllowlistPolicy` -- visibility ==
@@ -1641,6 +1654,7 @@ async fn handle_mcp(
                             binding.principal(),
                             Some(scope),
                             tools,
+                            &catalog_source,
                         );
                     }
                     None => {
@@ -1711,6 +1725,36 @@ async fn handle_mcp(
                 principal.map(|p| p.name().to_string()).unwrap_or_else(|| ANONYMOUS_IDENTITY.to_string());
             let audit_upstream_ns = crate::mesh::split_namespaced(name).map(|(ns, _)| ns.to_string());
 
+            // MESH-03: a namespaced name (`<namespace>__<tool>`) routes to
+            // its owning mesh upstream (or a clean "unavailable" tool-error
+            // if that upstream is down) BEFORE core/personal-federated
+            // dispatch is even attempted -- a namespaced name is never
+            // coincidentally a local or personal-federated tool. `None`
+            // (`state.mesh_pool` unset, e.g. every pre-MESH-03 deployment)
+            // and `Some(CallRoute::Local)` (a plain name, or a `__`-shaped
+            // name whose prefix isn't a known mesh namespace) both fall
+            // straight through to the existing core/personal-federated
+            // dispatch below, byte-for-byte unchanged.
+            //
+            // TERM #643: resolved HERE, above the connector-scope gate, rather
+            // than just above dispatch. The gate needs this call's PROVENANCE,
+            // and it must be the SAME resolution dispatch will use — computing
+            // it twice would let a health flip between the two authorize
+            // against one namespace and dispatch to another. No network I/O:
+            // `resolve_call_route` only reads the pool's tracked health flags.
+            let mesh_route = state.mesh_pool.as_ref().map(|pool| crate::mesh::resolve_call_route(name, pool));
+            // The catalog entry this call is about, provenance included. Local
+            // when the name dispatches locally — including a `__`-shaped name
+            // whose prefix names no registered upstream, which is exactly the
+            // case a syntactic split gets wrong.
+            let called_tool = crate::oauth::groups::CatalogTool {
+                name: name.to_string(),
+                namespace: mesh_route
+                    .as_ref()
+                    .and_then(CallRoute::namespace)
+                    .map(str::to_string),
+            };
+
             // TGW-04: gate every tool call -- core (local) AND
             // personal-federated -- through the same identity → allowlist →
             // rate-limit pipeline the inference-proxy routes use (see
@@ -1740,7 +1784,7 @@ async fn handle_mcp(
             if let Some(scope) = client_scope.as_deref() {
                 let denial_text = match &state.gateway {
                     Some(gateway) => gateway
-                        .guard_client_scope(binding.principal(), Some(scope), name)
+                        .guard_client_scope(binding.principal(), Some(scope), &called_tool)
                         .err(),
                     // No gateway means no account grant to intersect with, so
                     // there is no safe answer but the empty one. Round 1
@@ -1846,18 +1890,6 @@ async fn handle_mcp(
                     );
                 }
             }
-
-            // MESH-03: a namespaced name (`<namespace>__<tool>`) routes to
-            // its owning mesh upstream (or a clean "unavailable" tool-error
-            // if that upstream is down) BEFORE core/personal-federated
-            // dispatch is even attempted -- a namespaced name is never
-            // coincidentally a local or personal-federated tool. `None`
-            // (`state.mesh_pool` unset, e.g. every pre-MESH-03 deployment)
-            // and `Some(CallRoute::Local)` (a plain name, or a `__`-shaped
-            // name whose prefix isn't a known mesh namespace) both fall
-            // straight through to the existing core/personal-federated
-            // dispatch below, byte-for-byte unchanged.
-            let mesh_route = state.mesh_pool.as_ref().map(|pool| crate::mesh::resolve_call_route(name, pool));
 
             // MESH-10: once routing is resolved, attach the upstream/bare
             // tool name to the gate context (a no-op when `state.gateway` is

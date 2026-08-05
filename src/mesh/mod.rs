@@ -93,7 +93,7 @@ pub use client_onboarding::{
 pub use identity::TailnetIdentity;
 pub use merge::{
     namespaced, resolve_call_route, split_namespaced, upstream_unavailable_text, CallRoute,
-    MergedCatalog, Route, RoutingTable, MESH_NS_SEP,
+    CatalogSource, MergedCatalog, Route, RoutingTable, MESH_NS_SEP,
 };
 pub use onboarding::{
     onboard_upstream, MeshOnboardUpstream, OnboardingError, OnboardingRequest, OnboardingReport,

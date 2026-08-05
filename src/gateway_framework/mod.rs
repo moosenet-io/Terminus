@@ -89,6 +89,8 @@ use crate::mesh::Principal;
 // module owns the ACCOUNT half and hands it to `oauth::scope` through the
 // `AccountGrant` adapter below; the intersection itself lives there so that
 // `tools/list` and `tools/call` share exactly one implementation of it.
+use crate::mesh::CatalogSource;
+use crate::oauth::groups::CatalogTool;
 use crate::oauth::scope::{AccountGrant, ClientScope, ListFilterTally};
 use audit::{AuditDecision, AuditEntry, AuditResult};
 use rate_limit::{rate_limit_key, InProcessRateLimiter, RateLimitDecision, RateLimiter};
@@ -2015,11 +2017,16 @@ impl GatewayFramework {
     /// text for the caller. It is called BEFORE [`Self::guard`], so exactly one
     /// audit entry is still written per request — the same invariant `guard`
     /// itself maintains.
+    ///
+    /// `tool` carries the call's PROVENANCE, not just its name (TERM #643):
+    /// the caller builds it from the resolved [`crate::mesh::CallRoute`], so
+    /// authorization is decided against the namespace the call is about to
+    /// dispatch to rather than against a namespace guessed from the name.
     pub fn guard_client_scope(
         &self,
         principal: Option<&Principal>,
         scope: Option<&ClientScope>,
-        tool: &str,
+        tool: &CatalogTool,
     ) -> Result<(), String> {
         let Some(scope) = scope else {
             return Ok(());
@@ -2027,7 +2034,7 @@ impl GatewayFramework {
         let decision = crate::oauth::scope::decide(&self.account_grant(principal), scope, tool);
         match decision.deny_code() {
             None => Ok(()),
-            Some(reason) => Err(audit_client_scope_denial(principal, scope, tool, reason)),
+            Some(reason) => Err(audit_client_scope_denial(principal, scope, &tool.name, reason)),
         }
     }
 
@@ -2042,13 +2049,21 @@ impl GatewayFramework {
     /// [`Self::guard_client_scope`]. A tool object with no `name` string is
     /// dropped, matching [`AllowlistPolicy::filter_tools`]'s own fail-closed
     /// handling of a malformed entry.
+    ///
+    /// `source` is where each advertised name came FROM (TERM #643). It is a
+    /// required argument rather than an `Option` so that "this process
+    /// federates nothing" has to be stated as
+    /// [`crate::mesh::CatalogSource::AllLocal`] rather than arrived at by
+    /// forgetting to pass a routing table — treating a federated tool as local
+    /// would skip the `namespaces(client)` dimension entirely.
     pub fn filter_catalog_for_client(
         &self,
         principal: Option<&Principal>,
         scope: Option<&ClientScope>,
         tools: Vec<Value>,
+        source: &CatalogSource<'_>,
     ) -> Vec<Value> {
-        self.filter_catalog_for_client_tallied(principal, scope, tools).0
+        self.filter_catalog_for_client_tallied(principal, scope, tools, source).0
     }
 
     /// [`Self::filter_catalog_for_client`]'s body, also returning the tally it
@@ -2066,6 +2081,7 @@ impl GatewayFramework {
         principal: Option<&Principal>,
         scope: Option<&ClientScope>,
         tools: Vec<Value>,
+        source: &CatalogSource<'_>,
     ) -> (Vec<Value>, ListFilterTally) {
         let Some(scope) = scope else {
             return (tools, ListFilterTally::default());
@@ -2076,7 +2092,11 @@ impl GatewayFramework {
             .into_iter()
             .filter(|tool| match tool.get("name").and_then(Value::as_str) {
                 Some(name) => {
-                    let decision = crate::oauth::scope::decide(&grant, scope, name);
+                    let entry = CatalogTool {
+                        name: name.to_string(),
+                        namespace: source.namespace_of(name).map(str::to_string),
+                    };
+                    let decision = crate::oauth::scope::decide(&grant, scope, &entry);
                     tally.record(decision);
                     decision.is_allowed()
                 }
@@ -3060,6 +3080,65 @@ mod tests {
 
     // ── RMCP-07: the per-connector intersection, at the gateway seam ──────
 
+    /// A catalog entry for a test tool, treating a `__`-shaped advertised name
+    /// as genuinely contributed by the upstream it names.
+    ///
+    /// A FIXTURE builder, and the only place these tests read a name's shape.
+    /// TERM #643 removed that inference from the production path; the tests
+    /// that are about a name which LIES about its provenance build their
+    /// entries explicitly instead.
+    fn tool_entry(name: &str) -> CatalogTool {
+        match crate::mesh::split_namespaced(name) {
+            Some((namespace, bare)) => CatalogTool::from_upstream(namespace, bare),
+            None => CatalogTool::local(name),
+        }
+    }
+
+    /// The routing a merged catalog of these names would have produced.
+    fn routing_of(tools: &[Value]) -> crate::mesh::RoutingTable {
+        let mut routing = crate::mesh::RoutingTable::new();
+        for name in tools.iter().filter_map(|t| t["name"].as_str()) {
+            let route = match crate::mesh::split_namespaced(name) {
+                Some((namespace, bare_name)) => crate::mesh::Route::Upstream {
+                    namespace: namespace.to_string(),
+                    bare_name: bare_name.to_string(),
+                },
+                None => crate::mesh::Route::Local,
+            };
+            routing.insert(name, route);
+        }
+        routing
+    }
+
+    /// `filter_catalog_for_client` with the ordinary provenance for these
+    /// names. Exists so the tests that are NOT about provenance do not each
+    /// have to build a routing table.
+    fn filter_for_client(
+        fw: &GatewayFramework,
+        principal: Option<&Principal>,
+        scope: Option<&ClientScope>,
+        tools: Vec<Value>,
+    ) -> Vec<Value> {
+        let routing = routing_of(&tools);
+        fw.filter_catalog_for_client(principal, scope, tools, &CatalogSource::Routed(&routing))
+    }
+
+    /// [`filter_for_client`], also returning the production tally.
+    fn filter_for_client_tallied(
+        fw: &GatewayFramework,
+        principal: Option<&Principal>,
+        scope: Option<&ClientScope>,
+        tools: Vec<Value>,
+    ) -> (Vec<Value>, ListFilterTally) {
+        let routing = routing_of(&tools);
+        fw.filter_catalog_for_client_tallied(
+            principal,
+            scope,
+            tools,
+            &CatalogSource::Routed(&routing),
+        )
+    }
+
     /// Build a connector scope the way `ScopeResolver` would, without a store.
     fn connector_scope(patterns: &[&str], namespaces: &[&str]) -> ClientScope {
         use crate::oauth::model::ToolGroup;
@@ -3102,17 +3181,17 @@ mod tests {
             tool_json("vitals_summary"),
             tool_json("peerone__vitals_summary"),
         ];
-        let filtered = fw.filter_catalog_for_client(Some(&principal), Some(&scope), catalog);
+        let filtered = filter_for_client(&fw, Some(&principal), Some(&scope), catalog);
         let names: Vec<&str> =
             filtered.iter().filter_map(|t| t["name"].as_str()).collect();
         assert_eq!(names, vec!["ledger_accounts"]);
 
         // And the call gate agrees, with the grant named as the reason.
         assert!(fw
-            .guard_client_scope(Some(&principal), Some(&scope), "ledger_accounts")
+            .guard_client_scope(Some(&principal), Some(&scope), &tool_entry("ledger_accounts"))
             .is_ok());
         let denial = fw
-            .guard_client_scope(Some(&principal), Some(&scope), "vitals_summary")
+            .guard_client_scope(Some(&principal), Some(&scope), &tool_entry("vitals_summary"))
             .expect_err("the account grant must still refuse it");
         assert!(denial.contains("denied_by_grant"), "reason in denial: {denial}");
     }
@@ -3137,7 +3216,7 @@ mod tests {
             tool_json("peertwo__ledger_accounts"),
         ];
         let filtered =
-            fw.filter_catalog_for_client(Some(&principal), Some(&scope), catalog.clone());
+            filter_for_client(&fw, Some(&principal), Some(&scope), catalog.clone());
         let visible: Vec<String> = filtered
             .iter()
             .filter_map(|t| t["name"].as_str().map(str::to_string))
@@ -3145,7 +3224,7 @@ mod tests {
 
         for tool in catalog.iter().filter_map(|t| t["name"].as_str()) {
             let callable = fw
-                .guard_client_scope(Some(&principal), Some(&scope), tool)
+                .guard_client_scope(Some(&principal), Some(&scope), &tool_entry(tool))
                 .is_ok();
             assert_eq!(
                 visible.contains(&tool.to_string()),
@@ -3157,9 +3236,63 @@ mod tests {
         // And the tool that a group DID match but the namespace refused names
         // the namespace as the reason, not the group.
         let denial = fw
-            .guard_client_scope(Some(&principal), Some(&scope), "peertwo__ledger_accounts")
+            .guard_client_scope(Some(&principal), Some(&scope), &tool_entry("peertwo__ledger_accounts"))
             .expect_err("an unscoped upstream is uncallable even when a group matches");
         assert!(denial.contains("no_namespace"), "reason in denial: {denial}");
+    }
+
+    /// TERM #643 at the seam: provenance comes from the CATALOG, so a local
+    /// tool whose name looks federated is judged as local on both paths.
+    ///
+    /// The routing table here is the interesting input — it says
+    /// `peerhub__tool` was NOT contributed by `peerhub`, which no amount of
+    /// looking at the string could tell you. The connector holds the `peerhub`
+    /// namespace and a `peerhub::*` group, so the namespace dimension permits
+    /// it and the matcher is the only thing left to refuse: exactly the shape
+    /// that was over-granting. List and call must still agree.
+    #[test]
+    fn a_local_tool_that_looks_federated_is_judged_local_at_the_seam() {
+        let fw = framework_with(policy_allowing("dev-box", &["*"]), 10);
+        let principal = test_principal("dev-box");
+        let scope = connector_scope(&["peerhub::*"], &["peerhub"]);
+
+        let catalog = vec![tool_json("peerhub__tool")];
+        let mut routing = crate::mesh::RoutingTable::new();
+        routing.insert("peerhub__tool", crate::mesh::Route::Local);
+
+        let filtered = fw.filter_catalog_for_client(
+            Some(&principal),
+            Some(&scope),
+            catalog,
+            &CatalogSource::Routed(&routing),
+        );
+        assert!(
+            filtered.is_empty(),
+            "a qualified pattern must not reveal a tool that upstream never contributed"
+        );
+        let denial = fw
+            .guard_client_scope(
+                Some(&principal),
+                Some(&scope),
+                &CatalogTool::local("peerhub__tool"),
+            )
+            .expect_err("and it must not be callable either");
+        assert!(denial.contains("no_group"), "reason in denial: {denial}");
+
+        // The genuinely federated tool of the same advertised name is reached,
+        // so this narrows provenance rather than breaking the qualified form.
+        let real = vec![tool_json("peerhub__tool")];
+        let real_routing = routing_of(&real);
+        assert_eq!(
+            fw.filter_catalog_for_client(
+                Some(&principal),
+                Some(&scope),
+                real,
+                &CatalogSource::Routed(&real_routing)
+            )
+            .len(),
+            1
+        );
     }
 
     /// A connector with no scoping rows reaches nothing, even when the account
@@ -3172,11 +3305,9 @@ mod tests {
         let scope = ClientScope::empty("a-connector-client-id");
 
         let catalog = vec![tool_json("ledger_accounts"), tool_json("vitals_summary")];
-        assert!(fw
-            .filter_catalog_for_client(Some(&principal), Some(&scope), catalog)
-            .is_empty());
+        assert!(filter_for_client(&fw, Some(&principal), Some(&scope), catalog).is_empty());
         let denial = fw
-            .guard_client_scope(Some(&principal), Some(&scope), "ledger_accounts")
+            .guard_client_scope(Some(&principal), Some(&scope), &tool_entry("ledger_accounts"))
             .expect_err("an unscoped connector must reach nothing");
         assert!(denial.contains("no_group"), "reason in denial: {denial}");
     }
@@ -3188,11 +3319,12 @@ mod tests {
     fn a_connector_with_no_principal_reaches_nothing() {
         let fw = framework_with(policy_allowing("dev-box", &["*"]), 10);
         let scope = connector_scope(&["*"], &["peerone"]);
+        assert!(
+            filter_for_client(&fw, None, Some(&scope), vec![tool_json("ledger_accounts")])
+                .is_empty()
+        );
         assert!(fw
-            .filter_catalog_for_client(None, Some(&scope), vec![tool_json("ledger_accounts")])
-            .is_empty());
-        assert!(fw
-            .guard_client_scope(None, Some(&scope), "ledger_accounts")
+            .guard_client_scope(None, Some(&scope), &tool_entry("ledger_accounts"))
             .is_err());
     }
 
@@ -3206,17 +3338,17 @@ mod tests {
         let principal = test_principal("dev-box");
         let catalog = vec![tool_json("ledger_accounts"), tool_json("vitals_summary")];
         let filtered =
-            fw.filter_catalog_for_client(Some(&principal), None, catalog.clone());
+            filter_for_client(&fw, Some(&principal), None, catalog.clone());
         assert_eq!(filtered, catalog, "a non-OAuth request must be untouched");
         assert!(fw
-            .guard_client_scope(Some(&principal), None, "ledger_accounts")
+            .guard_client_scope(Some(&principal), None, &tool_entry("ledger_accounts"))
             .is_ok());
         // Including for an identity the allowlist does not know: with no
         // connector this method has no opinion at all, and `guard` is what
         // refuses. Applying the intersection here would be a second, silent
         // denial path.
         assert!(fw
-            .guard_client_scope(Some(&test_principal("stranger")), None, "ledger_accounts")
+            .guard_client_scope(Some(&test_principal("stranger")), None, &tool_entry("ledger_accounts"))
             .is_ok());
     }
 
@@ -3229,7 +3361,7 @@ mod tests {
         let scope = connector_scope(&["*"], &[]);
         let catalog = vec![json!({"description": "no name field"}), tool_json("ledger_accounts")];
         let (filtered, tally) =
-            fw.filter_catalog_for_client_tallied(Some(&principal), Some(&scope), catalog);
+            filter_for_client_tallied(&fw, Some(&principal), Some(&scope), catalog);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["name"], "ledger_accounts");
         // The malformed entry is dropped WITHOUT being tallied: it is a
@@ -3256,19 +3388,16 @@ mod tests {
         let scope = connector_scope(&["*"], &[]);
 
         assert!(fw
-            .guard_client_scope(Some(&principal), Some(&scope), "ledger_accounts")
+            .guard_client_scope(Some(&principal), Some(&scope), &tool_entry("ledger_accounts"))
             .is_ok());
         let denial = fw
-            .guard_client_scope(Some(&principal), Some(&scope), "secrets_read")
+            .guard_client_scope(Some(&principal), Some(&scope), &tool_entry("secrets_read"))
             .expect_err("a denied tool stays denied through the intersection");
         assert!(denial.contains("denied_by_grant"));
-        assert!(fw
-            .filter_catalog_for_client(
-                Some(&principal),
-                Some(&scope),
-                vec![tool_json("secrets_read")]
-            )
-            .is_empty());
+        assert!(
+            filter_for_client(&fw, Some(&principal), Some(&scope), vec![tool_json("secrets_read")])
+                .is_empty()
+        );
     }
 
     /// Round 1 finding 3: the gateway-less denial path must produce the SAME
@@ -3315,7 +3444,7 @@ mod tests {
         // The guarded path returns the identical text, so the two cannot drift.
         let fw = framework_with(policy_allowing("dev-box", &["*"]), 10);
         let via_guard = fw
-            .guard_client_scope(Some(&principal), Some(&scope), "peertwo__ledger_accounts")
+            .guard_client_scope(Some(&principal), Some(&scope), &tool_entry("peertwo__ledger_accounts"))
             .expect_err("denied");
         assert_eq!(via_guard, federated);
     }
@@ -3349,7 +3478,7 @@ mod tests {
         // recomputes the value it is checking cannot fail when the production
         // path stops computing it, which is exactly what a mutation run caught.
         let (kept, tally) =
-            fw.filter_catalog_for_client_tallied(Some(&principal), Some(&scope), catalog);
+            filter_for_client_tallied(&fw, Some(&principal), Some(&scope), catalog);
         let names: Vec<&str> = kept.iter().filter_map(|t| t["name"].as_str()).collect();
         assert_eq!(names, vec!["ledger_accounts", "peerone__ledger_report"]);
 

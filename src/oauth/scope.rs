@@ -45,39 +45,66 @@
 //! entry — see [`ScopeResolver`]'s own docs for why that cache is bounded the
 //! way it is.
 //!
-//! ## Relationship to RMCP-06 — and the collapse onto one matcher
-//! RMCP-06 owns tool GROUPS: their CRUD, their seeded starter set, and
-//! write-time validation of the pattern syntax. It had not landed when this
-//! item was built, so [`ScopePattern`] parses the same vocabulary here in order
-//! to be usable at all. The grammar is deliberately tiny either way — no regex,
-//! no negation.
+//! ## Relationship to RMCP-06 — the collapse, now done (TERM #637)
+//! RMCP-06 owns tool GROUPS: their CRUD, their seeded starter set, the pattern
+//! GRAMMAR, and the matcher. It had not landed when this item was built, so
+//! this file carried a second copy of that vocabulary — `ScopePattern` — in
+//! order to be usable at all.
 //!
 //! **Two matchers that must agree eventually disagree.** TERM #637 is the
 //! proof: this side qualified with `::` and the authoring side with `__`, so
-//! authored patterns were dead or over-granting the moment both shipped. The
-//! divergence was found by verification, not by either author noticing — which
-//! is the argument for collapsing rather than for documenting harder.
+//! authored patterns were dead or over-granting the moment both shipped. TERM
+//! #643 is the second instance of the same divergence, in the other direction:
+//! the authoring matcher had already been fixed to read provenance from the
+//! catalog entry, while this copy was still inferring it from the NAME's shape,
+//! so a local tool named `peerhub__tool` satisfied `peerhub::tool`. Neither
+//! divergence was noticed by either author; both were found by verification.
+//! That is the argument for collapsing rather than for documenting harder.
 //!
-//! **Sequencing, because it cannot be done here.** The collapse must FOLLOW
-//! RMCP-06 landing: deleting this parser now would leave the resolver with
-//! nothing to parse patterns with, and adopting RMCP-06's requires its code to
-//! exist. Once it merges the follow-up is mechanical — delete [`ScopePattern`],
-//! point [`ClientScope::from_rows`] at `groups.rs`'s matcher, and keep the
-//! tests.
+//! So there is now exactly ONE matcher — [`crate::oauth::groups::Pattern`] —
+//! and this file holds none of the grammar. [`ClientScope::from_rows`] parses
+//! stored rows with [`crate::oauth::groups::Pattern::parse_stored`] and
+//! [`decide`] matches with [`crate::oauth::groups::Pattern::matches`], which is
+//! the same code path the authoring side validates against.
 //!
-//! **Keep the tests, specifically.** They encode ENFORCEMENT properties an
-//! authoring-side suite has no reason to cover: that an unqualified prefix
-//! cannot cross a namespace boundary, that a bare `*` is still clamped by the
-//! account grant, that `tools/list` and `tools/call` never disagree, and that
-//! absence is the empty set. Re-point them at the surviving matcher rather than
-//! deleting them alongside the parser — they are the half of the contract that
-//! guards a live door.
+//! **The tests were RE-POINTED, not deleted with the parser.** They encode
+//! ENFORCEMENT properties an authoring-side suite has no reason to cover: that
+//! an unqualified prefix cannot cross a namespace boundary, that a bare `*` is
+//! still clamped by the account grant, that `tools/list` and `tools/call` never
+//! disagree, and that absence is the empty set. They are the half of the
+//! contract that guards a live door, so what changed in them is the matcher
+//! they call — never what they assert. The pure GRAMMAR tests (which strings
+//! parse, which are refused) went with the parser, because they now test
+//! `groups.rs`'s code and `groups.rs` already tests it.
 //!
-//! Note that parsing here is TOTAL and fail-closed: an unparseable pattern
-//! matches nothing rather than erroring at match time (a match-time error on
-//! the dispatch path is a denial-of-service, and a pattern that cannot be
-//! understood must certainly not be read as "allow"). RMCP-06 rejects such a
-//! pattern at write time so it never reaches storage; this is the second layer.
+//! Parsing on this path stays TOTAL and fail-closed: an unparseable stored
+//! pattern is dropped and matches nothing rather than erroring at match time (a
+//! match-time error on the dispatch path is a denial-of-service, and a pattern
+//! that cannot be understood must certainly not be read as "allow"). RMCP-06
+//! rejects such a pattern at write time so it never reaches storage; this is
+//! the second layer.
+//!
+//! ## Provenance, not name shape (TERM #643)
+//! Whether a tool is LOCAL or belongs to a federated namespace is a fact about
+//! where the catalog entry came FROM, and the only place that fact exists is
+//! the entry itself. [`decide`] therefore takes a
+//! [`crate::oauth::groups::CatalogTool`] — a name PLUS its provenance — and not
+//! a `&str`. Both dimensions it applies read the provenance: the namespace
+//! check compares [`crate::oauth::groups::CatalogTool::namespace`] against the
+//! client's namespaces, and the matcher decides the local/qualified boundary
+//! from the same field.
+//!
+//! `crate::mesh::split_namespaced` cannot stand in for this, and adopting the
+//! split-halves REPRESENTATION does not help either: the split is purely
+//! syntactic, so it hands the same false `Some("peerhub")` to a local tool
+//! literally named `peerhub__tool`. The two cases are byte-identical as
+//! strings. Only the catalog can tell them apart, so the catalog is asked.
+//!
+//! The provenance a request is decided against is the provenance it will
+//! DISPATCH to — `tools/list` reads
+//! [`crate::mesh::RoutingTable::namespace_of`] and `tools/call` reads
+//! [`crate::mesh::CallRoute::namespace`], the merge layer's own two answers —
+//! so an entry cannot be authorized as one thing and routed as another.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,9 +114,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::error::ToolError;
-use crate::mesh::split_namespaced;
-use crate::oauth::delegation::{owner_may_hold, PatternShape};
-use crate::oauth::groups::AuthorizedGroup;
+use crate::oauth::delegation::owner_may_hold;
+use crate::oauth::groups::{AuthorizedGroup, CatalogTool, Pattern};
 use crate::oauth::store::OauthStore;
 
 // ---------------------------------------------------------------------------
@@ -273,287 +299,6 @@ where
     }
 }
 
-// ---------------------------------------------------------------------------
-// Patterns
-// ---------------------------------------------------------------------------
-
-/// The longest pattern that will be accepted. A pattern is operator- (or
-/// delegated-owner-) authored and stored, so this is a sanity bound on stored
-/// data rather than a defence against a request body.
-const MAX_PATTERN_LEN: usize = 256;
-
-/// The delimiter separating a namespace qualifier from the rest of a pattern.
-///
-/// Deliberately NOT [`crate::mesh::MESH_NS_SEP`] (`__`), which is what an
-/// ADVERTISED name uses. TERM #637 settled the vocabulary this way because a
-/// distinct delimiter removes an ambiguity `__` cannot: `a__b__*` has two
-/// legitimate readings (namespace `a`, prefix `b__`; or namespace `a__b`), and
-/// picking one is a fiat that operators will get wrong in the other direction.
-/// `a::b__*` has exactly one reading — and, as a direct consequence, a BARE
-/// tool name may contain `__` freely without becoming ambiguous, which matters
-/// because plenty of them do.
-///
-/// So: patterns qualify with `::`, advertised names separate with `__`, and the
-/// two never have to be told apart by position.
-const NAMESPACE_SEP: &str = "::";
-
-/// One entry in a tool group.
-///
-/// ## The agreed semantics (RMCP-06's ruling, recorded here verbatim in intent)
-/// This matcher is a temporary second copy — RMCP-06 owns groups, and when its
-/// `groups.rs` lands this collapses onto its version. So the target is written
-/// down rather than left to be re-derived:
-///
-/// > An unqualified **exact** or **prefix** pattern matches local (unqualified)
-/// > tools only; a namespace-qualified pattern matches only within the
-/// > namespace it names; and the bare `*` matches the whole merged catalog,
-/// > local and federated alike, bounded by the client's allowed namespaces at
-/// > RMCP-07's intersection rather than by the matcher.
-///
-/// TERM #637 settled the two open points that ruling did not cover. The
-/// qualifier is `::` (not `__`), and the grammar has FOUR shapes rather than
-/// two: `<ns>::*`, `<ns>::<tool>`, `<ns>::<prefix>*` and the unqualified
-/// local-only pair. The qualified forms exist because without them a connector
-/// could only ever be given a whole federated server — an expressiveness gap
-/// that reads as a broken feature to the first operator who tries the obvious
-/// narrower thing.
-///
-/// ## Why `*` is exempt rather than inconsistent
-/// This is the part someone will later be tempted to "fix", so the reasoning
-/// belongs next to the code. The local-only rule exists because **letters
-/// collide**: `peer*` sweeping in `peerhub__*` is a widening the author cannot
-/// see in what they wrote. `*` has no letters, so there is no coincidence to
-/// fall foul of and no near-miss to mistake for a hit. It is also already the
-/// most heavily gated pattern in the system — operator-only at write time, and
-/// re-derived against the owner's current state on every resolution — so making
-/// it the one shape that could not reach a federated tool would leave the
-/// strongest-gated pattern weaker than shapes with fewer gates.
-///
-/// ## The division of labour this implies
-/// **The matcher does not bound `*`; the intersection does.** That is precisely
-/// why `namespaces(client)` is applied on the list path and the call path
-/// alike — see [`decide`]. If `*` stopped at the local registry instead,
-/// `namespaces(client)` would only ever constrain patterns that already name
-/// their own namespace, and the whole federated dimension would be vestigial.
-///
-/// ## Where a namespace begins
-/// Never decided here. Every arm defers to [`crate::mesh::split_namespaced`],
-/// the merge layer's own function, so this file holds no second opinion about
-/// separators. Two definitions of "where does the namespace end" is the same
-/// dual-writer hazard in miniature, and it is the kind that shows up as a
-/// silent widening rather than as a compile error.
-///
-/// The grammar is deliberately tiny — three forms and nothing else. No regex
-/// (a regex authored by a delegated federation owner is a denial-of-service
-/// against the dispatch path) and no negation (denial already has a layer, in
-/// [`crate::gateway_framework`], which composes on top of this and overrides
-/// unconditionally; a second, weaker negation here would be a way to *appear*
-/// to deny something that the real deny layer never sees).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScopePattern {
-    /// `*` — every tool in the catalog.
-    ///
-    /// This cannot widen anything: [`decide`] checks the account grant FIRST,
-    /// so `*` in a group means "everything this account could already do",
-    /// never "everything that exists". RMCP-06 additionally restricts authoring
-    /// a bare `*` to an operator-owned group at write time; that restriction is
-    /// a usability and blast-radius guard, not the thing that makes `*` safe.
-    All,
-    /// An exact LOCAL tool name.
-    ///
-    /// Local-only for the same reason as [`Self::Prefix`]: an unqualified
-    /// pattern addresses the local namespace. A bare pattern that spelled out a
-    /// namespaced name in full (`peerhub__alerts_list`) therefore matches
-    /// nothing — the grammar has no `<namespace>::<tool>` form, so a single
-    /// federated tool is not addressable, and refusing is the fail-closed
-    /// reading of a pattern that cannot be expressed.
-    Exact(String),
-    /// A trailing-`*` prefix, matching LOCAL tool names only.
-    ///
-    /// The local-only restriction is load-bearing and was added after RMCP-06's
-    /// review found the shared semantics wrong. A plain
-    /// `advertised.starts_with(prefix)` crosses namespace boundaries whenever
-    /// the prefix is also a prefix of a NAMESPACE: `peer*` matched
-    /// `peerhub__alerts_list`, so a pattern written for local tools silently
-    /// reached every tool of a federated server whose namespace happened to
-    /// start the same way.
-    ///
-    /// An earlier revision of this file claimed the boundary was already
-    /// enforced because prefixes match the advertised name — `ledger_*` does
-    /// not reach `peerone__ledger_accounts`. That was true, but only
-    /// incidentally: it holds because `peerone…` does not start with `ledger_`,
-    /// not because any rule forbade the crossing. Change the namespace to
-    /// `ledgerhub` and the same pattern reached straight into it. The property
-    /// is now enforced rather than emergent, and pinned by
-    /// `a_bare_prefix_cannot_reach_a_namespace_it_is_a_prefix_of`.
-    ///
-    /// The namespace dimension does not save this case: a client legitimately
-    /// scoped to `peerhub` passes the namespace check, and the over-broad
-    /// pattern is then the only thing standing between it and that server's
-    /// entire catalog.
-    Prefix(String),
-    /// `<namespace>::*` — every tool advertised under one mesh namespace.
-    Namespace(String),
-    /// `<namespace>::<tool>` — ONE specific federated tool.
-    ///
-    /// TERM #637 (part B, finding 1): without this form the only way to reach a
-    /// federated tool was to grant its whole namespace, because
-    /// [`Self::Exact`] is local-only. An operator who wants a connector to
-    /// reach exactly one tool on one peer had to hand it the entire peer — the
-    /// opposite of what a scoping feature is for, and the kind of gap that
-    /// reads as "scoping is broken" to whoever tries the obvious thing first.
-    NamespacedExact(String, String),
-    /// `<namespace>::<prefix>*` — a prefix WITHIN one namespace.
-    ///
-    /// TERM #637 (part B, finding 2). The prefix matches the BARE name inside
-    /// the namespace, never the advertised name, so `peerone::weather_*`
-    /// selects `peerone__weather_now` and cannot leak into `peertwo`. This is
-    /// the qualified counterpart of [`Self::Prefix`], and it is what makes the
-    /// two sides of the vocabulary able to express the same set.
-    NamespacedPrefix(String, String),
-}
-
-impl ScopePattern {
-    /// This pattern reduced to the shape delegation reasons about, so the
-    /// enforcing vocabulary and the authoring one ask
-    /// [`crate::oauth::delegation::owner_may_hold`] the same question.
-    ///
-    /// Exhaustive by construction: a form added later cannot default into the
-    /// permissive class.
-    pub fn shape(&self) -> PatternShape<'_> {
-        match self {
-            ScopePattern::All => PatternShape::Everything,
-            ScopePattern::Namespace(namespace)
-            | ScopePattern::NamespacedExact(namespace, _)
-            | ScopePattern::NamespacedPrefix(namespace, _) => PatternShape::Namespaced(namespace),
-            ScopePattern::Exact(_) | ScopePattern::Prefix(_) => PatternShape::Local,
-        }
-    }
-
-    /// Parse one stored pattern.
-    ///
-    /// Returns [`ToolError::InvalidArgument`] rather than a permissive
-    /// fallback — there is no reading of "I do not understand this pattern"
-    /// that should widen anything. Callers on the DISPATCH path must not
-    /// propagate the error: see [`ClientScope::from_rows`], which drops the
-    /// pattern (so it matches nothing) and logs.
-    pub fn parse(raw: &str) -> Result<Self, ToolError> {
-        let refuse = |why: &str| {
-            ToolError::InvalidArgument(format!(
-                "invalid tool-group pattern ({why}); the accepted forms are an exact tool name, \
-                 a trailing-* prefix, and <namespace>::*"
-            ))
-        };
-
-        let pattern = raw.trim();
-        if pattern.is_empty() {
-            return Err(refuse("empty"));
-        }
-        if pattern.len() > MAX_PATTERN_LEN {
-            return Err(refuse("too long"));
-        }
-        // A control character in a stored pattern is either corruption or an
-        // attempt to forge a log line; neither should reach the matcher.
-        if pattern.chars().any(char::is_control) {
-            return Err(refuse("contains a control character"));
-        }
-
-        if pattern == "*" {
-            return Ok(Self::All);
-        }
-
-        // At most one trailing `*`, wherever it appears. `a*b`, `**` and `*a`
-        // are all refused: accepting them would imply a glob grammar this
-        // matcher does not implement, and an operator who believes they wrote a
-        // glob has written a permission they cannot predict.
-        let trailing_star_only = |body: &str| {
-            let stars = body.matches('*').count();
-            stars == 0 || (stars == 1 && body.ends_with('*'))
-        };
-
-        // QUALIFIED: `<namespace>::<rest>`, split at the FIRST `::`.
-        if let Some((namespace, rest)) = pattern.split_once(NAMESPACE_SEP) {
-            if namespace.is_empty() {
-                return Err(refuse("namespace pattern with no namespace"));
-            }
-            // A mesh namespace never contains `:` or `*`, so `a::b::*` and
-            // `a*::x` are refused rather than quietly matching nothing — which
-            // would look like a working rule while granting no access at all.
-            if namespace.contains(':') || namespace.contains('*') {
-                return Err(refuse("malformed namespace"));
-            }
-            if rest.is_empty() {
-                return Err(refuse("namespace qualifier with nothing after it"));
-            }
-            // A second `::` is a third component this grammar has no meaning
-            // for. Refusing keeps `split_once` from silently deciding which
-            // half won.
-            if rest.contains(':') {
-                return Err(refuse("only one `::` qualifier is permitted"));
-            }
-            if !trailing_star_only(rest) {
-                return Err(refuse(
-                    "`*` is only permitted as a whole pattern or as a trailing wildcard",
-                ));
-            }
-            if rest == "*" {
-                return Ok(Self::Namespace(namespace.to_string()));
-            }
-            if let Some(prefix) = rest.strip_suffix('*') {
-                // Non-empty: `rest == "*"` was handled above.
-                return Ok(Self::NamespacedPrefix(namespace.to_string(), prefix.to_string()));
-            }
-            return Ok(Self::NamespacedExact(namespace.to_string(), rest.to_string()));
-        }
-
-        // UNQUALIFIED: local names only. A stray `:` here is a malformed
-        // qualifier (`a:b`, `a:::b`), not a tool name — no advertised name
-        // contains one — so it is refused rather than read as an exact match
-        // that can never fire.
-        if pattern.contains(':') {
-            return Err(refuse("`:` is only meaningful in a `<namespace>::` qualifier"));
-        }
-        if !trailing_star_only(pattern) {
-            return Err(refuse("`*` is only permitted as a whole pattern or as a trailing wildcard"));
-        }
-        if let Some(prefix) = pattern.strip_suffix('*') {
-            // `prefix` cannot be empty here: a bare `*` was handled above.
-            return Ok(Self::Prefix(prefix.to_string()));
-        }
-
-        Ok(Self::Exact(pattern.to_string()))
-    }
-
-    /// Whether this pattern matches an advertised tool name.
-    ///
-    /// Total and infallible by construction — every failure mode was spent at
-    /// parse time. A matcher that can error is a matcher that can be made to
-    /// error on the dispatch path.
-    pub fn matches(&self, advertised: &str) -> bool {
-        // An UNQUALIFIED pattern addresses the local namespace and nothing
-        // else. Reaching a federated tool requires an explicitly qualified
-        // `<namespace>::*` pattern — absence of a qualifier means local-only,
-        // never "anything that happens to start this way".
-        let is_local = split_namespaced(advertised).is_none();
-        match self {
-            Self::All => true,
-            Self::Exact(name) => is_local && advertised == name,
-            Self::Prefix(prefix) => is_local && advertised.starts_with(prefix.as_str()),
-            Self::Namespace(namespace) => {
-                split_namespaced(advertised).is_some_and(|(ns, _)| ns == namespace)
-            }
-            // The qualified forms match the BARE name inside the named
-            // namespace. Matching the advertised name instead would reintroduce
-            // the boundary bug the local-only rule exists to prevent, one level
-            // in: `peerone::peer*` would then match nothing, or worse, some
-            // other namespace's tool depending on how the halves were compared.
-            Self::NamespacedExact(namespace, name) => split_namespaced(advertised)
-                .is_some_and(|(ns, bare)| ns == namespace && bare == name),
-            Self::NamespacedPrefix(namespace, prefix) => split_namespaced(advertised)
-                .is_some_and(|(ns, bare)| ns == namespace && bare.starts_with(prefix.as_str())),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // A client's resolved scope
@@ -576,7 +321,10 @@ pub struct ClientScope {
     /// Flattened because groups are a UNION with each other and the decision
     /// never needs to know which group matched. Keeping the group boundary
     /// would only invite a per-group rule that does not exist.
-    patterns: Vec<ScopePattern>,
+    ///
+    /// [`crate::oauth::groups::Pattern`] — the ONE matcher, shared with the
+    /// authoring path (TERM #637). There is no enforcing-side pattern type.
+    patterns: Vec<Pattern>,
     /// The mesh namespaces this client may see, as owner-verified by the store.
     namespaces: BTreeSet<String>,
 }
@@ -614,8 +362,11 @@ impl ClientScope {
         for authorized in groups {
             let group = &authorized.group;
             for raw in &group.patterns {
-                match ScopePattern::parse(raw) {
-                    Ok(parsed) if !owner_may_hold(authorized.owner, parsed.shape()) => {
+                // `parse_stored` is the dispatch-path parser: syntax only, no
+                // error, and no authority decision — the authority question is
+                // asked immediately below, where a live owner is in hand.
+                match Pattern::parse_stored(raw) {
+                    Some(parsed) if !owner_may_hold(authorized.owner, parsed.shape()) => {
                         // RMCP-12's read-path re-derivation, and the reason this
                         // constructor now takes AUTHORIZED groups rather than
                         // bare rows. `authorized.owner` is projected by
@@ -633,14 +384,13 @@ impl ClientScope {
                              authorized to hold"
                         );
                     }
-                    Ok(parsed) => patterns.push(parsed),
-                    Err(err) => {
+                    Some(parsed) => patterns.push(parsed),
+                    None => {
                         // The pattern text itself is operator-authored config,
                         // not caller input, but it is still not echoed: the
                         // group NAME is what an operator needs to find it.
                         tracing::warn!(
                             group = %group.name,
-                            error = %err,
                             "rmcp scope: dropping an unparseable tool-group pattern (it matches nothing)"
                         );
                     }
@@ -679,7 +429,7 @@ impl ClientScope {
     pub fn unrestricted_for_test(client_id: impl Into<String>) -> Self {
         Self {
             client_id: client_id.into(),
-            patterns: vec![ScopePattern::All],
+            patterns: vec![Pattern::Everything],
             namespaces: BTreeSet::new(),
         }
     }
@@ -712,26 +462,37 @@ impl ClientScope {
 /// function does. Re-implementing denial here would create a second, weaker
 /// copy of it.
 ///
-/// ## Namespaces and LOCAL tools
-/// A name with no `<ns>__` prefix is a local tool, not a federated one, so the
-/// namespace dimension does not apply to it — requiring a namespace for local
-/// tools would mean no connector could ever call one. Namespace-ness is decided
-/// by [`crate::mesh::split_namespaced`], the same function the existing deny
-/// layer and the catalog merge use, so there is one answer to "is this name
-/// namespaced" across the whole process. A local tool whose own name happened
-/// to contain `__` would therefore be treated as federated and DENIED unless
-/// the client is scoped to the matching namespace — fail-closed, which is the
-/// correct direction for an ambiguity.
-pub fn decide<G: AccountGrant + ?Sized>(grant: &G, scope: &ClientScope, tool: &str) -> Decision {
-    // 1. The account's own grant. Checked first and never skipped: this is the
-    //    ceiling, and everything below can only narrow it.
-    if !grant.permits_tool(tool) {
+/// ## Namespaces and LOCAL tools (TERM #643)
+/// A LOCAL tool has no namespace, so the namespace dimension does not apply to
+/// it — requiring one would mean no connector could ever call a local tool.
+/// Which tools those are is read from [`CatalogTool::namespace`], the catalog's
+/// own record of where the entry came from, and NOT from the name's shape.
+///
+/// The earlier version asked `crate::mesh::split_namespaced` instead, and that
+/// is unsound in both directions because the split is purely syntactic: a local
+/// tool literally named `peerhub__tool` was treated as federated here (denied
+/// unless the client happened to hold `peerhub`, which reads as fail-closed)
+/// and, in the matcher, as a MEMBER of `peerhub` — so `peerhub::tool` and
+/// `peerhub::*` reached a tool from no namespace at all, while a client holding
+/// that namespace passed this check. That is the widening, and only provenance
+/// closes it: holding the two halves separately does not, since the splitter
+/// hands the split form the same false answer.
+pub fn decide<G: AccountGrant + ?Sized>(
+    grant: &G,
+    scope: &ClientScope,
+    tool: &CatalogTool,
+) -> Decision {
+    // 1. The account's own grant, asked by ADVERTISED name — the name a caller
+    //    invokes, and the one the allowlist and deny layers are written
+    //    against. Checked first and never skipped: this is the ceiling, and
+    //    everything below can only narrow it.
+    if !grant.permits_tool(&tool.name) {
         return Decision::Deny(DenyReason::DeniedByGrant);
     }
 
     // 2. The federated-server dimension. A tool from an upstream this client is
     //    not scoped to is invisible and uncallable no matter which groups match.
-    if let Some((namespace, _bare)) = split_namespaced(tool) {
+    if let Some(namespace) = tool.namespace.as_deref() {
         if !scope.namespaces.contains(namespace) {
             return Decision::Deny(DenyReason::NoNamespace);
         }
@@ -755,12 +516,12 @@ pub fn decide<G: AccountGrant + ?Sized>(grant: &G, scope: &ClientScope, tool: &s
 pub fn effective<'a, G, I>(grant: &G, scope: &ClientScope, catalog: I) -> BTreeSet<String>
 where
     G: AccountGrant + ?Sized,
-    I: IntoIterator<Item = &'a str>,
+    I: IntoIterator<Item = &'a CatalogTool>,
 {
     catalog
         .into_iter()
         .filter(|tool| decide(grant, scope, tool).is_allowed())
-        .map(str::to_string)
+        .map(|tool| tool.name.clone())
         .collect()
 }
 
@@ -1611,6 +1372,31 @@ mod tests {
         )
     }
 
+    /// A catalog entry from the ORDINARY world, where a `__`-shaped advertised
+    /// name really was contributed by the upstream it names.
+    ///
+    /// This is a FIXTURE BUILDER, and the only place in these tests that reads
+    /// a name's shape. That inference is exactly what TERM #643 removed from
+    /// the production path, so it is spent once here, building the input, and
+    /// never inside anything under test. The interesting cases — a LOCAL tool
+    /// whose name looks federated — are built with [`CatalogTool::local`]
+    /// explicitly, because there is no name from which that could be inferred.
+    fn advertised(name: &str) -> CatalogTool {
+        match crate::mesh::split_namespaced(name) {
+            Some((namespace, bare)) => CatalogTool::from_upstream(namespace, bare),
+            None => CatalogTool::local(name),
+        }
+    }
+
+    fn catalog(names: &[&str]) -> Vec<CatalogTool> {
+        names.iter().map(|n| advertised(n)).collect()
+    }
+
+    /// Parse a pattern the way the dispatch path does.
+    fn pattern(raw: &str) -> Pattern {
+        Pattern::parse_stored(raw).expect("the fixture pattern must parse")
+    }
+
     /// RMCP-12 at the ENFORCING matcher: the same stored rows resolve to less
     /// when their owner is no longer an operator. This is the read-path
     /// re-derivation, and it is what makes a demotion or a revoked delegation
@@ -1620,18 +1406,18 @@ mod tests {
         use crate::oauth::groups::GroupOwner;
         let operator_scope =
             scope_owned_by(&["weather_*", "peerone::*"], &["peerone"], GroupOwner::Operator);
-        assert!(decide(&allow_all, &operator_scope, "weather_get").is_allowed());
-        assert!(decide(&allow_all, &operator_scope, "peerone__weather_get").is_allowed());
+        assert!(decide(&allow_all, &operator_scope, &advertised("weather_get")).is_allowed());
+        assert!(decide(&allow_all, &operator_scope, &advertised("peerone__weather_get")).is_allowed());
 
         let delegated_scope =
             scope_owned_by(&["weather_*", "peerone::*"], &["peerone"], GroupOwner::Delegated);
         assert_eq!(
-            decide(&allow_all, &delegated_scope, "weather_get"),
+            decide(&allow_all, &delegated_scope, &advertised("weather_get")),
             Decision::Deny(DenyReason::NoGroup),
             "an unqualified pattern must not reach the fleet's own tools for a delegated owner"
         );
         assert!(
-            decide(&allow_all, &delegated_scope, "peerone__weather_get").is_allowed(),
+            decide(&allow_all, &delegated_scope, &advertised("peerone__weather_get")).is_allowed(),
             "and the namespaced pattern must still work — the rule separates them"
         );
     }
@@ -1645,11 +1431,15 @@ mod tests {
         let delegated_scope = scope_owned_by(&["*"], &[], GroupOwner::Delegated);
         assert!(delegated_scope.is_empty(), "the group must collapse to no patterns at all");
         assert_eq!(
-            decide(&allow_all, &delegated_scope, "weather_get"),
+            decide(&allow_all, &delegated_scope, &advertised("weather_get")),
             Decision::Deny(DenyReason::NoGroup)
         );
-        assert!(decide(&allow_all, &scope_owned_by(&["*"], &[], GroupOwner::Operator), "weather_get")
-            .is_allowed());
+        assert!(decide(
+            &allow_all,
+            &scope_owned_by(&["*"], &[], GroupOwner::Operator),
+            &advertised("weather_get")
+        )
+        .is_allowed());
     }
 
     /// A grant that permits everything — used to isolate the CLIENT half of the
@@ -1659,74 +1449,35 @@ mod tests {
     }
 
     // -- patterns -----------------------------------------------------------
+    //
+    // The GRAMMAR — which strings parse and which are refused — is
+    // `crate::oauth::groups`'s, and is tested there. TERM #637 deleted the
+    // second parser that used to live in this file, so the parse-shape tests
+    // went with it rather than being kept as a second, drifting copy of
+    // someone else's contract. What stayed is every test below: they assert
+    // ENFORCEMENT properties, which no authoring-side suite has a reason to
+    // cover, and they were RE-POINTED at the surviving matcher rather than
+    // deleted alongside the parser.
 
-    #[test]
-    fn the_three_pattern_forms_parse() {
-        assert_eq!(ScopePattern::parse("*").unwrap(), ScopePattern::All);
-        assert_eq!(
-            ScopePattern::parse("weather_now").unwrap(),
-            ScopePattern::Exact("weather_now".into())
-        );
-        assert_eq!(
-            ScopePattern::parse("weather_*").unwrap(),
-            ScopePattern::Prefix("weather_".into())
-        );
-        assert_eq!(
-            ScopePattern::parse("peerone::*").unwrap(),
-            ScopePattern::Namespace("peerone".into())
-        );
-        // Surrounding whitespace is stored noise, not a distinct pattern.
-        assert_eq!(
-            ScopePattern::parse("  weather_now  ").unwrap(),
-            ScopePattern::Exact("weather_now".into())
-        );
-    }
-
-    /// Anything outside the three forms must be refused at parse time, so it
-    /// can never be a match-time surprise. A grammar an operator THINKS they
-    /// wrote is a permission they cannot predict.
-    #[test]
-    fn nothing_else_parses() {
-        for bad in [
-            "",
-            "   ",
-            "a*b",
-            "*a",
-            "**",
-            "*weather*",
-            "::*",
-            "a::b::*",
-            "a*::*",
-            "with\nnewline",
-            "with\ttab",
-        ] {
-            assert!(
-                ScopePattern::parse(bad).is_err(),
-                "must refuse the pattern {bad:?}"
-            );
-        }
-        assert!(ScopePattern::parse(&"x".repeat(MAX_PATTERN_LEN + 1)).is_err());
-        assert!(ScopePattern::parse(&"x".repeat(MAX_PATTERN_LEN)).is_ok());
-    }
-
-    /// The acceptance criterion spelled out by name: a prefix pattern matches
-    /// the ADVERTISED name, so it cannot reach across a namespace boundary into
-    /// a federated server's tool whose BARE name happens to start the same way.
+    /// The acceptance criterion spelled out by name: an unqualified prefix
+    /// matches LOCAL tools only, so it cannot reach across a namespace boundary
+    /// into a federated server's tool whose bare name happens to start the same
+    /// way.
     #[test]
     fn a_prefix_does_not_reach_into_another_namespace() {
-        let pattern = ScopePattern::parse("a*").unwrap();
-        assert!(pattern.matches("agent_selftest"));
-        assert!(!pattern.matches("peerone__agent_selftest"));
+        let p = pattern("a*");
+        assert!(p.matches(&advertised("agent_selftest")));
+        assert!(!p.matches(&advertised("peerone__agent_selftest")));
 
         // And the namespace form matches only its own namespace.
-        let namespaced = ScopePattern::parse("peerone::*").unwrap();
-        assert!(namespaced.matches("peerone__anything"));
-        assert!(!namespaced.matches("peertwo__anything"));
-        assert!(!namespaced.matches("anything"));
-        // `split_namespaced` splits on the FIRST separator, so a bare name that
-        // itself contains the separator stays inside its own namespace.
-        assert!(namespaced.matches("peerone__deep__name"));
-        assert!(!ScopePattern::parse("deep::*").unwrap().matches("peerone__deep__name"));
+        let namespaced = pattern("peerone::*");
+        assert!(namespaced.matches(&advertised("peerone__anything")));
+        assert!(!namespaced.matches(&advertised("peertwo__anything")));
+        assert!(!namespaced.matches(&advertised("anything")));
+        // A bare name that itself contains the advertised separator stays
+        // inside its OWN namespace — the catalog says which that is.
+        assert!(namespaced.matches(&advertised("peerone__deep__name")));
+        assert!(!pattern("deep::*").matches(&advertised("peerone__deep__name")));
     }
 
     /// TERM #637 part B, findings 1 and 2: the qualified forms.
@@ -1738,62 +1489,48 @@ mod tests {
     #[test]
     fn qualified_patterns_address_one_federated_tool_or_one_prefix_within_a_namespace() {
         // ONE specific federated tool — and nothing else, in either namespace.
-        let exact = ScopePattern::parse("peerone::weather_now").unwrap();
+        let exact = pattern("peerone::weather_now");
         assert_eq!(
             exact,
-            ScopePattern::NamespacedExact("peerone".into(), "weather_now".into())
+            Pattern::NamespacedExact {
+                namespace: "peerone".into(),
+                bare: "weather_now".into()
+            }
         );
-        assert!(exact.matches("peerone__weather_now"));
-        assert!(!exact.matches("peertwo__weather_now"), "not another namespace");
-        assert!(!exact.matches("weather_now"), "not the local tool of the same name");
-        assert!(!exact.matches("peerone__weather_forecast"), "not a sibling");
+        assert!(exact.matches(&advertised("peerone__weather_now")));
+        assert!(!exact.matches(&advertised("peertwo__weather_now")), "not another namespace");
+        assert!(!exact.matches(&advertised("weather_now")), "not the local tool of the same name");
+        assert!(!exact.matches(&advertised("peerone__weather_forecast")), "not a sibling");
 
         // A prefix WITHIN one namespace.
-        let prefix = ScopePattern::parse("peerone::weather_*").unwrap();
+        let prefix = pattern("peerone::weather_*");
         assert_eq!(
             prefix,
-            ScopePattern::NamespacedPrefix("peerone".into(), "weather_".into())
+            Pattern::NamespacedPrefix {
+                namespace: "peerone".into(),
+                prefix: "weather_".into()
+            }
         );
-        assert!(prefix.matches("peerone__weather_now"));
-        assert!(prefix.matches("peerone__weather_forecast"));
-        assert!(!prefix.matches("peertwo__weather_now"), "cannot leak across the boundary");
-        assert!(!prefix.matches("weather_now"), "and does not reach local tools");
-        assert!(!prefix.matches("peerone__media_search"));
+        assert!(prefix.matches(&advertised("peerone__weather_now")));
+        assert!(prefix.matches(&advertised("peerone__weather_forecast")));
+        assert!(
+            !prefix.matches(&advertised("peertwo__weather_now")),
+            "cannot leak across the boundary"
+        );
+        assert!(!prefix.matches(&advertised("weather_now")), "and does not reach local tools");
+        assert!(!prefix.matches(&advertised("peerone__media_search")));
 
         // The prefix matches the BARE name, so a namespace that merely starts
         // the same way is not reachable — the round-3 boundary lesson, applied
         // to the qualified form.
-        let peer = ScopePattern::parse("peer::w*").unwrap();
-        assert!(peer.matches("peer__weather_now"));
-        assert!(!peer.matches("peerone__weather_now"));
+        let peer = pattern("peer::w*");
+        assert!(peer.matches(&advertised("peer__weather_now")));
+        assert!(!peer.matches(&advertised("peerone__weather_now")));
 
         // A bare name containing the advertised separator is addressable,
         // which is the whole reason the qualifier is `::` and not `__`.
-        let awkward = ScopePattern::parse("peerone::deep__name").unwrap();
-        assert!(awkward.matches("peerone__deep__name"));
-        assert!(ScopePattern::parse("peerone::deep*").unwrap().matches("peerone__deep__name"));
-    }
-
-    /// The qualified forms must not open a hole in the grammar's strictness.
-    #[test]
-    fn qualified_patterns_reject_everything_outside_the_grammar() {
-        for bad in [
-            "::weather_now",     // no namespace
-            "peerone::",         // qualifier with nothing after it
-            "peerone::a::b",     // a third component has no meaning
-            "a::b::*",           // (the pre-existing case, still refused)
-            "peerone::a*b",      // interior star
-            "peerone::*a",       // leading star
-            "peerone::**",
-            "peer*::weather",    // star in the namespace
-            "peer:one::weather", // stray colon in the namespace
-            "weather:now",       // stray colon, unqualified
-        ] {
-            assert!(
-                ScopePattern::parse(bad).is_err(),
-                "must refuse the pattern {bad:?}"
-            );
-        }
+        assert!(pattern("peerone::deep__name").matches(&advertised("peerone__deep__name")));
+        assert!(pattern("peerone::deep*").matches(&advertised("peerone__deep__name")));
     }
 
     /// The two halves of the vocabulary must be able to express the SAME set —
@@ -1802,26 +1539,22 @@ mod tests {
     /// locally.
     #[test]
     fn qualified_and_unqualified_forms_are_symmetric() {
-        let local = ["weather_now", "weather_forecast", "media_search"];
-        let federated = [
+        let local = catalog(&["weather_now", "weather_forecast", "media_search"]);
+        let federated = catalog(&[
             "peerone__weather_now",
             "peerone__weather_forecast",
             "peerone__media_search",
-        ];
+        ]);
         for (unqualified, qualified) in [
             ("weather_now", "peerone::weather_now"),
             ("weather_*", "peerone::weather_*"),
         ] {
-            let u = ScopePattern::parse(unqualified).unwrap();
-            let q = ScopePattern::parse(qualified).unwrap();
+            let u = pattern(unqualified);
+            let q = pattern(qualified);
             let matched_local: Vec<&str> =
-                local.iter().copied().filter(|t| u.matches(t)).collect();
-            let matched_federated: Vec<String> = federated
-                .iter()
-                .copied()
-                .filter(|t| q.matches(t))
-                .map(|t| t.trim_start_matches("peerone__").to_string())
-                .collect();
+                local.iter().filter(|t| u.matches(t)).map(|t| t.name.as_str()).collect();
+            let matched_federated: Vec<&str> =
+                federated.iter().filter(|t| q.matches(t)).map(CatalogTool::bare_name).collect();
             assert_eq!(
                 matched_local, matched_federated,
                 "{unqualified} and {qualified} must select the same names"
@@ -1835,19 +1568,19 @@ mod tests {
     #[test]
     fn a_connector_can_be_scoped_to_a_single_federated_tool() {
         let sc = scope(&["peerone::weather_now"], &["peerone"]);
-        assert!(decide(&allow_all, &sc, "peerone__weather_now").is_allowed());
+        assert!(decide(&allow_all, &sc, &advertised("peerone__weather_now")).is_allowed());
         assert_eq!(
-            decide(&allow_all, &sc, "peerone__media_search").deny_code(),
+            decide(&allow_all, &sc, &advertised("peerone__media_search")).deny_code(),
             Some("no_group"),
             "the rest of the peer stays out of reach"
         );
         assert_eq!(
-            decide(&allow_all, &sc, "peertwo__weather_now").deny_code(),
+            decide(&allow_all, &sc, &advertised("peertwo__weather_now")).deny_code(),
             Some("no_namespace"),
             "and another peer is refused on the namespace dimension first"
         );
         assert_eq!(
-            decide(&allow_all, &sc, "weather_now").deny_code(),
+            decide(&allow_all, &sc, &advertised("weather_now")).deny_code(),
             Some("no_group"),
             "and the local tool of the same name is NOT granted by a qualified pattern"
         );
@@ -1863,28 +1596,34 @@ mod tests {
     /// prefix, so only an actual boundary rule can refuse it.
     #[test]
     fn a_bare_prefix_cannot_reach_a_namespace_it_is_a_prefix_of() {
-        let pattern = ScopePattern::parse("peer*").unwrap();
+        let p = pattern("peer*");
 
         // Genuinely LOCAL tools starting with the prefix still match — the fix
         // must narrow the boundary, not break the pattern.
-        assert!(pattern.matches("peermetrics"));
-        assert!(pattern.matches("peer"));
+        assert!(p.matches(&advertised("peermetrics")));
+        assert!(p.matches(&advertised("peer")));
 
         // But nothing across a namespace boundary, however the namespace is
         // spelled — including when it starts with the prefix itself.
-        assert!(!pattern.matches("peerhub__alerts_list"));
-        assert!(!pattern.matches("peer__alerts_list"));
-        assert!(!pattern.matches("peermetrics__alerts_list"));
+        assert!(!p.matches(&advertised("peerhub__alerts_list")));
+        assert!(!p.matches(&advertised("peer__alerts_list")));
+        assert!(!p.matches(&advertised("peermetrics__alerts_list")));
 
         // A qualified pattern still reaches in, when written deliberately.
-        let qualified = ScopePattern::parse("peerhub::*").unwrap();
-        assert!(qualified.matches("peerhub__alerts_list"));
-        assert!(!qualified.matches("peermetrics"));
+        let qualified = pattern("peerhub::*");
+        assert!(qualified.matches(&advertised("peerhub__alerts_list")));
+        assert!(!qualified.matches(&advertised("peermetrics")));
 
-        // And a bare EXACT pattern spelling out a namespaced name reaches
-        // nothing: the grammar cannot address one federated tool.
-        let bare_exact = ScopePattern::parse("peerhub__alerts_list").unwrap();
-        assert!(!bare_exact.matches("peerhub__alerts_list"));
+        // And a bare pattern spelling out a namespaced name is REFUSED
+        // outright by the surviving matcher, rather than parsing into
+        // something that can never match. That is the stricter write-time rule
+        // from the authoring side, and it now also governs a stored row: an
+        // old-vocabulary `peerhub__alerts_list` drops instead of quietly
+        // becoming an unmatchable local exact.
+        assert!(
+            Pattern::parse_stored("peerhub__alerts_list").is_none(),
+            "`__` in an unqualified pattern must be refused, not reinterpreted"
+        );
     }
 
     /// The same boundary at the level that matters — a full [`decide`] where
@@ -1899,11 +1638,11 @@ mod tests {
         let sc = scope(&["peer*"], &["peerhub"]);
 
         assert!(
-            decide(&allow_all, &sc, "peermetrics").is_allowed(),
+            decide(&allow_all, &sc, &advertised("peermetrics")).is_allowed(),
             "the local tool the pattern was written for still works"
         );
         assert_eq!(
-            decide(&allow_all, &sc, "peerhub__alerts_list").deny_code(),
+            decide(&allow_all, &sc, &advertised("peerhub__alerts_list")).deny_code(),
             Some("no_group"),
             "the namespace check PASSES here — only the pattern boundary refuses this, \
              which is exactly why the boundary has to be a rule and not a coincidence"
@@ -1911,8 +1650,8 @@ mod tests {
 
         // Written deliberately, the qualified form does reach it.
         let deliberate = scope(&["peer*", "peerhub::*"], &["peerhub"]);
-        assert!(decide(&allow_all, &deliberate, "peerhub__alerts_list").is_allowed());
-        assert!(decide(&allow_all, &deliberate, "peermetrics").is_allowed());
+        assert!(decide(&allow_all, &deliberate, &advertised("peerhub__alerts_list")).is_allowed());
+        assert!(decide(&allow_all, &deliberate, &advertised("peermetrics")).is_allowed());
     }
 
     /// Namespace collision: a local tool and a mesh-prefixed tool of the same
@@ -1921,18 +1660,104 @@ mod tests {
     #[test]
     fn namespaced_and_local_tools_of_the_same_bare_name_are_distinct() {
         let local = scope(&["shared_tool"], &["peerone"]);
-        assert!(decide(&allow_all, &local, "shared_tool").is_allowed());
+        assert!(decide(&allow_all, &local, &advertised("shared_tool")).is_allowed());
         assert_eq!(
-            decide(&allow_all, &local, "peerone__shared_tool"),
+            decide(&allow_all, &local, &advertised("peerone__shared_tool")),
             Decision::Deny(DenyReason::NoGroup),
             "an exact local pattern must not match the namespaced tool"
         );
 
         let remote = scope(&["peerone::*"], &["peerone"]);
-        assert!(decide(&allow_all, &remote, "peerone__shared_tool").is_allowed());
+        assert!(decide(&allow_all, &remote, &advertised("peerone__shared_tool")).is_allowed());
         assert_eq!(
-            decide(&allow_all, &remote, "shared_tool"),
+            decide(&allow_all, &remote, &advertised("shared_tool")),
             Decision::Deny(DenyReason::NoGroup),
+        );
+    }
+
+    // -- provenance, not name shape (TERM #643) ------------------------------
+
+    /// **The defect.** A LOCAL tool whose literal name contains the mesh
+    /// separator belongs to no namespace, and no namespace-qualified pattern
+    /// may reach it — however exactly that name matches the qualifier.
+    ///
+    /// Mutation-verified: change `Pattern::matches`'s qualified arms to compare
+    /// `split_namespaced(&tool.name)` instead of `tool.namespace`, and every
+    /// assertion here goes red while the rest of the suite stays green — which
+    /// is precisely how this shipped. The client below holds the `peerhub`
+    /// namespace, so the namespace dimension does NOT refuse it either: the
+    /// provenance read is the only thing standing between a `peerhub` grant and
+    /// a tool the fleet itself registered.
+    #[test]
+    fn a_qualified_pattern_cannot_reach_a_local_tool_that_merely_looks_federated() {
+        let impostor = CatalogTool::local("peerhub__tool");
+        assert!(impostor.namespace.is_none());
+
+        for qualifier in ["peerhub::tool", "peerhub::*", "peerhub::t*"] {
+            assert!(
+                !pattern(qualifier).matches(&impostor),
+                "{qualifier} must not reach a local tool named {}",
+                impostor.name
+            );
+            let sc = scope(&[qualifier], &["peerhub"]);
+            assert_eq!(
+                decide(&allow_all, &sc, &impostor).deny_code(),
+                Some("no_group"),
+                "{qualifier} reached a LOCAL tool through decide()"
+            );
+        }
+
+        // The genuinely federated tool of the same advertised name is still
+        // reachable — the fix narrows provenance, it does not break the form.
+        let real = CatalogTool::from_upstream("peerhub", "tool");
+        assert_eq!(real.name, impostor.name, "the two are byte-identical as strings");
+        for qualifier in ["peerhub::tool", "peerhub::*", "peerhub::t*"] {
+            assert!(pattern(qualifier).matches(&real));
+            assert!(decide(&allow_all, &scope(&[qualifier], &["peerhub"]), &real).is_allowed());
+        }
+    }
+
+    /// The mirror image of the same defect, and the reason a fix that only
+    /// tightened the qualified arms would be half a fix: the local tool was
+    /// also UNREACHABLE by the unqualified pattern that legitimately covers it,
+    /// because the local arms demanded that its name not split.
+    ///
+    /// Mutation-verified: restore `namespace.is_none()` to
+    /// `split_namespaced(&tool.name).is_none()` in the local arms and this goes
+    /// red.
+    #[test]
+    fn an_unqualified_pattern_still_reaches_a_local_tool_that_looks_federated() {
+        let impostor = CatalogTool::local("peerhub__tool");
+        assert!(pattern("peer*").matches(&impostor));
+        assert!(pattern("*").matches(&impostor));
+
+        let sc = scope(&["peer*"], &[]);
+        assert!(
+            decide(&allow_all, &sc, &impostor).is_allowed(),
+            "a local tool must be reachable by the local pattern that covers it"
+        );
+        // And no namespace row is needed for it, because it came from no
+        // namespace. Note the client above holds NONE.
+        assert!(sc.namespaces().is_empty());
+    }
+
+    /// The namespace DIMENSION reads provenance too, not just the matcher.
+    ///
+    /// Mutation-verified: change `decide`'s step 2 back to
+    /// `split_namespaced(&tool.name)` and the first assertion goes red — a
+    /// local tool would need a namespace grant it can never legitimately
+    /// require.
+    #[test]
+    fn the_namespace_dimension_is_bounded_by_provenance() {
+        let sc = scope(&["*"], &[]);
+        assert!(
+            decide(&allow_all, &sc, &CatalogTool::local("peerhub__tool")).is_allowed(),
+            "a local tool needs no namespace grant, whatever it is called"
+        );
+        assert_eq!(
+            decide(&allow_all, &sc, &CatalogTool::from_upstream("peerhub", "tool")).deny_code(),
+            Some("no_namespace"),
+            "and the federated tool of that exact name still needs one"
         );
     }
 
@@ -1944,23 +1769,24 @@ mod tests {
     fn a_client_with_no_scoping_rows_reaches_nothing() {
         let none = ClientScope::empty("a-client-id");
         assert!(none.is_empty());
-        let catalog = ["weather_now", "peerone__weather_now", "media_search"];
-        assert!(effective(&allow_all, &none, catalog).is_empty());
-        for tool in catalog {
+        let entries = catalog(&["weather_now", "peerone__weather_now", "media_search"]);
+        assert!(effective(&allow_all, &none, entries.iter()).is_empty());
+        for tool in &entries {
             assert!(
                 !decide(&allow_all, &none, tool).is_allowed(),
-                "an unscoped client must reach nothing, even under an unrestricted grant: {tool}"
+                "an unscoped client must reach nothing, even under an unrestricted grant: {}",
+                tool.name
             );
         }
         // The reason differs by dimension, and BOTH dimensions are empty for an
         // unscoped client: a local tool has no group, a federated one has no
         // namespace (checked first, since it is the more specific refusal).
         assert_eq!(
-            decide(&allow_all, &none, "weather_now").deny_code(),
+            decide(&allow_all, &none, &advertised("weather_now")).deny_code(),
             Some("no_group")
         );
         assert_eq!(
-            decide(&allow_all, &none, "peerone__weather_now").deny_code(),
+            decide(&allow_all, &none, &advertised("peerone__weather_now")).deny_code(),
             Some("no_namespace")
         );
     }
@@ -1971,12 +1797,17 @@ mod tests {
     fn empty_and_zero_match_groups_are_the_empty_set() {
         let empty_group = scope(&[], &["peerone"]);
         assert!(empty_group.is_empty());
-        assert!(effective(&allow_all, &empty_group, ["weather_now"]).is_empty());
+        assert!(effective(&allow_all, &empty_group, catalog(&["weather_now"]).iter()).is_empty());
 
         let matches_nothing = scope(&["nothing_matches_this_*"], &["peerone"]);
         assert!(!matches_nothing.is_empty(), "it has a pattern");
         assert!(
-            effective(&allow_all, &matches_nothing, ["weather_now", "media_search"]).is_empty(),
+            effective(
+                &allow_all,
+                &matches_nothing,
+                catalog(&["weather_now", "media_search"]).iter()
+            )
+            .is_empty(),
             "a pattern matching zero tools is the empty set, not everything"
         );
     }
@@ -1986,9 +1817,9 @@ mod tests {
     #[test]
     fn an_unparseable_pattern_is_dropped_not_widened() {
         let with_junk = scope(&["a*b", "weather_*"], &["peerone"]);
-        assert!(decide(&allow_all, &with_junk, "weather_now").is_allowed());
+        assert!(decide(&allow_all, &with_junk, &advertised("weather_now")).is_allowed());
         assert_eq!(
-            decide(&allow_all, &with_junk, "media_search"),
+            decide(&allow_all, &with_junk, &advertised("media_search")),
             Decision::Deny(DenyReason::NoGroup)
         );
     }
@@ -2000,7 +1831,7 @@ mod tests {
     /// the account's own grant would deny.
     #[test]
     fn effective_is_subset_of_grant() {
-        let catalog: Vec<&str> = vec![
+        let mut entries = catalog(&[
             "weather_now",
             "weather_forecast",
             "media_search",
@@ -2011,7 +1842,12 @@ mod tests {
             "peertwo__weather_now",
             "peertwo__admin_reset",
             "odd__name__with__separators",
-        ];
+        ]);
+        // A LOCAL tool that looks federated, so the property is asserted over
+        // both readings of the same string shape.
+        entries.push(CatalogTool::local("peerthree__local_impostor"));
+        let names: Vec<&str> = entries.iter().map(|t| t.name.as_str()).collect();
+
         let pattern_sets: Vec<Vec<&str>> = vec![
             vec![],
             vec!["*"],
@@ -2022,6 +1858,8 @@ mod tests {
             vec!["*", "peerone::*", "weather_now"],
             vec!["nothing_here_*"],
             vec!["odd::*"],
+            vec!["peerthree::*"],
+            vec!["peer*"],
         ];
         let namespace_sets: Vec<Vec<&str>> = vec![
             vec![],
@@ -2038,8 +1876,8 @@ mod tests {
             Box::new(|_| true),
             Box::new(|t: &str| t.starts_with("weather_")),
             Box::new(|t: &str| !t.contains("admin")),
-            Box::new(|t: &str| split_namespaced(t).is_some()),
-            Box::new(|t: &str| split_namespaced(t).is_none()),
+            Box::new(|t: &str| crate::mesh::split_namespaced(t).is_some()),
+            Box::new(|t: &str| crate::mesh::split_namespaced(t).is_none()),
             Box::new(|t: &str| t.len() % 2 == 0),
         ];
 
@@ -2048,7 +1886,7 @@ mod tests {
             for namespaces in &namespace_sets {
                 let sc = scope(patterns, namespaces);
                 for grant in &grants {
-                    let allowed = effective(grant.as_ref(), &sc, catalog.iter().copied());
+                    let allowed = effective(grant.as_ref(), &sc, entries.iter());
                     for tool in &allowed {
                         assert!(
                             grant.permits_tool(tool),
@@ -2059,7 +1897,7 @@ mod tests {
                     }
                     // And the set is genuinely a subset of the catalog.
                     for tool in &allowed {
-                        assert!(catalog.contains(&tool.as_str()));
+                        assert!(names.contains(&tool.as_str()));
                     }
                 }
             }
@@ -2072,30 +1910,36 @@ mod tests {
     /// do rather than that they were written to.
     #[test]
     fn list_and_call_never_disagree() {
-        let catalog: Vec<&str> = vec![
+        let mut entries = catalog(&[
             "weather_now",
             "media_search",
             "admin_reset",
             "peerone__weather_now",
             "peertwo__media_search",
             "odd__name__with__separators",
-        ];
+        ]);
+        // TERM #643: a LOCAL entry whose name looks federated. It is the shape
+        // that made the two paths capable of disagreeing at all, so it belongs
+        // in the parity property rather than only in its own test.
+        entries.push(CatalogTool::local("peerone__local_only"));
         for patterns in [
             vec![],
             vec!["*"],
             vec!["weather_*", "peerone::*"],
             vec!["media_search"],
+            vec!["peer*"],
         ] {
             for namespaces in [vec![], vec!["peerone"], vec!["peerone", "peertwo"]] {
                 let sc = scope(&patterns, &namespaces);
                 let grant = |t: &str| !t.contains("admin");
-                let listed = effective(&grant, &sc, catalog.iter().copied());
-                for tool in &catalog {
+                let listed = effective(&grant, &sc, entries.iter());
+                for tool in &entries {
                     let callable = decide(&grant, &sc, tool).is_allowed();
                     assert_eq!(
-                        listed.contains(*tool),
+                        listed.contains(&tool.name),
                         callable,
-                        "list/call drift on {tool} (patterns={patterns:?}, ns={namespaces:?})"
+                        "list/call drift on {} (patterns={patterns:?}, ns={namespaces:?})",
+                        tool.name
                     );
                 }
             }
@@ -2107,9 +1951,10 @@ mod tests {
     #[test]
     fn a_disallowed_namespace_hides_and_blocks() {
         let sc = scope(&["*"], &["peerone"]);
-        let catalog = ["weather_now", "peerone__weather_now", "peertwo__weather_now"];
+        let entries =
+            catalog(&["weather_now", "peerone__weather_now", "peertwo__weather_now"]);
 
-        let listed = effective(&allow_all, &sc, catalog);
+        let listed = effective(&allow_all, &sc, entries.iter());
         assert!(listed.contains("weather_now"));
         assert!(listed.contains("peerone__weather_now"));
         assert!(
@@ -2117,7 +1962,7 @@ mod tests {
             "a tool from an unscoped upstream must be invisible"
         );
         assert_eq!(
-            decide(&allow_all, &sc, "peertwo__weather_now"),
+            decide(&allow_all, &sc, &advertised("peertwo__weather_now")),
             Decision::Deny(DenyReason::NoNamespace),
             "and uncallable, with the diagnosable reason"
         );
@@ -2130,10 +1975,10 @@ mod tests {
     #[test]
     fn a_down_upstream_yields_absence_not_a_permitted_error() {
         let sc = scope(&["*"], &["peerone"]);
-        let up = ["peerone__weather_now", "weather_now"];
-        let down = ["weather_now"];
-        assert!(effective(&allow_all, &sc, up).contains("peerone__weather_now"));
-        assert!(!effective(&allow_all, &sc, down).contains("peerone__weather_now"));
+        let up = catalog(&["peerone__weather_now", "weather_now"]);
+        let down = catalog(&["weather_now"]);
+        assert!(effective(&allow_all, &sc, up.iter()).contains("peerone__weather_now"));
+        assert!(!effective(&allow_all, &sc, down.iter()).contains("peerone__weather_now"));
     }
 
     /// A bare `*` cannot widen past the account grant. This is what makes the
@@ -2143,11 +1988,12 @@ mod tests {
     fn a_bare_star_is_still_clamped_by_the_grant() {
         let sc = scope(&["*"], &["peerone"]);
         let narrow = |t: &str| t == "weather_now";
-        let allowed = effective(&narrow, &sc, ["weather_now", "media_search", "peerone__x"]);
+        let entries = catalog(&["weather_now", "media_search", "peerone__x"]);
+        let allowed = effective(&narrow, &sc, entries.iter());
         assert_eq!(allowed.len(), 1);
         assert!(allowed.contains("weather_now"));
         assert_eq!(
-            decide(&narrow, &sc, "media_search"),
+            decide(&narrow, &sc, &advertised("media_search")),
             Decision::Deny(DenyReason::DeniedByGrant)
         );
     }
@@ -2159,18 +2005,18 @@ mod tests {
         let sc = scope(&["weather_*"], &["peerone"]);
         let deny_all = |_: &str| false;
         assert_eq!(
-            decide(&deny_all, &sc, "peertwo__media_search").deny_code(),
+            decide(&deny_all, &sc, &advertised("peertwo__media_search")).deny_code(),
             Some("denied_by_grant")
         );
         assert_eq!(
-            decide(&allow_all, &sc, "peertwo__weather_now").deny_code(),
+            decide(&allow_all, &sc, &advertised("peertwo__weather_now")).deny_code(),
             Some("no_namespace")
         );
         assert_eq!(
-            decide(&allow_all, &sc, "media_search").deny_code(),
+            decide(&allow_all, &sc, &advertised("media_search")).deny_code(),
             Some("no_group")
         );
-        assert_eq!(decide(&allow_all, &sc, "weather_now").deny_code(), None);
+        assert_eq!(decide(&allow_all, &sc, &advertised("weather_now")).deny_code(), None);
     }
 
     /// An account grant that narrows takes effect immediately, because the
@@ -2178,9 +2024,10 @@ mod tests {
     #[test]
     fn a_narrowed_grant_takes_effect_without_touching_the_scope() {
         let sc = scope(&["*"], &[]);
-        let before = effective(&allow_all, &sc, ["weather_now", "media_search"]);
+        let entries = catalog(&["weather_now", "media_search"]);
+        let before = effective(&allow_all, &sc, entries.iter());
         assert_eq!(before.len(), 2);
-        let after = effective(&|t: &str| t == "weather_now", &sc, ["weather_now", "media_search"]);
+        let after = effective(&|t: &str| t == "weather_now", &sc, entries.iter());
         assert_eq!(after.len(), 1);
     }
 
@@ -2334,7 +2181,7 @@ mod tests {
         let permitting = Arc::new(scope(&["media_*"], &[]));
         put_now(&cache, "cid", Arc::clone(&permitting));
         let hit = cache.get("cid").expect("precondition: the scope is cached");
-        assert!(decide(&allow_all, &hit, "media_search").is_allowed());
+        assert!(decide(&allow_all, &hit, &advertised("media_search")).is_allowed());
 
         // An operator revokes it. The store method opens by taking the guard,
         // and the database write then commits...
@@ -2394,7 +2241,7 @@ mod tests {
         let observed = cache.generation();
         let stale_permitting = Arc::new(scope(&["media_*"], &[]));
         assert!(
-            decide(&allow_all, &stale_permitting, "media_search").is_allowed(),
+            decide(&allow_all, &stale_permitting, &advertised("media_search")).is_allowed(),
             "precondition: what the reader read still permits the tool"
         );
 
@@ -2558,7 +2405,7 @@ mod tests {
 
         let cached = cache.get("cid").expect("the scope is cached");
         assert!(
-            decide(&allow_all, &cached, "media_search").is_allowed(),
+            decide(&allow_all, &cached, &advertised("media_search")).is_allowed(),
             "precondition: the cached scope permits the tool"
         );
 
@@ -2575,12 +2422,12 @@ mod tests {
         // And what the next call re-resolves to no longer permits it.
         let after = scope(&["weather_*"], &[]);
         assert_eq!(
-            decide(&allow_all, &after, "media_search").deny_code(),
+            decide(&allow_all, &after, &advertised("media_search")).deny_code(),
             Some("no_group"),
             "the re-resolved scope refuses the removed tool"
         );
         assert!(
-            decide(&allow_all, &after, "weather_now").is_allowed(),
+            decide(&allow_all, &after, &advertised("weather_now")).is_allowed(),
             "and the patterns that survived still work"
         );
     }
@@ -2599,7 +2446,7 @@ mod tests {
         // With its only group gone, the client resolves to the empty scope.
         let after = ClientScope::empty("cid");
         assert!(after.is_empty());
-        assert!(!decide(&allow_all, &after, "media_search").is_allowed());
+        assert!(!decide(&allow_all, &after, &advertised("media_search")).is_allowed());
     }
 
     /// The epoch only ever moves forward, and every invalidation moves it.
