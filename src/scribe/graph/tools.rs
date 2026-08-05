@@ -64,21 +64,31 @@ impl LoadedGraph {
     /// `extra` MUST be a JSON object; anything else is a programming error and
     /// is surfaced as one rather than silently dropping the payload.
     fn envelope(&self, found: bool, extra: Value) -> Result<ToolOutput, ToolError> {
-        let mut out = json!({
-            "project_id": self.requested,
-            "graph_key": self.key.to_string(),
-            "found": found,
-            "graph_built_at": self.built_at.and_then(rfc3339),
-            "graph_age_seconds": self.built_at.and_then(age_seconds),
-        });
         let Some(obj) = extra.as_object() else {
             return Err(ToolError::Execution(
                 "kg_* payload must be a JSON object".to_string(),
             ));
         };
-        for (k, v) in obj {
-            out[k] = v.clone();
+        // Lay the payload down FIRST, then stamp provenance over it, so
+        // provenance always wins. Review finding (opus + codex): merging the
+        // payload last meant a future field named `graph_key`/`found`/… would
+        // silently overwrite the provenance this envelope exists to guarantee —
+        // an answer that looks authoritative while misreporting which graph
+        // produced it. Writing provenance last makes that unrepresentable
+        // rather than merely unlikely; the debug_assert surfaces the collision
+        // to whoever introduces it.
+        let mut out = Value::Object(obj.clone());
+        for key in PROVENANCE_FIELDS {
+            debug_assert!(
+                !obj.contains_key(*key),
+                "kg_* payload must not define the provenance field {key:?}"
+            );
         }
+        out["project_id"] = json!(self.requested);
+        out["graph_key"] = json!(self.key.to_string());
+        out["found"] = json!(found);
+        out["graph_built_at"] = json!(self.built_at.and_then(rfc3339));
+        out["graph_age_seconds"] = json!(self.built_at.and_then(age_seconds));
         structured(out)
     }
 
@@ -93,6 +103,16 @@ impl LoadedGraph {
         self.envelope(false, json!({"message": message.into()}))
     }
 }
+
+/// The provenance keys [`LoadedGraph::envelope`] owns. A tool payload may never
+/// define one of these.
+const PROVENANCE_FIELDS: &[&str] = &[
+    "project_id",
+    "graph_key",
+    "found",
+    "graph_built_at",
+    "graph_age_seconds",
+];
 
 fn rfc3339(t: std::time::SystemTime) -> Option<String> {
     let dt: chrono::DateTime<chrono::Utc> = t.into();
@@ -152,6 +172,7 @@ fn key_miss(project_id: &str) -> Value {
         ),
         "known_keys": known,
         "did_you_mean": suggestion,
+        "orphaned_alias_graphs": store.orphaned_alias_keys(),
         "message": "the KEY did not resolve to a stored graph; this does NOT mean the project has no knowledge graph. Retry with one of known_keys, or set SCRIBE_KG_PROJECT_ALIASES to map this identifier to its canonical key.",
     })
 }
@@ -1343,6 +1364,30 @@ pub struct Widget;
             );
             assert!(v["found"].is_boolean(), "{name} must report found: {v}");
         }
+    }
+
+    /// Provenance must win over a colliding payload field, so an answer can
+    /// never misreport which graph produced it.
+    #[tokio::test]
+    #[serial]
+    async fn payload_fields_cannot_overwrite_provenance() {
+        let _g = seed_project("CLOBBER");
+        let out = KgFileSymbols
+            .execute_structured(json!({"project_id": "CLOBBER", "path": "src/w.rs"}))
+            .await
+            .unwrap();
+        let v = val(out);
+        assert_eq!(v["graph_key"], "clobber");
+        // Directly exercise the choke point with a hostile payload.
+        let loaded = load_graph("CLOBBER").unwrap().expect("graph");
+        let out = loaded
+            .ok(json!({"graph_key": "WRONG", "found": false, "project_id": "WRONG", "count": 1}))
+            .unwrap();
+        let v = val(out);
+        assert_eq!(v["graph_key"], "clobber", "provenance must win: {v}");
+        assert_eq!(v["project_id"], "CLOBBER", "provenance must win: {v}");
+        assert_eq!(v["found"], true, "provenance must win: {v}");
+        assert_eq!(v["count"], 1, "non-colliding payload preserved: {v}");
     }
 
     /// A found:false that came from the GRAPH (node not present) still reports

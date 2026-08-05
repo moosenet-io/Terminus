@@ -75,6 +75,21 @@ impl GraphStore {
             .and_then(|m| m.modified().ok())
     }
 
+    /// Store files whose name is NOT its own canonical key — i.e. graphs left
+    /// behind by a spelling that now collapses elsewhere (`chord.json` after
+    /// `chord` began resolving to `chrd`).
+    ///
+    /// These are never served: the canonical entry answers instead. Reporting
+    /// them is the point — an orphan that nobody can see is the same shape of
+    /// problem as a stale answer nobody can see. Surfaced in the key-miss
+    /// diagnostic so an operator can delete or re-fold them deliberately.
+    pub fn orphaned_alias_keys(&self) -> Vec<String> {
+        self.stored_keys()
+            .into_iter()
+            .filter(|k| ProjectKey::resolve(k).as_str() != k)
+            .collect()
+    }
+
     /// Every canonical key that currently has a stored graph, sorted.
     ///
     /// Used to answer a key miss with the truth ("these keys exist") instead of
@@ -312,6 +327,72 @@ mod tests {
                 "normalize/slugify diverged on {input:?} — this orphans the live store"
             );
         }
+    }
+
+    /// A finite hand-picked corpus cannot pin a duplicated algorithm (review
+    /// finding, codex — fair). This sweeps a few thousand DETERMINISTICALLY
+    /// generated strings over the byte classes that actually drive the two
+    /// functions apart: ASCII alphanumerics, separators, leading/trailing
+    /// separators, runs of separators, and non-ASCII. No RNG crate — a tiny
+    /// xorshift keeps the module dependency-free and the test reproducible.
+    #[test]
+    fn normalize_matches_slugify_over_a_generated_corpus() {
+        use crate::scribe::graph::project_key::normalize;
+        use crate::scribe::vault::slugify;
+        const ALPHABET: &[char] = &[
+            'a', 'Z', '0', '9', '-', '_', ' ', '.', '/', ':', '\\', '"', '\'', '!',
+            '\u{00e9}', '\u{0416}', '\u{1F600}', '\t', '\n',
+        ];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..4000 {
+            let len = (next() % 12) as usize;
+            let input: String = (0..len)
+                .map(|_| ALPHABET[(next() as usize) % ALPHABET.len()])
+                .collect();
+            assert_eq!(
+                normalize(&input),
+                slugify(&input),
+                "normalize/slugify diverged on {input:?} — this orphans the live store"
+            );
+        }
+    }
+
+    /// An alias file left on disk after collapsing is NOT silently readable —
+    /// the canonical entry answers — but it must be VISIBLE, so an operator can
+    /// see that `chord.json` is now orphaned rather than discovering it later.
+    #[test]
+    #[serial_test::serial]
+    fn orphaned_alias_files_are_reported_not_served() {
+        let root = tmp_root("orphan");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let store = GraphStore::new(&root);
+
+        // Simulate the live store: a stale `chord.json` beside a fresh `chrd.json`.
+        store.save("chrd", &sample("chrd")).unwrap();
+        fs::write(root.join("chord.json"), sample("chord").to_json_pretty().unwrap()).unwrap();
+
+        // The canonical entry answers; the stale file is never served.
+        assert!(store.load("chord").unwrap().is_some());
+        assert_eq!(
+            store.orphaned_alias_keys(),
+            vec!["chord".to_string()],
+            "the stale file must be reported as orphaned"
+        );
+        // A project with no alias file has no orphans.
+        let root2 = tmp_root("orphan2");
+        let _ = fs::remove_dir_all(&root2);
+        let s2 = GraphStore::new(&root2);
+        s2.save("muse", &sample("muse")).unwrap();
+        assert!(s2.orphaned_alias_keys().is_empty());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root2);
     }
 
     /// SOURCE-LEVEL RATCHET. The duplicate-key bug is only fixed for as long as

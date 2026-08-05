@@ -119,11 +119,18 @@ impl ProjectKey {
     /// table keyed by UUID) is still readable by asking for all of a project's
     /// spellings at once, with no data migration and no rewrite of history.
     pub fn aliases(&self) -> Vec<String> {
+        let pairs = alias_pairs();
         let mut out: BTreeSet<String> = BTreeSet::new();
         out.insert(self.0.clone());
-        for (alias, canonical) in alias_pairs() {
-            if canonical == self.0 {
-                out.insert(alias);
+        // Compare each alias's FULLY RESOLVED key, not its direct target.
+        // Review finding (codex, verified): matching only direct targets missed
+        // chained aliases — with `xx=chord` configured and the built-in
+        // `chord -> chrd`, `xx` resolves to `chrd` but was absent from
+        // `aliases("chrd")`, so kg_findings' ANY-binding silently skipped every
+        // row recorded under `xx`. Built-ins forbid chains; env entries do not.
+        for (alias, _) in &pairs {
+            if collapse(alias.clone(), &pairs) == self.0 {
+                out.insert(alias.clone());
             }
         }
         out.into_iter().collect()
@@ -170,20 +177,29 @@ pub fn normalize(input: &str) -> String {
     out
 }
 
-/// Follow the alias table to a fixed point, refusing to revisit a key so a
-/// cyclic configuration terminates rather than looping forever.
+/// Follow the alias table to a fixed point.
+///
+/// A cyclic table must not merely TERMINATE — every member of a cycle has to
+/// land on the SAME key. Review finding (codex, verified): stopping at
+/// "the key I re-entered on" made `a=b,b=c,c=a` resolve a->a, b->b, c->c —
+/// three keys for one alias group, i.e. silently re-creating the exact
+/// duplicate-key state (TERM #653) this type exists to remove, from a
+/// misconfigured env var. So on a cycle we pick the lexicographically smallest
+/// member, which is deterministic and identical whichever member you enter from.
+///
+/// No special case for a self-mapping: `parse_alias_env` skips those and
+/// `check_alias_table` forbids them, and a 1-cycle would be handled by the same
+/// branch anyway.
 fn collapse(start: String, pairs: &[(String, String)]) -> String {
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut seen: Vec<String> = Vec::new();
     let mut cur = start;
     loop {
-        if !seen.insert(cur.clone()) {
-            return cur;
+        if let Some(i) = seen.iter().position(|s| *s == cur) {
+            let mut cycle: Vec<&String> = seen[i..].iter().collect();
+            cycle.sort();
+            return cycle[0].clone();
         }
-        // No special case for a self-mapping: `parse_alias_env` skips those and
-        // `self_check_builtin_aliases` forbids them, so the only thing that could
-        // produce one is a bug — and the `seen` guard above already terminates
-        // it. An extra `!= cur` branch here would be unreachable and therefore
-        // untestable, which is its own liability.
+        seen.push(cur.clone());
         match pairs.iter().find(|(a, _)| *a == cur) {
             Some((_, canonical)) => cur = canonical.clone(),
             None => return cur,
@@ -456,6 +472,21 @@ mod tests {
     }
 
     #[test]
+    fn a_chained_alias_is_reported_by_aliases() {
+        let _g = env_lock();
+        // `xx -> chord -> chrd`. `xx` resolves to `chrd`, so anything keyed by
+        // `xx` belongs to that project and MUST appear in its alias set, or
+        // kg_findings' ANY-binding silently drops those rows.
+        std::env::set_var(ALIASES_ENV, "xx=chord"); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
+        assert_eq!(ProjectKey::resolve("xx").as_str(), "chrd");
+        let a = ProjectKey::resolve("chrd").aliases();
+        assert!(a.contains(&"xx".to_string()), "chained alias must be listed: {a:?}");
+        assert!(a.contains(&"chord".to_string()), "direct alias still listed: {a:?}");
+        assert!(a.contains(&"chrd".to_string()), "canonical still listed: {a:?}");
+        std::env::remove_var(ALIASES_ENV); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
+    }
+
+    #[test]
     fn a_self_mapping_cannot_re_split_a_collapsed_project() {
         let _g = env_lock();
         // `chord=chord` is the obvious way an operator would try to "turn off"
@@ -476,11 +507,18 @@ mod tests {
     fn a_cyclic_alias_config_terminates() {
         let _g = env_lock();
         std::env::set_var(ALIASES_ENV, "a=b,b=c,c=a"); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
-        // Any of a/b/c is an acceptable answer; hanging or panicking is not.
         let k = ProjectKey::resolve("a");
         assert!(["a", "b", "c"].contains(&k.as_str()), "got {k}");
         // Deterministic across calls, so it cannot flap between two stores.
         assert_eq!(ProjectKey::resolve("a"), k);
+        // ...and — the part that matters — EVERY member of the cycle must land
+        // on that SAME key. Terminating is not enough: a cycle that resolved
+        // each member to itself would hand one project three store keys, which
+        // is precisely the duplicate-key defect, re-introduced by ops config.
+        assert_eq!(ProjectKey::resolve("b"), k, "cycle member b must converge");
+        assert_eq!(ProjectKey::resolve("c"), k, "cycle member c must converge");
+        // Entering from any member yields one canonical alias group.
+        assert_eq!(ProjectKey::resolve("a").aliases(), ProjectKey::resolve("c").aliases());
         std::env::remove_var(ALIASES_ENV); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
     }
 

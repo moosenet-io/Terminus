@@ -553,9 +553,20 @@ built, and which visual artifacts exist. Returns found:false if no graph has bee
         let slug = ProjectKey::resolve(&project_id).to_string();
         let has = |ext: &str| Path::new(&cfg.kg_store_dir).join(format!("{slug}.{ext}")).exists();
         let clusters = g.nodes().filter_map(|n| n.cluster).collect::<std::collections::HashSet<_>>().len();
+        // Same freshness fields the kg_* envelope reports, so a caller reading
+        // status sees staleness the same way (review finding: this response
+        // escaped LoadedGraph and carried no build time).
+        let built_at = store.built_at(&project_id);
         Ok(structured(json!({
             "project_id": project_id, "found": true,
             "graph_key": slug,
+            "graph_built_at": built_at.and_then(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                Some(dt.to_rfc3339())
+            }),
+            "graph_age_seconds": built_at.and_then(|t| {
+                std::time::SystemTime::now().duration_since(t).ok().map(|d| d.as_secs())
+            }),
             "nodes": g.node_count(), "edges": g.edge_count(), "clusters": clusters,
             "generated_at": g.generated_at,
             "artifacts": {"svg": has("svg"), "graphml": has("graphml"), "html": has("html")},
