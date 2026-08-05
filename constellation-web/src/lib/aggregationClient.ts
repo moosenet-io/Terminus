@@ -242,7 +242,7 @@ export interface AggregationClient {
    * Still routed through this client so the "single path to the backend" rule holds even as
    * new panels (CONST-05..12) land ahead of their typed methods being added here.
    */
-  request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T>;
+  request<T>(system: SystemId, path: string, init?: RequestInit, isOk?: (result: T) => boolean): Promise<T>;
   /**
    * CONST-04: The one permitted WebSocket entry point. harmony-web's daemon pushes live
    * engine/ralph-loop/log events over a single same-origin `/ws` socket; this wraps that so
@@ -2162,8 +2162,8 @@ const mockAdapter: AggregationClient = {
       },
     },
   },
-  async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
-    return withMutationResultEvent(system, path, init, () => mockRequest<T>(system, path, init));
+  async request<T>(system: SystemId, path: string, init?: RequestInit, isOk?: (result: T) => boolean): Promise<T> {
+    return withMutationResultEvent(system, path, init, () => mockRequest<T>(system, path, init), isOk ?? (() => true));
   },
   ws: {
     connect: mockWsConnect,
@@ -2565,9 +2565,9 @@ const httpAdapter: AggregationClient = {
       },
     },
   },
-  async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
+  async request<T>(system: SystemId, path: string, init?: RequestInit, isOk?: (result: T) => boolean): Promise<T> {
     const normalized = path.startsWith('/') ? path : `/${path}`;
-    return withMutationResultEvent(system, path, init, () => httpJson<T>(`/api/${system}${normalized}`, init));
+    return withMutationResultEvent(system, path, init, () => httpJson<T>(`/api/${system}${normalized}`, init), isOk ?? (() => true));
   },
   ws: {
     connect(handlers: WsHandlers): WsConnection {

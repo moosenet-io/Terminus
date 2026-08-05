@@ -40,6 +40,7 @@ import { ChatPanel } from './lumina/ChatPanel';
 import { FleetPanel } from './terminus/FleetPanel';
 import { ToolsPanel } from './terminus/ToolsPanel';
 import { ActivityPanel } from './terminus/ActivityPanel';
+import { Accounts } from '../pages/Accounts';
 import { Connectors } from '../pages/Connectors';
 import { PersonaPanel } from './lumina/PersonaPanel';
 import { MemoryPanel } from './lumina/MemoryPanel';
@@ -565,6 +566,22 @@ registerPanel({
 // door the CLI uses. Registered `available: true` like every other terminus panel: when the
 // backing tools are not deployed the PAGE explains that itself, which is more useful than a
 // missing nav entry that looks like the feature does not exist.
+// TERM #654: the accounts surface — the humans the OAuth door authenticates. Registered
+// immediately before Connectors because it is upstream of it in every sense: a connector names an
+// account as its owner, and until this page existed there was no way to create one, so the
+// Connectors page could not be used on a fresh deployment at all. `available: true` for the same
+// reason as its neighbour, and it matters more here: this is the page that fixes an unusable
+// door, so a missing nav entry would hide the only way in.
+registerPanel({
+  id: 'terminus.accounts',
+  system: 'terminus',
+  title: 'Accounts',
+  path: '/terminus/accounts',
+  icon: '☖',
+  available: true,
+  component: Accounts,
+});
+
 registerPanel({
   id: 'terminus.connectors',
   system: 'terminus',

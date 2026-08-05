@@ -207,6 +207,101 @@ const REQUIRED_COLUMNS: [(&str, &str); 2] = [
 const OPERATOR_ONLY_REGISTRATION_TOKEN: &str =
     "only an operator account may mint or revoke registration tokens";
 
+/// The refusal a bootstrap attempt carries once this deployment has an operator
+/// (TERM #654).
+///
+/// Worded so an operator reading it knows the path is closed permanently rather
+/// than temporarily unavailable — the difference between "retry" and "ask the
+/// operator you already have".
+pub const BOOTSTRAP_CLOSED: &str =
+    "this deployment already has accounts, so the unauthenticated first-account path is closed \
+     permanently; ask an operator to create the account";
+
+/// How an account creation is authorized — and the ONLY way to say it.
+///
+/// This is a two-variant enum rather than a `bool is_operator` plus an
+/// `Option<Uuid> actor`, because those four combinations include two that must
+/// never exist: an actorless creation of a delegated account, and an
+/// operator-authorized creation with no actor. Making them unspellable is
+/// cheaper than testing that nobody spells them.
+///
+/// Neither variant carries a decision. `Bootstrap` is a REQUEST to use the
+/// first-account path, not a claim to be entitled to it, and
+/// [`OauthStore::create_account`] re-derives the entitlement inside the write
+/// transaction. `ByOperator::operator` says what KIND of account to create;
+/// whether the actor may create one at all is likewise re-derived there. A
+/// caller states who it is and what it wants, never what it is allowed to do —
+/// the same doctrine as [`OauthStore::actor_authority`].
+/// WHICH account is acting, and HOW the caller arrived at it.
+///
+/// The distinction is load-bearing and review round 3 (codex) is what put it
+/// here. The tool layer resolves an omitted `actor` to the deployment's sole
+/// active operator — a read taken on the pool, before the write transaction
+/// opens. If a second operator is created or promoted in that window, the write
+/// then proceeds as "the sole operator" on a fleet that now has two, which is
+/// exactly the attribution-by-guessing the surface refuses to do when it can
+/// see the ambiguity. The store could not detect it, because a bare `Uuid`
+/// cannot say whether it was named or inferred.
+///
+/// So the caller states which it was, and [`OauthStore::authorized_actor`]
+/// re-derives the corresponding condition inside the transaction: an operator
+/// check for a named actor, and additionally a still-the-only-one check for an
+/// inferred one. Same rule as everywhere else in this module — the authority is
+/// re-derived where the write lands, not where it was convenient to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorSelection {
+    /// The caller named this account explicitly.
+    Named(Uuid),
+    /// No actor was named; this is the account resolved as the deployment's
+    /// SOLE active operator at the time of the lookup.
+    InferredSole(Uuid),
+}
+
+impl ActorSelection {
+    /// The account either way, for callers that only need the identity.
+    pub fn account_id(self) -> Uuid {
+        match self {
+            Self::Named(id) | Self::InferredSole(id) => id,
+        }
+    }
+}
+
+/// A door's state, read as ONE consistent snapshot (review round 3, codex).
+///
+/// `resolve_reader` used to ask "is there an active operator?" and "are there
+/// any accounts?" as two separate pool reads, so a bootstrap committing between
+/// them produced "no operator" followed by "accounts exist" — a healthy door
+/// reported as stranded, which is the same false alarm the `Acting::Stranded`
+/// split was introduced to stop. Two questions about one state must be answered
+/// from one snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DoorState {
+    /// Any account row at all — the fact the bootstrap gate turns on.
+    pub any_account: bool,
+    /// Some active operator, deterministically chosen. `None` means none.
+    pub any_operator: Option<Uuid>,
+    /// Whether more than one operator is active, so a WRITE must name one.
+    pub several_operators: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountCreation {
+    /// Create this deployment's FIRST operator, valid only while it has never
+    /// had an account at all. The account created is always an operator: the
+    /// bootstrap exists to end the state where nobody can administer the door,
+    /// and creating a delegated account through it would spend the one-shot
+    /// path without ending that state.
+    Bootstrap,
+    /// Create an account as an existing operator, whose authority — and, for an
+    /// inferred actor, whose sole-ness — is re-derived at write time.
+    ByOperator {
+        /// The acting account, and how the caller arrived at it.
+        actor: ActorSelection,
+        /// Whether the NEW account is an operator.
+        operator: bool,
+    },
+}
+
 /// Repository over the `rmcp_*` tables.
 #[derive(Clone)]
 pub struct OauthStore {
@@ -493,8 +588,15 @@ impl OauthStore {
         &self,
         account_id: Uuid,
     ) -> Result<Option<Account>, ToolError> {
+        // `is_operator` is in this list because [`Account`] has the field and
+        // `query_as` decodes BY NAME: omitting it does not yield `false`, it
+        // yields a decode ERROR on every call, which took out RMCP-05's
+        // token→principal resolution entirely (this is the only caller). It was
+        // absent until TERM #654. `every_account_projection_is_complete` pins
+        // it now, because the failure is invisible until the door is used.
         sqlx::query_as::<_, Account>(
-            "SELECT id, name, password_hash, totp_secret_enc, disabled, created_at, updated_at \
+            "SELECT id, name, password_hash, totp_secret_enc, disabled, is_operator, \
+                    created_at, updated_at \
              FROM rmcp_account WHERE id = ?1 AND NOT disabled",
         )
         .bind(account_id)
@@ -523,7 +625,7 @@ impl OauthStore {
         .map_err(db)
     }
 
-    /// Insert an account.
+    /// Create an account (TERM #654).
     ///
     /// Takes an [`Argon2idHash`], not a `&str`. This layer never hashes — the
     /// argon2 parameters belong with the verifier in RMCP-03 — but requiring
@@ -536,23 +638,401 @@ impl OauthStore {
     /// no version or variant bits — which every consumer of these ids
     /// (including `Uuid`'s own parser on the way back out) is entitled to
     /// assume. Generating in Rust keeps the ids exactly what they were.
-    pub async fn insert_account(
+    ///
+    /// ## Why this replaced `insert_account` rather than joining it
+    ///
+    /// The version this supersedes took no actor and performed no check: it
+    /// inserted whatever it was handed, on the pool, in autocommit. It had ZERO
+    /// production callers, which is the only reason it was never a hole — and
+    /// it is exactly the shape that becomes one the moment somebody wires up
+    /// the account-creation surface it was obviously there for. Keeping both
+    /// would leave the unauthorized one as the easier call, so it is gone. One
+    /// door.
+    ///
+    /// ## The authorization, and where it is decided
+    ///
+    /// [`AccountCreation`] says which of the two rules applies; NEITHER is
+    /// evaluated by the caller. Both are re-derived here, inside the
+    /// `BEGIN IMMEDIATE` transaction that performs the insert:
+    ///
+    /// - [`AccountCreation::Bootstrap`] is permitted only while this deployment
+    ///   has NEVER had an account — `rmcp_account` is empty — and the account it
+    ///   creates IS an operator. The emptiness is read on the write path
+    ///   ([`Self::any_account_exists_tx`]), not taken from the caller. A caller
+    ///   that observed an empty table a moment ago and a caller that is lying
+    ///   are indistinguishable from here, and are treated identically.
+    ///
+    /// **The gate is "no account row", NOT "no active operator" — review round
+    /// 1 (codex), and the correction matters.** The first cut asked whether an
+    /// ACTIVE OPERATOR existed, which is a revocable fact, and a revocable fact
+    /// gating an unauthenticated privilege-creation path is fail-OPEN by
+    /// construction: bootstrap A, disable A, and the door reports no active
+    /// operator again, so anyone reaching the tool mints operator B — then
+    /// re-enabling A leaves two. "Permanently closed" was false, and the README
+    /// and `rmcp_account_list` both asserted it.
+    ///
+    /// Existence of a ROW is not revocable (nothing in this schema deletes an
+    /// account; disabling sets a flag), so the corrected gate genuinely closes
+    /// once and stays closed. It also loses nothing reachable: creating a
+    /// delegated account requires an operator, so "accounts exist but none ever
+    /// was an operator" cannot arise through this API.
+    ///
+    /// The cost is that a door whose every operator is disabled out of band is
+    /// STRANDED rather than re-bootstrappable — which is why
+    /// [`Self::ensure_an_operator_remains`] guards every in-band path that could
+    /// reach that state. Fail-closed and recoverable only by an operator is the
+    /// correct direction for this trade; fail-open and self-service is not.
+    /// - [`AccountCreation::ByOperator`] requires the acting account to be an
+    ///   active operator RIGHT NOW, via the same
+    ///   [`Self::actor_authority`] + [`authorize_operator_action`] path every
+    ///   other operator-only write in this module uses.
+    ///
+    /// The transition between them is therefore not a mode this code carries;
+    /// it is a fact about the table, re-read on every call. The instant a
+    /// bootstrap commits, `an_operator_exists` is true for every subsequent
+    /// transaction, and the bootstrap arm can never succeed again — including
+    /// for a concurrent second bootstrap, which is serialized behind the write
+    /// lock and then refused on the re-read. Proven by
+    /// `two_concurrent_bootstraps_cannot_both_create_an_operator`, not asserted.
+    pub async fn create_account(
         &self,
         name: &str,
         password_hash: &Argon2idHash,
-        totp_secret_enc: Option<&[u8]>,
+        creation: AccountCreation,
     ) -> Result<Uuid, ToolError> {
+        let mut tx = self.begin_immediate().await?;
+        let is_operator = match creation {
+            AccountCreation::Bootstrap => {
+                if Self::any_account_exists_tx(&mut tx).await? {
+                    return Err(ToolError::InvalidArgument(BOOTSTRAP_CLOSED.into()));
+                }
+                true
+            }
+            AccountCreation::ByOperator { actor, operator } => {
+                Self::authorized_actor(&mut tx, actor, "only an operator may create an account")
+                    .await?;
+                operator
+            }
+        };
         let id = Uuid::new_v4();
-        sqlx::query("INSERT INTO rmcp_account (id, name, password_hash, totp_secret_enc) \
-             VALUES (?1, ?2, ?3, ?4)")
+        sqlx::query(
+            "INSERT INTO rmcp_account (id, name, password_hash, is_operator) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
         .bind(id)
         .bind(name)
         .bind(password_hash.as_str())
-        .bind(totp_secret_enc)
-        .execute(&self.pool)
+        .bind(is_operator)
+        .execute(&mut *tx)
         .await
         .map_err(unique_aware("an account with that name already exists"))?;
+        tx.commit().await.map_err(db)?;
         Ok(id)
+    }
+
+    /// Grant or withdraw operator authority (TERM #654).
+    ///
+    /// Returns whether the row actually CHANGED: re-granting to an account that
+    /// already holds it is `Ok(false)`, not an error and not a silent success
+    /// the operator cannot distinguish from a real change.
+    ///
+    /// ## The last-operator guard, and why it is checked AFTER the update
+    ///
+    /// A deployment with zero operators is stranded: no account can create
+    /// another, promote anyone, delegate a namespace, or seed the starter
+    /// groups, and — because [`AccountCreation::Bootstrap`] is gated on there
+    /// being no operator — it would ALSO not be recoverable by bootstrap, since
+    /// the demoted operator's row still exists and `an_operator_exists` is
+    /// asking about ACTIVE OPERATORS, not about accounts. So the door would be
+    /// exactly as unusable as it was before this item, with no way back in.
+    ///
+    /// The guard is therefore not "you may not demote yourself" and not "you
+    /// may not demote the only operator I counted a moment ago" — both are
+    /// point-in-time statements about a set that this very statement is
+    /// changing. It applies the write and then asks the ONE question that
+    /// matters, in the same transaction: does an active operator still exist?
+    /// If not, the transaction is dropped without committing and the demotion
+    /// never happened. That is correct for demoting yourself, for demoting
+    /// someone else, and for the case a count-before check gets wrong — two
+    /// operators where the other one was disabled in between.
+    ///
+    /// It counts ACTIVE operators, so it also refuses to demote the last
+    /// operator when every other operator account is disabled — a disabled
+    /// operator cannot act, so it is not one for this purpose. Proven by
+    /// `demoting_the_last_operator_is_refused_and_rolled_back` and
+    /// `a_disabled_operator_does_not_satisfy_the_last_operator_guard`.
+    pub async fn set_account_operator(
+        &self,
+        actor: ActorSelection,
+        target: Uuid,
+        operator: bool,
+    ) -> Result<bool, ToolError> {
+        let mut tx = self.begin_immediate().await?;
+        Self::authorized_actor(
+            &mut tx,
+            actor,
+            "only an operator may change another account's operator authority",
+        )
+        .await?;
+        // NotFound for missing OR disabled, exactly as everywhere else — a
+        // disabled account is not one to hand authority to.
+        let current = Self::locked_active_account(&mut tx, target).await?;
+        if current == operator {
+            tx.commit().await.map_err(db)?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE rmcp_account SET is_operator = ?2, updated_at = unixepoch() \
+             WHERE id = ?1 AND NOT disabled",
+        )
+        .bind(target)
+        .bind(operator)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        Self::ensure_an_operator_remains(&mut tx).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(true)
+    }
+
+    /// Disable or re-enable an account (TERM #654).
+    ///
+    /// Returns whether the row actually changed, on the same terms as
+    /// [`Self::set_account_operator`].
+    ///
+    /// ## Why this shares the last-operator guard rather than having its own
+    ///
+    /// Disabling the last active operator strands the deployment EXACTLY as
+    /// demoting it does — [`Self::an_operator_exists`] counts active operators,
+    /// so a disabled operator is not one, and neither the administration tools
+    /// nor the bootstrap would have anybody to act as. Two guards for one
+    /// property is how they drift; both paths call
+    /// [`Self::ensure_an_operator_remains`] AFTER their write, in their own
+    /// transaction, so a new path that forgets it is a missing call rather than
+    /// a subtly different rule.
+    ///
+    /// This is also what keeps the bootstrap closed. Before this method existed,
+    /// account-disabling was reachable only by writing the database file
+    /// directly — which is already full control of the door — so "disabling
+    /// every operator reopens the first-account path" was a documented recovery
+    /// rather than an escalation. Adding an API for it would have made that
+    /// path reachable through the tool surface, which WOULD have been a hole:
+    /// disable your way to zero operators, then bootstrap yourself a new one.
+    /// The guard is what stops it, and
+    /// `the_disable_path_cannot_be_used_to_reopen_the_bootstrap` is what proves
+    /// it stays stopped.
+    ///
+    /// Targeting an account that does not exist is [`ToolError::NotFound`].
+    /// Unlike every other lookup in this module this one must NOT filter on
+    /// `NOT disabled` — re-enabling an account requires reading a disabled one —
+    /// so it reads the flag directly instead of going through
+    /// [`Self::locked_active_account`].
+    pub async fn set_account_disabled(
+        &self,
+        actor: ActorSelection,
+        target: Uuid,
+        disabled: bool,
+    ) -> Result<bool, ToolError> {
+        let mut tx = self.begin_immediate().await?;
+        Self::authorized_actor(
+            &mut tx,
+            actor,
+            "only an operator may disable or enable an account",
+        )
+        .await?;
+        let current = sqlx::query_scalar::<_, bool>(
+            "SELECT disabled FROM rmcp_account WHERE id = ?1",
+        )
+        .bind(target)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?
+        .ok_or_else(|| ToolError::NotFound("no such account".into()))?;
+        if current == disabled {
+            tx.commit().await.map_err(db)?;
+            return Ok(false);
+        }
+        sqlx::query("UPDATE rmcp_account SET disabled = ?2, updated_at = unixepoch() WHERE id = ?1")
+            .bind(target)
+            .bind(disabled)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        Self::ensure_an_operator_remains(&mut tx).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(true)
+    }
+
+    /// Refuse the transaction unless an ACTIVE OPERATOR still exists after the
+    /// write it has already applied (TERM #654).
+    ///
+    /// The single expression of the stranding rule, shared by every path that
+    /// can remove an operator from the active set (demotion and disablement
+    /// today). Called AFTER the write, deliberately: a count taken BEFORE is a
+    /// statement about a set the write is about to change, and gets the
+    /// two-operator-one-disabled case wrong in the dangerous direction.
+    ///
+    /// Returning `Err` without committing is what undoes the write — the
+    /// caller's `?` drops the transaction, which rolls back.
+    async fn ensure_an_operator_remains(
+        tx: &mut Transaction<'_, Sqlite>,
+    ) -> Result<(), ToolError> {
+        if Self::an_operator_exists(tx).await? {
+            return Ok(());
+        }
+        Err(ToolError::Conflict(
+            "that is this deployment's last active operator; promote or enable another account \
+             first, or the door would be left with nobody able to administer it and no way back in"
+                .into(),
+        ))
+    }
+
+    /// Authorize a WRITE's actor inside the transaction that performs it, and
+    /// re-derive whatever condition the caller relied on to choose it.
+    ///
+    /// Two checks, and the second is review round 3's (codex). Both actors must
+    /// still be active operators — the ordinary revocable-authority rule. An
+    /// INFERRED actor must additionally still be the ONLY active operator,
+    /// because "there is exactly one, so no ambiguity" is the entire
+    /// justification for not making the caller name it. A second operator
+    /// created or promoted between the lookup and this transaction destroys
+    /// that justification, and the resulting write would be attributed to a
+    /// human the caller never chose.
+    ///
+    /// The refusal is the same one the tool surface issues when it CAN see the
+    /// ambiguity, so a caller gets one answer to one situation regardless of
+    /// when the second operator appeared.
+    async fn authorized_actor(
+        tx: &mut Transaction<'_, Sqlite>,
+        actor: ActorSelection,
+        refusal: &'static str,
+    ) -> Result<Uuid, ToolError> {
+        let id = actor.account_id();
+        let authority = Self::actor_authority(tx, id).await?;
+        authorize_operator_action(&authority, refusal)?;
+        if matches!(actor, ActorSelection::InferredSole(_)) {
+            let active = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM rmcp_account WHERE is_operator AND NOT disabled",
+            )
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(db)?;
+            if active > 1 {
+                return Err(ToolError::Conflict(
+                    "this fleet has more than one operator account; name the acting one so the \
+                     action is attributed to a person"
+                        .into(),
+                ));
+            }
+        }
+        Ok(id)
+    }
+
+    /// The whole door state, from ONE transactional snapshot.
+    ///
+    /// See [`DoorState`] for why the three facts are read together rather than
+    /// as separate pool queries.
+    pub async fn read_door_state(&self) -> Result<DoorState, ToolError> {
+        let mut tx = self.begin_immediate().await?;
+        let any_account = Self::any_account_exists_tx(&mut tx).await?;
+        let operators = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM rmcp_account WHERE is_operator AND NOT disabled ORDER BY id LIMIT 2",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(DoorState {
+            any_account,
+            any_operator: operators.first().copied(),
+            several_operators: operators.len() > 1,
+        })
+    }
+
+    /// Whether this deployment has at least one ACTIVE operator account, read
+    /// inside the caller's write transaction.
+    ///
+    /// This backs the LAST-OPERATOR guard, not the bootstrap gate — the
+    /// bootstrap turns on [`Self::any_account_exists_tx`], because operator-ness
+    /// is revocable and account existence is not (see [`Self::create_account`]).
+    ///
+    /// Takes `&mut Transaction` for the same reason
+    /// [`Self::locked_active_account`] does: an answer read on the pool would be
+    /// true-when-read rather than true-at-commit. The type prevents the weaker
+    /// call.
+    async fn an_operator_exists(tx: &mut Transaction<'_, Sqlite>) -> Result<bool, ToolError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM rmcp_account WHERE is_operator AND NOT disabled)",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(db)
+    }
+
+    /// Every account, for the operator's administrative view (TERM #654).
+    ///
+    /// Operator-only, and the authority is re-derived on this READ path rather
+    /// than inherited from whatever established the caller — the sprint's
+    /// signature defect is authority that was true once. It opens a write
+    /// transaction for a read for exactly that reason: [`Self::actor_authority`]
+    /// is only sound inside one.
+    ///
+    /// An empty list means no accounts exist. It is not reachable as a refusal
+    /// — a non-operator gets an error, never a silently empty listing that
+    /// looks like an empty deployment and would send an operator off to
+    /// bootstrap a door that already has accounts.
+    pub async fn list_accounts(&self, actor: Uuid) -> Result<Vec<Account>, ToolError> {
+        let mut tx = self.begin_immediate().await?;
+        let authority = Self::actor_authority(&mut tx, actor).await?;
+        authorize_operator_action(&authority, "only an operator may list accounts")?;
+        // Deliberately NOT `authorized_actor`: a listing is a read, and its
+        // relaxed actor resolution (`resolve_reader`) never produces an
+        // `InferredSole`, so there is no sole-ness condition to re-verify here.
+        let accounts = sqlx::query_as::<_, Account>(
+            "SELECT id, name, password_hash, totp_secret_enc, disabled, is_operator, \
+                    created_at, updated_at \
+             FROM rmcp_account ORDER BY name",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(accounts)
+    }
+
+    /// Whether ANY account row exists at all — active, disabled, operator or
+    /// not.
+    ///
+    /// Distinct from [`Self::an_operator_exists`] and NOT a substitute for it.
+    /// This exists only so the tool surface can tell an operator which of two
+    /// situations they are in ("nothing here yet" versus "accounts exist but
+    /// none of them can administer this"), and it authorizes nothing. It is
+    /// deliberately not consulted by [`Self::create_account`]: the rule that
+    /// closes the bootstrap is about OPERATORS, and widening it to "any
+    /// account" would let a deployment full of delegated users still be
+    /// bootstrapped by anyone reaching the tool.
+    pub async fn any_account_exists(&self) -> Result<bool, ToolError> {
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM rmcp_account)")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db)
+    }
+
+    /// The same question, read INSIDE a write transaction — the form that
+    /// authorizes the bootstrap.
+    ///
+    /// Split from [`Self::any_account_exists`] deliberately, and the split is
+    /// the point of review round 1's second half: the pool-side read above is
+    /// INFORMATIONAL (it tells the tool surface which message to render) and
+    /// must never authorize anything, because its answer can be invalidated
+    /// before the write it would have authorized. Taking `&mut Transaction`
+    /// makes the authorizing form impossible to call on the pool, exactly as
+    /// [`Self::locked_active_account`] does for account state.
+    async fn any_account_exists_tx(tx: &mut Transaction<'_, Sqlite>) -> Result<bool, ToolError> {
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM rmcp_account)")
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(db)
     }
 
     // -----------------------------------------------------------------------
@@ -4548,6 +5028,517 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
              open; the scoping write would then attach a namespace its owner no longer holds"
         );
         tx.commit().await.expect("commit");
+    }
+
+
+    // -----------------------------------------------------------------------
+    // TERM #654 — account creation, the bootstrap, and the last-operator guard
+    // -----------------------------------------------------------------------
+
+    /// A real argon2id hash for a fixture. Goes through the production hasher
+    /// so the value stored is one the login verifier would accept.
+    fn fixture_hash(plaintext: &str) -> Argon2idHash {
+        crate::oauth::password::hash_password(plaintext).expect("hash")
+    }
+
+    /// **The bootstrap creates an operator on an empty deployment.**
+    ///
+    /// The base case the whole item rests on: one call and the door has
+    /// somebody who can administer it.
+    #[tokio::test]
+    async fn the_bootstrap_creates_the_first_operator() {
+        let (_dir, store) = temp_store().await;
+        let hash = fixture_hash("a-long-enough-passphrase");
+        let id = store
+            .create_account("first", &hash, AccountCreation::Bootstrap)
+            .await
+            .expect("bootstrap must succeed on an empty deployment");
+        assert_eq!(
+            store.account_authority(id).await.expect("no error"),
+            Some(true),
+            "the bootstrap account must hold operator authority, or it cannot do anything"
+        );
+    }
+
+    /// **The bootstrap closes the moment an operator exists.**
+    ///
+    /// Mutation-verify: delete the `an_operator_exists` check in the
+    /// `Bootstrap` arm of `create_account` and this goes red — the second call
+    /// succeeds and mints a second unauthenticated operator.
+    #[tokio::test]
+    async fn a_second_bootstrap_is_refused_once_an_operator_exists() {
+        let (_dir, store) = temp_store().await;
+        let hash = fixture_hash("a-long-enough-passphrase");
+        store.create_account("first", &hash, AccountCreation::Bootstrap).await.expect("bootstrap");
+
+        let err = store
+            .create_account("second", &hash, AccountCreation::Bootstrap)
+            .await
+            .expect_err("the first-account path must be closed");
+        assert!(err.to_string().contains("already has accounts"), "unexpected: {err}");
+        assert!(
+            store.resolve_account_id("second").await.expect("no error").is_none(),
+            "a refused bootstrap wrote a row anyway"
+        );
+    }
+
+    /// **Disabling every operator does NOT reopen the bootstrap.**
+    ///
+    /// Review round 1 (codex) rejected the first cut, which gated the bootstrap
+    /// on "no ACTIVE OPERATOR" and therefore reopened on exactly this sequence:
+    /// bootstrap A, disable A, bootstrap B, re-enable A — two operators, one of
+    /// them minted with no authentication, on a door whose README claimed the
+    /// path was permanently closed.
+    ///
+    /// The gate is now "no account ROW", which is not revocable. A door whose
+    /// operators are all disabled is STRANDED and needs an operator to fix out
+    /// of band — the fail-closed direction, and the reason
+    /// `ensure_an_operator_remains` guards every in-band path to that state.
+    ///
+    /// Mutation-verify: change `any_account_exists_tx` back to
+    /// `an_operator_exists` in the `Bootstrap` arm and this goes red.
+    #[tokio::test]
+    async fn disabling_every_operator_does_not_reopen_the_bootstrap() {
+        let (_dir, store) = temp_store().await;
+        let hash = fixture_hash("a-long-enough-passphrase");
+        let first =
+            store.create_account("first", &hash, AccountCreation::Bootstrap).await.expect("boot");
+
+        sqlx::query("UPDATE rmcp_account SET disabled = 1 WHERE id = ?1")
+            .bind(first)
+            .execute(&store.pool)
+            .await
+            .expect("disable out of band");
+
+        store
+            .create_account("recovery", &hash, AccountCreation::Bootstrap)
+            .await
+            .expect_err("a disabled operator must not reopen the first-account path");
+        assert!(
+            store.resolve_account_id("recovery").await.expect("no error").is_none(),
+            "the refused bootstrap wrote a row anyway"
+        );
+    }
+
+    /// **A DELETED-down-to-empty door is the only thing that reopens it, and
+    /// nothing in this schema deletes an account.**
+    ///
+    /// The property the corrected gate rests on, asserted rather than assumed:
+    /// once any account row exists the bootstrap is closed, whatever that row's
+    /// state. Three states, one answer.
+    #[tokio::test]
+    async fn any_account_row_at_all_closes_the_bootstrap() {
+        for (label, disabled, operator) in
+            [("active-operator", false, true), ("delegated", false, false), ("disabled", true, false)]
+        {
+            let (_dir, store) = temp_store().await;
+            let id = seed_account(&store, label, operator).await;
+            if disabled {
+                sqlx::query("UPDATE rmcp_account SET disabled = 1 WHERE id = ?1")
+                    .bind(id)
+                    .execute(&store.pool)
+                    .await
+                    .expect("disable");
+            }
+            let hash = fixture_hash("a-long-enough-passphrase");
+            assert!(
+                store.create_account("later", &hash, AccountCreation::Bootstrap).await.is_err(),
+                "a {label} account must close the bootstrap"
+            );
+        }
+    }
+
+
+    /// **An INFERRED sole operator is refused once a second operator exists.**
+    ///
+    /// Review round 3 (codex). The tool layer resolves an omitted `actor` to the
+    /// sole active operator on the POOL, before the write transaction opens. If
+    /// a second operator appears in that window the write would otherwise
+    /// proceed as "the sole operator" on a fleet that now has two — attribution
+    /// by guessing, which the surface refuses whenever it can see it.
+    ///
+    /// A NAMED actor is unaffected: naming one is a choice, not an inference, so
+    /// there is no sole-ness claim to invalidate. Both halves are asserted, or
+    /// the fix would read as "inferred actors are just broken".
+    ///
+    /// Mutation-verify: delete the `InferredSole` branch in `authorized_actor`
+    /// and the first assertion goes red.
+    #[tokio::test]
+    async fn an_inferred_actor_is_refused_once_it_is_no_longer_the_only_operator() {
+        let (_dir, store) = temp_store().await;
+        let hash = fixture_hash("a-long-enough-passphrase");
+        let first = seed_account(&store, "first-operator", true).await;
+        // The second operator appears AFTER a caller would have resolved
+        // `first` as the sole one.
+        seed_account(&store, "second-operator", true).await;
+
+        let err = store
+            .create_account(
+                "made-by-a-stale-inference",
+                &hash,
+                AccountCreation::ByOperator {
+                    actor: ActorSelection::InferredSole(first),
+                    operator: false,
+                },
+            )
+            .await
+            .expect_err("an inferred sole operator must be refused once it is not the only one");
+        assert!(err.to_string().contains("more than one operator"), "unexpected: {err}");
+        assert!(store.resolve_account_id("made-by-a-stale-inference").await.expect("no error").is_none());
+
+        // Naming the same account explicitly is a choice and still works.
+        store
+            .create_account(
+                "made-by-a-named-actor",
+                &hash,
+                AccountCreation::ByOperator {
+                    actor: ActorSelection::Named(first),
+                    operator: false,
+                },
+            )
+            .await
+            .expect("a NAMED actor carries no sole-ness claim and must still work");
+    }
+
+    /// **The sole-ness re-check covers promotion and disablement too.**
+    ///
+    /// One shared `authorized_actor`, so a path that forgets it is a missing
+    /// call rather than a different rule — asserted rather than assumed.
+    #[tokio::test]
+    async fn the_inferred_actor_recheck_covers_every_write() {
+        let (_dir, store) = temp_store().await;
+        let first = seed_account(&store, "first-operator", true).await;
+        seed_account(&store, "second-operator", true).await;
+        let friend = seed_account(&store, "friend", false).await;
+
+        store
+            .set_account_operator(ActorSelection::InferredSole(first), friend, true)
+            .await
+            .expect_err("promotion by a stale inferred actor must be refused");
+        store
+            .set_account_disabled(ActorSelection::InferredSole(first), friend, true)
+            .await
+            .expect_err("disablement by a stale inferred actor must be refused");
+        assert_eq!(store.account_authority(friend).await.expect("no error"), Some(false));
+    }
+
+    /// **`read_door_state` reports each state correctly.**
+    ///
+    /// The VALUE half. Renamed from a title that claimed to prove the snapshot
+    /// property it does not test — review round 4 (codex) was right that
+    /// sequential reads of stable states would pass against separate
+    /// non-transactional queries. The property itself is the test below.
+    #[tokio::test]
+    async fn the_door_state_reports_each_state_correctly() {
+        let (_dir, store) = temp_store().await;
+        let empty = store.read_door_state().await.expect("no error");
+        assert!(!empty.any_account);
+        assert_eq!(empty.any_operator, None);
+        assert!(!empty.several_operators);
+
+        let first = seed_account(&store, "first-operator", true).await;
+        let one = store.read_door_state().await.expect("no error");
+        assert!(one.any_account);
+        assert_eq!(one.any_operator, Some(first));
+        assert!(!one.several_operators, "one operator is not several");
+
+        seed_account(&store, "second-operator", true).await;
+        assert!(store.read_door_state().await.expect("no error").several_operators);
+
+        sqlx::query("UPDATE rmcp_account SET is_operator = 0")
+            .execute(&store.pool)
+            .await
+            .expect("demote every operator");
+        let stranded = store.read_door_state().await.expect("no error");
+        assert!(stranded.any_account);
+        assert_eq!(stranded.any_operator, None);
+        assert!(!stranded.several_operators);
+    }
+
+    /// **`read_door_state` never observes a HALF-APPLIED bootstrap.**
+    ///
+    /// The property, tested as a race rather than asserted (review round 4).
+    /// The failure it exists to prevent is specific and was live in round 3:
+    /// two separate reads could straddle a committing bootstrap, returning
+    /// "no operator" from the first and "accounts exist" from the second —
+    /// which `resolve_reader` reads as STRANDED, so a door that had just been
+    /// successfully bootstrapped would report that nothing could administer it
+    /// and tell the operator to go do database surgery.
+    ///
+    /// `any_account && any_operator.is_none()` is exactly that impossible
+    /// combination for a door whose only writer is a bootstrap, so the
+    /// assertion is on the combination rather than on either field.
+    ///
+    /// Mutation-verify: change `read_door_state` to run its two queries on
+    /// `&self.pool` instead of inside `begin_immediate`, and this goes red.
+    #[tokio::test]
+    async fn the_door_state_never_straddles_a_committing_bootstrap() {
+        for _ in 0..24 {
+            let (_dir, store) = temp_store().await;
+            let hash = fixture_hash("a-long-enough-passphrase");
+            let (created, observed) = tokio::join!(
+                store.create_account("racer", &hash, AccountCreation::Bootstrap),
+                store.read_door_state(),
+            );
+            created.expect("the bootstrap must succeed");
+            let state = observed.expect("no error");
+            assert!(
+                !(state.any_account && state.any_operator.is_none()),
+                "observed a door with accounts and no operator while the ONLY writer was a \
+                 bootstrap — the two facts came from different instants, which is what makes a \
+                 freshly-bootstrapped door report itself stranded"
+            );
+        }
+    }
+
+    /// **Two concurrent bootstraps cannot both create an operator.**
+    ///
+    /// The constraint stated as a race rather than as a claim. Both calls
+    /// resolve "no operator exists" at the same instant in wall-clock terms;
+    /// the write lock orders them, and the loser re-reads a table that now has
+    /// one. This is what makes "re-derive on the write path" different from
+    /// "check before writing".
+    ///
+    /// Mutation-verify: move the `an_operator_exists` read outside the
+    /// transaction (or delete it) and this goes red with two operators.
+    #[tokio::test]
+    async fn two_concurrent_bootstraps_cannot_both_create_an_operator() {
+        let (_dir, store) = temp_store().await;
+        let hash = fixture_hash("a-long-enough-passphrase");
+        let (a, b) = tokio::join!(
+            store.create_account("racer-a", &hash, AccountCreation::Bootstrap),
+            store.create_account("racer-b", &hash, AccountCreation::Bootstrap),
+        );
+        assert_eq!(
+            [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
+            1,
+            "exactly one bootstrap may win; two would mint two unauthenticated operators"
+        );
+        let operators = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM rmcp_account WHERE is_operator AND NOT disabled",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .expect("count");
+        assert_eq!(operators, 1, "the deployment ended with {operators} operators");
+    }
+
+    /// **A non-operator cannot create an account.**
+    ///
+    /// Mutation-verify: delete the `authorize_operator_action` call in the
+    /// `ByOperator` arm and this goes red.
+    #[tokio::test]
+    async fn a_delegated_account_cannot_create_an_account() {
+        let (_dir, store) = temp_store().await;
+        let hash = fixture_hash("a-long-enough-passphrase");
+        seed_account(&store, "the-operator", true).await;
+        let delegated = seed_account(&store, "delegated", false).await;
+
+        let err = store
+            .create_account(
+                "escalation",
+                &hash,
+                AccountCreation::ByOperator { actor: ActorSelection::Named(delegated), operator: true },
+            )
+            .await
+            .expect_err("a delegated account must not create accounts");
+        assert!(err.to_string().contains("only an operator"), "unexpected refusal: {err}");
+        assert!(store.resolve_account_id("escalation").await.expect("no error").is_none());
+    }
+
+    /// **A DEMOTED actor cannot create an account, even mid-flight.**
+    ///
+    /// Authority is revocable, so it is re-derived on the write path. An actor
+    /// resolved as an operator by the tool layer and demoted before the call
+    /// lands must be refused.
+    #[tokio::test]
+    async fn a_demoted_actor_cannot_create_an_account() {
+        let (_dir, store) = temp_store().await;
+        let hash = fixture_hash("a-long-enough-passphrase");
+        let actor = seed_account(&store, "was-an-operator", true).await;
+        seed_account(&store, "still-an-operator", true).await;
+        sqlx::query("UPDATE rmcp_account SET is_operator = 0 WHERE id = ?1")
+            .bind(actor)
+            .execute(&store.pool)
+            .await
+            .expect("demote");
+
+        store
+            .create_account("after", &hash, AccountCreation::ByOperator { actor: ActorSelection::Named(actor), operator: false })
+            .await
+            .expect_err("a demoted actor's creation must be refused");
+    }
+
+    /// **An operator-created account defaults to DELEGATED.**
+    ///
+    /// The fail-closed direction: `operator: false` must actually store false,
+    /// not inherit the creator's authority.
+    #[tokio::test]
+    async fn an_operator_created_account_is_delegated_unless_asked_for() {
+        let (_dir, store) = temp_store().await;
+        let hash = fixture_hash("a-long-enough-passphrase");
+        let operator = seed_account(&store, "the-operator", true).await;
+        let made = store
+            .create_account(
+                "friend",
+                &hash,
+                AccountCreation::ByOperator { actor: ActorSelection::Named(operator), operator: false },
+            )
+            .await
+            .expect("create");
+        assert_eq!(store.account_authority(made).await.expect("no error"), Some(false));
+    }
+
+    /// **Promotion and demotion both land, and a no-op is reported as one.**
+    #[tokio::test]
+    async fn operator_authority_can_be_granted_and_withdrawn() {
+        let (_dir, store) = temp_store().await;
+        let operator = seed_account(&store, "the-operator", true).await;
+        let friend = seed_account(&store, "friend", false).await;
+
+        assert!(store.set_account_operator(ActorSelection::Named(operator), friend, true).await.expect("promote"));
+        assert_eq!(store.account_authority(friend).await.expect("no error"), Some(true));
+        assert!(
+            !store.set_account_operator(ActorSelection::Named(operator), friend, true).await.expect("re-promote"),
+            "an unchanged row must report changed=false, not a phantom success"
+        );
+        assert!(store.set_account_operator(ActorSelection::Named(operator), friend, false).await.expect("demote"));
+        assert_eq!(store.account_authority(friend).await.expect("no error"), Some(false));
+    }
+
+    /// **The last operator cannot be demoted, and the refusal ROLLS BACK.**
+    ///
+    /// Mutation-verify: delete the post-update `an_operator_exists` check in
+    /// `set_account_operator` and this goes red — the demotion succeeds and the
+    /// door is stranded with nobody able to administer it and no way back in.
+    #[tokio::test]
+    async fn demoting_the_last_operator_is_refused_and_rolled_back() {
+        let (_dir, store) = temp_store().await;
+        let only = seed_account(&store, "the-only-operator", true).await;
+
+        let err = store
+            .set_account_operator(ActorSelection::Named(only), only, false)
+            .await
+            .expect_err("demoting the last operator must be refused");
+        assert!(err.to_string().contains("last active operator"), "unexpected refusal: {err}");
+        assert_eq!(
+            store.account_authority(only).await.expect("no error"),
+            Some(true),
+            "the refused demotion was applied anyway; the transaction did not roll back"
+        );
+    }
+
+    /// **A DISABLED operator does not satisfy the last-operator guard.**
+    ///
+    /// The case a naive `COUNT(*) FROM rmcp_account WHERE is_operator` gets
+    /// wrong: two operator ROWS, one of which cannot act. Demoting the active
+    /// one would strand the door just as thoroughly as demoting a sole
+    /// operator, so it must be refused.
+    ///
+    /// Mutation-verify: drop `AND NOT disabled` from `an_operator_exists` and
+    /// this goes red.
+    #[tokio::test]
+    async fn a_disabled_operator_does_not_satisfy_the_last_operator_guard() {
+        let (_dir, store) = temp_store().await;
+        let active = seed_account(&store, "active-operator", true).await;
+        let sidelined = seed_account(&store, "disabled-operator", true).await;
+        sqlx::query("UPDATE rmcp_account SET disabled = 1 WHERE id = ?1")
+            .bind(sidelined)
+            .execute(&store.pool)
+            .await
+            .expect("disable");
+
+        store
+            .set_account_operator(ActorSelection::Named(active), active, false)
+            .await
+            .expect_err("a disabled operator cannot administer the door, so it is not one here");
+        assert_eq!(store.account_authority(active).await.expect("no error"), Some(true));
+    }
+
+    /// **A non-operator cannot promote anyone, including itself.**
+    #[tokio::test]
+    async fn a_delegated_account_cannot_promote_itself() {
+        let (_dir, store) = temp_store().await;
+        seed_account(&store, "the-operator", true).await;
+        let delegated = seed_account(&store, "delegated", false).await;
+        store
+            .set_account_operator(ActorSelection::Named(delegated), delegated, true)
+            .await
+            .expect_err("self-promotion must be refused");
+        assert_eq!(store.account_authority(delegated).await.expect("no error"), Some(false));
+    }
+
+    /// **Promotion targets a DISABLED account with NotFound, not success.**
+    ///
+    /// Handing authority to an account that cannot authenticate would create an
+    /// operator nobody can use, and the row would then satisfy nothing the
+    /// guard above counts.
+    #[tokio::test]
+    async fn a_disabled_account_cannot_be_promoted() {
+        let (_dir, store) = temp_store().await;
+        let operator = seed_account(&store, "the-operator", true).await;
+        let sidelined = seed_account(&store, "sidelined", false).await;
+        sqlx::query("UPDATE rmcp_account SET disabled = 1 WHERE id = ?1")
+            .bind(sidelined)
+            .execute(&store.pool)
+            .await
+            .expect("disable");
+        store
+            .set_account_operator(ActorSelection::Named(operator), sidelined, true)
+            .await
+            .expect_err("a disabled account must not be promoted");
+    }
+
+    /// **Listing is operator-only, and absence means the empty set — never a
+    /// silently filtered view.**
+    ///
+    /// Mutation-verify: delete `authorize_operator_action` in `list_accounts`
+    /// and the delegated arm goes red.
+    #[tokio::test]
+    async fn listing_accounts_is_operator_only() {
+        let (_dir, store) = temp_store().await;
+        let operator = seed_account(&store, "b-operator", true).await;
+        let delegated = seed_account(&store, "a-delegated", false).await;
+
+        let listed = store.list_accounts(operator).await.expect("an operator may list");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].name, "a-delegated", "the listing must be name-ordered");
+
+        // `is_err()` rather than `expect_err`: `Account` deliberately has no
+        // `Debug` (it holds the encrypted TOTP seed), so `Result<Vec<Account>,
+        // _>::expect_err` — which formats the Ok value — does not compile.
+        assert!(
+            store.list_accounts(delegated).await.is_err(),
+            "a delegated account must be refused, not given an empty list"
+        );
+    }
+
+    /// **`find_active_account_by_id` actually decodes a row.**
+    ///
+    /// Review round 1 (codex) was right that a source-text scanner is only
+    /// indirect evidence for the bug it was written about, and round 2 agreed
+    /// the two overlapped — so the scanner is gone and this is the whole guard.
+    /// The projection that shipped omitted `is_operator`, and because
+    /// `query_as` decodes BY NAME that was a decode ERROR on every call rather
+    /// than a wrong value — so simply calling it and getting a row back is the
+    /// regression test, and it needs a real database to be one.
+    ///
+    /// Both flavours, because the omitted column was the operator flag and a
+    /// test that only ever looked at a delegated account would pass against a
+    /// projection that hard-coded `false`.
+    #[tokio::test]
+    async fn find_active_account_by_id_decodes_every_column() {
+        let (_dir, store) = temp_store().await;
+        for (name, operator) in [("an-operator", true), ("a-delegate", false)] {
+            let id = seed_account(&store, name, operator).await;
+            let account = store
+                .find_active_account_by_id(id)
+                .await
+                .expect("the projection must decode")
+                .expect("the account must be found");
+            assert_eq!(account.name, name);
+            assert_eq!(account.is_operator, operator, "is_operator decoded wrongly for {name}");
+        }
     }
 
     /// **Two concurrent redemptions cannot double-spend a single-use

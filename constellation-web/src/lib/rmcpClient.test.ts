@@ -6,6 +6,10 @@
 // against the live tools with nothing changed but the mode.
 import { describe, it, expect } from 'vitest';
 import {
+  createAccount,
+  listAccounts,
+  setAccountDisabled,
+  setAccountOperator,
   createClient,
   createGroup,
   listClients,
@@ -681,5 +685,93 @@ describe('creating a connector names its owner', () => {
       namespaces: [],
     }).catch(() => undefined);
     expect((await listClients()).length).toBe(before);
+  });
+});
+
+// ── Accounts (TERM #654) ─────────────────────────────────────────────────────
+//
+// These run against the fixture server exactly as the connector tests do, and they exist because
+// review round 2 pointed at a real hole in the round-1 test set: every added test covered a PURE
+// helper, so a broken wire→client translation passed CI untouched. The defect it missed was not
+// subtle in effect — the tool emits `created_at`, the client declares `createdAt`, the rows were
+// spread rather than mapped, and `a.createdAt.slice(0, 10)` threw for every non-empty result.
+// A page that worked only while it had nothing to show.
+describe('accounts adapter', () => {
+  it('TRANSLATES the wire shape rather than spreading it', async () => {
+    const view = await listAccounts();
+    expect(view.accounts.length).toBeGreaterThan(0);
+    for (const a of view.accounts) {
+      // The assertion that would have caught the shipped bug: a real RFC-3339 string, not
+      // `undefined`, and reachable by the name the page actually reads.
+      expect(typeof a.createdAt).toBe('string');
+      expect(a.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}/);
+      expect(a.account).toBeTruthy();
+      // No snake_case key survives the translation, and no credential field appears.
+      expect(Object.keys(a).sort()).toEqual(['account', 'createdAt', 'disabled', 'id', 'operator']);
+    }
+  });
+
+  it('reports the server flags rather than inferring them from the list length', async () => {
+    // All THREE states, because round 3 caught the earlier version exercising only the healthy
+    // one — where both flags are false, so it passed against a client that hard-coded them.
+    const { __setFixtureAccounts } = await import('./rmcpFixtures');
+    try {
+      const healthy = await listAccounts();
+      expect(healthy.accounts.length).toBeGreaterThan(0);
+      expect(healthy.bootstrapAvailable).toBe(false);
+      expect(healthy.stranded).toBe(false);
+
+      // A door that has never had an account: the bootstrap is OPEN, and the empty list is not
+      // what says so.
+      __setFixtureAccounts('empty');
+      const empty = await listAccounts();
+      expect(empty.accounts).toEqual([]);
+      expect(empty.bootstrapAvailable).toBe(true);
+      expect(empty.stranded).toBe(false);
+
+      // Accounts exist but none can administer: the list is EMPTY here too, and the flags are
+      // the only thing distinguishing it from the case above. Inferring from length would get
+      // this exactly backwards and offer a bootstrap that the server refuses.
+      __setFixtureAccounts('stranded');
+      const stranded = await listAccounts();
+      expect(stranded.accounts).toEqual([]);
+      expect(stranded.stranded).toBe(true);
+      expect(stranded.bootstrapAvailable).toBe(false);
+    } finally {
+      __setFixtureAccounts('default');
+    }
+  });
+
+  it('never carries a password in either direction', async () => {
+    const created = await createAccount({
+      account: 'adapter-test-account',
+      password: 'a-long-enough-passphrase',
+      operator: false,
+    });
+    expect(JSON.stringify(created)).not.toContain('a-long-enough-passphrase');
+    expect(Object.keys(created).sort()).toEqual(['account', 'bootstrap', 'id', 'operator']);
+
+    const view = await listAccounts();
+    expect(JSON.stringify(view)).not.toContain('a-long-enough-passphrase');
+    expect(JSON.stringify(view)).not.toContain('password');
+  });
+
+  it('surfaces the server refusal when the last active operator would be removed', async () => {
+    // The fixture enforces the same guard the server does, so this exercises the path the page
+    // takes when its disabled-button courtesy is bypassed — which is the whole reason that
+    // courtesy is not the guard.
+    await expect(setAccountOperator('primary', false)).rejects.toThrow(/last active operator/);
+    await expect(setAccountDisabled('primary', true)).rejects.toThrow(/last active operator/);
+  });
+
+  it('requires an actor for a WRITE once several operators are active, but not for the READ', async () => {
+    await setAccountOperator('delegate', true);
+    // The read still works with no actor — otherwise the page could never render the picker it
+    // needs in order to name one.
+    const view = await listAccounts();
+    expect(view.accounts.length).toBeGreaterThan(1);
+    // The write refuses until one is named.
+    await expect(setAccountOperator('delegate', false)).rejects.toThrow(/more than one operator/);
+    await expect(setAccountOperator('delegate', false, 'primary')).resolves.toBeUndefined();
   });
 });

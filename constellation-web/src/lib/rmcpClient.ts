@@ -55,6 +55,9 @@ import { getAggregationClient, resolveMode } from './aggregationClient';
 import { RMCP_TOOLS, RmcpError } from './rmcpContract';
 import type { RmcpErrorKind, RmcpToolName } from './rmcpContract';
 import type {
+  RmcpAccount,
+  RmcpAccountCreated,
+  RmcpAccountsView,
   RmcpClient,
   RmcpClientCreated,
   RmcpGroupPreview,
@@ -82,6 +85,15 @@ interface RmcpEnvelope<T> {
   result?: T;
   error?: { code?: string; message?: string; details?: string[] };
 }
+
+/** The tools that carry a `version` and can therefore lose an optimistic-concurrency race.
+ *  Only these get the "reload and re-apply" wording for a `conflict`; see `describeRmcpError`.
+ *  Derived from the tools that actually take a version argument, not from a name prefix, so a
+ *  new tool joins this set by acquiring the property rather than by being spelled a certain way. */
+const OPTIMISTIC_CONCURRENCY_TOOLS: ReadonlySet<string> = new Set<string>([
+  RMCP_TOOLS.clientUpdate,
+  RMCP_TOOLS.groupUpdate,
+]);
 
 /** Server error codes → local kinds. Unknown codes fall to `error`, never to a permissive
  *  reading: an unrecognised refusal must not present as success or as "just retry". */
@@ -129,10 +141,20 @@ async function callTool<T>(tool: RmcpToolName, args: Record<string, unknown> = {
 
   let envelope: RmcpEnvelope<T>;
   try {
-    envelope = await getAggregationClient().request<RmcpEnvelope<T>>('terminus', DISPATCH_PATH, {
-      method: 'POST',
-      body: JSON.stringify({ tool, args }),
-    });
+    envelope = await getAggregationClient().request<RmcpEnvelope<T>>(
+      'terminus',
+      DISPATCH_PATH,
+      { method: 'POST', body: JSON.stringify({ tool, args }) },
+      // A TOOL refusal is an HTTP 200 carrying `ok:false`, so without this
+      // classifier the activity/toast layer saw a settled request and announced
+      // SUCCESS — while the panel showed the refusal inline. Review round 3
+      // (codex) found it on the account mutations; it was never account-specific
+      // and applied to every connector write too, which is why the fix is here
+      // at the single dispatch rather than at a call site. This is exactly the
+      // `isOk` seam MACT-03 added for "a mutating call that degrades instead of
+      // throwing", finally used by the caller that most needed it.
+      envelope => envelope?.ok === true,
+    );
   } catch (e) {
     const message = e instanceof Error ? e.message : 'request failed';
     throw new RmcpError(kindFromTransport(message), tool, message);
@@ -246,6 +268,111 @@ export function resolveClientScope(
   });
 }
 
+// ── Accounts (TERM #654) ────────────────────────────────────────────────────
+//
+// The bootstrap surface. Read the module doc above first — everything there about ONE path to
+// the backend and AUTHORIZATION IS NOT HERE applies unchanged, and applies hardest here: this is
+// the only tool family with a path that runs before any account exists, so a client-side guess
+// about who may call it would be a guess about the one call nobody is authenticated for.
+//
+// **THE PASSWORD GOES ONE WAY.** It is a parameter of `createAccount` and appears nowhere else
+// in this module: no read returns it, nothing stores it, and no wrapper accepts it back. That is
+// deliberately unlike `createClient`, whose response carries a client secret the SERVER minted
+// and the UI must show exactly once. A password is the operator's own input; echoing it would add
+// a disclosure with no purpose.
+//
+// **`actor` is passed through, never invented** — the same rule, and the same reasoning, as
+// `createClient`'s `owner`/`actor` (see its doc). It is optional here because the server can
+// resolve a sole operator unambiguously, and when it cannot it REFUSES rather than picking one.
+// This layer must never fill it in to make a refusal go away.
+
+/** The account view, including the two no-account states. Absence is reported by the server as
+ *  an empty list plus the flags — never inferred here from a failed call. */
+export async function listAccounts(actor?: string): Promise<RmcpAccountsView> {
+  const r = await callTool<{
+    accounts: RmcpAccountWire[];
+    bootstrap_available: boolean;
+    stranded: boolean;
+  }>(RMCP_TOOLS.accountList, { actor });
+  return {
+    // Mapped FIELD BY FIELD, not spread. Review round 2 (codex) caught the
+    // spread version: the tool emits `created_at` and `RmcpAccount` declares
+    // `createdAt`, so every row arrived with `createdAt === undefined` and the
+    // page's `a.createdAt.slice(0, 10)` threw for every non-empty result — a
+    // page that worked only while the list was empty. TypeScript could not see
+    // it because the wire type was asserted rather than described; `RmcpAccountWire`
+    // is now the honest shape, so the compiler checks the translation.
+    accounts: (r.accounts ?? []).map(wireAccount),
+    // `?? false` is the fail-closed reading for BOTH: a response that omits
+    // `bootstrap_available` must not offer the bootstrap, and one that omits
+    // `stranded` must not claim the door is healthy — the page renders the
+    // ordinary "no accounts" copy in that case, which is true either way.
+    bootstrapAvailable: r.bootstrap_available ?? false,
+    stranded: r.stranded ?? false,
+  };
+}
+
+/** The account rows exactly as the tool emits them: snake_case, unmapped. Declared so the
+ *  translation below is type-checked rather than assumed. */
+interface RmcpAccountWire {
+  id: string;
+  account: string;
+  operator: boolean;
+  disabled: boolean;
+  created_at: string;
+}
+
+function wireAccount(a: RmcpAccountWire): RmcpAccount {
+  return {
+    id: a.id,
+    account: a.account,
+    // Booleans are read strictly rather than coerced: the server sends real
+    // booleans, and `!!undefined` would quietly render a missing `operator` as
+    // "delegated" and a missing `disabled` as "enabled" — the reassuring
+    // direction for both, which is the wrong way to be wrong about authority.
+    operator: a.operator === true,
+    disabled: a.disabled === true,
+    createdAt: a.created_at ?? '',
+  };
+}
+
+export interface CreateAccountInput {
+  /** The operator performing this. Optional — see the note above. NEVER defaulted locally. */
+  actor?: string;
+  account: string;
+  /** Sent once, held nowhere. */
+  password: string;
+  operator: boolean;
+}
+
+export function createAccount(input: CreateAccountInput): Promise<RmcpAccountCreated> {
+  return callTool<RmcpAccountCreated>(RMCP_TOOLS.accountCreate, {
+    actor: input.actor,
+    name: input.account,
+    password: input.password,
+    operator: input.operator,
+  });
+}
+
+/** Grant or withdraw operator authority. The server refuses to remove the last active operator;
+ *  this wrapper does not pre-empt that check, it surfaces the refusal. */
+export function setAccountOperator(account: string, operator: boolean, actor?: string): Promise<void> {
+  return callTool<unknown>(RMCP_TOOLS.accountPromote, {
+    actor,
+    account,
+    revoke: !operator,
+  }).then(() => undefined);
+}
+
+/** Disable or re-enable. Same last-operator refusal, same posture toward it. */
+export function setAccountDisabled(account: string, disabled: boolean, actor?: string): Promise<void> {
+  return callTool<unknown>(RMCP_TOOLS.accountDisable, {
+    actor,
+    account,
+    enable: !disabled,
+  }).then(() => undefined);
+}
+
 // ── Tool groups ─────────────────────────────────────────────────────────────
 
 export async function listGroups(): Promise<RmcpToolGroup[]> {
@@ -336,9 +463,23 @@ export function describeRmcpError(e: unknown): { kind: RmcpErrorKind; message: s
       case 'forbidden':
         return { kind: e.kind, message: 'Not permitted for this session — the server refused the change.' };
       case 'conflict':
+        // A `conflict` means two different things, and the right words differ completely.
+        //
+        // For the VERSION-CARRYING tools it is optimistic concurrency — somebody saved first —
+        // and the useful answer is procedural: reload, re-apply. The server's own message
+        // ("stale") is useless to a human, so the copy is written here.
+        //
+        // For everything else it is a REFUSAL whose whole value is the sentence the server
+        // wrote: "that is this deployment's last active operator", "this fleet has more than
+        // one operator account; name the acting one", "an account with that name already
+        // exists". Round 3 (codex) caught the account tools being given the connector copy —
+        // which told the operator to reload and retry a write that can never succeed, and hid
+        // the actual reason completely.
         return {
           kind: e.kind,
-          message: 'Someone else changed this connector while you were editing. Reload to see their version, then re-apply your change.',
+          message: OPTIMISTIC_CONCURRENCY_TOOLS.has(e.tool)
+            ? 'Someone else changed this connector while you were editing. Reload to see their version, then re-apply your change.'
+            : e.message,
         };
       case 'not_found':
         return { kind: e.kind, message: 'This object no longer exists — it may have been revoked elsewhere.' };

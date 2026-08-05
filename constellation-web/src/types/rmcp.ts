@@ -137,3 +137,59 @@ export interface RmcpClientCreated {
   /** Null for a public client (no secret was minted). */
   clientSecret: string | null;
 }
+
+// ── Accounts (TERM #654) ──────────────────────────────────────────────────────────────────────
+//
+// The human identity the OAuth door authenticates: an account logs in at `/oauth/login`, grants
+// consent, and is named as a connector's `owner`. Distinct from a fleet `Principal` — an account
+// MAPS to one (RMCP-05), it does not replace one.
+//
+// **There is no password field, in either direction.** It is not returned by any read (the server
+// stores an argon2id hash), it is not held in any state that outlives the create call, and it is
+// never round-tripped into a form. The only place a password appears in this app is the create
+// dialog's input, for the life of that submit.
+
+/** One account, as `rmcp_account_list` returns it. */
+export interface RmcpAccount {
+  id: string;
+  /** What the person types at `/oauth/login`. */
+  account: string;
+  /** Holds fleet-operator authority. Server-computed and server-enforced; the UI only shows it. */
+  operator: boolean;
+  /** A disabled account cannot log in, consent, or satisfy any authorization it held. */
+  disabled: boolean;
+  /** RFC 3339. */
+  createdAt: string;
+}
+
+/**
+ * The whole account view, including the two states in which there is nothing to list.
+ *
+ * `bootstrapAvailable` and `stranded` are the SERVER's answer, not inferred from
+ * `accounts.length` — they are different facts and conflating them is what sends an operator to
+ * run a command that cannot work:
+ *
+ *  - `bootstrapAvailable` — this door has never had an account, so the first-operator path is
+ *    open. The only state in which anyone may create an account without being an operator.
+ *  - `stranded` — accounts exist but none is an active operator. Nothing can administer the door
+ *    and the first-account path will NOT reopen (it is gated on account existence, not on
+ *    operator existence). Needs direct database access to fix.
+ *
+ * Both false with an empty `accounts` is not a state the server produces; if it ever appears,
+ * render it as "no accounts", never as "everything is fine".
+ */
+export interface RmcpAccountsView {
+  accounts: RmcpAccount[];
+  bootstrapAvailable: boolean;
+  stranded: boolean;
+}
+
+/** What `rmcp_account_create` returns. No secret: the password was the caller's own input and is
+ *  never echoed — unlike a client secret, which the SERVER mints and therefore must show once. */
+export interface RmcpAccountCreated {
+  id: string;
+  account: string;
+  operator: boolean;
+  /** Whether this call was the one-shot first-account creation. */
+  bootstrap: boolean;
+}

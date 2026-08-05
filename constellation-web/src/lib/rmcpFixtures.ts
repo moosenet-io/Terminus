@@ -336,6 +336,119 @@ let clients: FixtureClient[] = [
   },
 ];
 
+// ── Accounts (TERM #654) ──────────────────────────────────────────────────────────────────────
+//
+// Modelled so the two states that matter can actually be reached: a normal door with one
+// operator, and (by promoting a second) the multi-operator door where `actor` becomes required.
+//
+// **This fixture is at least as strict as the server, per rule 3 above** — it enforces the
+// last-active-operator refusal and the actor requirement, and it emits `created_at` in the
+// SERVER's snake_case rather than the client's camelCase. That last detail is the point: an
+// earlier client spread the wire rows straight into `RmcpAccount`, so every row arrived with
+// `createdAt === undefined` and the page threw on the first non-empty result. A fixture that
+// emitted the client's own shape would have hidden that defect completely.
+interface FixtureAccount {
+  id: string;
+  account: string;
+  operator: boolean;
+  disabled: boolean;
+  created_at: string;
+}
+
+let accounts: FixtureAccount[] = [
+  { id: 'acct-1', account: 'primary', operator: true, disabled: false, created_at: '2026-01-04T09:00:00Z' },
+  { id: 'acct-2', account: 'delegate', operator: false, disabled: false, created_at: '2026-02-11T14:30:00Z' },
+];
+
+/** Put the account table into a named state, so a test can reach the two states that otherwise
+ *  cannot occur mid-session: a door that has never had an account (bootstrap open) and one whose
+ *  accounts exist but whose operators are all disabled (stranded).
+ *
+ *  Exists because round 3 caught the flag test being vacuous — it only ever ran against a
+ *  healthy, non-empty fixture where both flags are false, so it would have passed against a
+ *  client that hard-coded them. A state the fixture cannot reach is a state no test covers. */
+export function __setFixtureAccounts(next: 'empty' | 'stranded' | 'default'): void {
+  if (next === 'empty') {
+    accounts = [];
+    return;
+  }
+  accounts = [
+    { id: 'acct-1', account: 'primary', operator: true, disabled: next !== 'stranded', created_at: '2026-01-04T09:00:00Z' },
+    { id: 'acct-2', account: 'delegate', operator: false, disabled: false, created_at: '2026-02-11T14:30:00Z' },
+  ];
+  if (next === 'stranded') {
+    // Accounts exist; none is an ACTIVE operator.
+    accounts[0].disabled = true;
+  } else {
+    accounts[0].disabled = false;
+  }
+}
+
+/** Active operators, the same predicate the server's `an_operator_exists` uses. */
+function activeOperatorAccounts(): FixtureAccount[] {
+  return accounts.filter(a => a.operator && !a.disabled);
+}
+
+/** Read `actor` as strictly as the server does: only a MISSING property is absence.
+ *
+ *  Round 4 caught the fixture repeating the very defect round 3 fixed in the server — it treated
+ *  `null`, a number and a blank string as "no actor", so a malformed request succeeded here by
+ *  inferring the sole operator while the live contract refuses it. A mock that is laxer than the
+ *  server trains the UI against a contract that does not exist, which is rule 3 of this file. */
+function strictActor(args: Record<string, unknown>, tool: RmcpToolName): string | null {
+  if (!('actor' in args) || args.actor === undefined) return null;
+  if (typeof args.actor !== 'string') {
+    throw new RmcpError('invalid', tool, 'actor must be a string');
+  }
+  const trimmed = args.actor.trim();
+  if (!trimmed) throw new RmcpError('invalid', tool, 'actor must not be blank');
+  return trimmed;
+}
+
+/** Resolve the acting operator for a WRITE, refusing exactly where the server refuses. */
+function writingActor(args: Record<string, unknown>, tool: RmcpToolName): FixtureAccount {
+  const named = strictActor(args, tool);
+  const active = activeOperatorAccounts();
+  if (named) {
+    const found = accounts.find(a => a.account === named);
+    if (!found) throw new RmcpError('not_found', tool, `no account named ${named}`);
+    if (!found.operator || found.disabled) {
+      throw new RmcpError('invalid', tool, `${named} is not an active operator`);
+    }
+    return found;
+  }
+  if (active.length === 0) {
+    throw new RmcpError('conflict', tool, 'this deployment has no ACTIVE operator');
+  }
+  if (active.length > 1) {
+    throw new RmcpError(
+      'conflict',
+      tool,
+      'this fleet has more than one operator account; name the acting one',
+    );
+  }
+  return active[0];
+}
+
+/** The server's shared last-operator guard: applied AFTER the change, never before. */
+function assertAnOperatorRemains(tool: RmcpToolName, apply: () => void, undo: () => void): void {
+  apply();
+  if (activeOperatorAccounts().length === 0) {
+    undo();
+    throw new RmcpError(
+      'conflict',
+      tool,
+      "that is this deployment's last active operator; promote or enable another account first",
+    );
+  }
+}
+
+function accountOr404(name: string, tool: RmcpToolName): FixtureAccount {
+  const found = accounts.find(a => a.account === name);
+  if (!found) throw new RmcpError('not_found', tool, `no account named ${name}`);
+  return found;
+}
+
 let sessions: RmcpSession[] = [
   { id: 's-1', accountName: 'delegated-owner', clientRowId: 'c-1', clientName: 'Reading assistant', scope: 'mcp', grantedAt: '2026-07-30T09:20:00Z', lastUsedAt: '2026-08-04T07:55:00Z', activeFamilies: 2, revokedAt: null },
   { id: 's-2', accountName: 'delegated-owner', clientRowId: 'c-1', clientName: 'Reading assistant', scope: 'mcp', grantedAt: '2026-08-01T14:02:00Z', lastUsedAt: null, activeFamilies: 1, revokedAt: null },
@@ -751,6 +864,84 @@ export async function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string
         const hit = sessionId ? s.id === sessionId : clientRowId ? s.clientRowId === clientRowId : false;
         return hit && !s.revokedAt ? { ...s, revokedAt: now, activeFamilies: 0 } : s;
       });
+      return delay(undefined as unknown as T);
+    }
+
+    case RMCP_TOOLS.accountList: {
+      // A READ: with several operators and no actor the server resolves one rather than
+      // refusing, because a listing is not scoped per operator. A NAMED actor is still checked.
+      const named = strictActor(args, tool);
+      if (named) {
+        const found = accounts.find(a => a.account === named);
+        if (!found || !found.operator || found.disabled) {
+          throw new RmcpError('invalid', tool, `${named} is not an active operator`);
+        }
+      }
+      const stranded = accounts.length > 0 && activeOperatorAccounts().length === 0;
+      return delay({
+        accounts: stranded ? [] : accounts.map(a => ({ ...a })),
+        bootstrap_available: accounts.length === 0,
+        stranded,
+      } as unknown as T);
+    }
+
+    case RMCP_TOOLS.accountCreate: {
+      const name = typeof args.name === 'string' ? args.name.trim() : '';
+      const password = typeof args.password === 'string' ? args.password : '';
+      if (!name) throw new RmcpError('invalid', tool, 'name is required');
+      // The floor is the SERVER's; restated here so the fixture cannot be laxer than it.
+      if ([...password].length < 12) {
+        throw new RmcpError('invalid', tool, 'password must be at least 12 characters');
+      }
+      if (accounts.some(a => a.account === name)) {
+        throw new RmcpError('conflict', tool, 'an account with that name already exists');
+      }
+      const bootstrap = accounts.length === 0;
+      // Bootstrap needs no actor and always makes an operator; anything else needs one.
+      if (!bootstrap) writingActor(args, tool);
+      if (typeof args.operator !== 'undefined' && typeof args.operator !== 'boolean') {
+        throw new RmcpError('invalid', tool, 'operator must be a boolean');
+      }
+      const created: FixtureAccount = {
+        id: nextId('acct'),
+        account: name,
+        operator: bootstrap ? true : args.operator === true,
+        disabled: false,
+        created_at: new Date().toISOString(),
+      };
+      accounts = [...accounts, created];
+      // NO PASSWORD IN THE RESPONSE — the server has only a hash, and this must not teach the
+      // client otherwise.
+      return delay({
+        id: created.id,
+        account: created.account,
+        operator: created.operator,
+        bootstrap,
+      } as unknown as T);
+    }
+
+    case RMCP_TOOLS.accountPromote: {
+      if (typeof args.revoke !== 'undefined' && typeof args.revoke !== 'boolean') {
+        throw new RmcpError('invalid', tool, 'revoke must be a boolean');
+      }
+      writingActor(args, tool);
+      const target = accountOr404(String(args.account ?? ''), tool);
+      if (target.disabled) throw new RmcpError('not_found', tool, 'no such active account');
+      const next = args.revoke !== true;
+      const before = target.operator;
+      assertAnOperatorRemains(tool, () => { target.operator = next; }, () => { target.operator = before; });
+      return delay(undefined as unknown as T);
+    }
+
+    case RMCP_TOOLS.accountDisable: {
+      if (typeof args.enable !== 'undefined' && typeof args.enable !== 'boolean') {
+        throw new RmcpError('invalid', tool, 'enable must be a boolean');
+      }
+      writingActor(args, tool);
+      const target = accountOr404(String(args.account ?? ''), tool);
+      const next = args.enable !== true;
+      const before = target.disabled;
+      assertAnOperatorRemains(tool, () => { target.disabled = next; }, () => { target.disabled = before; });
       return delay(undefined as unknown as T);
     }
 
