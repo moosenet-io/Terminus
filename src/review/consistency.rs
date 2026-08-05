@@ -450,6 +450,7 @@ mod tests {
             verdict: "REQUEST_CHANGES".to_string(),
             reasoning: String::new(),
             error: None,
+            outcome: crate::review::Outcome::Voted,
             findings,
         }
     }
