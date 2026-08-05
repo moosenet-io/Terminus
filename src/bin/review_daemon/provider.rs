@@ -772,24 +772,39 @@ mod tests {
     /// text` with the prompt on stdin returns the answer, so the flag following
     /// `-p` is parsed as a flag rather than eaten as its value.
     ///
-    /// **codex** -- from `codex exec --help`: `-c, --config <key=value>` and
-    /// `-m, --model <MODEL>` take values; `--skip-git-repo-check` is a boolean.
-    /// `--sandbox <mode>` and `--output-last-message <path>` are listed here as
-    /// value-taking on the strength of their in-tree use (`--sandbox read-only`,
-    /// `--output-last-message <tmpfile>`), which dispatches successfully.
+    /// **codex** -- all from `codex exec --help`, which prints a value
+    /// placeholder for value-taking options: `-c, --config <key=value>`,
+    /// `-m, --model <MODEL>`, `-s, --sandbox <SANDBOX_MODE>`,
+    /// `-o, --output-last-message <FILE>`, and also `-p, --profile
+    /// <CONFIG_PROFILE_V2>`; `--skip-git-repo-check` prints no placeholder and
+    /// is a boolean. An earlier revision justified `--sandbox` and
+    /// `--output-last-message` merely by "they work in-tree", which a reviewer
+    /// correctly rejected: a flag appearing to work proves nothing about
+    /// whether it CONSUMES the next token (codex would have accepted that token
+    /// as its positional prompt instead). They are now read from `--help`.
     ///
-    /// NOTE `--tools`/`--allowedTools` are VARIADIC on claude (`<tools...>`),
-    /// not single-valued. They stop at the next `-`-prefixed token, so a flag
-    /// following the tool list is still parsed as a flag. Only `--tools` is
-    /// listed, because it is the one the builder emits with a single (empty)
-    /// value; the guard deliberately does not model variadic arity.
+    /// `-p, --profile` is listed for codex even though the builder never emits
+    /// it, precisely because `-p` means something value-taking here and boolean
+    /// on claude -- the exact cross-CLI collision that caused this bug.
+    ///
+    /// **Declared limitation.** `--tools`/`--allowedTools` are VARIADIC on
+    /// claude (`<tools...>`), not single-valued: they consume tokens until the
+    /// next `-`-prefixed one, so a flag following the tool list is still parsed
+    /// as a flag and cannot be swallowed. The guard does NOT model variadic
+    /// arity. Only `--tools` is listed, because it is the one the builder emits
+    /// with a single (empty) value. `--allowedTools` therefore appears in
+    /// [`EMITTED_FLAG_LITERALS`] (it IS a flag, so it must be recognized as an
+    /// illegal *value*) but deliberately not here (it does not single-consume).
+    /// The invariant this guard asserts is therefore precisely: "no
+    /// SINGLE-VALUE-TAKING flag is starved or fed another flag" -- it does not
+    /// claim coverage of variadic options.
     fn value_taking_flags(binary: &str) -> &'static [&'static str] {
         match binary {
             // Go `flag` package: every non-bool flag takes the next element
             // UNCONDITIONALLY, without checking whether it looks like a flag.
             AGY_BIN => &["-p", "--print", "--prompt", "--model", "--effort", "--output-format", "--mode", "--agent"],
             CLAUDE_BIN => &["--model", "--output-format", "--effort", "--tools"],
-            CODEX_BIN => &["-m", "--config", "--output-last-message", "--sandbox"],
+            CODEX_BIN => &["-m", "--model", "-c", "--config", "-o", "--output-last-message", "-s", "--sandbox", "-p", "--profile"],
             other => panic!("unknown binary {other:?} -- add its flag semantics here"),
         }
     }

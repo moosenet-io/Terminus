@@ -472,7 +472,28 @@ async fn run_provider(
             (
                 std::borrow::Cow::Borrowed(bwrap_path.as_path()),
                 provider::BuiltCommand {
-                    binary: sandbox::BWRAP_BIN,
+                    // RVXAGY-01: ATTRIBUTION, not the thing spawned. The
+                    // process actually executed is `bwrap` via
+                    // `spawn_binary_path` (the separate argument below);
+                    // `binary` is used ONLY to label errors. Labelling agy's
+                    // failures "bwrap" is actively misleading, because bwrap
+                    // PROPAGATES its child's exit code -- so an ordinary agy
+                    // error surfaces as `bwrap exited rc=1: ...` and reads as a
+                    // SANDBOX failure.
+                    //
+                    // This is not hypothetical: on 2026-08-05 agy was failing
+                    // with `invalid model selection (--effort "")`, and the
+                    // resulting `bwrap exited rc=1` caused TWO independent
+                    // agents to diagnose a broken sandbox. Measured at the same
+                    // time: bwrap 0.11.0 present, the egress proxy bound on
+                    // loopback, and agy running fine INSIDE bwrap once the
+                    // model selection was correct. The sandbox was never the
+                    // problem; only the label said it was.
+                    //
+                    // Same failure class as the daemon reporting a quota-capped
+                    // codex as an infra/stdin bug: an error whose text points at
+                    // the wrong layer costs far more than one that says nothing.
+                    binary: AGY_ERROR_LABEL,
                     args: wrapped_args,
                     // Preserve whatever build_command(Agy) actually produced
                     // (currently always None -- agy has no --output-* temp
@@ -511,6 +532,14 @@ async fn run_provider(
 
     result
 }
+
+/// RVXAGY-01: how an `agy` dispatch failure is LABELLED in the error text.
+/// Names both layers, because the exit code genuinely comes from bwrap and the
+/// fault genuinely is usually agy's — a reader needs to know which to go look
+/// at, and `bwrap` alone sends them to the wrong one.
+const AGY_ERROR_LABEL: &str = "agy (spawned under the bwrap sandbox; a nonzero rc here is \
+usually agy's OWN exit code, which bwrap propagates -- check the message below before \
+suspecting the sandbox)";
 
 /// Process-global mutex serializing `agy` spawns. agy's OAuth access-token
 /// refresh races when two agy processes run at once (each refresh consults the
@@ -858,20 +887,38 @@ mod tests {
         assert!(out.ends_with("TAIL-SENTINEL-9c1b"), "tail lost in transit");
     }
 
-    /// The companion negative: with `stdin_prompt: None` the child must get
-    /// `Stdio::null()`, i.e. an IMMEDIATE EOF rather than an inherited or
-    /// dangling stdin. Without this, the small-prompt path could silently start
-    /// blocking on a terminal and hang the daemon. `cat` with null stdin reads
-    /// EOF at once and exits with empty output.
+    /// The companion negative: with `stdin_prompt: None` the child must reach
+    /// EOF immediately rather than blocking forever on an open stdin.
+    ///
+    /// **What this test proves, stated narrowly on purpose.** Three reviewers
+    /// flagged an earlier version of it as too weak, and they were right about
+    /// the specific defect: it accepted `Ok(_)` as success, which made it pass
+    /// for almost any behavior. That escape hatch is gone — the outcome is now
+    /// pinned to exactly `empty_output`.
+    ///
+    /// **What it deliberately does NOT claim.** It cannot distinguish
+    /// `Stdio::null()` from an INHERITED-but-already-closed stdin, because
+    /// under a test runner whose own stdin is closed those two are genuinely
+    /// indistinguishable from inside the child — the observable behavior is
+    /// identical, so no assertion here could separate them. Rather than dress
+    /// this up as a stronger guarantee than it is, the claim is limited to:
+    /// the no-payload path terminates promptly with empty output and does not
+    /// hang. The `Stdio::piped()` branch being load-bearing is established
+    /// separately and positively, by
+    /// [`the_executor_delivers_an_oversized_stdin_payload_whole_to_a_real_process`],
+    /// which a mutant forcing `Stdio::null()` on every path does kill.
     #[tokio::test]
-    async fn the_normal_path_gives_the_child_a_closed_stdin_not_a_hanging_one() {
+    async fn the_no_payload_path_terminates_promptly_with_empty_output() {
         let built = provider::BuiltCommand {
             binary: "cat",
             args: vec![],
             output_path: None,
             stdin_prompt: None,
         };
+        // A short backstop: if stdin were left OPEN, `cat` would block and this
+        // would surface as a `timeout`, which the assertion below rejects.
         let stall = StallConfig { timeout_secs: 10, stall_secs: None };
+        let started = std::time::Instant::now();
         let out = run_built_command(
             &built,
             std::path::Path::new("/bin/cat"),
@@ -880,13 +927,14 @@ mod tests {
             &HashMap::new(),
         )
         .await;
-        // Empty output is reported as the `empty_output` error kind, NOT a
-        // timeout -- a timeout here would mean stdin was left open and the
-        // child hung.
-        match out {
-            Err(("empty_output", _)) | Ok(_) => {}
-            Err((kind, detail)) => panic!("expected immediate EOF, got {kind}: {detail}"),
-        }
+        assert!(
+            matches!(out, Err(("empty_output", _))),
+            "no-payload path must terminate with empty_output, got {out:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(9),
+            "must reach EOF promptly, not ride the timeout backstop"
+        );
     }
 
     /// The `last_ms==0` sentinel edge case: a provider that prints IMMEDIATELY
