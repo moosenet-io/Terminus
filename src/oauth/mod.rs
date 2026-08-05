@@ -38,9 +38,9 @@
 //!
 //! ## What is here so far
 //! - **RMCP-01** — the persistence layer ([`model`], [`store`]) and the two
-//!   credential-storage newtypes below. Deliberately unreachable from the
-//!   network, so the schema and its fail-closed contracts could be reviewed on
-//!   their own.
+//!   credential-storage newtypes below. It landed with no network surface of
+//!   its own, so the schema and its fail-closed contracts could be reviewed
+//!   alone.
 //! - **RMCP-02** — discovery ([`metadata`], [`router`]): the two `.well-known`
 //!   documents and the `401` challenge that points at them. The only part of
 //!   this module with NO store dependency — discovery must answer while the
@@ -55,38 +55,149 @@
 //!   security property, not a style choice, because the first two failures
 //!   must never produce a redirect.
 //! - **RMCP-04** — the token endpoint ([`token`]) and access-token minting and
-//!   verification ([`jwt`]). It is a standalone router a binary merges in; it
-//!   is not mounted anywhere by this item.
+//!   verification ([`jwt`]). A standalone router, merged by [`mount`] (which
+//!   rebuilds its route in order to rate-limit it, then delegates to
+//!   [`token::TokenEndpoint::handle`] unchanged).
 //!
 //! - **RMCP-07** — the scoping resolver ([`scope`]): the intersection above,
 //!   as one function ([`scope::decide`]) that backs BOTH the `tools/list`
-//!   filter and the `tools/call` guard, plus the resolver that reads a
-//!   client's scope rows and the cache that keeps it off the hot path. It is
-//!   wired into [`crate::gateway_framework`] and [`crate::mcp_server`], but it
-//!   only ever engages for a request that carries a
-//!   [`scope::RmcpClientScope`] — which nothing inserts until RMCP-05's
-//!   resource-server validation lands, so every existing mTLS and tailnet
-//!   caller is unaffected byte-for-byte.
+//!   filter and the `tools/call` guard, plus [`scope::ScopeResolver`], which
+//!   reads a client's scope rows, and the cache that keeps it off the hot path.
+//!   It is wired into [`crate::gateway_framework`] and [`crate::mcp_server`],
+//!   but it only ever engages for a request that resolved to a
+//!   [`scope::ClientScope`] — which only an OAuth-authenticated caller can — so
+//!   every existing mTLS and tailnet caller is unaffected byte-for-byte. See
+//!   the second RISK note below for what is still missing on that path.
 //!
-//! Still to land as its own item: resource-server validation (RMCP-05). Apart
-//! from RMCP-02's discovery documents — which are deliberately public and
-//! unauthenticated — none of this is reachable from the network until a
-//! listener mounts the relevant router.
+//! ## Where the current state is written down
+//!
+//! **In the README, under *Exactly what is wired today* — not here.** That
+//! section is the single account of what is mounted, what is enforced, and what
+//! is still missing, and this module deliberately does not restate it.
+//!
+//! That is not a filing preference. This file previously carried its own status
+//! prose, written a round at a time, and it drifted into saying the endpoints
+//! were unreachable while `terminus_primary` was serving them — the same
+//! contradiction the README had one round earlier, reproduced here by the same
+//! mechanism. Two accounts of one state is how both happened. Anything that
+//! becomes untrue should be edited in that README section; a note here would
+//! become the third.
+//!
+//! The two ⚠ RISK sections below are the exception, and are disclosures rather
+//! than a status account: they describe residual gaps in controls THIS module
+//! ships, which is where a reader of this code needs them.
 //!
 //! ## What RMCP-09 adds ([`edge`])
-//! The public door's NETWORK policy, and still no endpoints. [`edge`] is the
-//! separate internet-facing listener and the per-path source-address policy that
-//! governs it — it decides which requests are allowed to reach a handler, not
-//! what any handler does. It is written and tested ahead of those handlers on
-//! purpose: the exposure surface of a public door is worth reviewing on its own,
-//! before there is anything behind it to be distracted by.
+//! The public door's NETWORK policy. [`edge`] is the separate internet-facing
+//! listener and the per-path source-address policy that governs it — it decides
+//! which requests are allowed to reach a handler, not what any handler does.
+//! [`mount`]'s router is what it serves.
+//! ## What RMCP-11 adds
+//! The operational safety layer over the door, and the wiring that makes the
+//! door exist: [`mount`] binds RMCP-03's, RMCP-04's and this item's routers into
+//! the process router, served by the private listeners and by [`edge`] alike.
+//! - [`limits`] — a per-endpoint, two-dimensional rate limiter with a bounded
+//!   key space. Now the door's single budget table: the login POST, the token
+//!   endpoint and revocation all draw on it, and RMCP-03's private login
+//!   limiter was converged onto it (TERM #633) rather than left as a second
+//!   definition that could drift.
+//! - [`audit`] — the OAuth event vocabulary and a record type that accepts no
+//!   free-form text at all, so there is nothing to redact and no redaction to
+//!   trust.
+//! - [`revoke`] — RFC 7009 revocation, session listing, the operator tools'
+//!   implementation, and [`revoke::SessionStore::dispatch_state`], the
+//!   per-family dispatch predicate — see the RISK note below for what is wired
+//!   today and what waits on TERM #635.
+//!
+//! ## ⚠ RISK: revoking ONE session among several does not cut it off (TERM #635)
+//!
+//! Read this before treating per-session revocation as a complete control.
+//!
+//! As of RMCP-05 the dispatch path DOES re-derive session state on every call,
+//! so the blanket warning this notice used to carry — "nothing checks, so a
+//! revoked token works until it expires" — is no longer true. The guarantee an
+//! operator can rely on is stated once, in RMCP-05's README section
+//! (*Presenting the token*), and is deliberately not restated here: two
+//! documents describing one guarantee is how they drift.
+//!
+//! What remains true, and is this module's to disclose because these are the
+//! controls it ships:
+//!
+//! * The wired check asks whether ANY session is live for an `(account,
+//!   client)` pair, because an access token carries no session claim and the
+//!   server cannot tell which session presented it. Its rejection is named
+//!   `AllSessionsRevoked` for exactly that reason.
+//! * So revoking **every** session for a pair — or disabling the client,
+//!   disabling the account, or revoking consent — denies the next dispatch.
+//!   Revoking **one** session while another is live for the same pair does
+//!   **not**: that access token keeps working until it expires. Its refresh
+//!   token is already dead, so the session cannot be extended, but it is not an
+//!   immediate cut-off.
+//! * **TERM #635** (a session claim in the token) is the named blocker, and
+//!   RMCP-05 carries a tripwire test asserting today's permissive outcome so it
+//!   fails loudly when the fix lands.
+//!
+//! [`revoke::RevocationService::dispatch_state`] is the per-family
+//! implementation that replaces the current check once #635 gives a token a
+//! session to name. It is deliberately NOT called from the dispatch path today:
+//! RMCP-05's check is the wired one, and a second live checker would be the
+//! dual-writer hazard this subsystem has already been bitten by.
+//!
+//! ## ⚠ RISK: an authenticated connector currently reaches NO tools
+//!
+//! RMCP-07's scope resolver is not yet wired into `terminus_primary`, which
+//! constructs its state with `scope_resolver: None` (TERM #631, item 5 — and
+//! the binary carries the same note at that field, so the two cannot drift
+//! apart silently). The door authenticates a connector correctly — metadata,
+//! authorize, consent, token, bearer validation, principal minting — and the
+//! intersection it then resolves is the EMPTY set, so no tool is reachable
+//! through it. `handle_mcp` logs a warning when that happens, which is the
+//! fail-closed reading.
+//!
+//! Stated here, in the module every one of those pieces lives in, because the
+//! failure presents as something else entirely: an operator links a connector,
+//! sees it authenticate, finds no tools, and reasonably concludes the connector
+//! is broken or that scoping has failed open somewhere they should go looking.
+//! The truth is duller — the last wire is missing — and it costs nothing to say
+//! so here rather than let it be diagnosed from symptoms.
+//!
+//! ### Which audit emission points are live, and which are deferred
+//!
+//! Review round 2 made the fair point that a structurally safe audit record
+//! nothing emits is not an audit trail. So, explicitly:
+//!
+//! **Emitting today**, from code this item owns:
+//! - every rate-limit refusal, from [`limits::OauthRateLimiter::check`] itself
+//!   rather than from each caller — a record every handler must remember to
+//!   write is one some handler will not write, and the missing one will be on
+//!   whichever path is under attack;
+//! - every revocation: applied, matched-nothing, and the loud
+//!   verify-after-write failure ([`revoke::RevocationService::revoke`]);
+//! - every RFC 7009 request outcome, including the unrecognised-token and
+//!   foreign-client cases that deliberately answer `200`;
+//! - refresh-token reuse detection ([`revoke::RevocationService::revoke_on_reuse`]);
+//! - every dispatch denial ([`revoke::RevocationService::dispatch_state`]).
+//!
+//! **Deferred**: client registration, which has no handler to emit from —
+//! RMCP-08 (dynamic client registration) is not merged. [`audit::OauthEvent`]
+//! and [`audit::AuditDetail`] already carry the variants for it, so that item
+//! adds a call site rather than a vocabulary.
+//!
+//! TERM #633 is **done**: RMCP-03's login POST used to carry its own
+//! `InProcessRateLimiter` with same-sized account and source buckets — which
+//! meant one address exhausting its own budget also exhausted the named
+//! account's, a free lockout of any guessable account name. It now shares
+//! [`limits::OauthRateLimiter`], so the login budget is defined once and
+//! inherits the subject-over-address invariant. Its per-address numbers were
+//! carried over unchanged: converging two definitions must not relax the
+//! stricter one.
 //!
 //! ## What RMCP-05 adds
-//! [`resource`] — the first REACHABLE surface here: it validates a bearer
-//! token on `/mcp` and resolves it to a [`crate::mesh::Principal`]. It is the
-//! consuming half of the tokens RMCP-04 will mint, and it deliberately landed
-//! first: a verifier written before an issuer cannot be quietly shaped around
-//! whatever the issuer happened to emit.
+//! [`resource`] — bearer-token validation on `/mcp`, resolving a token to a
+//! [`crate::mesh::Principal`]. The consuming half of the tokens [`token`]
+//! mints, and it deliberately landed BEFORE the issuer was reachable: a
+//! verifier written first cannot be quietly shaped around whatever the issuer
+//! happened to emit.
 //!
 //! ## Credential storage — nothing here is presentable
 //! No table in this schema stores a usable credential:
@@ -108,12 +219,16 @@
 //! ([`OauthConfig::from_env`]) and is never logged, returned, or embedded in an
 //! error.
 
+pub mod audit;
 pub mod authorize;
 pub mod edge;
 pub mod jwt;
+pub mod limits;
 pub mod metadata;
 pub mod model;
+pub mod mount;
 pub mod password;
+pub mod revoke;
 pub mod router;
 /// RMCP-05: resource-server validation — the half that turns a bearer token
 /// into a [`crate::mesh::Principal`] the existing gateway already authorizes.

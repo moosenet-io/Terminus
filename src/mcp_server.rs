@@ -249,6 +249,11 @@ pub struct McpServerState {
     /// where to get a key before it can check one is inert, whereas the reverse
     /// order would be a live unauthenticated path.
     pub rmcp_discovery: Option<Arc<crate::oauth::metadata::Discovery>>,
+
+    /// RMCP-11 (TERM #631): the mounted OAuth endpoints, when this process
+    /// serves them. See `crate::oauth::mount` for why mounting needed an owner
+    /// and why it ended up here.
+    pub rmcp_endpoints: Option<Arc<crate::oauth::mount::OauthEndpoints>>,
     /// RMCP-02: which OAuth surfaces this process serves — the authoritative
     /// input to [`McpServerState::oauth_door_enabled`], and through it the only
     /// thing that narrows `is_authorized`'s open arm.
@@ -399,6 +404,11 @@ pub fn build_router(state: Arc<McpServerState>) -> Router {
         .clone()
         .map(crate::oauth::router::oauth_router);
 
+    // Likewise captured before `state` is moved. Built from the endpoints' own
+    // `Arc`s rather than from `McpServerState`, so the auth surface does not
+    // acquire a dependency on the registry or the mesh pool.
+    let oauth_endpoint_routes = state.rmcp_endpoints.clone().map(|e| e.router());
+
     let router = Router::new()
         .route("/mcp", post(handle_mcp))
         .route("/healthz", get(handle_healthz))
@@ -433,6 +443,20 @@ pub fn build_router(state: Arc<McpServerState>) -> Router {
     // shell) irrespective of merge order.
     let router = match discovery_routes {
         Some(discovery) => router.merge(discovery),
+        None => router,
+    };
+
+    // RMCP-11 (TERM #631): the OAuth ENDPOINTS. Same `match`-rather-than-merge-
+    // an-empty-router shape as discovery above, and for the same reason: an
+    // unconfigured deployment must get the router it had before this item, not
+    // one that merely behaves the same.
+    //
+    // Merged AFTER the constellation router for the same reason discovery is —
+    // these are explicit routes, so they take precedence over that router's SPA
+    // fallback, which would otherwise answer `/oauth/authorize` with the app
+    // shell and turn a login page into a blank screen.
+    let router = match oauth_endpoint_routes {
+        Some(endpoints) => router.merge(endpoints),
         None => router,
     };
 
@@ -2662,6 +2686,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -2825,6 +2850,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes,
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -2963,6 +2989,7 @@ mod tests {
                 principal_resolver: PrincipalResolver::default(),
                 broker_routes,
                 rmcp_discovery: None,
+                rmcp_endpoints: None,
                 oauth_doors: crate::oauth::metadata::OauthDoors::none(),
                 oauth_resource: None,
                 scope_resolver: None,
@@ -3029,6 +3056,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes,
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -3110,6 +3138,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -3185,6 +3214,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -3239,6 +3269,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -3273,6 +3304,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -3339,6 +3371,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: Some(Arc::new(discovery)),
+            rmcp_endpoints: None,
             oauth_doors: doors,
             oauth_resource: None,
             scope_resolver: None,
@@ -3478,6 +3511,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -3712,6 +3746,7 @@ mod tests {
             broker_routes: crate::broker::routes::RouteTable::new(),
             // Discovery is DELIBERATELY unset. This is the whole point.
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: doors,
             oauth_resource: None,
             scope_resolver: None,
@@ -3976,6 +4011,7 @@ mod tests {
             principal_resolver,
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -4153,6 +4189,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,
@@ -4547,6 +4584,11 @@ mod tests {
             principal_resolver: resolver,
             broker_routes: crate::broker::routes::RouteTable::new(),
             rmcp_discovery: discovery.map(Arc::new),
+            // This fixture exercises the RESOURCE server (bearer token in,
+            // principal out), which is independent of whether the
+            // authorization-server endpoints are mounted — so `None` here is
+            // the honest value, not a placeholder.
+            rmcp_endpoints: None,
             // The door is on, so `OauthDoors` must say so — in production that
             // is automatic, because `RMCP_OAUTH_ENABLED` is an `RMCP_OAUTH_*`
             // name and `detect_from_env` keys on the prefix. Registering it

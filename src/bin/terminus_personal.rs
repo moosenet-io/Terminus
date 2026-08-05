@@ -346,6 +346,7 @@ async fn main() {
         // gateway pipeline in front of it, which is the wrong default even
         // though this item mounts nothing but public documents.
         rmcp_discovery: None,
+        rmcp_endpoints: None,
         // RMCP-02: never detected from the environment here. This binary is not
         // internet-facing, and narrowing its tokenless-loopback posture merely
         // because the host also runs the authorization server would break it

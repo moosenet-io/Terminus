@@ -836,6 +836,7 @@ mod tests {
             principal_resolver: PrincipalResolver::default(),
             broker_routes: RouteTable::new(),
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,

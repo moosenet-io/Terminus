@@ -105,6 +105,17 @@ pub struct GatewayServerConfig {
     /// ("couldn't reach the MCP server") names neither the field nor the
     /// server. There is no safe default to degrade to, so it must not start.
     pub rmcp_discovery: Option<Arc<crate::oauth::metadata::Discovery>>,
+
+    /// RMCP-11 (TERM #631): when `Some`, the OAuth ENDPOINTS — authorize,
+    /// login, consent, token, revoke — are mounted and reachable.
+    ///
+    /// Separate from `rmcp_discovery` because the two are genuinely independent:
+    /// discovery documents are static text and can be served by a process with
+    /// no database, while the endpoints need a pool and an applied schema. A
+    /// deployment can legitimately have the first and not the second (during a
+    /// migration, say), and collapsing them into one switch would mean either
+    /// refusing to serve discovery or pretending the endpoints are up.
+    pub rmcp_endpoints: Option<Arc<crate::oauth::mount::OauthEndpoints>>,
     /// RMCP-02: which OAuth surfaces this process serves — see
     /// `crate::mcp_server::McpServerState::oauth_doors`. `terminus_primary`
     /// passes `OauthDoors::detect_from_env()`; `terminus_personal` passes
@@ -153,6 +164,7 @@ impl std::fmt::Debug for GatewayServerConfig {
             // Presence only. The canonical connector URI is not a secret, but a
             // `Debug` line is not where an operator should read configuration.
             .field("rmcp_discovery", &self.rmcp_discovery.is_some())
+            .field("rmcp_endpoints", &self.rmcp_endpoints.is_some())
             // Names only, never values — one of them is a signing key.
             .field("oauth_doors", &self.oauth_doors.describe())
             // Presence only: the resource server holds HMAC key material and a
@@ -221,6 +233,7 @@ pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig
         // config -- see `GatewayServerConfig::rmcp_discovery`'s doc for why the
         // validation lives in `main()` rather than here.
         rmcp_discovery: config.rmcp_discovery.clone(),
+        rmcp_endpoints: config.rmcp_endpoints.clone(),
         oauth_doors: config.oauth_doors.clone(),
         // RMCP-05: pass through the door the caller's `main` already built and
         // validated. Nothing is read from the environment here, so this
@@ -341,6 +354,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             rmcp_discovery: None,
+            rmcp_endpoints: None,
             oauth_doors: crate::oauth::metadata::OauthDoors::none(),
             oauth_resource: None,
             scope_resolver: None,

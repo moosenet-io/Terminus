@@ -190,6 +190,46 @@ impl RefreshToken {
     }
 }
 
+/// One refresh-token FAMILY, aggregated — what RMCP-11 calls a "session".
+///
+/// A session is not a row anywhere: it is the set of `rmcp_refresh_token` rows
+/// sharing a `family_id`, which is what a single authorization grows into as it
+/// rotates. Naming the family rather than any individual token is deliberate and
+/// runs through this whole item — an operator revoking access means "cut this
+/// session off", not "invalidate one particular string", and the token hashes
+/// are exactly the values that must never reach a listing or a log
+/// (see the module rule above).
+///
+/// [`Self::revoked_at`] is the EARLIEST revocation across the family, and
+/// [`Self::live`] is computed in SQL against the database clock. Both follow
+/// [`crate::oauth::store::OauthStore::refresh_token_is_live`]'s family-wide
+/// rule: any revoked row kills the whole family, including rows inserted
+/// afterwards. A summary that reported per-row state would disagree with the
+/// predicate that actually gates dispatch, and an operator would be reading a
+/// different truth from the one being enforced.
+#[derive(Clone, Debug)]
+pub struct TokenFamily {
+    pub family_id: Uuid,
+    pub client_id: Uuid,
+    pub account_id: Uuid,
+    pub resource: String,
+    pub scope: String,
+    /// When the family began — the first token's issuance.
+    pub issued_at: DateTime<Utc>,
+    /// The most recent rotation's issuance.
+    pub last_issued_at: DateTime<Utc>,
+    /// The latest expiry in the family.
+    pub expires_at: DateTime<Utc>,
+    /// How many tokens the family has held, i.e. rotations + 1.
+    pub token_count: i64,
+    /// The earliest revocation in the family, if any.
+    pub revoked_at: Option<DateTime<Utc>>,
+    /// Whether the family can still be refreshed, judged by the DATABASE clock
+    /// at the moment of the query. Carried rather than derived in Rust so a
+    /// process with a drifted clock cannot report a dead session as live.
+    pub live: bool,
+}
+
 /// A recorded human approval of a client for a scope.
 #[derive(Clone, Debug)]
 pub struct Consent {
@@ -359,6 +399,20 @@ impl_from_row!(
     expires_at,
     rotated_to,
     revoked_at
+);
+impl_from_row!(
+    TokenFamily,
+    family_id,
+    client_id,
+    account_id,
+    resource,
+    scope,
+    issued_at,
+    last_issued_at,
+    expires_at,
+    token_count,
+    revoked_at,
+    live
 );
 impl_from_row!(Consent, id, account_id, client_id, scope, granted_at, revoked_at);
 impl_from_row!(ServerOwner, namespace, owner_account_id, granted_at);

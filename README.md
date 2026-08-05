@@ -748,13 +748,10 @@ resource-server half checks one on every call. It resolves to an ordinary `Princ
 then stops — an OAuth caller gets no new entitlement channel, and a `CallerContext` is still
 constructible only inside `gateway_framework`, from that principal's grants.
 
-> **Status: built, not yet enforcing end to end (TERM #631).** The behaviour described in
-> this section is implemented and tested, and the `/mcp` request path calls it. But the OAuth
-> subsystem as a whole is not finished being wired: the authorization-server routers are not
-> mounted. (Session state IS now consulted from this dispatch path, with the exact guarantee
-> and its per-session gap stated below.) Read what
-> follows as the contract the code implements, not as a control you can currently rely on in
-> production. Until that wiring lands, do not treat this door as an enforcement boundary.
+> **Status.** The behaviour described in this section is implemented, tested, and called by
+> the `/mcp` request path. For what is and is not wired in the assembled system — including
+> the two gaps that matter operationally — see *Exactly what is wired today* below, which is
+> the single account of that; this note deliberately does not restate it.
 
 - **The audience check is the load-bearing one, not the signature.** A valid signature proves
   only that *someone holding the key* minted the token. A token whose `aud` names a federated
@@ -801,6 +798,103 @@ constructible only inside `gateway_framework`, from that principal's grants.
   a client its credential is bad would send the user through a full re-authorization for a
   server-side outage.
 
+#### Keeping the door safe to leave open: rate limits, audit, and revocation
+
+An internet-facing auth surface needs three things beyond correctness — bounded abuse, a
+legible trail, and a working way to cut something off right now.
+
+**Rate limits** (`oauth::limits`) are the door's single budget table — the login POST, the
+token endpoint and revocation all draw on it, and RMCP-03's separate login limiter was
+converged onto it (TERM #633) rather than left as a second definition that could drift. They
+are per endpoint, because the endpoints have nothing in
+common operationally: `/oauth/token` is called by Anthropic's infrastructure on a schedule
+and should be generous, while `/oauth/login` verifies a password and should be tight. One
+shared bucket has to be sized for the most generous, so it never constrains the tightest.
+
+Each endpoint carries **two** budgets, and their relationship is the interesting part. An
+address-only limit lets a distributed attacker grind one account; a subject-only limit lets
+one address try a thousand accounts once each. So every request consults an address bucket
+*and* a bucket keyed on the account or client it named. Two rules make the pair work rather
+than interfere: the subject budget is **strictly larger** than the address budget — equal
+budgets would mean one host exhausting its own budget also exhausts the victim's, a free
+lockout of any account whose name can be guessed — and an address denial **short-circuits**
+before spending subject budget, without which that ratio would be worthless. The ordering is
+enforced at every construction site, and a configuration that violates it is a hard startup
+error rather than a quietly corrected one; an unparseable value, by contrast, falls back to
+the built-in default, because a typo is not an instruction. There is no way to disable
+limiting and no `Option` whose `None` means "skip the check", which is what makes a restart
+re-arm instead of leaving a gap. A 429 carries one fixed message produced in one place, so
+no endpoint can invent "too many attempts for this account" and turn throttling into an
+account-existence oracle. Subject keys are digests, so an attacker-chosen identifier costs
+constant memory — as do address keys, since a cap on the number of entries bounds memory only
+if each entry is bounded too and the address is just as caller-controlled. The bucket tables
+are bounded: at the ceiling, only a **fully refilled**
+bucket is evicted (dropping and re-creating one are indistinguishable, so it grants nothing),
+and when nothing is evictable the new key is refused rather than admitted untracked — a flood
+must not be able to switch the limiter off for everyone.
+
+**The audit trail** (`oauth::audit`) records every authorization decision, issuance, refresh,
+rotation, reuse detection and denial. Its design point is that **no record can contain a raw
+credential, because there is nowhere to put one.** Structured facts are typed (UUIDs, an
+endpoint, closed event and denial-reason enums), and the narrative is a closed `AuditDetail`
+enum — fixed sentence templates plus integers, with no variant carrying a `String`, so no
+call site can put caller data into it.
+
+The two genuinely variable values are both closed off, by different means. The source address
+is never parsed here at all: the setter takes a typed `IpAddr`, supplied by the edge's
+trusted-proxy resolver, which is the only code that legitimately has one. An earlier revision
+parsed a string and recorded it whenever it parsed as an address — but parseability is not
+proof about caller-controlled input, so the untyped entry point was removed rather than
+defended. A `client_id` is opaque by definition and no parser could prove anything about it
+either way, so the value is **never** recorded: a client that resolved is identified by its
+internal UUID, and one that did not contributes only a `ValueShape` — a length and a coarse
+charset class, enough to tell a typo'd connector name from a pasted blob without reproducing
+either. The address, being canonical by construction, stays actionable enough to write a
+firewall rule from.
+
+There is deliberately **no redaction pass at all**. Two earlier attempts failed the same way:
+first a prose field defended by a sanitizer, then a charset allowlist paired with a
+24-character opaque-run redactor — which left an 8- or 12-character authorization code passing
+both layers untouched. Lowering the threshold only moves the seam and starts eating legitimate
+short identifiers. A filter left lying around is also a filter someone routes a string through
+while believing they are safe, so the helpers were removed rather than kept as a backstop.
+
+Sessions are named by refresh-token **family id**, never by a token hash — a digest is still
+live authentication material. Records go to a `tracing` target and to a small bounded ring,
+which is what lets a test assert the guarantee by scanning what was actually emitted rather
+than by reading the code, including at the short lengths both previous layers missed.
+
+**Revocation** (`oauth::revoke`) has one implementation behind three surfaces: RFC 7009
+`POST /oauth/revoke`, the `rmcp_session_list` / `rmcp_session_revoke` tools, and the GUI,
+which calls the tools. A second path is how "revoked in the UI" and "still working" happen to
+two people at once. Everything revokes whole **families**, inheriting the store's family-wide
+liveness rule, and revoking an account+client pair revokes its **consent** inseparably —
+a revoked consent whose refresh tokens still work is not a revocation.
+
+> **⚠ Revoking one session among several does not cut it off.** The difference between
+> "revoked" and "cut off" — and the rest of the subsystem's wiring state — is set out in
+> *Exactly what is wired today* below. `oauth::revoke::dispatch_state` is the per-family
+> implementation that replaces the currently-wired check once TERM #635 gives an access token
+> a session claim to carry.
+
+Revocation does not report success
+on the strength of an `UPDATE` returning — it re-reads the affected families and fails loudly
+if any is still live, since an operator who believes the door is shut stops looking. Revoking
+something already revoked succeeds and says it changed nothing.
+
+Two refusals are deliberate. `rmcp_session_revoke` rejects an **empty selector**: the same
+empty arguments that legitimately mean "everything" for the listing tool would mean "revoke
+every session in the fleet" here, and an unresolvable name bails out before any query rather
+than degrading into "no filters". And neither tool accepts a raw token — selection is by
+account, client, or family id — so a credential never travels through tool dispatch and
+argument summaries. Revoking *by* token is the RFC 7009 endpoint's job, where it answers
+`200` for an unknown token (a `404` would be a validity oracle for harvested values) and
+`200`-but-revokes-nothing for a client presenting a token it does not own.
+
+Revocation is deliberately **not** approval-gated, unlike the guarded tools: it only ever
+narrows access and is undone by re-authorizing, and gating it would put a confirmation step
+in front of the one control an operator reaches for mid-incident.
+
 **Opening the door.** It is shut unless `RMCP_OAUTH_ENABLED` is set — an explicit switch, not
 "configured means enabled", because which hosts expose a public door should be a sentence an
 operator wrote rather than a side effect of an env file being copied. Once it *is* set, every
@@ -815,7 +909,8 @@ never links.
 authored by hand): `RMCP_DATABASE_URL`, `RMCP_OAUTH_SIGNING_KEY`, `RMCP_OAUTH_ISSUER`,
 `RMCP_OAUTH_RESOURCE`. The resource server adds exactly **one** name of its own,
 `RMCP_OAUTH_ENABLED` (the switch) — everything else it needs it reads through the code that
-already owns it. `RMCP_OAUTH_RESOURCE` is the connector URL exactly as typed into the client
+already owns it. The per-endpoint `RMCP_RATE_LIMIT_*` budgets are optional and documented in
+`.env.example`. `RMCP_OAUTH_RESOURCE` is the connector URL exactly as typed into the client
 (an absolute `https` URI, no trailing slash, no fragment) and is compared byte for byte
 against a token's `aud`; the signing key, issuer, optional
 `RMCP_OAUTH_SIGNING_KEY_PREVIOUS` rotation window and `RMCP_OAUTH_CLOCK_SKEW_SECONDS` leeway
@@ -846,6 +941,54 @@ subkey nothing derives yet, and a verifier cannot check a code against a seed it
 decrypt. That is a deliberate fail-closed gate, not a fault — RMCP-08 provisions the subkey.
 Clearing `totp_secret_enc` to work around it would silently downgrade the account to one
 factor and must not be done.
+
+#### Exactly what is wired today
+
+This is the single account of the subsystem's state. An earlier revision of this file carried
+two, written a round apart, and they disagreed — one said the endpoints were mounted and
+enforcement was live, the other said neither was. That is worse than either being wrong
+alone, because a reader who stops at the optimistic one concludes revocation is an immediate
+control. Anything below that later becomes untrue should be **edited here**, not qualified
+somewhere else.
+
+**Mounted: yes.** The routers are merged into the process's main router and served by the
+private listeners and by the public edge alike, at `/oauth/authorize`, `/oauth/login`,
+`/oauth/consent`, `/oauth/token` and `/oauth/revoke`. Until TERM #631 each OAuth item had
+merged a `Router` that nothing ever bound, so every item passed its own acceptance criteria
+while the feature did not exist in a running binary. A configured-but-unbuildable door is now
+a hard startup error, because a half-built auth surface that serves the login page and then
+fails at the token endpoint sends the operator looking at the client.
+
+**Revocation enforced at the next request: yes, at `(account, client)` granularity.** The
+dispatch path consults `any_session_is_live(account, client)` on every call (RMCP-05).
+Disable the client, disable the account, revoke consent, or revoke **all** sessions for a
+pair, and the caller is denied at their next request — not at the next token expiry.
+
+**Residual gap: revoking ONE session among several does not cut it off.** An access token
+carries no family claim, so the server cannot tell which session presented it and asks only
+whether *any* session for the pair is live. Revoking one while another is live leaves that
+token working until it expires; its refresh token is already dead, so the session cannot be
+extended. **TERM #635** adds the claim, and RMCP-05 carries a tripwire test asserting today's
+permissive outcome so it fails loudly when the fix lands.
+
+**Scope resolution: NOT wired — a connector that authenticates currently reaches nothing.**
+RMCP-07's resolver is not yet wired into `terminus_primary` (TERM #631, item 5), so an
+authenticated connector resolves the **empty** scope and no tool is reachable through it. The
+door authenticates correctly and then grants nothing. This is stated as plainly as the
+enforcement gaps above because a README describing a working connector, while the assembled
+system permits nothing, is the same class of error as the contradiction that produced this
+section: an operator would conclude the connector was broken, or that scoping had silently
+failed open somewhere else, rather than that the last wire is missing.
+
+**Audit trail: emitting.** Every authorization decision, login outcome, issuance, refresh and
+rotation emits the OAuth record, alongside every rate-limit refusal, revocation, RFC 7009
+outcome, reuse detection and dispatch denial. Client registration is the one event with no
+call site, and only because RMCP-08 has no handler yet; its record variants already exist.
+
+**Rate limiting: one table, every mounted route.** TERM #633 is closed — RMCP-03's separate
+login limiter is gone, and the login budget now comes from the same per-endpoint table as
+`/oauth/authorize`, `/oauth/consent`, `/oauth/token` and `/oauth/revoke`, inheriting the
+subject-over-address invariant it could not previously express.
 
 ### Live viewing activity — `media_now_playing`
 

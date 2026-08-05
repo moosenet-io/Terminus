@@ -132,12 +132,36 @@ struct Bucket {
     last_refill: Instant,
 }
 
+/// Default ceiling on the number of distinct keys one limiter will hold
+/// (RMCP-11).
+///
+/// The map used to be unbounded, which is fine while every key is an
+/// mTLS-derived identity (a closed set the operator enrolled) and becomes a
+/// memory-exhaustion vector the moment a key can be chosen by an unauthenticated
+/// caller — which is exactly what the internet-facing OAuth door does, keying on
+/// the resolved source address. RMCP-09's runbook flagged it and handed it here.
+///
+/// 100k is far above anything the fleet's own identity/action key space can
+/// reach (a few hundred identities x a few hundred actions is the realistic
+/// worst case for the pre-existing callers) and is a few megabytes of buckets,
+/// so this is a cap on an attacker, not a constraint on a legitimate deployment.
+pub const DEFAULT_MAX_KEYS: usize = 100_000;
+
+/// How many entries [`InProcessRateLimiter::evict_one_full_bucket`] examines
+/// before giving up. A full scan of a 100k-entry map on every admission under
+/// pressure would turn a memory attack into a CPU attack; a bounded sample keeps
+/// the work O(1) per request. In a map at capacity the overwhelming majority of
+/// entries are idle and fully refilled, so a small sample almost always finds an
+/// evictable one.
+const EVICTION_SAMPLE: usize = 64;
+
 /// A minimal per-key token bucket, held in a `Mutex<HashMap<..>>` — adequate
 /// for a single terminus-primary process (no cross-replica coordination,
 /// which is precisely what the later Redis-backed limiter adds).
 pub struct InProcessRateLimiter {
     capacity: f64,
     refill_per_sec: f64,
+    max_keys: usize,
     buckets: Mutex<HashMap<String, Bucket>>,
 }
 
@@ -147,9 +171,17 @@ impl InProcessRateLimiter {
     /// tokens) so a burst up to `capacity` succeeds immediately, then
     /// throttles.
     pub fn new(capacity: u32, refill_per_sec: f64) -> Self {
+        Self::with_max_keys(capacity, refill_per_sec, DEFAULT_MAX_KEYS)
+    }
+
+    /// Build a limiter with an explicit key-space ceiling (RMCP-11). See
+    /// [`DEFAULT_MAX_KEYS`] for why the ceiling exists and
+    /// [`Self::admit_key`] for the rule that makes hitting it safe.
+    pub fn with_max_keys(capacity: u32, refill_per_sec: f64, max_keys: usize) -> Self {
         Self {
             capacity: capacity.max(1) as f64,
             refill_per_sec: refill_per_sec.max(0.001),
+            max_keys: max_keys.max(1),
             buckets: Mutex::new(HashMap::new()),
         }
     }
@@ -164,9 +196,72 @@ impl InProcessRateLimiter {
         )
     }
 
+    /// Remove ONE fully-refilled bucket from `buckets`, sampling at most
+    /// [`EVICTION_SAMPLE`] entries. Returns whether it evicted anything.
+    ///
+    /// **Only a FULL bucket is ever evicted, and that restriction is the whole
+    /// security argument.** Evicting a bucket resets it to `capacity`, so an
+    /// eviction policy that could touch a throttled bucket (LRU, random,
+    /// oldest-first) would hand an attacker a budget reset: flood enough new
+    /// keys to push your own throttled bucket out, come back, and start from a
+    /// full burst again. A bucket that has already refilled to capacity carries
+    /// no debt — dropping it and re-creating it later are indistinguishable — so
+    /// evicting only those is information-free by construction.
+    fn evict_one_full_bucket(&self, buckets: &mut HashMap<String, Bucket>, now: Instant) -> bool {
+        let victim = buckets
+            .iter()
+            .take(EVICTION_SAMPLE)
+            .find(|(_, b)| {
+                // Judged on the bucket's value AFTER accrual, not on its stale
+                // stored `tokens`: an idle bucket is the common evictable case
+                // and its stored value is by definition out of date.
+                let elapsed = now.saturating_duration_since(b.last_refill).as_secs_f64();
+                (b.tokens + elapsed * self.refill_per_sec) >= self.capacity
+            })
+            .map(|(k, _)| k.clone());
+        match victim {
+            Some(k) => {
+                buckets.remove(&k);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether a bucket for a not-yet-seen `key` may be created.
+    ///
+    /// Under the [`DEFAULT_MAX_KEYS`] ceiling with nothing evictable, the answer
+    /// is NO and the caller is refused. That is the fail-closed direction: the
+    /// alternative — admit the request and skip limiting because the table is
+    /// full — would mean a high-cardinality flood turns the limiter OFF for
+    /// everyone, which is precisely the attack the ceiling exists to stop.
+    fn admit_key(&self, buckets: &mut HashMap<String, Bucket>, key: &str, now: Instant) -> bool {
+        if buckets.contains_key(key) || buckets.len() < self.max_keys {
+            return true;
+        }
+        self.evict_one_full_bucket(buckets, now)
+    }
+
+    /// The decision handed to a caller refused for key-space pressure rather
+    /// than for its own consumption. Deliberately an ordinary [`Limited`], not
+    /// [`Degraded`]: the limiter is working exactly as designed, and a caller
+    /// that backs off and retries is doing the right thing.
+    ///
+    /// [`Limited`]: RateLimitDecision::Limited
+    /// [`Degraded`]: RateLimitDecision::Degraded
+    fn pressure_denial(&self) -> RateLimitDecision {
+        RateLimitDecision::Limited {
+            retry_after_secs: self.retry_after_for(0.0),
+            refill_per_sec: self.refill_per_sec,
+        }
+    }
+
     fn check_sync(&self, key: &str) -> RateLimitDecision {
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
+        if !self.admit_key(&mut buckets, key, now) {
+            return self.pressure_denial();
+        }
         let bucket = buckets.entry(key.to_string()).or_insert_with(|| Bucket {
             tokens: self.capacity,
             last_refill: now,
@@ -199,6 +294,14 @@ impl InProcessRateLimiter {
     fn peek_sync(&self, key: &str) -> RateLimitDecision {
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
+        // Under key-space pressure `peek` reports the same denial `check` would
+        // and creates NO entry. Reporting `Allowed` here instead would make peek
+        // and check disagree about an unknown key at exactly the moment the
+        // disagreement is load-bearing (the shed decision), and creating an
+        // entry would let a peek-only caller fill the table.
+        if !self.admit_key(&mut buckets, key, now) {
+            return self.pressure_denial();
+        }
         let bucket = buckets.entry(key.to_string()).or_insert_with(|| Bucket {
             tokens: self.capacity,
             last_refill: now,
@@ -219,6 +322,13 @@ impl InProcessRateLimiter {
                 refill_per_sec: self.refill_per_sec,
             }
         }
+    }
+
+    /// Number of distinct keys currently held. Exposed for the bounded-memory
+    /// tests and for an operator-facing gauge; not part of the [`RateLimiter`]
+    /// trait because a Redis-backed implementation has no local answer.
+    pub fn tracked_keys(&self) -> usize {
+        self.buckets.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Seconds until this bucket accrues back to a full token, from its
@@ -343,5 +453,102 @@ mod tests {
     #[test]
     fn rate_limit_key_shape() {
         assert_eq!(rate_limit_key("dev-box", "ledger_accounts"), "dev-box:ledger_accounts");
+    }
+
+    // ── RMCP-11: bounded key space ────────────────────────────────────────
+
+    /// The headline memory property: a flood of distinct keys — one per source
+    /// address, which is what an internet-facing door sees — cannot grow the
+    /// bucket table past its ceiling.
+    #[tokio::test]
+    async fn key_space_is_bounded_against_a_high_cardinality_flood() {
+        let limiter = InProcessRateLimiter::with_max_keys(1, 0.0001, 8);
+        for i in 0..5_000 {
+            // RFC 5737 documentation range, the correct fixture for an address.
+            let key = rate_limit_key(&format!("192.0.2.{}:{i}", i % 256), "oauth_token");
+            let _ = limiter.check(&key).await;
+        }
+        assert!(
+            limiter.tracked_keys() <= 8,
+            "the table grew to {} entries despite a ceiling of 8",
+            limiter.tracked_keys()
+        );
+    }
+
+    /// The property that makes the eviction policy safe rather than merely
+    /// bounded: a caller who has ALREADY been throttled cannot get its budget
+    /// back by flooding new keys until its own bucket is evicted.
+    #[tokio::test]
+    async fn a_flood_cannot_evict_a_throttled_bucket_to_reset_its_budget() {
+        // Negligible refill, so nothing recovers on its own during the test.
+        let limiter = InProcessRateLimiter::with_max_keys(1, 0.0001, 4);
+        let victim = rate_limit_key("192.0.2.1", "oauth_token");
+
+        assert_eq!(limiter.check(&victim).await, RateLimitDecision::Allowed);
+        assert!(limiter.check(&victim).await.is_over_budget(), "budget should now be spent");
+
+        // Flood far past the ceiling, trying to push the throttled bucket out.
+        for i in 0..1_000 {
+            let _ = limiter.check(&rate_limit_key(&format!("198.51.100.{}:{i}", i % 256), "oauth_token")).await;
+        }
+
+        assert!(
+            limiter.check(&victim).await.is_over_budget(),
+            "the throttled bucket was evicted and reset — the flood bought a fresh burst"
+        );
+    }
+
+    /// Refusing at the ceiling is fail-CLOSED. The tempting alternative — let
+    /// the request through because there is no room to track it — would let a
+    /// flood switch the limiter off for everyone.
+    #[tokio::test]
+    async fn a_full_table_of_throttled_buckets_denies_rather_than_failing_open() {
+        let limiter = InProcessRateLimiter::with_max_keys(1, 0.0001, 2);
+        // Spend both slots' budgets so neither is evictable.
+        for addr in ["192.0.2.1", "192.0.2.2"] {
+            let key = rate_limit_key(addr, "oauth_token");
+            assert_eq!(limiter.check(&key).await, RateLimitDecision::Allowed);
+            assert!(limiter.check(&key).await.is_over_budget());
+        }
+        let fresh = rate_limit_key("192.0.2.3", "oauth_token");
+        let decision = limiter.check(&fresh).await;
+        assert!(matches!(decision, RateLimitDecision::Limited { .. }), "{decision:?}");
+        // And it is a real over-limit, not a backend-fault signal: the limiter
+        // is behaving exactly as designed.
+        assert!(!decision.is_degraded());
+    }
+
+    /// A fully-refilled bucket IS evictable — otherwise the ceiling would wedge
+    /// the limiter shut for every new caller once it filled with idle keys.
+    #[tokio::test]
+    async fn an_idle_full_bucket_is_evicted_to_make_room() {
+        let limiter = InProcessRateLimiter::with_max_keys(2, 1000.0, 1);
+        let idle = rate_limit_key("192.0.2.1", "oauth_token");
+        assert_eq!(limiter.check(&idle).await, RateLimitDecision::Allowed);
+        // Fast refill: the bucket is back at capacity almost immediately.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let newcomer = rate_limit_key("192.0.2.2", "oauth_token");
+        assert_eq!(
+            limiter.check(&newcomer).await,
+            RateLimitDecision::Allowed,
+            "a refilled, debt-free bucket should have been evicted to admit a new key"
+        );
+        assert_eq!(limiter.tracked_keys(), 1);
+    }
+
+    /// `peek` must not be a way to fill the table, and must agree with `check`
+    /// about an unknown key under pressure.
+    #[tokio::test]
+    async fn peek_neither_fills_the_table_nor_disagrees_under_pressure() {
+        let limiter = InProcessRateLimiter::with_max_keys(1, 0.0001, 1);
+        let held = rate_limit_key("192.0.2.1", "oauth_token");
+        assert_eq!(limiter.check(&held).await, RateLimitDecision::Allowed);
+        assert!(limiter.check(&held).await.is_over_budget());
+
+        for i in 0..100 {
+            let _ = limiter.peek(&rate_limit_key(&format!("198.51.100.{i}"), "oauth_token")).await;
+        }
+        assert_eq!(limiter.tracked_keys(), 1, "peek created entries under pressure");
     }
 }

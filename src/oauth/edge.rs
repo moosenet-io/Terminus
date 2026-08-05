@@ -1052,6 +1052,18 @@ pub fn build_edge_router(inner: Router, config: Arc<EdgeConfig>) -> Router {
     inner.layer(axum::middleware::from_fn_with_state(config, edge_guard))
 }
 
+/// The client address this middleware resolved, handed downstream as a request
+/// extension.
+///
+/// A newtype rather than a bare `IpAddr` so an extension lookup cannot collide
+/// with some other middleware's address, and so the name states where the value
+/// came from: this is the address the SOURCE POLICY was evaluated against, not
+/// the socket peer and not a header. Handlers that rate-limit or audit on a
+/// source must use this one, or they will be gating on a different caller than
+/// the edge admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedClientIp(pub IpAddr);
+
 /// One structured audit record per edge decision, on its own tracing target.
 ///
 /// Deliberately NOT a `gateway_framework::audit::AuditEntry`: that record is
@@ -1170,6 +1182,19 @@ pub async fn edge_guard(
     match config.policy.decide(&path, client) {
         EdgeDecision::Allow { class } => {
             audit_edge(&client_label, &path, &method, "allowed", &class);
+            // RMCP-11: hand the RESOLVED address to the handlers behind this
+            // middleware, rather than letting each re-derive one.
+            //
+            // This function has already done the only trustworthy resolution —
+            // peer address unless the peer is a configured proxy, then the
+            // rightmost untrusted `X-Forwarded-For` entry — and a handler that
+            // re-read `ConnectInfo` would see the PROXY, while one that read the
+            // header itself would see whatever the caller wrote. Either would be
+            // a second, divergent notion of "who is calling" behind the same
+            // door, and the rate limiter and the audit trail would then be
+            // keyed on an address the policy never approved.
+            let mut req = req;
+            req.extensions_mut().insert(ResolvedClientIp(client));
             next.run(req).await
         }
         // 404 rather than 403: an unlisted path is not something this listener
