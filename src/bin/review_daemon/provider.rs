@@ -82,6 +82,45 @@ const EXPLORE_TOOLS: &[&str] = &["Read", "Grep", "Glob", "LS"];
 const CODEX_MODEL: &str = "gpt-5.6-sol";
 /// agy (Antigravity CLI) model for the "agy" provider slot.
 const AGY_MODEL: &str = "gemini-3.1-pro";
+/// RVXAGY-01: agy's reasoning-effort flag. [`AGY_MODEL`] is NOT selectable
+/// without it. Measured live on the review-daemon host 2026-08-05:
+/// ```text
+/// $ agy --model gemini-3.1-pro -p "..."
+/// Error: invalid model selection (--model "gemini-3.1-pro" --effort ""):
+///        --model gemini-3.1-pro requires --effort (available: low, high)
+/// ```
+/// This is a SERVER-SIDE model-policy change (the installed agy binary predates
+/// it), so a constant that was correct when written became a hard failure with
+/// no code change -- `review_provider_status probe:true` reported `agy` as
+/// `status: error` on EVERY dispatch, large or small.
+const AGY_EFFORT_FLAG: &str = "--effort";
+/// agy offers only `low` and `high` for [`AGY_MODEL`] -- there is NO `medium`
+/// (confirmed by the CLI's own error text above and by `agy models`, which
+/// lists exactly "Gemini 3.1 Pro (High)" and "Gemini 3.1 Pro (Low)"). The
+/// daemon-wide `reasoning_effort` vocabulary is low/medium/high, so it is
+/// mapped onto agy's two tiers by [`agy_effort`].
+const AGY_EFFORT_LOW: &str = "low";
+const AGY_EFFORT_HIGH: &str = "high";
+/// Effort used when the caller supplies none. `high` is deliberate, not a
+/// placeholder: per the skill's panel-composition rule `agy` is a REQUIRED
+/// per-item seat precisely because it finds real defects, so the seat is worth
+/// nothing at its weakest reasoning tier. An explicit caller effort still wins.
+const AGY_DEFAULT_EFFORT: &str = AGY_EFFORT_HIGH;
+
+/// Map the daemon's low/medium/high effort vocabulary onto the only two tiers
+/// agy actually accepts. `medium` has no agy equivalent and rounds UP to `high`
+/// (a review seat should degrade toward more thought, never less). An
+/// unrecognized value falls back to [`AGY_DEFAULT_EFFORT`] rather than being
+/// forwarded -- agy rejects the whole invocation on an unknown effort, so
+/// passing one through would turn a soft mismatch into a dead seat.
+fn agy_effort(reasoning_effort: Option<&str>) -> &'static str {
+    match reasoning_effort {
+        Some(e) if e.eq_ignore_ascii_case(AGY_EFFORT_LOW) => AGY_EFFORT_LOW,
+        Some(e) if e.eq_ignore_ascii_case(AGY_EFFORT_HIGH) => AGY_EFFORT_HIGH,
+        Some(e) if e.eq_ignore_ascii_case("medium") => AGY_EFFORT_HIGH,
+        _ => AGY_DEFAULT_EFFORT,
+    }
+}
 
 /// REVCAP-01 PART B: the `claude` CLI flag that sets the model's reasoning
 /// effort level for the session. CONFIRMED against the installed `claude` CLI's
@@ -223,15 +262,60 @@ pub fn build_command_with_model(
             BuiltCommand { binary: CODEX_BIN, args, output_path: Some(output_path), stdin_prompt }
         }
         Provider::Agy => {
-            // TERM #495: over-large prompt → deliver on stdin. agy is
-            // claude-derived (`-p` is boolean print-mode, the prompt is a
-            // positional), so keep the `-p`/`--model`/skip-permissions flags and
-            // drop only the positional prompt; agy reads it from stdin. At/below
-            // the threshold the argv is byte-for-byte identical to before.
-            let mut args = vec!["--model".into(), AGY_MODEL.into(), "-p".into()];
+            // RVXAGY-01 -- the load-bearing correction to TERM #495.
+            //
+            // TERM #495 assumed "agy is claude-derived, so `-p` is a boolean
+            // print-mode flag and the prompt is a positional", and therefore
+            // kept `-p` while dropping the positional on the stdin path. THAT
+            // ASSUMPTION IS FALSE. agy is a Go CLI using the stdlib `flag`
+            // package, where `-p` is the short alias for `--print` and is a
+            // VALUE-TAKING string flag. Measured on the daemon host:
+            //
+            //     $ agy --model ... -p            → "flag needs an argument: -p"
+            //
+            // Go's `flag` takes the NEXT argv element as a string flag's value
+            // unconditionally -- it never checks whether that element looks
+            // like a flag. So the TERM #495 argv
+            //
+            //     --model <m> -p --dangerously-skip-permissions
+            //
+            // does not send an empty prompt and does not fail: `-p` SWALLOWS
+            // `--dangerously-skip-permissions` as its value, and agy dutifully
+            // answers a question about that CLI flag. Reproduced verbatim:
+            // "It looks like you've provided the flag
+            //  `--dangerously-skip-permissions`. Could you please provide more
+            //  context?"
+            //
+            // This is worse than a truncation and worse than a crash: the
+            // entire ~190 KB review payload is DISCARDED and REPLACED by a
+            // 29-character string, and the seat returns a fluent, well-formed,
+            // completely off-topic answer. Nothing errors. (It cannot inflate a
+            // majority -- such a reply carries no `VERDICT:` token, so RVXR-02
+            // classifies it `NoVerdict`/non-voting -- but it is still a seat the
+            // panel counted as dispatched while it reviewed nothing.)
+            //
+            // The correct stdin invocation OMITS `-p` ENTIRELY: agy reads its
+            // prompt from stdin when no `--print` value is supplied. Verified
+            // live on the daemon host with a 193,009-byte payload -- agy
+            // recovered a token planted at the TOP of the prompt and described
+            // the content at its END, proving the whole payload arrived intact,
+            // and returned a well-formed `VERDICT:` line.
+            //
+            // NOTE this divergence is agy-specific: `claude -p` genuinely IS
+            // boolean and `codex exec` genuinely does read stdin with no
+            // positional, so the TERM #495 handling of those two is correct and
+            // is left untouched.
+            let mut args = vec![
+                "--model".into(),
+                AGY_MODEL.into(),
+                AGY_EFFORT_FLAG.into(),
+                agy_effort(reasoning_effort).into(),
+            ];
             let stdin_prompt = if prompt.len() > MAX_PROMPT_ARGV_BYTES {
+                // No `-p` AT ALL. Emitting it here is the RVXAGY-01 defect.
                 Some(prompt.to_string())
             } else {
+                args.push("-p".into());
                 args.push(prompt.to_string());
                 None
             };
@@ -476,14 +560,55 @@ mod tests {
         assert_no_shell_markers(&cmd);
     }
 
+    // RVXAGY-01: the test that used to live here
+    // (`agy_command_ignores_effort_param_it_has_no_such_knob`) asserted that
+    // "agy has no effort knob and must ignore the parameter". That was a LYING
+    // FIXTURE: agy has had `--effort` all along, and `AGY_MODEL` cannot be
+    // selected without it. The test passed for months while the agy seat was
+    // dead, because it asserted the absence of exactly the flag whose absence
+    // was the bug. It is replaced by the assertions below, which pin the flag's
+    // PRESENCE and its value mapping.
+
     #[test]
-    fn agy_command_ignores_effort_param_it_has_no_such_knob() {
-        let cmd = build_command(Provider::Agy, "x", false, Some("high"));
-        assert!(
-            !cmd.args.iter().any(|a| a == "high" || a.contains(CODEX_REASONING_EFFORT_KEY)),
-            "agy has no effort knob and must ignore the parameter: {:?}",
-            cmd.args
-        );
+    fn agy_always_carries_the_effort_flag_because_the_model_requires_it() {
+        // Measured: `--model gemini-3.1-pro` without `--effort` is rejected
+        // outright ("requires --effort (available: low, high)"), so EVERY agy
+        // invocation -- every effort input, every prompt size, explore or not --
+        // must carry the flag with a non-empty value.
+        for effort in [None, Some("low"), Some("medium"), Some("high"), Some("nonsense")] {
+            for prompt in ["x", oversized_prompt().as_str()] {
+                for explore in [false, true] {
+                    let cmd = build_command(Provider::Agy, prompt, explore, effort);
+                    let pos = cmd
+                        .args
+                        .iter()
+                        .position(|a| a == AGY_EFFORT_FLAG)
+                        .unwrap_or_else(|| panic!("agy must carry {AGY_EFFORT_FLAG} (effort={effort:?}): {:?}", cmd.args));
+                    let value = cmd.args.get(pos + 1).expect("effort flag must have a value");
+                    assert!(
+                        value == AGY_EFFORT_LOW || value == AGY_EFFORT_HIGH,
+                        "agy accepts only low|high, got {value:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn agy_effort_maps_onto_the_only_two_tiers_agy_accepts() {
+        assert_eq!(agy_effort(Some("low")), "low");
+        assert_eq!(agy_effort(Some("LOW")), "low");
+        assert_eq!(agy_effort(Some("high")), "high");
+        // `medium` has no agy tier and must round UP, never silently pass through.
+        assert_eq!(agy_effort(Some("medium")), "high");
+        assert_ne!(agy_effort(Some("medium")), "medium");
+        // Unknown input must NOT be forwarded -- agy rejects the whole
+        // invocation on an unrecognized effort, which would kill the seat.
+        assert_eq!(agy_effort(Some("ultra")), AGY_DEFAULT_EFFORT);
+        assert_eq!(agy_effort(None), AGY_DEFAULT_EFFORT);
+        // The literals, asserted directly, so a constant rename can't hide a
+        // wrong value the way the previous fixture did.
+        assert_eq!(AGY_EFFORT_FLAG, "--effort");
     }
 
     // ── REVX-07/08: dynamic codex model override ────────────────────────
@@ -584,16 +709,162 @@ mod tests {
     }
 
     #[test]
-    fn oversized_agy_prompt_moves_to_stdin_keeps_flags() {
+    fn oversized_agy_prompt_moves_to_stdin_and_drops_p_entirely() {
+        // RVXAGY-01: this test previously asserted `-p` SURVIVES on the stdin
+        // path. That assertion was the bug, written down. agy's `-p` is
+        // value-taking, so a surviving `-p` consumes the next argv element as
+        // the prompt -- and the next element was
+        // `--dangerously-skip-permissions`.
         let prompt = oversized_prompt();
         let cmd = build_command(Provider::Agy, &prompt, false, None);
         assert!(!cmd.args.iter().any(|a| a == &prompt));
         assert_eq!(cmd.stdin_prompt.as_deref(), Some(prompt.as_str()));
-        // The load-bearing agy flags survive: -p, --model <model>, skip-permissions.
-        assert!(cmd.args.iter().any(|a| a == "-p"));
+        // THE regression assertion: no `-p`, and no `--print` either.
+        assert!(
+            !cmd.args.iter().any(|a| a == "-p" || a == "--print" || a == "--prompt"),
+            "agy's print flag is value-taking; on the stdin path it must be absent \
+             entirely or it will swallow the following flag as the prompt: {:?}",
+            cmd.args
+        );
+        // The genuinely load-bearing flags survive.
         assert!(cmd.args.windows(2).any(|w| w[0] == "--model" && w[1] == AGY_MODEL));
         assert!(cmd.args.iter().any(|a| a == "--dangerously-skip-permissions"));
         assert_no_shell_markers(&cmd);
+    }
+
+    /// Every flag literal any builder in this module can emit. An argv element
+    /// equal to one of these is unambiguously a FLAG, never a value.
+    const EMITTED_FLAG_LITERALS: &[&str] = &[
+        "-p", "--print", "--prompt", "-m", "--model", "--effort", "--output-format",
+        "--allowedTools", "--tools", "--config", "--output-last-message", "--sandbox",
+        "--skip-git-repo-check", "--dangerously-skip-permissions", "exec", "--",
+    ];
+    /// Which flags CONSUME the following argv element as their value --
+    /// **PER BINARY, because this is exactly what RVXAGY-01 got wrong.** The
+    /// original bug came from assuming agy shares claude's flag semantics
+    /// because it is claude-derived. It does not: agy is a Go CLI using the
+    /// stdlib `flag` package, where `-p`/`--print` is a value-taking STRING
+    /// flag, while `claude`'s `-p` is a genuine BOOLEAN.
+    ///
+    /// Each entry below is measured against the installed CLI, not inferred:
+    ///   - agy `-p` value-taking: `agy --model M -p` → "flag needs an argument: -p".
+    ///   - claude `-p` boolean:   `claude --model opus -p --output-format text`
+    ///     with the prompt on stdin returns the answer (the following flag is
+    ///     parsed as a flag, not eaten as a value).
+    ///   - codex reads stdin with no positional: `codex exec --skip-git-repo-check`.
+    fn value_taking_flags(binary: &str) -> &'static [&'static str] {
+        match binary {
+            // Go `flag` package: every non-bool flag takes the next element
+            // UNCONDITIONALLY, without checking whether it looks like a flag.
+            AGY_BIN => &["-p", "--print", "--prompt", "--model", "--effort", "--output-format", "--mode", "--agent"],
+            CLAUDE_BIN => &["--model", "--output-format", "--effort", "--tools"],
+            CODEX_BIN => &["-m", "--config", "--output-last-message", "--sandbox"],
+            other => panic!("unknown binary {other:?} -- add its flag semantics here"),
+        }
+    }
+
+    /// RVXAGY-01, the general invariant behind the specific bug: a value-taking
+    /// flag must never be the last argv element, and must never be followed by
+    /// something that is itself a flag -- because the CLI would silently consume
+    /// that flag AS the value. This is the structural guard; it would have
+    /// caught the `-p --dangerously-skip-permissions` argv on the day it was
+    /// written, for any provider, without anyone having to know agy's flag
+    /// semantics.
+    fn assert_no_flag_swallows_another_flag(cmd: &BuiltCommand, ctx: &str) {
+        let value_taking = value_taking_flags(cmd.binary);
+        for (i, a) in cmd.args.iter().enumerate() {
+            if !value_taking.contains(&a.as_str()) {
+                continue;
+            }
+            let next = cmd.args.get(i + 1).unwrap_or_else(|| {
+                panic!("{ctx}: value-taking flag {a:?} is the LAST argv element -- \
+                        the CLI will error 'flag needs an argument': {:?}", cmd.args)
+            });
+            assert!(
+                !EMITTED_FLAG_LITERALS.contains(&next.as_str()),
+                "{ctx}: value-taking flag {a:?} is immediately followed by the flag \
+                 {next:?} -- the CLI will consume that flag as {a:?}'s VALUE and the \
+                 real payload is silently discarded: {:?}",
+                cmd.args
+            );
+        }
+    }
+
+    #[test]
+    fn no_provider_ever_lets_a_flag_swallow_another_flag() {
+        let over = oversized_prompt();
+        for prov in [Provider::Opus, Provider::Fable, Provider::Codex, Provider::Agy] {
+            for prompt in ["small prompt", over.as_str()] {
+                for explore in [false, true] {
+                    for effort in [None, Some("low"), Some("high")] {
+                        let cmd = build_command(prov, prompt, explore, effort);
+                        assert_no_flag_swallows_another_flag(
+                            &cmd,
+                            &format!("{prov:?} explore={explore} effort={effort:?} prompt_len={}", prompt.len()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The kernel's PER-ARGUMENT limit, which is what actually bit here and is
+    /// NOT what `getconf ARG_MAX` reports. `ARG_MAX` on the daemon host is
+    /// 2,097,152, but Linux separately caps a SINGLE argv string at
+    /// `MAX_ARG_STRLEN` = 32 * PAGE_SIZE = 131072 bytes. No `ARG_MAX` check
+    /// catches an over-long single argument.
+    const MAX_ARG_STRLEN: usize = 32 * 4096;
+
+    #[test]
+    fn no_single_argv_element_can_exceed_the_kernel_per_argument_limit() {
+        // Exercised right up to the daemon's own accept ceiling
+        // (`config::MAX_PROMPT_BYTES`, 200 KiB), since anything at or below it
+        // is a payload the daemon will actually try to spawn with.
+        for len in [1, MAX_PROMPT_ARGV_BYTES, MAX_PROMPT_ARGV_BYTES + 1, 190 * 1024, 200 * 1024] {
+            let prompt = "Z".repeat(len);
+            for prov in [Provider::Opus, Provider::Fable, Provider::Codex, Provider::Agy] {
+                let cmd = build_command(prov, &prompt, false, None);
+                for a in &cmd.args {
+                    assert!(
+                        a.len() <= MAX_ARG_STRLEN,
+                        "{prov:?}: argv element of {} bytes exceeds MAX_ARG_STRLEN {} \
+                         (prompt_len={len}) -- spawn() will fail E2BIG",
+                        a.len(),
+                        MAX_ARG_STRLEN
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_oversized_payload_reaches_the_reviewer_intact_byte_for_byte() {
+        // "Intact or loudly" -- the payload must arrive WHOLE on stdin, never
+        // shortened, never summarized, never partially on argv. A silently
+        // shortened review is worse than a failed one.
+        for len in [MAX_PROMPT_ARGV_BYTES + 1, 190 * 1024, 200 * 1024] {
+            // A distinct head and tail so a truncation at EITHER end is caught.
+            let mut prompt = String::from("HEAD-SENTINEL-7f3a ");
+            prompt.push_str(&"m".repeat(len));
+            prompt.push_str(" TAIL-SENTINEL-9c1b");
+            for prov in [Provider::Opus, Provider::Fable, Provider::Codex, Provider::Agy] {
+                let cmd = build_command(prov, &prompt, false, None);
+                let delivered = cmd
+                    .stdin_prompt
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("{prov:?}: oversized payload must go to stdin"));
+                assert_eq!(delivered.len(), prompt.len(), "{prov:?}: payload length changed");
+                assert_eq!(delivered, prompt, "{prov:?}: payload not byte-for-byte intact");
+                assert!(delivered.starts_with("HEAD-SENTINEL-7f3a"), "{prov:?}: head lost");
+                assert!(delivered.ends_with("TAIL-SENTINEL-9c1b"), "{prov:?}: tail lost");
+                // And no fragment of it leaked onto argv.
+                assert!(
+                    !cmd.args.iter().any(|a| a.contains("SENTINEL")),
+                    "{prov:?}: payload fragment present on argv: {:?}",
+                    cmd.args
+                );
+            }
+        }
     }
 
     #[test]
