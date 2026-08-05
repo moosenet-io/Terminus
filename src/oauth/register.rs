@@ -1036,13 +1036,22 @@ mod tests {
         }
     }
 
-    /// A pool that is never connected. `PgPool::connect_lazy` opens nothing
-    /// until a query runs, and no test above runs one — which is the assertion:
-    /// every refusal here happens BEFORE the store is consulted.
-    fn lazy_pool() -> sqlx::PgPool {
-        sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://register-tests-never-connect/db")
-            .expect("a lazy pool is not a connection")
+    /// A pool that is never connected.
+    ///
+    /// `connect_lazy_with` performs no I/O and touches no filesystem path — the
+    /// database is only opened when a query runs, and no test here runs one,
+    /// which is itself the assertion: every refusal below happens BEFORE the
+    /// store is consulted.
+    ///
+    /// S132/RMCP-SQLITE also removed a small hazard from this fixture. Its
+    /// Postgres predecessor needed an invented DSN with a user, a
+    /// not-a-password and a host, which had to be spelled carefully (a DOTLESS
+    /// host) to avoid the repo's own `no_pii_in_own_source_tree` scanner
+    /// reading `<email>` as an email address. An in-memory SQLite
+    /// handle names nothing at all.
+    fn lazy_pool() -> sqlx::SqlitePool {
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .connect_lazy_with(sqlx::sqlite::SqliteConnectOptions::new().in_memory(true))
     }
 
     /// Stands in for `mount`'s shared charge layer, so the router test exercises

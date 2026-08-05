@@ -211,14 +211,28 @@
 //!   [`password`] (RMCP-03) owns the hashing and verification; RMCP-08 owns
 //!   provisioning.
 //!
-//! ## Secret access (S7/S8)
+//! ## Secret access (S7/S8) — and why this door no longer has a secret at all
 //! This crate has no separate `SecretManager::get()` API; the runtime secret
 //! store is materialized into the process environment at startup, so an env
 //! read here IS the vault read. See [`crate::pki`]'s module docs for the full
 //! rationale and [`crate::pg::conn`] for the established precedent this
-//! mirrors. The connection URL is read in exactly one place
-//! ([`OauthConfig::from_env`]) and is never logged, returned, or embedded in an
-//! error.
+//! mirrors.
+//!
+//! S132/RMCP-SQLITE moved this door's data plane from Postgres to a SQLite
+//! FILE, which removed the `RMCP_DATABASE_URL` secret outright: a file path is
+//! not a credential, so there is nothing here for the vault to hold, nothing to
+//! rotate, and no database, role or password to provision before the door can
+//! start. [`SQLITE_PATH_ENV`] is ordinary non-secret configuration and is read
+//! in exactly one place ([`OauthConfig::from_env`]).
+//!
+//! The FILE is nonetheless credential-adjacent — it holds argon2id password and
+//! client-secret hashes, SHA-256 refresh-token digests, and the consent records
+//! that decide what a connector may reach. Its operational contract
+//! (persistent storage, 0600 owned by the service user, backup, and the
+//! single-writer constraint) is documented on [`SQLITE_PATH_ENV`] and in
+//! `.env.example`. The path is still kept out of error text, not because it is
+//! secret but because an error body is not a place to disclose filesystem
+//! layout.
 
 pub mod audit;
 pub mod authorize;
@@ -251,13 +265,45 @@ pub mod token;
 
 use crate::error::ToolError;
 
-/// Env var naming the Postgres connection this module's own data plane uses.
+/// Env var naming the SQLite FILE this module's own data plane lives in.
 ///
 /// This is the S9-pg "application service owns its own data plane" case: the
 /// OAuth store is Terminus's own state, not ad-hoc fleet-database access, so it
-/// holds a pool rather than routing through the `pg_*` tools. Fleet queries by
-/// an agent still go through those tools.
-pub const DATABASE_URL_ENV: &str = "RMCP_DATABASE_URL";
+/// holds its own handle rather than routing through the `pg_*` tools. Fleet
+/// queries by an agent still go through those tools.
+///
+/// ## Renamed from `RMCP_DATABASE_URL`, deliberately
+///
+/// S132/RMCP-SQLITE replaced Postgres with SQLite for this door, and the old
+/// name would now be actively misleading: the value is a filesystem PATH, not a
+/// URL, and it is not a secret. Keeping the name would have meant an operator
+/// reading a deployment could not tell whether the door still needed a database
+/// and a credential provisioned for it — which is the whole thing this change
+/// removed. A rename makes a stale value fail loudly at startup with
+/// [`ToolError::NotConfigured`] naming the new variable, rather than silently
+/// being interpreted as a path and creating an empty database somewhere odd.
+///
+/// ## What an operator owes this file
+///
+/// - **Persistent storage.** It holds every account, client, consent and live
+///   refresh-token family. On a tmpfs or an ephemeral container layer, a
+///   restart silently revokes every connector and forgets every account.
+/// - **`0600`, owned by the service user.** It holds argon2id password and
+///   client-secret hashes and SHA-256 token digests. None of that is
+///   presentable — a copy yields nothing an attacker can replay — but it is
+///   offline-attackable material and it is the authorization database.
+///   The directory should be `0700` too: SQLite writes `-wal` and `-shm`
+///   sidecars beside the file, and they carry the same content.
+/// - **Backed up as a unit, and not with `cp`.** Use `sqlite3 <path> ".backup"`
+///   or `VACUUM INTO`, which are consistent against a live writer. Copying the
+///   file alone while the door is running can capture a torn page or miss
+///   committed data still in the `-wal`.
+/// - **ONE WRITER.** See [`crate::oauth::store::OauthStore::connect`] and the
+///   `rmcp_login_session_use` note in the migration: the login single-use
+///   guard is atomic across one FILE, so running two replicas against two
+///   files silently reinstates the process-local defect RMCP-03 review round 1
+///   rejected. Do not put the file on NFS to work around that.
+pub const SQLITE_PATH_ENV: &str = "RMCP_SQLITE_PATH";
 
 /// RMCP-12: which operator account the LOCAL tool surface acts as.
 ///
@@ -271,44 +317,48 @@ pub const OPERATOR_ACCOUNT_ENV: &str = "RMCP_OPERATOR_ACCOUNT";
 
 /// Non-secret configuration for the OAuth door.
 ///
-/// Deliberately does NOT derive `Debug`: the only field is a connection URL
-/// with an embedded password, and a stray `{:?}` in a log line is exactly how
-/// that leaks. Callers that want to describe this value get
+/// Deliberately does NOT derive `Debug`. Before S132/RMCP-SQLITE the only field
+/// was a connection URL with an embedded password, and a stray `{:?}` in a log
+/// line was exactly how that leaked. It is now a filesystem path and no longer
+/// a credential — but the `Debug` omission stays, because a path still
+/// discloses deployment layout and because re-adding it would have to be a
+/// deliberate decision rather than a default inherited from a struct that once
+/// held a password. Callers that want to describe this value get
 /// [`OauthConfig::describe`], which names the source and never the value.
 #[derive(Clone)]
 pub struct OauthConfig {
-    database_url: String,
+    sqlite_path: String,
 }
 
 impl OauthConfig {
     /// Read the configuration from the environment.
     ///
-    /// Returns [`ToolError::NotConfigured`] when the URL is absent or blank —
+    /// Returns [`ToolError::NotConfigured`] when the path is absent or blank —
     /// blank is treated as absent, matching `secrets_bootstrap`'s own rule that
-    /// an empty materialized secret is a missing one rather than a valid empty
-    /// credential. The error text names the VARIABLE, never its value.
+    /// an empty materialized value is a missing one rather than a valid empty
+    /// one. The error text names the VARIABLE, never its value.
     pub fn from_env() -> Result<Self, ToolError> {
-        let database_url = std::env::var(DATABASE_URL_ENV)
+        let sqlite_path = std::env::var(SQLITE_PATH_ENV)
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
                 ToolError::NotConfigured(format!(
-                    "{DATABASE_URL_ENV} not set — the RMCP OAuth door requires its own \
-                     Postgres connection"
+                    "{SQLITE_PATH_ENV} not set — the RMCP OAuth door keeps its own data plane \
+                     in a SQLite file on persistent storage"
                 ))
             })?;
-        Ok(Self { database_url })
+        Ok(Self { sqlite_path })
     }
 
-    /// The connection URL, for the one caller that opens the pool.
-    pub(crate) fn database_url(&self) -> &str {
-        &self.database_url
+    /// The database file path, for the one caller that opens the pool.
+    pub(crate) fn sqlite_path(&self) -> &str {
+        &self.sqlite_path
     }
 
     /// A log-safe description. Names where the value came from; never the value.
     pub fn describe(&self) -> String {
-        format!("RMCP OAuth store configured from {DATABASE_URL_ENV}")
+        format!("RMCP OAuth store configured from {SQLITE_PATH_ENV}")
     }
 }
 
@@ -641,17 +691,21 @@ mod tests {
         }
     }
 
-    /// A blank materialized secret is a MISSING one. If this ever returned
-    /// `Ok`, the pool would be opened against an empty URL and fail later with
-    /// a confusing connection error instead of a clear config error here.
+    /// A blank materialized value is a MISSING one. If this ever returned
+    /// `Ok`, the pool would be opened against an empty PATH — and unlike the
+    /// Postgres version, which failed with a confusing connection error, SQLite
+    /// would happily CREATE something: an empty filename is not an error to
+    /// `sqlite3`, so the door would come up on a database that is not the one
+    /// the operator provisioned, with no accounts and no clients in it. The
+    /// blank-is-absent rule matters more after the port, not less.
     #[test]
-    fn blank_database_url_is_treated_as_absent() {
+    fn blank_sqlite_path_is_treated_as_absent() {
         // Exercises the same filter `from_env` applies, without mutating
         // process-global environment state that would race other tests.
         let blank: Option<String> = Some("   ".to_string())
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
-        assert!(blank.is_none(), "a whitespace-only URL must read as absent");
+        assert!(blank.is_none(), "a whitespace-only path must read as absent");
     }
 
     /// The whole point of the newtype: a digest can only come from hashing, so
@@ -762,23 +816,26 @@ mod tests {
         assert!(!err.to_string().contains("correct-horse-battery-staple"));
     }
 
-    /// The config's own description must not be a channel for the URL.
+    /// The config's own description must not be a channel for the path.
     ///
-    /// The fixture deliberately uses a DOTLESS host. The repo's own
-    /// `no_pii_in_own_source_tree` self-check walks this file, and its email
-    /// detector fires on a user part, an at-sign, and a dotted domain — which
-    /// is exactly the shape of a realistic database DSN. So a natural-looking
-    /// connection string in a test fixture (or even in a comment describing
-    /// one) fails the PII gate rather than the assertion. A dotless host keeps
-    /// the credential-in-URL shape this test is actually about.
+    /// After S132/RMCP-SQLITE the value is no longer a credential, so the
+    /// stakes are lower — but the property is still worth holding: `describe`
+    /// is called into logs and tool output, and a deployment's filesystem
+    /// layout is not something an error body should hand out. Asserting on the
+    /// absence of `/` is the version that cannot pass by accident, because any
+    /// path the operator can configure contains one.
+    ///
+    /// The fixture is a plain path with no `@` in it. The repo's own
+    /// `no_pii_in_own_source_tree` self-check walks this file and its email
+    /// detector fires on a user part, an at-sign and a dotted domain — the
+    /// exact shape of the database DSN this fixture used to be. Losing that
+    /// hazard is a small side benefit of the port.
     #[test]
-    fn describe_never_contains_the_url() {
-        let cfg = OauthConfig {
-            database_url: "postgres://dbuser:not-a-real-password@db-host:5432/rmcp".to_string(),
-        };
+    fn describe_never_contains_the_path() {
+        let cfg = OauthConfig { sqlite_path: "/srv/private-dir/rmcp-oauth.db".to_string() };
         let described = cfg.describe();
-        assert!(!described.contains("not-a-real-password"));
-        assert!(!described.contains("postgres://"));
-        assert!(!described.contains("db-host"));
+        assert!(!described.contains("private-dir"));
+        assert!(!described.contains("rmcp-oauth.db"));
+        assert!(!described.contains('/'));
     }
 }

@@ -138,12 +138,12 @@ impl OauthEndpoints {
         // site happens to abort — any caller that reasonably reads
         // `NotConfigured` as "not configured, carry on" silently loses the door.
         //
-        // So: the ONLY absent case is the connection URL being unset or blank,
+        // So: the ONLY absent case is the database PATH being unset or blank,
         // tested directly. Everything after this line is a configured door, and
         // every failure below is therefore fatal — which is RMCP-02's rule,
         // reused rather than re-decided: ABSENT means not configured; PRESENT
         // means the value must be usable.
-        let configured = std::env::var(crate::oauth::DATABASE_URL_ENV)
+        let configured = std::env::var(crate::oauth::SQLITE_PATH_ENV)
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
@@ -162,10 +162,10 @@ impl OauthEndpoints {
             // come to be swallowed. `schema_not_ready_is_not_reported_as_absence`
             // pins that.
             return Err(ToolError::Database(
-                "the RMCP OAuth door is configured but its schema is not present — apply the \
-                 S132 migrations with pg_ddl before starting, or unset RMCP_DATABASE_URL. \
-                 Refusing to serve an auth surface whose every request would fail at the \
-                 database"
+                "the RMCP OAuth door is configured but its schema is not present — apply \
+                 migrations/S132-rmcp-sqlite-oauth.sql to the file named by RMCP_SQLITE_PATH \
+                 before starting, or unset RMCP_SQLITE_PATH. Refusing to serve an auth surface \
+                 whose every request would fail at the database"
                     .into(),
             ));
         }
@@ -928,9 +928,10 @@ mod tests {
 
             let registration = Registration::new(
                 ClientService::new(crate::oauth::store::OauthStore::from_pool(
-                    sqlx::postgres::PgPoolOptions::new()
-                        .connect_lazy("postgres://mount-tests-never-connect/db")
-                        .expect("a lazy pool is not a connection"),
+                    sqlx::sqlite::SqlitePoolOptions::new()
+                        .connect_lazy_with(
+                            sqlx::sqlite::SqliteConnectOptions::new().in_memory(true),
+                        ),
                 )),
                 dcr_enabled,
             );
@@ -1163,12 +1164,22 @@ mod tests {
         );
     }
 
-    /// A pool that is never connected — every refusal above happens in the
-    /// transport, so no test here reaches the store.
-    fn lazy_pool() -> sqlx::PgPool {
-        sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://mount-tests-never-connect/db")
-            .expect("a lazy pool is not a connection")
+    /// A pool that is never connected.
+    ///
+    /// `connect_lazy_with` performs no I/O and touches no filesystem path — the
+    /// database is only opened when a query runs, and no test here runs one,
+    /// which is itself the assertion: every refusal below happens BEFORE the
+    /// store is consulted.
+    ///
+    /// S132/RMCP-SQLITE also removed a small hazard from this fixture. Its
+    /// Postgres predecessor needed an invented DSN with a user, a
+    /// not-a-password and a host, which had to be spelled carefully (a DOTLESS
+    /// host) to avoid the repo's own `no_pii_in_own_source_tree` scanner
+    /// reading `<email>` as an email address. An in-memory SQLite
+    /// handle names nothing at all.
+    fn lazy_pool() -> sqlx::SqlitePool {
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .connect_lazy_with(sqlx::sqlite::SqliteConnectOptions::new().in_memory(true))
     }
 
     /// A wrong content type is REFUSED and RECORDED. Round 14: this early

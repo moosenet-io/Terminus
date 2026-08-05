@@ -130,7 +130,16 @@ prometheus = "0.13"
 # (data/prefix_registry.toml), compiled into the binary via include_str!.
 # Parse-only at runtime (overlay claims are JSON in Redis via serde_json).
 toml = "0.8"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"], default-features = false }
+# The "sqlite" driver is here for the RMCP OAuth door ONLY (S132/RMCP-SQLITE):
+# that door owns its own data plane in its own FILE, so it needs no database, no
+# role and no credential — which is what removed the `RMCP_DATABASE_URL` secret
+# and kept its argon2id hashes, refresh-token digests and consent records out of
+# the shared fleet database. Every OTHER sqlx user in this crate (intake,
+# scribe, discovery, reminder, pg_* tools) remains Postgres; this is not a
+# migration of the crate and there is deliberately no abstraction over the two.
+# "sqlite" is the BUNDLED variant (not "sqlite-unbundled"), so the build needs
+# no system libsqlite3 and the musl/native OCI publish matrix is unaffected.
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "chrono", "uuid"], default-features = false }
 # KGEMB-01: Atlas KG semantic-embeddings vector store (kg_embeddings table).
 # The "sqlx" feature binds pgvector::Vector as a bindable/decodable sqlx type
 # for the Postgres `vector(N)` column, matching our sqlx 0.8 pin.
