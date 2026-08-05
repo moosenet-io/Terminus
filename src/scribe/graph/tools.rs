@@ -26,16 +26,95 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::model::KnowledgeGraph;
+use super::project_key::{self, ProjectKey};
 use super::store::GraphStore;
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::scribe::ScribeConfig;
 use crate::tool::{RustTool, ToolOutput};
 
-/// Load a project's graph from the configured store, or a typed "not found"
-/// signal (`Ok(None)`).
-fn load_graph(project_id: &str) -> Result<Option<KnowledgeGraph>, ToolError> {
-    GraphStore::from_config(&ScribeConfig::from_env()).load(project_id)
+/// A graph that was actually found, together with the CANONICAL KEY that found
+/// it and WHEN it was built.
+///
+/// Every `kg_*` success answer is constructed from one of these (see
+/// [`LoadedGraph::ok`]), which is why no `kg_*` tool can return a result
+/// without saying which graph answered and how old it is. Before TERM #653 a
+/// stale answer and a fresh answer were byte-identical in shape, so a caller
+/// had no way to notice it had been served a seven-week-old graph.
+struct LoadedGraph {
+    /// The raw identifier the caller passed, echoed back unchanged.
+    requested: String,
+    /// The canonical key that actually addressed the store.
+    key: ProjectKey,
+    graph: KnowledgeGraph,
+    built_at: Option<std::time::SystemTime>,
+}
+
+impl std::ops::Deref for LoadedGraph {
+    type Target = KnowledgeGraph;
+    fn deref(&self) -> &KnowledgeGraph {
+        &self.graph
+    }
+}
+
+impl LoadedGraph {
+    /// Merge the per-tool payload into the standard provenance envelope
+    /// (`project_id` / `graph_key` / `graph_built_at` / `graph_age_seconds`).
+    ///
+    /// `extra` MUST be a JSON object; anything else is a programming error and
+    /// is surfaced as one rather than silently dropping the payload.
+    fn envelope(&self, found: bool, extra: Value) -> Result<ToolOutput, ToolError> {
+        let mut out = json!({
+            "project_id": self.requested,
+            "graph_key": self.key.to_string(),
+            "found": found,
+            "graph_built_at": self.built_at.and_then(rfc3339),
+            "graph_age_seconds": self.built_at.and_then(age_seconds),
+        });
+        let Some(obj) = extra.as_object() else {
+            return Err(ToolError::Execution(
+                "kg_* payload must be a JSON object".to_string(),
+            ));
+        };
+        for (k, v) in obj {
+            out[k] = v.clone();
+        }
+        structured(out)
+    }
+
+    /// A successful answer from this graph.
+    fn ok(&self, extra: Value) -> Result<ToolOutput, ToolError> {
+        self.envelope(true, extra)
+    }
+
+    /// A truthful "the graph answered, and the thing you asked for is not in
+    /// it" — distinct from "the key did not resolve" ([`key_miss`]).
+    fn miss(&self, message: impl Into<String>) -> Result<ToolOutput, ToolError> {
+        self.envelope(false, json!({"message": message.into()}))
+    }
+}
+
+fn rfc3339(t: std::time::SystemTime) -> Option<String> {
+    let dt: chrono::DateTime<chrono::Utc> = t.into();
+    Some(dt.to_rfc3339())
+}
+
+fn age_seconds(t: std::time::SystemTime) -> Option<u64> {
+    std::time::SystemTime::now().duration_since(t).ok().map(|d| d.as_secs())
+}
+
+/// Load a project's graph from the configured store, resolving the caller's
+/// identifier to its canonical key first. `Ok(None)` means the resolved key
+/// named no stored graph.
+fn load_graph(project_id: &str) -> Result<Option<LoadedGraph>, ToolError> {
+    let store = GraphStore::from_config(&ScribeConfig::from_env());
+    let key = GraphStore::key_for(project_id);
+    Ok(store.load(project_id)?.map(|graph| LoadedGraph {
+        requested: project_id.to_string(),
+        key,
+        graph,
+        built_at: store.built_at(project_id),
+    }))
 }
 
 /// Pull a required non-empty string argument.
@@ -47,9 +126,34 @@ fn req_str(args: &Value, key: &str) -> Result<String, ToolError> {
         .ok_or_else(|| ToolError::InvalidArgument(format!("'{key}' is required and must be a non-empty string")))
 }
 
-/// Standard "no graph yet" structured result.
-fn no_graph(project_id: &str) -> Value {
-    json!({"project_id": project_id, "found": false, "message": "no knowledge graph for this project (run scribe_kg_build first)"})
+/// Standard KEY-MISS result (TERM #652).
+///
+/// This replaces a message that read *"no knowledge graph for this project (run
+/// scribe_kg_build first)"*. That sentence was a statement about the SYSTEM,
+/// and when the caller had merely used the other key space (a project UUID
+/// rather than the slug the store is keyed by) the statement was FALSE — the
+/// graph existed, was fresh, and answered fine under its slug. It cost a false
+/// bug report and nearly cost an agent dispatched to fix a non-bug.
+///
+/// So this result asserts only what is actually known: which key was resolved,
+/// which keys DO have graphs, and the nearest plausible match. It never claims
+/// the project has no graph, because a key miss is not evidence of that.
+fn key_miss(project_id: &str) -> Value {
+    let store = GraphStore::from_config(&ScribeConfig::from_env());
+    let key = GraphStore::key_for(project_id);
+    let known = store.stored_keys();
+    let suggestion = project_key::nearest(project_id, &known);
+    json!({
+        "project_id": project_id,
+        "graph_key": key.to_string(),
+        "found": false,
+        "error": format!(
+            "unknown project key '{project_id}' (resolved to '{key}') — no graph is stored under that key"
+        ),
+        "known_keys": known,
+        "did_you_mean": suggestion,
+        "message": "the KEY did not resolve to a stored graph; this does NOT mean the project has no knowledge graph. Retry with one of known_keys, or set SCRIBE_KG_PROJECT_ALIASES to map this identifier to its canonical key.",
+    })
 }
 
 fn node_json(n: &super::model::KgNode) -> Value {
@@ -105,7 +209,7 @@ cluster, and degree. Ask the graph instead of grepping source."
         let query = req_str(&args, "query")?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
         let Some(g) = load_graph(&project_id)? else {
-            return structured(no_graph(&project_id));
+            return structured(key_miss(&project_id));
         };
         let q = query.to_lowercase();
         let mut hits: Vec<&super::model::KgNode> = g
@@ -123,7 +227,7 @@ cluster, and degree. Ask the graph instead of grepping source."
                 .then(a.id.cmp(&b.id))
         });
         let results: Vec<Value> = hits.iter().take(limit).map(|n| node_json(n)).collect();
-        structured(json!({"project_id": project_id, "found": true, "query": query, "count": results.len(), "results": results}))
+        g.ok(json!({"query": query, "count": results.len(), "results": results}))
     }
 }
 
@@ -158,10 +262,10 @@ references (outgoing) and what calls/references it (incoming). direction = out|i
         let node_id = req_str(&args, "node_id")?;
         let direction = args.get("direction").and_then(|v| v.as_str()).unwrap_or("both");
         let Some(g) = load_graph(&project_id)? else {
-            return structured(no_graph(&project_id));
+            return structured(key_miss(&project_id));
         };
         if g.get_node(&node_id).is_none() {
-            return structured(json!({"project_id": project_id, "found": false, "message": format!("no node '{node_id}'")}));
+            return g.miss(format!("no node '{node_id}'"));
         }
         // Single-source 1-hop walk (KGRAPH/CXEG-02): `super::query::one_hop_neighbors`
         // is the one place edges are iterated for a node's neighbors, shared with
@@ -170,7 +274,7 @@ references (outgoing) and what calls/references it (incoming). direction = out|i
         // byte-for-byte.
         use super::query::{one_hop_neighbors, EdgeDirection, NeighborFilter};
         let neighbors = one_hop_neighbors(&g, &node_id, NeighborFilter::Both);
-        let mut res = json!({"project_id": project_id, "found": true, "node_id": node_id});
+        let mut res = json!({"node_id": node_id});
         if direction == "out" || direction == "both" {
             let out: Vec<Value> = neighbors
                 .iter()
@@ -222,10 +326,10 @@ knowledge graph — the blast radius around a symbol. Returns the nodes and the 
         let node_id = req_str(&args, "node_id")?;
         let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(1).min(5) as usize;
         let Some(g) = load_graph(&project_id)? else {
-            return structured(no_graph(&project_id));
+            return structured(key_miss(&project_id));
         };
         if g.get_node(&node_id).is_none() {
-            return structured(json!({"project_id": project_id, "found": false, "message": format!("no node '{node_id}'")}));
+            return g.miss(format!("no node '{node_id}'"));
         }
         let adj = adjacency(&g);
         // BFS to depth
@@ -254,7 +358,7 @@ knowledge graph — the blast radius around a symbol. Returns the nodes and the 
             .filter(|e| seen.contains(e.from.as_str()) && seen.contains(e.to.as_str()))
             .map(|e| json!({"from": e.from, "to": e.to, "kind": e.kind.as_str(), "confidence": e.confidence.as_str()}))
             .collect();
-        structured(json!({"project_id": project_id, "found": true, "root": node_id, "depth": depth, "nodes": nodes, "edges": edges}))
+        g.ok(json!({"root": node_id, "depth": depth, "nodes": nodes, "edges": edges}))
     }
 }
 
@@ -289,10 +393,10 @@ project's Atlas knowledge graph. Returns the node-id sequence, or an empty path 
         let from = req_str(&args, "from")?;
         let to = req_str(&args, "to")?;
         let Some(g) = load_graph(&project_id)? else {
-            return structured(no_graph(&project_id));
+            return structured(key_miss(&project_id));
         };
         if g.get_node(&from).is_none() || g.get_node(&to).is_none() {
-            return structured(json!({"project_id": project_id, "found": false, "message": "from/to node not in graph"}));
+            return g.miss("from/to node not in graph");
         }
         let adj = adjacency(&g);
         // BFS shortest path (undirected).
@@ -330,7 +434,7 @@ project's Atlas knowledge graph. Returns the node-id sequence, or an empty path 
         } else {
             Vec::new()
         };
-        structured(json!({"project_id": project_id, "found": true, "from": from, "to": to, "connected": !path.is_empty(), "path": path}))
+        g.ok(json!({"from": from, "to": to, "connected": !path.is_empty(), "path": path}))
     }
 }
 
@@ -359,7 +463,7 @@ per-cluster counts, the top-degree hotspots, and orphan (degree-0) count."
     async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let project_id = req_str(&args, "project_id")?;
         let Some(g) = load_graph(&project_id)? else {
-            return structured(no_graph(&project_id));
+            return structured(key_miss(&project_id));
         };
         let mut by_kind: BTreeMap<&str, u64> = BTreeMap::new();
         let mut clusters: HashSet<u32> = HashSet::new();
@@ -386,8 +490,7 @@ per-cluster counts, the top-degree hotspots, and orphan (degree-0) count."
             .filter(|n| n.degree > 0)
             .map(|n| json!({"id": n.id, "rank": n.rank, "degree": n.degree, "cluster": n.cluster}))
             .collect();
-        structured(json!({
-            "project_id": project_id, "found": true,
+        g.ok(json!({
             "nodes": g.node_count(), "edges": g.edge_count(),
             "clusters": clusters.len(), "orphans": orphans,
             "by_kind": by_kind, "hotspots": hotspots,
@@ -427,7 +530,7 @@ graph instead of grepping the file for `fn`/`struct`/etc."
         let project_id = req_str(&args, "project_id")?;
         let path = req_str(&args, "path")?;
         let Some(g) = load_graph(&project_id)? else {
-            return structured(no_graph(&project_id));
+            return structured(key_miss(&project_id));
         };
         let mut hits: Vec<&super::model::KgNode> = g.current_nodes().filter(|n| n.path == path).collect();
         hits.sort_by(|a, b| b.rank.total_cmp(&a.rank).then(a.id.cmp(&b.id)));
@@ -436,8 +539,8 @@ graph instead of grepping the file for `fn`/`struct`/etc."
             .take(KG_FILE_SYMBOLS_MAX)
             .map(|n| json!({"id": n.id, "name": n.name, "kind": n.kind.as_str(), "rank": n.rank, "cluster": n.cluster}))
             .collect();
-        structured(json!({
-            "project_id": project_id, "found": true, "path": path,
+        g.ok(json!({
+            "path": path,
             "count": symbols.len(), "symbols": symbols,
         }))
     }
@@ -481,7 +584,7 @@ zoom without walking every node."
         let project_id = req_str(&args, "project_id")?;
         let want_level = args.get("level").and_then(|v| v.as_u64()).map(|l| l as u32);
         let Some(g) = load_graph(&project_id)? else {
-            return structured(no_graph(&project_id));
+            return structured(key_miss(&project_id));
         };
         let mut comms = super::community::hierarchical_communities(&g);
 
@@ -505,7 +608,7 @@ zoom without walking every node."
             comms.retain(|c| c.level == l);
         }
         let comms_json = serde_json::to_value(&comms).unwrap_or_else(|_| json!([]));
-        structured(json!({"project_id": project_id, "found": true, "count": comms.len(), "communities": comms_json}))
+        g.ok(json!({"count": comms.len(), "communities": comms_json}))
     }
 }
 
@@ -540,7 +643,7 @@ retrieved context plus, when a model is available, a synthesized answer."
         let project_id = req_str(&args, "project_id")?;
         let question = req_str(&args, "question")?;
         let Some(g) = load_graph(&project_id)? else {
-            return structured(no_graph(&project_id));
+            return structured(key_miss(&project_id));
         };
         let level = super::query::classify(&question);
         let context: Value = match level {
@@ -568,8 +671,7 @@ retrieved context plus, when a model is available, a synthesized answer."
             }
         }
 
-        structured(json!({
-            "project_id": project_id, "found": true,
+        g.ok(json!({
             "level": level, "question": question,
             "answer": answer, "context": context,
         }))
@@ -689,10 +791,14 @@ or unreachable, so callers should fall back to the lexical `kg_search` in that c
         // no_graph convention as the other kg_* tools. Callers should NOT fall
         // back to lexical here (there is nothing to search either way).
         let Some(g) = load_graph(&project_id)? else {
-            return structured(json!({
-                "configured": true, "found": false, "project_id": project_id, "count": 0, "results": [],
-                "message": "no knowledge graph for this project (run scribe_kg_build first)",
-            }));
+            // Same key-miss truth as every other kg_* tool, plus the
+            // `configured` flag this tool's contract requires (the store and
+            // embeddings ARE configured; only the key missed).
+            let mut v = key_miss(&project_id);
+            v["configured"] = json!(true);
+            v["count"] = json!(0);
+            v["results"] = json!([]);
+            return structured(v);
         };
 
         // `found` reflects whether there are actual semantic matches: zero hits,
@@ -700,10 +806,10 @@ or unreachable, so callers should fall back to the lexical `kg_search` in that c
         // graph), is found:false — a caller can distinguish "search ran, nothing
         // matched" from a genuine hit set without inspecting count.
         let results = map_topk_to_results(&hits, &g);
-        structured(json!({
-            "configured": true, "found": !results.is_empty(), "project_id": project_id,
-            "count": results.len(), "results": results,
-        }))
+        g.envelope(
+            !results.is_empty(),
+            json!({"configured": true, "count": results.len(), "results": results}),
+        )
     }
 }
 
@@ -1134,6 +1240,104 @@ pub struct Widget;
             .unwrap();
         assert_eq!(val(out)["found"], false);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── TERM #652 / #653 ───────────────────────────────────────────────────
+
+    /// The headline defect: a key that does not resolve must NOT be reported as
+    /// the project having no graph. The old message said
+    /// "no knowledge graph for this project (run scribe_kg_build first)" while
+    /// the graph existed and was fresh — a false statement about system state
+    /// that caused a real false bug report.
+    #[tokio::test]
+    #[serial]
+    async fn a_key_miss_is_reported_as_a_key_miss_not_as_an_absent_graph() {
+        let _g = seed_project("FSYMKEY");
+        // A UUID: the other key space, mapped to nothing.
+        let out = KgFileSymbols
+            .execute_structured(json!({
+                "project_id": "<uuid>",
+                "path": "src/w.rs"
+            }))
+            .await
+            .unwrap();
+        let v = val(out);
+        assert_eq!(v["found"], false);
+
+        let blob = serde_json::to_string(&v).unwrap();
+        assert!(
+            !blob.contains("no knowledge graph for this project"),
+            "must not assert the project has no graph: {blob}"
+        );
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("unknown project key"),
+            "must name the failing KEY: {v}"
+        );
+        // It must tell the caller what DOES exist, so the miss is actionable.
+        let known = v["known_keys"].as_array().expect("known_keys listed");
+        assert!(
+            known.iter().any(|k| k == "fsymkey"),
+            "the store's real keys must be listed: {v}"
+        );
+        // ...and it must not invent a suggestion for something unrecognisable.
+        assert!(v["did_you_mean"].is_null(), "no confident wrong guess: {v}");
+    }
+
+    /// A near-miss key gets an actionable suggestion.
+    #[tokio::test]
+    #[serial]
+    async fn a_near_miss_key_suggests_the_real_one() {
+        let _g = seed_project("STATNEAR");
+        let out = KgStats
+            .execute_structured(json!({"project_id": "statnea"}))
+            .await
+            .unwrap();
+        let v = val(out);
+        assert_eq!(v["found"], false);
+        assert_eq!(v["did_you_mean"], "statnear", "{v}");
+    }
+
+    /// TERM #653's visibility half: every answer carries the key that answered
+    /// and when that graph was built, so a consumer can SEE staleness instead
+    /// of having to trust the result.
+    #[tokio::test]
+    #[serial]
+    async fn every_answer_reports_which_graph_answered_and_how_old_it_is() {
+        let _g = seed_project("FRESH");
+        let out = KgStats.execute_structured(json!({"project_id": "FRESH"})).await.unwrap();
+        let v = val(out);
+        assert_eq!(v["found"], true);
+        assert_eq!(v["graph_key"], "fresh", "canonical key reported: {v}");
+        assert_eq!(v["project_id"], "FRESH", "raw request echoed back: {v}");
+        assert!(
+            v["graph_built_at"].as_str().is_some(),
+            "build time must be present on a real answer: {v}"
+        );
+        assert!(
+            v["graph_age_seconds"].as_u64().is_some(),
+            "age must be present on a real answer: {v}"
+        );
+    }
+
+    /// A found:false that came from the GRAPH (node not present) still reports
+    /// which graph was searched — otherwise "not found" is ambiguous between
+    /// "wrong key" and "genuinely absent", which is the ambiguity that started
+    /// all of this.
+    #[tokio::test]
+    #[serial]
+    async fn a_graph_level_miss_still_names_the_graph_that_answered() {
+        let _g = seed_project("NBRMISS");
+        let out = KgNeighbors
+            .execute_structured(json!({"project_id": "NBRMISS", "node_id": "crate::w::nope"}))
+            .await
+            .unwrap();
+        let v = val(out);
+        assert_eq!(v["found"], false);
+        assert_eq!(v["graph_key"], "nbrmiss", "{v}");
+        assert!(v["graph_built_at"].as_str().is_some(), "{v}");
+        assert!(v["message"].as_str().unwrap().contains("no node"), "{v}");
+        // Crucially NOT a key miss.
+        assert!(v["error"].is_null(), "a present graph is not a key error: {v}");
     }
 
     #[tokio::test]

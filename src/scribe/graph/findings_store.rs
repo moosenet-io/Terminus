@@ -369,7 +369,7 @@ impl FindingsStore {
         let mut sql = String::from(
             "SELECT id, project_id, category, severity, scope_kind, scope_ref, description, \
              provenance, first_seen, last_seen, occurrences, crystallize_state \
-             FROM kg_findings WHERE project_id = $1",
+             FROM kg_findings WHERE project_id = ANY($1)",
         );
 
         let mut idx = 1;
@@ -387,7 +387,16 @@ impl FindingsStore {
         }
         sql.push_str(" ORDER BY occurrences DESC, last_seen DESC");
 
-        let mut query = sqlx::query(&sql).bind(project_id.to_string());
+        // Bind EVERY spelling of this project, not just the one asked for
+        // (TERM #652). `kg_findings` rows are keyed by whatever string the
+        // recording review passed — historically a project UUID, while the
+        // graph tools key by slug. Asking for all of a project's aliases at
+        // once makes both key spaces answer, with no rewrite of live rows and
+        // no migration. `aliases()` always contains at least the canonical key,
+        // so this can never degrade to an empty IN-list that silently returns
+        // nothing.
+        let keys = super::project_key::ProjectKey::resolve(project_id).aliases();
+        let mut query = sqlx::query(&sql).bind(keys);
         if let Some(sk) = scope_kind {
             query = query.bind(sk.to_string());
         }
