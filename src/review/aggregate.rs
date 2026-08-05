@@ -503,6 +503,42 @@ mod tests {
         );
     }
 
+    /// Found by mutation M7: every other all-absent test used seats that were
+    /// ALSO errored, so `is_voting()` and `is_available()` agreed and the
+    /// adversarial guard could be silently weakened to the availability check
+    /// without any test noticing. The discriminating case is a defence that
+    /// DISPATCHED FINE and merely never committed to a verdict: available,
+    /// but not a judgement. Approving that would let prose defend a change.
+    #[test]
+    fn adversarial_defence_that_only_produced_prose_is_no_quorum_not_approve() {
+        let results = vec![no_verdict("opus"), ok("codex", "NOT_REFUTED")];
+        assert!(results[0].is_available(), "the defence's dispatch succeeded");
+        assert!(!results[0].is_voting(), "...but it produced no judgement");
+        assert_eq!(
+            aggregate(Structure::AdversarialPair, &results),
+            (NO_QUORUM.to_string(), false),
+            "a defence that never judged must not be carried to APPROVE by an \
+             unrefuting attacker"
+        );
+    }
+
+    /// The unanimous counterpart of the same blind spot: seats that dispatched
+    /// fine and said nothing. `is_available()` is true for all of them, so only
+    /// a voting-based emptiness check reports NO_QUORUM here.
+    #[test]
+    fn unanimous_panel_of_prose_only_seats_is_no_quorum_not_approve() {
+        let results = vec![no_verdict("opus"), no_verdict("codex")];
+        assert!(results.iter().all(|r| r.is_available()));
+        assert_eq!(
+            aggregate(Structure::PanelUnanimous, &results),
+            (NO_QUORUM.to_string(), false)
+        );
+        assert_eq!(
+            aggregate(Structure::PanelMajority, &results),
+            (NO_QUORUM.to_string(), false)
+        );
+    }
+
     #[test]
     fn single_seat_that_did_not_vote_is_no_quorum() {
         assert_eq!(

@@ -2823,9 +2823,17 @@ mod tests {
         let out = tool().execute(args).await.unwrap();
         let parsed: Value = serde_json::from_str(&out).unwrap();
 
-        assert_eq!(parsed["aggregate_verdict"], "UNKNOWN", "{parsed}");
+        // RVXR-02: an all-degraded panel is now NO_QUORUM, not UNKNOWN --
+        // strictly stronger for this test's own purpose ("risk alone must
+        // never set the verdict"), because NO_QUORUM says positively that
+        // nothing judged the change rather than merely that the token could
+        // not be parsed.
+        assert_eq!(parsed["aggregate_verdict"], NO_QUORUM, "{parsed}");
         assert_eq!(parsed["complete"], false, "{parsed}");
         assert_ne!(parsed["aggregate_verdict"], "REQUEST_CHANGES", "risk alone must never set REQUEST_CHANGES: {parsed}");
+        assert_ne!(parsed["aggregate_verdict"], "APPROVE", "an empty panel must never approve: {parsed}");
+        assert_eq!(parsed["quorum"]["voted"], 0, "{parsed}");
+        assert_eq!(parsed["quorum"]["seated"], 1, "{parsed}");
 
         let _ = std::fs::remove_dir_all(&store_dir);
         std::env::remove_var("SCRIBE_KG_STORE_DIR");
