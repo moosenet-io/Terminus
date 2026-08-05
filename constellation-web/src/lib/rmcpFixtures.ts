@@ -413,6 +413,56 @@ function assertNamespacesAssignable(namespaces: string[] | undefined, tool: Rmcp
   }
 }
 
+// ── Accounts (TERM-647) ──────────────────────────────────────────────────────
+//
+// The fixture principal — the account this mock server considers authenticated. A DELEGATED
+// OWNER, not an operator, matching the file's stated posture: that is what makes the
+// "you may not create a connector in someone else's name" refusal reachable at all.
+const FIXTURE_PRINCIPAL = 'delegated-owner';
+
+/** Every account name this fixture knows. Anything else resolves to nothing, exactly as a
+ *  missing or DISABLED account does on the real server — one collapsed answer, so the tool is
+ *  not an account-existence oracle. */
+const FIXTURE_ACCOUNTS = new Set([FIXTURE_PRINCIPAL, 'studio-owner']);
+
+/**
+ * The account checks `rmcp_client_create` performs, in the SERVER's order: resolve the named
+ * accounts, then authorize the pairing, and only then look at scope assignability. Order is not
+ * cosmetic — it decides which refusal an operator sees when two things are wrong at once, and
+ * "your group is not yours" is a confusing answer to a typo'd owner name.
+ *
+ * Stricter than production in one respect, deliberately: production trusts the stated `actor`
+ * because the transport authenticated a mesh principal, whereas this fixture authenticates
+ * exactly one principal and refuses a claim to be anybody else. Stricter is the allowed
+ * direction; a fixture that accepted any actor would let a UI bug through here and only fail in
+ * front of an operator.
+ */
+function assertAccountsAcceptable(args: Record<string, unknown>, tool: RmcpToolName): void {
+  const owner = typeof args.owner === 'string' ? args.owner.trim() : '';
+  const actor = typeof args.actor === 'string' ? args.actor.trim() : '';
+  // Absent and blank are both PRESENT-and-unusable, and neither may be defaulted — the whole
+  // point of the requirement is that the server never picks an owner.
+  if (owner.length === 0) {
+    throw new RmcpError('invalid', tool, 'owner is required — there is no default owner');
+  }
+  if (actor.length === 0) {
+    throw new RmcpError('invalid', tool, 'actor is required — there is no default actor');
+  }
+  if (!FIXTURE_ACCOUNTS.has(owner) || !FIXTURE_ACCOUNTS.has(actor)) {
+    throw new RmcpError('not_found', tool, 'no such account');
+  }
+  if (actor !== FIXTURE_PRINCIPAL) {
+    throw new RmcpError('forbidden', tool, 'not permitted to act as another account');
+  }
+  if (owner !== actor) {
+    // The real rule: an operator may create a connector owned by anyone, anybody else only one
+    // owned by themselves. The fixture principal is not an operator, so this always refuses —
+    // which is the point, since a self-owned create would satisfy the check unconditionally and
+    // prove nothing about it.
+    throw new RmcpError('forbidden', tool, 'only an operator may create a connector for another account');
+  }
+}
+
 /**
  * Mirrors `OauthStore::set_client_tool_groups`' ownership check — the symmetric rule that was
  * missing here entirely: every assigned group must belong to the actor. Same unspecific error,
@@ -529,6 +579,7 @@ export async function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string
       return delay({ clients: clients.filter(c => c.owner === 'me').map(wire) } as unknown as T);
 
     case RMCP_TOOLS.clientCreate: {
+      assertAccountsAcceptable(args, tool);
       assertNamespacesAssignable(args.namespaces as string[] | undefined, tool);
       assertGroupsAssignable(args.tool_group_ids as string[] | undefined, tool);
       const created: FixtureClient = {

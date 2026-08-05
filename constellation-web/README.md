@@ -839,6 +839,21 @@ same cosmetic-plus-server-enforced pattern as every other panel.
 
 - **Empty state guides creation.** No connectors ⇒ an explanation of what a connector is plus a
   "create the first connector" action, not a blank table.
+- **Creating a connector requires naming BOTH an owner account and an acting account** (TERM-647).
+  Neither is inferred and neither has a default, so Create stays disabled until you supply both.
+  The reason is that this surface has no account identity to infer one from: the tools are reached
+  over transports that authenticate a *mesh principal*, not an `rmcp_account`, so the server will
+  not guess who owns a connector — and a UI that guessed on its behalf would defeat the point. The
+  two are asked separately because they are different claims: an operator may legitimately mint a
+  connector owned by *someone else*, which is exactly the case that has to be authorized rather
+  than assumed (the server permits a create when the actor **is** the owner, so silently copying
+  one into the other would satisfy that check unconditionally). The authorization rule itself lives
+  with the tool — see *Every administrative write is authorized* in the root `README.md`; this note
+  only covers what the operator must type. Known account names are offered as click-to-fill
+  suggestions, drawn from the server-owner records the page has already loaded; that list is **not**
+  the set of legal answers — there is no account-listing tool, so it is routinely partial or empty
+  and **typing a name is normal, not an error**. An unknown or disabled account, and a pairing you
+  are not authorized for, are both refused by the server and shown in the dialog.
 - **The client secret is shown exactly once.** It lives only in `ClientCreateDialog`'s component
   state, for the life of the created step, with a copy control, an explicit "this is the only
   time you will see this", and an acknowledgement checkbox gating the Done button. No read tool
