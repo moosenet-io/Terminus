@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::error::ToolError;
 use crate::oauth::delegation::{
     authorize_client_write, authorize_namespace_scoping, ActorAuthority, DelegationChange,
-    DelegationStore,
+    DelegationGrant, DelegationRevocation, DelegationStore,
 };
 use crate::oauth::groups::{
     normalize_description, validate_group, validate_patterns, AuthorizedGroup, Pattern,
@@ -1836,13 +1836,22 @@ impl OauthStore {
     /// PREVIOUS owner had scoped to it. One owner per namespace, enforced by the
     /// primary key.
     ///
-    /// **Authorization is NOT here.** Granting is operator-only and that
-    /// decision belongs to
-    /// [`crate::oauth::delegation::authorize_delegation_change`], which
-    /// [`crate::oauth::delegation::DelegationService`] calls against a freshly
-    /// resolved authority. Putting a second copy of the rule in this method is
-    /// what "never two ways to do one thing" forbids; what this method owes is
-    /// atomicity, which is the thing only it can provide.
+    /// **PRIVATE to this module, and it takes the authorization rather than the
+    /// arguments.** Both halves matter, and round 1 of review is why:
+    ///
+    /// - Private, so no other module in the crate can reach it. `ScopeResolver`
+    ///   used to call the `pub` version with no actor at all, which made
+    ///   `DelegationService` the polite path rather than the only one. Rust's
+    ///   module privacy is what turns "nobody should call this directly" from a
+    ///   comment into a compile error.
+    /// - It takes a [`DelegationGrant`], whose only constructor runs the
+    ///   operator check, so even in-module the arguments cannot arrive
+    ///   unauthorized. The rule itself still lives in exactly one place
+    ///   (`delegation::authorize_delegation_change`); this method does not
+    ///   restate it, it DEMANDS it.
+    ///
+    /// What this method owes is atomicity, which is the thing only it can
+    /// provide.
     ///
     /// The narrowing is in the SAME transaction as the reassignment. The read
     /// path already refuses those rows the instant ownership moves — that is the
@@ -1850,11 +1859,12 @@ impl OauthStore {
     /// than the decision itself. Doing it here rather than lazily means an
     /// operator inspecting the former owner's client sees what it can actually
     /// reach.
-    pub async fn set_server_owner(
+    async fn set_server_owner(
         &self,
-        namespace: &str,
-        owner_account_id: Uuid,
+        grant: &DelegationGrant,
     ) -> Result<DelegationChange, ToolError> {
+        let namespace = grant.namespace();
+        let owner_account_id = grant.grantee();
         let _scope_write = ScopeWrite::begin();
         let mut tx = self.pool.begin().await.map_err(db)?;
         let previous = sqlx::query_scalar::<_, Uuid>(
@@ -1954,6 +1964,8 @@ impl OauthStore {
 
     /// Remove a delegation, narrowing every client that drew on it.
     ///
+    /// Private, and takes the authorization — see [`Self::set_server_owner`].
+    ///
     /// Idempotent: clearing an absent delegation reports zero narrowed rows
     /// rather than failing, because "this namespace is not delegated" is the
     /// state the caller asked for.
@@ -1963,7 +1975,11 @@ impl OauthStore {
     /// is gone, on the very next call, with no TTL in between. If this
     /// transaction's cleanup half failed, the rows it left behind would already
     /// authorize nothing.
-    pub async fn clear_server_owner(&self, namespace: &str) -> Result<DelegationChange, ToolError> {
+    async fn clear_server_owner(
+        &self,
+        revocation: &DelegationRevocation,
+    ) -> Result<DelegationChange, ToolError> {
+        let namespace = revocation.namespace();
         let _scope_write = ScopeWrite::begin();
         let mut tx = self.pool.begin().await.map_err(db)?;
         sqlx::query("DELETE FROM rmcp_server_owner WHERE namespace = $1")
@@ -2051,14 +2067,16 @@ impl DelegationStore for OauthStore {
 
     async fn grant_namespace(
         &self,
-        namespace: &str,
-        grantee: Uuid,
+        grant: &DelegationGrant,
     ) -> Result<DelegationChange, ToolError> {
-        self.set_server_owner(namespace, grantee).await
+        self.set_server_owner(grant).await
     }
 
-    async fn revoke_namespace(&self, namespace: &str) -> Result<DelegationChange, ToolError> {
-        self.clear_server_owner(namespace).await
+    async fn revoke_namespace(
+        &self,
+        revocation: &DelegationRevocation,
+    ) -> Result<DelegationChange, ToolError> {
+        self.clear_server_owner(revocation).await
     }
 
     async fn list_server_owners(&self) -> Result<Vec<ServerOwner>, ToolError> {
@@ -2579,6 +2597,110 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
             "owner state belongs in the join, not split across the projection"
         );
         assert!(src.contains("a.is_operator AS owner_is_operator"));
+    }
+
+    /// **Enforces, across the WHOLE CRATE, that the raw delegation mutators are
+    /// reachable only through the authorized path.**
+    ///
+    /// Round 1 of review found that `set_server_owner`/`clear_server_owner` were
+    /// `pub`, unauthenticated, and called directly by `ScopeResolver` with no
+    /// actor — so `DelegationService` was the polite way to mutate a delegation,
+    /// not the only way. Two things now stop that, and this test covers the half
+    /// the compiler does not:
+    ///
+    /// 1. **The compiler.** Both methods are private to this module, so no other
+    ///    file CAN call them, and both demand a `DelegationGrant` /
+    ///    `DelegationRevocation` whose only constructor runs the operator check.
+    /// 2. **This scan.** Privacy stops other MODULES; it does not stop a future
+    ///    method added inside `store.rs` from calling them with a proof minted
+    ///    for something else, and it does not stop the `DelegationStore` trait
+    ///    forwarders being pointed somewhere new. So the call sites are pinned
+    ///    by name.
+    ///
+    /// Mutation-verify by adding a call to `self.set_server_owner(` in any
+    /// function other than `grant_namespace`: this goes red naming that
+    /// function. Delete the `let expected` filter and the non-vacuity assertion
+    /// below goes red instead — the guard cannot be silently emptied.
+    #[test]
+    fn the_raw_delegation_mutators_have_exactly_the_callers_we_intend() {
+        // The authorized forwarders, and nothing else. `grant_namespace` and
+        // `revoke_namespace` are the `DelegationStore` impl methods, which can
+        // only be reached with a proof value.
+        let expected: &[(&str, &str)] =
+            &[("set_server_owner", "grant_namespace"), ("clear_server_owner", "revoke_namespace")];
+
+        let files = crate_source_files();
+        assert!(files.len() > 50, "the crate walk is not scanning the tree");
+
+        let mut found: Vec<(String, String, String)> = Vec::new();
+        for path in &files {
+            let Ok(source) = std::fs::read_to_string(path) else { continue };
+            let label = path
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            // Production half only: the test module below names these methods in
+            // string literals, and scanning it would find the guard's own
+            // vocabulary and call it a caller.
+            let production = source.split("\n#[cfg(test)]").next().unwrap_or(&source);
+            let mut current_fn = String::from("(top level)");
+            for line in production.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if let Some(rest) = trimmed
+                    .strip_prefix("pub async fn ")
+                    .or_else(|| trimmed.strip_prefix("async fn "))
+                    .or_else(|| trimmed.strip_prefix("pub fn "))
+                    .or_else(|| trimmed.strip_prefix("fn "))
+                {
+                    current_fn = rest
+                        .split(|c: char| c == '(' || c == '<')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    continue;
+                }
+                for (method, _) in expected {
+                    if trimmed.contains(&format!(".{method}(")) {
+                        found.push((label.clone(), current_fn.clone(), (*method).to_string()));
+                    }
+                }
+            }
+        }
+
+        let unexpected: Vec<&(String, String, String)> = found
+            .iter()
+            .filter(|(_, caller, method)| {
+                !expected.iter().any(|(m, allowed)| m == method && allowed == caller)
+            })
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "RMCP-12: the raw delegation mutators are reachable from somewhere that has not \
+             proved an operator authorized the change. Route it through \
+             `delegation::DelegationService`, which is what mints the proof value these \
+             methods demand:\n{}",
+            unexpected
+                .iter()
+                .map(|(file, caller, method)| format!("  {file}: fn {caller} calls {method}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        // Non-vacuity: the scan must actually have SEEN both authorized call
+        // sites. A rename, a refactor, or a broken function-splitter fails here
+        // rather than passing green having matched nothing.
+        for (method, caller) in expected {
+            assert!(
+                found.iter().any(|(_, f, m)| f == caller && m == method),
+                "the scan did not find the known {method} call site in fn {caller}; it is \
+                 matching nothing and would pass whatever it was given"
+            );
+        }
     }
 
     /// The operator flag is an AUTHORIZATION input, so a deploy that is missing

@@ -349,6 +349,102 @@ pub struct DelegationChange {
     pub rows_narrowed: u64,
 }
 
+/// Proof that a delegation GRANT was authorized, carrying the decision's own
+/// inputs.
+///
+/// ## Why this type exists — and why it is not a marker token
+///
+/// Round 1 of review found the hazard this closes: the store's raw
+/// `set_server_owner`/`clear_server_owner` performed no authorization at all, so
+/// [`DelegationService`] was not the only way to mutate a delegation, merely the
+/// polite one. Anything holding the store — including code written later by
+/// someone who has never heard of this module — could grant a namespace to
+/// anybody. Every authoring rule this item added was bypassable one layer down.
+///
+/// The fix is structural, not documentary, and it is deliberately NOT the shape
+/// RMCP-01 and RMCP-07 both threw out. A *data-free* marker (`struct Approved;`)
+/// proves nothing, because any caller can mint one and claim a check it never
+/// ran — that is a comment wearing a type's clothes.
+///
+/// This value instead CARRIES the decision's inputs, and the only constructor
+/// is [`Self::authorize`], which performs the check. Producing one IS the
+/// check:
+///
+/// - Its fields are private, so it cannot be assembled by a struct literal.
+/// - Its constructor demands an [`ActorAuthority`], which has no public
+///   constructor of its own — the only ways to obtain one are a live store read
+///   ([`ActorAuthority::resolve`]) or the crate-visible
+///   [`ActorAuthority::from_live_state`] the store calls under its own locks.
+/// - The namespace and grantee are read back OUT of the proof by the store, so
+///   a caller cannot authorize one namespace and then mutate a different one.
+///   That last point is what makes it a proof rather than a permission slip.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegationGrant {
+    actor: Uuid,
+    namespace: String,
+    grantee: Uuid,
+}
+
+impl DelegationGrant {
+    /// Run the check; on success, the returned value is the evidence.
+    ///
+    /// `actor` must be an authority derived from a LIVE read — the snapshot rule
+    /// this whole module is built on. [`DelegationService::grant`] resolves one
+    /// immediately before calling this.
+    pub fn authorize(
+        actor: &ActorAuthority,
+        namespace: &str,
+        grantee: Uuid,
+    ) -> Result<Self, ToolError> {
+        authorize_delegation_change(actor)?;
+        Ok(Self {
+            actor: actor.account_id(),
+            namespace: namespace.to_string(),
+            grantee,
+        })
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn grantee(&self) -> Uuid {
+        self.grantee
+    }
+
+    /// The account whose authority was checked, for the audit record.
+    pub fn actor(&self) -> Uuid {
+        self.actor
+    }
+}
+
+/// Proof that a delegation REVOCATION was authorized. See [`DelegationGrant`];
+/// same construction, same reasoning, and a separate type so a grant's evidence
+/// cannot be handed to a revocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegationRevocation {
+    actor: Uuid,
+    namespace: String,
+}
+
+impl DelegationRevocation {
+    pub fn authorize(actor: &ActorAuthority, namespace: &str) -> Result<Self, ToolError> {
+        authorize_delegation_change(actor)?;
+        Ok(Self {
+            actor: actor.account_id(),
+            namespace: namespace.to_string(),
+        })
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn actor(&self) -> Uuid {
+        self.actor
+    }
+}
+
 /// The store operations delegation needs, as a seam.
 ///
 /// A trait for the same reason [`crate::oauth::revoke::SessionStore`] is one:
@@ -365,15 +461,23 @@ pub trait DelegationStore: Send + Sync {
 
     /// Assign ownership, narrowing any clients the PREVIOUS owner had scoped to
     /// it, in one transaction.
+    ///
+    /// Takes the AUTHORIZATION, not the arguments: there is no way to call this
+    /// without having run the check, because the only way to obtain a
+    /// [`DelegationGrant`] is to pass it (see that type's docs). The namespace
+    /// and grantee are read out of the proof rather than accepted alongside it,
+    /// so an authorized grant cannot be redirected at a different namespace.
     async fn grant_namespace(
         &self,
-        namespace: &str,
-        grantee: Uuid,
+        grant: &DelegationGrant,
     ) -> Result<DelegationChange, ToolError>;
 
     /// Remove a delegation, narrowing every client scoped to it, in one
-    /// transaction.
-    async fn revoke_namespace(&self, namespace: &str) -> Result<DelegationChange, ToolError>;
+    /// transaction. Same construction as [`Self::grant_namespace`].
+    async fn revoke_namespace(
+        &self,
+        revocation: &DelegationRevocation,
+    ) -> Result<DelegationChange, ToolError>;
 
     /// Every delegation, for the operator's view.
     async fn list_server_owners(&self) -> Result<Vec<ServerOwner>, ToolError>;
@@ -415,6 +519,14 @@ impl DelegationService {
         grantee_name: &str,
     ) -> Result<DelegationChange, ToolError> {
         let actor = ActorAuthority::resolve(self.store.as_ref(), actor_account_id).await?;
+        // Checked BEFORE the grantee is looked up, and that ordering is the
+        // whole reason this call is here rather than only inside
+        // `DelegationGrant::authorize` below. Resolving a name first would let
+        // an unauthorized caller distinguish "no such account" from "not
+        // allowed" — an account-existence oracle handed to precisely the caller
+        // who should learn nothing. It is the same predicate, not a second
+        // rule: the proof below is what the store will actually accept, and
+        // this is only the order in which the caller learns the answer.
         authorize_delegation_change(&actor)?;
         let Some(grantee) = self.store.account_id_by_name(grantee_name).await? else {
             // Same answer as a disabled account below would give: this must not
@@ -424,7 +536,8 @@ impl DelegationService {
         if self.store.account_authority(grantee).await?.is_none() {
             return Err(ToolError::NotFound("no such active account".into()));
         }
-        let change = self.store.grant_namespace(namespace, grantee).await?;
+        let grant = DelegationGrant::authorize(&actor, namespace, grantee)?;
+        let change = self.store.grant_namespace(&grant).await?;
         OauthAuditRecord::new(OauthEvent::DelegationChanged)
             .account(actor.account_id())
             .detail(AuditDetail::DelegationGranted {
@@ -447,8 +560,8 @@ impl DelegationService {
         namespace: &str,
     ) -> Result<DelegationChange, ToolError> {
         let actor = ActorAuthority::resolve(self.store.as_ref(), actor_account_id).await?;
-        authorize_delegation_change(&actor)?;
-        let change = self.store.revoke_namespace(namespace).await?;
+        let revocation = DelegationRevocation::authorize(&actor, namespace)?;
+        let change = self.store.revoke_namespace(&revocation).await?;
         OauthAuditRecord::new(OauthEvent::DelegationChanged)
             .account(actor.account_id())
             .detail(AuditDetail::DelegationCleared {
@@ -616,6 +729,52 @@ mod tests {
         assert!(!owner_may_hold(GroupOwner::Delegated, PatternShape::Local));
     }
 
+    // ── The proof values: producing one IS the check ─────────────────────────
+
+    #[test]
+    fn only_an_operator_can_produce_a_delegation_proof() {
+        let operator = operator();
+        let delegated = delegated(&["peerone"]);
+
+        DelegationGrant::authorize(&operator, "peerone", Uuid::from_u128(2))
+            .expect("an operator may authorize a grant");
+        DelegationRevocation::authorize(&operator, "peerone")
+            .expect("an operator may authorize a revocation");
+
+        // And a delegated owner cannot — not even for the server they own, and
+        // not even to give it away. Delegation does not chain.
+        assert!(DelegationGrant::authorize(&delegated, "peerone", Uuid::from_u128(3)).is_err());
+        assert!(DelegationRevocation::authorize(&delegated, "peerone").is_err());
+    }
+
+    /// The proof CARRIES the decision's inputs, which is what makes it a proof
+    /// rather than a marker token: the store reads the namespace and grantee
+    /// back out of it, so an authorized grant cannot be redirected at a
+    /// different namespace after the fact.
+    #[test]
+    fn a_proof_carries_the_inputs_it_was_authorized_for() {
+        let operator = operator();
+        let grant = DelegationGrant::authorize(&operator, "peerone", Uuid::from_u128(2)).unwrap();
+        assert_eq!(grant.namespace(), "peerone");
+        assert_eq!(grant.grantee(), Uuid::from_u128(2));
+        assert_eq!(grant.actor(), operator.account_id());
+
+        let revocation = DelegationRevocation::authorize(&operator, "peertwo").unwrap();
+        assert_eq!(revocation.namespace(), "peertwo");
+        assert_eq!(revocation.actor(), operator.account_id());
+    }
+
+    /// Mutation-verify: delete the `authorize_delegation_change(actor)?` line
+    /// from either constructor and this goes red. It asserts the REFUSAL, which
+    /// is the half a happy-path test cannot see.
+    #[test]
+    fn deleting_the_check_from_a_proof_constructor_would_be_caught() {
+        let delegated = delegated(&["peerone"]);
+        let err = DelegationGrant::authorize(&delegated, "peerone", Uuid::from_u128(3))
+            .expect_err("a delegated owner must not be able to mint a grant proof");
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
     // ── The service, against a fake store ────────────────────────────────────
 
     #[derive(Default)]
@@ -649,9 +808,9 @@ mod tests {
 
         async fn grant_namespace(
             &self,
-            namespace: &str,
-            grantee: Uuid,
+            grant: &DelegationGrant,
         ) -> Result<DelegationChange, ToolError> {
+            let (namespace, grantee) = (grant.namespace(), grant.grantee());
             let mut owners = self.owners.lock().unwrap();
             let reassigned = owners.iter().any(|o| o.namespace == namespace);
             owners.retain(|o| o.namespace != namespace);
@@ -664,7 +823,11 @@ mod tests {
             Ok(DelegationChange { reassigned, rows_narrowed })
         }
 
-        async fn revoke_namespace(&self, namespace: &str) -> Result<DelegationChange, ToolError> {
+        async fn revoke_namespace(
+            &self,
+            revocation: &DelegationRevocation,
+        ) -> Result<DelegationChange, ToolError> {
+            let namespace = revocation.namespace();
             let mut owners = self.owners.lock().unwrap();
             let existed = owners.iter().any(|o| o.namespace == namespace);
             owners.retain(|o| o.namespace != namespace);

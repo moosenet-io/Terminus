@@ -339,7 +339,7 @@ pub fn register(registry: &mut ToolRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oauth::delegation::DelegationChange;
+    use crate::oauth::delegation::{DelegationChange, DelegationGrant, DelegationRevocation};
     use crate::oauth::model::ServerOwner;
     use std::sync::Mutex;
 
@@ -381,9 +381,9 @@ mod tests {
 
         async fn grant_namespace(
             &self,
-            namespace: &str,
-            grantee: Uuid,
+            grant: &DelegationGrant,
         ) -> Result<DelegationChange, ToolError> {
+            let (namespace, grantee) = (grant.namespace(), grant.grantee());
             let mut owners = self.owners.lock().unwrap();
             let reassigned = owners.iter().any(|o| o.namespace == namespace);
             owners.retain(|o| o.namespace != namespace);
@@ -395,7 +395,11 @@ mod tests {
             Ok(DelegationChange { reassigned, rows_narrowed: 0 })
         }
 
-        async fn revoke_namespace(&self, namespace: &str) -> Result<DelegationChange, ToolError> {
+        async fn revoke_namespace(
+            &self,
+            revocation: &DelegationRevocation,
+        ) -> Result<DelegationChange, ToolError> {
+            let namespace = revocation.namespace();
             let mut owners = self.owners.lock().unwrap();
             let existed = owners.iter().any(|o| o.namespace == namespace);
             owners.retain(|o| o.namespace != namespace);

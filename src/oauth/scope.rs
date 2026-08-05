@@ -1412,28 +1412,43 @@ impl ScopeResolver {
         result
     }
 
-    /// Grant server ownership, then drop EVERY cached scope.
+    /// Grant server ownership AS `actor_account_id`, then drop EVERY cached
+    /// scope.
     ///
-    /// This and [`Self::clear_server_owner`] are why
-    /// [`Self::invalidate_all`] exists. A delegation change's blast radius is
-    /// not one client: it can narrow every connector owned by the account that
-    /// just lost the namespace, and this process does not know which those are
-    /// without asking the store. Dropping the whole map costs a re-read per
-    /// client and is the only version of this that cannot miss one.
+    /// This and [`Self::revoke_server_owner`] are why [`Self::invalidate_all`]
+    /// exists. A delegation change's blast radius is not one client: it can
+    /// narrow every connector owned by the account that just lost the
+    /// namespace, and this process does not know which those are without asking
+    /// the store. Dropping the whole map costs a re-read per client and is the
+    /// only version of this that cannot miss one.
     ///
-    /// Authorization is NOT here — [`crate::oauth::delegation::DelegationService`]
-    /// decides who may grant, against a freshly resolved authority. This method
-    /// is the cache's half of the same action, and is not a second door: the
-    /// store bumps the process-global epoch either way, so a caller that goes
-    /// straight to the store is equally safe (that is the property
-    /// [`ScopeWrite`] exists to guarantee). What it gains is that the entries
-    /// are also FREED rather than left resident-but-stale.
+    /// ## The actor is an argument because round 1 found it missing
+    ///
+    /// The first version of this method took only a namespace and an owner, and
+    /// called the store's raw mutator. That made the resolver a SECOND,
+    /// unauthorized door onto delegation: every rule
+    /// [`crate::oauth::delegation`] enforces was bypassable by calling this
+    /// instead of [`crate::oauth::delegation::DelegationService`]. The store's
+    /// mutators are now private and demand a proof value that can only be
+    /// produced by running the check, so this method could not be written that
+    /// way today — but it also no longer wants to be. It delegates to the same
+    /// service every other caller uses, and adds exactly one thing: the cache
+    /// drop.
+    ///
+    /// The epoch bump alone is already sufficient for CORRECTNESS (see
+    /// [`ScopeWrite`]) — no stale entry can be served across a delegation write
+    /// whether or not this method is the one used. What the explicit drop adds
+    /// is that the entries are FREED rather than left resident-but-unusable.
     pub async fn set_server_owner(
         &self,
+        actor_account_id: Uuid,
         namespace: &str,
-        owner_account_id: Uuid,
+        grantee_name: &str,
     ) -> Result<crate::oauth::delegation::DelegationChange, ToolError> {
-        let result = self.store.set_server_owner(namespace, owner_account_id).await;
+        let result = self
+            .delegation()
+            .grant(actor_account_id, namespace, grantee_name)
+            .await;
         // On the FAILURE path too, for the same reason as every other write
         // here: re-reading a correct answer costs one query, and a missed
         // invalidation leaves revoked authority live.
@@ -1441,15 +1456,27 @@ impl ScopeResolver {
         result
     }
 
-    /// Revoke server ownership, then drop every cached scope. See
-    /// [`Self::set_server_owner`].
-    pub async fn clear_server_owner(
+    /// Revoke server ownership AS `actor_account_id`, then drop every cached
+    /// scope. See [`Self::set_server_owner`].
+    pub async fn revoke_server_owner(
         &self,
+        actor_account_id: Uuid,
         namespace: &str,
     ) -> Result<crate::oauth::delegation::DelegationChange, ToolError> {
-        let result = self.store.clear_server_owner(namespace).await;
+        let result = self.delegation().revoke(actor_account_id, namespace).await;
         self.invalidate_all();
         result
+    }
+
+    /// The delegation service over this resolver's own store.
+    ///
+    /// Constructed per call rather than held: it is a handle around the same
+    /// `Arc`, and building it here means there is no second place where an
+    /// authority could be cached across requests.
+    fn delegation(&self) -> crate::oauth::delegation::DelegationService {
+        crate::oauth::delegation::DelegationService::new(
+            Arc::clone(&self.store) as Arc<dyn crate::oauth::delegation::DelegationStore>
+        )
     }
 
     /// Enable or disable a client, then invalidate.
