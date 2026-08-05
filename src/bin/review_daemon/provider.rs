@@ -746,12 +746,43 @@ mod tests {
     /// stdlib `flag` package, where `-p`/`--print` is a value-taking STRING
     /// flag, while `claude`'s `-p` is a genuine BOOLEAN.
     ///
-    /// Each entry below is measured against the installed CLI, not inferred:
-    ///   - agy `-p` value-taking: `agy --model M -p` → "flag needs an argument: -p".
-    ///   - claude `-p` boolean:   `claude --model opus -p --output-format text`
-    ///     with the prompt on stdin returns the answer (the following flag is
-    ///     parsed as a flag, not eaten as a value).
-    ///   - codex reads stdin with no positional: `codex exec --skip-git-repo-check`.
+    /// **Provenance of every entry, because a table like this is exactly the
+    /// kind of unverified assumption that caused the bug it guards against.**
+    /// An earlier revision of this comment claimed all entries were "measured";
+    /// a reviewer correctly pointed out that only four of them actually were.
+    /// They have since ALL been measured, by the methods named below. If an
+    /// entry is ever added without a probe, say so here rather than inheriting
+    /// this sentence.
+    ///
+    /// **agy** -- probed on the daemon host by passing each flag as the LAST
+    /// argv element. Go's `flag` package reports `flag needs an argument: X`
+    /// for a value-taking flag and does not for a boolean:
+    /// ```text
+    ///   -p --print --prompt --model --effort --output-format --mode --agent
+    ///                                     → "flag needs an argument"  = VALUE-TAKING
+    ///   --dangerously-skip-permissions --disable-slash-commands
+    ///                                     → parsed, no complaint      = BOOLEAN
+    /// ```
+    ///
+    /// **claude** -- read from `claude --help`, where a value-taking option
+    /// prints a value placeholder and a boolean does not: `--model <model>`,
+    /// `--output-format <format>`, `--effort <level>`, `--tools <tools...>` all
+    /// take a value, while `-p, --print` has NO placeholder and is a genuine
+    /// BOOLEAN. Cross-checked live: `claude --model opus -p --output-format
+    /// text` with the prompt on stdin returns the answer, so the flag following
+    /// `-p` is parsed as a flag rather than eaten as its value.
+    ///
+    /// **codex** -- from `codex exec --help`: `-c, --config <key=value>` and
+    /// `-m, --model <MODEL>` take values; `--skip-git-repo-check` is a boolean.
+    /// `--sandbox <mode>` and `--output-last-message <path>` are listed here as
+    /// value-taking on the strength of their in-tree use (`--sandbox read-only`,
+    /// `--output-last-message <tmpfile>`), which dispatches successfully.
+    ///
+    /// NOTE `--tools`/`--allowedTools` are VARIADIC on claude (`<tools...>`),
+    /// not single-valued. They stop at the next `-`-prefixed token, so a flag
+    /// following the tool list is still parsed as a flag. Only `--tools` is
+    /// listed, because it is the one the builder emits with a single (empty)
+    /// value; the guard deliberately does not model variadic arity.
     fn value_taking_flags(binary: &str) -> &'static [&'static str] {
         match binary {
             // Go `flag` package: every non-bool flag takes the next element

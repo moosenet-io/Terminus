@@ -804,6 +804,91 @@ mod tests {
         assert_eq!(out.expect("silent-then-speaking must complete"), "READY");
     }
 
+    /// RVXAGY-01, raised by the review panel: the builder-level tests prove only
+    /// that the payload was ASSIGNED to `stdin_prompt`. They cannot prove the
+    /// EXECUTOR delivers it. This test closes that gap against a REAL process.
+    ///
+    /// `cat` echoes its stdin verbatim, so a payload that survives the round
+    /// trip byte-for-byte proves the whole chain: pipe wiring, the spawned
+    /// writer task, and the EOF shutdown that makes the child stop reading. The
+    /// size is deliberately far past both the 64 KiB argv threshold and the
+    /// 64 KiB default OS pipe buffer -- a payload larger than the pipe buffer is
+    /// exactly the case a blocking (unspawned) write would DEADLOCK on, so this
+    /// also pins the concurrency of the writer against the output pumps.
+    #[tokio::test]
+    async fn the_executor_delivers_an_oversized_stdin_payload_whole_to_a_real_process() {
+        // Head and tail sentinels so truncation at EITHER end is caught, not
+        // just a length mismatch.
+        let mut payload = String::from("HEAD-SENTINEL-7f3a\n");
+        payload.push_str(&"payload line that exists only to exceed the pipe buffer\n".repeat(4000));
+        payload.push_str("TAIL-SENTINEL-9c1b");
+        assert!(
+            payload.len() > provider::MAX_PROMPT_ARGV_BYTES,
+            "payload must exceed the argv threshold to exercise the stdin path"
+        );
+
+        let built = provider::BuiltCommand {
+            binary: "cat",
+            args: vec![],
+            output_path: None,
+            stdin_prompt: Some(payload.clone()),
+        };
+        let stall = StallConfig { timeout_secs: 60, stall_secs: None };
+        let out = run_built_command(
+            &built,
+            std::path::Path::new("/bin/cat"),
+            &stall,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .expect("cat must echo the payload back");
+
+        // `run_built_command` trims the reply, so compare against the trimmed
+        // payload rather than weakening the assertion to a `contains`.
+        assert_eq!(
+            out.len(),
+            payload.trim().len(),
+            "payload length changed in transit: sent {}, got {}",
+            payload.trim().len(),
+            out.len()
+        );
+        assert_eq!(out, payload.trim(), "payload not delivered byte-for-byte");
+        assert!(out.starts_with("HEAD-SENTINEL-7f3a"), "head lost in transit");
+        assert!(out.ends_with("TAIL-SENTINEL-9c1b"), "tail lost in transit");
+    }
+
+    /// The companion negative: with `stdin_prompt: None` the child must get
+    /// `Stdio::null()`, i.e. an IMMEDIATE EOF rather than an inherited or
+    /// dangling stdin. Without this, the small-prompt path could silently start
+    /// blocking on a terminal and hang the daemon. `cat` with null stdin reads
+    /// EOF at once and exits with empty output.
+    #[tokio::test]
+    async fn the_normal_path_gives_the_child_a_closed_stdin_not_a_hanging_one() {
+        let built = provider::BuiltCommand {
+            binary: "cat",
+            args: vec![],
+            output_path: None,
+            stdin_prompt: None,
+        };
+        let stall = StallConfig { timeout_secs: 10, stall_secs: None };
+        let out = run_built_command(
+            &built,
+            std::path::Path::new("/bin/cat"),
+            &stall,
+            None,
+            &HashMap::new(),
+        )
+        .await;
+        // Empty output is reported as the `empty_output` error kind, NOT a
+        // timeout -- a timeout here would mean stdin was left open and the
+        // child hung.
+        match out {
+            Err(("empty_output", _)) | Ok(_) => {}
+            Err((kind, detail)) => panic!("expected immediate EOF, got {kind}: {detail}"),
+        }
+    }
+
     /// The `last_ms==0` sentinel edge case: a provider that prints IMMEDIATELY
     /// (first output within the first ms → elapsed 0) and THEN wedges must still be
     /// stall-killed — not mistaken for "never spoke". The +1 sentinel guarantees this.
