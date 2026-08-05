@@ -327,8 +327,8 @@ mod tests {
             if path.extension().map(|e| e != "rs").unwrap_or(true) {
                 continue;
             }
-            let body = non_test_source(&fs::read_to_string(&path).expect("read kg source"));
-            for (i, line) in body.lines().enumerate() {
+            let source = fs::read_to_string(&path).expect("read kg source");
+            for (i, line) in non_test_source(&source).lines().enumerate() {
                 let code = line.split("//").next().unwrap_or("");
                 if code.contains("slugify(") {
                     offenders.push(format!("{}:{}", path.display(), i + 1));
@@ -354,8 +354,8 @@ mod tests {
             if path.extension().map(|e| e != "rs").unwrap_or(true) {
                 continue;
             }
-            let body = non_test_source(&fs::read_to_string(&path).expect("read kg source"));
-            for (i, line) in body.lines().enumerate() {
+            let source = fs::read_to_string(&path).expect("read kg source");
+            for (i, line) in non_test_source(&source).lines().enumerate() {
                 let code = line.split("//").next().unwrap_or("");
                 if code.contains("no knowledge graph for this project") {
                     offenders.push(format!("{}:{}", path.display(), i + 1));
