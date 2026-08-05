@@ -560,9 +560,9 @@ built, and which visual artifacts exist. Returns found:false if no graph has bee
         Ok(structured(json!({
             "project_id": project_id, "found": true,
             "graph_key": slug,
-            "graph_built_at": built_at.and_then(|t| {
+            "graph_built_at": built_at.map(|t| {
                 let dt: chrono::DateTime<chrono::Utc> = t.into();
-                Some(dt.to_rfc3339())
+                dt.to_rfc3339()
             }),
             "graph_age_seconds": built_at.and_then(|t| {
                 std::time::SystemTime::now().duration_since(t).ok().map(|d| d.as_secs())

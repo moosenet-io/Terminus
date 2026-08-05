@@ -137,6 +137,27 @@ impl ProjectKey {
     }
 }
 
+/// Every key a lookup for `raw` must consider: the project's canonical key, all
+/// of its aliases, AND the caller's raw string exactly as given.
+///
+/// The raw string is the load-bearing part. Review finding (opus, verified):
+/// binding only `aliases()` turned an intended WIDENING into a silent
+/// NARROWING. `kg_findings` rows are keyed by whatever string the recording
+/// review passed — in this pipeline `"TERM"` or a project UUID — and
+/// `aliases()` contains only normalized keys, so `list("TERM")` matched
+/// `["term", "terminus"]` and therefore matched NOTHING. An empty findings
+/// list that reads as "this project has no findings" is exactly the
+/// absence-that-looks-like-a-result failure this change exists to remove, so
+/// this function is defined to return a SUPERSET of the old exact match:
+/// whatever `= raw` used to find, `= ANY(lookup_keys(raw))` still finds.
+pub fn lookup_keys(raw: &str) -> Vec<String> {
+    let mut keys = ProjectKey::resolve(raw).aliases();
+    if !keys.iter().any(|k| k == raw) {
+        keys.push(raw.to_string());
+    }
+    keys
+}
+
 impl std::fmt::Display for ProjectKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -544,6 +565,27 @@ mod tests {
             "a UUID-keyed store must be reachable from the slug: {a:?}"
         );
         std::env::remove_var(ALIASES_ENV); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
+    }
+
+    #[test]
+    fn lookup_keys_is_always_a_superset_of_the_raw_string() {
+        let _g = env_lock();
+        std::env::remove_var(ALIASES_ENV); // hermeticity-allow: serialized on env_lock(); serial_test is unavailable to the standalone harness
+        // The exact strings this fleet records findings under.
+        for raw in ["TERM", "Terminus", "CHRD", "chrd", "MUSE", "muse", "Some-Odd_Name"] {
+            let keys = lookup_keys(raw);
+            assert!(
+                keys.iter().any(|k| k == raw),
+                "lookup for {raw:?} must still match the raw string it used to match: {keys:?}"
+            );
+            assert!(
+                keys.iter().any(|k| k == ProjectKey::resolve(raw).as_str()),
+                "lookup for {raw:?} must include the canonical key: {keys:?}"
+            );
+        }
+        // ...and it still widens across spellings.
+        let k = lookup_keys("CHRD");
+        assert!(k.contains(&"chrd".to_string()) && k.contains(&"chord".to_string()), "{k:?}");
     }
 
     #[test]

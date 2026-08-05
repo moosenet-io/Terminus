@@ -1338,6 +1338,7 @@ pub struct Widget;
             ("kg_stats", json!({"project_id": "FRESH"})),
             ("kg_communities", json!({"project_id": "FRESH"})),
             ("kg_file_symbols", json!({"project_id": "FRESH", "path": "src/w.rs"})),
+            ("kg_query", json!({"project_id": "FRESH", "question": "where is helper"})),
         ];
         for (name, args) in cases {
             let out = match name {
@@ -1348,6 +1349,7 @@ pub struct Widget;
                 "kg_stats" => KgStats.execute_structured(args).await,
                 "kg_communities" => KgCommunities.execute_structured(args).await,
                 "kg_file_symbols" => KgFileSymbols.execute_structured(args).await,
+                "kg_query" => KgQuery.execute_structured(args).await,
                 other => panic!("unhandled tool {other}"),
             }
             .unwrap_or_else(|e| panic!("{name} failed: {e:?}"));
