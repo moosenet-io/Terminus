@@ -410,6 +410,22 @@ fn parse_loopback(uri: &str) -> Option<LoopbackUri<'_>> {
     Some(LoopbackUri { host, rest })
 }
 
+/// Whether a URI is an RFC 8252 loopback redirect, by the SAME rules the
+/// matcher applies.
+///
+/// Exported for RMCP-08's registration validation, which must accept exactly
+/// the loopback URIs this module will later honour. A second definition over
+/// there — "starts with `http://127.0.0.1`", say — would be the more dangerous
+/// half of a disagreement: it would register a URI whose userinfo makes its
+/// real host somebody else's, and [`parse_loopback`]'s refusal of `@` would
+/// then be a guard that never sees the value it exists to catch.
+///
+/// One parser, one answer. `parse_loopback` itself stays private because its
+/// split-out parts are only meaningful to the matcher.
+pub(crate) fn is_loopback_redirect_uri(uri: &str) -> bool {
+    parse_loopback(uri).is_some()
+}
+
 /// Whether a presented redirect URI matches a registered one.
 ///
 /// EXACT string comparison, with the single RFC 8252 loopback exception

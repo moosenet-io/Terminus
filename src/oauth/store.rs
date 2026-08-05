@@ -26,15 +26,17 @@ use uuid::Uuid;
 
 use crate::error::ToolError;
 use crate::oauth::delegation::{
-    authorize_client_write, authorize_namespace_scoping, reverify_delegation_change,
-    ActorAuthority, DelegationChange, DelegationGrant, DelegationRevocation, DelegationStore,
+    authorize_client_write, authorize_namespace_scoping, authorize_operator_action,
+    reverify_delegation_change, ActorAuthority, DelegationChange, DelegationGrant,
+    DelegationRevocation, DelegationStore,
 };
 use crate::oauth::groups::{
     normalize_description, validate_group, validate_patterns, AuthorizedGroup, Pattern,
     MAX_GROUPS_PER_CLIENT, STARTER_GROUPS,
 };
 use crate::oauth::model::{
-    Account, AuthCode, Client, Consent, RefreshToken, ServerOwner, TokenFamily, ToolGroup,
+    Account, AuthCode, Client, ClientAdmin, Consent, RefreshToken, ServerOwner, TokenFamily,
+    ToolGroup,
 };
 use crate::oauth::revoke::{DispatchState, SessionStore};
 use crate::oauth::scope::ScopeWrite;
@@ -71,7 +73,7 @@ fn max_connections() -> u32 {
 /// rather than one per item: "the schema this code needs" is a single question,
 /// and a per-item split would let a deploy that applied only the older file
 /// report ready while the login path's single-use guard had no table behind it.
-const REQUIRED_TABLES: [&str; 10] = [
+const REQUIRED_TABLES: [&str; 11] = [
     "rmcp_account",
     "rmcp_client",
     "rmcp_tool_group",
@@ -82,6 +84,13 @@ const REQUIRED_TABLES: [&str; 10] = [
     "rmcp_consent",
     "rmcp_server_owner",
     "rmcp_login_session_use",
+    // RMCP-08. Listed even though dynamic client registration is OFF by
+    // default: the table also backs the operator's minting of initial access
+    // tokens, and — more to the point — a readiness check that passes on a
+    // partially applied migration is the confident-but-wrong "ready" this
+    // whole check exists to prevent. A deployment that has not applied the
+    // RMCP-08 migration is not ready, whatever it has DCR set to.
+    "rmcp_registration_token",
 ];
 
 /// Columns added to an EXISTING table by a later S132 migration, which the
@@ -90,7 +99,22 @@ const REQUIRED_TABLES: [&str; 10] = [
 /// `rmcp_account.is_operator` (RMCP-06) is load-bearing for authorization, not
 /// merely for a feature: it is the only source of truth for whether an author
 /// may write a bare `*` pattern. A deploy missing it must report NOT ready.
-const REQUIRED_COLUMNS: [(&str, &str); 1] = [("rmcp_account", "is_operator")];
+const REQUIRED_COLUMNS: [(&str, &str); 2] = [
+    ("rmcp_account", "is_operator"),
+    // RMCP-08. `rmcp_client.version` is the optimistic-concurrency token every
+    // administrative write states and re-checks. Without the column the
+    // administration tools fail with an opaque "column does not exist" on the
+    // first edit; with this line the deployment says so at startup instead.
+    ("rmcp_client", "version"),
+];
+
+/// The refusal an unauthorized initial-access-token action carries (RMCP-08).
+///
+/// A `&'static str`, so it names the action for the operator reading the error
+/// and can carry nothing a caller submitted. It never reaches the audit record,
+/// which stays the closed `ScopingRefusal` vocabulary.
+const OPERATOR_ONLY_REGISTRATION_TOKEN: &str =
+    "only an operator account may mint or revoke registration tokens";
 
 /// Repository over the `rmcp_*` tables.
 #[derive(Clone)]
@@ -296,8 +320,21 @@ impl OauthStore {
     /// (which is what Claude registers as), and an [`Argon2idHash`] otherwise —
     /// same enforcement-by-type as [`Self::insert_account`].
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// `actor_account_id` is the account CREATING the client, and it is
+    /// authorized inside this transaction: an operator may create a connector
+    /// owned by anyone, and anyone else only one owned by themselves (RMCP-08
+    /// review round 2).
+    ///
+    /// Without that check, naming another account as `owner` would be enough to
+    /// mint a connector in their name and then scope it to THEIR groups and
+    /// namespaces — because the scoping write authorizes against the client's
+    /// owner. It is the same defect class as the unauthorized edit, reached
+    /// through creation rather than through modification.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_client(
         &self,
+        actor_account_id: Uuid,
         client_id: &str,
         client_secret_hash: Option<&Argon2idHash>,
         name: &str,
@@ -308,7 +345,17 @@ impl OauthStore {
         registration_source: &str,
     ) -> Result<Uuid, ToolError> {
         let _scope_write = ScopeWrite::begin();
-        sqlx::query_scalar::<_, Uuid>(
+        let mut tx = self.pool.begin().await.map_err(db)?;
+
+        // `authorize_client_write` reads exactly this rule — operator, or the
+        // owner themselves — so creation and modification are decided by ONE
+        // function rather than two that could drift. The "client owner" it is
+        // given is the owner the caller asked for, which is what makes
+        // "creating a connector for somebody else" the operator-only case.
+        let actor = Self::actor_authority(&mut tx, actor_account_id).await?;
+        authorize_client_write(&actor, owner_account_id)?;
+
+        let id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO rmcp_client (client_id, client_secret_hash, name, redirect_uris, \
                                       grant_types, token_endpoint_auth_method, \
                                       owner_account_id, registration_source) \
@@ -322,9 +369,12 @@ impl OauthStore {
         .bind(token_endpoint_auth_method)
         .bind(owner_account_id)
         .bind(registration_source)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(unique_aware("a client with that client_id already exists"))
+        .map_err(unique_aware("a client with that client_id already exists"))?;
+
+        tx.commit().await.map_err(db)?;
+        Ok(id)
     }
 
     /// List the clients an account owns.
@@ -910,6 +960,30 @@ impl OauthStore {
         .map_err(db)
     }
 
+    /// The group-count bound, checked before any transaction is opened.
+    ///
+    /// Bound the client's total resolution cost at the point an operator is
+    /// present to read the error. Every group contributes up to
+    /// MAX_PATTERNS_PER_GROUP patterns, and resolution walks the concatenated
+    /// list once per catalog tool, so the group count is what turns a bounded
+    /// per-group cap into an unbounded aggregate. Refused rather than
+    /// truncated: silently dropping groups would store a scope different from
+    /// the one the operator just asked for.
+    ///
+    /// Split out so RMCP-08's atomic administrative edit applies the same bound
+    /// before IT opens a transaction, rather than carrying a second copy of the
+    /// number.
+    fn check_group_budget(group_ids: &[Uuid]) -> Result<(), ToolError> {
+        let distinct = group_ids.iter().collect::<std::collections::HashSet<_>>().len();
+        if distinct > MAX_GROUPS_PER_CLIENT {
+            return Err(ToolError::InvalidArgument(format!(
+                "a client may be scoped to at most {MAX_GROUPS_PER_CLIENT} tool groups \
+                 (requested {distinct}); combine patterns into fewer groups"
+            )));
+        }
+        Ok(())
+    }
+
     /// Replace a client's group assignments wholesale, in one transaction,
     /// after verifying that `actor` owns both the client and every group.
     ///
@@ -940,27 +1014,58 @@ impl OauthStore {
         client_id: Uuid,
         group_ids: &[Uuid],
     ) -> Result<(), ToolError> {
-        // Bound the client's total resolution cost at the point an operator is
-        // present to read the error. Every group here contributes up to
-        // MAX_PATTERNS_PER_GROUP patterns, and resolution walks the concatenated
-        // list once per catalog tool, so the group count is what turns a bounded
-        // per-group cap into an unbounded aggregate. Refused rather than
-        // truncated: silently dropping groups would store a scope different from
-        // the one the operator just asked for.
-        let distinct = group_ids.iter().collect::<std::collections::HashSet<_>>().len();
-        if distinct > MAX_GROUPS_PER_CLIENT {
-            return Err(ToolError::InvalidArgument(format!(
-                "a client may be scoped to at most {MAX_GROUPS_PER_CLIENT} tool groups \
-                 (requested {distinct}); combine patterns into fewer groups"
-            )));
-        }
+        Self::check_group_budget(group_ids)?;
 
         // Established AFTER the cheap argument check: `ScopeWrite::begin` bumps
         // the epoch immediately, so entering it only to reject the request would
         // invalidate every cached resolution for a write that never happened.
         let _scope_write = ScopeWrite::begin();
         let mut tx = self.pool.begin().await.map_err(db)?;
+        Self::set_client_tool_groups_in_tx(
+            &mut tx,
+            &_scope_write,
+            actor_account_id,
+            client_id,
+            group_ids,
+        )
+        .await?;
+        // Invalidates on the ERROR path too: a commit that failed to report is
+        // not a commit that provably did not happen, and an unnecessary
+        // invalidation costs one store read while a missed one leaves a revoked
+        // permission live.
+        tx.commit().await.map_err(db)
+    }
 
+    /// The group-scoping write itself, INSIDE a caller's transaction.
+    ///
+    /// ## Why this is split out
+    /// RMCP-08's administrative edit changes a client's enabled state, its
+    /// redirect URIs, its groups and its namespaces in one operator action.
+    /// Applied as separate transactions, a failure partway leaves the client
+    /// ENABLED with its old scope — a half-applied authorization change, and the
+    /// one kind least worth leaving behind. Sharing this body is what lets the
+    /// whole edit commit or not at all, without a second copy of the
+    /// authorization rules that decide it.
+    ///
+    /// Every rule below is RMCP-12's, unchanged: `actor_authority` +
+    /// `locked_client_owner` + [`authorize_client_write`], all read under `FOR
+    /// SHARE` in the caller's transaction. This split moved WHERE the
+    /// transaction is opened, never what it checks.
+    ///
+    /// ## The `_scope_write` parameter
+    /// A WITNESS, not a value: a `&ScopeWrite` cannot be produced without a live
+    /// guard, so this function is uncallable unless the caller is holding one
+    /// and will therefore invalidate the resolution cache on both sides of the
+    /// write. That is a compiler check where the crate-wide scanner
+    /// (`no_in_crate_write_bypasses_scope_invalidation`) can only make a
+    /// textual one, and the scanner recognises it for exactly that reason.
+    async fn set_client_tool_groups_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        _scope_write: &ScopeWrite,
+        actor_account_id: Uuid,
+        client_id: Uuid,
+        group_ids: &[Uuid],
+    ) -> Result<(), ToolError> {
         // The actor's authority and the client's owner, both read under `FOR
         // SHARE` in this transaction. Without the locks the checks are a TOCTOU:
         // a concurrent transfer or demotion could land in the gap and the write
@@ -969,14 +1074,14 @@ impl OauthStore {
         // Same answer for "no such client" and "not yours" (see
         // `delegation::authorize_client_write`): distinguishing them would
         // confirm the existence of another account's client.
-        let actor = Self::actor_authority(&mut tx, actor_account_id).await?;
-        let Some(client_owner) = Self::locked_client_owner(&mut tx, client_id).await? else {
+        let actor = Self::actor_authority(tx, actor_account_id).await?;
+        let Some(client_owner) = Self::locked_client_owner(tx, client_id).await? else {
             return Err(ToolError::NotFound("no such client for this account".into()));
         };
         authorize_client_write(&actor, client_owner)?;
         // What this scope RESOLVES to is decided by the client owner's
         // holdings, so that is whose authority the group check runs against.
-        let owner_authority = Self::client_owner_authority(&mut tx, &actor, client_owner).await?;
+        let owner_authority = Self::client_owner_authority(tx, &actor, client_owner).await?;
 
         // Every requested group must belong to the actor, and each matching row
         // is LOCKED for the rest of the transaction (`FOR SHARE`) so ownership
@@ -990,7 +1095,7 @@ impl OauthStore {
         )
         .bind(group_ids)
         .bind(owner_authority.account_id())
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await
         .map_err(db)?
         .len() as i64;
@@ -1007,7 +1112,7 @@ impl OauthStore {
         // the outcome always one of the two intended states.
         sqlx::query("DELETE FROM rmcp_client_scope WHERE client_id = $1")
             .bind(client_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db)?;
         for group_id in group_ids {
@@ -1017,15 +1122,11 @@ impl OauthStore {
             )
             .bind(client_id)
             .bind(group_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db)?;
         }
-        // Invalidates on the ERROR path too: a commit that failed to report is
-        // not a commit that provably did not happen, and an unnecessary
-        // invalidation costs one store read while a missed one leaves a revoked
-        // permission live.
-        tx.commit().await.map_err(db)
+        Ok(())
     }
 
     /// Replace a client's namespace assignments wholesale, after verifying that
@@ -1044,7 +1145,32 @@ impl OauthStore {
     ) -> Result<(), ToolError> {
         let _scope_write = ScopeWrite::begin();
         let mut tx = self.pool.begin().await.map_err(db)?;
+        Self::set_client_namespaces_in_tx(
+            &mut tx,
+            &_scope_write,
+            actor_account_id,
+            client_id,
+            namespaces,
+        )
+        .await?;
+        // Invalidates on the ERROR path too: a commit that failed to report is
+        // not a commit that provably did not happen, and an unnecessary
+        // invalidation costs one store read while a missed one leaves a revoked
+        // permission live.
+        tx.commit().await.map_err(db)
+    }
 
+    /// The namespace-scoping write itself, INSIDE a caller's transaction. Split
+    /// out for the same reason as [`Self::set_client_tool_groups_in_tx`], and
+    /// carrying the same `_scope_write` witness — see that function's doc. Every
+    /// authorization rule below is RMCP-12's, unchanged.
+    async fn set_client_namespaces_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        _scope_write: &ScopeWrite,
+        actor_account_id: Uuid,
+        client_id: Uuid,
+        namespaces: &[String],
+    ) -> Result<(), ToolError> {
         // `FOR SHARE` throughout, exactly as in `set_client_tool_groups`. Round
         // 8 caught that this copy had been left as an unlocked `SELECT EXISTS`
         // while its own doc comment claimed the same locking guarantee — a
@@ -1056,8 +1182,8 @@ impl OauthStore {
         // race: `clear_server_owner` could otherwise land between the ownership
         // read and the insert, letting a former owner attach a server they no
         // longer own.
-        let actor = Self::actor_authority(&mut tx, actor_account_id).await?;
-        let Some(client_owner) = Self::locked_client_owner(&mut tx, client_id).await? else {
+        let actor = Self::actor_authority(tx, actor_account_id).await?;
+        let Some(client_owner) = Self::locked_client_owner(tx, client_id).await? else {
             return Err(ToolError::NotFound("no such client for this account".into()));
         };
         authorize_client_write(&actor, client_owner)?;
@@ -1071,12 +1197,12 @@ impl OauthStore {
         // `client_namespaces` re-joins on at resolution time. Checking the
         // actor's instead would let an operator write rows for a delegated
         // user's client that then resolve to nothing.
-        let owner_authority = Self::client_owner_authority(&mut tx, &actor, client_owner).await?;
+        let owner_authority = Self::client_owner_authority(tx, &actor, client_owner).await?;
         authorize_namespace_scoping(&owner_authority, namespaces)?;
 
         sqlx::query("DELETE FROM rmcp_client_server WHERE client_id = $1")
             .bind(client_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db)?;
         for namespace in namespaces {
@@ -1086,15 +1212,422 @@ impl OauthStore {
             )
             .bind(client_id)
             .bind(namespace)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db)?;
         }
-        // Invalidates on the ERROR path too: a commit that failed to report is
-        // not a commit that provably did not happen, and an unnecessary
-        // invalidation costs one store read while a missed one leaves a revoked
-        // permission live.
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // RMCP-08 — client administration and initial access tokens
+    //
+    // Every write below authorizes through RMCP-12's machinery
+    // (`actor_authority` + `locked_client_owner` + `authorize_client_write`, or
+    // `authorize_operator_action`), derived INSIDE the writing transaction
+    // under `FOR SHARE`. There is deliberately no second mechanism and no
+    // authority a caller can carry in: round 2 of RMCP-08's review found these
+    // writes constrained only by `id` and `version`, with the tool layer
+    // passing the TARGET ROW's own owner as the actor — which asks the object
+    // being modified who may modify it, and can only answer yes.
+    // -----------------------------------------------------------------------
+
+    /// The three administrative client queries, written out in full.
+    ///
+    /// ## Why the column list is repeated instead of shared
+    ///
+    /// It was a `const` spliced in with `format!()`. The interpolated value was
+    /// a local constant, so it was not exploitable — and review round 3
+    /// (`gpt56`) asked for it changed anyway, for a reason worth recording: the
+    /// value of "no SQL string interpolation anywhere in this module" is that it
+    /// is MECHANICALLY CHECKABLE. A scanner cannot tell "interpolating a
+    /// private constant" from "interpolating something a caller reached", so
+    /// every benign exception costs the rule its ability to be enforced by
+    /// anything except someone noticing. This sprint has already found several
+    /// guards that could not fail for the case they existed to catch; an
+    /// advisory version of this one would be another.
+    ///
+    /// The cost of writing it out is drift between three literals. That is
+    /// bounded and it is tested: `the_admin_queries_never_select_the_secret_hash`
+    /// asserts every one of them projects `(client_secret_hash IS NOT NULL) AS
+    /// confidential` and that none selects the hash itself — which is the only
+    /// property the shared constant was actually protecting.
+    const CLIENT_ADMIN_BY_ID: &'static str = "SELECT \
+         id, client_id, name, redirect_uris, grant_types, token_endpoint_auth_method, \
+         owner_account_id, registration_source, disabled, \
+         (client_secret_hash IS NOT NULL) AS confidential, created_at, version \
+         FROM rmcp_client WHERE id = $1";
+
+    const CLIENT_ADMIN_BY_OWNER: &'static str = "SELECT \
+         id, client_id, name, redirect_uris, grant_types, token_endpoint_auth_method, \
+         owner_account_id, registration_source, disabled, \
+         (client_secret_hash IS NOT NULL) AS confidential, created_at, version \
+         FROM rmcp_client WHERE ($1::uuid IS NULL OR owner_account_id = $1) \
+         ORDER BY created_at";
+
+    const CLIENT_ADMIN_UPDATE: &'static str = "UPDATE rmcp_client SET \
+         disabled = COALESCE($3::boolean, disabled), \
+         redirect_uris = COALESCE($4::text[], redirect_uris), \
+         version = version + 1 \
+         WHERE id = $1 AND version = $2 \
+         RETURNING \
+         id, client_id, name, redirect_uris, grant_types, token_endpoint_auth_method, \
+         owner_account_id, registration_source, disabled, \
+         (client_secret_hash IS NOT NULL) AS confidential, created_at, version";
+
+    /// One client, administratively. Includes DISABLED clients, unlike
+    /// [`Self::find_active_client`]: an operator managing a revoked connector
+    /// has to be able to see it, and this view authenticates nothing.
+    pub async fn find_client_admin(&self, id: Uuid) -> Result<Option<ClientAdmin>, ToolError> {
+        sqlx::query_as::<_, ClientAdmin>(Self::CLIENT_ADMIN_BY_ID)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)
+    }
+
+    /// Every client, administratively, or just one owner's.
+    ///
+    /// `None` means "every client". It is a READ, so a broad default is safe
+    /// here in a way it never is for a write — the same split
+    /// [`crate::tools::rmcp_session`] makes between its listing and its
+    /// revocation.
+    pub async fn list_clients_admin(
+        &self,
+        owner_account_id: Option<Uuid>,
+    ) -> Result<Vec<ClientAdmin>, ToolError> {
+        sqlx::query_as::<_, ClientAdmin>(Self::CLIENT_ADMIN_BY_OWNER)
+        .bind(owner_account_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)
+    }
+
+    /// Apply an administrative edit — AUTHORIZED, and the WHOLE edit, in ONE
+    /// transaction.
+    ///
+    /// ## The two defects this shape exists for
+    ///
+    /// **Round 1: it was three transactions.** The client fields, the tool
+    /// groups and the namespaces were written separately, so a failure partway
+    /// left the client with its new enabled state and redirect URIs and its OLD
+    /// scope — a half-applied authorization change that looks, from either
+    /// side, like a deliberate configuration.
+    ///
+    /// **Round 2: it was not authorized at all.** The field `UPDATE` below
+    /// constrains `id` and `version` and nothing else, so without the check it
+    /// is reachable by anyone holding both. An ownership check DID run, but on
+    /// the scope path only — so an edit touching just `enabled` or
+    /// `redirect_uris` routed around it. `redirect_uris` is where an
+    /// authorization code is delivered: rewriting one redirects where a linked
+    /// account's credentials land, which makes it the most attacker-valuable
+    /// field in the item.
+    ///
+    /// ## How it is authorized
+    ///
+    /// RMCP-12's machinery, unchanged and not duplicated: [`Self::actor_authority`]
+    /// and [`Self::locked_client_owner`] read the actor and the client's owner
+    /// under `FOR SHARE` in THIS transaction, and [`authorize_client_write`]
+    /// decides. There is no proof value to carry in — the authority is derived
+    /// where it is used, so an actor demoted or disabled between an earlier
+    /// read and this commit cannot act on a stale snapshot.
+    ///
+    /// Returns `Ok(None)` when no row matched the version — either the client
+    /// is gone or it has moved on. The caller re-reads either way.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_client_admin_edit(
+        &self,
+        actor_account_id: Uuid,
+        client_id: Uuid,
+        expected_version: i32,
+        disabled: Option<bool>,
+        redirect_uris: Option<&[String]>,
+        tool_group_ids: Option<&[Uuid]>,
+        namespaces: Option<&[String]>,
+    ) -> Result<Option<ClientAdmin>, ToolError> {
+        // The cheap argument bound first, before the epoch is bumped or a
+        // transaction is opened — same ordering as the standalone writer.
+        if let Some(group_ids) = tool_group_ids {
+            Self::check_group_budget(group_ids)?;
+        }
+
+        let _scope_write = ScopeWrite::begin();
+        let mut tx = self.pool.begin().await.map_err(db)?;
+
+        // AUTHORIZE FIRST, in this transaction, before anything is written.
+        let actor = Self::actor_authority(&mut tx, actor_account_id).await?;
+        let Some(client_owner) = Self::locked_client_owner(&mut tx, client_id).await? else {
+            return Err(ToolError::NotFound("no such client for this account".into()));
+        };
+        authorize_client_write(&actor, client_owner)?;
+
+        let updated = sqlx::query_as::<_, ClientAdmin>(Self::CLIENT_ADMIN_UPDATE)
+        .bind(client_id)
+        .bind(expected_version)
+        .bind(disabled)
+        .bind(redirect_uris)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+
+        let Some(updated) = updated else {
+            tx.rollback().await.map_err(db)?;
+            return Ok(None);
+        };
+
+        // The scoping writes re-derive the same authority inside this same
+        // transaction. That is not redundant: it is what keeps ONE rule for
+        // "may this actor scope this client", evaluated by the same function
+        // whether the caller came through here or through the standalone
+        // writers.
+        if let Some(group_ids) = tool_group_ids {
+            Self::set_client_tool_groups_in_tx(
+                &mut tx,
+                &_scope_write,
+                actor_account_id,
+                client_id,
+                group_ids,
+            )
+            .await?;
+        }
+        if let Some(namespaces) = namespaces {
+            Self::set_client_namespaces_in_tx(
+                &mut tx,
+                &_scope_write,
+                actor_account_id,
+                client_id,
+                namespaces,
+            )
+            .await?;
+        }
+
+        // Any `?` above returns before this line, dropping `tx` and rolling the
+        // WHOLE edit back — including the field update that had already
+        // succeeded. That is the property this method exists for.
+        tx.commit().await.map_err(db)?;
+        Ok(Some(updated))
+    }
+
+    /// Revoke a connector: disable it and kill its live refresh tokens, in ONE
+    /// authorized transaction.
+    ///
+    /// Round 2 (`gpt56`) found the revoke path taking only a client id — no
+    /// actor, no authority, nothing. Revocation only ever NARROWS access, which
+    /// is why it is not approval-gated; but "only narrows" is not "anyone may",
+    /// because disabling somebody else's connector is a denial of service
+    /// against their linked account.
+    ///
+    /// Both halves commit together. Disabling without killing the refresh
+    /// tokens would let a later re-enable silently resurrect a session that had
+    /// been cut off; killing tokens without disabling would let the client
+    /// re-authorize immediately.
+    ///
+    /// Returns the number of refresh tokens newly revoked. Idempotent.
+    pub async fn revoke_client(
+        &self,
+        actor_account_id: Uuid,
+        client_id: Uuid,
+    ) -> Result<u64, ToolError> {
+        let _scope_write = ScopeWrite::begin();
+        let mut tx = self.pool.begin().await.map_err(db)?;
+
+        let actor = Self::actor_authority(&mut tx, actor_account_id).await?;
+        let Some(client_owner) = Self::locked_client_owner(&mut tx, client_id).await? else {
+            return Err(ToolError::NotFound("no such client for this account".into()));
+        };
+        authorize_client_write(&actor, client_owner)?;
+
+        // The version is bumped so a concurrent editor holding a pre-revocation
+        // read is refused rather than re-enabling the client by saving a stale
+        // form.
+        sqlx::query("UPDATE rmcp_client SET disabled = true, version = version + 1 WHERE id = $1")
+            .bind(client_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+
+        let tokens = sqlx::query(
+            "UPDATE rmcp_refresh_token SET revoked_at = now() \
+             WHERE client_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(client_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+
+        tx.commit().await.map_err(db)?;
+        Ok(tokens)
+    }
+
+    /// Store an initial access token's digest. OPERATOR-only.
+    ///
+    /// Takes a [`SecretHash`], which can only be produced by hashing — the same
+    /// enforcement-by-type as authorization codes and refresh tokens.
+    ///
+    /// The operator check is [`authorize_operator_action`], against an authority
+    /// derived in this transaction. Round 2 (`gpt56`) found no check at all
+    /// here, and an initial access token is precisely the thing that makes
+    /// gated DCR reachable — so an unauthorized mint hands out the ability to
+    /// create clients.
+    pub async fn insert_registration_token(
+        &self,
+        token_hash: &SecretHash,
+        issued_by: Uuid,
+        label: &str,
+        uses: i32,
+        ttl_seconds: i64,
+    ) -> Result<(), ToolError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let actor = Self::actor_authority(&mut tx, issued_by).await?;
+        authorize_operator_action(&actor, OPERATOR_ONLY_REGISTRATION_TOKEN)?;
+        sqlx::query(
+            "INSERT INTO rmcp_registration_token \
+                 (token_hash, issued_by, label, uses_remaining, expires_at) \
+             VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5::double precision))",
+        )
+        .bind(token_hash.as_bytes())
+        .bind(issued_by)
+        .bind(label)
+        .bind(uses)
+        .bind(ttl_seconds as f64)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
         tx.commit().await.map_err(db)
+    }
+
+    /// Spend one use of an initial access token — atomically, and only if the
+    /// ISSUING ACCOUNT still holds the authority that minted it.
+    ///
+    /// ## The defect this closes (review round 3)
+    ///
+    /// The previous version checked the TOKEN's own state — unspent, unexpired,
+    /// unrevoked — and nothing about the account behind it. So a token minted
+    /// by an operator who was later demoted or disabled went on registering
+    /// clients until it expired.
+    ///
+    /// That is this sprint's defect class for the seventh time, and it is worth
+    /// naming as a sequence rather than an incident: a write-time check trusted
+    /// on the read path (rounds 1–2), the same hole reached through creation
+    /// rather than modification (round 2's fifth instance), and now a BEARER
+    /// CREDENTIAL whose backing authority was never re-checked at redemption.
+    /// Every direct write path in this item derives authority inside its own
+    /// transaction; a carried credential walked around all of them.
+    ///
+    /// **A token is a read path.** Any authority that can be REVOKED must be
+    /// re-derived when it is used, not trusted from when it was issued.
+    ///
+    /// ## Why re-derivation rather than revoking tokens on demotion
+    ///
+    /// Cascading a revocation at demotion time would also stop these tokens,
+    /// and it is worth doing eventually — but it is only sound if nothing can
+    /// be minted in the window between the demotion and the cascade, and it
+    /// fixes nothing for a token minted by an account that is disabled rather
+    /// than demoted, or for a cascade that fails halfway. Re-derivation is
+    /// correct regardless of ordering and regardless of what else ran, which is
+    /// why it is the control rather than the optimisation.
+    ///
+    /// ## Ordering, and why the use is not spent first
+    ///
+    /// The token row is locked `FOR UPDATE` and its issuer authorized BEFORE
+    /// the decrement. A token presented while its issuer is unauthorized is not
+    /// consumed — it was never spendable, and burning a use would let anyone
+    /// holding a copy exhaust a legitimate token by presenting it during a
+    /// demotion.
+    ///
+    /// Single-use atomicity is preserved by that same lock: two concurrent
+    /// redemptions serialize on it, and PostgreSQL re-evaluates the `WHERE`
+    /// after the lock is granted under READ COMMITTED, so the loser sees
+    /// `uses_remaining = 0` and gets `None`.
+    ///
+    /// ## One answer for every failure
+    ///
+    /// Unknown, expired, revoked, exhausted, AND issued-by-an-account-that-no-
+    /// longer-qualifies all return `None`. A caller that could tell them apart
+    /// would have an oracle reporting which of its guesses was once a real
+    /// token — and, worse, which operator had just been demoted.
+    pub async fn claim_registration_token(
+        &self,
+        token_hash: &SecretHash,
+    ) -> Result<Option<Uuid>, ToolError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+
+        // Lock the token row. `FOR UPDATE`, not `FOR SHARE`: this row is about
+        // to be decremented, and two redeemers must not both pass the check.
+        let Some(issued_by) = sqlx::query_scalar::<_, Uuid>(
+            "SELECT issued_by FROM rmcp_registration_token \
+             WHERE token_hash = $1 AND uses_remaining > 0 AND expires_at > now() \
+               AND revoked_at IS NULL \
+             FOR UPDATE",
+        )
+        .bind(token_hash.as_bytes())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?
+        else {
+            return Ok(None);
+        };
+
+        // RE-DERIVE the issuer's authority, here, under `FOR SHARE`, in this
+        // transaction — the same discipline every direct write path in this
+        // item uses. `actor_authority` errors for a missing or disabled
+        // account, and the operator check is the same
+        // `authorize_operator_action` the mint used, so the predicate is
+        // evaluated twice against two different reads rather than being two
+        // rules that could drift.
+        let still_authorized = match Self::actor_authority(&mut tx, issued_by).await {
+            Ok(actor) => {
+                authorize_operator_action(&actor, OPERATOR_ONLY_REGISTRATION_TOKEN).is_ok()
+            }
+            // A disabled or deleted issuer. Not an error to the caller — the
+            // same `None` as every other unusable token.
+            Err(_) => false,
+        };
+        if !still_authorized {
+            // Nothing is consumed, and the transaction is rolled back
+            // explicitly so the intent is visible where it matters.
+            tx.rollback().await.map_err(db)?;
+            return Ok(None);
+        }
+
+        sqlx::query(
+            "UPDATE rmcp_registration_token SET uses_remaining = uses_remaining - 1 \
+             WHERE token_hash = $1",
+        )
+        .bind(token_hash.as_bytes())
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+
+        tx.commit().await.map_err(db)?;
+        Ok(Some(issued_by))
+    }
+
+    /// Revoke every outstanding initial access token. OPERATOR-only, verified
+    /// in this transaction.
+    ///
+    /// The blunt control on purpose. A minted token is never readable again —
+    /// only its digest is stored — so there is no way to name one, and an
+    /// operator reaching for this has decided that no outstanding invitation
+    /// should remain valid. Returns how many were still live.
+    pub async fn revoke_all_registration_tokens(
+        &self,
+        actor_account_id: Uuid,
+    ) -> Result<u64, ToolError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let actor = Self::actor_authority(&mut tx, actor_account_id).await?;
+        authorize_operator_action(&actor, OPERATOR_ONLY_REGISTRATION_TOKEN)?;
+        let revoked = sqlx::query(
+            "UPDATE rmcp_registration_token SET revoked_at = now() \
+             WHERE revoked_at IS NULL AND uses_remaining > 0 AND expires_at > now()",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        tx.commit().await.map_err(db)?;
+        Ok(revoked)
     }
 
     // -----------------------------------------------------------------------
@@ -2312,7 +2845,22 @@ mod tests {
             }
             mutated.sort_unstable();
             mutated.dedup();
-            if !body.contains("let _scope_write = ScopeWrite::begin();") {
+            // A function satisfies the rule either by OPENING a guard, or by
+            // taking one as a `&ScopeWrite` WITNESS parameter — which is a
+            // stronger form of the same guarantee, and a compiler-checked one:
+            // a reference cannot exist without a live guard somewhere up the
+            // call stack, so such a function is uncallable outside an
+            // invalidating scope. RMCP-08 needed this to make an administrative
+            // edit atomic (the field write and both scoping writes share one
+            // transaction), which means the SQL had to move into helpers that
+            // do not own the guard.
+            //
+            // Textual, like the rest of this scanner, but it recognises a
+            // property the compiler is already enforcing rather than widening
+            // what counts as compliance.
+            let holds_guard = body.contains("let _scope_write = ScopeWrite::begin();");
+            let takes_witness = body.contains("_scope_write: &ScopeWrite");
+            if !holds_guard && !takes_witness {
                 offenders.push(UnguardedWrite {
                     file: file.to_string(),
                     function: name.clone(),
@@ -2481,6 +3029,39 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
             "binding the guard to `_` must still be reported"
         );
 
+        // The WITNESS form is clean: a function taking `&ScopeWrite` cannot be
+        // called without a live guard, which is a compiler check where this
+        // scanner can only make a textual one. RMCP-08 needed it so an
+        // administrative edit could apply its field write and both scoping
+        // writes in ONE transaction.
+        let witnessed = elsewhere.replace(
+            "pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid)",
+            "pub async fn reassign_owner(pool: &PgPool, _scope_write: &ScopeWrite, ns: &str, owner: Uuid)",
+        );
+        assert!(
+            scan_for_unguarded_scope_writes("src/admin/servers.rs", &witnessed).is_empty(),
+            "a write inside a function holding a guard WITNESS is legitimate"
+        );
+
+        // …and the witness must be the real thing. A parameter that merely
+        // resembles it does not count, or the exemption would be a hole
+        // anybody could open by naming a variable suggestively.
+        for near_miss in [
+            "_scope_write: &str",
+            "scope_write: &ScopeWrite2",
+            "_scope_writer: &ScopeWrite",
+        ] {
+            let faked = elsewhere.replace(
+                "pool: &PgPool, ns: &str",
+                &format!("pool: &PgPool, {near_miss}, ns: &str"),
+            );
+            assert_eq!(
+                scan_for_unguarded_scope_writes("src/admin/servers.rs", &faked).len(),
+                1,
+                "{near_miss} must not satisfy the guard"
+            );
+        }
+
         // A table NOT in the scope-affecting set is none of this guard's
         // business — the rule is keyed on the table, and staying narrow is what
         // keeps it from flushing the cache on every token issuance.
@@ -2538,7 +3119,7 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
     /// rather than silently weaken the readiness check.
     #[test]
     fn schema_readiness_covers_every_migrated_table() {
-        assert_eq!(REQUIRED_TABLES.len(), 10);
+        assert_eq!(REQUIRED_TABLES.len(), 11);
         for table in [
             "rmcp_account",
             "rmcp_client",
@@ -2553,8 +3134,235 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
             // a deploy that applies only the core migration reports NOT ready
             // rather than running the login path with no guard behind it.
             "rmcp_login_session_use",
+            // RMCP-08's initial access tokens. Same reasoning: a deploy that
+            // applied the earlier migrations and not this one must report NOT
+            // ready, rather than failing the first registration attempt with an
+            // opaque `relation does not exist`.
+            "rmcp_registration_token",
         ] {
             assert!(REQUIRED_TABLES.contains(&table), "{table} missing from the readiness check");
+        }
+
+        // The COLUMN half. A migration that adds a column to an existing table
+        // is invisible to the table check above, which is the whole reason
+        // `REQUIRED_COLUMNS` exists — and a second entry is exactly where the
+        // first one's lesson gets forgotten.
+        assert_eq!(REQUIRED_COLUMNS.len(), 2);
+        for column in [("rmcp_account", "is_operator"), ("rmcp_client", "version")] {
+            assert!(
+                REQUIRED_COLUMNS.contains(&column),
+                "{column:?} missing from the readiness check"
+            );
+        }
+
+        // Every table and column named above must actually be created by a
+        // migration in the tree. Without this the readiness check could name a
+        // table nothing ships, which fails a deployment that is in fact correct
+        // — the opposite error, and one a green test suite would never show.
+        let migrations: String = std::fs::read_dir(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"),
+        )
+        .expect("migrations directory")
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|e| e == "sql"))
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .collect();
+        for table in REQUIRED_TABLES {
+            assert!(
+                migrations.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
+                "{table} is required at startup but no migration creates it"
+            );
+        }
+        for (table, column) in REQUIRED_COLUMNS {
+            assert!(
+                migrations.contains(column),
+                "{table}.{column} is required at startup but no migration adds it"
+            );
+        }
+    }
+
+    /// The three administrative queries must never select the secret hash, and
+    /// must all project the same `confidential` boolean.
+    ///
+    /// This is what the shared `format!()`ed column constant was actually
+    /// protecting, restated as a test now that the SQL is written out three
+    /// times (review round 3 — see `CLIENT_ADMIN_BY_ID`'s doc for why the
+    /// interpolation had to go even though it was not exploitable).
+    ///
+    /// The mutation target: change any one of the three to select
+    /// `client_secret_hash` directly and this goes red.
+    #[test]
+    fn the_admin_queries_never_select_the_secret_hash() {
+        let queries = [
+            ("CLIENT_ADMIN_BY_ID", OauthStore::CLIENT_ADMIN_BY_ID),
+            ("CLIENT_ADMIN_BY_OWNER", OauthStore::CLIENT_ADMIN_BY_OWNER),
+            ("CLIENT_ADMIN_UPDATE", OauthStore::CLIENT_ADMIN_UPDATE),
+        ];
+        for (name, sql) in queries {
+            assert!(
+                sql.contains("(client_secret_hash IS NOT NULL) AS confidential"),
+                "{name} must project the derived boolean"
+            );
+            // The hash itself must appear ONLY inside that projection. Any other
+            // occurrence would be selecting a credential digest into a type that
+            // has no field for it — or, worse, into one that later gains a field.
+            assert_eq!(
+                sql.matches("client_secret_hash").count(),
+                1,
+                "{name} references the secret hash outside the derived projection"
+            );
+        }
+
+        // And the three agree on the column list, which is the drift the shared
+        // constant used to prevent structurally.
+        let columns = |sql: &str| {
+            sql.split_whitespace()
+                .filter(|t| t.ends_with(',') || *t == "version")
+                .map(|t| t.trim_end_matches(',').to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            columns(OauthStore::CLIENT_ADMIN_BY_ID),
+            columns(OauthStore::CLIENT_ADMIN_BY_OWNER),
+            "the two read queries have drifted apart"
+        );
+    }
+
+    /// **No SQL string in this module is built by interpolation.**
+    ///
+    /// The rule round 3 restored. Its value is that it can be checked by a
+    /// machine: a scanner cannot distinguish a benign interpolation of a
+    /// private constant from one that reached a caller's value, so a single
+    /// exception turns the rule into a matter of human attention. There is now
+    /// no exception, and this is what keeps it that way.
+    #[test]
+    fn no_sql_in_this_module_is_built_by_interpolation() {
+        let file = include_str!("store.rs");
+        let production = file.split("\n#[cfg(test)]").next().expect("production half");
+        let offenders: Vec<(usize, &str)> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            // Deliberately narrow: a `sqlx::query*` call whose argument is a
+            // `format!`. `format!` on its own is fine and common here — it
+            // builds error MESSAGES, which are not sent to the database — so
+            // flagging it would make this guard noisy and it would be loosened.
+            // Both halves must appear on the query's own line, which is where
+            // the removed interpolation lived.
+            .filter(|(_, line)| line.contains("sqlx::query") && line.contains("format!"))
+            .map(|(i, line)| (i + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "SQL (or something adjacent to it) is being built by interpolation, which makes the \
+             no-interpolation rule uncheckable by anything but a careful reader: {offenders:?}"
+        );
+    }
+
+    /// **Every administrative write is AUTHORIZED, and authorized first.**
+    ///
+    /// Round 2 (`gpt56`) found `apply_client_admin_edit` writing the client's
+    /// fields constrained only by `id` and `version` — no owner, no actor —
+    /// while an ownership check ran on the SCOPE path only. An edit touching
+    /// just `enabled` or `redirect_uris` routed around it entirely, and
+    /// `redirect_uris` decides where an authorization code is delivered.
+    /// `revoke_client`, the token mint and the token revoke-all had no check at
+    /// all.
+    ///
+    /// A source-text guard, like `no_in_crate_write_bypasses_scope_invalidation`
+    /// and for the same reason: the property is a SQL predicate plus an
+    /// ordering, so it is not reachable from a unit test without a database —
+    /// but it is exactly the kind of check that gets dropped in a refactor
+    /// without anything going red.
+    ///
+    /// It asserts two things per entry point: that the authorization is
+    /// present, and that it comes BEFORE the mutation. Presence alone would
+    /// pass for a check bolted on after the write, which authorizes nothing.
+    ///
+    /// The mutation target: delete any one authorization call, or move it below
+    /// its statement, and this goes red naming the function.
+    #[test]
+    fn every_administrative_write_is_authorized_before_it_mutates() {
+        let file = include_str!("store.rs");
+        let production = file.split("\n#[cfg(test)]").next().expect("production half");
+
+        // (function, the authorization it must perform, the mutation it guards)
+        //
+        // `claim_registration_token` is in this list even though it is a READ
+        // path, and that is the round-3 lesson: a bearer credential is a read
+        // path, and the authority behind it must be re-derived when it is
+        // spent. It was the seventh instance of this sprint's defect class.
+        let entry_points = [
+            (
+                "claim_registration_token",
+                "actor_authority(&mut tx, issued_by)",
+                "SET uses_remaining = uses_remaining - 1",
+            ),
+            // The mutation marker is the CONSTANT this executes, not the SQL
+            // text: round 3 moved that text into `CLIENT_ADMIN_UPDATE` to get
+            // `format!()` out of the query, and this guard correctly went red
+            // until the marker followed it. What the constant itself contains
+            // is pinned by `the_admin_queries_never_select_the_secret_hash`.
+            ("apply_client_admin_edit", "authorize_client_write(&actor", "Self::CLIENT_ADMIN_UPDATE"),
+            ("revoke_client", "authorize_client_write(&actor", "UPDATE rmcp_client SET disabled"),
+            (
+                "insert_registration_token",
+                "authorize_operator_action(&actor",
+                "INSERT INTO rmcp_registration_token",
+            ),
+            (
+                "revoke_all_registration_tokens",
+                "authorize_operator_action(&actor",
+                "UPDATE rmcp_registration_token SET",
+            ),
+        ];
+
+        for (function, authorization, mutation) in entry_points {
+            let marker = format!("pub async fn {function}(");
+            let start = production
+                .find(&marker)
+                .unwrap_or_else(|| panic!("{function} has been renamed or removed"));
+            let rest = &production[start..];
+            let end = rest[1..]
+                .find("\n    pub async fn ")
+                .or_else(|| rest[1..].find("\n    async fn "))
+                .map(|i| i + 1)
+                .unwrap_or(rest.len());
+            let body: String = rest[..end]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let authorized_at = body.find(authorization).unwrap_or_else(|| {
+                panic!(
+                    "{function} mutates a client or a registration token WITHOUT calling \
+                     {authorization}. Anyone able to reach it could then act on an object they \
+                     do not own — for `redirect_uris`, that is control over where an \
+                     authorization code is delivered."
+                )
+            });
+            let mutates_at = body.find(mutation).unwrap_or_else(|| {
+                panic!("{function} no longer contains the mutation {mutation:?} this guard pins")
+            });
+            assert!(
+                authorized_at < mutates_at,
+                "{function} authorizes AFTER it mutates, which authorizes nothing"
+            );
+            // And the authority it authorizes against must be derived in THIS
+            // transaction, not passed in. A caller-supplied authority is the
+            // stale-snapshot shape RMCP-12 already had to close once.
+            assert!(
+                body.contains("Self::actor_authority(&mut tx"),
+                "{function} must derive the actor's authority inside its own transaction"
+            );
+            // …and it must be a TRANSACTION, so the authority is locked for the
+            // rest of it. A helper reading outside one is a point-in-time proof
+            // again, which is the shape this whole sprint kept reopening.
+            assert!(
+                body.contains("self.pool.begin()"),
+                "{function} must open its own transaction so the authority read is locked"
+            );
         }
     }
 

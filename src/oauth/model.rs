@@ -281,6 +281,47 @@ pub struct Consent {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
+/// A client as the ADMINISTRATION surface sees it (RMCP-08).
+///
+/// Deliberately a separate type from [`Client`] rather than three more fields
+/// on it. [`Client`] is what the authorization and token paths read on every
+/// request, and it is the type whose `client_secret_hash` those paths verify
+/// against; widening it for the benefit of a listing tool would put an
+/// administrative concern on the hot authentication path and drag every
+/// `SELECT` and every test fixture along with it.
+///
+/// The difference that matters is the last field. This view carries
+/// `confidential` — computed in SQL as `client_secret_hash IS NOT NULL` — and
+/// carries **no hash at all**. A client secret is minted once, hashed, and then
+/// unreachable: there is no field here that could carry it, so no listing, no
+/// serialization and no tool response can leak one even by mistake.
+#[derive(Clone, Debug)]
+pub struct ClientAdmin {
+    pub id: Uuid,
+    pub client_id: String,
+    pub name: String,
+    pub redirect_uris: Vec<String>,
+    pub grant_types: Vec<String>,
+    pub token_endpoint_auth_method: String,
+    pub owner_account_id: Uuid,
+    pub registration_source: String,
+    pub disabled: bool,
+    /// Whether a secret hash exists. Never the hash, and never the secret.
+    pub confidential: bool,
+    pub created_at: DateTime<Utc>,
+    /// Optimistic-concurrency token. An update states the version it read; a
+    /// stale value is a conflict, never a silent overwrite.
+    pub version: i32,
+}
+
+impl ClientAdmin {
+    /// Typed view of [`Self::registration_source`], with the same fail-closed
+    /// parse [`Client::source`] uses — one reading of that column, not two.
+    pub fn source(&self) -> RegistrationSource {
+        RegistrationSource::parse(&self.registration_source)
+    }
+}
+
 /// Which account administers a federated namespace (RMCP-12).
 #[derive(Clone, Debug)]
 pub struct ServerOwner {
@@ -405,6 +446,21 @@ impl_from_row!(
     registration_source,
     disabled,
     created_at
+);
+impl_from_row!(
+    ClientAdmin,
+    id,
+    client_id,
+    name,
+    redirect_uris,
+    grant_types,
+    token_endpoint_auth_method,
+    owner_account_id,
+    registration_source,
+    disabled,
+    confidential,
+    created_at,
+    version
 );
 impl_from_row!(
     ToolGroup,
