@@ -977,6 +977,24 @@ in SQL and has no field a hash — let alone a secret — could occupy. Public c
 what Claude registers as) get no secret at all and authenticate with PKCE alone; that is the
 default, because defaulting the other way would mint a credential nobody asked for.
 
+**An absent `grant_types` means `authorization_code` alone** — RFC 7591's default, followed
+exactly. Not `authorization_code` plus `refresh_token`: that would grant a capability the client
+never requested, and `grant_types` is enforced at the token endpoint, so it is a real one. A
+connector that must keep working without sending the user back through authorization every hour
+— which is what Claude expects — has to state `["authorization_code", "refresh_token"]`, and
+`rmcp_client_create` takes a `grant_types` argument for exactly that. The convenience this costs
+is the point: absence must never grant more than was asked for.
+
+**A registration token is re-checked against its ISSUER's live authority when it is spent**, not
+only when it was minted. An initial access token issued by an operator who is later demoted or
+disabled stops working at its next use, rather than remaining valid until it expires. This is the
+same rule as everywhere else in the item — *any authority that can be revoked must be re-derived
+on the read path* — and a bearer token is a read path. Consumption locks the token row `FOR
+UPDATE`, re-derives the issuer's authority under `FOR SHARE`, and only then spends a use; a token
+presented while its issuer is unauthorized is **not** consumed, so it cannot be burned by
+presenting it during a demotion. Unknown, expired, revoked, exhausted and issued-by-a-demoted-
+operator all answer identically, so the endpoint reports nothing about which.
+
 **Redirect URIs are validated as an allowlist, at write time.** Absolute `https`, or an RFC 8252
 loopback URI — nothing else. A scheme nobody anticipated is refused by default rather than by a
 denylist entry somebody had to have thought of. Userinfo is refused on both arms, because a URI may

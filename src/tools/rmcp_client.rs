@@ -239,6 +239,7 @@ impl RustTool for RmcpClientCreate {
                 "owner": { "type": "string", "description": "Account name that will own this connector. Required — there is no default owner." },
                 "name": { "type": "string", "description": "Display name, shown to the human on the consent page." },
                 "redirect_uris": { "type": "array", "items": { "type": "string" }, "description": "Absolute https URIs, or RFC 8252 http loopback URIs. At least one." },
+                "grant_types": { "type": "array", "items": { "type": "string" }, "description": "Defaults to [\"authorization_code\"] alone. A connector that must keep working without re-authorizing every hour — which is what Claude expects — needs [\"authorization_code\", \"refresh_token\"] stated explicitly. Enforced at the token endpoint." },
                 "confidential": { "type": "boolean", "description": "Mint a client secret. Defaults to false — Claude and other hosted connectors are PUBLIC clients that authenticate with PKCE alone." },
                 "tool_group_ids": { "type": "array", "items": { "type": "string" }, "description": "Tool groups to scope the connector to. Omit or leave empty and it reaches nothing." },
                 "namespaces": { "type": "array", "items": { "type": "string" }, "description": "Mesh namespaces the connector may see. Omit or leave empty and it reaches nothing." }
@@ -259,6 +260,12 @@ impl RustTool for RmcpClientCreate {
         let submitted = SubmittedMetadata {
             name: args.get("name").and_then(Value::as_str).map(str::to_string),
             redirect_uris: optional_string_array(&args, "redirect_uris")?.unwrap_or_default(),
+            // Absent means the RFC default — `authorization_code` alone. An
+            // operator who wants the connector to be able to REFRESH has to say
+            // so, exactly as a dynamically registering client does: this is
+            // enforced at the token endpoint, so defaulting it in would grant a
+            // capability nobody asked for (review round 3).
+            grant_types: optional_string_array(&args, "grant_types")?,
             // The tool's vocabulary is `confidential`; the RFC's is
             // `token_endpoint_auth_method`. They are translated HERE, in one
             // place, so validation and storage see one representation.
@@ -317,19 +324,21 @@ impl RustTool for RmcpClientCreate {
         let text = match &minted.secret {
             Some(secret) => format!(
                 "created connector {} (client_id {})\nclient secret (SHOWN ONCE — it is stored \
-                 only as an argon2id hash and cannot be retrieved again):\n{}\nscoped to {} tool \
-                 group(s) and {} namespace(s)",
+                 only as an argon2id hash and cannot be retrieved again):\n{}\ngrants: {}\n\
+                 scoped to {} tool group(s) and {} namespace(s)",
                 view.client.name,
                 view.client.client_id,
                 secret,
+                view.client.grant_types.join(", "),
                 view.tool_group_ids.len(),
                 view.namespaces.len()
             ),
             None => format!(
                 "created public connector {} (client_id {}); no secret — it authenticates with \
-                 PKCE alone\nscoped to {} tool group(s) and {} namespace(s)",
+                 PKCE alone\ngrants: {}\nscoped to {} tool group(s) and {} namespace(s)",
                 view.client.name,
                 view.client.client_id,
+                view.client.grant_types.join(", "),
                 view.tool_group_ids.len(),
                 view.namespaces.len()
             ),

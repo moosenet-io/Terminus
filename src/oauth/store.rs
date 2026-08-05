@@ -1232,14 +1232,46 @@ impl OauthStore {
     // being modified who may modify it, and can only answer yes.
     // -----------------------------------------------------------------------
 
-    /// The columns of the administrative client view.
+    /// The three administrative client queries, written out in full.
     ///
-    /// Written once and shared by both readers below, because the one thing
-    /// that must never drift between them is `client_secret_hash IS NOT NULL AS
-    /// confidential`: a copy of this list that selected the hash itself would
-    /// hand a listing tool a credential digest to render.
-    const CLIENT_ADMIN_COLUMNS: &'static str =
-        "id, client_id, name, redirect_uris, grant_types, token_endpoint_auth_method, \
+    /// ## Why the column list is repeated instead of shared
+    ///
+    /// It was a `const` spliced in with `format!()`. The interpolated value was
+    /// a local constant, so it was not exploitable — and review round 3
+    /// (`gpt56`) asked for it changed anyway, for a reason worth recording: the
+    /// value of "no SQL string interpolation anywhere in this module" is that it
+    /// is MECHANICALLY CHECKABLE. A scanner cannot tell "interpolating a
+    /// private constant" from "interpolating something a caller reached", so
+    /// every benign exception costs the rule its ability to be enforced by
+    /// anything except someone noticing. This sprint has already found several
+    /// guards that could not fail for the case they existed to catch; an
+    /// advisory version of this one would be another.
+    ///
+    /// The cost of writing it out is drift between three literals. That is
+    /// bounded and it is tested: `the_admin_queries_never_select_the_secret_hash`
+    /// asserts every one of them projects `(client_secret_hash IS NOT NULL) AS
+    /// confidential` and that none selects the hash itself — which is the only
+    /// property the shared constant was actually protecting.
+    const CLIENT_ADMIN_BY_ID: &'static str = "SELECT \
+         id, client_id, name, redirect_uris, grant_types, token_endpoint_auth_method, \
+         owner_account_id, registration_source, disabled, \
+         (client_secret_hash IS NOT NULL) AS confidential, created_at, version \
+         FROM rmcp_client WHERE id = $1";
+
+    const CLIENT_ADMIN_BY_OWNER: &'static str = "SELECT \
+         id, client_id, name, redirect_uris, grant_types, token_endpoint_auth_method, \
+         owner_account_id, registration_source, disabled, \
+         (client_secret_hash IS NOT NULL) AS confidential, created_at, version \
+         FROM rmcp_client WHERE ($1::uuid IS NULL OR owner_account_id = $1) \
+         ORDER BY created_at";
+
+    const CLIENT_ADMIN_UPDATE: &'static str = "UPDATE rmcp_client SET \
+         disabled = COALESCE($3::boolean, disabled), \
+         redirect_uris = COALESCE($4::text[], redirect_uris), \
+         version = version + 1 \
+         WHERE id = $1 AND version = $2 \
+         RETURNING \
+         id, client_id, name, redirect_uris, grant_types, token_endpoint_auth_method, \
          owner_account_id, registration_source, disabled, \
          (client_secret_hash IS NOT NULL) AS confidential, created_at, version";
 
@@ -1247,10 +1279,7 @@ impl OauthStore {
     /// [`Self::find_active_client`]: an operator managing a revoked connector
     /// has to be able to see it, and this view authenticates nothing.
     pub async fn find_client_admin(&self, id: Uuid) -> Result<Option<ClientAdmin>, ToolError> {
-        sqlx::query_as::<_, ClientAdmin>(&format!(
-            "SELECT {} FROM rmcp_client WHERE id = $1",
-            Self::CLIENT_ADMIN_COLUMNS
-        ))
+        sqlx::query_as::<_, ClientAdmin>(Self::CLIENT_ADMIN_BY_ID)
         .bind(id)
         .fetch_optional(&self.pool)
         .await
@@ -1267,11 +1296,7 @@ impl OauthStore {
         &self,
         owner_account_id: Option<Uuid>,
     ) -> Result<Vec<ClientAdmin>, ToolError> {
-        sqlx::query_as::<_, ClientAdmin>(&format!(
-            "SELECT {} FROM rmcp_client \
-             WHERE ($1::uuid IS NULL OR owner_account_id = $1) ORDER BY created_at",
-            Self::CLIENT_ADMIN_COLUMNS
-        ))
+        sqlx::query_as::<_, ClientAdmin>(Self::CLIENT_ADMIN_BY_OWNER)
         .bind(owner_account_id)
         .fetch_all(&self.pool)
         .await
@@ -1336,15 +1361,7 @@ impl OauthStore {
         };
         authorize_client_write(&actor, client_owner)?;
 
-        let updated = sqlx::query_as::<_, ClientAdmin>(&format!(
-            "UPDATE rmcp_client SET \
-                 disabled = COALESCE($3::boolean, disabled), \
-                 redirect_uris = COALESCE($4::text[], redirect_uris), \
-                 version = version + 1 \
-             WHERE id = $1 AND version = $2 \
-             RETURNING {}",
-            Self::CLIENT_ADMIN_COLUMNS
-        ))
+        let updated = sqlx::query_as::<_, ClientAdmin>(Self::CLIENT_ADMIN_UPDATE)
         .bind(client_id)
         .bind(expected_version)
         .bind(disabled)
@@ -1480,38 +1497,111 @@ impl OauthStore {
         tx.commit().await.map_err(db)
     }
 
-    /// Spend one use of an initial access token, atomically.
+    /// Spend one use of an initial access token — atomically, and only if the
+    /// ISSUING ACCOUNT still holds the authority that minted it.
     ///
-    /// Returns the issuing account on success and `None` when the token is
-    /// unknown, expired, revoked, or exhausted — one answer for all four, so a
-    /// caller cannot branch on the difference and turn this into an oracle
-    /// telling an attacker which of their guesses was a real token that had
-    /// merely run out.
+    /// ## The defect this closes (review round 3)
     ///
-    /// The read and the decrement are ONE conditional `UPDATE`, evaluated under
-    /// the row lock it takes. Two concurrent registrations presenting the same
-    /// single-use token therefore cannot both succeed — which is the whole
-    /// point of a single-use token, and is exactly what a `SELECT` followed by
-    /// an `UPDATE` would fail to deliver.
+    /// The previous version checked the TOKEN's own state — unspent, unexpired,
+    /// unrevoked — and nothing about the account behind it. So a token minted
+    /// by an operator who was later demoted or disabled went on registering
+    /// clients until it expired.
     ///
-    /// Every condition is re-evaluated HERE, on the read path, rather than
-    /// trusted from issuance: `revoked_at IS NULL` is an authority an operator
-    /// can withdraw after the token was minted, and a check made only at mint
-    /// time would never notice.
+    /// That is this sprint's defect class for the seventh time, and it is worth
+    /// naming as a sequence rather than an incident: a write-time check trusted
+    /// on the read path (rounds 1–2), the same hole reached through creation
+    /// rather than modification (round 2's fifth instance), and now a BEARER
+    /// CREDENTIAL whose backing authority was never re-checked at redemption.
+    /// Every direct write path in this item derives authority inside its own
+    /// transaction; a carried credential walked around all of them.
+    ///
+    /// **A token is a read path.** Any authority that can be REVOKED must be
+    /// re-derived when it is used, not trusted from when it was issued.
+    ///
+    /// ## Why re-derivation rather than revoking tokens on demotion
+    ///
+    /// Cascading a revocation at demotion time would also stop these tokens,
+    /// and it is worth doing eventually — but it is only sound if nothing can
+    /// be minted in the window between the demotion and the cascade, and it
+    /// fixes nothing for a token minted by an account that is disabled rather
+    /// than demoted, or for a cascade that fails halfway. Re-derivation is
+    /// correct regardless of ordering and regardless of what else ran, which is
+    /// why it is the control rather than the optimisation.
+    ///
+    /// ## Ordering, and why the use is not spent first
+    ///
+    /// The token row is locked `FOR UPDATE` and its issuer authorized BEFORE
+    /// the decrement. A token presented while its issuer is unauthorized is not
+    /// consumed — it was never spendable, and burning a use would let anyone
+    /// holding a copy exhaust a legitimate token by presenting it during a
+    /// demotion.
+    ///
+    /// Single-use atomicity is preserved by that same lock: two concurrent
+    /// redemptions serialize on it, and PostgreSQL re-evaluates the `WHERE`
+    /// after the lock is granted under READ COMMITTED, so the loser sees
+    /// `uses_remaining = 0` and gets `None`.
+    ///
+    /// ## One answer for every failure
+    ///
+    /// Unknown, expired, revoked, exhausted, AND issued-by-an-account-that-no-
+    /// longer-qualifies all return `None`. A caller that could tell them apart
+    /// would have an oracle reporting which of its guesses was once a real
+    /// token — and, worse, which operator had just been demoted.
     pub async fn claim_registration_token(
         &self,
         token_hash: &SecretHash,
     ) -> Result<Option<Uuid>, ToolError> {
-        sqlx::query_scalar::<_, Uuid>(
-            "UPDATE rmcp_registration_token SET uses_remaining = uses_remaining - 1 \
+        let mut tx = self.pool.begin().await.map_err(db)?;
+
+        // Lock the token row. `FOR UPDATE`, not `FOR SHARE`: this row is about
+        // to be decremented, and two redeemers must not both pass the check.
+        let Some(issued_by) = sqlx::query_scalar::<_, Uuid>(
+            "SELECT issued_by FROM rmcp_registration_token \
              WHERE token_hash = $1 AND uses_remaining > 0 AND expires_at > now() \
                AND revoked_at IS NULL \
-             RETURNING issued_by",
+             FOR UPDATE",
         )
         .bind(token_hash.as_bytes())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(db)
+        .map_err(db)?
+        else {
+            return Ok(None);
+        };
+
+        // RE-DERIVE the issuer's authority, here, under `FOR SHARE`, in this
+        // transaction — the same discipline every direct write path in this
+        // item uses. `actor_authority` errors for a missing or disabled
+        // account, and the operator check is the same
+        // `authorize_operator_action` the mint used, so the predicate is
+        // evaluated twice against two different reads rather than being two
+        // rules that could drift.
+        let still_authorized = match Self::actor_authority(&mut tx, issued_by).await {
+            Ok(actor) => {
+                authorize_operator_action(&actor, OPERATOR_ONLY_REGISTRATION_TOKEN).is_ok()
+            }
+            // A disabled or deleted issuer. Not an error to the caller — the
+            // same `None` as every other unusable token.
+            Err(_) => false,
+        };
+        if !still_authorized {
+            // Nothing is consumed, and the transaction is rolled back
+            // explicitly so the intent is visible where it matters.
+            tx.rollback().await.map_err(db)?;
+            return Ok(None);
+        }
+
+        sqlx::query(
+            "UPDATE rmcp_registration_token SET uses_remaining = uses_remaining - 1 \
+             WHERE token_hash = $1",
+        )
+        .bind(token_hash.as_bytes())
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+
+        tx.commit().await.map_err(db)?;
+        Ok(Some(issued_by))
     }
 
     /// Revoke every outstanding initial access token. OPERATOR-only, verified
@@ -3091,6 +3181,84 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
         }
     }
 
+    /// The three administrative queries must never select the secret hash, and
+    /// must all project the same `confidential` boolean.
+    ///
+    /// This is what the shared `format!()`ed column constant was actually
+    /// protecting, restated as a test now that the SQL is written out three
+    /// times (review round 3 — see `CLIENT_ADMIN_BY_ID`'s doc for why the
+    /// interpolation had to go even though it was not exploitable).
+    ///
+    /// The mutation target: change any one of the three to select
+    /// `client_secret_hash` directly and this goes red.
+    #[test]
+    fn the_admin_queries_never_select_the_secret_hash() {
+        let queries = [
+            ("CLIENT_ADMIN_BY_ID", OauthStore::CLIENT_ADMIN_BY_ID),
+            ("CLIENT_ADMIN_BY_OWNER", OauthStore::CLIENT_ADMIN_BY_OWNER),
+            ("CLIENT_ADMIN_UPDATE", OauthStore::CLIENT_ADMIN_UPDATE),
+        ];
+        for (name, sql) in queries {
+            assert!(
+                sql.contains("(client_secret_hash IS NOT NULL) AS confidential"),
+                "{name} must project the derived boolean"
+            );
+            // The hash itself must appear ONLY inside that projection. Any other
+            // occurrence would be selecting a credential digest into a type that
+            // has no field for it — or, worse, into one that later gains a field.
+            assert_eq!(
+                sql.matches("client_secret_hash").count(),
+                1,
+                "{name} references the secret hash outside the derived projection"
+            );
+        }
+
+        // And the three agree on the column list, which is the drift the shared
+        // constant used to prevent structurally.
+        let columns = |sql: &str| {
+            sql.split_whitespace()
+                .filter(|t| t.ends_with(',') || *t == "version")
+                .map(|t| t.trim_end_matches(',').to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            columns(OauthStore::CLIENT_ADMIN_BY_ID),
+            columns(OauthStore::CLIENT_ADMIN_BY_OWNER),
+            "the two read queries have drifted apart"
+        );
+    }
+
+    /// **No SQL string in this module is built by interpolation.**
+    ///
+    /// The rule round 3 restored. Its value is that it can be checked by a
+    /// machine: a scanner cannot distinguish a benign interpolation of a
+    /// private constant from one that reached a caller's value, so a single
+    /// exception turns the rule into a matter of human attention. There is now
+    /// no exception, and this is what keeps it that way.
+    #[test]
+    fn no_sql_in_this_module_is_built_by_interpolation() {
+        let file = include_str!("store.rs");
+        let production = file.split("\n#[cfg(test)]").next().expect("production half");
+        let offenders: Vec<(usize, &str)> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            // Deliberately narrow: a `sqlx::query*` call whose argument is a
+            // `format!`. `format!` on its own is fine and common here — it
+            // builds error MESSAGES, which are not sent to the database — so
+            // flagging it would make this guard noisy and it would be loosened.
+            // Both halves must appear on the query's own line, which is where
+            // the removed interpolation lived.
+            .filter(|(_, line)| line.contains("sqlx::query") && line.contains("format!"))
+            .map(|(i, line)| (i + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "SQL (or something adjacent to it) is being built by interpolation, which makes the \
+             no-interpolation rule uncheckable by anything but a careful reader: {offenders:?}"
+        );
+    }
+
     /// **Every administrative write is AUTHORIZED, and authorized first.**
     ///
     /// Round 2 (`gpt56`) found `apply_client_admin_edit` writing the client's
@@ -3119,8 +3287,23 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
         let production = file.split("\n#[cfg(test)]").next().expect("production half");
 
         // (function, the authorization it must perform, the mutation it guards)
+        //
+        // `claim_registration_token` is in this list even though it is a READ
+        // path, and that is the round-3 lesson: a bearer credential is a read
+        // path, and the authority behind it must be re-derived when it is
+        // spent. It was the seventh instance of this sprint's defect class.
         let entry_points = [
-            ("apply_client_admin_edit", "authorize_client_write(&actor", "UPDATE rmcp_client SET"),
+            (
+                "claim_registration_token",
+                "actor_authority(&mut tx, issued_by)",
+                "SET uses_remaining = uses_remaining - 1",
+            ),
+            // The mutation marker is the CONSTANT this executes, not the SQL
+            // text: round 3 moved that text into `CLIENT_ADMIN_UPDATE` to get
+            // `format!()` out of the query, and this guard correctly went red
+            // until the marker followed it. What the constant itself contains
+            // is pinned by `the_admin_queries_never_select_the_secret_hash`.
+            ("apply_client_admin_edit", "authorize_client_write(&actor", "Self::CLIENT_ADMIN_UPDATE"),
             ("revoke_client", "authorize_client_write(&actor", "UPDATE rmcp_client SET disabled"),
             (
                 "insert_registration_token",
@@ -3172,6 +3355,13 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
             assert!(
                 body.contains("Self::actor_authority(&mut tx"),
                 "{function} must derive the actor's authority inside its own transaction"
+            );
+            // …and it must be a TRANSACTION, so the authority is locked for the
+            // rest of it. A helper reading outside one is a point-in-time proof
+            // again, which is the shape this whole sprint kept reopening.
+            assert!(
+                body.contains("self.pool.begin()"),
+                "{function} must open its own transaction so the authority read is locked"
             );
         }
     }

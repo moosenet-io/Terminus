@@ -70,6 +70,14 @@ use crate::oauth::{random_token, SecretHash};
 /// password grants; neither appears here, and neither may be registered.
 pub const SUPPORTED_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_token"];
 
+/// What an ABSENT `grant_types` means: the authorization-code grant, alone.
+///
+/// RFC 7591 §2's default, followed exactly. Not `authorization_code` plus
+/// `refresh_token` — that would hand a client a capability it did not request,
+/// which is a widening on the absence path and the one direction this item
+/// refuses everywhere else.
+pub const DEFAULT_GRANT_TYPE: &str = "authorization_code";
+
 /// The token-endpoint authentication methods this server supports, matching
 /// what the metadata advertises. `none` is a public client (PKCE only), which
 /// is what Claude registers as.
@@ -463,9 +471,20 @@ pub fn validate(submitted: &SubmittedMetadata) -> Result<ValidatedMetadata, Vec<
 
     // ── Grant types ─────────────────────────────────────────────────────────
     //
-    // Absence means the RFC 7591 default, which is the authorization-code
-    // grant. Note that absence is NOT read as "all of them" — the same rule
-    // this subsystem applies to scope rows, applied to a smaller thing.
+    // Absence means the RFC 7591 default, which is `authorization_code` ALONE.
+    //
+    // Round 3 (`gpt56`): this defaulted to `authorization_code` PLUS
+    // `refresh_token`, which grants a capability the client never asked for —
+    // a widening on the absence path, and the exact direction this item has
+    // been correcting everywhere else. A client that wants to refresh has to
+    // say so, in the same request, like every other capability here.
+    //
+    // The convenience it cost is real and is the right trade: a connector that
+    // cannot refresh degrades into "reauthorize every hour", which reads to a
+    // user as an unreliable server. But that is a reason to DOCUMENT the
+    // requirement (the `.env.example` and README both name it), not a reason
+    // for the server to decide on the client's behalf — absence must never
+    // grant more than was requested.
     let grant_types = match &submitted.grant_types {
         Some(requested) => {
             for (index, grant) in requested.iter().enumerate() {
@@ -475,7 +494,7 @@ pub fn validate(submitted: &SubmittedMetadata) -> Result<ValidatedMetadata, Vec<
             }
             requested.clone()
         }
-        None => vec!["authorization_code".to_string(), "refresh_token".to_string()],
+        None => vec![DEFAULT_GRANT_TYPE.to_string()],
     };
 
     // ── Response types ──────────────────────────────────────────────────────
@@ -1056,15 +1075,42 @@ mod tests {
         assert_eq!(SUPPORTED_GRANT_TYPES, ["authorization_code", "refresh_token"]);
     }
 
-    /// Absence of `grant_types` means the RFC's default, NEVER "all of them" —
-    /// the same rule this subsystem applies to scope rows.
+    /// **Absence of `grant_types` grants the RFC's default and nothing more.**
+    ///
+    /// Round 3 (`gpt56`): this used to default to `authorization_code` PLUS
+    /// `refresh_token`, handing every registration a capability it never asked
+    /// for. Refresh is not cosmetic — it is what lets a client keep acting
+    /// without the human present — so granting it on the absence path is a
+    /// widening, and this item refuses widenings on absence paths everywhere
+    /// else.
+    ///
+    /// The mutation target: put `refresh_token` back into the `None` arm and
+    /// this goes red.
     #[test]
     fn an_absent_grant_type_list_defaults_narrow_not_wide() {
         let validated = validate(&submitted(&["https://connector.test/cb"])).expect("valid");
-        assert_eq!(validated.grant_types, ["authorization_code", "refresh_token"]);
+        assert_eq!(
+            validated.grant_types,
+            ["authorization_code"],
+            "an absent grant_types must not grant refresh capability"
+        );
+        assert!(
+            !validated.grant_types.iter().any(|g| g == "refresh_token"),
+            "refresh must be asked for, never defaulted in"
+        );
         for grant in &validated.grant_types {
             assert!(SUPPORTED_GRANT_TYPES.contains(&grant.as_str()));
         }
+
+        // …and a client that WANTS refresh gets it by saying so, which is the
+        // half that must keep working.
+        let mut asks = submitted(&["https://connector.test/cb"]);
+        asks.grant_types =
+            Some(vec!["authorization_code".into(), "refresh_token".into()]);
+        assert_eq!(
+            validate(&asks).expect("valid").grant_types,
+            ["authorization_code", "refresh_token"]
+        );
     }
 
     /// The default is a PUBLIC client. Defaulting the other way would mint a
