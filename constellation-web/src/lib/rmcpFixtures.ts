@@ -368,6 +368,7 @@ let accounts: FixtureAccount[] = [
  *  healthy, non-empty fixture where both flags are false, so it would have passed against a
  *  client that hard-coded them. A state the fixture cannot reach is a state no test covers. */
 export function __setFixtureAccounts(next: 'empty' | 'stranded' | 'default'): void {
+  rawAccountRows = null;
   if (next === 'empty') {
     accounts = [];
     return;
@@ -383,6 +384,20 @@ export function __setFixtureAccounts(next: 'empty' | 'stranded' | 'default'): vo
     accounts[0].disabled = false;
   }
 }
+
+/** Put ARBITRARY rows on the wire, including malformed ones, so the client's translation can be
+ *  tested against what a broken or newer server could actually send. Nothing else can produce
+ *  that: every other path here emits well-formed rows by construction, which is exactly why the
+ *  mapper's validation went unpinned. */
+export function __setFixtureAccountRows(rows: unknown[] | null): void {
+  rawAccountRows = rows;
+}
+
+/** When set, `rmcp_account_list` returns these rows VERBATIM and skips its own state derivation.
+ *  Bypassing that logic is the point: the fixture would otherwise classify a row missing
+ *  `operator` as "not an active operator", report the door stranded, and return an empty list —
+ *  so the malformed row would never reach the client mapper under test. */
+let rawAccountRows: unknown[] | null = null;
 
 /** Active operators, the same predicate the server's `an_operator_exists` uses. */
 function activeOperatorAccounts(): FixtureAccount[] {
@@ -876,6 +891,13 @@ export async function rmcpFixtureCall<T>(tool: RmcpToolName, args: Record<string
         if (!found || !found.operator || found.disabled) {
           throw new RmcpError('invalid', tool, `${named} is not an active operator`);
         }
+      }
+      if (rawAccountRows) {
+        return delay({
+          accounts: rawAccountRows,
+          bootstrap_available: false,
+          stranded: false,
+        } as unknown as T);
       }
       const stranded = accounts.length > 0 && activeOperatorAccounts().length === 0;
       return delay({

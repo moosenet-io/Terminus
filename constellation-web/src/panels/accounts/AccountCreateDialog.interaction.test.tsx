@@ -83,9 +83,23 @@ describe('AccountCreateDialog — the password does not outlive the flow', () =>
 
     // The confirmation names the ACCOUNT.
     expect(await screen.findByText(/was created/i)).toBeTruthy();
-    // Mutation-verify: delete `setPassword('')` from the `.then` and this goes red.
-    expect(passwordValues().every(v => v === '')).toBe(true);
+    // WHAT THIS PINS, precisely — and the precision is the point, because two earlier versions
+    // of this assertion claimed more than they delivered and I only found out by running the
+    // mutation instead of trusting the comment:
+    //
+    //   • The success view does not render the credential. Genuinely pinned by the line below.
+    //   • The success-path `setPassword('')` is NOT pinned here, and cannot be. Once
+    //     `setCreated(...)` fires, the confirmation branch replaces the form, so the input is
+    //     unmounted and no assertion in this state can observe the retained value —
+    //     `passwordValues()` is `[]` and `[].every()` is vacuously true. Deleting that clear
+    //     leaves every test in this file green (verified by doing it).
+    //
+    // That clear is therefore defence in depth rather than the guarantee: it drops the plaintext
+    // a moment earlier than the close-reset would. The OBSERVABLE guarantees are this view not
+    // showing it, plus the refusal and close paths below, which are pinned and which do go red.
     expect(documentText()).not.toContain(SECRET);
+    expect(passwordValues()).toHaveLength(0);
+
     // It was sent exactly once, and only to the create call.
     expect(mockCreate).toHaveBeenCalledTimes(1);
     expect(mockCreate.mock.calls[0][0]).toMatchObject({ password: SECRET });

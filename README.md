@@ -1066,8 +1066,15 @@ an error, or the journal. These tools are deliberately **not** approval-gated: t
 persists a guarded call's raw arguments, which would write the plaintext to disk.
 
 So a fresh deployment goes: apply the migration → `rmcp_account_create` → `rmcp_client_create`
-→ paste the `client_id` into Claude. The **Accounts** page (`/terminus/accounts`) is the same
-flow in the GUI, and calls exactly these tools.
+→ paste the `client_id` into Claude.
+
+The **Accounts** page (`/terminus/accounts`) is that same flow in the GUI and calls exactly these
+tools — **but it is not usable yet, and this is the honest state of it**: the page reaches the
+tools through `POST /api/terminus/rmcp/call`, a web bridge that **does not exist in this repo**.
+Until it is built the page renders an explanatory "cannot reach the account tools" state instead
+of a list, exactly as the Connectors page has since RMCP-13. The tools themselves are live on the
+Terminus door, so **the CLI path above is the working one today**; the page is built, embedded in
+the binary, and waiting on its bridge.
 
 **Nothing can strand the door.** `rmcp_account_promote … revoke=true` and `rmcp_account_disable`
 both refuse to remove the last *active* operator, through one shared server-side check that runs

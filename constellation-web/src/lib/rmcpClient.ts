@@ -302,7 +302,7 @@ export async function listAccounts(actor?: string): Promise<RmcpAccountsView> {
     // page that worked only while the list was empty. TypeScript could not see
     // it because the wire type was asserted rather than described; `RmcpAccountWire`
     // is now the honest shape, so the compiler checks the translation.
-    accounts: (r.accounts ?? []).map(wireAccount),
+    accounts: (r.accounts ?? []).map(row => wireAccount(row, RMCP_TOOLS.accountList)),
     // `?? false` is the fail-closed reading for BOTH: a response that omits
     // `bootstrap_available` must not offer the bootstrap, and one that omits
     // `stranded` must not claim the door is healthy — the page renders the
@@ -322,17 +322,42 @@ interface RmcpAccountWire {
   created_at: string;
 }
 
-function wireAccount(a: RmcpAccountWire): RmcpAccount {
+/**
+ * Translate one wire row, REFUSING a malformed one.
+ *
+ * Round 5 (codex) found the previous version's `a.disabled === true` doing exactly what its own
+ * comment said it was avoiding. A missing or malformed `disabled` became `false` — "enabled" —
+ * and if `operator` was validly `true` the page then counted that row as an ACTIVE OPERATOR. That
+ * feeds `actorIsAmbiguous` and `wouldStrandTheDoor`, so a malformed row could make the GUI believe
+ * there is a spare operator and offer to demote the real one. The reassuring direction, on
+ * authority, from absent data.
+ *
+ * The mapper cannot resolve that safely by guessing either way: "assume disabled" hides a real
+ * account, "assume enabled" invents an operator. So it does neither and REFUSES — an operator
+ * seeing an error and reaching for the CLI is strictly better than one acting on a listing that
+ * quietly misrepresents who can administer the door. Absence is not the empty set here; absence
+ * is a broken response, and this module's contract already says an `ok:true` with a malformed
+ * payload is a contract violation rather than data.
+ */
+function wireAccount(a: RmcpAccountWire, tool: RmcpToolName): RmcpAccount {
+  const bad = (field: string): never => {
+    throw new RmcpError(
+      'error',
+      tool,
+      `the server returned an account row with a missing or malformed ${field}`,
+    );
+  };
+  if (typeof a?.id !== 'string' || !a.id) bad('id');
+  if (typeof a?.account !== 'string' || !a.account) bad('account');
+  if (typeof a?.operator !== 'boolean') bad('operator');
+  if (typeof a?.disabled !== 'boolean') bad('disabled');
+  if (typeof a?.created_at !== 'string' || !a.created_at) bad('created_at');
   return {
     id: a.id,
     account: a.account,
-    // Booleans are read strictly rather than coerced: the server sends real
-    // booleans, and `!!undefined` would quietly render a missing `operator` as
-    // "delegated" and a missing `disabled` as "enabled" — the reassuring
-    // direction for both, which is the wrong way to be wrong about authority.
-    operator: a.operator === true,
-    disabled: a.disabled === true,
-    createdAt: a.created_at ?? '',
+    operator: a.operator,
+    disabled: a.disabled,
+    createdAt: a.created_at,
   };
 }
 

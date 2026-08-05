@@ -1001,17 +1001,24 @@ impl OauthStore {
     }
 
     /// Whether ANY account row exists at all — active, disabled, operator or
-    /// not.
+    /// not, read on the pool.
     ///
-    /// Distinct from [`Self::an_operator_exists`] and NOT a substitute for it.
-    /// This exists only so the tool surface can tell an operator which of two
-    /// situations they are in ("nothing here yet" versus "accounts exist but
-    /// none of them can administer this"), and it authorizes nothing. It is
-    /// deliberately not consulted by [`Self::create_account`]: the rule that
-    /// closes the bootstrap is about OPERATORS, and widening it to "any
-    /// account" would let a deployment full of delegated users still be
-    /// bootstrapped by anyone reaching the tool.
-    pub async fn any_account_exists(&self) -> Result<bool, ToolError> {
+    /// **This is the WEAKER, non-authorizing form, and it has no production
+    /// caller.** [`Self::any_account_exists_tx`] is the one the bootstrap gate
+    /// uses; [`Self::read_door_state`] is the one the tool surface uses to
+    /// choose a message. This remains only because the tool tests assert on it
+    /// directly, and it is `pub(crate)` so it cannot acquire a caller outside
+    /// this crate.
+    ///
+    /// Its doc previously described the REJECTED rule — that the bootstrap
+    /// turns on operator existence and deliberately does not consult account
+    /// existence — which was the exact fail-open design review round 1 threw
+    /// out, left sitting next to the corrected code where it would have talked
+    /// the next maintainer straight back into it. Round 5 (codex) caught that.
+    /// The rule, once: **the bootstrap is gated on whether any account ROW
+    /// exists**, because a row's existence is not revocable and operator-ness
+    /// is.
+    pub(crate) async fn any_account_exists(&self) -> Result<bool, ToolError> {
         sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM rmcp_account)")
             .fetch_one(&self.pool)
             .await
@@ -5282,11 +5289,25 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
             );
             created.expect("the bootstrap must succeed");
             let state = observed.expect("no error");
-            assert!(
-                !(state.any_account && state.any_operator.is_none()),
-                "observed a door with accounts and no operator while the ONLY writer was a \
-                 bootstrap — the two facts came from different instants, which is what makes a \
-                 freshly-bootstrapped door report itself stranded"
+            // EVERY hybrid, not one of them. Round 5 (codex) caught the first
+            // version asserting only `(any_account, None)` — which two pool
+            // reads in this function's order can never produce, so the test
+            // passed with the transaction removed. The reachable hybrid is the
+            // OTHER one, `(false, Some(op))`: `any_account` read before the
+            // commit and the operator list after it. A bootstrap creates the
+            // door's only account AND its only operator in one transaction, so
+            // for this workload the two facts must always agree; asserting the
+            // agreement catches both directions and needs no knowledge of which
+            // order the queries happen to run in.
+            assert_eq!(
+                state.any_account,
+                state.any_operator.is_some(),
+                "observed any_account={} with any_operator={:?} while the ONLY writer was a \
+                 bootstrap that creates both in one transaction — the two facts came from \
+                 different instants, which is what makes a freshly-bootstrapped door report \
+                 itself stranded",
+                state.any_account,
+                state.any_operator
             );
         }
     }

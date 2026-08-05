@@ -711,6 +711,31 @@ describe('accounts adapter', () => {
     }
   });
 
+  it('REFUSES a malformed row rather than presenting it as enabled', async () => {
+    // Round 5 (codex): the mapper manufactured `disabled: false` from a missing key, so a
+    // malformed row with `operator: true` was counted as an ACTIVE OPERATOR — which drives the
+    // actor picker and the last-operator controls. The mutation this pins is the type checks in
+    // `wireAccount`: delete any one of them and the matching case below stops throwing.
+    const { __setFixtureAccountRows, __setFixtureAccounts } = await import('./rmcpFixtures');
+    try {
+      const good = { id: 'x', account: 'x', operator: true, disabled: false, created_at: '2026-01-01T00:00:00Z' };
+      for (const field of ['id', 'account', 'operator', 'disabled', 'created_at'] as const) {
+        const row: Record<string, unknown> = { ...good };
+        delete row[field];
+        __setFixtureAccountRows([row]);
+        await expect(listAccounts()).rejects.toThrow(new RegExp(field));
+        // …and a wrong TYPE is refused too, not just a missing key.
+        __setFixtureAccountRows([{ ...good, [field]: 12345 }]);
+        await expect(listAccounts()).rejects.toThrow(new RegExp(field));
+      }
+      // The well-formed row still passes, so the guard is not simply rejecting everything.
+      __setFixtureAccountRows([good]);
+      await expect(listAccounts()).resolves.toMatchObject({ accounts: [{ account: 'x', operator: true }] });
+    } finally {
+      __setFixtureAccounts('default');
+    }
+  });
+
   it('reports the server flags rather than inferring them from the list length', async () => {
     // All THREE states, because round 3 caught the earlier version exercising only the healthy
     // one — where both flags are false, so it passed against a client that hard-coded them.

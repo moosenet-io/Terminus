@@ -18,7 +18,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { onMutationResult } from './aggregationClient';
 import type { MutationResultEvent } from './aggregationClient';
-import { listClients, RmcpError } from './rmcpClient';
+import { createAccount, listClients, RmcpError } from './rmcpClient';
+
+// pii-test-fixture: a synthetic passphrase, asserted ABSENT from the emitted event.
+const PASSWORD = 'a-synthetic-passphrase-for-this-test'; // pii-test-fixture
 
 const realFetch = globalThis.fetch;
 
@@ -36,6 +39,30 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = realFetch;
   delete (window as unknown as { __AGG_MODE__?: string }).__AGG_MODE__;
+});
+
+describe('the mutation event never carries the request body', () => {
+  it('emits only {system, method, path, ok} — never the password that was just sent', async () => {
+    // Round 5 (opus) asked for this confirmation rather than assuming it: `createAccount` is the
+    // first tool to put a PLAINTEXT CREDENTIAL in the request body, and it travels
+    // callTool → request → withMutationResultEvent, whose event feeds the activity feed and the
+    // toast layer. The module doc claims the password never reaches a toast; nothing tested it.
+    //
+    // Mutation-verify: add `body: init?.body` to the object `emitMutationResult` is called with
+    // in `withMutationResultEvent` and this goes red.
+    const seen: MutationResultEvent[] = [];
+    const off = onMutationResult(e => seen.push(e));
+    respondWith({ ok: true, result: { id: 'a1', account: 'someone', operator: false, bootstrap: false } });
+
+    await createAccount({ account: 'someone', password: PASSWORD, operator: false });
+    off();
+
+    expect(seen.length).toBe(1);
+    // The whole event, serialized — so a body folded in under ANY key is caught, not just one
+    // this test thought to name.
+    expect(JSON.stringify(seen[0])).not.toContain(PASSWORD);
+    expect(Object.keys(seen[0]).sort()).toEqual(['method', 'ok', 'path', 'system']);
+  });
 });
 
 describe('a tool refusal is reported as a FAILED mutation, not a successful one', () => {

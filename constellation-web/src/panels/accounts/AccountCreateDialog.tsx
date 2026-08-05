@@ -10,7 +10,12 @@
 // an argon2id hash, and echoing it back would add a disclosure that buys nothing.
 //
 // So the value lives in this component's state for the life of one submit and is cleared on every
-// exit path — success, cancel, and failure alike. It is never put in `client.prefs` (the app's
+// exit path — success, cancel, and failure alike. Two of those are load-bearing and pinned by
+// `AccountCreateDialog.interaction.test.tsx` (the refusal path, and the reset on close); the
+// success-path clear is defence in depth, because the confirmation branch has already unmounted
+// the input by then and the close-reset would clear it regardless. The test file says which is
+// which rather than implying all three are guarded — a claim written twice will otherwise
+// disagree with itself, which is how the refusal path came to be unguarded in the first place. It is never put in `client.prefs` (the app's
 // only browser storage), never in a URL, never in a toast, never in the success copy, and never
 // re-read: no tool returns it. The confirmation names the ACCOUNT, never the credential.
 //

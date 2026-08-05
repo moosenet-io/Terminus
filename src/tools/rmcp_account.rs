@@ -1543,7 +1543,23 @@ mod tests {
     }
 
 
-    /// **A configured `RMCP_OPERATOR_ACCOUNT` resolves a multi-operator fleet.**
+    /// **A NAMED operator resolves on a multi-operator fleet, and an inferred
+    /// one does not.**
+    ///
+    /// RENAMED in round 5 (codex), and the correction matters more than the
+    /// name: the previous title claimed to exercise the
+    /// `RMCP_OPERATOR_ACCOUNT` branch and did not — it calls
+    /// `resolve_named_operator` directly, so deleting the environment branch
+    /// entirely would leave it green. That is the fake-guard shape this item
+    /// has spent five rounds removing, and it was mine.
+    ///
+    /// It is not fixed by reading the variable here: `std::env` is
+    /// process-global and these tests run concurrently in one process, so a
+    /// test that set it would make its neighbours' outcomes depend on
+    /// scheduling. What the environment branch does once it has the name IS
+    /// what this covers — resolution and the Named-vs-InferredSole
+    /// consequence — and the read itself is the same three lines `rmcp_owner`
+    /// has always had. Stating that is honest; claiming coverage was not.
     ///
     /// Review round 4 (codex) read the environment branch running BEFORE the
     /// several-operator check as a hole — "a write succeeds without the caller
@@ -1558,7 +1574,7 @@ mod tests {
     /// say the rule precisely: ambiguity is refused only when nobody has said
     /// which operator is acting.
     #[tokio::test]
-    async fn a_configured_environment_actor_resolves_a_multi_operator_fleet() {
+    async fn a_named_operator_resolves_on_a_multi_operator_fleet_and_an_inferred_one_does_not() {
         let (_dir, _path, source) = fixture().await;
         create(&source)
             .execute_structured(json!({ "name": "boss", "password": "a-long-enough-passphrase" }))
