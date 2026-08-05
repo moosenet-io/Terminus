@@ -298,6 +298,29 @@ pub fn resolve_backend_at(
 /// in each caller: see [`crate::intake::gpu_stop_guard`].
 ///
 /// Registry unset / unreadable / unparseable ⇒ empty ⇒ nothing is stopped.
+/// Every systemd unit that must never be stopped, per the live registry file:
+/// the declared and transient units of every backend the guard refuses to stop.
+///
+/// Exists so [`crate::intake::lifecycle::stop`] — which is PUBLIC and takes a
+/// caller-supplied `ResolvedBackend`, not a guarded value — can refuse a target
+/// that belongs to a protected backend. Raised in review (gpt56, round 5): the
+/// guard type covers `free_gpu`, but `stop` could be handed a hand-built backend
+/// with `always_on: false` and `unit: "ollama.service"`.
+///
+/// Registry unset / unreadable / unparseable ⇒ empty. That is the same
+/// graceful-degrade posture as the rest of this module, and it fails in the
+/// direction the ORIGINAL code already had: nothing extra is protected, nothing
+/// extra is stopped either, because `free_gpu`'s candidate list is empty too.
+pub fn protected_units() -> std::collections::BTreeSet<String> {
+    let Some(path) = registry_path() else {
+        return Default::default();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Default::default();
+    };
+    gpu_stop_guard::protected_units_from_json(&text)
+}
+
 pub fn stoppable_gpu_backends(keep: &str) -> Vec<StoppableGpuBackend> {
     let Some(path) = registry_path() else {
         return Vec::new();

@@ -64,7 +64,7 @@ pub async fn ensure_up(backend: &ResolvedBackend, model: &str) -> Result<(), Str
                 .ok_or_else(|| format!("could not resolve GGUF blob for '{model}' under {local}"))?
         };
         let unit_name = transient_unit(&backend.name);
-        let _ = run(["systemctl", "stop", &unit_name]); // clear any stale unit
+        stop_unit_unless_protected(&unit_name); // clear any stale unit
         let mut argv: Vec<String> = vec![
             format!("--unit={unit_name}"),
             "--collect".to_string(),
@@ -154,14 +154,41 @@ pub fn stop(backend: &ResolvedBackend) {
     {
         return;
     }
-    match &backend.unit {
-        Some(unit) => {
-            let _ = run(["systemctl", "stop", unit]);
-        }
-        None => {
-            let _ = run(["systemctl", "stop", &transient_unit(&backend.name)]);
-        }
+    let target = backend
+        .unit
+        .clone()
+        .unwrap_or_else(|| transient_unit(&backend.name));
+    stop_unit_unless_protected(&target);
+}
+
+/// **The ONLY place this module issues `systemctl stop`.**
+///
+/// Every stop path funnels here, and here the target is checked against the
+/// registry-derived protected set — the declared AND transient units of every
+/// backend the guard refuses to stop. Two review findings made this the right
+/// shape rather than three separate guarded call sites:
+/// - `stop` is PUBLIC and takes a caller-supplied `ResolvedBackend`, so it has no
+///   guarded value to lean on: a hand-built backend with `always_on: false` and
+///   `unit: "ollama.service"` passed its field checks (gpt56, round 5).
+/// - `free_gpu` stops a candidate's TRANSIENT unit as well as its declared one, so
+///   an always-on backend declaring `unit: "chord-evict.service"` could be stopped
+///   as on-demand backend `evict`'s transient unit — with nothing misdescribed at
+///   all (codex, round 5). `ensure_up`'s stale-transient clear had the same shape.
+///
+/// The guard already excludes such candidates at construction; this is the second,
+/// independent line, placed at the point of action where it cannot be forgotten.
+/// It re-reads the registry per stop — a few hundred bytes, on a path that is
+/// already spawning `systemctl`, in exchange for the check being unskippable.
+fn stop_unit_unless_protected(unit: &str) {
+    if infer::protected_units().contains(unit) {
+        tracing::warn!(
+            unit = %unit,
+            "refusing to stop a protected unit: it belongs to an always-on or \
+             unmanaged backend in the model registry (CHRD #112)"
+        );
+        return;
     }
+    let _ = run(["systemctl", "stop", unit]);
 }
 
 /// Stop every **stoppable** GPU backend except `keep` (frees the single GPU).
@@ -175,14 +202,17 @@ pub fn stop(backend: &ResolvedBackend) {
 fn free_gpu(keep: &str) {
     for backend in infer::stoppable_gpu_backends(keep) {
         if let Some(unit) = backend.unit() {
-            let _ = run(["systemctl", "stop", unit]);
+            stop_unit_unless_protected(unit);
         }
-        let _ = run(["systemctl", "stop", &transient_unit(backend.name())]);
+        stop_unit_unless_protected(&transient_unit(backend.name()));
     }
 }
 
+/// Re-exported from the guard, which owns the definition: the guard has to reason
+/// about transient units to decide what may be stopped, and two copies of this
+/// format string would be two chances for the guard and the effect to disagree.
 fn transient_unit(backend: &str) -> String {
-    format!("chord-{backend}.service")
+    gpu_stop_guard::transient_unit(backend)
 }
 
 // ── GGUF blob resolution ────────────────────────────────────────────────────
@@ -447,21 +477,17 @@ mod tests {
     /// SOURCE-LEVEL RATCHET (CHRD #112 / TERM #650), in two halves.
     ///
     /// The type guard makes it impossible to *ask* `free_gpu` to stop an
-    /// always-on backend. It cannot, on its own, stop someone adding a NEW place
-    /// in this file that shells out `systemctl stop` against a name pulled
-    /// straight from the registry — which is exactly how the original defect was
-    /// written. Hence a ratchet. It has two halves because neither is sufficient:
+    /// always-on backend, and `stop_unit_unless_protected` re-checks the target at
+    /// the point of action. Neither can stop someone adding a NEW place in this
+    /// file that shells out `systemctl stop` directly — which is exactly how the
+    /// original defect was written. Hence a ratchet, in two halves:
     ///
-    /// **1. Attribution** — which functions issue a `systemctl stop`. Informative:
-    /// it names the offender. Allowed here:
-    /// - `ensure_up` — clears a stale transient `chord-<name>` unit for the
-    ///   backend it is about to start; it has already returned early for
-    ///   always-on/ollama/daemon backends, so that name is an on-demand one.
-    /// - `stop` — gated by [`gpu_stop_guard::may_stop`].
-    /// - `free_gpu` — can only iterate values the guard constructed.
+    /// **1. Attribution** — which functions issue a `systemctl stop`. Exactly ONE
+    /// is allowed: `stop_unit_unless_protected`, the single chokepoint every stop
+    /// path funnels through. A second is a design change, not a detail.
     ///
     /// **2. Census** — how many `"systemctl"` string literals exist at all.
-    /// Syntax-independent, and the answer to the arms race two review rounds
+    /// Syntax-independent, and the answer to the arms race the review rounds
     /// exposed: a lexical scanner will never attribute every legal spelling of a
     /// function header, and it cannot see `let verb = "stop"` at all — but every
     /// such bypass still has to name `systemctl`, so the count moves. It also
@@ -471,7 +497,7 @@ mod tests {
     /// Both read the REAL source of this file, so neither can drift from what
     /// ships. The scanners themselves are unit-tested in `gpu_stop_guard`.
     #[test]
-    fn every_systemctl_stop_in_this_module_lives_in_a_guarded_function() {
+    fn every_systemctl_stop_in_this_module_lives_in_one_guarded_chokepoint() {
         const SRC: &str = include_str!("lifecycle.rs");
 
         // Half 1: attribution.
@@ -481,26 +507,22 @@ mod tests {
             "the ratchet found no `systemctl stop` call sites at all — it has \
              stopped measuring anything; fix the scanner rather than deleting it"
         );
-        let allowed = ["ensure_up", "stop", "free_gpu"];
-        let unexpected: Vec<&String> =
-            owners.iter().filter(|o| !allowed.contains(&o.as_str())).collect();
-        assert!(
-            unexpected.is_empty(),
-            "new `systemctl stop` call site(s) in {unexpected:?} — every stop in \
-             this module must go through the gpu_stop_guard-gated path (CHRD #112). \
-             All sites found: {owners:?}"
+        assert_eq!(
+            owners,
+            vec!["stop_unit_unless_protected".to_string()],
+            "every stop in this module must funnel through the single \
+             protected-unit-checked chokepoint (CHRD #112); found {owners:?}"
         );
 
-        // Half 2: census. 7 today = 1 `start` in `ensure_up`, 1 stale-transient
-        // `stop` in `ensure_up`, 2 in `stop`, 2 in `free_gpu`, 1 `Command::new`
-        // in the unit-liveness probe.
+        // Half 2: census. 3 today = 1 `start` in `ensure_up`, 1 `stop` in
+        // `stop_unit_unless_protected`, 1 `Command::new` in the unit-liveness probe.
         assert_eq!(
             gpu_stop_guard::systemctl_literal_count(SRC),
-            7,
+            3,
             "the number of `systemctl` invocations in this module changed. That is \
              not automatically wrong — but a new one must be justified: it has to be \
-             unreachable for an always-on backend, either because the guard type \
-             gates it or because it cannot target a registry-named unit. Update this \
+             unreachable for a protected unit, either because the guard type gates \
+             it or because it routes through stop_unit_unless_protected. Update this \
              count in the same commit that adds it (CHRD #112)."
         );
     }

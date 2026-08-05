@@ -106,6 +106,42 @@ pub fn is_unmanaged_kind(kind: Option<&str>) -> bool {
     matches!(kind.map(str::trim), Some("ollama"))
 }
 
+/// The transient systemd unit a launch-based backend runs as when it has no
+/// declared unit. Defined HERE, not in `lifecycle`, because the guard has to
+/// reason about it: `free_gpu` stops a candidate's declared unit AND its
+/// transient one, so both are stop TARGETS and both must be checked. Two copies
+/// of this format string would be two chances for the guard and the effect to
+/// disagree about what they are naming.
+pub fn transient_unit(backend: &str) -> String {
+    format!("chord-{backend}.service")
+}
+
+/// Every systemd unit that must never be stopped, given the raw registry text:
+/// for each backend this guard refuses to stop, both its DECLARED unit and its
+/// TRANSIENT unit.
+///
+/// The transient half is round-5 (codex), and it needed no lie at all to exploit:
+/// an always-on backend declaring `unit: "chord-evict.service"` alongside an
+/// ordinary on-demand backend NAMED `evict` meant the candidate passed every
+/// filter and then `free_gpu` stopped the always-on backend as the candidate's
+/// own transient unit. Collisions are checked against stop TARGETS, not against
+/// entries.
+pub fn protected_units_from_json(raw: &str) -> std::collections::BTreeSet<String> {
+    let Ok(reg) = serde_json::from_str::<RegFile>(raw) else {
+        return Default::default();
+    };
+    reg.backends
+        .iter()
+        .filter(|(_, b)| !may_stop(b.always_on) || is_unmanaged_kind(b.kind.as_deref()))
+        .flat_map(|(name, b)| {
+            b.unit
+                .clone()
+                .into_iter()
+                .chain(std::iter::once(transient_unit(name)))
+        })
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct RegFile {
     #[serde(default)]
@@ -132,9 +168,11 @@ struct RegBackend {
 /// - `always_on` backends — [`may_stop`], the assistant's engine;
 /// - `ollama`-kind backends — [`is_unmanaged_kind`], a second independent signal
 ///   for the same thing, so a registry has to lie twice to become dangerous;
-/// - anything naming the UNIT of a backend the first two rules protected — a
-///   protected unit is protected under every alias, so a second entry cannot
-///   launder `ollama.service` through an innocuous-looking name;
+/// - anything whose stop TARGETS (declared unit or transient `chord-<name>` unit)
+///   collide with a unit the first two rules protected — a protected unit is
+///   protected under every alias, so neither a second entry naming
+///   `ollama.service` nor a backend whose transient unit happens to be a
+///   protected backend's declared unit can launder a stop through;
 /// - non-GPU backends — they are not holding the GPU.
 ///
 /// A missing/unparseable registry yields an EMPTY list, so the caller stops
@@ -145,21 +183,17 @@ pub fn stoppable_gpu_backends_from_json(raw: &str, keep: &str) -> Vec<StoppableG
         return Vec::new();
     };
 
-    // PROTECTED UNITS: every systemd unit named by a backend this guard refuses
-    // to stop. No candidate may stop one of these, whatever entry it arrives
-    // under.
+    // PROTECTED UNITS: every stop TARGET belonging to a backend this guard refuses
+    // to stop — declared and transient alike. No candidate may name one, whatever
+    // entry it arrives under.
     //
-    // This is what closes gpt56's round-4 case — a SECOND entry, of an innocuous
-    // kind and `always_on: false`, that names `unit: "ollama.service"`. It is not
-    // a unit-name denylist and invents no second source of truth: the protected
-    // set is derived from THIS registry, so the rule is just "the registry must be
-    // self-consistent". A protected unit is protected under every alias.
-    let protected: std::collections::BTreeSet<&str> = reg
-        .backends
-        .values()
-        .filter(|b| !may_stop(b.always_on) || is_unmanaged_kind(b.kind.as_deref()))
-        .filter_map(|b| b.unit.as_deref())
-        .collect();
+    // This closes two review findings at once: a SECOND entry of an innocuous kind
+    // naming `unit: "ollama.service"` (r4, gpt56), and a candidate whose TRANSIENT
+    // unit collides with a protected backend's declared unit (r5, codex). Neither
+    // is a unit-name denylist and neither invents a second source of truth: the
+    // protected set is derived from THIS registry, so the rule is just "the
+    // registry must be self-consistent".
+    let protected = protected_units_from_json(raw);
 
     reg.backends
         .iter()
@@ -168,7 +202,22 @@ pub fn stoppable_gpu_backends_from_json(raw: &str, keep: &str) -> Vec<StoppableG
                 && b.hardware.as_deref() == Some("gpu")
                 && may_stop(b.always_on)
                 && !is_unmanaged_kind(b.kind.as_deref())
+                // BOTH stop targets: `free_gpu` stops the declared unit and the
+                // transient one, so a collision on either is disqualifying.
+                //
+                // DELIBERATE REDUNDANCY, measured, not assumed: because every
+                // protected entry contributes its OWN transient unit to
+                // `protected`, the two clauses above (`may_stop`,
+                // `!is_unmanaged_kind`) are already implied by the collision check
+                // — a mutant deleting either one survives the suite. They are kept
+                // explicit anyway: a safety rule that holds only as an emergent
+                // consequence of a different rule is one refactor away from
+                // silently not holding. The RULES themselves are load-bearing and
+                // proven so (mutating `may_stop` kills 6 tests, mutating
+                // `is_unmanaged_kind` kills 2); it is only their restatement here
+                // that is redundant.
                 && !b.unit.as_deref().is_some_and(|u| protected.contains(u))
+                && !protected.contains(&transient_unit(name))
         })
         .map(|(name, b)| StoppableGpuBackend {
             name: name.clone(),
@@ -575,6 +624,58 @@ mod tests {
         let got = stoppable_gpu_backends_from_json(ordinary, "llama-gpu");
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].unit(), Some("innocuous.service"));
+    }
+
+    /// Round-5 (codex): the exploit that needed NO lie. `free_gpu` stops a
+    /// candidate's TRANSIENT unit as well as its declared one, so an always-on
+    /// backend that declares `unit: "chord-evict.service"` was stoppable as
+    /// on-demand backend `evict`'s transient unit. Everything here is truthful.
+    #[test]
+    fn a_transient_unit_collision_cannot_stop_a_protected_backend() {
+        let colliding = r#"{"backends":{
+            "pinned":{"url":"http://x","kind":"llama-server","hardware":"gpu",
+                      "unit":"chord-evict.service","always_on":true},
+            "evict":{"url":"http://y","kind":"llama-server","hardware":"gpu",
+                     "always_on":false}}}"#;
+        let got = stoppable_gpu_backends_from_json(colliding, "llama-gpu");
+        assert!(
+            got.is_empty(),
+            "`evict`'s transient unit IS the always-on backend's declared unit: {got:?}"
+        );
+
+        // CONTROL: rename the on-demand backend so nothing collides, and it is
+        // stoppable again — the rule must key on the collision, not on the
+        // presence of an always-on entry.
+        let ok = r#"{"backends":{
+            "pinned":{"url":"http://x","kind":"llama-server","hardware":"gpu",
+                      "unit":"chord-evict.service","always_on":true},
+            "other":{"url":"http://y","kind":"llama-server","hardware":"gpu",
+                     "always_on":false}}}"#;
+        let got = stoppable_gpu_backends_from_json(ok, "llama-gpu");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].name(), "other");
+    }
+
+    #[test]
+    fn protected_units_covers_declared_and_transient() {
+        let raw = r#"{"backends":{
+            "ollama":{"url":"http://x","kind":"ollama","hardware":"gpu",
+                      "unit":"ollama.service","always_on":true},
+            "lemonade":{"url":"http://y","kind":"llama-server","hardware":"gpu",
+                        "unit":"lemonade-coder.service","always_on":false}}}"#;
+        let p = protected_units_from_json(raw);
+        assert!(p.contains("ollama.service"), "declared unit: {p:?}");
+        assert!(p.contains("chord-ollama.service"), "transient unit: {p:?}");
+        assert!(
+            !p.contains("lemonade-coder.service") && !p.contains("chord-lemonade.service"),
+            "an on-demand backend's units are NOT protected — it must stay \
+             evictable: {p:?}"
+        );
+    }
+
+    #[test]
+    fn transient_unit_names_the_chord_scoped_unit() {
+        assert_eq!(transient_unit("llama-gpu"), "chord-llama-gpu.service");
     }
 
     #[test]
