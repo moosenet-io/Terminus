@@ -149,7 +149,7 @@ pub fn idle_secs(backend: &str) -> Option<u64> {
 /// concern (those kinds have no process for this crate to manage).
 pub fn stop(backend: &ResolvedBackend) {
     if !gpu_stop_guard::may_stop(backend.always_on)
-        || backend.kind == "ollama"
+        || gpu_stop_guard::is_unmanaged_kind(Some(&backend.kind))
         || backend.kind == "daemon"
     {
         return;

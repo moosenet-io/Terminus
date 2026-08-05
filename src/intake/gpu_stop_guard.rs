@@ -27,7 +27,13 @@
 //! tested exhaustively without a filesystem, a registry, or — most importantly —
 //! ever running `systemctl` against a live host.
 //!
-//! ## Known residual: the guard trusts the registry's own `always_on` flag
+//! ## Known residual: the guard trusts the registry
+//! The rule is now TWO independent signals — `always_on` and the backend `kind`
+//! (see [`is_unmanaged_kind`]) — so an entry has to misdescribe itself twice
+//! before the assistant's engine becomes stoppable. What follows is the residual
+//! that remains after both.
+//!
+//! ### It still trusts the registry's own fields
 //! Raised in review (opus) and acknowledged rather than fixed. An entry written as
 //! `always_on: false, unit: "ollama.service"` would be approved, and `free_gpu`
 //! would stop it. Nothing here can prevent that: the registry is the only
@@ -82,6 +88,24 @@ pub fn may_stop(always_on: bool) -> bool {
     !always_on
 }
 
+/// A backend KIND this crate never process-manages: an `ollama` serve's lifecycle
+/// belongs to its own unit and to `gpu_authority`, never to backend arbitration.
+///
+/// This is a SECOND, INDEPENDENT signal from the same registry, and it exists
+/// because reviewers (codex, gpt56) kept pressing on the one residual the
+/// `always_on` flag alone cannot cover: an entry that misdescribes the assistant
+/// engine as `always_on: false`. Requiring the entry to lie about BOTH its flag
+/// AND its kind before it becomes stoppable is materially harder to do by
+/// accident, and it costs nothing real — `lifecycle::stop` has ALWAYS refused
+/// `ollama`-kind backends, so `free_gpu` stopping one was already the odd one out.
+///
+/// `daemon` kinds deliberately stay stoppable BY `free_gpu` (though not by
+/// `stop`): a GPU-holding daemon must be evictable to free the GPU, and it is not
+/// the assistant's engine.
+pub fn is_unmanaged_kind(kind: Option<&str>) -> bool {
+    matches!(kind.map(str::trim), Some("ollama"))
+}
+
 #[derive(Deserialize)]
 struct RegFile {
     #[serde(default)]
@@ -92,6 +116,8 @@ struct RegFile {
 struct RegBackend {
     #[serde(default)]
     hardware: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
     #[serde(default)]
     unit: Option<String>,
     #[serde(default)]
@@ -104,6 +130,8 @@ struct RegBackend {
 /// Excluded, and each for its own reason:
 /// - `keep` itself — never stop the thing you are starting;
 /// - `always_on` backends — [`may_stop`], the assistant's engine;
+/// - `ollama`-kind backends — [`is_unmanaged_kind`], a second independent signal
+///   for the same thing, so a registry has to lie twice to become dangerous;
 /// - non-GPU backends — they are not holding the GPU.
 ///
 /// A missing/unparseable registry yields an EMPTY list, so the caller stops
@@ -116,7 +144,10 @@ pub fn stoppable_gpu_backends_from_json(raw: &str, keep: &str) -> Vec<StoppableG
     reg.backends
         .into_iter()
         .filter(|(name, b)| {
-            name != keep && b.hardware.as_deref() == Some("gpu") && may_stop(b.always_on)
+            name != keep
+                && b.hardware.as_deref() == Some("gpu")
+                && may_stop(b.always_on)
+                && !is_unmanaged_kind(b.kind.as_deref())
         })
         .map(|(name, b)| StoppableGpuBackend {
             name,
@@ -356,6 +387,7 @@ mod tests {
             "ollama":    {"url":"http://127.0.0.1:11434","kind":"ollama","hardware":"gpu","unit":"ollama.service","always_on":true},
             "llama-gpu": {"url":"http://127.0.0.1:8082","kind":"llama-server","hardware":"gpu","always_on":false},
             "lemonade":  {"url":"http://127.0.0.1:8081","kind":"llama-server","hardware":"gpu","unit":"lemonade-coder.service","always_on":false},
+            "pinned-gpu":{"url":"http://127.0.0.1:8085","kind":"llama-server","hardware":"gpu","unit":"pinned.service","always_on":true},
             "ollama-cpu":{"url":"http://127.0.0.1:11435","kind":"ollama","hardware":"cpu","always_on":true},
             "llama-cpu": {"url":"http://127.0.0.1:8084","kind":"llama-server","hardware":"cpu","unit":"chord-llama-cpu.service","always_on":false}
         }
@@ -373,6 +405,14 @@ mod tests {
         assert!(
             !got.iter().any(|b| b.unit() == Some("ollama.service")),
             "ollama.service must never appear as a unit to stop: {got:?}"
+        );
+        // `pinned-gpu` is excluded by `always_on` ALONE — it is a llama-server, so
+        // the kind rule does not reach it. Without this case the headline
+        // assertion would be satisfied by the kind rule and would no longer
+        // discriminate the always_on rule at all (a mutant proved exactly that).
+        assert!(
+            !got.iter().any(|b| b.name() == "pinned-gpu"),
+            "an always-on llama-server backend must be excluded by always_on alone: {got:?}"
         );
     }
 
@@ -437,6 +477,40 @@ mod tests {
         let got = stoppable_gpu_backends_from_json(raw, "other");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name(), "llama-gpu");
+    }
+
+    /// The residual codex and gpt56 pressed on across two rounds: an entry that
+    /// misdescribes the assistant engine as `always_on: false`. It is now
+    /// excluded by the SECOND signal (kind), so the registry has to lie twice.
+    #[test]
+    fn a_mislabelled_ollama_engine_is_still_not_stoppable() {
+        let lying = r#"{"backends":{
+            "ollama":{"url":"http://x","kind":"ollama","hardware":"gpu",
+                      "unit":"ollama.service","always_on":false}}}"#;
+        assert!(
+            stoppable_gpu_backends_from_json(lying, "llama-gpu").is_empty(),
+            "an ollama-kind GPU serve is never process-managed here, whatever its \
+             always_on flag claims"
+        );
+
+        // CONTROL: the kind rule must not swallow everything. A daemon-kind GPU
+        // backend IS still stoppable by free_gpu — it holds the GPU and is not the
+        // assistant's engine. (`lifecycle::stop` separately declines it; that
+        // asymmetry is deliberate and documented on `is_unmanaged_kind`.)
+        let daemon = r#"{"backends":{
+            "dgem":{"url":"http://x","kind":"daemon","hardware":"gpu",
+                    "unit":"dgem.service","always_on":false}}}"#;
+        let got = stoppable_gpu_backends_from_json(daemon, "llama-gpu");
+        assert_eq!(got.len(), 1, "a GPU-holding daemon must stay evictable: {got:?}");
+        assert_eq!(got[0].name(), "dgem");
+    }
+
+    #[test]
+    fn unmanaged_kind_is_the_ollama_rule() {
+        assert!(is_unmanaged_kind(Some("ollama")));
+        assert!(!is_unmanaged_kind(Some("llama-server")));
+        assert!(!is_unmanaged_kind(Some("daemon")));
+        assert!(!is_unmanaged_kind(None));
     }
 
     #[test]
