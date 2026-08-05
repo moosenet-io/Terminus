@@ -335,7 +335,7 @@ async fn main() {
         Err(e) => {
             eprintln!("FATAL: {e}");
             eprintln!(
-                "Refusing to start: the RMCP OAuth door is configured but could not be built.                  Serving a partial auth surface is worse than serving none, because the failure                  shows up as a client-side error that names neither the field nor this process.                  Fix the RMCP_* configuration (or unset RMCP_DATABASE_URL) and restart."
+                "Refusing to start: the RMCP OAuth door is configured but could not be built.                  Serving a partial auth surface is worse than serving none, because the failure                  shows up as a client-side error that names neither the field nor this process.                  Fix the RMCP_* configuration (or unset RMCP_SQLITE_PATH) and restart."
             );
             std::process::exit(1);
         }

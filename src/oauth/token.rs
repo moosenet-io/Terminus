@@ -1530,34 +1530,26 @@ mod tests {
         assert!(TokenEndpoint::new(store_stub(), signer, DEFAULT_REFRESH_TTL_SECONDS).is_ok());
     }
 
-    /// A store over a lazily-connected pool. `PgPool::connect_lazy` performs no
-    /// I/O, so this is a valid `OauthStore` value for tests that never issue a
-    /// query — which is every test in this module. The DB-backed behaviours
-    /// (atomic single-use, rotation, family revocation) are guarantees of the
-    /// store's SQL and are covered where they live, in RMCP-01.
+    /// A store over a lazily-connected pool. `connect_lazy_with` performs no
+    /// I/O and opens no file, so this is a valid `OauthStore` value for tests
+    /// that never issue a query — which is every test in this module. The
+    /// DB-backed behaviours (atomic single-use, rotation, family revocation)
+    /// are guarantees of the store's SQL and are covered where they live, in
+    /// RMCP-01 — which, since S132/RMCP-SQLITE, covers them against a REAL
+    /// database file rather than by scanning the SQL's text.
     ///
-    /// Two things about the URL, both deliberate, so the next review round does
-    /// not have to re-derive them:
-    ///
-    /// - **Every part of it is obviously fake** — a placeholder user, a
-    ///   literally-named non-password, and a generic host. Nothing here is or
-    ///   resembles a real credential, and the value never leaves this test.
-    /// - **The host has no dot.** The repo's own `no_pii_in_own_source_tree`
-    ///   self-check reads "something, an at-sign, then a dotted host" as an
-    ///   email address — which is precisely the shape of a realistic database
-    ///   DSN. A dotless host keeps the credential-in-URL shape the fixture
-    ///   needs without tripping a scanner that is right to be blunt.
-    ///
-    /// The S1 rule this sits under targets real infrastructure — RFC 1918
-    /// addresses, container ids, actual internal hostnames — none of which is
-    /// present.
+    /// The fixture used to be an invented Postgres DSN, and it needed two
+    /// paragraphs of justification: every part obviously fake, and the host
+    /// deliberately DOTLESS, because the repo's own `no_pii_in_own_source_tree`
+    /// scanner reads a user part followed by a dotted host as an email address.
+    /// That shape is deliberately described rather than quoted here — writing
+    /// it out trips the scanner even inside a comment. An in-memory SQLite
+    /// handle names no user, no host and no credential, so none of the
+    /// reasoning is needed any more.
     fn store_stub() -> OauthStore {
         OauthStore::from_pool(
-            sqlx::postgres::PgPool::connect_lazy(
-                // pii-test-fixture: invented DSN, connects to nothing
-                "postgres://placeholder-user:not-a-real-password@db-host:5432/rmcp",
-            )
-            .expect("lazy pool performs no I/O"),
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .connect_lazy_with(sqlx::sqlite::SqliteConnectOptions::new().in_memory(true)),
         )
     }
 }

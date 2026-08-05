@@ -855,8 +855,8 @@ pub struct AuthorizedGroup {
 // `crate::oauth::model`: this workspace builds sqlx without the derive feature.
 // The authority column is projected by the query rather than stored on the
 // group, so it cannot be read from a stale row.
-impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for AuthorizedGroup {
-    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for AuthorizedGroup {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row;
         let owner = if row.try_get::<bool, _>("owner_is_operator")? {
             GroupOwner::Operator

@@ -25,7 +25,7 @@
 //!    precisely the widening bug this shape is meant to prevent.
 
 use chrono::{DateTime, Utc};
-use sqlx::postgres::PgRow;
+use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -411,12 +411,104 @@ impl std::fmt::Debug for RefreshToken {
 // correct if a `SELECT`'s column order changes — only a rename can break it,
 // and that breaks loudly at the first query rather than silently decoding the
 // wrong field into the right-typed slot.
+//
+// S132/RMCP-SQLITE changed the row type from `PgRow` to `SqliteRow`. The
+// decode-by-name discipline is unchanged and is what made that a one-line
+// change for most types; the two that needed more are the ones holding a list.
+
+/// Decode a `text[]`-replacement column: a JSON array of strings in a TEXT
+/// column (see the type-mapping note in `migrations/S132-rmcp-sqlite-oauth.sql`).
+///
+/// ## Why this is BOUNDED here, on the read path
+///
+/// RMCP-06 caps a group at [`crate::oauth::groups::MAX_PATTERNS_PER_GROUP`]
+/// patterns, and `validate_group` / `validate_patterns` enforce that at the
+/// write gate. Under Postgres the write gate was the only way a row could come
+/// into existence, so a write-time bound was a real bound.
+///
+/// It is not any more. The store is now a FILE, and an operator (or anything
+/// that can write that file) can put a million-element array in this column
+/// without passing through any Rust at all. A write-time check that a caller
+/// can go around is exactly the shape of defect this item has spent its whole
+/// review history removing — the same reasoning that makes every revocable
+/// authority get re-derived on the read path applies to a bound that can be
+/// bypassed on the write path.
+///
+/// So the limit is re-applied on DECODE, and exceeding it is a decode ERROR
+/// rather than a truncation. Truncating would silently produce a DIFFERENT
+/// permission set from the one stored and then resolve against it, which is the
+/// "looks the same, is weaker" substitution this sprint keeps finding. An error
+/// makes the row unreadable, and an unreadable group grants nothing.
+///
+/// A NULL is impossible (the column is `NOT NULL DEFAULT '[]'`) and malformed
+/// JSON is refused by the column's own `json_valid` CHECK; both are still
+/// handled here rather than assumed, because the CHECK constraint is only
+/// enforced for writes SQLite performs, and this code should not be the thing
+/// that trusts a file it has just finished arguing it cannot trust.
+fn decode_string_list(row: &SqliteRow, column: &str) -> Result<Vec<String>, sqlx::Error> {
+    let raw: String = row.try_get(column)?;
+    let parsed: Vec<String> = serde_json::from_str(&raw).map_err(|e| sqlx::Error::ColumnDecode {
+        index: column.to_string(),
+        // The parse error can quote the offending input, which for these
+        // columns is operator-authored pattern text rather than a credential —
+        // but the standing rule in this module is that no stored value reaches
+        // an error, so only the CATEGORY is reported. `serde_json`'s `Category`
+        // is a four-variant enum (Io/Syntax/Data/Eof) carrying no payload from
+        // the input, which is exactly why it is the thing reported and why
+        // `{:?}` on it is safe — `{}` is not even available, since it does not
+        // implement `Display`.
+        source: format!("column `{column}` is not a JSON array of strings ({:?})", e.classify())
+            .into(),
+    })?;
+    if parsed.len() > MAX_STORED_LIST_LEN {
+        return Err(sqlx::Error::ColumnDecode {
+            index: column.to_string(),
+            source: format!(
+                "column `{column}` holds {} entries, over the {MAX_STORED_LIST_LEN} bound; \
+                 the row is refused rather than truncated",
+                parsed.len()
+            )
+            .into(),
+        });
+    }
+    Ok(parsed)
+}
+
+/// The read-path bound applied by [`decode_string_list`].
+///
+/// Set from [`crate::oauth::groups::MAX_PATTERNS_PER_GROUP`], which is the
+/// largest of the three lists this decode serves (`rmcp_tool_group.patterns`;
+/// `rmcp_client.redirect_uris` and `.grant_types` are far smaller in practice
+/// and have no separate cap worth inventing). Deriving it rather than restating
+/// a number means the write gate and the read gate cannot drift to two
+/// different limits.
+const MAX_STORED_LIST_LEN: usize = crate::oauth::groups::MAX_PATTERNS_PER_GROUP;
 
 macro_rules! impl_from_row {
     ($ty:ident, $($field:ident),+ $(,)?) => {
-        impl<'r> sqlx::FromRow<'r, PgRow> for $ty {
-            fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        impl<'r> sqlx::FromRow<'r, SqliteRow> for $ty {
+            fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
                 Ok(Self { $($field: row.try_get(stringify!($field))?),+ })
+            }
+        }
+    };
+}
+
+/// As [`impl_from_row`], but the named `$list` fields are decoded by
+/// [`decode_string_list`] instead of by `try_get`.
+///
+/// A separate macro rather than a flag on the first one so that a list column
+/// CANNOT be decoded the ordinary way by omission: `try_get::<Vec<String>>` on
+/// a SQLite TEXT column does not compile, so leaving a list field out of the
+/// `[…]` group is a build error rather than a silently wrong decode.
+macro_rules! impl_from_row_with_lists {
+    ($ty:ident, [$($list:ident),+ $(,)?], $($field:ident),+ $(,)?) => {
+        impl<'r> sqlx::FromRow<'r, SqliteRow> for $ty {
+            fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
+                Ok(Self {
+                    $($list: decode_string_list(row, stringify!($list))?,)+
+                    $($field: row.try_get(stringify!($field))?),+
+                })
             }
         }
     };
@@ -433,27 +525,25 @@ impl_from_row!(
     created_at,
     updated_at
 );
-impl_from_row!(
+impl_from_row_with_lists!(
     Client,
+    [redirect_uris, grant_types],
     id,
     client_id,
     client_secret_hash,
     name,
-    redirect_uris,
-    grant_types,
     token_endpoint_auth_method,
     owner_account_id,
     registration_source,
     disabled,
     created_at
 );
-impl_from_row!(
+impl_from_row_with_lists!(
     ClientAdmin,
+    [redirect_uris, grant_types],
     id,
     client_id,
     name,
-    redirect_uris,
-    grant_types,
     token_endpoint_auth_method,
     owner_account_id,
     registration_source,
@@ -462,12 +552,12 @@ impl_from_row!(
     created_at,
     version
 );
-impl_from_row!(
+impl_from_row_with_lists!(
     ToolGroup,
+    [patterns],
     id,
     name,
     description,
-    patterns,
     owner_account_id,
     created_at
 );

@@ -2696,7 +2696,6 @@ mod tests {
     const WIRE_KEY: &str = "term631-scope-wiring-test-key-32b!!"; // pii-test-fixture
     const WIRE_ISSUER: &str = "https://connector.example.test"; // pii-test-fixture
     const WIRE_RESOURCE: &str = "https://connector.example.test/mcp"; // pii-test-fixture
-    const WIRE_DB_URL: &str = "postgres://<email>/rmcp"; // pii-test-fixture
 
     fn wire_resource_config() -> crate::oauth::resource::ResourceServerConfig {
         let signer = crate::oauth::jwt::JwtSigner::new(
@@ -2713,20 +2712,20 @@ mod tests {
 
     /// A door built the PRODUCTION way, over a pool that is never connected.
     ///
-    /// `connect_lazy` performs no I/O, so this is hermetic: it stands up the
-    /// real `OauthStore` type over a real `PgPool` handle without a database,
-    /// which is exactly enough to assert the OWNERSHIP arrangement this item
-    /// changed. Nothing here issues a query.
+    /// `connect_lazy_with` performs no I/O and opens no file, so this is
+    /// hermetic: it stands up the real `OauthStore` type over a real
+    /// `SqlitePool` handle without a database, which is exactly enough to
+    /// assert the OWNERSHIP arrangement this item changed. Nothing here issues
+    /// a query.
     ///
-    /// It does need a tokio runtime, though — `connect_lazy` builds the pool
-    /// eagerly (only the CONNECTING is deferred) and spawns its idle reaper, so
-    /// its callers below are `#[tokio::test]`. That is a runtime requirement,
-    /// not a network one.
+    /// It does need a tokio runtime, though — the pool is built eagerly (only
+    /// the CONNECTING is deferred) and spawns its idle reaper, so its callers
+    /// below are `#[tokio::test]`. That is a runtime requirement, not a
+    /// filesystem one.
     fn production_shaped_door() -> Arc<crate::oauth::resource::OauthResourceServer> {
-        let pool = sqlx::postgres::PgPoolOptions::new()
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
-            .connect_lazy(WIRE_DB_URL)
-            .expect("a well-formed URL yields a lazy pool without connecting");
+            .connect_lazy_with(sqlx::sqlite::SqliteConnectOptions::new().in_memory(true));
         let store = Arc::new(OauthStore::from_pool(pool));
         Arc::new(crate::oauth::resource::OauthResourceServer::new(
             wire_resource_config(),

@@ -898,16 +898,23 @@ in front of the one control an operator reaches for mid-incident.
 **Opening the door.** It is shut unless `RMCP_OAUTH_ENABLED` is set — an explicit switch, not
 "configured means enabled", because which hosts expose a public door should be a sentence an
 operator wrote rather than a side effect of an env file being copied. Once it *is* set, every
-remaining failure (a malformed canonical resource, a missing signing key, an unreachable OAuth
-database, an unapplied migration) refuses the process at startup. That is deliberate and has a
-real cost — it couples the gateway's startup to Postgres on hosts that opt in — but the
-alternative is worse than an outage: a door that is configured, believed open and silently
+remaining failure (a malformed canonical resource, a missing signing key, an unopenable OAuth
+database file, an unapplied migration) refuses the process at startup. That is deliberate and
+still has a cost — the gateway's startup depends on that file being present and writable on
+hosts that opt in — but it is a much smaller one than it was: S132/RMCP-SQLITE moved this data
+plane to a local SQLite file, so opting a host in no longer couples its startup to a Postgres
+server being reachable, nor to a database, role and password having been provisioned first.
+The alternative to failing loudly is worse than an outage: a door that is configured, believed open and silently
 shut produces no error anywhere, and presents to the operator as a connector that mysteriously
 never links.
 
-**Configuration** (names only — values are materialized from the runtime secret store, never
-authored by hand): `RMCP_DATABASE_URL`, `RMCP_OAUTH_SIGNING_KEY`, `RMCP_OAUTH_ISSUER`,
-`RMCP_OAUTH_RESOURCE`. The resource server adds exactly **one** name of its own,
+**Configuration.** `RMCP_OAUTH_SIGNING_KEY`, `RMCP_OAUTH_ISSUER` and `RMCP_OAUTH_RESOURCE`
+are names only — their values are materialized from the runtime secret store and never
+authored by hand. **`RMCP_SQLITE_PATH` is the exception and is not a secret**: it is a
+filesystem path to this door's own database file, so it is authored directly. See *The OAuth
+database file* below for what an operator owes that file — it is the one part of this
+subsystem where a provisioning mistake is a credential exposure rather than an outage.
+The resource server adds exactly **one** name of its own,
 `RMCP_OAUTH_ENABLED` (the switch) — everything else it needs it reads through the code that
 already owns it. The per-endpoint `RMCP_RATE_LIMIT_*` budgets are optional and documented in
 `.env.example`. `RMCP_OAUTH_RESOURCE` is the connector URL exactly as typed into the client
@@ -919,10 +926,58 @@ them here. That is deliberate and was learned the hard way: an earlier revision 
 resource server read its own `RMCP_CANONICAL_RESOURCE` for the audience, which under the
 documented configuration would have rejected every token the fleet issued — a door that fails
 silently, which is the failure mode this whole subsystem keeps having to design against. The
-schema lives in `migrations/S132-rmcp01-oauth-core.sql` and
-`migrations/S132-rmcp03-login-session.sql` and is **not** applied at startup: apply it via
-`pg_ddl` as part of the deploy. Until it is, the store reports the door unconfigured rather
-than serving a silently dead auth surface.
+schema lives in `migrations/S132-rmcp-sqlite-oauth.sql` and is **not** applied at startup:
+apply it as part of the deploy (see below). Until it is, the store reports the door
+unconfigured rather than serving a silently dead auth surface.
+
+**The OAuth database file.** S132/RMCP-SQLITE moved this door's data plane from Postgres to a
+SQLite file named by **`RMCP_SQLITE_PATH`**. That removed a deployment blocker outright — no
+database, no role and no credential have to exist before the door can start, and there is no
+`RMCP_DATABASE_URL` secret any more. What it added is a file an operator has to provision
+correctly, and the rest of this note is that contract. Every other subsystem here (`intake`,
+`scribe`, discovery, the `pg_*` tools) is still Postgres; this is one door's own data plane,
+not a migration of the crate.
+
+- **It is a path, not a URL, and not a secret.** Author it directly in the environment; it
+  does not belong in the runtime secret store. `RMCP_DATABASE_URL` is **ignored** — a
+  deployment still carrying it fails at startup naming `RMCP_SQLITE_PATH`, deliberately,
+  because silently reading a Postgres URL as a path would create an empty database somewhere
+  odd and bring the door up with no accounts, no clients and no consents in it.
+- **Persistent LOCAL storage — not a network filesystem.** SQLite's locking is built on POSIX
+  advisory locks, which NFS implements unreliably; putting the file on a share to make it
+  reachable from two hosts trades a visible constraint for silent corruption of the
+  authorization database. On a tmpfs or an ephemeral container layer the failure is quieter
+  still: a restart revokes every connector and forgets every account, with nothing logged.
+- **Permissions and backups are credential-grade.** The file holds argon2id password and
+  client-secret hashes, SHA-256 refresh-token and authorization-code digests, and the consent
+  records that decide what each connector may reach. None of it is presentable — a copy yields
+  nothing an attacker can replay — but it is offline-attackable material and it *is* the
+  authorization database. Mode `0600` owned by the service user, in a `0700` directory:
+  SQLite writes `<file>-wal` and `<file>-shm` sidecars beside it carrying the same content, so
+  the directory matters as much as the file. Back it up with `sqlite3 <path> ".backup <dest>"`
+  or `VACUUM INTO`, which are consistent against a live writer; a plain `cp` of a running
+  database can capture a torn page or miss committed data still in the `-wal`.
+- **Exactly one process may write it.** This is the one guarantee the port narrowed, so it is
+  stated rather than left to be discovered. `rmcp_login_session_use` enforces "one
+  authentication yields at most one authorization code", and under Postgres that held across
+  every replica because they shared one database. It now holds across every writer of one
+  *file*. Two instances with two files each believe they are the first to spend a session, and
+  nothing errors — which is precisely the process-local defect RMCP-03's review rejected,
+  reintroduced by topology instead of by code. Run one instance, and do not reach for the
+  network-filesystem "fix" above. **TERM #649** tracks it.
+- **Applying the schema.** One file replaces the four Postgres migrations
+  (`S132-rmcp01-oauth-core`, `-rmcp03-login-session`, `-rmcp06-account-operator-flag`,
+  `-rmcp08-client-registration`), which were sequenced additively against a live database that
+  never existed; they are deleted rather than kept. It is idempotent (`IF NOT EXISTS`
+  throughout) and, per the standing deploy rule, is **not** applied at service startup:
+
+  ```
+  sqlite3 "$RMCP_SQLITE_PATH" < migrations/S132-rmcp-sqlite-oauth.sql
+  ```
+
+  Sequence it with or before the image swap. Until it has run, the readiness check reports the
+  door unconfigured and the process refuses to start rather than serving an auth surface whose
+  every request would fail at the database.
 
 **The scoping intersection is applied at both enforcement points** in `mcp_server` and
 enforced by `gateway_framework`, engaging for any request that carries a resolved connector
@@ -1100,11 +1155,16 @@ while the feature did not exist in a running binary. A configured-but-unbuildabl
 a hard startup error, because a half-built auth surface that serves the login page and then
 fails at the token endpoint sends the operator looking at the client.
 
-**Migrations: applied by hand, and RMCP-08 adds one.** `S132-rmcp08-client-registration.sql`
-adds `rmcp_client.version` and the `rmcp_registration_token` table. Both are in the startup
-readiness check, so a deployment that ships this code without applying the migration refuses to
-start with a message naming it, rather than failing the first connector edit with an opaque
-`column does not exist`.
+**Migrations: applied by hand, and there is now exactly ONE.** S132/RMCP-SQLITE replaced the
+four Postgres migrations with a single `migrations/S132-rmcp-sqlite-oauth.sql` against a SQLite
+file. Every table, plus `rmcp_account.is_operator` and `rmcp_client.version`, is in the startup
+readiness check — the column half matters because a table-level check cannot see a column, and
+an interrupted migration is exactly the state where a confident "ready" does the most damage.
+A deployment that ships this code without applying the migration refuses to start with a
+message naming it, rather than failing the first connector edit with an opaque
+`no such column`. The operator contract for the file itself — where it lives, its permissions,
+backups, and the single-writer requirement — is *The OAuth database file* above; this note
+deliberately does not restate it.
 
 **Revocation enforced at the next request: yes, at `(account, client)` granularity.** The
 dispatch path consults `any_session_is_live(account, client)` on every call (RMCP-05).
@@ -1437,8 +1497,9 @@ intersection something to bound.
 - **Operator-ness is read from the database, not supplied by the caller.** The bare `*`
   rule is enforced against `rmcp_account.is_operator`, read inside the same transaction as
   the write it authorizes. A caller states *who* is writing; it never states what they are
-  allowed to write. Requires the `S132-rmcp06-account-operator-flag.sql` migration —
-  `schema_ready()` reports NOT ready without it.
+  allowed to write. `rmcp_account.is_operator` is one of the two COLUMNS the readiness
+  check probes by name, so a deployment whose migration did not finish reports NOT ready
+  rather than treating every account as delegated.
 - **Who the author is decides more than just `*` (RMCP-12).** A *delegated* author may hold
   only namespace-qualified patterns, over servers they own; unqualified patterns address the
   fleet's own local tools and are the operator's. The single account of that model is
