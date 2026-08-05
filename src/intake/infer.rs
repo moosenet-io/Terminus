@@ -21,6 +21,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::intake::context;
+use crate::intake::gpu_stop_guard::{self, StoppableGpuBackend};
 
 /// Normalized per-inference metrics, backend-agnostic.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -287,26 +288,24 @@ pub fn resolve_backend_at(
     }
 }
 
-/// All GPU-hardware backends defined in the registry, as `(name, unit)` pairs
-/// (unit `None` ⇒ spawned as a transient `chord-<name>` unit). Used by lifecycle
-/// GPU arbitration to free the single GPU before starting another GPU backend.
-pub fn gpu_backends() -> Vec<(String, Option<String>)> {
+/// The GPU-hardware backends that may be **stopped** to free the single GPU
+/// before starting `keep`. Used by lifecycle GPU arbitration.
+///
+/// This REPLACES the former `gpu_backends()`, which returned every GPU backend —
+/// including the always-on primary Ollama serve, i.e. the live assistant's own
+/// engine. `free_gpu` stopped whatever it was handed, so that list was a loaded
+/// gun (CHRD #112). The guard now lives in the value's construction rather than
+/// in each caller: see [`crate::intake::gpu_stop_guard`].
+///
+/// Registry unset / unreadable / unparseable ⇒ empty ⇒ nothing is stopped.
+pub fn stoppable_gpu_backends(keep: &str) -> Vec<StoppableGpuBackend> {
     let Some(path) = registry_path() else {
         return Vec::new();
     };
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return Vec::new(),
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
     };
-    let reg: RegFile = match serde_json::from_str(&text) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    reg.backends
-        .into_iter()
-        .filter(|(_, b)| b.hardware.as_deref() == Some("gpu"))
-        .map(|(name, b)| (name, b.unit))
-        .collect()
+    gpu_stop_guard::stoppable_gpu_backends_from_json(&text, keep)
 }
 
 /// Current GPU VRAM-in-use (MB) from sysfs (`mem_info_vram_used`). Best-effort;

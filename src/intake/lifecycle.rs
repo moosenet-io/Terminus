@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use crate::intake::gpu_stop_guard;
 use crate::intake::infer::{self, ResolvedBackend};
 
 /// Ensure `backend` is running and ready to serve `model`. Returns `Ok(())` when
@@ -141,8 +142,16 @@ pub fn idle_secs(backend: &str) -> Option<u64> {
 
 /// Stop an on-demand backend (its unit, or its transient `chord-<name>` unit).
 /// Best-effort; always-on/ollama/daemon backends are left running.
+///
+/// The `always_on` half of that refusal is the shared safety rule
+/// ([`gpu_stop_guard::may_stop`]), not a second copy of it — a rule written twice
+/// drifts. The `ollama`/`daemon` kind refusal is this function's own lifecycle
+/// concern (those kinds have no process for this crate to manage).
 pub fn stop(backend: &ResolvedBackend) {
-    if backend.always_on || backend.kind == "ollama" || backend.kind == "daemon" {
+    if !gpu_stop_guard::may_stop(backend.always_on)
+        || backend.kind == "ollama"
+        || backend.kind == "daemon"
+    {
         return;
     }
     match &backend.unit {
@@ -155,17 +164,20 @@ pub fn stop(backend: &ResolvedBackend) {
     }
 }
 
-/// Stop every GPU backend except `keep` (frees the single GPU). Stops both
-/// declared units and transient `chord-<name>` units.
+/// Stop every **stoppable** GPU backend except `keep` (frees the single GPU).
+/// Stops both declared units and transient `chord-<name>` units.
+///
+/// This function cannot stop an always-on backend, and not because it remembers
+/// to check: [`infer::stoppable_gpu_backends`] is the only source of
+/// [`gpu_stop_guard::StoppableGpuBackend`], and it applies the guard while parsing the registry.
+/// The old shape — iterate every GPU backend, `systemctl stop` each — could
+/// stop `ollama.service`, the live assistant's own engine (CHRD #112).
 fn free_gpu(keep: &str) {
-    for (name, unit) in infer::gpu_backends() {
-        if name == keep {
-            continue;
+    for backend in infer::stoppable_gpu_backends(keep) {
+        if let Some(unit) = backend.unit() {
+            let _ = run(["systemctl", "stop", unit]);
         }
-        if let Some(unit) = unit {
-            let _ = run(["systemctl", "stop", &unit]);
-        }
-        let _ = run(["systemctl", "stop", &transient_unit(&name)]);
+        let _ = run(["systemctl", "stop", &transient_unit(backend.name())]);
     }
 }
 
@@ -430,6 +442,41 @@ mod tests {
     #[test]
     fn transient_unit_name() {
         assert_eq!(transient_unit("llama-gpu"), "chord-llama-gpu.service");
+    }
+
+    /// SOURCE-LEVEL RATCHET (CHRD #112 / TERM #650).
+    ///
+    /// The type guard makes it impossible to *ask* `free_gpu` to stop an
+    /// always-on backend. It cannot, on its own, stop someone adding a FOURTH
+    /// place in this file that shells out `systemctl stop` against a name pulled
+    /// straight from the registry — which is exactly how the original defect was
+    /// written. So this pins the set of functions here that may issue a stop:
+    ///
+    /// - `ensure_up` — clears a stale transient `chord-<name>` unit for the
+    ///   backend it is about to start; it has already returned early for
+    ///   always-on/ollama/daemon backends, so that name is an on-demand one.
+    /// - `stop` — gated by [`gpu_stop_guard::may_stop`].
+    /// - `free_gpu` — can only iterate values the guard constructed.
+    ///
+    /// Reads the REAL source of this file (never a copy), so it cannot drift from
+    /// what ships. The scanner itself is tested in `gpu_stop_guard`.
+    #[test]
+    fn every_systemctl_stop_in_this_module_lives_in_a_guarded_function() {
+        let owners = gpu_stop_guard::stop_call_site_owners(include_str!("lifecycle.rs"));
+        assert!(
+            !owners.is_empty(),
+            "the ratchet found no `systemctl stop` call sites at all — it has \
+             stopped measuring anything; fix the scanner rather than deleting it"
+        );
+        let allowed = ["ensure_up", "stop", "free_gpu"];
+        let unexpected: Vec<&String> =
+            owners.iter().filter(|o| !allowed.contains(&o.as_str())).collect();
+        assert!(
+            unexpected.is_empty(),
+            "new `systemctl stop` call site(s) in {unexpected:?} — every stop in \
+             this module must go through the gpu_stop_guard-gated path (CHRD #112). \
+             All sites found: {owners:?}"
+        );
     }
 
     #[test]
