@@ -291,7 +291,7 @@ references (outgoing) and what calls/references it (incoming). direction = out|i
                 .collect();
             res["incoming"] = json!(incoming);
         }
-        structured(res)
+        g.ok(res)
     }
 }
 
@@ -1297,26 +1297,52 @@ pub struct Widget;
         assert_eq!(v["did_you_mean"], "statnear", "{v}");
     }
 
-    /// TERM #653's visibility half: every answer carries the key that answered
+    /// TERM #653's visibility half: EVERY answer carries the key that answered
     /// and when that graph was built, so a consumer can SEE staleness instead
     /// of having to trust the result.
+    ///
+    /// Asserted across every graph-backed tool, not a representative one. The
+    /// first version of this test checked `kg_stats` alone, and `kg_neighbors`
+    /// duly shipped a success response with no provenance at all — the same
+    /// shape of gap as the defect being fixed.
     #[tokio::test]
     #[serial]
     async fn every_answer_reports_which_graph_answered_and_how_old_it_is() {
         let _g = seed_project("FRESH");
-        let out = KgStats.execute_structured(json!({"project_id": "FRESH"})).await.unwrap();
-        let v = val(out);
-        assert_eq!(v["found"], true);
-        assert_eq!(v["graph_key"], "fresh", "canonical key reported: {v}");
-        assert_eq!(v["project_id"], "FRESH", "raw request echoed back: {v}");
-        assert!(
-            v["graph_built_at"].as_str().is_some(),
-            "build time must be present on a real answer: {v}"
-        );
-        assert!(
-            v["graph_age_seconds"].as_u64().is_some(),
-            "age must be present on a real answer: {v}"
-        );
+        let cases: Vec<(&str, Value)> = vec![
+            ("kg_search", json!({"project_id": "FRESH", "query": "helper"})),
+            ("kg_neighbors", json!({"project_id": "FRESH", "node_id": "crate::w::caller"})),
+            ("kg_subgraph", json!({"project_id": "FRESH", "node_id": "crate::w::caller"})),
+            ("kg_path", json!({"project_id": "FRESH", "from": "crate::w::caller", "to": "crate::w::helper"})),
+            ("kg_stats", json!({"project_id": "FRESH"})),
+            ("kg_communities", json!({"project_id": "FRESH"})),
+            ("kg_file_symbols", json!({"project_id": "FRESH", "path": "src/w.rs"})),
+        ];
+        for (name, args) in cases {
+            let out = match name {
+                "kg_search" => KgSearch.execute_structured(args).await,
+                "kg_neighbors" => KgNeighbors.execute_structured(args).await,
+                "kg_subgraph" => KgSubgraph.execute_structured(args).await,
+                "kg_path" => KgPath.execute_structured(args).await,
+                "kg_stats" => KgStats.execute_structured(args).await,
+                "kg_communities" => KgCommunities.execute_structured(args).await,
+                "kg_file_symbols" => KgFileSymbols.execute_structured(args).await,
+                other => panic!("unhandled tool {other}"),
+            }
+            .unwrap_or_else(|e| panic!("{name} failed: {e:?}"));
+            let v = val(out);
+            assert_eq!(v["graph_key"], "fresh", "{name} must report the canonical key: {v}");
+            assert_eq!(v["project_id"], "FRESH", "{name} must echo the raw request: {v}");
+            assert!(
+                v["graph_built_at"].as_str().is_some(),
+                "{name} must report the graph build time: {v}"
+            );
+            assert!(
+                v["graph_age_seconds"].as_u64().is_some(),
+                "{name} must report the graph age: {v}"
+            );
+            assert!(v["found"].is_boolean(), "{name} must report found: {v}");
+        }
     }
 
     /// A found:false that came from the GRAPH (node not present) still reports
