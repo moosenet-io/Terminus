@@ -1150,6 +1150,135 @@ and a troubleshooting table. Deploy assets live in
 [`deploy/rmcp-edge.service`](deploy/rmcp-edge.service) and
 [`deploy/rmcp-edge-proxy.conf.example`](deploy/rmcp-edge-proxy.conf.example).
 
+## Connector tool groups (RMCP-06)
+
+The OAuth connector door (`src/oauth/`) scopes a client by **tool group** — a name plus a
+small list of patterns over the tool catalog — so an operator scopes a connector as
+"media" rather than by listing several hundred tool names. Patterns are matched against the
+live catalog rather than expanded once and stored, so a newly registered tool matching an
+existing pattern needs no config edit.
+
+> **Everything below describes how groups are authored, validated and stored — not what
+> authorizes a request.** Two pointers rather than a third account of either: for the
+> assembled system's wiring state see *Exactly what is wired today* above, which is this
+> file's single account of it and already records that scope resolution is not wired; for
+> which matcher owns these pattern semantics until TERM #637 collapses the two, see the
+> `Status` section of the `src/oauth/groups.rs` module docs.
+
+### Pattern syntax
+
+Exactly these shapes parse. There is no glob, no regex, and no negation.
+
+| Pattern | Meaning | Example |
+|---|---|---|
+| `tool_name` | that one tool, exactly | `weather_get` |
+| `prefix*` | every **local** tool whose name starts with `prefix` | `weather_*` |
+| `namespace::*` | every tool advertised by one mesh upstream | `peerhub::*` |
+| `namespace::prefix*` | tools from one upstream whose bare name starts with `prefix` | `peerhub::ledger*` |
+| `*` | every tool, **local and federated** — operator-owned groups only | |
+
+The full grammar, so the rejections are as unambiguous as the semantics:
+
+```text
+pattern   := "*"                        -- every tool (operator-owned groups only)
+           | namespace "::" "*"         -- one upstream, all of it
+           | namespace "::" bare "*"    -- one upstream, bare names starting with `bare`
+           | namespace "::" bare        -- one federated tool, exactly
+           | local "*"                  -- LOCAL tools starting with `local`
+           | local                      -- one local tool, exactly
+
+namespace := printable ASCII, no "*", no "::", must round-trip through the mesh splitter
+             (so: no "__" inside, no trailing "_")
+bare      := printable ASCII, no "*", no "::"   (may contain and even end with "__")
+local     := printable ASCII, no "*", no "::", no "__"
+```
+
+**Two separators, deliberately different characters.** `::` delimits a *pattern*; `__`
+separates the halves of an *advertised name*. Keeping them distinct is what makes
+`a::b__*` unambiguous — namespace `a`, bare prefix `b__`, with no second reading. An
+earlier revision used `__` for both, which made `a__b__*` genuinely ambiguous (namespace
+`a__b`, or namespace `a` with prefix `b__`?) and could only be settled by declaring a
+precedence rule; a pattern whose meaning depends on a precedence rule is one an author
+cannot read. `::` also matches what the enforcing matcher in RMCP-07 already used — the two
+had diverged, which is TERM #637.
+
+**Which side of the boundary a tool is on is read from the catalog, not guessed from its
+name.** A local tool may legitimately be named with `__` in it — that is not something the
+pattern grammar controls — and such a name splits like a namespaced one. Matching therefore
+consults the catalog entry's provenance, so a qualified pattern like `peerhub::tool` reaches
+the federated tool and never a local tool that merely looks federated (TERM #637).
+
+**`__` in an unqualified pattern is refused**, not reinterpreted. It can never match (any
+advertised name carrying `__` is namespaced, hence not local), and it is exactly what an
+old-vocabulary pattern looks like — so `peerhub__*` errors with the correct form named
+(`peerhub::*`) rather than silently becoming a local prefix that grants nothing.
+
+Rejected at write time, exhaustively: the empty pattern; anything over 96 characters; any
+non-printable-ASCII character; a `*` anywhere but as the single final character (`*weather`
+and `weather*foo` are errors, not suffix matches); a pattern beginning with `__`; and any
+namespace that cannot round-trip (`::*`, `a__b::*`, `foo_::*`). Every one of those would
+otherwise parse to something the author did not write — usually a pattern that silently
+matches nothing, leaving a connector quietly missing tools with no error to explain it.
+
+**The rule in one sentence:** an unqualified *exact* or *prefix* pattern matches local
+tools only; a namespace-qualified pattern matches only within the namespace it names; and
+the bare `*` matches the whole merged catalog, bounded by the client's allowed namespaces
+at the RMCP-07 intersection rather than by the matcher. `*` is deliberately not local-only
+— it has no letters, so there is no prefix collision to guard against, it is the most
+heavily gated pattern here, and it is what gives the namespace dimension of the
+intersection something to bound.
+
+- **No regex.** A pattern may be authored by a delegated federation user, and this matcher
+  is designed to run on the dispatch path, once per request per pattern — an author-supplied
+  regex there is a denial of service.
+- **No negation.** Subtraction is the existing deny layer's job
+  (`DEFAULT_SENSITIVE_DENY_PREFIXES`). Two subtractive mechanisms in two files is how two
+  authorization systems come to disagree.
+- **An unqualified pattern matches only unqualified (local) names.** A bare prefix does
+  not span the `__` mesh separator, so `peer*` matches a local `peer_status` but **not**
+  `peerhub__alerts_list` — a namespace that merely shares the prefix's letters is not a
+  match. Reaching a federated tool takes a pattern that names the upstream, which an author
+  can only write deliberately. Absence of a namespace qualifier means "local only", never
+  "anything that happens to start this way".
+- **A bad pattern is refused when it is stored, never when it is matched.** Matching is
+  pure and total; an error there would be an availability failure inside the authorization
+  system rather than a safety property.
+- **Operator-ness is read from the database, not supplied by the caller.** The bare `*`
+  rule is enforced against `rmcp_account.is_operator`, read inside the same transaction as
+  the write it authorizes. A caller states *who* is writing; it never states what they are
+  allowed to write. Requires the `S132-rmcp06-account-operator-flag.sql` migration —
+  `schema_ready()` reports NOT ready without it.
+- **And this resolver re-derives it rather than trusting the row.** A write-time check is
+  point-in-time, so a stored `*` expands only if its group's owner is an operator *right
+  now* and not disabled.
+  A wildcard written by someone since demoted — or stored before the flag column existed —
+  resolves to the **empty set**. General rule for anything built on top of this: an
+  authority that can be revoked must be re-derived on the read path, never cached in a row.
+
+### Bounds
+
+A group holds at most 128 patterns and a client is scoped to at most 32 groups, both
+enforced at write time; this resolver refuses outright above `32 x 128` patterns. The per-group cap alone bounds nothing that
+matters: resolution concatenates every group a client holds and walks that list once per
+catalog tool, so the group count is the unbounded factor. Over the limit, resolution is
+**refused, never truncated** — a truncated pattern list is a scope that silently differs
+from the configured one, and which patterns survived would depend on row ordering.
+
+### What empty means
+
+**Empty means empty.** An empty group grants nothing, and a well-formed pattern that
+happens to match no tool in the current catalog grants nothing. Neither is ever read as
+"unrestricted". A group can only ever *narrow*: RMCP-07 intersects the group set with the
+account's own grant and the client's visible namespaces, so no group can grant a tool the
+human behind it could not already call. That intersection is RMCP-07's, and today it runs
+against RMCP-07's matcher — see the status note above.
+
+### Starter groups
+
+`groups::STARTER_GROUPS` seeds a few ordinary, editable groups (`daily briefing`, `home`,
+`media`, `personal records`) built from tool-name prefixes that already exist in the
+registry, so the first connector is usable without hand-authoring. None of them uses `*`.
+
 ## Quick Start
 
 ```sh

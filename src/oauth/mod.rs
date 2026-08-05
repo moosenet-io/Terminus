@@ -222,6 +222,7 @@
 pub mod audit;
 pub mod authorize;
 pub mod edge;
+pub mod groups;
 pub mod jwt;
 pub mod limits;
 pub mod metadata;
