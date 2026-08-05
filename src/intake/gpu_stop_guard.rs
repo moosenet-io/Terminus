@@ -132,6 +132,9 @@ struct RegBackend {
 /// - `always_on` backends — [`may_stop`], the assistant's engine;
 /// - `ollama`-kind backends — [`is_unmanaged_kind`], a second independent signal
 ///   for the same thing, so a registry has to lie twice to become dangerous;
+/// - anything naming the UNIT of a backend the first two rules protected — a
+///   protected unit is protected under every alias, so a second entry cannot
+///   launder `ollama.service` through an innocuous-looking name;
 /// - non-GPU backends — they are not holding the GPU.
 ///
 /// A missing/unparseable registry yields an EMPTY list, so the caller stops
@@ -141,17 +144,35 @@ pub fn stoppable_gpu_backends_from_json(raw: &str, keep: &str) -> Vec<StoppableG
     let Ok(reg) = serde_json::from_str::<RegFile>(raw) else {
         return Vec::new();
     };
+
+    // PROTECTED UNITS: every systemd unit named by a backend this guard refuses
+    // to stop. No candidate may stop one of these, whatever entry it arrives
+    // under.
+    //
+    // This is what closes gpt56's round-4 case — a SECOND entry, of an innocuous
+    // kind and `always_on: false`, that names `unit: "ollama.service"`. It is not
+    // a unit-name denylist and invents no second source of truth: the protected
+    // set is derived from THIS registry, so the rule is just "the registry must be
+    // self-consistent". A protected unit is protected under every alias.
+    let protected: std::collections::BTreeSet<&str> = reg
+        .backends
+        .values()
+        .filter(|b| !may_stop(b.always_on) || is_unmanaged_kind(b.kind.as_deref()))
+        .filter_map(|b| b.unit.as_deref())
+        .collect();
+
     reg.backends
-        .into_iter()
+        .iter()
         .filter(|(name, b)| {
-            name != keep
+            name.as_str() != keep
                 && b.hardware.as_deref() == Some("gpu")
                 && may_stop(b.always_on)
                 && !is_unmanaged_kind(b.kind.as_deref())
+                && !b.unit.as_deref().is_some_and(|u| protected.contains(u))
         })
         .map(|(name, b)| StoppableGpuBackend {
-            name,
-            unit: b.unit,
+            name: name.clone(),
+            unit: b.unit.clone(),
         })
         .collect()
 }
@@ -279,6 +300,17 @@ fn strip_comments_and_normalize(src: &str) -> (String, Vec<usize>) {
 /// bypasses still has to name `systemctl` somewhere, so pinning the COUNT catches
 /// them all — including ones nobody has thought of — at the cost of also firing on
 /// a legitimate new invocation, which is exactly when a human should look.
+///
+/// ## What this deliberately does NOT catch (codex, review round 4)
+/// An author who WANTS to hide a stop can:
+/// `run([&("system".to_owned() + "ctl"), &("st".to_owned() + "op"), u])`. No
+/// literal, no census movement. That is sabotage, not the accident this ratchet
+/// exists to catch, and no `#[cfg(test)]` lexical check survives an adversary
+/// willing to obfuscate — chasing it is an arms race with no end state. Held
+/// knowingly, and it is not the load-bearing protection anyway: the TYPE is.
+/// Even obfuscated code cannot obtain an always-on backend from this module; it
+/// would have to hardcode the unit name, which is a different and far more
+/// visible thing to write.
 #[cfg(test)]
 pub fn systemctl_literal_count(src: &str) -> usize {
     let (norm, _) = strip_comments_and_normalize(src);
@@ -493,6 +525,18 @@ mod tests {
              always_on flag claims"
         );
 
+        // The same lie with NO unit — so only the KIND rule can exclude it. Without
+        // this case the protected-unit cross-check masks the kind rule entirely and
+        // a mutant that deletes the kind rule survives (it did, once).
+        let lying_unitless = r#"{"backends":{
+            "ollama":{"url":"http://x","kind":"ollama","hardware":"gpu",
+                      "always_on":false}}}"#;
+        assert!(
+            stoppable_gpu_backends_from_json(lying_unitless, "llama-gpu").is_empty(),
+            "an ollama-kind backend is excluded by its KIND alone, with no unit to \
+             protect and no always_on flag to trust"
+        );
+
         // CONTROL: the kind rule must not swallow everything. A daemon-kind GPU
         // backend IS still stoppable by free_gpu — it holds the GPU and is not the
         // assistant's engine. (`lifecycle::stop` separately declines it; that
@@ -503,6 +547,34 @@ mod tests {
         let got = stoppable_gpu_backends_from_json(daemon, "llama-gpu");
         assert_eq!(got.len(), 1, "a GPU-holding daemon must stay evictable: {got:?}");
         assert_eq!(got[0].name(), "dgem");
+    }
+
+    /// Round-4 (gpt56): a SECOND entry, innocuous kind, `always_on: false`, that
+    /// names the protected unit. Closed by the protected-unit cross-check.
+    #[test]
+    fn a_protected_unit_cannot_be_laundered_through_another_entry() {
+        let laundered = r#"{"backends":{
+            "ollama":{"url":"http://x","kind":"ollama","hardware":"gpu",
+                      "unit":"ollama.service","always_on":true},
+            "innocuous":{"url":"http://y","kind":"llama-server","hardware":"gpu",
+                         "unit":"ollama.service","always_on":false}}}"#;
+        let got = stoppable_gpu_backends_from_json(laundered, "llama-gpu");
+        assert!(
+            got.is_empty(),
+            "a unit protected under one entry is protected under every entry: {got:?}"
+        );
+
+        // CONTROL: the cross-check must only protect units that are ACTUALLY
+        // protected. The same second entry, naming its own unit, is stoppable —
+        // otherwise this rule would quietly disable GPU arbitration.
+        let ordinary = r#"{"backends":{
+            "ollama":{"url":"http://x","kind":"ollama","hardware":"gpu",
+                      "unit":"ollama.service","always_on":true},
+            "innocuous":{"url":"http://y","kind":"llama-server","hardware":"gpu",
+                         "unit":"innocuous.service","always_on":false}}}"#;
+        let got = stoppable_gpu_backends_from_json(ordinary, "llama-gpu");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].unit(), Some("innocuous.service"));
     }
 
     #[test]
