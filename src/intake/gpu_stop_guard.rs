@@ -26,6 +26,17 @@
 //! The parsing core is pure (raw JSON text in, decisions out) so the rule can be
 //! tested exhaustively without a filesystem, a registry, or — most importantly —
 //! ever running `systemctl` against a live host.
+//!
+//! ## Known residual: the guard trusts the registry's own `always_on` flag
+//! Raised in review (opus) and acknowledged rather than fixed. An entry written as
+//! `always_on: false, unit: "ollama.service"` would be approved, and `free_gpu`
+//! would stop it. Nothing here can prevent that: the registry is the only
+//! statement this crate has of which backends are always-on, and a unit-name
+//! denylist would be a second, weaker source of truth — wrong for every fleet
+//! whose assistant engine is not literally named `ollama.service`. The guard makes
+//! a TRUTHFUL registry unstoppable; a registry that misdescribes itself is a
+//! different defect, in whatever wrote it. Chord seeds `always_on: true`, and the
+//! pre-existing code was strictly worse — it ignored the flag entirely.
 
 use std::collections::BTreeMap;
 
@@ -127,33 +138,60 @@ pub fn stoppable_gpu_backends_from_json(raw: &str, keep: &str) -> Vec<StoppableG
 /// is wrong is worse than no ratchet: it reports "no new stop sites" forever.
 #[cfg(test)]
 pub fn stop_call_site_owners(src: &str) -> Vec<String> {
-    // Item-level `fn` spans, in source order: (name, byte offset of `fn`).
-    let mut fns: Vec<(&str, usize)> = Vec::new();
-    for (idx, _) in src.match_indices("fn ") {
-        // Only item-level fns: what precedes `fn` on its line must be nothing,
-        // `pub`, `async`, or `pub async` — never an `Fn(` bound or prose.
-        let line_start = src[..idx].rfind('\n').map(|p| p + 1).unwrap_or(0);
-        let prefix = src[line_start..idx].trim();
-        if !matches!(prefix, "" | "pub" | "async" | "pub async") {
+    // Whitespace is normalised FIRST, keeping a map back to original offsets, so
+    // the scan does not depend on formatting. Review round 1 (codex, gpt56, agy
+    // independently) showed the naive line-based version missed a multi-line
+    // `run([\n  "systemctl",\n  "stop", …])` entirely.
+    let mut norm = String::with_capacity(src.len());
+    let mut map: Vec<usize> = Vec::with_capacity(src.len());
+    let mut in_ws = false;
+    for (i, c) in src.char_indices() {
+        if c.is_whitespace() {
+            in_ws = true;
             continue;
         }
-        let rest = &src[idx + 3..];
+        if in_ws && !norm.is_empty() {
+            // A space after a comma carries no meaning in an argv literal; drop it
+            // so `"systemctl", "stop"` and `"systemctl","stop"` scan identically.
+            if !norm.ends_with(',') {
+                norm.push(' ');
+                map.push(i);
+            }
+        }
+        in_ws = false;
+        norm.push(c);
+        map.push(i);
+    }
+
+    // Item-level `fn` headers, in source order: (name, ORIGINAL byte offset).
+    let mut fns: Vec<(&str, usize)> = Vec::new();
+    for (nidx, _) in norm.match_indices("fn ") {
+        let orig = map[nidx];
+        let line_start = src[..orig].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        if !is_item_fn_prefix(&src[line_start..orig]) {
+            continue;
+        }
+        let rest = &src[orig + 3..];
         let name_end = rest
             .find(|c: char| !(c.is_alphanumeric() || c == '_'))
             .unwrap_or(rest.len());
-        fns.push((&rest[..name_end], idx));
+        let name = rest[..name_end].trim();
+        if !name.is_empty() {
+            fns.push((name, orig));
+        }
     }
 
     // Every `systemctl` + `stop` argv, attributed to its enclosing fn. The needle
     // is assembled at runtime so this file never contains it literally (a
     // self-match would make the ratchet report a phantom site).
-    let needle = format!("{}, {}", "\"systemctl\"", "\"stop\"");
+    let needle = format!("{},{}", "\"systemctl\"", "\"stop\"");
     let mut owners: Vec<String> = Vec::new();
-    for (idx, _) in src.match_indices(needle.as_str()) {
+    for (nidx, _) in norm.match_indices(needle.as_str()) {
+        let orig = map[nidx];
         let owner = fns
             .iter()
             .rev()
-            .find(|(_, start)| *start < idx)
+            .find(|(_, start)| *start < orig)
             .map(|(name, _)| (*name).to_string())
             .unwrap_or_else(|| "<top level>".to_string());
         if !owners.contains(&owner) {
@@ -161,6 +199,39 @@ pub fn stop_call_site_owners(src: &str) -> Vec<String> {
         }
     }
     owners
+}
+
+/// Does what precedes `fn` on its line consist ONLY of things that can legally
+/// precede an ITEM-level function — i.e. is this a real function header rather
+/// than a `fn` inside prose, a `fn(..)` pointer type, or a trait bound?
+///
+/// Written as "every token must be a permitted modifier" rather than an allow-list
+/// of whole prefixes. The whole-prefix version accepted exactly
+/// `""`/`"pub"`/`"async"`/`"pub async"`, so `pub(crate) fn`, `const fn`,
+/// `unsafe fn`, `extern "C" fn` and `#[inline] fn` were all invisible to it — and
+/// a stop site inside such a function was silently attributed to the previous,
+/// allow-listed function. Three reviewers found this independently; it was real.
+#[cfg(test)]
+fn is_item_fn_prefix(prefix: &str) -> bool {
+    let mut p = prefix.trim();
+    // Attributes on the same line: `#[inline] pub fn …`.
+    while let Some(stripped) = p.strip_prefix("#[") {
+        match stripped.find(']') {
+            Some(i) => p = stripped[i + 1..].trim_start(),
+            None => return false,
+        }
+    }
+    // Restricted visibility: `pub(crate)`, `pub(super)`, `pub(in path)`.
+    if let Some(stripped) = p.strip_prefix("pub(") {
+        match stripped.find(')') {
+            Some(i) => p = stripped[i + 1..].trim_start(),
+            None => return false,
+        }
+    }
+    p.split_whitespace().all(|t| {
+        matches!(t, "pub" | "async" | "unsafe" | "const" | "default" | "extern")
+            || t.starts_with('"') // the ABI string in `extern "C"`
+    })
 }
 
 #[cfg(test)]
@@ -270,18 +341,25 @@ mod tests {
     /// function's header and its stop site — so a scanner that stops
     /// distinguishing item-level `fn`s misattributes the site to `reap_all`
     /// instead of `stop`, and the tests below say so.
+    ///
+    /// `ensure_up`'s argv is deliberately split across lines: the first version of
+    /// this scanner was line-based and could not see it at all.
     const SAMPLE: &str = r#"
 /// docs mentioning fn free_gpu in prose
 pub fn stop(b: &B) {
     // mirrors fn reap_all in the pre-guard code
-    let hook: fn(u8) -> u8 = |x| x;
+    let hook: fn (u8) -> u8 = |x| x;
     let _ = run(["systemctl", "stop", unit]);
 }
 
 fn helper<F: Fn(u8) -> u8>(f: F) -> u8 { f(1) }
 
 pub async fn ensure_up(b: &B) {
-    let _ = run(["systemctl", "stop", &unit_name]);
+    let _ = run([
+        "systemctl",
+        "stop",
+        &unit_name,
+    ]);
 }
 "#;
 
@@ -293,26 +371,67 @@ pub async fn ensure_up(b: &B) {
         );
     }
 
-    /// The ratchet's whole job: a NEW function that stops a unit must show up.
+    /// The ratchet's whole job: a NEW function that stops a unit must show up —
+    /// in EVERY form a Rust function can legally take. Round-1 review found the
+    /// scanner blind to all of these, which meant the ratchet would have gone on
+    /// reporting "no new stop sites" while one sat in the file.
     #[test]
-    fn ratchet_catches_a_new_unguarded_stop_site() {
-        let rogue = format!(
-            "{SAMPLE}\nfn reap_everything(name: &str) {{\n    let _ = run([\"systemctl\", \"stop\", name]);\n}}\n"
-        );
-        assert_eq!(
-            stop_call_site_owners(&rogue),
-            vec![
-                "stop".to_string(),
-                "ensure_up".to_string(),
-                "reap_everything".to_string()
-            ],
-            "a new stop site must be attributed, not swallowed"
-        );
+    fn ratchet_catches_a_new_unguarded_stop_site_in_any_function_form() {
+        let forms: [(&str, &str); 6] = [
+            ("pub(crate) fn rogue_a()", "rogue_a"),
+            ("const fn rogue_b()", "rogue_b"),
+            ("unsafe fn rogue_c()", "rogue_c"),
+            ("pub(super) async fn rogue_d()", "rogue_d"),
+            ("#[inline] pub(crate) fn rogue_e()", "rogue_e"),
+            ("fn rogue_f()", "rogue_f"),
+        ];
+        for (header, name) in forms {
+            let rogue = format!(
+                "{SAMPLE}\n{header} {{\n    let _ = run([\"systemctl\", \"stop\", name]);\n}}\n"
+            );
+            let owners = stop_call_site_owners(&rogue);
+            assert!(
+                owners.contains(&name.to_string()),
+                "`{header}` must be attributed as a new stop site, not absorbed into \
+                 an allow-listed function; got {owners:?}"
+            );
+        }
     }
 
-    /// A parser that found nothing would pass every allow-list assertion forever.
-    /// The real ratchet asserts non-emptiness for exactly this reason; assert here
-    /// that "no stop sites" is a state this function can actually report.
+    /// A stop site written with different spacing must still be seen — the
+    /// normalisation, not the exact literal, is what the scan depends on.
+    #[test]
+    fn ratchet_is_insensitive_to_argv_formatting() {
+        for argv in [
+            "[\"systemctl\",\"stop\", u]",
+            "[\"systemctl\",    \"stop\", u]",
+            "[\n    \"systemctl\",\n    \"stop\",\n    u,\n]",
+        ] {
+            let src = format!("fn rogue() {{\n    let _ = run({argv});\n}}\n");
+            assert_eq!(
+                stop_call_site_owners(&src),
+                vec!["rogue".to_string()],
+                "formatting must not hide a stop site: {argv}"
+            );
+        }
+    }
+
+    /// The prefix rule accepts every legal item-fn modifier and rejects the
+    /// near-misses. Tested directly because it is the part that was wrong.
+    #[test]
+    fn item_fn_prefix_accepts_modifiers_and_rejects_prose() {
+        for ok in [
+            "", "pub", "async", "pub async", "pub(crate)", "pub(super)",
+            "pub(in crate::intake)", "const", "unsafe", "pub unsafe",
+            "extern \"C\"", "#[inline]", "#[inline] pub(crate)",
+        ] {
+            assert!(is_item_fn_prefix(ok), "should accept prefix {ok:?}");
+        }
+        for bad in ["///", "// mirrors", "let hook:", "F: Fn(u8) ->", "type T ="] {
+            assert!(!is_item_fn_prefix(bad), "should reject prefix {bad:?}");
+        }
+    }
+
     #[test]
     fn ratchet_reports_nothing_when_there_is_nothing() {
         assert!(stop_call_site_owners("fn quiet() { let _ = 1; }").is_empty());
