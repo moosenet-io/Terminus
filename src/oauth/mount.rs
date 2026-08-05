@@ -984,8 +984,20 @@ mod tests {
             ClientService::new(crate::oauth::store::OauthStore::from_pool(lazy_pool())),
             true,
         );
+        // The charge layer is included because PRODUCTION includes it, and the
+        // ordering is load-bearing: `handle_register` extracts `AddressCleared`
+        // before it extracts the body, so a router without the charge layer
+        // fails that extraction first and never reaches the body limit at all.
+        // The first version of this test omitted it and asserted a 413 that
+        // could not happen — a test that would have passed for the wrong reason
+        // had the layer been broken.
+        let limiter = Arc::new(OauthRateLimiter::with_defaults());
         let router = Router::new()
             .merge(registration.router())
+            .route_layer(axum::middleware::from_fn_with_state(
+                limiter,
+                charge_address_budget,
+            ))
             .layer(axum::middleware::from_fn(audit_transport_refusals));
 
         // Distinctive, and far over the bound.
