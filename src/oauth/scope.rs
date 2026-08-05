@@ -88,7 +88,8 @@ use uuid::Uuid;
 
 use crate::error::ToolError;
 use crate::mesh::split_namespaced;
-use crate::oauth::model::ToolGroup;
+use crate::oauth::delegation::{owner_may_hold, PatternShape};
+use crate::oauth::groups::AuthorizedGroup;
 use crate::oauth::store::OauthStore;
 
 // ---------------------------------------------------------------------------
@@ -413,6 +414,22 @@ pub enum ScopePattern {
 }
 
 impl ScopePattern {
+    /// This pattern reduced to the shape delegation reasons about, so the
+    /// enforcing vocabulary and the authoring one ask
+    /// [`crate::oauth::delegation::owner_may_hold`] the same question.
+    ///
+    /// Exhaustive by construction: a form added later cannot default into the
+    /// permissive class.
+    pub fn shape(&self) -> PatternShape<'_> {
+        match self {
+            ScopePattern::All => PatternShape::Everything,
+            ScopePattern::Namespace(namespace)
+            | ScopePattern::NamespacedExact(namespace, _)
+            | ScopePattern::NamespacedPrefix(namespace, _) => PatternShape::Namespaced(namespace),
+            ScopePattern::Exact(_) | ScopePattern::Prefix(_) => PatternShape::Local,
+        }
+    }
+
     /// Parse one stored pattern.
     ///
     /// Returns [`ToolError::InvalidArgument`] rather than a permissive
@@ -589,14 +606,33 @@ impl ClientScope {
     /// working while still never granting anything.
     pub fn from_rows(
         client_id: impl Into<String>,
-        groups: &[ToolGroup],
+        groups: &[AuthorizedGroup],
         namespaces: Vec<String>,
     ) -> Self {
         let client_id = client_id.into();
         let mut patterns = Vec::new();
-        for group in groups {
+        for authorized in groups {
+            let group = &authorized.group;
             for raw in &group.patterns {
                 match ScopePattern::parse(raw) {
+                    Ok(parsed) if !owner_may_hold(authorized.owner, parsed.shape()) => {
+                        // RMCP-12's read-path re-derivation, and the reason this
+                        // constructor now takes AUTHORIZED groups rather than
+                        // bare rows. `authorized.owner` is projected by
+                        // `client_authorized_groups` from `rmcp_account` in the
+                        // same statement as the group, so it is the owner's
+                        // CURRENT authority — not the authority they had when
+                        // the pattern was written.
+                        //
+                        // Dropping the pattern (never the group, never the
+                        // request) is what makes a revoked authority resolve to
+                        // less rather than to an error or to everything.
+                        tracing::warn!(
+                            group = %group.name,
+                            "rmcp scope: dropping a pattern its group's owner is no longer \
+                             authorized to hold"
+                        );
+                    }
                     Ok(parsed) => patterns.push(parsed),
                     Err(err) => {
                         // The pattern text itself is operator-authored config,
@@ -1310,7 +1346,13 @@ impl ScopeResolver {
         // namespace whose delegation was cleared, both drop out HERE, on the
         // read path, rather than living on because they were valid when they
         // were written.
-        let groups = self.store.client_tool_groups(client.id).await?;
+        // `client_authorized_groups`, NOT `client_tool_groups`: the former
+        // projects the owner's CURRENT authority in the same statement as the
+        // rows, and resolving from the latter would drop it — honouring a `*`
+        // (or, since RMCP-12, a local pattern) whose owner is no longer entitled
+        // to hold one. Its own doc comment says it is the resolution entry
+        // point; this call site is the one that has to agree with that.
+        let groups = self.store.client_authorized_groups(client.id).await?;
         let namespaces = self.store.client_namespaces(client.id).await?;
         Ok(ClientScope::from_rows(client_id, &groups, namespaces))
     }
@@ -1368,6 +1410,73 @@ impl ScopeResolver {
             .await;
         self.invalidate(client);
         result
+    }
+
+    /// Grant server ownership AS `actor_account_id`, then drop EVERY cached
+    /// scope.
+    ///
+    /// This and [`Self::revoke_server_owner`] are why [`Self::invalidate_all`]
+    /// exists. A delegation change's blast radius is not one client: it can
+    /// narrow every connector owned by the account that just lost the
+    /// namespace, and this process does not know which those are without asking
+    /// the store. Dropping the whole map costs a re-read per client and is the
+    /// only version of this that cannot miss one.
+    ///
+    /// ## The actor is an argument because round 1 found it missing
+    ///
+    /// The first version of this method took only a namespace and an owner, and
+    /// called the store's raw mutator. That made the resolver a SECOND,
+    /// unauthorized door onto delegation: every rule
+    /// [`crate::oauth::delegation`] enforces was bypassable by calling this
+    /// instead of [`crate::oauth::delegation::DelegationService`]. The store's
+    /// mutators are now private and demand a proof value that can only be
+    /// produced by running the check, so this method could not be written that
+    /// way today — but it also no longer wants to be. It delegates to the same
+    /// service every other caller uses, and adds exactly one thing: the cache
+    /// drop.
+    ///
+    /// The epoch bump alone is already sufficient for CORRECTNESS (see
+    /// [`ScopeWrite`]) — no stale entry can be served across a delegation write
+    /// whether or not this method is the one used. What the explicit drop adds
+    /// is that the entries are FREED rather than left resident-but-unusable.
+    pub async fn set_server_owner(
+        &self,
+        actor_account_id: Uuid,
+        namespace: &str,
+        grantee_name: &str,
+    ) -> Result<crate::oauth::delegation::DelegationChange, ToolError> {
+        let result = self
+            .delegation()
+            .grant(actor_account_id, namespace, grantee_name)
+            .await;
+        // On the FAILURE path too, for the same reason as every other write
+        // here: re-reading a correct answer costs one query, and a missed
+        // invalidation leaves revoked authority live.
+        self.invalidate_all();
+        result
+    }
+
+    /// Revoke server ownership AS `actor_account_id`, then drop every cached
+    /// scope. See [`Self::set_server_owner`].
+    pub async fn revoke_server_owner(
+        &self,
+        actor_account_id: Uuid,
+        namespace: &str,
+    ) -> Result<crate::oauth::delegation::DelegationChange, ToolError> {
+        let result = self.delegation().revoke(actor_account_id, namespace).await;
+        self.invalidate_all();
+        result
+    }
+
+    /// The delegation service over this resolver's own store.
+    ///
+    /// Constructed per call rather than held: it is a handle around the same
+    /// `Arc`, and building it here means there is no second place where an
+    /// authority could be cached across requests.
+    fn delegation(&self) -> crate::oauth::delegation::DelegationService {
+        crate::oauth::delegation::DelegationService::new(
+            Arc::clone(&self.store) as Arc<dyn crate::oauth::delegation::DelegationStore>
+        )
     }
 
     /// Enable or disable a client, then invalidate.
@@ -1470,23 +1579,77 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    fn group(patterns: &[&str]) -> ToolGroup {
-        ToolGroup {
-            id: Uuid::nil(),
-            name: "g".into(),
-            description: String::new(),
-            patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
-            owner_account_id: Uuid::nil(),
-            created_at: Utc::now(),
+    fn group(patterns: &[&str], owner: crate::oauth::groups::GroupOwner) -> AuthorizedGroup {
+        AuthorizedGroup {
+            group: crate::oauth::model::ToolGroup {
+                id: Uuid::nil(),
+                name: "g".into(),
+                description: String::new(),
+                patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
+                owner_account_id: Uuid::nil(),
+                created_at: Utc::now(),
+            },
+            owner,
         }
     }
 
+    /// The default test scope is OPERATOR-owned, because most of these tests
+    /// are about the matcher rather than about delegation.
     fn scope(patterns: &[&str], namespaces: &[&str]) -> ClientScope {
+        scope_owned_by(patterns, namespaces, crate::oauth::groups::GroupOwner::Operator)
+    }
+
+    fn scope_owned_by(
+        patterns: &[&str],
+        namespaces: &[&str],
+        owner: crate::oauth::groups::GroupOwner,
+    ) -> ClientScope {
         ClientScope::from_rows(
             "a-client-id",
-            &[group(patterns)],
+            &[group(patterns, owner)],
             namespaces.iter().map(|n| (*n).to_string()).collect(),
         )
+    }
+
+    /// RMCP-12 at the ENFORCING matcher: the same stored rows resolve to less
+    /// when their owner is no longer an operator. This is the read-path
+    /// re-derivation, and it is what makes a demotion or a revoked delegation
+    /// effective on the next call rather than at a TTL.
+    #[test]
+    fn a_delegated_owners_local_patterns_do_not_reach_the_enforcing_matcher() {
+        use crate::oauth::groups::GroupOwner;
+        let operator_scope =
+            scope_owned_by(&["weather_*", "peerone::*"], &["peerone"], GroupOwner::Operator);
+        assert!(decide(&allow_all, &operator_scope, "weather_get").is_allowed());
+        assert!(decide(&allow_all, &operator_scope, "peerone__weather_get").is_allowed());
+
+        let delegated_scope =
+            scope_owned_by(&["weather_*", "peerone::*"], &["peerone"], GroupOwner::Delegated);
+        assert_eq!(
+            decide(&allow_all, &delegated_scope, "weather_get"),
+            Decision::Deny(DenyReason::NoGroup),
+            "an unqualified pattern must not reach the fleet's own tools for a delegated owner"
+        );
+        assert!(
+            decide(&allow_all, &delegated_scope, "peerone__weather_get").is_allowed(),
+            "and the namespaced pattern must still work — the rule separates them"
+        );
+    }
+
+    /// Mutation-verified: delete the `owner_may_hold` arm in
+    /// `ClientScope::from_rows` and this goes red, because a `*` stored by a
+    /// non-operator would expand to the whole catalog again.
+    #[test]
+    fn a_delegated_owners_stored_wildcard_expands_to_nothing_here_too() {
+        use crate::oauth::groups::GroupOwner;
+        let delegated_scope = scope_owned_by(&["*"], &[], GroupOwner::Delegated);
+        assert!(delegated_scope.is_empty(), "the group must collapse to no patterns at all");
+        assert_eq!(
+            decide(&allow_all, &delegated_scope, "weather_get"),
+            Decision::Deny(DenyReason::NoGroup)
+        );
+        assert!(decide(&allow_all, &scope_owned_by(&["*"], &[], GroupOwner::Operator), "weather_get")
+            .is_allowed());
     }
 
     /// A grant that permits everything — used to isolate the CLIENT half of the

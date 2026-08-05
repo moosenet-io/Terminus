@@ -3071,9 +3071,13 @@ mod tests {
             owner_account_id: uuid::Uuid::nil(),
             created_at: chrono::Utc::now(),
         };
+        let authorized = crate::oauth::groups::AuthorizedGroup {
+            group,
+            owner: crate::oauth::groups::GroupOwner::Operator,
+        };
         ClientScope::from_rows(
             "a-connector-client-id",
-            &[group],
+            &[authorized],
             namespaces.iter().map(|n| (*n).to_string()).collect(),
         )
     }

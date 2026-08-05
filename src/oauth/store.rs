@@ -25,8 +25,12 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::ToolError;
+use crate::oauth::delegation::{
+    authorize_client_write, authorize_namespace_scoping, reverify_delegation_change,
+    ActorAuthority, DelegationChange, DelegationGrant, DelegationRevocation, DelegationStore,
+};
 use crate::oauth::groups::{
-    normalize_description, validate_group, validate_patterns, AuthorizedGroup, GroupOwner, Pattern,
+    normalize_description, validate_group, validate_patterns, AuthorizedGroup, Pattern,
     MAX_GROUPS_PER_CLIENT, STARTER_GROUPS,
 };
 use crate::oauth::model::{
@@ -404,22 +408,102 @@ impl OauthStore {
     /// read and the write it authorizes.
     ///
     /// A missing or DISABLED account yields [`ToolError::NotFound`] rather than
-    /// [`GroupOwner::Delegated`]: an account that cannot authenticate should not
-    /// be authoring scoping records at all, so this refuses the write outright
+    /// a delegated authority: an account that cannot authenticate should not be
+    /// authoring scoping records at all, so this refuses the write outright
     /// instead of quietly downgrading it to the less privileged path.
-    async fn authoring_authority(
+    ///
+    /// ## RMCP-12: it now carries the OWNED NAMESPACES too
+    ///
+    /// Both halves of an actor's authority — is it an operator, and which
+    /// servers does it own — are read in the SAME transaction, under `FOR
+    /// SHARE`, so neither can move between the check and the write it
+    /// authorizes. That is the whole reason delegation's rules are pure
+    /// functions over an [`ActorAuthority`]: the value can be derived where the
+    /// locks are, and the rule can then be the same one the read path uses.
+    ///
+    /// The namespace rows are locked as well as the account row. Without that,
+    /// `clear_server_owner` could land between this read and the insert, and
+    /// the write would proceed on a delegation that no longer exists.
+    async fn actor_authority(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         account_id: Uuid,
-    ) -> Result<GroupOwner, ToolError> {
-        let is_operator = sqlx::query_scalar::<_, bool>(
+    ) -> Result<ActorAuthority, ToolError> {
+        let is_operator = Self::locked_active_account(tx, account_id).await?;
+        let owned = sqlx::query_scalar::<_, String>(
+            "SELECT namespace FROM rmcp_server_owner WHERE owner_account_id = $1 \
+             ORDER BY namespace FOR SHARE",
+        )
+        .bind(account_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(db)?;
+        Ok(ActorAuthority::from_live_state(account_id, is_operator, owned))
+    }
+
+    /// Read an account's operator flag, requiring it to be ACTIVE, and hold the
+    /// row for the rest of the transaction.
+    ///
+    /// `FOR SHARE` is the whole point: it is what makes the answer true at
+    /// COMMIT and not merely true when it was read. Every authorization that
+    /// depends on account state goes through here, so there is one place where
+    /// "is this account allowed, right now, and will it still be when this
+    /// write lands" is answered.
+    ///
+    /// A missing or disabled account is [`ToolError::NotFound`] with one shared
+    /// message — not two, and not a downgrade to a less privileged authority.
+    async fn locked_active_account(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        account_id: Uuid,
+    ) -> Result<bool, ToolError> {
+        sqlx::query_scalar::<_, bool>(
             "SELECT is_operator FROM rmcp_account WHERE id = $1 AND NOT disabled FOR SHARE",
         )
         .bind(account_id)
         .fetch_optional(&mut **tx)
         .await
         .map_err(db)?
-        .ok_or_else(|| ToolError::NotFound("no such active account".into()))?;
-        Ok(if is_operator { GroupOwner::Operator } else { GroupOwner::Delegated })
+        .ok_or_else(|| ToolError::NotFound("no such active account".into()))
+    }
+
+    /// The authority of the account that OWNS a client, derived in the same
+    /// transaction — reusing the actor's own when they are the same account.
+    ///
+    /// Why the client's owner and not the actor: what a scoping row resolves to
+    /// is decided by the CLIENT OWNER's holdings
+    /// ([`Self::client_namespaces`], [`Self::client_authorized_groups`] — both
+    /// join on `c.owner_account_id`). An operator administering a delegated
+    /// user's client must therefore attach that user's servers and groups, not
+    /// their own; the alternative is a write that succeeds and then resolves to
+    /// nothing, which is the most confusing possible outcome for the operator
+    /// trying to help.
+    async fn client_owner_authority(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        actor: &ActorAuthority,
+        client_owner: Uuid,
+    ) -> Result<ActorAuthority, ToolError> {
+        if client_owner == actor.account_id() {
+            return Ok(actor.clone());
+        }
+        Self::actor_authority(tx, client_owner).await
+    }
+
+    /// The client's owner, locked for the rest of the transaction.
+    ///
+    /// `FOR SHARE` so ownership cannot be reassigned between this read and the
+    /// write it authorizes — a TOCTOU that would let a write proceed on stale
+    /// authority. `None` when there is no such client; callers must answer that
+    /// exactly as they answer "not yours", so this is not an existence oracle.
+    async fn locked_client_owner(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        client_id: Uuid,
+    ) -> Result<Option<Uuid>, ToolError> {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT owner_account_id FROM rmcp_client WHERE id = $1 FOR SHARE",
+        )
+        .bind(client_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db)
     }
 
     /// Insert a tool group, VALIDATING it first (RMCP-06).
@@ -433,7 +517,7 @@ impl OauthStore {
     ///
     /// The authority that decides whether a bare `*` is acceptable is read from
     /// `owner_account_id`'s own row, in this transaction — see
-    /// [`Self::authoring_authority`]. There is deliberately no parameter for it:
+    /// [`Self::actor_authority`]. There is deliberately no parameter for it:
     /// the caller states WHO is writing, never WHAT they are allowed to write.
     ///
     /// An empty `patterns` slice is permitted and stores a group that matches
@@ -448,8 +532,8 @@ impl OauthStore {
     ) -> Result<Uuid, ToolError> {
         let _scope_write = ScopeWrite::begin();
         let mut tx = self.pool.begin().await.map_err(db)?;
-        let owner_kind = Self::authoring_authority(&mut tx, owner_account_id).await?;
-        let group = validate_group(name, description, patterns, owner_kind)?;
+        let authority = Self::actor_authority(&mut tx, owner_account_id).await?;
+        let group = validate_group(name, description, patterns, &authority.authoring())?;
         let rendered = group.rendered_patterns();
         let id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO rmcp_tool_group (name, description, patterns, owner_account_id) \
@@ -507,13 +591,13 @@ impl OauthStore {
         patterns: &[String],
     ) -> Result<(), ToolError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
-        let owner_kind = Self::authoring_authority(&mut tx, actor_account_id).await?;
+        let authority = Self::actor_authority(&mut tx, actor_account_id).await?;
         // The name is not editable here (renaming would have to contend with the
         // fleet-wide UNIQUE constraint, which is RMCP-08's surface to own), so
         // only the two editable fields are validated.
         let description = normalize_description(description)?;
         let patterns: Vec<String> =
-            validate_patterns(patterns, owner_kind)?.iter().map(Pattern::render).collect();
+            validate_patterns(patterns, &authority.authoring())?.iter().map(Pattern::render).collect();
         // Editing a group's patterns changes what every client scoped to it
         // resolves to, so the resolver's cache must see this write. Held to the
         // end of the function, past the commit.
@@ -584,7 +668,7 @@ impl OauthStore {
     /// Returns the number of groups actually created.
     pub async fn seed_starter_groups(&self, owner_account_id: Uuid) -> Result<u64, ToolError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
-        if Self::authoring_authority(&mut tx, owner_account_id).await? != GroupOwner::Operator {
+        if !Self::actor_authority(&mut tx, owner_account_id).await?.is_operator() {
             return Err(ToolError::InvalidArgument(
                 "starter groups may only be seeded onto an operator account".into(),
             ));
@@ -597,8 +681,16 @@ impl OauthStore {
             // Validated on the way in like any other write, so a bad edit to the
             // seed list fails here rather than being the one path that bypasses
             // the matcher's contract.
-            let group =
-                validate_group(starter.name, starter.description, &patterns, GroupOwner::Operator)?;
+            //
+            // `Authoring::Operator` is sound HERE and only here: the account was
+            // verified to be an active operator above, in this transaction,
+            // under `FOR SHARE`.
+            let group = validate_group(
+                starter.name,
+                starter.description,
+                &patterns,
+                &crate::oauth::delegation::Authoring::Operator,
+            )?;
             let rendered = group.rendered_patterns();
             let inserted = sqlx::query(
                 "INSERT INTO rmcp_tool_group (name, description, patterns, owner_account_id) \
@@ -769,17 +861,48 @@ impl OauthStore {
     /// an account that has since been disabled must not remain reachable
     /// through that account's connectors.
     ///
-    /// Same note to RMCP-12 as on [`Self::client_tool_groups`]: if delegation
-    /// introduces a legitimate operator override, THIS is the predicate to
-    /// widen deliberately and with tests.
+    /// ## RMCP-12 widened this predicate, deliberately and with tests
+    ///
+    /// This is the operator override the note above invited, and it is the ONE
+    /// widening in this item. `rmcp_server_owner` records DELEGATIONS; the
+    /// operator owns every namespace by default and has no row. Without the
+    /// override, an operator's own connector could not reach a federated server
+    /// at all unless the operator first delegated it to themselves — and the
+    /// symptom would be a scoping row that saves and then resolves to nothing.
+    ///
+    /// What it does NOT do is widen for anyone else. Read the predicate as two
+    /// disjoint cases:
+    ///
+    /// - **The client owner is an active operator** — an explicit
+    ///   `rmcp_client_server` row is honoured. Still explicit reach: no row, no
+    ///   namespace. And still revocable — demote or disable the account and the
+    ///   `a` join drops every row on the next call.
+    /// - **Anyone else** — `o.owner_account_id = c.owner_account_id` must hold,
+    ///   exactly as before. An unowned namespace (`o` NULL through the LEFT
+    ///   JOIN) fails it, so "nobody has claimed this server" still never reads
+    ///   as "everyone may reach it".
+    ///
+    /// **Carrying TERM #637B's hardening across the rewrite.** The previous
+    /// version joined `rmcp_account` on `o.owner_account_id`, which is what
+    /// made a DISABLED delegated owner's namespaces stop resolving. This
+    /// version joins on `c.owner_account_id` instead — and that is not a
+    /// weakening, because in the delegated branch the predicate
+    /// `o.owner_account_id = c.owner_account_id` forces those two columns to be
+    /// the SAME account, so the same row is checked and `NOT a.disabled` still
+    /// applies to it. Moving the join is what lets the operator branch see the
+    /// client owner's `is_operator` at all. If that equality predicate is ever
+    /// relaxed, this join has to be revisited with it: they are one rule in two
+    /// clauses, exactly as `client_authorized_groups` documents for its own
+    /// pair.
     pub async fn client_namespaces(&self, client_id: Uuid) -> Result<Vec<String>, ToolError> {
         sqlx::query_scalar::<_, String>(
             "SELECT s.namespace FROM rmcp_client_server s \
              JOIN rmcp_client c ON c.id = s.client_id AND NOT c.disabled \
-             JOIN rmcp_server_owner o ON o.namespace = s.namespace \
-                                     AND o.owner_account_id = c.owner_account_id \
-             JOIN rmcp_account a ON a.id = o.owner_account_id AND NOT a.disabled \
-             WHERE s.client_id = $1 ORDER BY s.namespace",
+             JOIN rmcp_account a ON a.id = c.owner_account_id AND NOT a.disabled \
+             LEFT JOIN rmcp_server_owner o ON o.namespace = s.namespace \
+             WHERE s.client_id = $1 \
+               AND (a.is_operator OR o.owner_account_id = c.owner_account_id) \
+             ORDER BY s.namespace",
         )
         .bind(client_id)
         .fetch_all(&self.pool)
@@ -838,24 +961,22 @@ impl OauthStore {
         let _scope_write = ScopeWrite::begin();
         let mut tx = self.pool.begin().await.map_err(db)?;
 
-        // `FOR SHARE` locks the client row for the rest of the transaction, so
-        // its ownership cannot be reassigned between this check and the write.
-        // Without it the check is a TOCTOU: a concurrent transfer could land in
-        // the gap and the write would proceed on stale authority.
-        let owns_client = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM rmcp_client WHERE id = $1 AND owner_account_id = $2 FOR SHARE",
-        )
-        .bind(client_id)
-        .bind(actor_account_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db)?
-        .is_some();
-        if !owns_client {
-            // Same answer for "no such client" and "not yours": distinguishing
-            // them would confirm the existence of another account's client.
+        // The actor's authority and the client's owner, both read under `FOR
+        // SHARE` in this transaction. Without the locks the checks are a TOCTOU:
+        // a concurrent transfer or demotion could land in the gap and the write
+        // would proceed on stale authority.
+        //
+        // Same answer for "no such client" and "not yours" (see
+        // `delegation::authorize_client_write`): distinguishing them would
+        // confirm the existence of another account's client.
+        let actor = Self::actor_authority(&mut tx, actor_account_id).await?;
+        let Some(client_owner) = Self::locked_client_owner(&mut tx, client_id).await? else {
             return Err(ToolError::NotFound("no such client for this account".into()));
-        }
+        };
+        authorize_client_write(&actor, client_owner)?;
+        // What this scope RESOLVES to is decided by the client owner's
+        // holdings, so that is whose authority the group check runs against.
+        let owner_authority = Self::client_owner_authority(&mut tx, &actor, client_owner).await?;
 
         // Every requested group must belong to the actor, and each matching row
         // is LOCKED for the rest of the transaction (`FOR SHARE`) so ownership
@@ -868,7 +989,7 @@ impl OauthStore {
              FOR SHARE",
         )
         .bind(group_ids)
-        .bind(actor_account_id)
+        .bind(owner_authority.account_id())
         .fetch_all(&mut *tx)
         .await
         .map_err(db)?
@@ -924,44 +1045,34 @@ impl OauthStore {
         let _scope_write = ScopeWrite::begin();
         let mut tx = self.pool.begin().await.map_err(db)?;
 
-        // `FOR SHARE`, exactly as in `set_client_tool_groups`. Round 8 caught
-        // that this copy had been left as an unlocked `SELECT EXISTS` while its
-        // own doc comment claimed the same locking guarantee — a documented
-        // promise the code did not keep, which is worse than an undocumented
-        // gap because it stops the next reader looking.
-        let owns_client = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM rmcp_client WHERE id = $1 AND owner_account_id = $2 FOR SHARE",
-        )
-        .bind(client_id)
-        .bind(actor_account_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db)?
-        .is_some();
-        if !owns_client {
+        // `FOR SHARE` throughout, exactly as in `set_client_tool_groups`. Round
+        // 8 caught that this copy had been left as an unlocked `SELECT EXISTS`
+        // while its own doc comment claimed the same locking guarantee — a
+        // documented promise the code did not keep, which is worse than an
+        // undocumented gap because it stops the next reader looking.
+        //
+        // `actor_authority` locks the account row AND every `rmcp_server_owner`
+        // row that account holds, which is what closes the other half of that
+        // race: `clear_server_owner` could otherwise land between the ownership
+        // read and the insert, letting a former owner attach a server they no
+        // longer own.
+        let actor = Self::actor_authority(&mut tx, actor_account_id).await?;
+        let Some(client_owner) = Self::locked_client_owner(&mut tx, client_id).await? else {
             return Err(ToolError::NotFound("no such client for this account".into()));
-        }
+        };
+        authorize_client_write(&actor, client_owner)?;
 
-        // Locked with `FOR SHARE` for the same reason as the client and group
-        // checks: `set_server_owner` could otherwise reassign a namespace
-        // between the check and the insert, letting the PREVIOUS owner attach a
-        // server they no longer own. Holding the lock to commit closes that.
-        let owned_namespaces = sqlx::query_scalar::<_, String>(
-            "SELECT namespace FROM rmcp_server_owner \
-             WHERE namespace = ANY($1) AND owner_account_id = $2 FOR SHARE",
-        )
-        .bind(namespaces)
-        .bind(actor_account_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db)?
-        .len() as i64;
-        let requested = namespaces.iter().collect::<std::collections::HashSet<_>>().len() as i64;
-        if owned_namespaces != requested {
-            return Err(ToolError::InvalidArgument(
-                "one or more servers are not owned by this account".into(),
-            ));
-        }
+        // RMCP-12: ONE function decides this, here and on every other write
+        // path. It is given an authority derived inside this transaction, under
+        // those locks — never one a caller supplied, and never one read before
+        // the transaction began.
+        //
+        // It is the CLIENT OWNER's authority, because that is whose ownership
+        // `client_namespaces` re-joins on at resolution time. Checking the
+        // actor's instead would let an operator write rows for a delegated
+        // user's client that then resolve to nothing.
+        let owner_authority = Self::client_owner_authority(&mut tx, &actor, client_owner).await?;
+        authorize_namespace_scoping(&owner_authority, namespaces)?;
 
         sqlx::query("DELETE FROM rmcp_client_server WHERE client_id = $1")
             .bind(client_id)
@@ -1739,14 +1850,65 @@ impl OauthStore {
     // Server ownership (RMCP-12)
     // -----------------------------------------------------------------------
 
-    /// Assign (or reassign) ownership of a namespace. One owner per namespace,
-    /// enforced by the primary key.
-    pub async fn set_server_owner(
+    /// Assign (or reassign) ownership of a namespace, narrowing any clients the
+    /// PREVIOUS owner had scoped to it. One owner per namespace, enforced by the
+    /// primary key.
+    ///
+    /// **PRIVATE to this module, and it takes the authorization rather than the
+    /// arguments.** Both halves matter, and round 1 of review is why:
+    ///
+    /// - Private, so no other module in the crate can reach it. `ScopeResolver`
+    ///   used to call the `pub` version with no actor at all, which made
+    ///   `DelegationService` the polite path rather than the only one. Rust's
+    ///   module privacy is what turns "nobody should call this directly" from a
+    ///   comment into a compile error.
+    /// - It takes a [`DelegationGrant`], whose only constructor runs the
+    ///   operator check, so even in-module the arguments cannot arrive
+    ///   unauthorized. The rule itself still lives in exactly one place
+    ///   (`delegation::authorize_delegation_change`); this method does not
+    ///   restate it, it DEMANDS it.
+    ///
+    /// What this method owes is atomicity, which is the thing only it can
+    /// provide.
+    ///
+    /// The narrowing is in the SAME transaction as the reassignment. The read
+    /// path already refuses those rows the instant ownership moves — that is the
+    /// enforcement — so this is the state catching up with the decision rather
+    /// than the decision itself. Doing it here rather than lazily means an
+    /// operator inspecting the former owner's client sees what it can actually
+    /// reach.
+    async fn set_server_owner(
         &self,
-        namespace: &str,
-        owner_account_id: Uuid,
-    ) -> Result<(), ToolError> {
+        grant: &DelegationGrant,
+    ) -> Result<DelegationChange, ToolError> {
+        let namespace = grant.namespace();
+        let owner_account_id = grant.grantee();
         let _scope_write = ScopeWrite::begin();
+        let mut tx = self.pool.begin().await.map_err(db)?;
+
+        // RE-VERIFY, under lock, inside the writing transaction (round 2).
+        // The proof establishes that the check ran; these two reads establish
+        // that it still HOLDS at commit. Without them an operator demoted or
+        // disabled between minting the proof and this statement could still
+        // complete the grant — and that window is exactly the moment an
+        // operator is racing to cut off a compromised account.
+        let live_actor = Self::actor_authority(&mut tx, grant.actor()).await?;
+        reverify_delegation_change(grant.actor(), &live_actor)?;
+        // The GRANTEE's active status is equally point-in-time: the service
+        // checked it before the transaction opened. Locked here so a delegation
+        // cannot land on an account that was disabled in the meantime — the
+        // read path would refuse it anyway (`client_namespaces` joins the
+        // owner's account), so this stops the row existing rather than stopping
+        // it working.
+        Self::locked_active_account(&mut tx, owner_account_id).await?;
+
+        let previous = sqlx::query_scalar::<_, Uuid>(
+            "SELECT owner_account_id FROM rmcp_server_owner WHERE namespace = $1 FOR UPDATE",
+        )
+        .bind(namespace)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
         sqlx::query(
             "INSERT INTO rmcp_server_owner (namespace, owner_account_id) VALUES ($1, $2) \
              ON CONFLICT (namespace) DO UPDATE SET owner_account_id = EXCLUDED.owner_account_id, \
@@ -1754,9 +1916,53 @@ impl OauthStore {
         )
         .bind(namespace)
         .bind(owner_account_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
-        .map(|_| ())
+        .map_err(db)?;
+        // Only the clients whose owner no longer owns this namespace lose the
+        // row — never the new owner's, and never an operator's, whose reach is
+        // by default rather than by delegation.
+        let rows_narrowed = Self::narrow_clients_losing(&mut tx, namespace).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(DelegationChange {
+            reassigned: previous.is_some_and(|prior| prior != owner_account_id),
+            rows_narrowed,
+        })
+    }
+
+    /// Delete every `rmcp_client_server` row for `namespace` that its client's
+    /// owner can no longer justify.
+    ///
+    /// The predicate is the WRITE-side mirror of [`Self::client_namespaces`]'s
+    /// read predicate, and deliberately so: a row this deletes is a row that
+    /// query had already stopped returning. Keeping them identical is what makes
+    /// the cleanup provably unable to remove reach that the read path would
+    /// still have honoured.
+    async fn narrow_clients_losing(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        namespace: &str,
+    ) -> Result<u64, ToolError> {
+        // Both callers already hold a guard, so this one is redundant for
+        // correctness — and it is here anyway, because the crate-wide scan
+        // (`no_in_crate_write_bypasses_scope_invalidation`) reasons per
+        // FUNCTION, and it is right to: a helper that mutates a scope-affecting
+        // table must invalidate on its own account, or the next caller added to
+        // it inherits an obligation nothing checks. The epoch is a COUNT, so
+        // nesting is exactly what it is built for.
+        let _scope_write = ScopeWrite::begin();
+        sqlx::query(
+            "DELETE FROM rmcp_client_server s \
+             USING rmcp_client c, rmcp_account a \
+             WHERE s.namespace = $1 AND c.id = s.client_id AND a.id = c.owner_account_id \
+               AND NOT a.is_operator \
+               AND NOT EXISTS (SELECT 1 FROM rmcp_server_owner o \
+                               WHERE o.namespace = s.namespace \
+                                 AND o.owner_account_id = c.owner_account_id)",
+        )
+        .bind(namespace)
+        .execute(&mut **tx)
+        .await
+        .map(|done| done.rows_affected())
         .map_err(db)
     }
 
@@ -1791,14 +1997,145 @@ impl OauthStore {
         .map_err(db)
     }
 
-    /// Remove a delegation.
-    pub async fn clear_server_owner(&self, namespace: &str) -> Result<(), ToolError> {
+    /// Remove a delegation, narrowing every client that drew on it.
+    ///
+    /// Private, and takes the authorization — see [`Self::set_server_owner`].
+    ///
+    /// Idempotent: clearing an absent delegation reports zero narrowed rows
+    /// rather than failing, because "this namespace is not delegated" is the
+    /// state the caller asked for.
+    ///
+    /// As with [`Self::set_server_owner`], the ENFORCEMENT is the read path —
+    /// `client_namespaces` stops returning those namespaces the moment the row
+    /// is gone, on the very next call, with no TTL in between. If this
+    /// transaction's cleanup half failed, the rows it left behind would already
+    /// authorize nothing.
+    async fn clear_server_owner(
+        &self,
+        revocation: &DelegationRevocation,
+    ) -> Result<DelegationChange, ToolError> {
+        let namespace = revocation.namespace();
         let _scope_write = ScopeWrite::begin();
+        let mut tx = self.pool.begin().await.map_err(db)?;
+
+        // Re-verified under lock, exactly as in `set_server_owner` and for the
+        // same reason. There is no "but this one only narrows" exemption: a
+        // revocation is an administrative action on someone else's access, and
+        // an account that has just been disabled must not be able to complete
+        // one on a proof it minted a moment earlier.
+        let live_actor = Self::actor_authority(&mut tx, revocation.actor()).await?;
+        reverify_delegation_change(revocation.actor(), &live_actor)?;
+
         sqlx::query("DELETE FROM rmcp_server_owner WHERE namespace = $1")
             .bind(namespace)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
-            .map(|_| ())
+            .map_err(db)?;
+        let rows_narrowed = Self::narrow_clients_losing(&mut tx, namespace).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(DelegationChange { reassigned: false, rows_narrowed })
+    }
+
+    /// Every delegation, namespace-ordered. Unfiltered — the CALLER's view is
+    /// narrowed by [`crate::oauth::delegation::DelegationService::list`], which
+    /// owns the rule that a delegated owner sees only their own row.
+    pub async fn list_server_owners(&self) -> Result<Vec<ServerOwner>, ToolError> {
+        sqlx::query_as::<_, ServerOwner>(
+            "SELECT namespace, owner_account_id, granted_at FROM rmcp_server_owner \
+             ORDER BY namespace",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)
+    }
+
+    /// `Some(is_operator)` for an ACTIVE account, `None` for one that is missing
+    /// or disabled — collapsed deliberately, because neither may act and
+    /// distinguishing them is an account-existence oracle.
+    pub async fn account_authority(&self, account_id: Uuid) -> Result<Option<bool>, ToolError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT is_operator FROM rmcp_account WHERE id = $1 AND NOT disabled",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)
+    }
+
+    /// The single active operator account, when there is exactly one.
+    ///
+    /// This is how the local tool surface establishes WHO is acting without
+    /// taking an identity from its arguments — the same doctrine as
+    /// [`crate::tool::CallerContext`], where an identity a caller can type is no
+    /// identity at all.
+    ///
+    /// Three outcomes, and the two failures are different on purpose: `None`
+    /// means no active operator exists (nothing to act as), and
+    /// [`ToolError::Conflict`] means SEVERAL do, so the caller must say which
+    /// via [`crate::oauth::OPERATOR_ACCOUNT_ENV`]. Guessing between operators
+    /// would attribute an audited administrative action to the wrong human.
+    pub async fn find_sole_operator_account(&self) -> Result<Option<Uuid>, ToolError> {
+        let operators = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM rmcp_account WHERE is_operator AND NOT disabled ORDER BY id LIMIT 2",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        match operators.len() {
+            0 => Ok(None),
+            1 => Ok(Some(operators[0])),
+            _ => Err(ToolError::Conflict(
+                "this fleet has more than one operator account; name the acting one in the \
+                 environment so the action is attributed to a person"
+                    .into(),
+            )),
+        }
+    }
+}
+
+/// RMCP-12: the delegation seam, satisfied by the real repository.
+///
+/// A thin forwarding impl, exactly like [`SessionStore`] above and for the same
+/// reason: the RULES live in [`crate::oauth::delegation`] where they are
+/// testable without a database, and anything implemented here instead would be
+/// out of reach of those tests.
+#[async_trait::async_trait]
+impl DelegationStore for OauthStore {
+    async fn account_authority(&self, account_id: Uuid) -> Result<Option<bool>, ToolError> {
+        OauthStore::account_authority(self, account_id).await
+    }
+
+    async fn namespaces_owned_by(&self, account_id: Uuid) -> Result<Vec<String>, ToolError> {
+        OauthStore::namespaces_owned_by(self, account_id).await
+    }
+
+    async fn grant_namespace(
+        &self,
+        grant: &DelegationGrant,
+    ) -> Result<DelegationChange, ToolError> {
+        self.set_server_owner(grant).await
+    }
+
+    async fn revoke_namespace(
+        &self,
+        revocation: &DelegationRevocation,
+    ) -> Result<DelegationChange, ToolError> {
+        self.clear_server_owner(revocation).await
+    }
+
+    async fn list_server_owners(&self) -> Result<Vec<ServerOwner>, ToolError> {
+        OauthStore::list_server_owners(self).await
+    }
+
+    async fn account_id_by_name(&self, name: &str) -> Result<Option<Uuid>, ToolError> {
+        self.resolve_account_id(name).await
+    }
+
+    async fn account_name(&self, account_id: Uuid) -> Result<Option<String>, ToolError> {
+        sqlx::query_scalar::<_, String>("SELECT name FROM rmcp_account WHERE id = $1")
+            .bind(account_id)
+            .fetch_optional(&self.pool)
+            .await
             .map_err(db)
     }
 }
@@ -2263,14 +2600,30 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
         for (function, marker) in [
             ("client_tool_groups / client_authorized_groups",
              "JOIN rmcp_account a ON a.id = g.owner_account_id AND NOT a.disabled"),
+            // RMCP-12 moved this join from `o.owner_account_id` to
+            // `c.owner_account_id`, and the guard was updated with it rather
+            // than around it. The two are the SAME account in the delegated
+            // branch, because that branch requires
+            // `o.owner_account_id = c.owner_account_id` — which is asserted
+            // separately below, since without it this join would no longer
+            // cover the delegated owner at all and this marker alone would pass
+            // a genuinely weakened query.
             ("client_namespaces",
-             "JOIN rmcp_account a ON a.id = o.owner_account_id AND NOT a.disabled"),
+             "JOIN rmcp_account a ON a.id = c.owner_account_id AND NOT a.disabled"),
         ] {
             assert!(
                 src.contains(marker),
                 "{function} must exclude a disabled owner in its join: missing {marker:?}"
             );
         }
+
+        // The other half of that one rule. Delete it and a namespace delegated
+        // to ANY account would resolve for ANY other account's client.
+        assert!(
+            src.contains("AND (a.is_operator OR o.owner_account_id = c.owner_account_id)"),
+            "client_namespaces must bind the delegation to the CLIENT's own owner, with the \
+             operator override as the only alternative branch"
+        );
         // BOTH group queries, not just one — the regression was exactly that the
         // display query had it and the resolution query did not.
         assert_eq!(
@@ -2288,6 +2641,171 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
             "owner state belongs in the join, not split across the projection"
         );
         assert!(src.contains("a.is_operator AS owner_is_operator"));
+    }
+
+    /// **Enforces, across the WHOLE CRATE, that the raw delegation mutators are
+    /// reachable only through the authorized path.**
+    ///
+    /// Round 1 of review found that `set_server_owner`/`clear_server_owner` were
+    /// `pub`, unauthenticated, and called directly by `ScopeResolver` with no
+    /// actor — so `DelegationService` was the polite way to mutate a delegation,
+    /// not the only way. Two things now stop that, and this test covers the half
+    /// the compiler does not:
+    ///
+    /// 1. **The compiler.** Both methods are private to this module, so no other
+    ///    file CAN call them, and both demand a `DelegationGrant` /
+    ///    `DelegationRevocation` whose only constructor runs the operator check.
+    /// 2. **This scan.** Privacy stops other MODULES; it does not stop a future
+    ///    method added inside `store.rs` from calling them with a proof minted
+    ///    for something else, and it does not stop the `DelegationStore` trait
+    ///    forwarders being pointed somewhere new. So the call sites are pinned
+    ///    by name.
+    ///
+    /// Mutation-verify by adding a call to `self.set_server_owner(` in any
+    /// function other than `grant_namespace`: this goes red naming that
+    /// function. Delete the `let expected` filter and the non-vacuity assertion
+    /// below goes red instead — the guard cannot be silently emptied.
+    #[test]
+    fn the_raw_delegation_mutators_have_exactly_the_callers_we_intend() {
+        // The authorized forwarders, and nothing else. `grant_namespace` and
+        // `revoke_namespace` are the `DelegationStore` impl methods, which can
+        // only be reached with a proof value.
+        let expected: &[(&str, &str)] =
+            &[("set_server_owner", "grant_namespace"), ("clear_server_owner", "revoke_namespace")];
+
+        let files = crate_source_files();
+        assert!(files.len() > 50, "the crate walk is not scanning the tree");
+
+        let mut found: Vec<(String, String, String)> = Vec::new();
+        for path in &files {
+            let Ok(source) = std::fs::read_to_string(path) else { continue };
+            let label = path
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            // Production half only: the test module below names these methods in
+            // string literals, and scanning it would find the guard's own
+            // vocabulary and call it a caller.
+            let production = source.split("\n#[cfg(test)]").next().unwrap_or(&source);
+            let mut current_fn = String::from("(top level)");
+            for line in production.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if let Some(rest) = trimmed
+                    .strip_prefix("pub async fn ")
+                    .or_else(|| trimmed.strip_prefix("async fn "))
+                    .or_else(|| trimmed.strip_prefix("pub fn "))
+                    .or_else(|| trimmed.strip_prefix("fn "))
+                {
+                    current_fn = rest
+                        .split(|c: char| c == '(' || c == '<')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    continue;
+                }
+                for (method, _) in expected {
+                    if trimmed.contains(&format!(".{method}(")) {
+                        found.push((label.clone(), current_fn.clone(), (*method).to_string()));
+                    }
+                }
+            }
+        }
+
+        let unexpected: Vec<&(String, String, String)> = found
+            .iter()
+            .filter(|(_, caller, method)| {
+                !expected.iter().any(|(m, allowed)| m == method && allowed == caller)
+            })
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "RMCP-12: the raw delegation mutators are reachable from somewhere that has not \
+             proved an operator authorized the change. Route it through \
+             `delegation::DelegationService`, which is what mints the proof value these \
+             methods demand:\n{}",
+            unexpected
+                .iter()
+                .map(|(file, caller, method)| format!("  {file}: fn {caller} calls {method}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        // Non-vacuity: the scan must actually have SEEN both authorized call
+        // sites. A rename, a refactor, or a broken function-splitter fails here
+        // rather than passing green having matched nothing.
+        for (method, caller) in expected {
+            assert!(
+                found.iter().any(|(_, f, m)| f == caller && m == method),
+                "the scan did not find the known {method} call site in fn {caller}; it is \
+                 matching nothing and would pass whatever it was given"
+            );
+        }
+    }
+
+    /// **Both delegation mutators must RE-VERIFY the actor inside their own
+    /// transaction** (round 2).
+    ///
+    /// The proof value they take establishes that the operator check ran; it
+    /// cannot establish that it still holds at commit, because an account can be
+    /// demoted or disabled in between. The re-read is the thing that closes
+    /// that, and it is precisely the kind of code a later reader deletes as
+    /// redundant — it looks like a second copy of a check that already happened.
+    ///
+    /// A text guard for the same reason the disabled-owner guard is one: the
+    /// property is "this SQL ran under a lock in this transaction", which no
+    /// unit test can observe without a database. `delegation`'s own tests prove
+    /// the RULE refuses a stale proof; this proves the mutators actually ask it.
+    ///
+    /// Mutation-verify: delete either `reverify_delegation_change` call and this
+    /// goes red naming that function.
+    #[test]
+    fn both_delegation_mutators_re_verify_the_actor_under_lock() {
+        let file = include_str!("store.rs");
+        let production = file.split("#[cfg(test)]").next().expect("file has a production half");
+
+        for function in ["set_server_owner", "clear_server_owner"] {
+            let start = production
+                .find(&format!("async fn {function}("))
+                .unwrap_or_else(|| panic!("fn {function} not found; has it been renamed?"));
+            // The body runs to the next `\n    async fn ` / `\n    pub ` at the
+            // same indentation, which is enough to bound one method.
+            let rest = &production[start..];
+            let end = rest[1..]
+                .find("\n    /// ")
+                .map(|i| i + 1)
+                .unwrap_or(rest.len());
+            let body: String = rest[..end]
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            assert!(
+                body.contains("Self::actor_authority(&mut tx,"),
+                "fn {function} must re-read the actor's authority INSIDE its transaction — a \
+                 proof minted before a demotion must not authorize a write after it"
+            );
+            assert!(
+                body.contains("reverify_delegation_change("),
+                "fn {function} must re-verify the proof against that live authority; the proof \
+                 alone only establishes that the check RAN, never that it still holds"
+            );
+        }
+
+        // The grantee's active status is re-read under lock too, and only the
+        // grant path has a grantee.
+        let grant_start = production.find("async fn set_server_owner(").unwrap();
+        let grant_body = &production[grant_start..(grant_start + 4000).min(production.len())];
+        assert!(
+            grant_body.contains("Self::locked_active_account(&mut tx, owner_account_id)"),
+            "set_server_owner must re-check the GRANTEE under lock; its active status was \
+             established before the transaction opened and can change under it"
+        );
     }
 
     /// The operator flag is an AUTHORIZATION input, so a deploy that is missing
@@ -2318,7 +2836,7 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
     // inputs) and by RMCP-14's end-to-end test, both of which run against a real
     // schema. Adding a DB-backed integration harness is not this item's scope.
     //
-    // The same applies to `authoring_authority`: that a delegated account cannot
+    // The same applies to `actor_authority`: that a delegated account cannot
     // write a bare `*` is now enforced by a SQL read of `rmcp_account.is_operator`
     // inside the write's transaction, which is only meaningfully testable against
     // a database. What IS unit-testable — that the flag, and nothing else,

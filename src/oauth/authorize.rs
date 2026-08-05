@@ -1503,7 +1503,13 @@ async fn render_consent(
     // A store failure here must not fall back to rendering an empty (or worse,
     // an assumed-full) capability list: the human would be approving something
     // other than what they were shown.
-    let groups = match state.store.client_tool_groups(request.client_row_id).await {
+    // `client_authorized_groups`, not `client_tool_groups`: the consent screen
+    // must show what this client can ACTUALLY reach, and a group's patterns are
+    // filtered by its owner's CURRENT authority at resolution (RMCP-12). Showing
+    // a pattern that resolves to nothing would overstate the grant the human is
+    // approving — and overstating it is the direction that makes them refuse a
+    // safe connector, or approve while believing a wilder one.
+    let groups = match state.store.client_authorized_groups(request.client_row_id).await {
         Ok(groups) => groups,
         Err(_) => return internal_error(),
     };
@@ -1514,10 +1520,24 @@ async fn render_consent(
 
     let groups: Vec<GroupSummary> = groups
         .into_iter()
-        .map(|g| GroupSummary {
-            name: g.name,
-            description: g.description,
-            patterns: g.patterns,
+        .map(|authorized| {
+            let owner = authorized.owner;
+            let g = authorized.group;
+            GroupSummary {
+                name: g.name,
+                description: g.description,
+                // Same rule as the resolver applies, so the screen and the
+                // dispatch path cannot disagree about this client's reach.
+                patterns: g
+                    .patterns
+                    .into_iter()
+                    .filter(|raw| {
+                        crate::oauth::groups::Pattern::parse_stored(raw).is_some_and(|parsed| {
+                            crate::oauth::delegation::owner_may_hold(owner, parsed.shape())
+                        })
+                    })
+                    .collect(),
+            }
         })
         .collect();
 

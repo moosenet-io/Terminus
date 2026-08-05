@@ -1020,6 +1020,14 @@ rotation emits the OAuth record, alongside every rate-limit refusal, revocation,
 outcome, reuse detection and dispatch denial. Client registration is the one event with no
 call site, and only because RMCP-08 has no handler yet; its record variants already exist.
 
+**Federation delegation (RMCP-12): enforced in the store, not yet reachable from the GUI.**
+Namespace ownership, the `allowed_servers ⊆ owned_namespaces(actor)` rule and the
+`rmcp_server_owner_set` / `rmcp_server_owner_list` tools are live; the Connectors page that
+would let a delegated owner administer their own server in a browser is RMCP-13. Until then a
+delegation is administered by the operator at the tool surface, and the delegated owner's
+*enforcement* — what their connectors may reach — is already in effect. See *Federation
+delegation and server ownership* below for the model.
+
 **Rate limiting: one table, every mounted route.** TERM #633 is closed — RMCP-03's separate
 login limiter is gone, and the login budget now comes from the same per-endpoint table as
 `/oauth/authorize`, `/oauth/consent`, `/oauth/token` and `/oauth/revoke`, inheriting the
@@ -1283,6 +1291,11 @@ intersection something to bound.
   the write it authorizes. A caller states *who* is writing; it never states what they are
   allowed to write. Requires the `S132-rmcp06-account-operator-flag.sql` migration —
   `schema_ready()` reports NOT ready without it.
+- **Who the author is decides more than just `*` (RMCP-12).** A *delegated* author may hold
+  only namespace-qualified patterns, over servers they own; unqualified patterns address the
+  fleet's own local tools and are the operator's. The single account of that model is
+  *Federation delegation and server ownership* below — this bullet is a pointer to it, not a
+  second copy.
 - **And this resolver re-derives it rather than trusting the row.** A write-time check is
   point-in-time, so a stored `*` expands only if its group's owner is an operator *right
   now* and not disabled.
@@ -1313,6 +1326,90 @@ against RMCP-07's matcher — see the status note above.
 `groups::STARTER_GROUPS` seeds a few ordinary, editable groups (`daily briefing`, `home`,
 `media`, `personal records`) built from tool-name prefixes that already exist in the
 registry, so the first connector is usable without hand-authoring. None of them uses `*`.
+
+## Federation delegation and server ownership (RMCP-12)
+
+A friend running their own MCP server behind Tailscale needs to configure who reaches **their**
+server, without being able to touch anyone else's. That is what namespace ownership is: one
+mesh namespace (one federated server) is bound to one account, and the rule everything else
+follows from is
+
+```text
+allowed_servers ⊆ owned_namespaces(actor)
+```
+
+The operator owns every namespace **by default** and holds no row; `rmcp_server_owner` records
+*delegations*. An unowned namespace is therefore the operator's to attach and nobody else's —
+"nobody has claimed this server" never reads as "everyone may reach it".
+
+### What a delegated owner may do
+
+- Create and edit **their own** connector clients, and scope them to servers they own.
+- Author tool groups over servers they own — including `theirserver::*`. Granting their own
+  server wholesale is the ordinary case, not a loophole.
+- List their own clients, groups and delegation. They see no evidence of anyone else's;
+  enumeration is itself a disclosure, so "you have none" and "there are none" read the same.
+
+### What a delegated owner may not do
+
+- **Name a server they do not own** — refused when the pattern is written, not merely
+  filtered later.
+- **Hold any unqualified pattern.** `weather_*` and `pg_stat` address the *local* namespace,
+  which is the fleet's own tools, and no client-side namespace row bounds them — so a
+  delegated account may hold only namespace-qualified patterns. The bare `*` stays
+  operator-only, as it was under RMCP-06.
+- **Sub-delegate.** Delegation does **not** chain: granting and revoking server ownership is
+  operator-only, including revoking a delegation you hold. A chain of delegations is a chain
+  nobody can audit.
+- **Touch another owner's client, group or session**, by any path.
+
+### Revocation is immediate, and it is the read path that makes it so
+
+Revoking a delegation stops authorizing on the **very next call**, not at a cache TTL: every
+resolution re-joins `rmcp_server_owner` and re-reads the owning account's current state, so a
+cleared delegation, a demoted operator or a disabled account all narrow instantly. The
+write-side tidy-up that deletes the now-unjustified client-scoping rows runs in the same
+transaction as the revocation, but it is bookkeeping — if it failed, the rows it left behind
+would already authorize nothing. The same re-derivation is why a demoted operator's stored
+local patterns stop resolving rather than living on in the row that recorded them.
+
+One consequence worth stating: a delegation for a namespace this fleet no longer federates
+with is **stale, not dangerous**. No catalog tool carries that prefix any more, so it grants
+nothing; `rmcp_server_owner_list` reports the row as unconfigured so an operator can find out
+why a connector went quiet.
+
+### Administering it
+
+```sh
+rmcp_server_owner_set   namespace=peerhub account=<account-name>   # grant (or reassign)
+rmcp_server_owner_set   namespace=peerhub revoke=true              # revoke, narrowing clients
+rmcp_server_owner_list                                             # who owns what
+```
+
+Both are operator-only, and the acting operator is resolved from the **deployment**, never
+from an argument: the sole active operator account, or the one named by
+`RMCP_OPERATOR_ACCOUNT` when a fleet has several. With several operators and nothing named,
+the tool refuses rather than picking one — an administrative action attributed to the wrong
+human is worse than one that did not happen. The account is re-verified to be an active
+operator on every use, so a stale configuration cannot preserve authority it has since lost.
+
+Granting is deliberately **not** approval-gated, for the reason RMCP-11 gives for revocation:
+the caller has already been authenticated as the operator by the surface it arrived on, the
+action is bounded to namespaces the operator already controls, both directions are audited,
+and it is undone in one call whose effect lands on the next request.
+
+Every scoping write authorizes through one function, and the store's raw ownership mutators
+are private and take an authorization **proof value** whose only constructor runs the operator
+check — so there is no polite path and impolite path, there is one path. A source-scanning
+test pins the callers, because that is the half a test exercising the authorized path cannot
+observe.
+
+The proof is then **re-verified inside the writing transaction**, under `FOR SHARE` locks, for
+both the acting operator and the grantee. A proof establishes that the check *ran*; it cannot
+establish that it still *holds*, and the gap between them is exactly the moment an operator is
+racing to disable a compromised account. So an operator demoted or disabled after minting a
+proof cannot complete the mutation, and a delegation cannot land on an account disabled in the
+meantime.
 
 ## Quick Start
 

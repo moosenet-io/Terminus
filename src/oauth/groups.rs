@@ -160,6 +160,7 @@ use sqlx::FromRow;
 
 use crate::error::ToolError;
 use crate::mesh::merge::{split_namespaced, MESH_NS_SEP};
+use crate::oauth::delegation::{owner_may_hold, Authoring, PatternShape};
 
 /// The delimiter between a namespace and a tool WITHIN A PATTERN.
 ///
@@ -329,14 +330,42 @@ impl Pattern {
     /// than it appears to.
     pub fn parse(raw: &str, owner: GroupOwner) -> Result<Self, ToolError> {
         let parsed = Self::parse_syntax_checked(raw)?;
-        if parsed == Pattern::Everything && owner != GroupOwner::Operator {
-            return Err(ToolError::InvalidArgument(
-                "the bare `*` pattern is reserved for operator-owned groups; \
-                 name the prefixes or namespaces this group needs instead"
-                    .into(),
-            ));
+        // The SHAPE rule, and the only place it is spelled out for authoring:
+        // `crate::oauth::delegation::owner_may_hold`. RMCP-12 widened it from
+        // "a delegated author may not write `*`" to "a delegated author may
+        // write ONLY namespace-qualified patterns", because an unqualified
+        // pattern addresses the LOCAL namespace — the fleet's own tools — which
+        // no delegated account owns and which no client-side namespace row ever
+        // bounds (`decide` applies the namespace dimension only to namespaced
+        // NAMES). The same function runs again on every resolution, so a demoted
+        // author's stored local patterns stop resolving rather than living on.
+        if !owner_may_hold(owner, parsed.shape()) {
+            return Err(ToolError::InvalidArgument(match parsed.shape() {
+                PatternShape::Everything => "the bare `*` pattern is reserved for \
+                     operator-owned groups; name the namespaces this group needs instead"
+                    .to_string(),
+                _ => "a group owned by a delegated account may contain only \
+                     namespace-qualified patterns (`<server>::*`, `<server>::<prefix>*`, \
+                     `<server>::<tool>`); an unqualified pattern addresses the fleet's own \
+                     tools, which belong to the operator"
+                    .to_string(),
+            }));
         }
         Ok(parsed)
+    }
+
+    /// This pattern reduced to the shape delegation reasons about.
+    ///
+    /// The mapping is exhaustive by construction (no `_` arm), so a pattern
+    /// form added later cannot silently default into the permissive class.
+    pub fn shape(&self) -> PatternShape<'_> {
+        match self {
+            Pattern::Everything => PatternShape::Everything,
+            Pattern::Namespace(namespace)
+            | Pattern::NamespacedPrefix { namespace, .. }
+            | Pattern::NamespacedExact { namespace, .. } => PatternShape::Namespaced(namespace),
+            Pattern::Prefix(_) | Pattern::Exact(_) => PatternShape::Local,
+        }
     }
 
     /// Parse a pattern READ BACK FROM STORAGE: syntax only, no error, and no
@@ -641,12 +670,12 @@ pub fn validate_group(
     name: &str,
     description: &str,
     patterns: &[String],
-    owner: GroupOwner,
+    authoring: &Authoring<'_>,
 ) -> Result<ValidatedGroup, ToolError> {
     Ok(ValidatedGroup {
         name: normalize_group_name(name)?,
         description: normalize_description(description)?,
-        patterns: validate_patterns(patterns, owner)?,
+        patterns: validate_patterns(patterns, authoring)?,
     })
 }
 
@@ -656,7 +685,19 @@ pub fn validate_group(
 /// Split out so an update path does not have to invent a placeholder name to
 /// reach pattern validation: the one thing that must never be skippable is the
 /// parse, so it lives where every write can reach it directly.
-pub fn validate_patterns(patterns: &[String], owner: GroupOwner) -> Result<Vec<Pattern>, ToolError> {
+///
+/// Two authorization questions are asked here, and they are separate on
+/// purpose (RMCP-12): [`Pattern::parse`] asks the SHAPE question, which the
+/// read path re-asks on every resolution, and
+/// [`Authoring::authorize_ownership`] asks the OWNERSHIP question, which only a
+/// write can ask because the answer is a live row that resolution bounds
+/// differently — by the client's own `rmcp_client_server` rows, re-derived per
+/// call.
+pub fn validate_patterns(
+    patterns: &[String],
+    authoring: &Authoring<'_>,
+) -> Result<Vec<Pattern>, ToolError> {
+    let owner = authoring.owner();
     if patterns.len() > MAX_PATTERNS_PER_GROUP {
         return Err(ToolError::InvalidArgument(format!(
             "a group may hold at most {MAX_PATTERNS_PER_GROUP} patterns"
@@ -666,6 +707,7 @@ pub fn validate_patterns(patterns: &[String], owner: GroupOwner) -> Result<Vec<P
     let mut parsed: Vec<Pattern> = Vec::with_capacity(patterns.len());
     for raw in patterns {
         let pattern = Pattern::parse(raw, owner)?;
+        authoring.authorize_ownership(pattern.shape())?;
         // Deduplicated so a group's cost reflects its meaning: a list repeating
         // one pattern fifty times resolves identically and should not cost
         // fifty passes over the catalog.
@@ -887,14 +929,19 @@ pub fn resolve_groups<'a>(
         .flat_map(|authorized| {
             let owner = authorized.owner;
             authorized.group.patterns.iter().filter_map(move |raw| {
-                match Pattern::parse_stored(raw) {
-                    // The revocation check. Not a filter over the RESULT set —
-                    // dropping the pattern is what makes an unauthorized `*`
-                    // resolve to nothing rather than to the catalog minus
-                    // something.
-                    Some(Pattern::Everything) if owner != GroupOwner::Operator => None,
-                    other => other,
-                }
+                // The revocation check. Not a filter over the RESULT set —
+                // dropping the pattern is what makes an unauthorized pattern
+                // resolve to nothing rather than to the catalog minus
+                // something.
+                //
+                // RMCP-12: the rule is now `delegation::owner_may_hold`, the
+                // same function the authoring path calls, so a delegated
+                // owner's stored LOCAL patterns collapse here exactly as a
+                // stale `*` always did. That matters for the demotion case an
+                // authoring check cannot cover: an operator authors `pg_*`, is
+                // later demoted, and their groups must stop reaching the
+                // fleet's own tools on the very next resolution.
+                Pattern::parse_stored(raw).filter(|parsed| owner_may_hold(owner, parsed.shape()))
             })
         })
         .collect();
@@ -1130,13 +1177,13 @@ mod tests {
         assert_eq!(
             resolve_stored(vec![
                 authorized(
-                    stored_group(vec!["*".into(), "weather_*".into()]),
+                    stored_group(vec!["*".into(), "peerhub::*".into()]),
                     GroupOwner::Delegated,
                 ),
                 authorized(stored_group(vec!["news_headlines".into()]), GroupOwner::Operator),
             ]),
-            vec!["news_headlines", "weather_alerts", "weather_get"],
-            "the delegated group keeps its explicit prefix; only its `*` is dropped"
+            vec!["news_headlines", "peerhub__alerts_list", "peerhub__ledger_add"],
+            "the delegated group keeps its namespaced pattern; only its `*` is dropped"
         );
     }
 
@@ -1153,9 +1200,9 @@ mod tests {
 
         let resolved = resolve_stored(vec![
             authorized(stored_group(vec!["*".into()]), GroupOwner::Delegated),
-            authorized(stored_group(vec!["news_*".into()]), GroupOwner::Delegated),
+            authorized(stored_group(vec!["peerhub::alerts_list".into()]), GroupOwner::Delegated),
         ]);
-        assert_eq!(resolved, vec!["news_headlines"], "no wildcard survives here");
+        assert_eq!(resolved, vec!["peerhub__alerts_list"], "no wildcard survives here");
     }
 
     // ── The three accepted shapes ────────────────────────────────────────────
@@ -1659,6 +1706,71 @@ mod tests {
         assert!(!p.matches(&loc("")));
     }
 
+    /// The owned set a delegated author in these tests holds.
+    fn delegated_owns() -> std::collections::BTreeSet<String> {
+        ["peerhub".to_string()].into_iter().collect()
+    }
+
+    /// RMCP-12's authoring rule, at the `groups.rs` entry point: a delegated
+    /// author may write patterns over a server they OWN, and nothing else.
+    #[test]
+    fn a_delegated_author_may_write_only_patterns_over_a_server_they_own() {
+        let owned = delegated_owns();
+        let authoring = Authoring::Delegated { owned: &owned };
+        for allowed in ["peerhub::*", "peerhub::ledger*", "peerhub::ledger_add"] {
+            validate_patterns(&[allowed.to_string()], &authoring)
+                .unwrap_or_else(|e| panic!("{allowed:?} must be authorable: {e}"));
+        }
+        for refused in ["otherpeer::*", "otherpeer::ledger_add"] {
+            assert!(
+                validate_patterns(&[refused.to_string()], &authoring).is_err(),
+                "{refused:?} names a server this author does not own"
+            );
+        }
+    }
+
+    /// The other half, and the one that is a WIDENING if it is missing: an
+    /// unqualified pattern addresses the fleet's own tools.
+    #[test]
+    fn a_delegated_author_may_not_write_an_unqualified_pattern() {
+        let owned = delegated_owns();
+        let authoring = Authoring::Delegated { owned: &owned };
+        for refused in ["weather_*", "weather_get", "*"] {
+            assert!(
+                validate_patterns(&[refused.to_string()], &authoring).is_err(),
+                "{refused:?} must not be authorable by a delegated owner"
+            );
+        }
+        // The operator may write every one of them — the rule SEPARATES the two
+        // authorities rather than refusing everything.
+        for allowed in ["weather_*", "weather_get", "*"] {
+            assert!(validate_patterns(&[allowed.to_string()], &Authoring::Operator).is_ok());
+        }
+    }
+
+    /// A delegated owner's stored LOCAL pattern stops resolving, which is what
+    /// covers the case an authoring check cannot: an operator authored it and
+    /// was later demoted.
+    #[test]
+    fn a_demoted_owners_local_patterns_stop_resolving() {
+        assert_eq!(
+            resolve_stored(vec![authorized(
+                stored_group(vec!["weather_*".into(), "peerhub::*".into()]),
+                GroupOwner::Operator,
+            )]),
+            vec!["peerhub__alerts_list", "peerhub__ledger_add", "weather_alerts", "weather_get"],
+        );
+        // Same rows, same patterns — only the owner's live authority changed.
+        assert_eq!(
+            resolve_stored(vec![authorized(
+                stored_group(vec!["weather_*".into(), "peerhub::*".into()]),
+                GroupOwner::Delegated,
+            )]),
+            vec!["peerhub__alerts_list", "peerhub__ledger_add"],
+            "the local patterns must collapse, and the namespaced one must survive"
+        );
+    }
+
     /// A federation user must not be able to grant themselves the fleet.
     #[test]
     fn bare_star_is_operator_only() {
@@ -1672,7 +1784,8 @@ mod tests {
             "a delegated owner may not grant themselves everything"
         );
         assert!(
-            validate_group("g", "", &["*".to_string()], GroupOwner::Delegated).is_err(),
+            validate_group("g", "", &["*".to_string()], &Authoring::Delegated { owned: &delegated_owns() })
+                .is_err(),
             "the refusal must hold through the group-level entry point too"
         );
     }
@@ -1707,40 +1820,68 @@ mod tests {
 
     #[test]
     fn validation_dedupes_and_bounds_patterns() {
+        // Dedup is the subject; an OPERATOR authors it because RMCP-12 made
+        // unqualified patterns operator-only (see
+        // `a_delegated_author_may_not_write_an_unqualified_pattern`).
         let group = validate_group(
             " media ",
             "  the library  ",
             &["media_*".into(), "media_*".into()],
-            GroupOwner::Delegated,
+            &Authoring::Operator,
         )
         .unwrap();
         assert_eq!(group.name, "media");
         assert_eq!(group.description, "the library");
         assert_eq!(group.rendered_patterns(), vec!["media_*"]);
 
+        // And the same for a delegated author, in the vocabulary they may use.
+        let owned = delegated_owns();
+        let delegated_group = validate_group(
+            "peer media",
+            "",
+            &["peerhub::media_*".into(), "peerhub::media_*".into()],
+            &Authoring::Delegated { owned: &owned },
+        )
+        .unwrap();
+        assert_eq!(delegated_group.rendered_patterns(), vec!["peerhub::media_*"]);
+
         let too_many: Vec<String> = (0..=MAX_PATTERNS_PER_GROUP).map(|i| format!("t{i}_*")).collect();
-        assert!(validate_group("g", "", &too_many, GroupOwner::Operator).is_err());
+        assert!(validate_group("g", "", &too_many, &Authoring::Operator).is_err());
     }
 
     /// An empty group is a legitimate stored state — it just grants nothing.
     #[test]
     fn an_empty_group_is_storable() {
-        let group = validate_group("new", "", &[], GroupOwner::Delegated).unwrap();
+        let owned = delegated_owns();
+        let group =
+            validate_group("new", "", &[], &Authoring::Delegated { owned: &owned }).unwrap();
         assert!(group.patterns.is_empty());
     }
 
     // ── Starter groups ───────────────────────────────────────────────────────
 
-    /// Every seeded group must be storable by a DELEGATED owner — which is the
-    /// check that none of them smuggles in a bare `*`. A later edit that adds
-    /// one fails here rather than seeding full access into a fresh install.
+    /// Every seeded group must be valid, and none may smuggle in a bare `*`. A
+    /// later edit that adds one fails here rather than seeding full access into
+    /// a fresh install.
+    ///
+    /// Authored as an OPERATOR, which is what `seed_starter_groups` verifies its
+    /// target account to be. RMCP-12 is why this is no longer expressed as
+    /// "storable by a delegated owner": the starter groups are local prefixes
+    /// over the FLEET's own tools, which a delegated owner may not hold at all
+    /// now, so that formulation would test the wrong property. The `*` refusal
+    /// it was standing in for is asserted directly below instead.
     #[test]
     fn starter_groups_are_valid_and_never_wildcard() {
         assert!(!STARTER_GROUPS.is_empty());
         for group in STARTER_GROUPS {
             let patterns: Vec<String> = group.patterns.iter().map(|p| (*p).to_string()).collect();
+            assert!(
+                !patterns.iter().any(|p| p.trim() == "*"),
+                "starter group {:?} smuggles in a bare wildcard",
+                group.name
+            );
             let validated =
-                validate_group(group.name, group.description, &patterns, GroupOwner::Delegated)
+                validate_group(group.name, group.description, &patterns, &Authoring::Operator)
                     .unwrap_or_else(|e| panic!("starter group {:?} is invalid: {e}", group.name));
             assert!(!validated.patterns.is_empty(), "a seeded group that grants nothing is noise");
             assert!(!validated.patterns.contains(&Pattern::Everything));
@@ -1777,14 +1918,14 @@ mod tests {
 
         // At the ceiling: still resolves, and still resolves CORRECTLY.
         let ok: Vec<AuthorizedGroup> = (0..MAX_GROUPS_PER_CLIENT)
-            .map(|_| authorized(stored_group(vec!["weather_*".into()]), GroupOwner::Delegated))
+            .map(|_| authorized(stored_group(vec!["weather_*".into()]), GroupOwner::Operator))
             .collect();
         let resolved = resolve_groups(&ok, &cat).expect("exactly at the bound must resolve");
         assert_eq!(names(&resolved), vec!["weather_alerts", "weather_get"]);
 
         // One group past it: refused, and the error says why and by how much.
         let over: Vec<AuthorizedGroup> = (0..MAX_GROUPS_PER_CLIENT + 1)
-            .map(|_| authorized(stored_group(vec!["weather_*".into()]), GroupOwner::Delegated))
+            .map(|_| authorized(stored_group(vec!["weather_*".into()]), GroupOwner::Operator))
             .collect();
         let err = resolve_groups(&over, &cat).unwrap_err().to_string();
         assert!(err.contains(&MAX_GROUPS_PER_CLIENT.to_string()), "names the limit: {err}");
@@ -1796,7 +1937,7 @@ mod tests {
             .map(|_| {
                 let pats: Vec<String> =
                     (0..MAX_RESOLVED_PATTERNS / 3).map(|i| format!("t{i}_*")).collect();
-                authorized(stored_group(pats), GroupOwner::Delegated)
+                authorized(stored_group(pats), GroupOwner::Operator)
             })
             .collect();
         assert!(fat.len() <= MAX_GROUPS_PER_CLIENT, "the group count alone is within bounds");

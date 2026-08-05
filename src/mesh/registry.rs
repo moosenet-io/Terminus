@@ -244,6 +244,21 @@ impl UpstreamRegistry {
         self.upstreams.iter().filter(|u| u.enabled)
     }
 
+    /// Every configured namespace, in registry order.
+    ///
+    /// RMCP-12 reads this to answer one question and only one: is a namespace
+    /// carrying an ownership delegation still a server this fleet federates
+    /// with? It is display metadata, NEVER an authorization input. A delegation
+    /// for a namespace that has been renamed or removed upstream is stale, and
+    /// the fail-closed direction is already automatic — no catalog tool carries
+    /// that prefix any more, so
+    /// [`crate::oauth::scope::decide`]'s namespace check matches nothing.
+    /// Reporting the row as unconfigured is how an operator finds out; it is not
+    /// what makes it harmless.
+    pub fn namespaces(&self) -> impl Iterator<Item = &str> {
+        self.upstreams.iter().map(|u| u.namespace.as_str())
+    }
+
     /// Look up an upstream by its (unique) namespace prefix.
     pub fn by_namespace(&self, namespace: &str) -> Option<&UpstreamServer> {
         self.upstreams.iter().find(|u| u.namespace == namespace)
