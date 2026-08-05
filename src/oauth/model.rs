@@ -452,8 +452,12 @@ fn decode_string_list(row: &SqliteRow, column: &str) -> Result<Vec<String>, sqlx
         // The parse error can quote the offending input, which for these
         // columns is operator-authored pattern text rather than a credential —
         // but the standing rule in this module is that no stored value reaches
-        // an error, so only the shape is reported.
-        source: format!("column `{column}` is not a JSON array of strings ({})", e.classify())
+        // an error, so only the CATEGORY is reported. `serde_json`'s `Category`
+        // is a four-variant enum (Io/Syntax/Data/Eof) carrying no payload from
+        // the input, which is exactly why it is the thing reported and why
+        // `{:?}` on it is safe — `{}` is not even available, since it does not
+        // implement `Display`.
+        source: format!("column `{column}` is not a JSON array of strings ({:?})", e.classify())
             .into(),
     })?;
     if parsed.len() > MAX_STORED_LIST_LEN {
