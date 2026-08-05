@@ -1412,6 +1412,44 @@ impl ClientScopeSource for ScopeResolver {
     }
 }
 
+/// THE way a binary turns its OAuth door into a scope source (TERM #631, item 5).
+///
+/// Before this existed, `terminus_primary` built its gateway state with
+/// `scope_resolver: None` while the door itself was fully mounted: a connector
+/// could authenticate, reach `handle_mcp`, resolve to [`ClientScope::empty`]
+/// and be refused every tool. Fail-closed and therefore not a security hole —
+/// but the feature reached nothing, and no unit test could see it, because
+/// every unit-level piece passed while the assembled process permitted nothing.
+///
+/// ## Why it is a function and not three lines in each `main`
+/// There must be exactly ONE answer to "where does a connector's ceiling come
+/// from", for the same reason [`decide`] is one function with two call sites.
+/// A second binary that grew its own version of this would be one refactor away
+/// from a `unwrap_or_else(|| unrestricted)` that no reviewer of THIS file would
+/// ever see.
+///
+/// ## The three branches, and why each is the safe one
+/// - The door is OFF (`None`): no request can carry a connector at all, so
+///   there is nothing to scope. Not a widening — [`crate::mcp_server`] only
+///   consults a scope when [`crate::oauth::resource::OauthCaller`] bound one.
+/// - The door is ON and owns a store: a real [`ScopeResolver`] over THAT store.
+///   The same handle the door authenticates through, never a second pool.
+/// - The door is ON and owns no store (a door built over a fake
+///   [`crate::oauth::resource::TokenState`]): `None`, which
+///   [`crate::mcp_server`] reads as the EMPTY scope and refuses. There is
+///   deliberately no branch here that opens a store, and none that substitutes
+///   a permissive source: a missing store must never read as permission.
+///
+/// Note what this function does NOT do: it never returns a source that permits
+/// more than the store says, and absence at every level collapses to the empty
+/// set rather than to a default.
+pub fn scope_source_for_door(
+    door: Option<&Arc<crate::oauth::resource::OauthResourceServer>>,
+) -> Option<Arc<dyn ClientScopeSource>> {
+    let store = door?.store()?;
+    Some(Arc::new(ScopeResolver::new(Arc::clone(store))) as Arc<dyn ClientScopeSource>)
+}
+
 /// Resolve the cache TTL, falling back to the default on absent or unparseable
 /// input.
 ///
@@ -2485,5 +2523,131 @@ mod tests {
         assert_eq!(parse(""), DEFAULT_CACHE_TTL_SECS);
         assert_eq!(parse("not-a-number"), DEFAULT_CACHE_TTL_SECS);
         assert_eq!(parse("-1"), DEFAULT_CACHE_TTL_SECS);
+    }
+
+    // ── TERM #631 item 5: the binary's wiring ────────────────────────────
+
+    // pii-test-fixture: an invented signing key, an RFC 6761 `.invalid`
+    // database host that can never resolve, and an RFC 6761 `.test` connector
+    // URI. None of them names a real host, database or credential.
+    const WIRE_KEY: &str = "term631-scope-wiring-test-key-32b!!"; // pii-test-fixture
+    const WIRE_ISSUER: &str = "https://connector.example.test"; // pii-test-fixture
+    const WIRE_RESOURCE: &str = "https://connector.example.test/mcp"; // pii-test-fixture
+    const WIRE_DB_URL: &str = "postgres://<email>/rmcp"; // pii-test-fixture
+
+    fn wire_resource_config() -> crate::oauth::resource::ResourceServerConfig {
+        let signer = crate::oauth::jwt::JwtSigner::new(
+            WIRE_KEY.to_string(),
+            None,
+            WIRE_ISSUER.to_string(),
+            900,
+            30,
+        )
+        .expect("valid signer");
+        crate::oauth::resource::ResourceServerConfig::new(WIRE_RESOURCE, signer)
+            .expect("valid resource-server config")
+    }
+
+    /// A door built the PRODUCTION way, over a pool that is never connected.
+    ///
+    /// `connect_lazy` performs no I/O, so this is hermetic: it stands up the
+    /// real `OauthStore` type over a real `PgPool` handle without a database,
+    /// which is exactly enough to assert the OWNERSHIP arrangement this item
+    /// changed. Nothing here issues a query.
+    fn production_shaped_door() -> Arc<crate::oauth::resource::OauthResourceServer> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy(WIRE_DB_URL)
+            .expect("a well-formed URL yields a lazy pool without connecting");
+        let store = Arc::new(OauthStore::from_pool(pool));
+        Arc::new(crate::oauth::resource::OauthResourceServer::new(
+            wire_resource_config(),
+            store,
+        ))
+    }
+
+    /// THE regression this item exists for: a production-shaped door yields a
+    /// scope source, so a binary that derives its state from the door no longer
+    /// constructs `scope_resolver: None`.
+    ///
+    /// Before TERM #631 item 5 this was impossible to express — the door
+    /// CONSUMED the store, so there was no handle left to build a resolver
+    /// from, and `terminus_primary` hardcoded `None` for exactly that reason.
+    #[test]
+    fn a_production_door_yields_a_scope_source_from_its_own_store() {
+        let door = production_shaped_door();
+        assert!(
+            door.store().is_some(),
+            "the production constructor must KEEP its store handle; without it the \
+             resolver has nothing to read and the connector reaches no tools"
+        );
+        assert!(
+            scope_source_for_door(Some(&door)).is_some(),
+            "a mounted door must produce a scope source"
+        );
+    }
+
+    /// The store is SHARED, not duplicated: the door and the resolver read the
+    /// same handle, so there is one connection budget and one answer to whether
+    /// the database is reachable.
+    #[test]
+    fn the_resolver_shares_the_doors_store_rather_than_opening_a_second_one() {
+        let door = production_shaped_door();
+        let store = door.store().expect("production door owns a store");
+        let before = Arc::strong_count(store);
+        let source = scope_source_for_door(Some(&door)).expect("a source");
+        assert_eq!(
+            Arc::strong_count(door.store().expect("still owns a store")),
+            before + 1,
+            "the resolver must hold a CLONE of the door's handle, not a fresh store"
+        );
+        drop(source);
+    }
+
+    /// Absence is the empty set, in the wiring too.
+    ///
+    /// Neither branch may manufacture a store or substitute a permissive
+    /// source: a closed door has no connector to scope, and a door with no
+    /// store cannot read a ceiling, which `mcp_server` refuses on.
+    #[test]
+    fn a_door_with_no_store_and_no_door_at_all_both_yield_no_source() {
+        assert!(
+            scope_source_for_door(None).is_none(),
+            "a closed door must not fabricate a scope source"
+        );
+
+        struct NeverLive;
+        #[async_trait::async_trait]
+        impl crate::oauth::resource::TokenState for NeverLive {
+            async fn active_client_row(
+                &self,
+                _: &str,
+            ) -> Result<Option<Uuid>, ToolError> {
+                Ok(None)
+            }
+            async fn active_account_name(
+                &self,
+                _: Uuid,
+            ) -> Result<Option<String>, ToolError> {
+                Ok(None)
+            }
+            async fn consent_is_live(&self, _: Uuid, _: Uuid) -> Result<bool, ToolError> {
+                Ok(false)
+            }
+            async fn any_session_is_live(&self, _: Uuid, _: Uuid) -> Result<bool, ToolError> {
+                Ok(false)
+            }
+        }
+
+        let storeless = Arc::new(crate::oauth::resource::OauthResourceServer::with_state(
+            wire_resource_config(),
+            Arc::new(NeverLive),
+        ));
+        assert!(storeless.store().is_none());
+        assert!(
+            scope_source_for_door(Some(&storeless)).is_none(),
+            "a door with no store must yield no source — which reads as the EMPTY scope, \
+             never as an unscoped door"
+        );
     }
 }

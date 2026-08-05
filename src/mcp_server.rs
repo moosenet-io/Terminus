@@ -5018,4 +5018,209 @@ mod tests {
         malformed.insert("authorization", "Basic abc".parse().unwrap());
         assert!(oauth_is_candidate(true, None, &malformed, None, None));
     }
+
+    // ── TERM #631 item 5: the INTEGRATION assertion ──────────────────────
+    //
+    // Why these exist, since every unit-level piece already passed while the
+    // assembled process permitted nothing — which is exactly how the gap
+    // survived five merges without a failing test. Each of the parts below is
+    // separately covered elsewhere: `oauth::scope` proves `decide` and
+    // `ClientScope::from_rows`, `oauth::resource` proves token validation, and
+    // `scope_source_for_door` proves the binary now has a source at all. None
+    // of that answers the only question an operator cares about — does a
+    // connector that authenticates actually REACH a tool.
+    //
+    // So these drive the real axum handler, over a real bearer token this
+    // process would itself have issued, through the real catalog filter and the
+    // real call guard, and assert the reachable tool set on the wire. And the
+    // negative alongside it, because a test that only asserts "non-empty" is
+    // equally satisfied by a door widened until everything gets through.
+    //
+    // What they deliberately do NOT cover: the SQL round trip inside
+    // `ScopeResolver::load`. This crate stands up no Postgres in tests. The
+    // scope source below composes exactly as `load` does — `from_rows` over
+    // group rows and namespace rows, per client — so everything from that
+    // composition outward is real; the two store queries it stands in for are
+    // covered by `oauth::store`'s own tests and by RMCP-14's live run.
+
+    /// The rows an operator's scoping assignment leaves behind for one client.
+    struct ScopedClients {
+        /// `client_id -> (its tool groups, its namespaces)`. A client that is
+        /// ABSENT here is the unscoped case, and — exactly as
+        /// `ScopeResolver::load` does for a client the store does not return —
+        /// resolves to the empty scope rather than to anything else.
+        rows: HashMap<String, (Vec<crate::oauth::model::ToolGroup>, Vec<String>)>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::oauth::scope::ClientScopeSource for ScopedClients {
+        async fn scope_for(&self, client_id: &str) -> Arc<crate::oauth::scope::ClientScope> {
+            // Deliberately the same shape as `ScopeResolver::load`: absence is
+            // `ClientScope::empty`, never a default and never the account's
+            // grant.
+            Arc::new(match self.rows.get(client_id) {
+                Some((groups, namespaces)) => crate::oauth::scope::ClientScope::from_rows(
+                    client_id,
+                    groups,
+                    namespaces.clone(),
+                ),
+                None => crate::oauth::scope::ClientScope::empty(client_id),
+            })
+        }
+    }
+
+    /// A tool group as RMCP-06 stores one.
+    fn scoped_group(name: &str, patterns: &[&str]) -> crate::oauth::model::ToolGroup {
+        crate::oauth::model::ToolGroup {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            description: String::new(),
+            patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
+            owner_account_id: uuid::Uuid::nil(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// A token identical to `oauth_token()` except for the connector it names,
+    /// so the scoped and unscoped cases differ in ONE variable.
+    fn oauth_token_for_client(client_id: &str, jti: &str) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let claims = json!({
+            "iss": OA_ISSUER,
+            "sub": OA_ACCOUNT_ID,
+            "aud": OA_RESOURCE,
+            "client_id": client_id,
+            "scope": "mcp",
+            "jti": jti,
+            "iat": now,
+            "nbf": now - 1,
+            "exp": now + 900,
+        });
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(OA_KEY.as_bytes()),
+        )
+        .expect("mint")
+    }
+
+    /// One state serving BOTH cases below: `OA_CLIENT` is scoped to a group
+    /// matching `health` and to one namespace; `OA_UNSCOPED_CLIENT` has no rows
+    /// at all. Same process, same account grant, same catalog — the connector
+    /// is the only thing that differs.
+    fn state_with_scoped_and_unscoped_clients() -> Arc<McpServerState> {
+        let mut rows = HashMap::new();
+        rows.insert(
+            OA_CLIENT.to_string(),
+            (
+                vec![scoped_group("ops-readonly", &["health"])],
+                vec!["peerhub".to_string()],
+            ),
+        );
+        state_with_oauth_scoped(
+            gateway_allowing("lumina", &["health"]),
+            None,
+            Some(Arc::new(ScopedClients { rows })),
+        )
+    }
+
+    /// A connector with no scoping rows.
+    const OA_UNSCOPED_CLIENT: &str = "client-unscoped";
+
+    /// THE acceptance assertion for TERM #631 item 5: a SCOPED connector
+    /// authenticates and reaches a tool, end to end.
+    ///
+    /// `tools/list` must be non-empty and name the tool, and `tools/call` must
+    /// then succeed on it — list and call agreeing is half the point, since a
+    /// catalog that advertises what a call refuses is its own bug.
+    #[tokio::test]
+    async fn term631_a_scoped_connector_reaches_tools_end_to_end() {
+        let state = state_with_scoped_and_unscoped_clients();
+        let auth = bearer_header(&oauth_token_for_client(OA_CLIENT, "jti-term631-scoped"));
+
+        let (status, listed, _) = post_mcp_to(
+            build_router(Arc::clone(&state)),
+            "/mcp",
+            json!({"jsonrpc": "2.0", "id": 631, "method": "tools/list"}),
+            None,
+            &[("authorization", auth.as_str())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .expect("a tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(
+            !names.is_empty(),
+            "a scoped connector must see a NON-EMPTY catalog; this is the assertion that \
+             the whole item exists for: {listed}"
+        );
+        assert!(
+            names.contains(&"health"),
+            "the catalog must contain the tool the connector's group matches, got {names:?}"
+        );
+
+        let (status, called, _) = post_mcp_to(
+            build_router(state),
+            "/mcp",
+            health_call(632),
+            None,
+            &[("authorization", auth.as_str())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            called["result"]["isError"], false,
+            "a tool the connector was just shown must also be CALLABLE by it: {called}"
+        );
+    }
+
+    /// The control, and the reason the assertion above is worth anything: an
+    /// UNSCOPED connector on the SAME process, with the same account grant and
+    /// the same catalog, still reaches nothing.
+    ///
+    /// Without this, wiring a resolver that returned "everything" would pass
+    /// the test above — which is precisely the widening this sprint's defect
+    /// class produces. Absence of scoping rows is the empty set.
+    #[tokio::test]
+    async fn term631_an_unscoped_connector_still_reaches_nothing() {
+        let state = state_with_scoped_and_unscoped_clients();
+        let auth = bearer_header(&oauth_token_for_client(
+            OA_UNSCOPED_CLIENT,
+            "jti-term631-unscoped",
+        ));
+
+        let (status, listed, _) = post_mcp_to(
+            build_router(Arc::clone(&state)),
+            "/mcp",
+            json!({"jsonrpc": "2.0", "id": 633, "method": "tools/list"}),
+            None,
+            &[("authorization", auth.as_str())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listed["result"]["tools"].as_array().expect("a tools array").len(),
+            0,
+            "an unscoped connector must see an EMPTY catalog: {listed}"
+        );
+
+        let (status, called, _) = post_mcp_to(
+            build_router(state),
+            "/mcp",
+            health_call(634),
+            None,
+            &[("authorization", auth.as_str())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            called["result"]["isError"], true,
+            "an unscoped connector must not be able to CALL what it cannot see — and it \
+             cannot reach it by naming it directly either: {called}"
+        );
+    }
 }

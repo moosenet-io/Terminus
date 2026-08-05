@@ -143,23 +143,24 @@
 //! RMCP-05's check is the wired one, and a second live checker would be the
 //! dual-writer hazard this subsystem has already been bitten by.
 //!
-//! ## ⚠ RISK: an authenticated connector currently reaches NO tools
+//! ## What an authenticated connector reaches
 //!
-//! RMCP-07's scope resolver is not yet wired into `terminus_primary`, which
-//! constructs its state with `scope_resolver: None` (TERM #631, item 5 — and
-//! the binary carries the same note at that field, so the two cannot drift
-//! apart silently). The door authenticates a connector correctly — metadata,
-//! authorize, consent, token, bearer validation, principal minting — and the
-//! intersection it then resolves is the EMPTY set, so no tool is reachable
-//! through it. `handle_mcp` logs a warning when that happens, which is the
-//! fail-closed reading.
+//! `terminus_primary` derives its scope source from the door itself, through
+//! [`scope::scope_source_for_door`] — the door keeps its `OauthStore` handle
+//! and the resolver shares it, so there is one pool and one answer to "is the
+//! door up" (TERM #631, item 5).
 //!
-//! Stated here, in the module every one of those pieces lives in, because the
-//! failure presents as something else entirely: an operator links a connector,
-//! sees it authenticate, finds no tools, and reasonably concludes the connector
-//! is broken or that scoping has failed open somewhere they should go looking.
-//! The truth is duller — the last wire is missing — and it costs nothing to say
-//! so here rather than let it be diagnosed from symptoms.
+//! So a connector reaches exactly the intersection of its account's grant, its
+//! tool groups and its namespaces. That means it still reaches NOTHING until an
+//! operator has actually scoped it: a client with no group rows resolves to
+//! [`scope::ClientScope::empty`], and so does a client on a process whose door
+//! carries no store. Absence is the empty set at every level, never a default.
+//!
+//! Worth saying plainly, because the two cases present identically to an
+//! operator who links a connector and sees no tools: an UNSCOPED client is
+//! working as designed, and only a scoped client seeing nothing is a fault.
+//! `handle_mcp` logs a warning for the second-order case (a connector arriving
+//! at a process with no scope source at all).
 //!
 //! ### Which audit emission points are live, and which are deferred
 //!
