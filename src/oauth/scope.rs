@@ -2554,6 +2554,11 @@ mod tests {
     /// real `OauthStore` type over a real `PgPool` handle without a database,
     /// which is exactly enough to assert the OWNERSHIP arrangement this item
     /// changed. Nothing here issues a query.
+    ///
+    /// It does need a tokio runtime, though — `connect_lazy` builds the pool
+    /// eagerly (only the CONNECTING is deferred) and spawns its idle reaper, so
+    /// its callers below are `#[tokio::test]`. That is a runtime requirement,
+    /// not a network one.
     fn production_shaped_door() -> Arc<crate::oauth::resource::OauthResourceServer> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
@@ -2573,8 +2578,8 @@ mod tests {
     /// Before TERM #631 item 5 this was impossible to express — the door
     /// CONSUMED the store, so there was no handle left to build a resolver
     /// from, and `terminus_primary` hardcoded `None` for exactly that reason.
-    #[test]
-    fn a_production_door_yields_a_scope_source_from_its_own_store() {
+    #[tokio::test]
+    async fn a_production_door_yields_a_scope_source_from_its_own_store() {
         let door = production_shaped_door();
         assert!(
             door.store().is_some(),
@@ -2590,8 +2595,8 @@ mod tests {
     /// The store is SHARED, not duplicated: the door and the resolver read the
     /// same handle, so there is one connection budget and one answer to whether
     /// the database is reachable.
-    #[test]
-    fn the_resolver_shares_the_doors_store_rather_than_opening_a_second_one() {
+    #[tokio::test]
+    async fn the_resolver_shares_the_doors_store_rather_than_opening_a_second_one() {
         let door = production_shaped_door();
         let store = door.store().expect("production door owns a store");
         let before = Arc::strong_count(store);
