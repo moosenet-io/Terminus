@@ -139,11 +139,14 @@ pub fn is_chord_namespaced_unit(unit: &str) -> bool {
 /// filter and then `free_gpu` stopped the always-on backend as the candidate's
 /// own transient unit. Collisions are checked against stop TARGETS, not against
 /// entries.
-pub fn protected_units_from_json(raw: &str) -> std::collections::BTreeSet<String> {
-    let Ok(reg) = serde_json::from_str::<RegFile>(raw) else {
-        return Default::default();
-    };
-    reg.backends
+pub fn protected_units_from_json(raw: &str) -> Option<std::collections::BTreeSet<String>> {
+    // `None` means "cannot know", NOT "nothing is protected". gpt56 (review round
+    // 7) found the fail-open this closes: an earlier version validated the text as
+    // generic JSON and then let a STRICT parse failure here fall through to an
+    // empty set, so `{"backends": null}` — syntactically valid, structurally not —
+    // reported that nothing was protected. Absence is never read as zero.
+    let reg = serde_json::from_str::<RegFile>(raw).ok()?;
+    Some(reg.backends
         .iter()
         .filter(|(_, b)| !may_stop(b.always_on) || is_unmanaged_kind(b.kind.as_deref()))
         .flat_map(|(name, b)| {
@@ -152,7 +155,7 @@ pub fn protected_units_from_json(raw: &str) -> std::collections::BTreeSet<String
                 .into_iter()
                 .chain(std::iter::once(transient_unit(name)))
         })
-        .collect()
+        .collect())
 }
 
 #[derive(Deserialize)]
@@ -192,9 +195,11 @@ struct RegBackend {
 /// nothing. That is the safe direction: without a registry we cannot know what is
 /// safe to stop, and doing nothing never takes a service down.
 pub fn stoppable_gpu_backends_from_json(raw: &str, keep: &str) -> Vec<StoppableGpuBackend> {
-    let Ok(reg) = serde_json::from_str::<RegFile>(raw) else {
-        return Vec::new();
-    };
+    inner(raw, keep).unwrap_or_default()
+}
+
+fn inner(raw: &str, keep: &str) -> Option<Vec<StoppableGpuBackend>> {
+    let reg = serde_json::from_str::<RegFile>(raw).ok()?;
 
     // PROTECTED UNITS: every stop TARGET belonging to a backend this guard refuses
     // to stop — declared and transient alike. No candidate may name one, whatever
@@ -206,9 +211,12 @@ pub fn stoppable_gpu_backends_from_json(raw: &str, keep: &str) -> Vec<StoppableG
     // is a unit-name denylist and neither invents a second source of truth: the
     // protected set is derived from THIS registry, so the rule is just "the
     // registry must be self-consistent".
-    let protected = protected_units_from_json(raw);
+    // A registry we cannot understand yields NO candidates — the same fail-closed
+    // answer as an unreadable one, reached the same way.
+    let protected = protected_units_from_json(raw)?;
 
-    reg.backends
+    let out = reg
+        .backends
         .iter()
         .filter(|(name, b)| {
             name.as_str() != keep
@@ -236,7 +244,8 @@ pub fn stoppable_gpu_backends_from_json(raw: &str, keep: &str) -> Vec<StoppableG
             name: name.clone(),
             unit: b.unit.clone(),
         })
-        .collect()
+        .collect();
+    Some(out)
 }
 
 /// Test-only source scanner backing the ratchet in
@@ -722,13 +731,51 @@ mod tests {
                       "unit":"ollama.service","always_on":true},
             "lemonade":{"url":"http://y","kind":"llama-server","hardware":"gpu",
                         "unit":"lemonade-coder.service","always_on":false}}}"#;
-        let p = protected_units_from_json(raw);
+        let p = protected_units_from_json(raw).expect("a well-formed registry parses");
         assert!(p.contains("ollama.service"), "declared unit: {p:?}");
         assert!(p.contains("chord-ollama.service"), "transient unit: {p:?}");
         assert!(
             !p.contains("lemonade-coder.service") && !p.contains("chord-lemonade.service"),
             "an on-demand backend's units are NOT protected — it must stay \
              evictable: {p:?}"
+        );
+    }
+
+    /// Round-7 (gpt56): "cannot know" must be distinguishable from "nothing is
+    /// protected". A structurally invalid registry is syntactically valid JSON, so
+    /// a generic-JSON pre-check let it through as an empty protected set — which
+    /// reads as permission. Both must be `None`.
+    #[test]
+    fn an_unparseable_registry_reports_cannot_know_not_nothing_protected() {
+        for bad in [
+            "not json",
+            "",
+            r#"{"backends": null}"#,
+            r#"{"backends": {"ollama": null}}"#,
+            r#"{"backends": []}"#,
+        ] {
+            assert!(
+                protected_units_from_json(bad).is_none(),
+                "a registry we cannot understand must report None, not an empty \
+                 set: {bad}"
+            );
+            // ...and it must yield no stop candidates either.
+            assert!(
+                stoppable_gpu_backends_from_json(bad, "llama-gpu").is_empty(),
+                "no candidates from an unreadable registry: {bad}"
+            );
+        }
+
+        // CONTROL: a well-formed registry with nothing to protect is a REAL answer
+        // — `Some(empty)` — not "cannot know". Without this the rule above could be
+        // satisfied by returning None for everything.
+        let no_protected = r#"{"backends":{
+            "llama-gpu":{"url":"http://y","kind":"llama-server","hardware":"gpu",
+                         "always_on":false}}}"#;
+        assert_eq!(
+            protected_units_from_json(no_protected),
+            Some(Default::default()),
+            "a parseable registry with no protected backends is a real, empty answer"
         );
     }
 

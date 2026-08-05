@@ -315,9 +315,11 @@ pub fn protected_units() -> Option<std::collections::BTreeSet<String>> {
     let text = std::fs::read_to_string(registry_path()?).ok()?;
     // A registry that PARSES to no protected units is a real answer (`Some(empty)`);
     // one that could not be read or parsed is NOT, and must not be reported as
-    // "nothing is protected". Absence is never read as zero.
-    serde_json::from_str::<serde_json::Value>(&text).ok()?;
-    Some(gpu_stop_guard::protected_units_from_json(&text))
+    // "nothing is protected". The parse happens ONCE, inside the guard, and its
+    // `None` propagates — an earlier version pre-validated the text as generic JSON
+    // here and let the guard's STRICT parse failure fall through to an empty set,
+    // which was a fail-open (gpt56, review round 7).
+    gpu_stop_guard::protected_units_from_json(&text)
 }
 
 pub fn stoppable_gpu_backends(keep: &str) -> Vec<StoppableGpuBackend> {
