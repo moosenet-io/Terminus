@@ -395,9 +395,12 @@ fn strip_comments_and_normalize(src: &str) -> (String, Vec<usize>) {
             continue;
         }
         if in_ws && !out.is_empty() {
-            // A space after a comma carries no meaning in an argv literal; drop it
-            // so `"systemctl", "stop"` and `"systemctl","stop"` scan identically.
-            if !out.ends_with(',') {
+            // Whitespace adjacent to a comma carries no meaning in an argv literal;
+            // drop it so `"systemctl", "stop"`, `"systemctl","stop"` and
+            // `"systemctl" , "stop"` all scan identically. The last of those was a
+            // live hole (codex, review round 8): only the space AFTER a comma was
+            // dropped, so a space BEFORE one defeated the needle.
+            if !out.ends_with(',') && c != ',' {
                 push(&mut out, &mut map, off, ' ');
             }
         }
@@ -992,6 +995,25 @@ pub async fn ensure_up(b: &B) {
                 vec!["rogue".to_string()],
                 "formatting must not hide a stop site: {argv}"
             );
+        }
+    }
+
+    /// Round-8 (codex): whitespace BEFORE the comma defeated the needle — only the
+    /// space after one was being dropped.
+    #[test]
+    fn whitespace_around_the_comma_cannot_hide_a_stop_site() {
+        for argv in [
+            "[\"systemctl\" , \"stop\", u]",
+            "[\"systemctl\"  ,  \"stop\" , u]",
+            "[\"systemctl\"\n    ,\n    \"stop\", u]",
+        ] {
+            let src = format!("fn rogue() {{\n    let _ = run({argv});\n}}\n");
+            assert_eq!(
+                stop_call_site_owners(&src),
+                vec!["rogue".to_string()],
+                "comma spacing must not hide a stop site: {argv}"
+            );
+            assert_eq!(systemctl_literal_count(&src), 1);
         }
     }
 

@@ -64,7 +64,7 @@ pub async fn ensure_up(backend: &ResolvedBackend, model: &str) -> Result<(), Str
                 .ok_or_else(|| format!("could not resolve GGUF blob for '{model}' under {local}"))?
         };
         let unit_name = transient_unit(&backend.name);
-        stop_unit_unless_protected(&unit_name); // clear any stale unit
+        stop_unit_unless_protected(&unit_name, StopOrigin::Internal); // clear any stale unit
         let mut argv: Vec<String> = vec![
             format!("--unit={unit_name}"),
             "--collect".to_string(),
@@ -158,7 +158,7 @@ pub fn stop(backend: &ResolvedBackend) {
         .unit
         .clone()
         .unwrap_or_else(|| transient_unit(&backend.name));
-    stop_unit_unless_protected(&target);
+    stop_unit_unless_protected(&target, StopOrigin::Caller);
 }
 
 /// **The ONLY place this module issues `systemctl stop`.**
@@ -179,7 +179,17 @@ pub fn stop(backend: &ResolvedBackend) {
 /// independent line, placed at the point of action where it cannot be forgotten.
 /// It re-reads the registry per stop — a few hundred bytes, on a path that is
 /// already spawning `systemctl`, in exchange for the check being unskippable.
-fn stop_unit_unless_protected(unit: &str) {
+/// Where a stop target came from — the only thing that distinguishes a name this
+/// module derived from a backend it verified, from one a caller handed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopOrigin {
+    /// Derived inside this module from an already-verified on-demand backend.
+    Internal,
+    /// Supplied by a caller, whose `always_on`/`kind` claims are unverified.
+    Caller,
+}
+
+fn stop_unit_unless_protected(unit: &str, origin: StopOrigin) {
     match infer::protected_units() {
         Some(protected) => {
             if protected.contains(unit) {
@@ -192,17 +202,29 @@ fn stop_unit_unless_protected(unit: &str) {
             }
         }
         // FAIL CLOSED. No registry ⇒ no way to know whether this unit is the
-        // assistant's engine, so only Chord's OWN namespace may be stopped. An
-        // arbitrary declared unit name could be any system service — which is
-        // exactly the path a caller-supplied `unit: "ollama.service"` took when
-        // this returned an empty set instead of "cannot know" (gpt56, round 6).
+        // assistant's engine (gpt56, round 6). How closed depends on WHERE the
+        // target came from, which is what `origin` records:
+        //
+        // - `Internal` — the target was derived from a backend this module already
+        //   proved is on-demand: `free_gpu`'s guard-approved candidates, and
+        //   `ensure_up`'s stale-transient clear for the backend it is about to
+        //   start (which returned early for always-on/ollama/daemon). Chord's own
+        //   `chord-*` namespace is still stoppable, so teardown keeps working
+        //   without a registry.
+        // - `Caller` — `stop`'s `ResolvedBackend` came from outside and asserts its
+        //   own always_on/kind. With no registry to check it against, NOTHING is
+        //   stopped. Round 8 (codex): the namespace fallback alone let a caller
+        //   name `chord-<always-on-backend>.service` and have it stopped. A caller
+        //   assertion we cannot verify is not a basis for stopping a unit.
         None => {
-            if !gpu_stop_guard::is_chord_namespaced_unit(unit) {
+            let permitted = matches!(origin, StopOrigin::Internal)
+                && gpu_stop_guard::is_chord_namespaced_unit(unit);
+            if !permitted {
                 tracing::warn!(
                     unit = %unit,
-                    "refusing to stop a unit outside chord's own namespace: the \
-                     model registry is unavailable, so protected units cannot be \
-                     determined (CHRD #112)"
+                    origin = ?origin,
+                    "refusing to stop: the model registry is unavailable, so \
+                     protected units cannot be determined (CHRD #112)"
                 );
                 return;
             }
@@ -222,9 +244,9 @@ fn stop_unit_unless_protected(unit: &str) {
 fn free_gpu(keep: &str) {
     for backend in infer::stoppable_gpu_backends(keep) {
         if let Some(unit) = backend.unit() {
-            stop_unit_unless_protected(unit);
+            stop_unit_unless_protected(unit, StopOrigin::Internal);
         }
-        stop_unit_unless_protected(&transient_unit(backend.name()));
+        stop_unit_unless_protected(&transient_unit(backend.name()), StopOrigin::Internal);
     }
 }
 
