@@ -89,7 +89,7 @@ use crate::scribe::graph::vec_embed::EmbedClient;
 use crate::scribe::ScribeConfig;
 use crate::tool::{RustTool, ToolOutput};
 
-pub use aggregate::{aggregate, Finding, ProviderResult};
+pub use aggregate::{aggregate, Finding, Outcome, ProviderResult, Quorum, NO_QUORUM};
 pub use dispatch::ReviewConfig;
 // REVX-13: `claude-fable-5` is a REVIEW/capstone-only provider -- this
 // codebase's review tool never scaffolds, so the enforceable guard here is
@@ -97,7 +97,7 @@ pub use dispatch::ReviewConfig;
 // that DOES dispatch implementer work can assert against it); the
 // authoritative enforcement is the build-pipeline/skill rule (REVX-15).
 pub use effort_policy::is_review_only_provider;
-pub use prompt::{build_docs_prompt, build_prompt, parse_findings, parse_verdict, Role, Structure};
+pub use prompt::{build_docs_prompt, build_prompt, parse_findings, parse_verdict, Role, Structure, Verdict};
 // CXEG-10: the calibration harness needs to name the CXEG-07 lens's result
 // types to read back what it would have flagged. Re-exported rather than
 // widening `consistency` itself to `pub` -- see the `mod consistency;` note
@@ -660,7 +660,11 @@ async fn maybe_escalate(
 fn finalize_escalation(decision: EscalationDecision, results: &[ProviderResult]) -> Value {
     let mut escalation_degraded = decision.escalation_degraded;
     if let Some(provider) = &decision.added_provider {
-        if results.iter().find(|r| &r.provider == provider).map(|r| r.error.is_some()).unwrap_or(true) {
+        // RVXR-02: the escalation is degraded when the added seat did not
+        // VOTE -- not merely when its HTTP call errored. An escalation seat
+        // that replied with prose and no verdict added no lens at all, which
+        // is exactly what "degraded" is meant to tell the operator.
+        if results.iter().find(|r| &r.provider == provider).map(|r| !r.is_voting()).unwrap_or(true) {
             escalation_degraded = true;
         }
     }
@@ -887,24 +891,63 @@ async fn run_one_provider(
             record_dispatch_outcome(&provider, &Ok(()));
             let (verdict, reasoning) = parse_verdict(&text);
             let findings = parse_findings(&text);
+            // RVXR-02: a successful dispatch is NOT automatically a vote. The
+            // model may have produced prose and never committed to a
+            // `VERDICT:` token -- that is `NoVerdict`, and it is non-voting.
+            // This is the S130 shape: transport fine, judgement absent.
+            let outcome = if verdict == Verdict::Unknown {
+                Outcome::NoVerdict
+            } else {
+                Outcome::Voted
+            };
             ProviderResult {
                 provider,
                 verdict: verdict.as_str().to_string(),
                 reasoning,
                 error: None,
+                outcome,
                 findings,
             }
         }
         Err(reason) => {
             record_dispatch_outcome(&provider, &Err(reason.clone()));
+            let outcome = classify_failure(&reason);
             ProviderResult {
                 provider,
                 verdict: "UNKNOWN".to_string(),
                 reasoning: String::new(),
                 error: Some(reason),
+                outcome,
                 findings: Vec::new(),
             }
         }
+    }
+}
+
+/// RVXR-02: markers that identify a dispatch failure as an EVICTION -- the
+/// seat was preempted mid-inference to free VRAM, rather than failing for its
+/// own reasons.
+///
+/// Per the eviction-signal contract agreed with the Chord half (CHRD RVXR-01),
+/// Chord fails a preempted request with HTTP 409 and an error body of type
+/// `model_evicted`. Terminus's dispatch layer folds that into its degrade
+/// string, so matching the marker here is sufficient; the second entry catches
+/// the same condition phrased by an intermediate hop.
+const EVICTION_MARKERS: &[&str] = &["model_evicted", "evicted mid-inference"];
+
+/// Classify a dispatch failure into a non-voting [`Outcome`].
+///
+/// SAFETY NOTE (load-bearing): both arms are non-voting. This function decides
+/// only how a seat's absence is REPORTED, never whether it counts. A wrong
+/// answer here cannot turn a non-vote into a vote in either direction -- which
+/// is precisely why this half does not have to wait on Chord to start emitting
+/// the marker.
+fn classify_failure(reason: &str) -> Outcome {
+    let lower = reason.to_ascii_lowercase();
+    if EVICTION_MARKERS.iter().any(|m| lower.contains(m)) {
+        Outcome::Evicted
+    } else {
+        Outcome::Errored
     }
 }
 
@@ -1289,6 +1332,8 @@ than failing the whole call."
                             verdict: "UNKNOWN".to_string(),
                             reasoning: String::new(),
                             error: Some(format!("unavailable: task join error: {join_err}")),
+                            // RVXR-02: a panicked task produced no judgement.
+                            outcome: Outcome::Errored,
                             findings: Vec::new(),
                         },
                     ));
@@ -1372,6 +1417,10 @@ than failing the whole call."
                 verdict: "ADVISORY".to_string(),
                 reasoning: String::new(),
                 error: None,
+                // RVXR-02: the Tier-C lens is advisory and is NOT a panel seat
+                // -- it never reaches `aggregate`, only the findings recorder.
+                // Marked non-voting so it can never be mistaken for one.
+                outcome: Outcome::NoVerdict,
                 findings: consistency_run
                     .findings
                     .iter()
@@ -1415,11 +1464,30 @@ than failing the whole call."
                 .collect::<Vec<_>>(),
         });
 
+        // RVXR-02: the seat census. "Whatever was available" must be REPORTED,
+        // never silently absorbed -- a gate that ran 2 of 5 seats is not the
+        // gate the caller asked for, and it has to say so. `absent` names each
+        // missing seat and why, so a report can name a dead seat instead of
+        // saying only "the gate passed".
+        let quorum = Quorum::of(&results);
+        let quorum_block = json!({
+            "seated": quorum.seated,
+            "voted": quorum.voted,
+            "evicted": quorum.evicted,
+            "errored": quorum.errored,
+            "no_verdict": quorum.no_verdict,
+            "absent": Quorum::absent_seats(&results)
+                .into_iter()
+                .map(|(provider, outcome)| json!({"provider": provider, "outcome": outcome}))
+                .collect::<Vec<_>>(),
+        });
+
         Ok(json!({
             "structure": args["structure"],
             "providers": results,
             "aggregate_verdict": aggregate_verdict,
             "complete": complete,
+            "quorum": quorum_block,
             "kg_rebuild": kg_rebuild,
             "scribe_docs": scribe_docs,
             "findings_recorded": findings_recorded,
@@ -2192,12 +2260,97 @@ mod tests {
         }
     }
 
+    // ── RVXR-02: failure classification + the no-verdict promotion rule ───
+
+    #[test]
+    fn classify_failure_recognizes_the_contracted_eviction_marker() {
+        // The exact shape the Chord half emits (409 + error type), as folded
+        // into Terminus's degrade string by `dispatch_diffusion`/friends.
+        assert_eq!(
+            classify_failure("unavailable: chord http 409 Conflict: model_evicted"),
+            Outcome::Evicted
+        );
+        // Case-insensitively, since the marker travels through prose.
+        assert_eq!(classify_failure("unavailable: MODEL_EVICTED while streaming"), Outcome::Evicted);
+        assert_eq!(classify_failure("unavailable: evicted mid-inference"), Outcome::Evicted);
+    }
+
+    #[test]
+    fn classify_failure_does_not_call_ordinary_failures_evictions() {
+        for reason in [
+            "unavailable: REVIEW_DAEMON_TOKEN not configured",
+            "unavailable: openrouter http 404: model not found",
+            "unavailable: openrouter http 429 Too Many Requests",
+            "unavailable: chord unreachable: connection refused",
+            "unavailable: task join error: panicked",
+            // Deliberately adjacent wording that is NOT the contracted marker:
+            // a review whose CONTENT discusses eviction must not reclassify
+            // the seat.
+            "unavailable: daemon response missing 'text'",
+        ] {
+            assert_eq!(classify_failure(reason), Outcome::Errored, "{reason}");
+        }
+    }
+
+    /// The safety property that lets the two halves ship independently: BOTH
+    /// classifications are non-voting, so a misclassification in either
+    /// direction cannot promote an absent seat into a vote.
+    #[test]
+    fn every_failure_classification_is_non_voting_whichever_way_it_lands() {
+        assert!(!classify_failure("unavailable: model_evicted").is_voting());
+        assert!(!classify_failure("unavailable: anything else at all").is_voting());
+    }
+
+    #[test]
+    fn verdict_unknown_maps_to_the_non_voting_no_verdict_outcome() {
+        // This is the rule `run_one_provider` applies on the SUCCESS arm: a
+        // reply that parsed to `Verdict::Unknown` produced no judgement.
+        let (verdict, _) = parse_verdict("I read the diff and have opinions.");
+        assert_eq!(verdict, Verdict::Unknown);
+        let outcome = if verdict == Verdict::Unknown { Outcome::NoVerdict } else { Outcome::Voted };
+        assert_eq!(outcome, Outcome::NoVerdict);
+        assert!(!outcome.is_voting());
+
+        // ...and a real verdict on the same arm does vote.
+        let (verdict, _) = parse_verdict("Fine.\nVERDICT: APPROVE");
+        let outcome = if verdict == Verdict::Unknown { Outcome::NoVerdict } else { Outcome::Voted };
+        assert_eq!(outcome, Outcome::Voted);
+        assert!(outcome.is_voting());
+    }
+
+    #[test]
+    fn escalation_is_degraded_when_the_added_seat_replied_without_a_verdict() {
+        let decision = EscalationDecision {
+            escalated: true,
+            added_provider: Some("gpt56".to_string()),
+            band: "high".to_string(),
+            risk_score: Some(8.0),
+            waived: false,
+            waiver: None,
+            escalation_degraded: false,
+            reason: "test".to_string(),
+        };
+        let seat_gave_prose_only = ProviderResult {
+            provider: "gpt56".to_string(),
+            verdict: "UNKNOWN".to_string(),
+            reasoning: "thoughts, no verdict".to_string(),
+            // NOTE: no error -- the dispatch succeeded. The pre-RVXR-02 check
+            // (`error.is_some()`) would have called this escalation healthy.
+            error: None,
+            outcome: Outcome::NoVerdict,
+            findings: Vec::new(),
+        };
+        let out = finalize_escalation(decision, &[seat_gave_prose_only]);
+        assert_eq!(out["escalation_degraded"], json!(true));
+    }
+
     fn provider_with(provider: &str, findings: Vec<Finding>) -> ProviderResult {
         ProviderResult {
             provider: provider.to_string(),
             verdict: "REQUEST_CHANGES".to_string(),
             reasoning: String::new(),
             error: None,
+            outcome: Outcome::Voted,
             findings,
         }
     }

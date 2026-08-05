@@ -34,6 +34,55 @@ pub struct Finding {
     pub subjective: Option<bool>,
 }
 
+/// RVXR-02: what a seat actually CONTRIBUTED to the panel. This is the
+/// distinction the aggregate turns on -- not "did the HTTP call return", which
+/// is what `error.is_none()` answered before.
+///
+/// **The invariant this type exists to enforce: an absent seat is not a vote,
+/// and zero votes is not an approval.** A seat that was evicted mid-inference,
+/// that errored, or that replied without a parseable `VERDICT:` produced NO
+/// judgement. It must not count toward a panel verdict in EITHER direction --
+/// it is neither an approval nor a dissent, and it must not sit in the
+/// denominator of a majority.
+///
+/// **Why `Evicted` and `Errored` are separate variants but behave identically:**
+/// both are non-voting, always. The split is REPORTING only -- an operator
+/// wants to know "the seat was preempted for VRAM" apart from "the seat's auth
+/// is broken", because the remedies differ. Crucially, this means a
+/// MISCLASSIFICATION IN EITHER DIRECTION CANNOT AFFECT A VERDICT: nothing can
+/// promote a non-vote into a vote by being labelled wrong. That is what lets
+/// the eviction marker (produced by Chord, CHRD RVXR-01) land on its own
+/// schedule without this half's safety depending on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    /// The seat returned a real, parseable judgement. The ONLY voting variant.
+    Voted,
+    /// The seat was preempted mid-inference (model evicted to free VRAM).
+    /// Non-voting.
+    Evicted,
+    /// Dispatch failed (unreachable, auth, rate limit, timeout, ...).
+    /// Non-voting.
+    Errored,
+    /// Dispatch SUCCEEDED but the reply carried no parseable `VERDICT:` token.
+    ///
+    /// This is the quiet one, and it is the shape of the S130 failure: the
+    /// transport was fine, so the old `error.is_none()` test called the seat
+    /// "available" and counted it as a whole participant -- inflating the
+    /// majority denominator and, worse, reporting `complete: true` for a panel
+    /// that had a seat which never actually judged anything. Prose without a
+    /// verdict is not a verdict.
+    NoVerdict,
+}
+
+impl Outcome {
+    /// Whether this seat's verdict counts toward the panel. Exactly one
+    /// variant does.
+    pub fn is_voting(self) -> bool {
+        matches!(self, Outcome::Voted)
+    }
+}
+
 /// One provider's outcome, as surfaced in the tool's `providers` output array.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderResult {
@@ -41,6 +90,8 @@ pub struct ProviderResult {
     pub verdict: String,
     pub reasoning: String,
     pub error: Option<String>,
+    /// RVXR-02: this seat's contribution class. See [`Outcome`].
+    pub outcome: Outcome,
     /// KGFIND-02: structured findings parsed from the reply's optional
     /// `FINDINGS_JSON:` block. Empty when absent/malformed/not applicable
     /// (e.g. an errored/degraded provider) -- never affects `verdict`.
@@ -49,26 +100,89 @@ pub struct ProviderResult {
 }
 
 impl ProviderResult {
+    /// Whether the DISPATCH succeeded. Retained for the diagnostic/reporting
+    /// paths that legitimately mean "did the transport work" -- but NOT for
+    /// deciding whether this seat votes. Use [`Self::is_voting`] for that: a
+    /// dispatch can succeed and still produce no judgement (`NoVerdict`).
     pub fn is_available(&self) -> bool {
         self.error.is_none()
     }
+
+    /// RVXR-02: whether this seat's verdict counts toward the panel.
+    pub fn is_voting(&self) -> bool {
+        self.outcome.is_voting()
+    }
 }
+
+/// RVXR-02: the seat census for a run -- how many seats were SEATED versus how
+/// many actually VOTED, and why the rest did not.
+///
+/// This exists because "the gate passed" is an incomplete report when a seat
+/// was absent. Reporting it is the point: on the S130 epic a seat died for
+/// twelve consecutive gates while the aggregate kept reporting verdicts as
+/// though the panel were whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub struct Quorum {
+    /// Seats dispatched (the panel the caller asked for).
+    pub seated: usize,
+    /// Seats that returned a real judgement -- the only ones that voted.
+    pub voted: usize,
+    pub evicted: usize,
+    pub errored: usize,
+    pub no_verdict: usize,
+}
+
+impl Quorum {
+    pub fn of(results: &[ProviderResult]) -> Self {
+        let mut q = Quorum { seated: results.len(), ..Default::default() };
+        for r in results {
+            match r.outcome {
+                Outcome::Voted => q.voted += 1,
+                Outcome::Evicted => q.evicted += 1,
+                Outcome::Errored => q.errored += 1,
+                Outcome::NoVerdict => q.no_verdict += 1,
+            }
+        }
+        q
+    }
+
+    /// Names of the seats that did NOT vote, with why -- so a run can say
+    /// which seats were absent instead of silently absorbing them.
+    pub fn absent_seats(results: &[ProviderResult]) -> Vec<(String, Outcome)> {
+        results
+            .iter()
+            .filter(|r| !r.is_voting())
+            .map(|r| (r.provider.clone(), r.outcome))
+            .collect()
+    }
+}
+
+/// The verdict token reported when NOT ONE seat produced a judgement.
+///
+/// It is deliberately NOT `UNKNOWN` (which historically also meant "a provider
+/// replied but I could not parse it") and emphatically not `APPROVE`. An empty
+/// panel returning APPROVE would gate-pass code that nothing reviewed -- the
+/// worst failure this system can have.
+pub const NO_QUORUM: &str = "NO_QUORUM";
 
 /// Aggregate per-provider results into `(aggregate_verdict, complete)`.
 ///
-/// - `single`: mirrors the one provider's verdict; `complete` iff it's available.
+/// RVXR-02: every structure below counts VOTING seats only ([`Outcome::Voted`]),
+/// and every structure returns [`NO_QUORUM`] with `complete: false` when not one
+/// seat voted. `complete` means "every seated provider voted" -- not "every HTTP
+/// call returned".
+///
+/// - `single`: mirrors the one provider's verdict; `complete` iff it voted.
 /// - `panel_majority`: whichever verdict has strictly more than 50% of the
-///   AVAILABLE (non-errored) providers; ties or no-majority fail safe to
-///   `REQUEST_CHANGES`. `complete` iff every provider was available.
-/// - `panel_unanimous`: `APPROVE` only if ALL available providers said
-///   `APPROVE` (and at least one was available), else `REQUEST_CHANGES`.
-///   `complete` iff every provider was available.
+///   VOTING providers; ties or no-majority fail safe to `REQUEST_CHANGES`.
+/// - `panel_unanimous`: `APPROVE` only if ALL voting providers said `APPROVE`
+///   (and at least one voted), else `REQUEST_CHANGES`.
 /// - `adversarial_pair`: providers\[0\] is "defend", providers\[1\] is "attack".
 ///   Reflects whether defend survived attack's refutation attempt:
 ///     - attack says `REFUTED` -> `REQUEST_CHANGES` (attack succeeded)
 ///     - defend says `REQUEST_CHANGES` -> `REQUEST_CHANGES`
 ///     - otherwise (defend `APPROVE`, attack `NOT_REFUTED`) -> `APPROVE`
-///   `complete` iff both sides were available.
+///   `complete` iff both sides voted.
 pub fn aggregate(structure: Structure, results: &[ProviderResult]) -> (String, bool) {
     match structure {
         Structure::Single => aggregate_single(results),
@@ -86,51 +200,58 @@ pub fn aggregate(structure: Structure, results: &[ProviderResult]) -> (String, b
 
 fn aggregate_single(results: &[ProviderResult]) -> (String, bool) {
     match results.first() {
-        Some(r) if r.is_available() => (r.verdict.clone(), true),
-        _ => ("UNKNOWN".to_string(), false),
+        Some(r) if r.is_voting() => (r.verdict.clone(), true),
+        // Includes the seat that dispatched fine but produced no verdict: one
+        // seat that did not judge is a panel of zero votes.
+        _ => (NO_QUORUM.to_string(), false),
     }
 }
 
 fn aggregate_panel_majority(results: &[ProviderResult]) -> (String, bool) {
-    let available: Vec<&ProviderResult> = results.iter().filter(|r| r.is_available()).collect();
-    let complete = available.len() == results.len();
-    if available.is_empty() {
-        return ("UNKNOWN".to_string(), complete);
+    // RVXR-02: the denominator is VOTING seats, not "seats whose HTTP call
+    // returned". A seat that produced no judgement is not half a vote against
+    // and not a body to divide by -- it simply is not there.
+    let voting: Vec<&ProviderResult> = results.iter().filter(|r| r.is_voting()).collect();
+    let complete = voting.len() == results.len();
+    if voting.is_empty() {
+        // THE invariant. Nothing reviewed this; say so, never APPROVE.
+        return (NO_QUORUM.to_string(), false);
     }
-    let total = available.len();
-    let approve = available.iter().filter(|r| r.verdict == "APPROVE").count();
-    let reject = available.iter().filter(|r| r.verdict == "REQUEST_CHANGES").count();
+    let total = voting.len();
+    let approve = voting.iter().filter(|r| r.verdict == "APPROVE").count();
+    let reject = voting.iter().filter(|r| r.verdict == "REQUEST_CHANGES").count();
     let verdict = if approve * 2 > total {
         "APPROVE"
     } else if reject * 2 > total {
         "REQUEST_CHANGES"
     } else {
-        // No strict majority (tie, or split across UNKNOWN/other tokens) --
-        // fail safe, never rubber-stamp.
+        // No strict majority (a tie) -- fail safe, never rubber-stamp.
         "REQUEST_CHANGES"
     };
     (verdict.to_string(), complete)
 }
 
 fn aggregate_panel_unanimous(results: &[ProviderResult]) -> (String, bool) {
-    let available: Vec<&ProviderResult> = results.iter().filter(|r| r.is_available()).collect();
-    let complete = available.len() == results.len();
-    if available.is_empty() {
-        return ("UNKNOWN".to_string(), complete);
+    let voting: Vec<&ProviderResult> = results.iter().filter(|r| r.is_voting()).collect();
+    let complete = voting.len() == results.len();
+    if voting.is_empty() {
+        return (NO_QUORUM.to_string(), false);
     }
-    let all_approve = available.iter().all(|r| r.verdict == "APPROVE");
+    let all_approve = voting.iter().all(|r| r.verdict == "APPROVE");
     (if all_approve { "APPROVE" } else { "REQUEST_CHANGES" }.to_string(), complete)
 }
 
 fn aggregate_adversarial_pair(results: &[ProviderResult]) -> (String, bool) {
     let defend = results.first();
     let attack = results.get(1);
-    let complete = defend.map(|d| d.is_available()).unwrap_or(false)
-        && attack.map(|a| a.is_available()).unwrap_or(false);
+    let complete = defend.map(|d| d.is_voting()).unwrap_or(false)
+        && attack.map(|a| a.is_voting()).unwrap_or(false);
 
     match (defend, attack) {
-        (Some(d), _) if !d.is_available() => ("UNKNOWN".to_string(), false),
-        (Some(d), Some(a)) if a.is_available() => {
+        // No judgement from the defence at all -- there is nothing to attack
+        // and nothing to approve.
+        (Some(d), _) if !d.is_voting() => (NO_QUORUM.to_string(), false),
+        (Some(d), Some(a)) if a.is_voting() => {
             let verdict = if a.verdict == "REFUTED" {
                 "REQUEST_CHANGES"
             } else if d.verdict == "REQUEST_CHANGES" {
@@ -141,11 +262,12 @@ fn aggregate_adversarial_pair(results: &[ProviderResult]) -> (String, bool) {
             (verdict.to_string(), complete)
         }
         (Some(d), _) => {
-            // Attack side unavailable: best-effort mirror of defend alone,
-            // but never claim completeness.
+            // Attack side did not judge: best-effort mirror of a defence that
+            // DID judge (guaranteed by the guard arm above), but never claim
+            // completeness -- the adversarial half of the structure is absent.
             (d.verdict.clone(), false)
         }
-        (None, _) => ("UNKNOWN".to_string(), false),
+        (None, _) => (NO_QUORUM.to_string(), false),
     }
 }
 
@@ -159,6 +281,7 @@ mod tests {
             verdict: verdict.into(),
             reasoning: "r".into(),
             error: None,
+            outcome: Outcome::Voted,
             findings: Vec::new(),
         }
     }
@@ -169,6 +292,33 @@ mod tests {
             verdict: "UNKNOWN".into(),
             reasoning: String::new(),
             error: Some(reason.into()),
+            outcome: Outcome::Errored,
+            findings: Vec::new(),
+        }
+    }
+
+    /// RVXR-02: a seat preempted mid-inference (Chord evicted the model).
+    fn evicted(provider: &str) -> ProviderResult {
+        ProviderResult {
+            provider: provider.into(),
+            verdict: "UNKNOWN".into(),
+            reasoning: String::new(),
+            error: Some("unavailable: chord http 409: model_evicted".into()),
+            outcome: Outcome::Evicted,
+            findings: Vec::new(),
+        }
+    }
+
+    /// RVXR-02: the quiet failure -- the dispatch SUCCEEDED (no error at all),
+    /// the model produced prose, but there is no parseable `VERDICT:`. Under
+    /// the old `error.is_none()` test this seat counted as a full participant.
+    fn no_verdict(provider: &str) -> ProviderResult {
+        ProviderResult {
+            provider: provider.into(),
+            verdict: "UNKNOWN".into(),
+            reasoning: "I have thoughts but never committed to a verdict.".into(),
+            error: None,
+            outcome: Outcome::NoVerdict,
             findings: Vec::new(),
         }
     }
@@ -184,7 +334,7 @@ mod tests {
     #[test]
     fn single_degrades_when_provider_unavailable() {
         let results = vec![err("opus", "unavailable: timeout")];
-        assert_eq!(aggregate(Structure::Single, &results), ("UNKNOWN".to_string(), false));
+        assert_eq!(aggregate(Structure::Single, &results), (NO_QUORUM.to_string(), false));
     }
 
     // ── panel_majority ───────────────────────────────────────────────────
@@ -220,9 +370,158 @@ mod tests {
     }
 
     #[test]
-    fn panel_majority_all_errored_is_unknown_incomplete() {
+    fn panel_majority_all_errored_is_no_quorum_incomplete() {
         let results = vec![err("opus", "x"), err("codex", "y")];
-        assert_eq!(aggregate(Structure::PanelMajority, &results), ("UNKNOWN".to_string(), false));
+        assert_eq!(aggregate(Structure::PanelMajority, &results), (NO_QUORUM.to_string(), false));
+    }
+
+    // ── RVXR-02: the invariant, stated directly ──────────────────────────
+    //
+    // "An absent seat is not a vote, and zero votes is not an approval."
+    // These are the tests a mutation must not survive.
+
+    /// THE one that matters most: every seat evicted mid-inference. Nothing
+    /// reviewed the code. The run must NOT approve it, under ANY structure.
+    #[test]
+    fn all_seats_evicted_is_never_approve_in_any_structure() {
+        let results = vec![evicted("opus"), evicted("codex"), evicted("agy")];
+        for structure in [
+            Structure::Single,
+            Structure::PanelMajority,
+            Structure::PanelUnanimous,
+            Structure::AdversarialPair,
+            Structure::Epic,
+        ] {
+            let (verdict, complete) = aggregate(structure, &results);
+            assert_ne!(verdict, "APPROVE", "{structure:?} approved an all-evicted panel");
+            assert_eq!(verdict, NO_QUORUM, "{structure:?} must report NO_QUORUM");
+            assert!(!complete, "{structure:?} claimed completeness with zero votes");
+        }
+    }
+
+    /// The mixed-cause version: not one seat produced a judgement, but for
+    /// three different reasons. Still zero votes, still never an approval.
+    #[test]
+    fn no_seat_voted_for_mixed_reasons_is_still_no_quorum() {
+        let results = vec![evicted("opus"), err("codex", "auth"), no_verdict("agy")];
+        for structure in [Structure::PanelMajority, Structure::PanelUnanimous, Structure::Epic] {
+            let (verdict, complete) = aggregate(structure, &results);
+            assert_eq!(verdict, NO_QUORUM, "{structure:?}");
+            assert!(!complete, "{structure:?}");
+        }
+    }
+
+    /// One of three evicted: the majority is computed over the TWO that
+    /// actually voted, not over three. Both voters approved, so 2/2 is a
+    /// majority -- but the panel is NOT complete, because a seat is missing.
+    #[test]
+    fn one_of_three_evicted_computes_majority_over_the_remaining_two() {
+        let results = vec![ok("opus", "APPROVE"), ok("codex", "APPROVE"), evicted("agy")];
+        assert_eq!(
+            aggregate(Structure::PanelMajority, &results),
+            ("APPROVE".to_string(), false),
+            "majority over 2 voters, and never 'complete' with an absent seat"
+        );
+
+        // And the split case: 1-1 among the two voters is a TIE, which fails
+        // safe. If the evicted seat were wrongly counted in the denominator
+        // this would be 1 of 3 either way -- also REQUEST_CHANGES -- so the
+        // discriminating assertion is the census below, not the verdict.
+        let split = vec![ok("opus", "APPROVE"), ok("codex", "REQUEST_CHANGES"), evicted("agy")];
+        assert_eq!(
+            aggregate(Structure::PanelMajority, &split),
+            ("REQUEST_CHANGES".to_string(), false)
+        );
+        let q = Quorum::of(&split);
+        assert_eq!((q.seated, q.voted, q.evicted), (3, 2, 1));
+    }
+
+    /// A lone dissent among voters must still beat an evicted majority: two
+    /// seats gone and the one survivor says REQUEST_CHANGES. If absent seats
+    /// were counted as anything at all, 1-of-3 would lose its majority and the
+    /// dissent would be diluted away.
+    #[test]
+    fn a_single_surviving_dissent_carries_the_panel() {
+        let results = vec![ok("opus", "REQUEST_CHANGES"), evicted("codex"), evicted("agy")];
+        assert_eq!(
+            aggregate(Structure::PanelMajority, &results),
+            ("REQUEST_CHANGES".to_string(), false)
+        );
+    }
+
+    /// The converse, and the sharpest false-pass risk: a lone survivor that
+    /// approves is a majority of ONE. The verdict may be APPROVE -- that is
+    /// the honest reading of the votes cast -- but `complete` MUST be false so
+    /// the gate does not read it as a whole panel.
+    #[test]
+    fn a_lone_surviving_approval_is_never_reported_as_complete() {
+        let results = vec![ok("opus", "APPROVE"), evicted("codex"), evicted("agy")];
+        let (verdict, complete) = aggregate(Structure::PanelMajority, &results);
+        assert_eq!(verdict, "APPROVE");
+        assert!(!complete, "a 1-of-3 panel must never claim completeness");
+    }
+
+    /// The S130 shape: the seat dispatched FINE (no error) but returned prose
+    /// with no verdict. It must not be counted as a participant, and the panel
+    /// must not report itself whole.
+    #[test]
+    fn a_dispatch_that_returned_no_verdict_does_not_count_as_a_seat() {
+        let results = vec![ok("opus", "APPROVE"), ok("codex", "APPROVE"), no_verdict("agy")];
+        let (verdict, complete) = aggregate(Structure::PanelMajority, &results);
+        assert_eq!(verdict, "APPROVE");
+        assert!(
+            !complete,
+            "a seat that replied without a verdict left the panel incomplete, \
+             even though its HTTP call succeeded"
+        );
+        // The seat is NOT errored -- `is_available()` still says the transport
+        // worked. That is exactly why the voting test cannot be `is_available`.
+        assert!(results[2].is_available());
+        assert!(!results[2].is_voting());
+    }
+
+    #[test]
+    fn quorum_census_counts_every_class_and_names_the_absent() {
+        let results = vec![
+            ok("opus", "APPROVE"),
+            evicted("codex"),
+            err("agy", "auth"),
+            no_verdict("free"),
+        ];
+        let q = Quorum::of(&results);
+        assert_eq!(q, Quorum { seated: 4, voted: 1, evicted: 1, errored: 1, no_verdict: 1 });
+
+        let absent = Quorum::absent_seats(&results);
+        assert_eq!(
+            absent,
+            vec![
+                ("codex".to_string(), Outcome::Evicted),
+                ("agy".to_string(), Outcome::Errored),
+                ("free".to_string(), Outcome::NoVerdict),
+            ],
+            "absent seats must be NAMED with a cause, never silently absorbed"
+        );
+    }
+
+    #[test]
+    fn single_seat_that_did_not_vote_is_no_quorum() {
+        assert_eq!(
+            aggregate(Structure::Single, &[evicted("opus")]),
+            (NO_QUORUM.to_string(), false)
+        );
+        assert_eq!(
+            aggregate(Structure::Single, &[no_verdict("opus")]),
+            (NO_QUORUM.to_string(), false)
+        );
+    }
+
+    #[test]
+    fn unanimous_ignores_a_non_voting_seat_but_never_calls_it_complete() {
+        let results = vec![ok("opus", "APPROVE"), ok("codex", "APPROVE"), evicted("agy")];
+        assert_eq!(
+            aggregate(Structure::PanelUnanimous, &results),
+            ("APPROVE".to_string(), false)
+        );
     }
 
     // ── panel_unanimous ──────────────────────────────────────────────────
@@ -277,9 +576,9 @@ mod tests {
     }
 
     #[test]
-    fn adversarial_pair_defend_unavailable_is_unknown_incomplete() {
+    fn adversarial_pair_defend_unavailable_is_no_quorum_incomplete() {
         let results = vec![err("opus", "unavailable: timeout"), ok("codex", "NOT_REFUTED")];
-        assert_eq!(aggregate(Structure::AdversarialPair, &results), ("UNKNOWN".to_string(), false));
+        assert_eq!(aggregate(Structure::AdversarialPair, &results), (NO_QUORUM.to_string(), false));
     }
 
     #[test]
