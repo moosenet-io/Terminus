@@ -774,8 +774,11 @@ mod tests {
     #[tokio::test]
     async fn an_update_that_changes_nothing_is_refused() {
         let tool = RmcpClientUpdate { source: source() };
+        // An actor IS named — otherwise this would be refused for the missing
+        // actor instead, and would stop testing what it claims to.
         let error = tool
             .execute_structured(json!({
+                "actor": "an-operator",
                 "id": "11111111-1111-4111-8111-111111111111",
                 "version": 1
             }))
@@ -783,6 +786,10 @@ mod tests {
             .expect_err("must refuse");
         let message = error.to_string();
         assert!(message.contains("at least one thing to change"), "{message}");
+        assert!(
+            !message.contains("must not be reached"),
+            "an empty edit must be refused before the store is consulted: {message}"
+        );
     }
 
     /// The version is REQUIRED, and its absence is refused before any store
@@ -793,6 +800,7 @@ mod tests {
         let tool = RmcpClientUpdate { source: source() };
         let error = tool
             .execute_structured(json!({
+                "actor": "an-operator",
                 "id": "11111111-1111-4111-8111-111111111111",
                 "enabled": false
             }))
