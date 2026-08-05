@@ -985,6 +985,17 @@ connector that must keep working without sending the user back through authoriza
 `rmcp_client_create` takes a `grant_types` argument for exactly that. The convenience this costs
 is the point: absence must never grant more than was asked for.
 
+**Refusals that never reach a handler are recorded anyway.** An oversized body or an unsupported
+method is rejected by middleware, so the handler that would normally audit it never runs — which
+left the door's most operationally interesting refusal path silently untraced. One layer, applied
+outermost, observes every outcome and records the two statuses no handler can produce (`413` and
+`405`), rather than each early return remembering to emit; the rule that every author must
+remember is the rule some author will not. The record carries the endpoint, the status and this
+process's own byte bound — never the body, which is caller-controlled. A `404` for a path the
+door does not serve is deliberately *not* recorded: attributing a port scan to the fail-closed
+default endpoint would fill the trail with noise, and a trail people learn to ignore is worse
+than a quiet one.
+
 **A registration token is re-checked against its ISSUER's live authority when it is spent**, not
 only when it was minted. An initial access token issued by an operator who is later demoted or
 disabled stops working at its next use, rather than remaining valid until it expires. This is the

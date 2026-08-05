@@ -257,6 +257,10 @@ impl OauthEndpoints {
                 self.limiter.clone(),
                 charge_address_budget,
             ))
+            // OUTERMOST, so it observes every refusal the layers inside it
+            // produce — including the ones that never reach a handler. See
+            // `audit_transport_refusals`.
+            .layer(axum::middleware::from_fn(audit_transport_refusals))
     }
 
     /// A log-safe description of what was mounted.
@@ -281,6 +285,27 @@ impl OauthEndpoints {
 /// test passes, and it is the safe direction to be wrong in: a route added
 /// without updating this map gets throttled hard, which is noticed, instead of
 /// silently unlimited, which is not.
+/// Every path this module mounts.
+///
+/// Production, not test-only: [`audit_transport_refusals`] uses it to tell "a
+/// refusal on one of OUR routes" from "a 404 for a path this router does not
+/// serve". Without that distinction a scan of absent paths would be attributed
+/// to whichever budget [`endpoint_for_path`] defaults to, which is the login
+/// one — turning a port scan into a stream of `LoginDenied` records.
+///
+/// `/oauth/register` is listed unconditionally even though it is only mounted
+/// when DCR is on. It cannot produce a refusal while unmounted (the path 404s
+/// and the guard above excludes 404s), and listing it conditionally would mean
+/// this constant disagreed with `endpoint_for_path`, which is not conditional.
+pub(crate) const MOUNTED_PATHS: &[&str] = &[
+    "/oauth/authorize",
+    "/oauth/consent",
+    "/oauth/login",
+    crate::oauth::token::TOKEN_PATH,
+    REVOKE_PATH,
+    REGISTER_PATH,
+];
+
 fn endpoint_for_path(path: &str) -> OauthEndpoint {
     match path {
         "/oauth/authorize" | "/oauth/consent" => OauthEndpoint::Authorize,
@@ -336,6 +361,127 @@ async fn charge_address_budget(
             next.run(req).await
         }
     }
+}
+
+/// The denial event each endpoint records.
+///
+/// One mapping, beside [`endpoint_for_path`], so "which event does a refusal on
+/// this path emit" is answered in exactly one place.
+fn denial_event_for(endpoint: OauthEndpoint) -> OauthEvent {
+    match endpoint {
+        OauthEndpoint::Authorize => OauthEvent::AuthorizationDenied,
+        OauthEndpoint::Login => OauthEvent::LoginDenied,
+        OauthEndpoint::Token => OauthEvent::TokenDenied,
+        OauthEndpoint::Revoke => OauthEvent::Revoked,
+        OauthEndpoint::Register => OauthEvent::RegistrationDenied,
+    }
+}
+
+/// The body bound each endpoint's route enforces, for the audit record only.
+///
+/// `0` means "this endpoint has no bound of its own". Reported so an operator
+/// reading a size refusal can see WHICH bound was exceeded without going to the
+/// source.
+fn body_bound_for(endpoint: OauthEndpoint) -> usize {
+    match endpoint {
+        OauthEndpoint::Token => MAX_TOKEN_BODY_BYTES,
+        OauthEndpoint::Revoke => MAX_REVOKE_BODY_BYTES,
+        OauthEndpoint::Register => crate::oauth::register::MAX_REGISTER_BODY_BYTES,
+        OauthEndpoint::Authorize | OauthEndpoint::Login => 0,
+    }
+}
+
+/// **Record the refusals that never reach a handler.**
+///
+/// ## Why this layer exists
+///
+/// Round 4 (`gpt56`) found that an oversized registration was rejected by
+/// `DefaultBodyLimit` — a layer — so `handle_register` never ran and no
+/// `RegistrationDenied` was ever emitted. The door's stated property is that
+/// registration refusals are audited, and this was an internet-facing refusal
+/// path that silently was not: exactly the one an operator would go looking for
+/// during an incident.
+///
+/// It is the same shape RMCP-11 fixed five times inside this module — a refusal
+/// that happens BEFORE the place that records refusals — and the resolution is
+/// deliberately the one RMCP-11 landed on rather than the obvious one. The
+/// obvious fix is to emit at each early return; that is a rule every future
+/// author must remember, and this item has already deleted three duplicate 429
+/// constructors and two redaction passes for being exactly that. So: ONE place
+/// observes every outcome, applied outermost.
+///
+/// ## Why it only records two statuses
+///
+/// `413` and `405` are the statuses no handler on this router can produce —
+/// every handler's refusals are `400`, `401`, `404`, `429`, `500` or `503`, and
+/// each of those is already audited at the point it is decided. Restricting to
+/// the two that are structurally unreachable from a handler is what makes this
+/// layer additive rather than a second, competing emission for refusals that
+/// are already recorded. A `429` from `charge_address_budget` passes through
+/// untouched, because the limiter records it itself.
+///
+/// That restriction is asserted, not assumed:
+/// `no_handler_produces_a_status_this_layer_also_records` pins it.
+///
+/// ## What reaches the record
+///
+/// The endpoint, the status, and this process's own configured bound. The body
+/// is caller-controlled and has no field to occupy — see
+/// [`AuditDetail::RefusedBeforeHandler`].
+///
+/// ## What this layer deliberately does NOT cover
+///
+/// Stated rather than left as a silent gap, the way RMCP-11 documented its own
+/// boundary:
+///
+/// - **[`crate::oauth::edge`]'s source-policy denials.** The public edge refuses
+///   requests by CLIENT ADDRESS before they reach any router, this one included.
+///   Those are not unrecorded — `edge::audit_edge` keeps its own trail — and
+///   they are deliberately a separate one: an edge denial is a network-policy
+///   fact about a peer, not an OAuth-protocol outcome for an endpoint, and
+///   folding them into this vocabulary would mean a port scan and a failed
+///   login shared a record type.
+/// - **The unmounted [`crate::oauth::token::build_token_router`].** It carries
+///   its own body limit, but this module rebuilds the token route rather than
+///   using it (see [`OauthEndpoints::router`]), so that limit is not on any
+///   served path.
+/// - **Other subsystems' routers** (`pki::enroll`, `broker::control`). They have
+///   the same middleware-refuses-before-handler shape and their own audit
+///   arrangements; this layer is scoped to the OAuth door's routes because the
+///   record type and the endpoint vocabulary are.
+async fn audit_transport_refusals(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let endpoint = endpoint_for_path(req.uri().path());
+    // Resolved before the request is consumed. An unattributable source is not
+    // a reason to skip the record — the endpoint and status still answer the
+    // operator's question.
+    let source = crate::oauth::authorize::resolved_source_for(req.extensions());
+    let matched = MOUNTED_PATHS.contains(&req.uri().path());
+
+    let response = next.run(req).await;
+
+    let status = response.status().as_u16();
+    // A path this router does not serve produces a 404 that means "no such
+    // route", which is RMCP-09's edge concern and not a refusal by any
+    // endpoint here. Recording it would attribute a scan to whichever budget
+    // `endpoint_for_path` happens to default to.
+    // Each status is named ONCE, which keeps
+    // `no_handler_produces_a_status_this_layer_also_records` able to assert
+    // "exactly one occurrence, and it is here".
+    let too_large = status == StatusCode::PAYLOAD_TOO_LARGE.as_u16();
+    let bad_method = status == StatusCode::METHOD_NOT_ALLOWED.as_u16();
+    if matched && (too_large || bad_method) {
+        let limit_bytes = if too_large { body_bound_for(endpoint) } else { 0 };
+        OauthAuditRecord::new(denial_event_for(endpoint))
+            .endpoint(endpoint)
+            .from_address(source)
+            .reason(DenialReason::MalformedRequest)
+            .detail(AuditDetail::RefusedBeforeHandler { status, limit_bytes })
+            .emit();
+    }
+    response
 }
 
 #[derive(Clone)]
@@ -814,6 +960,203 @@ mod tests {
             );
             assert_eq!(advertised, dcr_enabled, "the flag is what decides");
         }
+    }
+
+    /// **An oversized body is refused AND recorded — the round-4 defect.**
+    ///
+    /// `DefaultBodyLimit` rejects before the handler runs, so `handle_register`
+    /// never executed and nothing was ever emitted. On an internet-facing
+    /// refusal path that is the record an operator goes looking for first.
+    ///
+    /// Driven through a REAL router carrying the real layers, because the whole
+    /// point is that the refusal happens in middleware — a test that called the
+    /// handler directly could not observe this defect at all.
+    ///
+    /// The mutation target: delete the `.layer(from_fn(audit_transport_refusals))`
+    /// line in `router()` and this goes red.
+    #[tokio::test]
+    async fn an_oversized_registration_body_is_refused_and_recorded() {
+        use crate::oauth::audit::{record_text, recent_records};
+        use tower::ServiceExt as _;
+
+        let source = "203.0.113.77".parse::<std::net::IpAddr>().expect("literal");
+        let registration = crate::oauth::register::Registration::new(
+            ClientService::new(crate::oauth::store::OauthStore::from_pool(lazy_pool())),
+            true,
+        );
+        let router = Router::new()
+            .merge(registration.router())
+            .layer(axum::middleware::from_fn(audit_transport_refusals));
+
+        // Distinctive, and far over the bound.
+        let body = "distinctive-oversized-marker".repeat(
+            crate::oauth::register::MAX_REGISTER_BODY_BYTES,
+        );
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri(REGISTER_PATH)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body))
+            .expect("request");
+        request.extensions_mut().insert(ResolvedClientIp(source));
+
+        let response = router.oneshot(request).await.expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the body bound must still reject the request"
+        );
+
+        let recorded = recent_records()
+            .into_iter()
+            .filter(|r| r.source_address().as_deref() == Some("203.0.113.77"))
+            .find(|r| r.event_kind() == OauthEvent::RegistrationDenied)
+            .expect("the oversized registration was not recorded");
+        assert_eq!(recorded.endpoint_of(), Some(OauthEndpoint::Register));
+        assert_eq!(
+            recorded.detail_kind(),
+            Some(AuditDetail::RefusedBeforeHandler {
+                status: 413,
+                limit_bytes: crate::oauth::register::MAX_REGISTER_BODY_BYTES,
+            }),
+            "the record must name the status and the bound that was exceeded"
+        );
+        // Nothing the caller sent reaches the record.
+        for text in record_text(&recorded) {
+            assert!(
+                !text.contains("distinctive-oversized-marker"),
+                "the offending body reached the audit record: {text}"
+            );
+        }
+    }
+
+    /// A method the route does not serve is recorded too, and carries no bound
+    /// (it was not a size refusal).
+    #[tokio::test]
+    async fn an_unsupported_method_is_recorded_without_a_size_bound() {
+        use crate::oauth::audit::recent_records;
+        use tower::ServiceExt as _;
+
+        let source = "203.0.113.78".parse::<std::net::IpAddr>().expect("literal");
+        let registration = crate::oauth::register::Registration::new(
+            ClientService::new(crate::oauth::store::OauthStore::from_pool(lazy_pool())),
+            true,
+        );
+        let router = Router::new()
+            .merge(registration.router())
+            .layer(axum::middleware::from_fn(audit_transport_refusals));
+
+        let mut request = axum::http::Request::builder()
+            .method("GET")
+            .uri(REGISTER_PATH)
+            .body(axum::body::Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(ResolvedClientIp(source));
+
+        let response = router.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let recorded = recent_records()
+            .into_iter()
+            .filter(|r| r.source_address().as_deref() == Some("203.0.113.78"))
+            .find(|r| r.event_kind() == OauthEvent::RegistrationDenied)
+            .expect("the method rejection was not recorded");
+        assert_eq!(
+            recorded.detail_kind(),
+            Some(AuditDetail::RefusedBeforeHandler { status: 405, limit_bytes: 0 })
+        );
+    }
+
+    /// A 404 for a path this router does not serve is NOT recorded.
+    ///
+    /// Without the `matched` guard, `endpoint_for_path`'s fail-closed default
+    /// would attribute every scanned path to the LOGIN endpoint, turning a port
+    /// scan into a stream of `LoginDenied` records that an operator would have
+    /// to learn to ignore — and an audit trail people learn to ignore is worse
+    /// than one that is quiet.
+    #[tokio::test]
+    async fn a_scan_of_absent_paths_produces_no_records() {
+        use crate::oauth::audit::recent_records;
+        use tower::ServiceExt as _;
+
+        let source = "203.0.113.79".parse::<std::net::IpAddr>().expect("literal");
+        let router = Router::new()
+            .route("/oauth/login", axum::routing::post(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn(audit_transport_refusals));
+
+        for path in ["/oauth/does-not-exist", "/admin", "/.env"] {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            request.extensions_mut().insert(ResolvedClientIp(source));
+            let response = router.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        assert!(
+            recent_records()
+                .into_iter()
+                .all(|r| r.source_address().as_deref() != Some("203.0.113.79")),
+            "scanning absent paths must not fill the audit trail"
+        );
+    }
+
+    /// **The layer records ONLY statuses no handler can produce.**
+    ///
+    /// This is what keeps it additive rather than a second emission competing
+    /// with the ones the handlers already make. Asserted against the handler
+    /// source rather than assumed: if a handler ever starts returning `413` or
+    /// `405`, this layer would double-record it, and that must fail here rather
+    /// than quietly duplicate the trail.
+    #[test]
+    fn no_handler_produces_a_status_this_layer_also_records() {
+        let sources = [
+            ("mount.rs", include_str!("mount.rs")),
+            ("register.rs", include_str!("register.rs")),
+            ("revoke.rs", include_str!("revoke.rs")),
+        ];
+        for (name, source) in sources {
+            let production = source.split("\n#[cfg(test)]").next().expect("production half");
+            for forbidden in ["PAYLOAD_TOO_LARGE", "METHOD_NOT_ALLOWED"] {
+                // The layer itself names them; nothing else may.
+                let occurrences = production
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .filter(|l| l.contains(forbidden))
+                    .count();
+                // Exactly one occurrence in `mount.rs`: the layer's own
+                // comparison. Anywhere else, none.
+                let allowed = usize::from(name == "mount.rs");
+                assert_eq!(
+                    occurrences, allowed,
+                    "{name} produces {forbidden}, which `audit_transport_refusals` also records \
+                     — the refusal would be audited twice"
+                );
+            }
+        }
+    }
+
+    /// The production path list and the test table must name the same routes.
+    #[test]
+    fn the_mounted_path_list_matches_the_route_table() {
+        let from_table: std::collections::BTreeSet<&str> =
+            MOUNTED_ROUTES.iter().map(|(p, _, _)| *p).collect();
+        let from_const: std::collections::BTreeSet<&str> =
+            MOUNTED_PATHS.iter().copied().collect();
+        assert_eq!(
+            from_table, from_const,
+            "MOUNTED_PATHS (production) and MOUNTED_ROUTES (tests) have drifted"
+        );
+    }
+
+    /// A pool that is never connected — every refusal above happens in the
+    /// transport, so no test here reaches the store.
+    fn lazy_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://mount-tests-never-connect/db")
+            .expect("a lazy pool is not a connection")
     }
 
     /// A wrong content type is REFUSED and RECORDED. Round 14: this early

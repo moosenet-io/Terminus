@@ -421,6 +421,23 @@ pub enum AuditDetail {
     /// which the endpoint and the count already answer; what the header said
     /// is not worth a channel for arbitrary bytes.
     RefusedBeforeParsing,
+    /// A request was refused by the TRANSPORT, before any handler ran — an
+    /// oversized body, or a method the route does not serve.
+    ///
+    /// This variant exists because those refusals happen in middleware, so the
+    /// handler that would normally record them never executes. Round 4 of
+    /// RMCP-08's review found the registration body limit doing exactly that:
+    /// an oversized registration was rejected by `DefaultBodyLimit` and left no
+    /// trace, on an internet-facing path, which is precisely the refusal an
+    /// operator reaches for during an incident.
+    ///
+    /// Carries two INTEGERS and nothing else: the HTTP status (from the closed
+    /// set the transport can produce here) and the configured byte bound, which
+    /// is this process's own constant. `limit_bytes` is `0` when the refusal was
+    /// not a size refusal. The body that triggered it is caller-controlled and
+    /// deliberately has no field to occupy — the operationally useful facts are
+    /// the endpoint, the status, and the bound that was exceeded.
+    RefusedBeforeHandler { status: u16, limit_bytes: usize },
 
     // ── RMCP-12: delegation ───────────────────────────────────────────────
     /// Server ownership was assigned. `reassigned` distinguishes a fresh grant
@@ -518,6 +535,17 @@ impl AuditDetail {
             AuditDetail::ClientRegistered => "client registered".to_string(),
             AuditDetail::RefusedBeforeParsing => {
                 "request refused before it could be parsed".to_string()
+            }
+            AuditDetail::RefusedBeforeHandler { status, limit_bytes } => {
+                if *limit_bytes > 0 {
+                    format!(
+                        "request refused by the transport before any handler ran                          (status={status}, body bound {limit_bytes} bytes)"
+                    )
+                } else {
+                    format!(
+                        "request refused by the transport before any handler ran (status={status})"
+                    )
+                }
             }
             AuditDetail::DelegationGranted { reassigned, rows_narrowed } => format!(
                 "server ownership granted (reassigned={reassigned}, \

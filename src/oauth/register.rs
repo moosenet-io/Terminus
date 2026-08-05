@@ -63,7 +63,7 @@ use crate::oauth::metadata::REGISTER_PATH;
 /// also what makes "deeply nested JSON" a bounded problem rather than a
 /// recursion one, since 4 KiB cannot express a nesting depth worth worrying
 /// about.
-const MAX_REGISTER_BODY_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_REGISTER_BODY_BYTES: usize = 4 * 1024;
 
 /// Everything `POST /oauth/register` needs.
 #[derive(Clone)]
