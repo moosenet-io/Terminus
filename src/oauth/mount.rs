@@ -29,6 +29,14 @@
 //! | `/oauth/login`, `/oauth/consent` | RMCP-03 | interactive |
 //! | `/oauth/token` | RMCP-04 [`token::build_token_router`] | anthropic |
 //! | `/oauth/revoke` | RMCP-11, here | anthropic |
+//! | `/oauth/register` | RMCP-08 [`register::Registration`] | anthropic |
+//!
+//! `/oauth/register` is the one CONDITIONAL route: it exists only when
+//! `RMCP_OAUTH_DCR_ENABLED` is on, read through
+//! [`crate::oauth::metadata::dcr_enabled_from_env`] — the same call
+//! [`crate::oauth::metadata`] uses to decide whether to advertise
+//! `registration_endpoint`. One read, so the document and the router cannot
+//! disagree about whether the endpoint is there.
 //!
 //! The authorize router is `nest`ed under `/oauth` because its own routes are
 //! written relative (`/authorize`), and its cookie is scoped to `/oauth` — so
@@ -64,7 +72,10 @@ use crate::error::ToolError;
 use crate::oauth::audit::{AuditDetail, DenialReason, OauthAuditRecord, OauthEvent};
 use crate::oauth::authorize::{AuthorizeConfig, AuthorizeState};
 use crate::oauth::edge::ResolvedClientIp;
+use crate::oauth::clients::ClientService;
 use crate::oauth::limits::{throttled_response, OauthEndpoint, OauthRateLimiter};
+use crate::oauth::metadata::REGISTER_PATH;
+use crate::oauth::register::Registration;
 use crate::oauth::revoke::{RevocationRequest, RevocationService, SessionStore};
 use crate::oauth::session::SessionKey;
 use crate::oauth::store::OauthStore;
@@ -97,6 +108,7 @@ pub struct OauthEndpoints {
     authorize: Arc<AuthorizeState>,
     token: Arc<TokenEndpoint>,
     revocation: RevocationService,
+    registration: Registration,
     limiter: Arc<OauthRateLimiter>,
 }
 
@@ -109,7 +121,12 @@ impl OauthEndpoints {
     /// operator who has not set it has not asked for an OAuth door. The signing
     /// key, issuer and resource are then REQUIRED — if the door is being asked
     /// for, a missing signing key is a broken door, not an absent one.
-    pub async fn from_env() -> Result<Option<Self>, ToolError> {
+    /// `dcr_enabled` is PASSED IN for the same reason it is passed into
+    /// [`crate::oauth::metadata::Discovery::from_env`]: whether the endpoint is
+    /// advertised and whether it is served must come from ONE read, not two
+    /// agreeing ones. See that function's doc, and
+    /// `the_dcr_flag_is_read_exactly_once_in_the_tree` below, which enforces it.
+    pub async fn from_env(dcr_enabled: bool) -> Result<Option<Self>, ToolError> {
         // Absence is decided HERE, on the variable itself — never inferred from
         // an error variant.
         //
@@ -165,10 +182,15 @@ impl OauthEndpoints {
             limiter.clone(),
         ));
         let token = Arc::new(TokenEndpoint::from_env(store.clone())?);
+
+        // RMCP-08. The flag arrives as a VALUE from the caller's single read,
+        // so the mounted surface cannot disagree with the advertised one.
+        let registration = Registration::new(ClientService::new(store.clone()), dcr_enabled);
+
         let session_store: Arc<dyn SessionStore> = Arc::new(store);
         let revocation = RevocationService::new(session_store);
 
-        Ok(Some(Self { authorize, token, revocation, limiter }))
+        Ok(Some(Self { authorize, token, revocation, registration, limiter }))
     }
 
     /// Build from already-constructed parts. The tests' door, and the seam a
@@ -177,9 +199,10 @@ impl OauthEndpoints {
         authorize: Arc<AuthorizeState>,
         token: Arc<TokenEndpoint>,
         revocation: RevocationService,
+        registration: Registration,
         limiter: Arc<OauthRateLimiter>,
     ) -> Self {
-        Self { authorize, token, revocation, limiter }
+        Self { authorize, token, revocation, registration, limiter }
     }
 
     /// The router to merge into the process's main router.
@@ -225,6 +248,10 @@ impl OauthEndpoints {
             .nest("/oauth", crate::oauth::authorize::router(self.authorize.clone()))
             .merge(token)
             .merge(revoke)
+            // RMCP-08. Spells its path absolutely, like the token router, so it
+            // is merged rather than nested. EMPTY when DCR is off, which is how
+            // the route comes not to exist rather than to exist-and-refuse.
+            .merge(self.registration.router())
             // The per-address charge, ahead of every handler on this router.
             .route_layer(axum::middleware::from_fn_with_state(
                 self.limiter.clone(),
@@ -236,8 +263,9 @@ impl OauthEndpoints {
     pub fn describe(&self) -> String {
         format!(
             "RMCP OAuth endpoints mounted: /oauth/authorize, /oauth/login, /oauth/consent, \
-             {}, {REVOKE_PATH}",
-            crate::oauth::token::TOKEN_PATH
+             {}, {REVOKE_PATH}; dynamic client registration ({REGISTER_PATH}) {}",
+            crate::oauth::token::TOKEN_PATH,
+            if self.registration.enabled() { "ENABLED" } else { "disabled" }
         )
     }
 }
@@ -259,6 +287,7 @@ fn endpoint_for_path(path: &str) -> OauthEndpoint {
         "/oauth/login" => OauthEndpoint::Login,
         crate::oauth::token::TOKEN_PATH => OauthEndpoint::Token,
         REVOKE_PATH => OauthEndpoint::Revoke,
+        REGISTER_PATH => OauthEndpoint::Register,
         _ => OauthEndpoint::Login,
     }
 }
@@ -556,6 +585,13 @@ mod tests {
         ("/oauth/login", OauthEndpoint::Login, true),
         (crate::oauth::token::TOKEN_PATH, OauthEndpoint::Token, true),
         (REVOKE_PATH, OauthEndpoint::Revoke, true),
+        // RMCP-08. Conditionally mounted (DCR off by default), but
+        // unconditionally covered: the budget map and the charge layer are
+        // keyed on the PATH, so the route must be limited from the moment it
+        // can exist. A conditional route that only gets a budget when someone
+        // remembers to add one is exactly the round-6 defect — a limiter wired
+        // into some of the handlers — with a feature flag in front of it.
+        (REGISTER_PATH, OauthEndpoint::Register, false),
     ];
 
 
@@ -568,6 +604,10 @@ mod tests {
         // these strings; this test pins that this module agrees with both.
         assert_eq!(crate::oauth::token::TOKEN_PATH, "/oauth/token");
         assert_eq!(REVOKE_PATH, "/oauth/revoke");
+        // RMCP-02 owns this one; the advertised `registration_endpoint` is
+        // built from the same constant, so the document and the route agree by
+        // construction rather than by two authors agreeing on a string.
+        assert_eq!(REGISTER_PATH, "/oauth/register");
         // The authorize router is nested under `/oauth`, so its relative routes
         // become the interactive paths the policy classifies.
         for path in ["/oauth/authorize", "/oauth/login", "/oauth/consent"] {
@@ -590,7 +630,7 @@ mod tests {
 
         assert_eq!(
             mounted.len(),
-            5,
+            6,
             "a route was added to or removed from `router()` without updating this table"
         );
         for &(path, endpoint, _) in mounted {
@@ -610,17 +650,170 @@ mod tests {
             );
         }
 
-        // The three endpoint budgets the door actually draws on. `Register` has
-        // no mounted route (RMCP-08 is not merged) and is therefore absent —
-        // stated here so its absence reads as known rather than as another
-        // unwired endpoint.
+        // Every endpoint budget the door draws on. `register` joined the set
+        // with RMCP-08; it is the only conditionally-mounted one, and it is
+        // listed anyway because its budget must exist whether or not this
+        // deployment has DCR switched on.
         let used: std::collections::BTreeSet<&str> =
             mounted.iter().map(|(_, e, _)| e.as_str()).collect();
         assert_eq!(
             used,
-            ["authorize", "login", "revoke", "token"].into_iter().collect(),
+            ["authorize", "login", "register", "revoke", "token"].into_iter().collect(),
             "the mounted surface no longer matches the budgets it draws on"
         );
+    }
+
+    /// **The DCR flag is read exactly ONCE in the whole tree.**
+    ///
+    /// Round 1 (`gpt56`) found the first attempt had centralised the parser and
+    /// not the value: two callers each invoked `dcr_enabled_from_env`, so two
+    /// reads of a mutable process environment decided, independently, whether
+    /// `registration_endpoint` is advertised and whether `/oauth/register` is
+    /// mounted. Agreeing readers are not one read.
+    ///
+    /// The fix is structural — both consumers now take the boolean as an
+    /// argument — and this is what keeps it that way. It walks the crate and
+    /// counts CALLS to the reader outside its own definition and outside test
+    /// code. Exactly one is permitted: the binary's, at startup.
+    ///
+    /// The mutation target: add a second call anywhere (including back inside
+    /// `Discovery::from_env` or `OauthEndpoints::from_env`, which is precisely
+    /// where it was) and this goes red naming the file.
+    #[test]
+    fn the_dcr_flag_is_read_exactly_once_in_the_tree() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        files.sort();
+        assert!(files.len() > 50, "the crate walk found only {} file(s)", files.len());
+
+        let mut callers: Vec<String> = Vec::new();
+        for path in &files {
+            let Ok(source) = std::fs::read_to_string(path) else { continue };
+            // Production halves only: the metadata module's own tests call the
+            // reader directly, deliberately, to prove it still aborts on a
+            // typo now that `Discovery` no longer reaches it.
+            let production = source
+                .split_once("\n#[cfg(test)]")
+                .map(|(before, _)| before)
+                .unwrap_or(&source);
+            let label = path
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            for line in production.lines() {
+                let trimmed = line.trim_start();
+                // Not comments (this doc quotes the name), and not the
+                // definition itself.
+                if trimmed.starts_with("//") || trimmed.starts_with("pub fn dcr_enabled_from_env") {
+                    continue;
+                }
+                if line.contains("dcr_enabled_from_env(") {
+                    callers.push(label.clone());
+                }
+            }
+        }
+
+        assert_eq!(
+            callers.len(),
+            1,
+            "the DCR flag must be read exactly once and its VALUE passed to both the metadata \
+             document and the route mounting. Found {} read(s), in: {:?}. Two reads of a mutable \
+             environment can disagree, and what they decide is whether the endpoint is \
+             ADVERTISED versus whether it is SERVED — the combination this rule exists to \
+             prevent.",
+            callers.len(),
+            callers
+        );
+        assert!(
+            callers[0].contains("bin/"),
+            "the single read belongs at startup in the binary, not in a library module: {:?}",
+            callers[0]
+        );
+    }
+
+    /// **The advertised endpoint and the mounted route are the same fact.**
+    ///
+    /// This is the property RMCP-02 wrote its `registration_endpoint` gate for
+    /// and could not finish alone, because it owns the document and not the
+    /// router. Of the four combinations, two are fine and two are bugs; the
+    /// dangerous one is ADVERTISED-BUT-ABSENT, where a client reads the key as
+    /// a supported path, attempts it, gets a 404 and reports a broken server
+    /// rather than falling back to the pre-registered `client_id` the operator
+    /// already pasted in.
+    ///
+    /// Both sides are derived from one flag here, exactly as they are in
+    /// production (`metadata::dcr_enabled_from_env`), and asserted to move
+    /// together. The mutation target: hardcode either side's flag and one arm
+    /// goes red.
+    #[tokio::test]
+    async fn the_advertised_endpoint_and_the_mounted_route_move_together() {
+        use tower::ServiceExt as _;
+
+        for dcr_enabled in [false, true] {
+            let discovery = crate::oauth::metadata::Discovery::new(
+                crate::oauth::metadata::CanonicalUri::parse(
+                    "TEST_VAR",
+                    "https://connector.test/mcp",
+                )
+                .expect("fixture"),
+                crate::oauth::metadata::CanonicalUri::parse("TEST_VAR", "https://connector.test")
+                    .expect("fixture"),
+                false,
+                vec!["mcp".to_string(), "offline_access".to_string()],
+                "mcp".to_string(),
+                dcr_enabled,
+            )
+            .expect("fixture");
+            let document: serde_json::Value =
+                serde_json::from_str(discovery.authorization_server_json()).expect("json");
+            let advertised = document.get("registration_endpoint").is_some();
+
+            let registration = Registration::new(
+                ClientService::new(crate::oauth::store::OauthStore::from_pool(
+                    sqlx::postgres::PgPoolOptions::new()
+                        .connect_lazy("postgres://mount-tests-never-connect/db")
+                        .expect("a lazy pool is not a connection"),
+                )),
+                dcr_enabled,
+            );
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(REGISTER_PATH)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let status = registration
+                .router()
+                .oneshot(request)
+                .await
+                .expect("response")
+                .status();
+            // 404 means the path is not served. Any other status means it is —
+            // this deliberately does not care WHICH other status, because the
+            // question here is existence, and the refusal shapes are asserted
+            // in `register`'s own tests.
+            let mounted = status != StatusCode::NOT_FOUND;
+
+            assert_eq!(
+                advertised, mounted,
+                "with RMCP_OAUTH_DCR_ENABLED={dcr_enabled}, the metadata document \
+                 {} the registration endpoint while the router {} it",
+                if advertised { "ADVERTISES" } else { "omits" },
+                if mounted { "serves" } else { "does NOT serve" }
+            );
+            assert_eq!(advertised, dcr_enabled, "the flag is what decides");
+        }
     }
 
     /// A wrong content type is REFUSED and RECORDED. Round 14: this early

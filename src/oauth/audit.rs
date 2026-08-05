@@ -447,7 +447,11 @@ pub enum ScopingRefusal {
     NotClientOwner,
     /// One or more requested namespaces are not owned by the actor.
     NamespaceNotOwned,
-    /// The action is operator-only (granting or revoking a delegation).
+    /// The action is operator-only — granting or revoking a delegation
+    /// (RMCP-12), or minting/revoking an initial access token (RMCP-08). One
+    /// variant for one rule: `delegation::authorize_operator_action` is the
+    /// single decision behind every use, so a second code here would imply a
+    /// second rule that does not exist.
     NotOperator,
 }
 

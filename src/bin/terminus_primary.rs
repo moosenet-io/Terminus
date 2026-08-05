@@ -271,7 +271,25 @@ async fn main() {
     // fails at token issuance with a client-side message — "couldn't reach the
     // MCP server" — that names neither the field nor this process. Refusing to
     // start is the only failure mode an operator can act on.
-    let rmcp_discovery = match terminus_rs::oauth::metadata::Discovery::from_env() {
+    // RMCP-08 (review round 1): the DCR flag is read ONCE, here, and the VALUE
+    // is passed to both consumers.
+    //
+    // Round 1 (`gpt56`) found the first attempt had centralised the PARSING and
+    // not the value: `Discovery::from_env` called the reader, and
+    // `OauthEndpoints::from_env` called it again. Two reads of a mutable
+    // process environment can disagree — and the two things they decide are
+    // "is `registration_endpoint` advertised" and "is `/oauth/register`
+    // mounted". Disagreement there is precisely the failure the single-read
+    // rule exists to prevent, so the fix is one read and two arguments, not two
+    // careful readers.
+    let rmcp_dcr_enabled = match terminus_rs::oauth::metadata::dcr_enabled_from_env() {
+        Ok(enabled) => enabled,
+        Err(e) => {
+            tracing::error!("terminus_primary: RMCP OAuth DCR configuration is invalid: {e}");
+            std::process::exit(1);
+        }
+    };
+    let rmcp_discovery = match terminus_rs::oauth::metadata::Discovery::from_env(rmcp_dcr_enabled) {
         Ok(discovery) => discovery,
         Err(e) => {
             tracing::error!("terminus_primary: RMCP OAuth discovery configuration is invalid: {e}");
@@ -297,7 +315,8 @@ async fn main() {
     // sharper version of the same reason: a half-built auth surface that serves
     // `/oauth/authorize` and then fails at `/oauth/token` sends the operator
     // looking at the client, because that is where the error appears.
-    let rmcp_endpoints = match terminus_rs::oauth::mount::OauthEndpoints::from_env().await {
+    let rmcp_endpoints =
+        match terminus_rs::oauth::mount::OauthEndpoints::from_env(rmcp_dcr_enabled).await {
         Ok(Some(endpoints)) => {
             tracing::info!("terminus_primary: {}", endpoints.describe());
             // Registered as a door so RMCP-02's `/mcp` challenge knows an OAuth

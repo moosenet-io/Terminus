@@ -222,6 +222,10 @@
 
 pub mod audit;
 pub mod authorize;
+/// RMCP-08: how a `client_id` comes into existence (operator minting and gated
+/// DCR), and the client lifecycle behind both the tools and the RFC 7591
+/// endpoint.
+pub mod clients;
 pub mod delegation;
 pub mod edge;
 pub mod groups;
@@ -231,6 +235,9 @@ pub mod metadata;
 pub mod model;
 pub mod mount;
 pub mod password;
+/// RMCP-08: the RFC 7591 dynamic client registration endpoint. Off by default,
+/// and never an unauthenticated write when on.
+pub mod register;
 pub mod revoke;
 pub mod router;
 /// RMCP-05: resource-server validation — the half that turns a bearer token

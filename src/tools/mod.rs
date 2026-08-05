@@ -15,6 +15,9 @@ pub mod docgen;
 pub mod rmcp_session;
 /// RMCP-12 (S132): `rmcp_server_owner_set` / `rmcp_server_owner_list` — the
 /// operator's control over which account administers which federated server.
+/// RMCP-08 (S132): `rmcp_client_*` and the initial-access-token tools — the
+/// two ways a connector's `client_id` comes into existence, and its lifecycle.
+pub mod rmcp_client;
 pub mod rmcp_owner;
 pub mod serving_tools;
 
@@ -23,6 +26,7 @@ use crate::registry::ToolRegistry;
 /// Register every tool under `tools/`.
 pub fn register(registry: &mut ToolRegistry) {
     docgen::register(registry);
+    rmcp_client::register(registry);
     rmcp_owner::register(registry);
     rmcp_session::register(registry);
     serving_tools::register(registry);

@@ -319,13 +319,44 @@ pub fn authorize_client_write(
 /// administering their namespace cannot sub-delegate it, because a chain of
 /// delegations is a chain nobody can audit.
 pub fn authorize_delegation_change(actor: &ActorAuthority) -> Result<(), ToolError> {
+    authorize_operator_action(actor, DELEGATION_CHANGE_IS_OPERATOR_ONLY)
+}
+
+/// The refusal [`authorize_delegation_change`] carries.
+pub const DELEGATION_CHANGE_IS_OPERATOR_ONLY: &str =
+    "only an operator account may grant or revoke server ownership";
+
+/// Authorize any OPERATOR-only administrative action.
+///
+/// ## Why this exists (RMCP-08, review round 2)
+///
+/// [`authorize_delegation_change`] was this rule, written for delegation
+/// specifically. RMCP-08 needs the identical rule for its initial-access-token
+/// controls — minting one is what makes gated dynamic client registration
+/// reachable at all, so a delegated account able to mint one could invite
+/// clients into a fleet it does not administer.
+///
+/// Generalised IN PLACE rather than copied. Two functions answering "is this
+/// actor an operator" is exactly the duplicate-rule shape this module exists to
+/// prevent, and the copy would be the one that fails to get updated. So
+/// `authorize_delegation_change` is now a thin call to this, keeping its own
+/// message, and the audit record is unchanged: [`ScopingRefusal::NotOperator`]
+/// already covered "the action is operator-only", so no new vocabulary was
+/// added.
+///
+/// `refusal` is a `&'static str`, never a runtime string. It names the ACTION
+/// for the operator reading the error; it cannot carry anything a caller
+/// submitted, and it does not reach the audit record at all — that stays the
+/// closed enum, with no free text, as everywhere else in this module.
+pub fn authorize_operator_action(
+    actor: &ActorAuthority,
+    refusal_message: &'static str,
+) -> Result<(), ToolError> {
     if actor.is_operator {
         return Ok(());
     }
     refusal(actor, ScopingRefusal::NotOperator);
-    Err(ToolError::InvalidArgument(
-        "only an operator account may grant or revoke server ownership".into(),
-    ))
+    Err(ToolError::InvalidArgument(refusal_message.into()))
 }
 
 /// Re-verify a delegation proof against the actor's LIVE authority, read inside

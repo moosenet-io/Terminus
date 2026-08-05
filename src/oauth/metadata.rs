@@ -361,7 +361,17 @@ impl Discovery {
     /// fatal at startup (see `src/bin/terminus_primary.rs`), because a
     /// half-configured discovery surface fails at the client with a message
     /// that names nothing.
-    pub fn from_env() -> Result<Option<Self>, ToolError> {
+    /// `dcr_enabled` is PASSED IN, not read here.
+    ///
+    /// Round 1 (`gpt56`) found this function calling
+    /// [`dcr_enabled_from_env`] while [`crate::oauth::mount::OauthEndpoints::from_env`]
+    /// called it too — one parser, but two reads of a mutable process
+    /// environment, which can disagree. What they decide is whether
+    /// `registration_endpoint` is ADVERTISED and whether `/oauth/register` is
+    /// MOUNTED, and the dangerous combination (advertised, not mounted) is
+    /// exactly what a single read exists to rule out. So the caller reads it
+    /// once and hands the same boolean to both.
+    pub fn from_env(dcr_enabled: bool) -> Result<Option<Self>, ToolError> {
         let Some(raw_resource) = read_env(CANONICAL_RESOURCE_ENV)? else {
             // The door is not configured. Before accepting that, check that the
             // operator did not configure the REST of it and miss this one — a
@@ -426,7 +436,6 @@ impl Discovery {
             None => DEFAULT_REQUIRED_SCOPE.to_string(),
         };
 
-        let dcr_enabled = read_flag(DCR_ENABLED_ENV)?;
         let issuer_externally_served = read_flag(ISSUER_EXTERNALLY_SERVED_ENV)?;
 
         Self::new(
@@ -568,14 +577,18 @@ impl Discovery {
             "authorization_endpoint": format!("{}{AUTHORIZE_PATH}", issuer.as_str()),
             "token_endpoint": format!("{}{TOKEN_PATH}", issuer.as_str()),
             "scopes_supported": scopes_supported.clone(),
-            "response_types_supported": ["code"],
+            "response_types_supported": crate::oauth::clients::SUPPORTED_RESPONSE_TYPES,
             "response_modes_supported": ["query"],
             // No implicit grant and no password grant: OAuth 2.1 removed both,
             // and this list is the only thing telling a client what to try.
-            "grant_types_supported": ["authorization_code", "refresh_token"],
-            "token_endpoint_auth_methods_supported": [
-                "none", "client_secret_post", "client_secret_basic"
-            ],
+            // RMCP-08's list, not a second copy of it: registration validates
+            // against exactly what is advertised here, so a client cannot be
+            // registered for a grant this document never offered and cannot be
+            // refused one it did.
+            "grant_types_supported": crate::oauth::clients::SUPPORTED_GRANT_TYPES,
+            // Likewise shared with RMCP-08's registration validation.
+            "token_endpoint_auth_methods_supported":
+                crate::oauth::clients::SUPPORTED_AUTH_METHODS,
             // Exactly `["S256"]`. `plain` is not merely weaker, it is a
             // downgrade target: a client that sees it offered may use it, and
             // PKCE with `plain` protects against nothing an attacker who can
@@ -1008,6 +1021,26 @@ const FALSE_FORMS: &[&str] = &["0", "false", "no", "off"];
 /// enforces is about values that are PUBLISHED and COMPARED, not about every
 /// string it reads. Trimming is not the same as guessing: a trimmed value still
 /// has to be one of the accepted spellings.
+/// Whether dynamic client registration is enabled, read from the environment.
+///
+/// **The single read of [`DCR_ENABLED_ENV`] in the crate.** Two things depend
+/// on this flag and they must never disagree: this module advertises
+/// `registration_endpoint` when it is on, and [`crate::oauth::mount`] mounts
+/// [`crate::oauth::register`]'s route when it is on. A deployment advertising an
+/// endpoint nothing serves is the worst of the four combinations — the client
+/// takes the key as a supported path, attempts it, and reports the 404 as a
+/// broken server rather than falling back to the pre-registered `client_id` the
+/// operator already pasted in.
+///
+/// Sharing one function rather than one variable name is what makes that
+/// impossible to get wrong: the parsing, the accepted spellings and the
+/// hard-error-on-a-typo behaviour are all decided here, once, so a second
+/// caller cannot read `RMCP_OAUTH_DCR_ENABLED=ture` as "off" while this one
+/// aborts on it.
+pub fn dcr_enabled_from_env() -> Result<bool, ToolError> {
+    read_flag(DCR_ENABLED_ENV)
+}
+
 fn read_flag(var: &str) -> Result<bool, ToolError> {
     let Some(raw) = read_env(var)? else {
         return Ok(false);
@@ -1270,7 +1303,7 @@ mod tests {
         // SAFETY-BY-CONVENTION: serialized against every other env-mutating
         // test in the crate by `#[serial]`; cleared on every exit path below.
         std::env::set_var(CANONICAL_RESOURCE_ENV, "https://connector.test/mcp ");
-        let untrimmed = Discovery::from_env();
+        let untrimmed = Discovery::from_env(false);
         std::env::remove_var(CANONICAL_RESOURCE_ENV);
         let err = untrimmed.expect_err("a trailing space must not reach a document");
         assert!(err.to_string().contains("whitespace"), "{err}");
@@ -1278,7 +1311,7 @@ mod tests {
         // Control: the same value without the space builds, so the test above
         // is demonstrating the whitespace rule and not some unrelated refusal.
         std::env::set_var(CANONICAL_RESOURCE_ENV, "https://connector.test/mcp");
-        let clean = Discovery::from_env();
+        let clean = Discovery::from_env(false);
         std::env::remove_var(CANONICAL_RESOURCE_ENV);
         let discovery = clean
             .expect("a clean value must build")
@@ -1291,7 +1324,7 @@ mod tests {
         // `auth_token` that restores the open `/mcp` posture round 2 closed. A
         // fail-open reachable by an invisible character. It must ABORT.
         std::env::set_var(CANONICAL_RESOURCE_ENV, "   ");
-        let whitespace = Discovery::from_env();
+        let whitespace = Discovery::from_env(false);
         std::env::remove_var(CANONICAL_RESOURCE_ENV);
         let err = whitespace.expect_err("whitespace must abort, never disable the door");
         assert!(err.to_string().contains("whitespace"), "{err}");
@@ -1302,7 +1335,7 @@ mod tests {
         // aborting on it would fail to boot every deployment that materializes
         // the full template.
         std::env::set_var(CANONICAL_RESOURCE_ENV, "");
-        let empty = Discovery::from_env();
+        let empty = Discovery::from_env(false);
         std::env::remove_var(CANONICAL_RESOURCE_ENV);
         assert!(
             matches!(empty, Ok(None)),
@@ -1311,7 +1344,7 @@ mod tests {
 
         // And unset is the same as empty.
         std::env::remove_var(CANONICAL_RESOURCE_ENV);
-        assert!(matches!(Discovery::from_env(), Ok(None)));
+        assert!(matches!(Discovery::from_env(false), Ok(None)));
     }
 
     /// REVIEW ROUND 6, and the third member of the same family. A CONFIGURED
@@ -1333,7 +1366,7 @@ mod tests {
             CANONICAL_RESOURCE_ENV,
             OsString::from_vec(vec![b'h', b't', b't', b'p', 0x80]),
         );
-        let result = Discovery::from_env();
+        let result = Discovery::from_env(false);
         std::env::remove_var(CANONICAL_RESOURCE_ENV);
 
         let err = result.expect_err("a non-UTF-8 value must abort, never disable the door");
@@ -1352,28 +1385,41 @@ mod tests {
     #[test]
     #[serial]
     fn an_unrecognised_boolean_aborts_rather_than_defaulting_to_false() {
+        // `ISSUER_EXTERNALLY_SERVED_ENV` is still read inside `from_env`.
         let with = |var: &str, value: &str| {
             std::env::set_var(CANONICAL_RESOURCE_ENV, "https://connector.test/mcp");
             std::env::set_var(var, value);
-            let result = Discovery::from_env();
+            let result = Discovery::from_env(false);
             std::env::remove_var(var);
             std::env::remove_var(CANONICAL_RESOURCE_ENV);
             result
         };
 
-        // Both flags, because both are reached through the same reader and a
-        // regression in either is the same class of defect.
-        for var in [DCR_ENABLED_ENV, ISSUER_EXTERNALLY_SERVED_ENV] {
-            for garbage in ["garbage", "ture", "enabled", "2", "yes please", "-1"] {
-                assert!(
-                    with(var, garbage).is_err(),
-                    "{var}={garbage:?} must abort, not quietly read as false"
-                );
-            }
+        // `DCR_ENABLED_ENV` is read by the binary now (RMCP-08 review round 1:
+        // one read, passed as a value to both consumers), so its arm exercises
+        // the reader DIRECTLY. The property under test is unchanged — an
+        // unrecognised boolean aborts rather than silently choosing a posture —
+        // and moving the call site must not quietly drop it.
+        let with_dcr = |value: &str| {
+            std::env::set_var(DCR_ENABLED_ENV, value);
+            let result = dcr_enabled_from_env();
+            std::env::remove_var(DCR_ENABLED_ENV);
+            result
+        };
+
+        for garbage in ["garbage", "ture", "enabled", "2", "yes please", "-1"] {
+            assert!(
+                with(ISSUER_EXTERNALLY_SERVED_ENV, garbage).is_err(),
+                "{ISSUER_EXTERNALLY_SERVED_ENV}={garbage:?} must abort, not quietly read as false"
+            );
+            assert!(
+                with_dcr(garbage).is_err(),
+                "{DCR_ENABLED_ENV}={garbage:?} must abort, not quietly read as false"
+            );
         }
 
         // And the refusal must name the variable, so an operator can act on it.
-        let err = with(DCR_ENABLED_ENV, "ture").expect_err("a typo must abort");
+        let err = with_dcr("ture").expect_err("a typo must abort");
         let message = err.to_string();
         assert!(message.contains(DCR_ENABLED_ENV), "{message}");
         assert!(message.contains("ture"), "the error must show what was read: {message}");
@@ -1394,23 +1440,31 @@ mod tests {
             ("No", false),
             ("OFF", false),
         ] {
-            let discovery = with(DCR_ENABLED_ENV, value)
-                .unwrap_or_else(|e| panic!("{value:?} must be accepted: {e}"))
-                .expect("the door is enabled in this fixture");
-            assert_eq!(discovery.dcr_enabled(), expected, "for {value:?}");
+            assert_eq!(
+                with_dcr(value).unwrap_or_else(|e| panic!("{value:?} must be accepted: {e}")),
+                expected,
+                "for {value:?}"
+            );
         }
 
         // And ABSENT still means off, without an error — the other half of the
         // one rule.
-        std::env::set_var(CANONICAL_RESOURCE_ENV, "https://connector.test/mcp");
         std::env::remove_var(DCR_ENABLED_ENV);
-        let unset = Discovery::from_env();
+        let unset = dcr_enabled_from_env();
         std::env::set_var(DCR_ENABLED_ENV, "");
-        let empty = Discovery::from_env();
+        let empty = dcr_enabled_from_env();
         std::env::remove_var(DCR_ENABLED_ENV);
+        assert!(!unset.expect("unset is fine"));
+        assert!(!empty.expect("empty is fine"));
+
+        // The value the caller passes is what the document reflects — the
+        // other half of "one read, two consumers".
+        std::env::set_var(CANONICAL_RESOURCE_ENV, "https://connector.test/mcp");
+        let on = Discovery::from_env(true);
+        let off = Discovery::from_env(false);
         std::env::remove_var(CANONICAL_RESOURCE_ENV);
-        assert!(!unset.expect("unset is fine").expect("enabled").dcr_enabled());
-        assert!(!empty.expect("empty is fine").expect("enabled").dcr_enabled());
+        assert!(on.expect("builds").expect("enabled").dcr_enabled());
+        assert!(!off.expect("builds").expect("enabled").dcr_enabled());
     }
 
     /// The other route to the same fail-open: the operator configured the
@@ -1422,7 +1476,7 @@ mod tests {
     fn a_half_configured_door_is_refused_rather_than_disabled() {
         std::env::remove_var(CANONICAL_RESOURCE_ENV);
         std::env::set_var(REQUIRED_SCOPE_ENV, "mcp");
-        let orphaned = Discovery::from_env();
+        let orphaned = Discovery::from_env(false);
         std::env::remove_var(REQUIRED_SCOPE_ENV);
         let err = orphaned.expect_err("a partly-configured door must not read as 'off'");
         assert!(err.to_string().contains(CANONICAL_RESOURCE_ENV), "{err}");
@@ -1433,7 +1487,7 @@ mod tests {
         // must not force the discovery door on.
         std::env::remove_var(CANONICAL_RESOURCE_ENV);
         std::env::set_var(ISSUER_ENV, "https://connector.test");
-        let issuer_only = Discovery::from_env();
+        let issuer_only = Discovery::from_env(false);
         std::env::remove_var(ISSUER_ENV);
         assert!(
             matches!(issuer_only, Ok(None)),

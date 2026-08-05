@@ -945,6 +945,100 @@ decrypt. That is a deliberate fail-closed gate, not a fault — RMCP-08 provisio
 Clearing `totp_secret_enc` to work around it would silently downgrade the account to one
 factor and must not be done.
 
+#### Where a `client_id` comes from — operator minting, and gated DCR
+
+There are exactly two ways a connector comes into existence, and the default posture is the
+one that answers *"only I can link my account"*: **an operator mints it**. `rmcp_client_create`
+names an owner, a display name and the redirect URIs, and returns the public `client_id` to
+paste into Claude's custom-connector dialog. No client exists that the operator did not create.
+
+**Dynamic client registration (RFC 7591) is OFF unless `RMCP_OAUTH_DCR_ENABLED` is set**, and
+even then it is never an anonymous write: `POST /oauth/register` requires an operator-issued
+**initial access token** (`rmcp_registration_token_mint` — single-use by default, expiring, and
+shown exactly once). Absent, unknown, expired, revoked and exhausted tokens all answer
+identically, so the endpoint is not an oracle telling an attacker which of their guesses was
+once real. Whether the endpoint is *advertised* and whether it is *served* come from one read of that
+flag at startup, whose **value** is handed to both — not from two readers that agree, which is a
+different and weaker thing. A document promising a `registration_endpoint` that 404s is worse
+than one that promises nothing: the client treats the key as a supported path and reports a
+broken server instead of falling back to the `client_id` already pasted in.
+
+**A registered client reaches nothing until an operator scopes it.** It lands with no scope
+rows, and RMCP-07 reads absence as the empty set — so it can authenticate a human, obtain a
+token, and call zero tools. Note which control that is: *not* the `disabled` column, which is
+the authentication kill switch and would have meant a DCR client could not complete a flow at
+all, conflating "revoked" with "awaiting approval". The connector shows up in the Connectors
+GUI as unscoped, and stays inert until somebody assigns it groups and namespaces.
+
+**A client secret is shown exactly once.** It is generated from OS entropy, stored only as an
+argon2id PHC string, and returned in the response to the call that created it. Nothing reads it
+back and nothing *can*: the administrative row type carries a `confidential` boolean computed
+in SQL and has no field a hash — let alone a secret — could occupy. Public clients (which is
+what Claude registers as) get no secret at all and authenticate with PKCE alone; that is the
+default, because defaulting the other way would mint a credential nobody asked for.
+
+**Redirect URIs are validated as an allowlist, at write time.** Absolute `https`, or an RFC 8252
+loopback URI — nothing else. A scheme nobody anticipated is refused by default rather than by a
+denylist entry somebody had to have thought of. Userinfo is refused on both arms, because a URI may
+carry a trusted-looking name in its userinfo segment and a host of the attacker's choosing after
+the `@` — it reads as the connector's and resolves to somebody else's. Fragments, wildcards, over-long values and duplicates are refused, as are URIs
+carrying a query parameter reserved for the authorization response — registering one of those
+would mint a client that can never complete a flow, since `/oauth/authorize` refuses it at
+request time. The loopback rule is **asked of the matcher**, not re-derived here, so a URI can
+never be registrable under one definition and unmatchable under another.
+
+Refusals name a field and an index (`redirect_uris[1]: must not contain a fragment`) and never
+echo the submitted value — the same rule the audit vocabulary enforces, applied to the error
+body, because on a public endpoint that body reaches logs on both sides.
+
+**A present-but-wrong-typed member is malformed, never absent.** RMCP-02's rule applies one level
+down: *absent* means not configured, *present* means the value must be usable, and
+present-but-unusable is refused. Without that, `grant_types: "password"` reads as absence and
+takes the supported default, and `token_endpoint_auth_method: 42` lands silently on the weakest
+method — a client registered with semantics it never submitted.
+
+**Metadata handling is an allowlist.** Members this server understands are acted on; a short list
+of deliberately *cosmetic* ones (`client_uri`, `logo_uri`, `contacts`, `scope`, …) is ignored per
+RFC 7591 §3.1; **everything else is refused**. Security-significant members we can name — request
+object signing and encryption, authorization-response signing and encryption, ID-token and
+userinfo signing and encryption, TLS client authentication, pairwise subject identifiers,
+`software_statement`, `jwks`/`jwks_uri` — are refused *by name*, so the message says which. Anything
+unrecognised is refused generically, contributing only a boolean, because an unknown key is
+caller-chosen text and this rejection reaches an error body.
+
+The first cut was a denylist, on the argument that a strict allowlist makes interoperability
+hostage to a list nobody maintains. That argument is real but the burden falls on the denylist to
+be *complete*, and it was not — request-object signing, response encryption and TLS client
+authentication were all silently ignored. Completeness is unprovable and the failure of an
+incomplete denylist is invisible, so the structure is inverted: the interoperability burden now
+sits on the cosmetic list, where forgetting an entry produces a **loud refusal** rather than the
+silent acceptance of a member whose meaning nobody checked.
+
+**Every administrative write is authorized, against RMCP-12's machinery rather than a second copy
+of it.** Each mutating tool names an `actor`; the store derives that account's `ActorAuthority`
+inside the writing transaction under `FOR SHARE`, reads the client's owner under the same lock,
+and lets `authorize_client_write` decide — the operator may administer any connector, anyone else
+only their own. Minting or revoking an initial access token is operator-only
+(`authorize_operator_action`, RMCP-12's delegation check generalised in place rather than forked).
+
+Authority is re-derived **at the write**, never carried from an earlier read: there is no proof
+value to pass in, so an actor demoted or disabled between an earlier check and the commit cannot
+act on a stale snapshot. Review round 2 found the first cut doing none of this — the client-field
+`UPDATE` constrained only `id` and `version`, and the tool computed its actor as *the target row's
+own owner*, which asks the object being modified who may modify it and can only answer yes. An
+ownership check did run, but on the scope path only, so an edit touching just `enabled` or
+`redirect_uris` routed around it entirely.
+
+Lifecycle runs through tools, not a second API path: `rmcp_client_create`, `rmcp_client_list`,
+`rmcp_client_update`, `rmcp_client_revoke`. Updates carry the `version` the caller read and are
+**refused** if the connector has moved on, rather than overwriting whatever another operator
+saved — the thing being overwritten would be an authorization record. An update is **atomic**:
+the enabled flag, the redirect URIs, the tool groups and the namespaces commit together or not at
+all, in one transaction. Applied separately, a failure partway leaves a client with its new
+enabled state and its old scope — a half-applied authorization change that looks, from either
+side, like a deliberate configuration. Revoking disables the
+client *and* kills its refresh tokens, so the caller is denied at its **next** request.
+
 #### Exactly what is wired today
 
 This is the single account of the subsystem's state. An earlier revision of this file carried
@@ -956,11 +1050,20 @@ somewhere else.
 
 **Mounted: yes.** The routers are merged into the process's main router and served by the
 private listeners and by the public edge alike, at `/oauth/authorize`, `/oauth/login`,
-`/oauth/consent`, `/oauth/token` and `/oauth/revoke`. Until TERM #631 each OAuth item had
+`/oauth/consent`, `/oauth/token` and `/oauth/revoke` — plus `/oauth/register` when, and only
+when, `RMCP_OAUTH_DCR_ENABLED` is set (RMCP-08); with it unset the path 404s exactly as it does
+on a build without the feature, and the metadata document omits the key. Until TERM #631 each
+OAuth item had
 merged a `Router` that nothing ever bound, so every item passed its own acceptance criteria
 while the feature did not exist in a running binary. A configured-but-unbuildable door is now
 a hard startup error, because a half-built auth surface that serves the login page and then
 fails at the token endpoint sends the operator looking at the client.
+
+**Migrations: applied by hand, and RMCP-08 adds one.** `S132-rmcp08-client-registration.sql`
+adds `rmcp_client.version` and the `rmcp_registration_token` table. Both are in the startup
+readiness check, so a deployment that ships this code without applying the migration refuses to
+start with a message naming it, rather than failing the first connector edit with an opaque
+`column does not exist`.
 
 **Revocation enforced at the next request: yes, at `(account, client)` granularity.** The
 dispatch path consults `any_session_is_live(account, client)` on every call (RMCP-05).
@@ -1017,8 +1120,9 @@ a tool group and the tools appear.
 
 **Audit trail: emitting.** Every authorization decision, login outcome, issuance, refresh and
 rotation emits the OAuth record, alongside every rate-limit refusal, revocation, RFC 7009
-outcome, reuse detection and dispatch denial. Client registration is the one event with no
-call site, and only because RMCP-08 has no handler yet; its record variants already exist.
+outcome, reuse detection and dispatch denial. Client registration joined that list with
+RMCP-08: every accepted and refused registration emits, carrying the client's row id and the
+issuing account and nothing the caller wrote.
 
 **Federation delegation (RMCP-12): enforced in the store, not yet reachable from the GUI.**
 Namespace ownership, the `allowed_servers ⊆ owned_namespaces(actor)` rule and the
@@ -1030,8 +1134,11 @@ delegation and server ownership* below for the model.
 
 **Rate limiting: one table, every mounted route.** TERM #633 is closed — RMCP-03's separate
 login limiter is gone, and the login budget now comes from the same per-endpoint table as
-`/oauth/authorize`, `/oauth/consent`, `/oauth/token` and `/oauth/revoke`, inheriting the
-subject-over-address invariant it could not previously express.
+`/oauth/authorize`, `/oauth/consent`, `/oauth/token`, `/oauth/revoke` and (when DCR is on)
+`/oauth/register`, inheriting the subject-over-address invariant it could not previously
+express. `/oauth/register` is the one conditionally-mounted route and it carries a budget
+unconditionally, because a route that only gets one when someone remembers is the same defect
+as a limiter wired into some of the handlers.
 
 ### Live viewing activity — `media_now_playing`
 
