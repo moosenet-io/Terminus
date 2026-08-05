@@ -66,10 +66,14 @@ use crate::scribe::ScribeConfig;
 const CONSISTENCY_MARKER: &str = "CONSISTENCY_FINDINGS_JSON:";
 
 /// Default lens provider when `CONSISTENCY_REVIEW_PROVIDER` is unset/empty --
-/// a free-tier, code-specialized OpenRouter model (see `dispatch::QWEN_CODER_MODEL`),
+/// the live-curated free-tier pool (see [`DEFAULT_PROVIDER`]),
 /// chosen as a cheap/stable default rather than one of the paid CLI-backed
 /// daemon providers.
-const DEFAULT_PROVIDER: &str = "qwen_coder";
+// RVXR-05: was `qwen_coder`, whose pinned OpenRouter id 404s on every call --
+// so the Tier-C lens has been silently degrading to "no findings" rather than
+// running at all. `free` draws from the LIVE-curated pool instead of a pinned
+// id, so it cannot rot the same way; the lens stays advisory and $0.
+const DEFAULT_PROVIDER: &str = "free";
 
 /// Default target temperature when `CONSISTENCY_REVIEW_TEMPERATURE` is
 /// unset/unparseable -- low/deterministic, matching this lens's "cite what's

@@ -208,7 +208,10 @@ fn env_list(key: &str, default: &[&str]) -> Vec<String> {
 }
 
 const DEFAULT_CAPSTONE_PROVIDERS: &[&str] = &["opus", "codex", "agy", "claude-fable-5", "paid"];
-const DEFAULT_BREADTH_TAIL_PROVIDERS: &[&str] = &["free", "nemotron", "qwen_coder", "diffusion"];
+// RVXR-05: `qwen_coder` retired (dead pinned id); the local seats take its
+// place in the breadth tail -- same $0 role, and actually reachable.
+const DEFAULT_BREADTH_TAIL_PROVIDERS: &[&str] =
+    &["free", "nemotron", "diffusion", "gemma3", "coder30b"];
 
 const DEFAULT_RISK_PATH_SUBSTRINGS: &[&str] = &[
     "auth", "secret", "credential", "token", "password", "vault", "crypto", "cipher",

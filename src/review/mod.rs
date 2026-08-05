@@ -109,8 +109,23 @@ pub use consistency::{ConsistencyFinding, ConsistencyRun};
 // allowlist alongside the sub/free lenses; gated behind the REVX-11 runtime
 // toggle (default OFF) and the existing paid-model credit floor, not the
 // routine default gate.
+// RVXR-05: `qwen_coder` is RETIRED, not merely broken. Its pinned id
+// (`qwen/qwen3-coder:free`) returns `openrouter http 404 Not Found: This model
+// is unavailable for free` on EVERY call -- measured live 2026-08-05, and it is
+// neither quota nor auth but a dead id. A seat that 404s every time is worse
+// than an absent one because it looks like participation, so it is removed from
+// the vocabulary rather than left to fail silently. `parse_input` rejects it
+// with a message naming the local coder seat that replaces it.
+const RETIRED_PROVIDERS: &[(&str, &str)] = &[(
+    "qwen_coder",
+    "retired: its pinned OpenRouter id 404s on every call (model no longer free).      Use 'coder30b' (local qwen3-coder:30b via Chord) or 'free' (live-curated pool)",
+)];
+
 const ALLOWED_PROVIDERS: &[&str] = &[
-    "opus", "codex", "agy", "nemotron", "qwen_coder", "free", "claude-fable-5", "gpt56", "diffusion", "paid",
+    "opus", "codex", "agy", "nemotron", "free", "claude-fable-5", "gpt56",
+    // RVXR-05: LOCAL, Chord-routed, zero marginal cost.
+    "diffusion", "gemma3", "coder30b",
+    "paid",
 ];
 /// Routine review panel cap (per one `review_run` call).
 const MAX_PROVIDERS: usize = 5;
@@ -734,6 +749,11 @@ fn parse_input(args: &Value) -> Result<(Structure, Vec<String>, String, Value), 
         let name = p
             .as_str()
             .ok_or_else(|| ToolError::InvalidArgument("each entry in 'providers' must be a string".into()))?;
+        if let Some((_, why)) = RETIRED_PROVIDERS.iter().find(|(r, _)| *r == name) {
+            return Err(ToolError::InvalidArgument(format!(
+                "provider '{name}' is {why}"
+            )));
+        }
         if !ALLOWED_PROVIDERS.contains(&name) {
             return Err(ToolError::InvalidArgument(format!(
                 "unknown provider '{name}', must be one of {ALLOWED_PROVIDERS:?}"
@@ -844,12 +864,15 @@ async fn dispatch_provider_raw(
         // with 429 failover (see free_pool). Used as the tail of a 3-5 provider
         // panel, after the sub/OAuth providers.
         cfg.dispatch_free_pool(prompt_text).await
-    } else if provider == "diffusion" {
-        // TERM-DIFF-01: LOCAL, offline, zero-cost lens -- routed to Chord's
-        // DiffusionGemma serve, not OpenRouter/daemon, so it gets its own arm
+    } else if dispatch::is_local_provider(provider) {
+        // TERM-DIFF-01 / RVXR-05: LOCAL, offline, zero-cost lenses -- routed to
+        // Chord's own serves, not OpenRouter/daemon, so they get their own arm
         // ahead of the `openrouter_model_for` check rather than being folded
-        // into that table.
-        cfg.dispatch_diffusion(prompt_text).await
+        // into that table. A local seat that isn't resident degrades to a
+        // normal non-voting outcome (RVXR-02) instead of shrinking the panel
+        // silently -- which matters most for `coder30b`, which is expected to
+        // be reaped much of the time.
+        cfg.dispatch_local(prompt_text, provider).await
     } else if provider == "paid" {
         // REVX-09/10/11: the pooled, curated PAID OpenRouter provider --
         // round-robin + 429 failover + the runtime toggle + the credit floor,
@@ -1571,12 +1594,17 @@ impl RustTool for OpenRouterCredits {
 /// zero-cost, Chord-routed) IS part of the routine panel story, so it's
 /// included here like the other non-capstone-only providers.
 const STATUS_PROVIDERS: &[&str] =
-    &["opus", "codex", "agy", "free", "nemotron", "qwen_coder", "diffusion"];
+    &["opus", "codex", "agy", "free", "nemotron", "diffusion", "gemma3", "coder30b"];
 
 /// `review_provider_status` — REVCAP-01 PART A: report the reviewer-provider
 /// capacity registry's current state per provider (cached, zero extra
 /// dispatch cost by default), or optionally refresh it with a minimal probe
 /// dispatch per provider (`probe: true`).
+/// RVXR-03: default freshness window for a scoped probe. Short enough that a
+/// panel precheck reflects reality, long enough that back-to-back gates in one
+/// session do not each pay for a full round of dispatches.
+const DEFAULT_PROBE_TTL_SECS: u64 = 300;
+
 struct ReviewProviderStatus;
 
 impl ReviewProviderStatus {
@@ -1599,11 +1627,13 @@ impl RustTool for ReviewProviderStatus {
     }
 
     fn description(&self) -> &str {
-        "Report each review provider's (opus, codex, agy, free, nemotron, qwen_coder) \
-         current capacity-registry state: available/cooldown/shelved/latency/error, the \
-         absolute capped_until time, the reset horizon, provenance, and consecutive-cap \
-         count. Default returns the CACHED registry state (no extra provider dispatch). \
-         Pass 'probe: true' to refresh every provider with one minimal dispatch first."
+        "Report each review provider's current capacity-registry state: \
+         available/cooldown/shelved/latency/error, the absolute capped_until time, the \
+         reset horizon, provenance, consecutive-cap count, and how OLD the reading is. \
+         Default returns the CACHED state (no provider dispatch). Pass 'probe: true' to \
+         refresh first -- SCOPE IT with 'providers' to just the panel you are about to \
+         run, since each probe spends real provider usage. A reading younger than \
+         'ttl_secs' (default 300) is reused instead of re-probed."
     }
 
     fn parameters(&self) -> Value {
@@ -1612,8 +1642,22 @@ impl RustTool for ReviewProviderStatus {
             "properties": {
                 "probe": {
                     "type": "boolean",
-                    "description": "If true, dispatch one minimal probe per provider to refresh \
-                                     the registry before reporting (spends real provider usage)."
+                    "description": "If true, dispatch one minimal probe to refresh the registry \
+                                     before reporting (spends real provider usage)."
+                },
+                "providers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "RVXR-03: scope the probe (and the report) to just these \
+                                     providers -- normally the panel you are about to run. \
+                                     Omit to cover every known provider."
+                },
+                "ttl_secs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Reuse a cached reading younger than this many seconds \
+                                     instead of spending a probe (default 300). 0 forces a \
+                                     fresh probe of every requested provider."
                 }
             },
             "additionalProperties": false
@@ -1626,15 +1670,56 @@ impl RustTool for ReviewProviderStatus {
 
     async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let probe = args.get("probe").and_then(Value::as_bool).unwrap_or(false);
+
+        // RVXR-03: scope to the requested panel. Probing all seven providers to
+        // learn about the three you are about to seat is pure waste -- each
+        // probe is a real dispatch against a real quota.
+        let requested: Vec<String> = match args.get("providers").and_then(Value::as_array) {
+            Some(list) => list
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            None => STATUS_PROVIDERS.iter().map(|p| p.to_string()).collect(),
+        };
+        // An explicitly EMPTY list means "nothing asked for", not "everything".
+        // Silently widening it to the full set is how a scoped call turns back
+        // into the unscoped one it was meant to replace.
+        let unknown: Vec<String> = requested
+            .iter()
+            .filter(|p| !STATUS_PROVIDERS.contains(&p.as_str()))
+            .cloned()
+            .collect();
+        let requested: Vec<String> =
+            requested.into_iter().filter(|p| STATUS_PROVIDERS.contains(&p.as_str())).collect();
+
+        let ttl = std::time::Duration::from_secs(
+            args.get("ttl_secs").and_then(Value::as_u64).unwrap_or(DEFAULT_PROBE_TTL_SECS),
+        );
+
+        let now = std::time::SystemTime::now();
+        let mut probe_actions: std::collections::HashMap<String, &'static str> =
+            std::collections::HashMap::new();
         if probe {
             let cfg = ReviewConfig::from_env();
-            for provider in STATUS_PROVIDERS {
+            for provider in &requested {
+                // Reuse a young reading rather than spending a dispatch. Fail
+                // STALE: a provider never observed is never "fresh".
+                if capacity::registry().get(provider).is_fresh(now, ttl) {
+                    probe_actions.insert(provider.clone(), "skipped_fresh");
+                    continue;
+                }
+                // Fail-soft: `probe_one` folds the outcome into the registry
+                // and never returns an error, so one dead provider can never
+                // take down the status call for the others. The outcome is
+                // still REPORTED per provider below -- a failed probe is a
+                // result, not something to swallow.
                 Self::probe_one(&cfg, provider).await;
+                probe_actions.insert(provider.clone(), "probed");
             }
         }
 
-        let now = std::time::SystemTime::now();
-        let providers: Vec<Value> = STATUS_PROVIDERS
+        let providers: Vec<Value> = requested
             .iter()
             .map(|name| {
                 let s = capacity::registry().get(name);
@@ -1651,6 +1736,15 @@ impl RustTool for ReviewProviderStatus {
                     "consecutive_caps": s.consecutive_caps,
                     "backoff_secs": s.backoff_secs,
                     "source": s.source,
+                    // RVXR-03: how old this reading is, and what the probe did.
+                    // A caller must be able to tell a fresh observation from a
+                    // days-old belief -- that distinction is the whole item.
+                    "observation_age_secs": s.observation_age(now).map(|d| d.as_secs()),
+                    "ever_observed": s.observed_at.is_some(),
+                    "probe_action": probe_actions
+                        .get(name.as_str())
+                        .copied()
+                        .unwrap_or(if probe { "skipped_fresh" } else { "not_probed" }),
                 })
             })
             .collect();
@@ -1659,6 +1753,11 @@ impl RustTool for ReviewProviderStatus {
 
         let structured = json!({
             "probed": probe,
+            "ttl_secs": ttl.as_secs(),
+            "scoped": args.get("providers").is_some(),
+            // Named, never silently dropped: an unrecognised provider in a
+            // scoped request is a caller bug worth surfacing.
+            "unknown_providers": unknown,
             "providers": providers,
             "frontier_capacity_paused": paused,
             "frontier_down": down_providers,
@@ -2302,6 +2401,141 @@ mod tests {
              an early return that dispatched nothing (use `aggregate::undispatched_panel`)."
         );
         assert!(verdict_sites >= 4, "expected at least the 4 known return paths, found {verdict_sites}");
+    }
+
+    // ── RVXR-03: scoped probing ──────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn provider_status_scoped_to_a_panel_reports_only_that_panel() {
+        let out = ReviewProviderStatus
+            .execute_structured(json!({"providers": ["opus", "agy"]}))
+            .await
+            .unwrap();
+        let v = out.structured.unwrap();
+        let names: Vec<&str> =
+            v["providers"].as_array().unwrap().iter().map(|p| p["provider"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["opus", "agy"], "{v}");
+        assert_eq!(v["scoped"], true, "{v}");
+        assert_eq!(v["probed"], false, "no probe unless asked: {v}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn provider_status_names_unknown_providers_instead_of_dropping_them() {
+        let out = ReviewProviderStatus
+            .execute_structured(json!({"providers": ["opus", "not_a_provider"]}))
+            .await
+            .unwrap();
+        let v = out.structured.unwrap();
+        assert_eq!(v["unknown_providers"], json!(["not_a_provider"]), "{v}");
+        assert_eq!(v["providers"].as_array().unwrap().len(), 1, "{v}");
+    }
+
+    /// An explicitly EMPTY scope means "nothing", not "everything". Widening it
+    /// back to the full set would quietly undo the scoping this item adds.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_empty_provider_scope_reports_nothing_rather_than_everything() {
+        let out =
+            ReviewProviderStatus.execute_structured(json!({"providers": []})).await.unwrap();
+        let v = out.structured.unwrap();
+        assert_eq!(v["providers"].as_array().unwrap().len(), 0, "{v}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn provider_status_reports_reading_age_and_probe_action() {
+        capacity::registry().update("opus", |s| s.mark_success());
+        let out = ReviewProviderStatus
+            .execute_structured(json!({"providers": ["opus"]}))
+            .await
+            .unwrap();
+        let v = out.structured.unwrap();
+        let p = &v["providers"][0];
+        assert_eq!(p["ever_observed"], true, "{v}");
+        assert!(p["observation_age_secs"].is_number(), "age must be reported: {v}");
+        assert_eq!(p["probe_action"], "not_probed", "{v}");
+        assert_eq!(v["ttl_secs"], DEFAULT_PROBE_TTL_SECS, "{v}");
+    }
+
+    /// The TTL is what makes probing-every-run affordable: a reading taken
+    /// moments ago is reused instead of spending another real dispatch.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_fresh_reading_is_reused_instead_of_reprobed() {
+        capacity::registry().update("opus", |s| s.mark_success());
+        let out = ReviewProviderStatus
+            .execute_structured(json!({"providers": ["opus"], "probe": true, "ttl_secs": 3600}))
+            .await
+            .unwrap();
+        let v = out.structured.unwrap();
+        assert_eq!(v["providers"][0]["probe_action"], "skipped_fresh", "{v}");
+    }
+
+    // ── RVXR-05: local seats + the retired provider ──────────────────────
+
+    #[test]
+    fn the_local_seats_are_allowed_providers_and_route_locally() {
+        for p in ["diffusion", "gemma3", "coder30b"] {
+            assert!(ALLOWED_PROVIDERS.contains(&p), "{p} must be seatable");
+            assert!(dispatch::is_local_provider(p), "{p} must route to Chord");
+            assert!(dispatch::local_review_model(p).is_some(), "{p} needs a model id");
+            // A local seat is neither daemon-backed nor OpenRouter-backed.
+            assert!(!dispatch::is_daemon_provider(p), "{p}");
+            assert!(dispatch::openrouter_model_for(p).is_none(), "{p}");
+        }
+    }
+
+    #[test]
+    fn a_retired_provider_is_rejected_by_name_with_a_replacement() {
+        let err = parse_input(&json!({
+            "structure": "panel_majority",
+            "providers": ["opus", "qwen_coder"],
+            "criteria": "x"
+        }))
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("qwen_coder"), "{msg}");
+        assert!(msg.contains("retired"), "{msg}");
+        // It must name what to use instead -- a bare rejection just moves the
+        // confusion rather than resolving it.
+        assert!(msg.contains("coder30b") || msg.contains("free"), "{msg}");
+        assert!(!ALLOWED_PROVIDERS.contains(&"qwen_coder"));
+        assert!(!STATUS_PROVIDERS.contains(&"qwen_coder"));
+    }
+
+    /// RVXR-05's reporting requirement, which is RVXR-02's quorum rule applied
+    /// to the endcap: "whatever is available" must be REPORTED. A capstone that
+    /// ran 2 of 5 seats is not a capstone.
+    #[test]
+    fn an_endcap_that_lost_local_seats_names_them_rather_than_shrinking_silently() {
+        let results = vec![
+            ProviderResult {
+                provider: "opus".into(), verdict: "APPROVE".into(), reasoning: "r".into(),
+                error: None, outcome: Outcome::Voted, findings: Vec::new(),
+            },
+            ProviderResult {
+                provider: "coder30b".into(), verdict: "UNKNOWN".into(), reasoning: String::new(),
+                error: Some("unavailable: model_evicted".into()),
+                outcome: Outcome::Evicted, findings: Vec::new(),
+            },
+            ProviderResult {
+                provider: "gemma3".into(), verdict: "UNKNOWN".into(), reasoning: String::new(),
+                error: Some("unavailable: chord unreachable".into()),
+                outcome: Outcome::Errored, findings: Vec::new(),
+            },
+        ];
+        let (verdict, complete) = aggregate(Structure::Epic, &results);
+        assert_eq!(verdict, "APPROVE", "the one voting seat carries the advisory verdict");
+        assert!(!complete, "an endcap missing 2 of 3 seats is NOT complete");
+
+        let block = aggregate::quorum_block(&results);
+        assert_eq!(block["seated"], 3);
+        assert_eq!(block["voted"], 1);
+        let absent: Vec<&str> = block["absent"].as_array().unwrap()
+            .iter().map(|a| a["provider"].as_str().unwrap()).collect();
+        assert_eq!(absent, vec!["coder30b", "gemma3"], "absent seats must be named: {block}");
     }
 
     // ── RVXR-02: failure classification + the no-verdict promotion rule ───

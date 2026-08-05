@@ -34,7 +34,8 @@ pub const NEMOTRON_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b:free";
 /// be free. `qwen/qwen3-coder:free` is re-confirmed live, genuinely
 /// free-tier, and frontier-class (480B total params, 1M token context),
 /// with a code-specialization that fits this tool's review use case well.
-pub const QWEN_CODER_MODEL: &str = "qwen/qwen3-coder:free";
+// RVXR-05: QWEN_CODER_MODEL removed -- `qwen/qwen3-coder:free` returns
+// `openrouter http 404: This model is unavailable for free` on every call.
 /// `gpt56`'s OpenRouter model tag: the GPT-5.6 **Luna** tier ($1/$6 per 1M in/out) —
 /// the cost-conscious "middle of the road" GPT-5.6 (the deep Sol tier is $5/$30). A
 /// PAID model (no `:free` suffix), so its dispatch is credit-guarded (see
@@ -66,14 +67,36 @@ fn openrouter_chat_url() -> String {
 /// `MERIDIAN_LLM_MODEL`'s override pattern in `src/meridian/tools.rs`).
 const DEFAULT_DIFFUSION_REVIEW_MODEL: &str = "diffusion-gemma";
 
-/// The `diffusion` provider's model tag: `DIFFUSION_REVIEW_MODEL` if set, else
-/// [`DEFAULT_DIFFUSION_REVIEW_MODEL`].
-fn diffusion_review_model() -> String {
-    std::env::var("DIFFUSION_REVIEW_MODEL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_DIFFUSION_REVIEW_MODEL.to_string())
+/// RVXR-05: the LOCAL reviewer seats, served by Chord on the GPU host at zero
+/// marginal cost. Measured live 2026-08-05: with the assistant cohort resident
+/// there is ~16 GB of headroom, so `gemma3:12b` (8.1 GB) is co-resident, while
+/// `qwen3-coder:30b` (18.6 GB) does NOT fit and is reaped-window-only. The
+/// latter is therefore EXPECTED to be absent much of the time -- which, since
+/// RVXR-02, is reported honestly as a non-voting seat rather than silently
+/// shrinking the panel.
+const DEFAULT_GEMMA3_REVIEW_MODEL: &str = "gemma3:12b";
+const DEFAULT_CODER30B_REVIEW_MODEL: &str = "qwen3-coder:30b";
+
+/// Model id for a local Chord-routed seat, env-overridable per provider.
+pub fn local_review_model(provider: &str) -> Option<String> {
+    let (var, default) = match provider {
+        "diffusion" => ("DIFFUSION_REVIEW_MODEL", DEFAULT_DIFFUSION_REVIEW_MODEL),
+        "gemma3" => ("GEMMA3_REVIEW_MODEL", DEFAULT_GEMMA3_REVIEW_MODEL),
+        "coder30b" => ("CODER30B_REVIEW_MODEL", DEFAULT_CODER30B_REVIEW_MODEL),
+        _ => return None,
+    };
+    Some(
+        std::env::var(var)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default.to_string()),
+    )
+}
+
+/// RVXR-05: whether `provider` is one of the LOCAL, Chord-routed seats.
+pub fn is_local_provider(provider: &str) -> bool {
+    matches!(provider, "diffusion" | "gemma3" | "coder30b")
 }
 
 /// Chord's OpenAI-compatible chat-completions endpoint (mirrors
@@ -361,6 +384,16 @@ impl ReviewConfig {
     /// this degrades cleanly (`"unavailable: ..."`) with NO network call,
     /// mirroring the `CHORD_LLM_URL`-unset path -- never panics.
     pub async fn dispatch_diffusion(&self, prompt: &str) -> Result<String, String> {
+        self.dispatch_local(prompt, "diffusion").await
+    }
+
+    /// RVXR-05: dispatch any LOCAL Chord-routed reviewer seat (`diffusion`,
+    /// `gemma3`, `coder30b`). Identical transport to the diffusion path that
+    /// preceded it -- same service JWT, same OpenAI-compatible Chord endpoint,
+    /// same clean degrade -- differing only in the model id.
+    pub async fn dispatch_local(&self, prompt: &str, provider: &str) -> Result<String, String> {
+        let model = local_review_model(provider)
+            .ok_or_else(|| format!("unavailable: '{provider}' is not a local seat"))?;
         let url = chord_chat_url()?;
         let jwt = crate::federation::mint_service_jwt().map_err(|e| format!("unavailable: {e}"))?;
         let client = Self::client().map_err(|e| format!("unavailable: {e}"))?;
@@ -368,7 +401,7 @@ impl ReviewConfig {
             .post(&url)
             .bearer_auth(jwt)
             .json(&json!({
-                "model": diffusion_review_model(),
+                "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": false,
             }))
@@ -393,7 +426,7 @@ impl ReviewConfig {
 
         let text = body["choices"][0]["message"]["content"].as_str().unwrap_or("").trim().to_string();
         if text.is_empty() {
-            Err("unavailable: chord diffusion returned empty content".to_string())
+            Err(format!("unavailable: chord {provider} returned empty content"))
         } else {
             Ok(text)
         }
@@ -574,7 +607,6 @@ pub fn is_openrouter_rate_limited(err: &str) -> bool {
 pub fn openrouter_model_for(provider: &str) -> Option<&'static str> {
     match provider {
         "nemotron" => Some(NEMOTRON_MODEL),
-        "qwen_coder" => Some(QWEN_CODER_MODEL),
         "gpt56" => Some(GPT56_MODEL),
         _ => None,
     }
@@ -1038,7 +1070,8 @@ mod tests {
     #[test]
     fn openrouter_model_for_maps_known_providers() {
         assert_eq!(openrouter_model_for("nemotron"), Some(NEMOTRON_MODEL));
-        assert_eq!(openrouter_model_for("qwen_coder"), Some(QWEN_CODER_MODEL));
+        // RVXR-05: retired -- no longer routes anywhere.
+        assert_eq!(openrouter_model_for("qwen_coder"), None);
         assert_eq!(openrouter_model_for("opus"), None);
     }
 
@@ -1050,7 +1083,6 @@ mod tests {
         // The Fable capstone lens routes to the daemon's claude CLI.
         assert!(is_daemon_provider("claude-fable-5"));
         assert!(!is_daemon_provider("nemotron"));
-        assert!(!is_daemon_provider("qwen_coder"));
         assert!(!is_daemon_provider("free"));
         // gpt56 is an OpenRouter model, NOT a daemon provider.
         assert!(!is_daemon_provider("gpt56"));
@@ -1063,7 +1095,6 @@ mod tests {
         // gpt56 is PAID (credit-guarded); the free lenses are not.
         assert!(is_paid_openrouter_model(GPT56_MODEL));
         assert!(!is_paid_openrouter_model(NEMOTRON_MODEL));
-        assert!(!is_paid_openrouter_model(QWEN_CODER_MODEL));
         assert!(!is_paid_openrouter_model("anything:free"));
     }
 
