@@ -64,6 +64,15 @@ pub enum Outcome {
     /// Dispatch failed (unreachable, auth, rate limit, timeout, ...).
     /// Non-voting.
     Errored,
+    /// The seat was never even attempted -- the run short-circuited before
+    /// dispatch (the `paid` pool disabled, a KG rebuild lock, a capacity
+    /// pause). Non-voting.
+    ///
+    /// This variant exists so an early return can still say WHICH seats are
+    /// missing. Reporting `seated: 0` for those paths would be its own small
+    /// lie: it reads as "no seats were ever asked for" when in fact the caller
+    /// asked for a full panel and got none of it.
+    NotDispatched,
     /// Dispatch SUCCEEDED but the reply carried no parseable `VERDICT:` token.
     ///
     /// This is the quiet one, and it is the shape of the S130 failure: the
@@ -129,6 +138,8 @@ pub struct Quorum {
     pub voted: usize,
     pub evicted: usize,
     pub errored: usize,
+    /// Seats the run never attempted (short-circuited before dispatch).
+    pub not_dispatched: usize,
     pub no_verdict: usize,
 }
 
@@ -140,6 +151,7 @@ impl Quorum {
                 Outcome::Voted => q.voted += 1,
                 Outcome::Evicted => q.evicted += 1,
                 Outcome::Errored => q.errored += 1,
+                Outcome::NotDispatched => q.not_dispatched += 1,
                 Outcome::NoVerdict => q.no_verdict += 1,
             }
         }
@@ -155,6 +167,49 @@ impl Quorum {
             .map(|r| (r.provider.clone(), r.outcome))
             .collect()
     }
+}
+
+/// Seat records for a panel the run NEVER DISPATCHED, so an early return can
+/// still report which seats are missing and why.
+///
+/// `reason` is the same human-readable text the early return puts in its
+/// `reason` field, carried per-seat so a consumer reading only `quorum.absent`
+/// still learns the cause.
+pub fn undispatched_panel(providers: &[String], reason: &str) -> Vec<ProviderResult> {
+    providers
+        .iter()
+        .map(|p| ProviderResult {
+            provider: p.clone(),
+            verdict: "UNKNOWN".to_string(),
+            reasoning: String::new(),
+            error: Some(reason.to_string()),
+            outcome: Outcome::NotDispatched,
+            findings: Vec::new(),
+        })
+        .collect()
+}
+
+/// THE single constructor for the result's `quorum` block.
+///
+/// Every result-shaped return in `review_run` builds its census through this
+/// one function -- including the early returns that dispatch nothing. That is
+/// deliberate: a consumer that trusts `quorum` to exist will read its ABSENCE
+/// as "nothing was absent", which is the exact inversion of what an early
+/// return means. An omitted quorum block is a worse lie than a wrong one.
+pub fn quorum_block(results: &[ProviderResult]) -> serde_json::Value {
+    let q = Quorum::of(results);
+    serde_json::json!({
+        "seated": q.seated,
+        "voted": q.voted,
+        "evicted": q.evicted,
+        "errored": q.errored,
+        "not_dispatched": q.not_dispatched,
+        "no_verdict": q.no_verdict,
+        "absent": Quorum::absent_seats(results)
+            .into_iter()
+            .map(|(provider, outcome)| serde_json::json!({"provider": provider, "outcome": outcome}))
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// The verdict token reported when NOT ONE seat produced a judgement.
@@ -199,8 +254,16 @@ pub fn aggregate(structure: Structure, results: &[ProviderResult]) -> (String, b
 }
 
 fn aggregate_single(results: &[ProviderResult]) -> (String, bool) {
+    // `structure` and `providers` are INDEPENDENT in the tool's schema --
+    // nothing rejects `structure: "single"` with three seats. So `complete`
+    // here must mean the same thing it means everywhere else: EVERY SEATED
+    // provider voted, not merely the first one. Reading only `results.first()`
+    // would report `complete: true` while two other seated providers produced
+    // nothing -- a flag that lies, inside the item written to stop flags that
+    // lie.
+    let complete = !results.is_empty() && results.iter().all(|r| r.is_voting());
     match results.first() {
-        Some(r) if r.is_voting() => (r.verdict.clone(), true),
+        Some(r) if r.is_voting() => (r.verdict.clone(), complete),
         // Includes the seat that dispatched fine but produced no verdict: one
         // seat that did not judge is a panel of zero votes.
         _ => (NO_QUORUM.to_string(), false),
@@ -489,7 +552,10 @@ mod tests {
             no_verdict("free"),
         ];
         let q = Quorum::of(&results);
-        assert_eq!(q, Quorum { seated: 4, voted: 1, evicted: 1, errored: 1, no_verdict: 1 });
+        assert_eq!(
+            q,
+            Quorum { seated: 4, voted: 1, evicted: 1, errored: 1, not_dispatched: 0, no_verdict: 1 }
+        );
 
         let absent = Quorum::absent_seats(&results);
         assert_eq!(
@@ -537,6 +603,75 @@ mod tests {
             aggregate(Structure::PanelMajority, &results),
             (NO_QUORUM.to_string(), false)
         );
+    }
+
+    // ── F1: `single` with more seats than it reads ───────────────────────
+
+    /// `structure` and `providers` are independent in the schema, so a
+    /// `single` run CAN be handed a multi-seat panel. `complete` must then
+    /// mean what it means everywhere else -- every seated provider voted --
+    /// rather than "the first one did".
+    #[test]
+    fn single_with_extra_seated_providers_is_not_complete() {
+        let results = vec![ok("opus", "APPROVE"), no_verdict("codex"), evicted("agy")];
+        let (verdict, complete) = aggregate(Structure::Single, &results);
+        assert_eq!(verdict, "APPROVE", "it still mirrors the first seat's verdict");
+        assert!(
+            !complete,
+            "two seated providers produced nothing; `complete` must not claim otherwise"
+        );
+        let q = Quorum::of(&results);
+        assert_eq!((q.seated, q.voted), (3, 1));
+    }
+
+    #[test]
+    fn single_with_exactly_one_voting_seat_is_still_complete() {
+        // The ordinary case must not regress.
+        assert_eq!(
+            aggregate(Structure::Single, &[ok("opus", "APPROVE")]),
+            ("APPROVE".to_string(), true)
+        );
+    }
+
+    // ── F2: the quorum block on every return path ────────────────────────
+
+    #[test]
+    fn quorum_block_for_an_undispatched_panel_names_every_requested_seat() {
+        let panel = vec!["opus".to_string(), "codex".to_string(), "agy".to_string()];
+        let seats = undispatched_panel(&panel, "KG rebuild in progress; retry when ready");
+        let block = quorum_block(&seats);
+
+        assert_eq!(block["seated"], 3, "an early return still asked for 3 seats");
+        assert_eq!(block["voted"], 0);
+        assert_eq!(block["not_dispatched"], 3);
+        let absent = block["absent"].as_array().unwrap();
+        assert_eq!(absent.len(), 3, "every requested seat must be named absent");
+        assert_eq!(absent[0]["provider"], "opus");
+        assert_eq!(absent[0]["outcome"], "not_dispatched");
+        // ...and none of them votes.
+        assert!(seats.iter().all(|s| !s.is_voting()));
+    }
+
+    #[test]
+    fn quorum_block_reports_a_fully_voting_panel_with_no_absentees() {
+        let results = vec![ok("opus", "APPROVE"), ok("codex", "APPROVE")];
+        let block = quorum_block(&results);
+        assert_eq!(block["seated"], 2);
+        assert_eq!(block["voted"], 2);
+        assert_eq!(block["absent"].as_array().unwrap().len(), 0);
+    }
+
+    /// An empty `absent` list must mean "nothing was absent" -- which is only
+    /// safe if the block is ALWAYS present. This pins the distinction the
+    /// single-constructor rule protects.
+    #[test]
+    fn quorum_block_distinguishes_nothing_absent_from_nothing_dispatched() {
+        let all_voted = quorum_block(&[ok("opus", "APPROVE")]);
+        let none_dispatched =
+            quorum_block(&undispatched_panel(&["opus".to_string()], "capacity paused"));
+        assert_eq!(all_voted["absent"].as_array().unwrap().len(), 0);
+        assert_eq!(none_dispatched["absent"].as_array().unwrap().len(), 1);
+        assert_ne!(all_voted["voted"], none_dispatched["voted"]);
     }
 
     #[test]

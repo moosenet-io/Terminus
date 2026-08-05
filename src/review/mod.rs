@@ -1039,13 +1039,18 @@ than failing the whole call."
         // enabled providers" result rather than a silently empty panel.
         if providers.iter().any(|p| p == "paid") && !paid_pool::is_enabled() {
             if providers.iter().all(|p| p == "paid") {
+                let reason = "paid pool is disabled and was the only requested provider -- \
+                              no enabled providers";
+                // RVXR-02/F2: dispatched nothing, but still SAY so per seat --
+                // an omitted quorum block reads as "nothing was absent".
+                let seats = aggregate::undispatched_panel(&providers, reason);
                 return Ok(json!({
                     "structure": args["structure"],
                     "providers": [],
-                    "aggregate_verdict": "UNKNOWN",
+                    "aggregate_verdict": NO_QUORUM,
                     "complete": false,
-                    "reason": "paid pool is disabled and was the only requested provider -- \
-                               no enabled providers",
+                    "quorum": aggregate::quorum_block(&seats),
+                    "reason": reason,
                 })
                 .to_string());
             }
@@ -1058,13 +1063,19 @@ than failing the whole call."
         if let Some(project_id) = context.get("project_id").and_then(|v| v.as_str()) {
             let locked = in_flight().lock().unwrap_or_else(|e| e.into_inner()).contains(project_id);
             if locked {
+                let reason = format!("KG rebuild in progress for {project_id}; retry when ready");
+                let seats = aggregate::undispatched_panel(&providers, &reason);
                 return Ok(json!({
                     "structure": args["structure"],
                     "providers": [],
-                    "aggregate_verdict": "UNKNOWN",
+                    // Not a review outcome: nothing judged this change. Keep
+                    // `locked: true` as the retry signal, but never let the
+                    // verdict field imply a panel ran.
+                    "aggregate_verdict": NO_QUORUM,
                     "complete": false,
                     "locked": true,
-                    "reason": format!("KG rebuild in progress for {project_id}; retry when ready"),
+                    "quorum": aggregate::quorum_block(&seats),
+                    "reason": reason,
                 })
                 .to_string());
             }
@@ -1123,6 +1134,10 @@ than failing the whole call."
                 "aggregate_verdict": "CAPACITY_PAUSED",
                 "complete": false,
                 "capacity_paused": true,
+                "quorum": aggregate::quorum_block(&aggregate::undispatched_panel(
+                    &providers,
+                    "insufficient adversarial capacity: frontier providers capped",
+                )),
                 "down_providers": down_providers,
                 "earliest_recovery_unix": earliest,
                 "reason": "insufficient adversarial capacity: 2 or more frontier reviewer \
@@ -1469,18 +1484,7 @@ than failing the whole call."
         // gate the caller asked for, and it has to say so. `absent` names each
         // missing seat and why, so a report can name a dead seat instead of
         // saying only "the gate passed".
-        let quorum = Quorum::of(&results);
-        let quorum_block = json!({
-            "seated": quorum.seated,
-            "voted": quorum.voted,
-            "evicted": quorum.evicted,
-            "errored": quorum.errored,
-            "no_verdict": quorum.no_verdict,
-            "absent": Quorum::absent_seats(&results)
-                .into_iter()
-                .map(|(provider, outcome)| json!({"provider": provider, "outcome": outcome}))
-                .collect::<Vec<_>>(),
-        });
+        let quorum_block = aggregate::quorum_block(&results);
 
         Ok(json!({
             "structure": args["structure"],
@@ -2088,8 +2092,16 @@ mod tests {
 
         assert_eq!(parsed["locked"], true, "{parsed}");
         assert_eq!(parsed["providers"].as_array().unwrap().len(), 0, "{parsed}");
-        assert_eq!(parsed["aggregate_verdict"], "UNKNOWN", "{parsed}");
+        // RVXR-02/F2: a short-circuit is NOT a review outcome. It reports
+        // NO_QUORUM (nothing judged the change) and, critically, still carries
+        // a populated quorum block naming the seat it never dispatched --
+        // otherwise a consumer reads the missing block as "nothing was absent".
+        assert_eq!(parsed["aggregate_verdict"], NO_QUORUM, "{parsed}");
         assert_eq!(parsed["complete"], false, "{parsed}");
+        assert_eq!(parsed["quorum"]["seated"], 1, "{parsed}");
+        assert_eq!(parsed["quorum"]["voted"], 0, "{parsed}");
+        assert_eq!(parsed["quorum"]["not_dispatched"], 1, "{parsed}");
+        assert_eq!(parsed["quorum"]["absent"][0]["provider"], "opus", "{parsed}");
     }
 
     #[tokio::test]
@@ -2258,6 +2270,38 @@ mod tests {
             description: description.to_string(),
             subjective: None,
         }
+    }
+
+    /// RVXR-02/F2 ratchet: EVERY result-shaped return in this file must carry
+    /// a `quorum` block.
+    ///
+    /// The four known return paths are covered by behavioural tests above, but
+    /// those tests cannot fail for a return path that does not exist yet --
+    /// and the original defect was exactly that: three early returns added
+    /// over time, each individually reasonable, none carrying the census. A
+    /// consumer that trusts `quorum` to exist reads its absence as "nothing
+    /// was absent", so a missing block is a worse lie than a wrong one.
+    ///
+    /// This is a source-level ratchet in the same spirit as the PCON-08
+    /// hermeticity guard: it fails loudly when a FIFTH path appears, rather
+    /// than waiting for someone to notice the omission in production.
+    #[test]
+    fn every_result_shaped_return_carries_a_quorum_block() {
+        let src = include_str!("mod.rs");
+        // Consider only the non-test half of the file.
+        let body = src.split("\nmod tests {").next().unwrap_or(src);
+
+        let verdict_sites = body.matches("\"aggregate_verdict\":").count();
+        let quorum_sites = body.matches("\"quorum\":").count();
+
+        assert_eq!(
+            verdict_sites, quorum_sites,
+            "{verdict_sites} result-shaped return(s) emit `aggregate_verdict` but only \
+             {quorum_sites} emit `quorum`. Every return that reports a verdict must also \
+             report the seat census, built through `aggregate::quorum_block` — including \
+             an early return that dispatched nothing (use `aggregate::undispatched_panel`)."
+        );
+        assert!(verdict_sites >= 4, "expected at least the 4 known return paths, found {verdict_sites}");
     }
 
     // ── RVXR-02: failure classification + the no-verdict promotion rule ───
@@ -2950,6 +2994,13 @@ mod tests {
         assert_eq!(v["capacity_paused"], true, "{v}");
         assert_eq!(v["complete"], false, "{v}");
         assert!(v["providers"].as_array().unwrap().is_empty(), "gate must dispatch nothing: {v}");
+        // RVXR-02/F2: dispatching nothing must still be REPORTED per seat.
+        assert_eq!(v["quorum"]["voted"], 0, "{v}");
+        assert!(v["quorum"]["seated"].as_u64().unwrap() > 0, "{v}");
+        assert_eq!(
+            v["quorum"]["seated"], v["quorum"]["not_dispatched"],
+            "a capacity pause dispatches none of the seats it was asked for: {v}"
+        );
         let down: Vec<String> = v["down_providers"]
             .as_array()
             .unwrap()
