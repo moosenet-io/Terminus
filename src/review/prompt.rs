@@ -206,6 +206,86 @@ impl Verdict {
     }
 }
 
+/// RVXR-04: control-token markers that a raw chat template can leak into a
+/// provider's reply text.
+///
+/// The observed leak is the `diffusion` seat (Chord-routed, local) emitting
+/// reasoning that begins `<|channel>thought` -- the model's own harmony-format
+/// scaffolding, surfacing verbatim because nothing strips it. Note the MALFORMED
+/// variant: `<|channel>` has no closing pipe, so a naive `<|...|>` matcher misses
+/// exactly the token actually seen in the wild.
+///
+/// These leak into `reasoning`, which is what a human reads in the PR comment
+/// and what gets recorded as a finding -- so a reviewer's judgement arrives
+/// wrapped in template noise that looks like corruption.
+const CONTROL_TOKEN_PREFIXES: &[&str] = &["<|", "<｜"];
+
+/// RVXR-04: strip chat-template control tokens from a provider's raw reply.
+///
+/// Deliberately conservative -- it removes ONLY the marker tokens themselves,
+/// never the prose between them, and never reorders or truncates. It runs
+/// BEFORE verdict/findings parsing for one specific reason: a control token
+/// abutting the sentinel (`<|channel|>VERDICT: APPROVE`) would otherwise leave
+/// the sentinel intact but the surrounding text mangled, and a leaked marker
+/// inside the reasoning slice is the visible symptom being fixed.
+///
+/// Handles both the well-formed `<|token|>` and the malformed `<|token` shapes
+/// (the latter terminated by whitespace), plus the full-width `<｜` variant some
+/// templates emit. A `<` that is not the start of a control token -- ordinary
+/// prose, a Rust generic, an HTML snippet in a diff quote -- is passed through
+/// untouched.
+pub fn sanitize_reply(raw: &str) -> String {
+    // Fast path: the overwhelming majority of replies carry no control token
+    // at all, and must come back byte-for-byte identical.
+    if !CONTROL_TOKEN_PREFIXES.iter().any(|p| raw.contains(p)) {
+        return raw.to_string();
+    }
+
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    'outer: while !rest.is_empty() {
+        // Find the next control-token opener, if any.
+        let mut best: Option<(usize, &str)> = None;
+        for prefix in CONTROL_TOKEN_PREFIXES {
+            if let Some(i) = rest.find(prefix) {
+                if best.map(|(b, _)| i < b).unwrap_or(true) {
+                    best = Some((i, prefix));
+                }
+            }
+        }
+        let Some((start, prefix)) = best else {
+            out.push_str(rest);
+            break 'outer;
+        };
+        out.push_str(&rest[..start]);
+        let after = &rest[start + prefix.len()..];
+
+        // Three terminators, and the EARLIEST one wins so a malformed token can
+        // never swallow an arbitrary amount of following prose hunting for a
+        // closer that never arrives:
+        //   `<|token|>`  well-formed  -> ends at `|>`
+        //   `<|token>`   malformed    -> ends at `>`   (the observed leak:
+        //                                `<|channel>thought`, where `thought`
+        //                                is CONTENT and must survive)
+        //   `<|token `   unterminated -> ends at whitespace, which is consumed
+        //                                as the marker's own separator
+        let cands = [
+            after.find("|>").map(|i| (i, i + 2)),
+            after.find('>').map(|i| (i, i + 1)),
+            after.find(char::is_whitespace).map(|i| (i, i + 1)),
+        ];
+        let end = cands.into_iter().flatten().min_by_key(|(start, _)| *start);
+        match end {
+            // Drop the marker; keep everything after it.
+            Some((_, consumed)) => rest = &after[consumed..],
+            // A trailing `<|` with no terminator at all: drop the remainder,
+            // which is a dangling marker by construction.
+            None => break 'outer,
+        }
+    }
+    out
+}
+
 /// Extract the `VERDICT: ...` token from a provider's raw response text, and
 /// return `(verdict, reasoning)` where `reasoning` is the response with the
 /// verdict line stripped (trimmed). Scans from the END of the text backwards
@@ -213,6 +293,9 @@ impl Verdict {
 /// its instructions-echo earlier in the response doesn't get picked up
 /// instead of its actual final answer.
 pub fn parse_verdict(raw: &str) -> (Verdict, String) {
+    // RVXR-04: strip chat-template control tokens first, so a leaked marker
+    // neither corrupts the reasoning slice nor abuts the VERDICT sentinel.
+    let raw: &str = &sanitize_reply(raw);
     // ASCII-only uppercasing (not `to_uppercase()`): some Unicode uppercasing
     // is NOT byte-length-preserving (e.g. U+01F0 'ǰ' -> "J" + combining caron
     // grows from 2 bytes to 3), which would desync `pos` (a byte offset into
@@ -472,6 +555,74 @@ mod tests {
         assert!(p.contains("VERDICT: APPROVE") && p.contains("VERDICT: REQUEST_CHANGES"));
         // It is an audit, not a fix: never instructs code edits.
         assert!(p.contains("ADVISORY"));
+    }
+
+    // ── RVXR-04: reviewer-output sanitization ────────────────────────────
+
+    #[test]
+    fn sanitize_strips_the_observed_diffusion_channel_leak() {
+        // The exact shape seen in the wild: reasoning that BEGINS with the
+        // model's own harmony-format scaffolding. Note `<|channel>` has no
+        // closing pipe — a naive `<|...|>` matcher misses precisely this.
+        let raw = "<|channel>thought The diff adds a guard.\nVERDICT: APPROVE";
+        let (v, reasoning) = parse_verdict(raw);
+        assert_eq!(v, Verdict::Approve);
+        assert!(!reasoning.contains("<|"), "control marker leaked into reasoning: {reasoning:?}");
+        assert!(!reasoning.contains("channel>"), "{reasoning:?}");
+        assert!(reasoning.contains("The diff adds a guard."), "prose must survive: {reasoning:?}");
+    }
+
+    #[test]
+    fn sanitize_strips_well_formed_and_malformed_and_fullwidth_markers() {
+        assert_eq!(sanitize_reply("<|start|>hello"), "hello");
+        assert_eq!(sanitize_reply("<|channel>thought hello"), "thought hello");
+        assert_eq!(sanitize_reply("<\u{ff5c}start|>hello"), "hello");
+        assert_eq!(sanitize_reply("a<|end|>b"), "ab");
+    }
+
+    /// The fast path must be byte-for-byte identity. A sanitizer that rewrites
+    /// ordinary replies would be a silent corruption channel of its own.
+    #[test]
+    fn sanitize_leaves_ordinary_replies_byte_for_byte_identical() {
+        for raw in [
+            "Looks fine.\n\nVERDICT: APPROVE",
+            "if a < b && c > d { }",
+            "The type is Vec<String> and the tag is <div>.",
+            "",
+            "no markers at all",
+        ] {
+            assert_eq!(sanitize_reply(raw), raw, "mutated a clean reply: {raw:?}");
+        }
+    }
+
+    /// A control token must not swallow arbitrary prose while hunting for a
+    /// `|>` that never arrives — the malformed form ends at whitespace.
+    #[test]
+    fn a_malformed_marker_consumes_only_itself_not_the_rest_of_the_reply() {
+        let out = sanitize_reply("<|channel the entire rest of the review survives");
+        assert_eq!(out, "the entire rest of the review survives");
+    }
+
+    #[test]
+    fn sanitizing_never_changes_a_verdict() {
+        // Same verdicts before and after, for clean and dirty inputs alike.
+        for (raw, expect) in [
+            ("x\nVERDICT: APPROVE", Verdict::Approve),
+            ("<|channel>thought x\nVERDICT: REQUEST_CHANGES", Verdict::RequestChanges),
+            ("<|start|>x\nVERDICT: NOT_REFUTED", Verdict::NotRefuted),
+            ("<|channel>analysis\nVERDICT: REFUTED", Verdict::Refuted),
+        ] {
+            assert_eq!(parse_verdict(raw).0, expect, "{raw:?}");
+        }
+    }
+
+    /// A marker abutting the sentinel must still parse — this is why
+    /// sanitization runs BEFORE the verdict scan rather than only on the
+    /// reasoning slice afterwards.
+    #[test]
+    fn a_marker_abutting_the_verdict_sentinel_still_parses() {
+        let (v, _) = parse_verdict("reasoning here\n<|channel|>VERDICT: APPROVE");
+        assert_eq!(v, Verdict::Approve);
     }
 
     #[test]

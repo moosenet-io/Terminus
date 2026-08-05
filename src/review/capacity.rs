@@ -1,6 +1,6 @@
 //! REVCAP-01 PART A — reviewer-provider capacity core.
 //!
-//! Review providers (opus/codex/agy/free/nemotron/qwen_coder) periodically hit
+//! Review providers (opus/codex/agy/free/nemotron/local seats) periodically hit
 //! rate limits or subscription/quota cliffs on their upstream. Before this
 //! module, `review_run` just degraded that one provider's entry to
 //! `"unavailable: ..."` per-call with no memory -- so a genuinely-shelved
@@ -103,6 +103,16 @@ pub struct ReviewerStatus {
     /// Human-readable provenance of the last state change (e.g. the dispatch
     /// error text that produced it, or `"dispatch success"`).
     pub source: String,
+    /// RVXR-03: when this entry last saw a REAL dispatch outcome (success or
+    /// failure). `None` means nothing has ever been observed.
+    ///
+    /// This is what makes "probe the panel, not the cached registry" costable:
+    /// a caller can ask for a fresh read and the registry can answer "this
+    /// observation is N seconds old" instead of silently handing back a stale
+    /// belief. Without it there is no way to distinguish a reading taken a
+    /// second ago from one taken three days ago.
+    #[serde(with = "option_systemtime_unix")]
+    pub observed_at: Option<SystemTime>,
 }
 
 impl ReviewerStatus {
@@ -116,6 +126,23 @@ impl ReviewerStatus {
             last_horizon_secs: None,
             last_status: CapStatus::Available,
             source: "no dispatch yet".to_string(),
+            observed_at: None,
+        }
+    }
+
+    /// RVXR-03: age of the last real observation at `now`. `None` when nothing
+    /// has ever been observed (which a TTL check must treat as STALE, never
+    /// as fresh -- an unobserved provider is the least trustworthy of all).
+    pub fn observation_age(&self, now: SystemTime) -> Option<Duration> {
+        self.observed_at.and_then(|t| now.duration_since(t).ok())
+    }
+
+    /// RVXR-03: whether the cached reading is young enough to reuse instead of
+    /// spending a real probe dispatch. Fail-stale: never observed => not fresh.
+    pub fn is_fresh(&self, now: SystemTime, ttl: Duration) -> bool {
+        match self.observation_age(now) {
+            Some(age) => age < ttl,
+            None => false,
         }
     }
 
@@ -156,6 +183,7 @@ impl ReviewerStatus {
         self.cooldown_until = Some(now + Duration::from_secs(effective_secs));
         self.last_horizon_secs = Some(base);
         self.source = source.into();
+        self.observed_at = Some(now);
     }
 
     /// Whether `now` is at/after `cooldown_until` (i.e. the cap has expired).
@@ -188,6 +216,7 @@ impl ReviewerStatus {
         self.last_horizon_secs = None;
         self.last_status = CapStatus::Available;
         self.source = "dispatch success".to_string();
+        self.observed_at = Some(SystemTime::now());
     }
 
     /// Record a wall-clock timeout: NOT a cap (still available), but tracked as
@@ -195,6 +224,7 @@ impl ReviewerStatus {
     pub fn mark_latency(&mut self, source: impl Into<String>) {
         self.last_status = CapStatus::Latency;
         self.source = source.into();
+        self.observed_at = Some(SystemTime::now());
         // Latency never blocks dispatch and never touches cooldown_until/
         // consecutive_caps -- `available` stays whatever it already was.
     }
@@ -202,8 +232,22 @@ impl ReviewerStatus {
     /// Record a non-cap dispatch error (auth failure, malformed response, ...).
     /// Still available for the next attempt; tracked only for diagnostics.
     pub fn mark_error(&mut self, source: impl Into<String>) {
+        let source = source.into();
         self.last_status = CapStatus::Error;
-        self.source = source.into();
+        self.observed_at = Some(SystemTime::now());
+        // RVXR-05: a PERMANENT error is not "still available for the next
+        // attempt" -- it will fail identically every time. Measured live
+        // 2026-08-05: `qwen_coder` reported `available: true, status: error`
+        // while returning `openrouter http 404: This model is unavailable for
+        // free` on EVERY call. That is the same defect class RVXR-02 fixed in
+        // the aggregate: a dead seat that still looks like participation.
+        //
+        // Transient errors (unreachable, malformed response, timeout) keep the
+        // old behaviour and stay available -- retrying those is correct.
+        if is_permanent_error(&source) {
+            self.available = false;
+        }
+        self.source = source;
     }
 
     /// Whether this provider currently counts as "down" for the capacity gate:
@@ -341,6 +385,32 @@ pub fn is_rate_limit_error(msg: &str) -> bool {
         "resets in",
     ];
     NEEDLES.iter().any(|n| m.contains(n))
+}
+
+/// RVXR-05: whether a dispatch error is PERMANENT -- it will recur identically
+/// on every retry until a human changes configuration.
+///
+/// The motivating case is a pinned model id that no longer exists:
+/// `openrouter http 404 Not Found: This model is unavailable for free`. That is
+/// neither quota nor auth; it is a dead id, and a seat carrying one should stop
+/// advertising itself as available. Deliberately NARROW and fail-soft: anything
+/// not positively recognised as permanent stays transient (available, retried),
+/// because wrongly shelving a healthy provider is the worse error -- it is
+/// exactly the stale-capability-note failure the panel rules warn about.
+pub fn is_permanent_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    // A 404 on the MODEL is permanent; a 404 on some other path (a
+    // misconfigured route, a proxy hop) is NOT -- so require the model signal.
+    //
+    // The `not found` alternative that used to sit here DEFEATED that
+    // requirement: HTTP 404's standard reason phrase is literally "Not Found",
+    // so every 404 response line matched and a transient
+    // `chord http 404: route not found` would permanently bench a healthy
+    // local seat -- the exact direction this classifier is supposed to avoid.
+    let model_404 = m.contains("404") && m.contains("model");
+    // An explicitly non-free/paid-only model id is permanent for a free seat.
+    let unavailable_for_free = m.contains("unavailable for free");
+    model_404 || unavailable_for_free
 }
 
 /// Whether a dispatch error string indicates a wall-clock TIMEOUT rather than a
@@ -526,6 +596,153 @@ pub fn earliest_recovery(reg: &ReviewerRegistry, providers: &[String]) -> Option
 
 #[cfg(test)]
 mod tests {
+    // ── RVXR-03/05: observation freshness + permanent-error classification ──
+
+    #[test]
+    fn a_never_observed_provider_is_never_fresh() {
+        // Fail-stale. An entry nothing has ever dispatched against is the
+        // LEAST trustworthy reading there is; treating "no data" as "fresh
+        // data" would skip the probe precisely when it is most needed.
+        let s = super::ReviewerStatus::new("opus");
+        assert!(s.observed_at.is_none());
+        assert!(!s.is_fresh(std::time::SystemTime::now(), std::time::Duration::from_secs(300)));
+        assert_eq!(s.observation_age(std::time::SystemTime::now()), None);
+    }
+
+    #[test]
+    fn a_just_observed_provider_is_fresh_and_an_old_one_is_not() {
+        let mut s = super::ReviewerStatus::new("opus");
+        s.mark_success();
+        let now = std::time::SystemTime::now();
+        assert!(s.is_fresh(now, std::time::Duration::from_secs(300)));
+        // A zero TTL always forces a re-probe.
+        assert!(!s.is_fresh(now, std::time::Duration::from_secs(0)));
+        // And an ancient reading is stale.
+        s.observed_at = Some(now - std::time::Duration::from_secs(3600));
+        assert!(!s.is_fresh(now, std::time::Duration::from_secs(300)));
+        assert!(s.observation_age(now).unwrap() >= std::time::Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn every_real_outcome_stamps_an_observation_time() {
+        for mut s in [
+            super::ReviewerStatus::new("a"),
+            super::ReviewerStatus::new("b"),
+            super::ReviewerStatus::new("c"),
+        ] {
+            assert!(s.observed_at.is_none());
+            s.mark_success();
+            assert!(s.observed_at.is_some(), "success must stamp an observation");
+        }
+        let mut s = super::ReviewerStatus::new("d");
+        s.mark_latency("timeout");
+        assert!(s.observed_at.is_some(), "latency must stamp an observation");
+        let mut s = super::ReviewerStatus::new("e");
+        s.mark_error("unavailable: chord unreachable");
+        assert!(s.observed_at.is_some(), "error must stamp an observation");
+        let mut s = super::ReviewerStatus::new("f");
+        s.mark_rate_limited(Some(60), std::time::SystemTime::now(), "429");
+        assert!(s.observed_at.is_some(), "rate limit must stamp an observation");
+    }
+
+    /// RVXR-05, measured live 2026-08-05: `qwen_coder` reported
+    /// `available: true, status: error` while 404ing on EVERY call. A seat that
+    /// fails identically forever must stop advertising itself as available.
+    #[test]
+    fn a_permanent_error_marks_the_provider_unavailable() {
+        let mut s = super::ReviewerStatus::new("qwen_coder");
+        s.mark_error(
+            "unavailable: openrouter http 404 Not Found: This model is unavailable for free. \
+             The paid version is available",
+        );
+        assert!(!s.available, "a permanently 404ing seat must not look live");
+        assert_eq!(s.last_status, super::CapStatus::Error);
+    }
+
+    /// The converse, and the more dangerous direction: a TRANSIENT failure must
+    /// NOT shelve a healthy provider. Wrongly routing around a working reviewer
+    /// is the stale-capability-note failure that cost a whole epic.
+    #[test]
+    fn a_transient_error_leaves_the_provider_available() {
+        for reason in [
+            "unavailable: chord unreachable: connection refused",
+            "unavailable: malformed daemon response: eof",
+            "unavailable: daemon response missing 'text'",
+            "unavailable: openrouter returned empty content",
+        ] {
+            let mut s = super::ReviewerStatus::new("opus");
+            s.mark_error(reason);
+            assert!(s.available, "transient error wrongly shelved the seat: {reason}");
+        }
+    }
+
+    /// Isolates the `unavailable for free` branch, which mutation S05c showed
+    /// no test reached: every 404 fixture ALSO matched the `model_404` branch,
+    /// so the paid-only rule was live but unspecified.
+    ///
+    /// The MEASURED form (2026-08-05) is a 404. This asserts the rule the
+    /// branch actually encodes -- a model that is paid-only is permanently
+    /// unusable by a free seat whatever status code carries the news -- so a
+    /// `402 Payment Required` phrasing classifies the same way.
+    #[test]
+    fn paid_only_rejection_is_permanent_even_without_a_404() {
+        assert!(super::is_permanent_error(
+            "unavailable: openrouter http 402: This model is unavailable for free"
+        ));
+        // ...and the branch is genuinely load-bearing: strip the 404 signal
+        // from the string and it must STILL classify as permanent.
+        assert!(super::is_permanent_error("this model is unavailable for free"));
+    }
+
+    #[test]
+    fn is_permanent_error_is_narrow() {
+        assert!(super::is_permanent_error(
+            "openrouter http 404 Not Found: This model is unavailable for free"
+        ));
+        assert!(super::is_permanent_error("http 404: model not found"));
+        assert!(!super::is_permanent_error("http 429 Too Many Requests"));
+        assert!(!super::is_permanent_error("connection refused"));
+        assert!(!super::is_permanent_error("timed out after 300s"));
+    }
+
+    /// Regression, found by `codex` on the RVXR-03/04/05 review (PR #338).
+    ///
+    /// The classifier used to accept `404 && ("model" || "not found")`. HTTP
+    /// 404's standard reason phrase IS "Not Found", so EVERY 404 line matched
+    /// and the model-signal requirement its own doc comment claimed was
+    /// vacuous -- a transient `chord http 404: route not found` would
+    /// permanently bench a healthy local seat. That is the wrong direction:
+    /// wrongly shelving a working reviewer is the worse failure.
+    #[test]
+    fn a_non_model_404_is_transient_not_permanent() {
+        for transient in [
+            "unavailable: chord http 404: route not found",
+            "unavailable: http 404 Not Found",
+            "unavailable: openrouter http 404 Not Found",
+            "unavailable: gateway 404 not found",
+        ] {
+            assert!(
+                !super::is_permanent_error(transient),
+                "a 404 without a MODEL signal must stay transient: {transient}"
+            );
+            let mut st = super::ReviewerStatus::new("gemma3");
+            st.mark_error(transient);
+            assert!(st.available, "a healthy seat was wrongly shelved by: {transient}");
+        }
+    }
+
+    #[test]
+    fn a_success_after_a_permanent_error_restores_availability() {
+        // Nothing is permanently condemned: once an operator fixes the model
+        // id, the very next successful dispatch clears the state.
+        let mut s = super::ReviewerStatus::new("qwen_coder");
+        s.mark_error("openrouter http 404: model not found");
+        assert!(!s.available);
+        s.mark_success();
+        assert!(s.available);
+        assert_eq!(s.last_status, super::CapStatus::Available);
+    }
+
     use super::*;
 
     fn secs_from_now(now: SystemTime, secs: u64) -> SystemTime {
