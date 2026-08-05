@@ -13,6 +13,9 @@ pub mod docgen;
 /// on top of a subsystem (`crate::oauth`) rather than wrapping one external
 /// integration, and the subsystem must stay usable without the tool layer.
 pub mod rmcp_session;
+/// RMCP-12 (S132): `rmcp_server_owner_set` / `rmcp_server_owner_list` — the
+/// operator's control over which account administers which federated server.
+pub mod rmcp_owner;
 pub mod serving_tools;
 
 use crate::registry::ToolRegistry;
@@ -20,6 +23,7 @@ use crate::registry::ToolRegistry;
 /// Register every tool under `tools/`.
 pub fn register(registry: &mut ToolRegistry) {
     docgen::register(registry);
+    rmcp_owner::register(registry);
     rmcp_session::register(registry);
     serving_tools::register(registry);
 }

@@ -136,6 +136,11 @@ pub enum OauthEvent {
     Revoked,
     /// A request was refused for exceeding a per-endpoint budget.
     RateLimited,
+    /// RMCP-12: server ownership was granted, reassigned, or revoked.
+    DelegationChanged,
+    /// RMCP-12: a scoping write was refused because the actor's live authority
+    /// did not cover it.
+    ScopingDenied,
 }
 
 /// Why something was refused.
@@ -416,6 +421,46 @@ pub enum AuditDetail {
     /// which the endpoint and the count already answer; what the header said
     /// is not worth a channel for arbitrary bytes.
     RefusedBeforeParsing,
+
+    // ── RMCP-12: delegation ───────────────────────────────────────────────
+    /// Server ownership was assigned. `reassigned` distinguishes a fresh grant
+    /// from one that took a namespace off its previous owner, and
+    /// `rows_narrowed` counts the client-scoping rows removed as a result.
+    ///
+    /// Counts, never namespaces or client ids: an audit record naming another
+    /// account's objects is the same enumeration disclosure this item refuses
+    /// on its read paths.
+    DelegationGranted { reassigned: bool, rows_narrowed: u64 },
+    /// A delegation was removed, narrowing `rows_narrowed` client-scoping rows.
+    DelegationCleared { rows_narrowed: u64 },
+    /// A scoping write was refused. The reason is a closed code; nothing about
+    /// WHICH namespace or client was refused is recorded, for the reason above.
+    ScopingRefused { reason: ScopingRefusal },
+}
+
+/// Why a scoping write was refused. Closed, like every other reason vocabulary
+/// here, so no caller-controlled text can reach the trail through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopingRefusal {
+    /// The client belongs to another account and the actor is not an operator.
+    NotClientOwner,
+    /// One or more requested namespaces are not owned by the actor.
+    NamespaceNotOwned,
+    /// The action is operator-only (granting or revoking a delegation).
+    NotOperator,
+}
+
+impl ScopingRefusal {
+    /// The stable audit code. Treated as a wire contract, like
+    /// [`crate::oauth::scope::DenyReason::code`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotClientOwner => "not_client_owner",
+            Self::NamespaceNotOwned => "namespace_not_owned",
+            Self::NotOperator => "not_operator",
+        }
+    }
 }
 
 impl AuditDetail {
@@ -469,6 +514,16 @@ impl AuditDetail {
             AuditDetail::ClientRegistered => "client registered".to_string(),
             AuditDetail::RefusedBeforeParsing => {
                 "request refused before it could be parsed".to_string()
+            }
+            AuditDetail::DelegationGranted { reassigned, rows_narrowed } => format!(
+                "server ownership granted (reassigned={reassigned}, \
+                 client_scoping_rows_narrowed={rows_narrowed})"
+            ),
+            AuditDetail::DelegationCleared { rows_narrowed } => format!(
+                "server ownership revoked (client_scoping_rows_narrowed={rows_narrowed})"
+            ),
+            AuditDetail::ScopingRefused { reason } => {
+                format!("scoping write refused: {}", reason.as_str())
             }
         }
     }

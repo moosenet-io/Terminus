@@ -222,6 +222,7 @@
 
 pub mod audit;
 pub mod authorize;
+pub mod delegation;
 pub mod edge;
 pub mod groups;
 pub mod jwt;
@@ -250,6 +251,16 @@ use crate::error::ToolError;
 /// holds a pool rather than routing through the `pg_*` tools. Fleet queries by
 /// an agent still go through those tools.
 pub const DATABASE_URL_ENV: &str = "RMCP_DATABASE_URL";
+
+/// RMCP-12: which operator account the LOCAL tool surface acts as.
+///
+/// Only consulted when the fleet has more than one active operator account —
+/// with exactly one there is nothing to choose, and the store resolves it
+/// ([`crate::oauth::store::OauthStore::find_sole_operator_account`]). It names
+/// an ACCOUNT, never a credential, and it is not an identity a request can
+/// carry: a tool caller cannot set it, only the operator deploying the service
+/// can.
+pub const OPERATOR_ACCOUNT_ENV: &str = "RMCP_OPERATOR_ACCOUNT";
 
 /// Non-secret configuration for the OAuth door.
 ///
