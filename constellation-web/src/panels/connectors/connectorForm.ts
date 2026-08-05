@@ -6,6 +6,7 @@
 // functions exist so the operator sees the likely problem while typing instead of after a
 // round trip; a value this file is happy with can still be refused, and that refusal is
 // surfaced verbatim. Nothing here ever *permits* anything.
+import { RMCP_TOOLS, RmcpError } from '../../lib/rmcpContract';
 import type { RmcpClient, RmcpServer } from '../../types/rmcp';
 
 /** Split a textarea's contents into non-empty, trimmed lines. */
@@ -119,6 +120,59 @@ export function serverUnassignableReason(server: Pick<RmcpServer, 'ownedByMe' | 
   return server.ownerName === null
     ? 'unclaimed server — no owner, so it cannot be assigned to anything'
     : `owned by ${server.ownerName} — not yours to assign`;
+}
+
+// ── Ownership (TERM-647) ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Account names already visible to this session, as SUGGESTIONS for the create dialog's account
+ * fields.
+ *
+ * The source is `rmcp_server_owner_list` — records the page has already loaded through the one
+ * aggregation seam. There is no account-listing tool on the `rmcp_*` surface and this does not
+ * invent one: adding a second REST route or a direct DB read to enumerate accounts is exactly
+ * what RMCP-13's module doc forbids, and enumerating accounts is a disclosure in its own right.
+ * So the list is whatever ownership the server already chose to show this session, and it can
+ * legitimately be EMPTY — which is why the field it feeds accepts a typed name too.
+ *
+ * These are suggestions and nothing more. Picking one is not a permission; the server resolves
+ * the name, refuses an unknown or disabled account, and refuses an unauthorized pairing. The
+ * point of surfacing them is that an operator should not have to remember an account name
+ * exactly — not that this list is the set of legal answers.
+ */
+export function accountSuggestions(servers: Pick<RmcpServer, 'ownerName'>[]): string[] {
+  const names = servers
+    .map(s => s.ownerName)
+    .filter((n): n is string => typeof n === 'string' && n.trim().length > 0)
+    .map(n => n.trim());
+  return [...new Set(names)].sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * A create refusal that is about the ACCOUNTS the operator named, rendered in those terms — or
+ * null when it is some other failure and the generic wording applies.
+ *
+ * This exists because the generic `not_found` copy ("This object no longer exists — it may have
+ * been revoked elsewhere") is actively wrong on the create path. Nothing went away underneath
+ * the view; the account named does not resolve, because it does not exist or is disabled — which
+ * the server deliberately collapses into one answer so the tool is not an account-existence
+ * oracle. Telling the operator to reload would send them to re-check a connector list that is
+ * perfectly fine, and leave the typo in the field they were actually looking at.
+ *
+ * `forbidden` gets the same treatment: on create it means the pairing was refused — creating a
+ * connector owned by a DIFFERENT account takes operator authority — not that the page is
+ * off-limits. The server's own message is appended rather than replaced, because it is the
+ * authority on why, and this only supplies the context the kind alone loses.
+ */
+export function accountRefusal(e: unknown): string | null {
+  if (!(e instanceof RmcpError) || e.tool !== RMCP_TOOLS.clientCreate) return null;
+  if (e.kind === 'not_found') {
+    return `No such account — check the acting and owner names (a disabled account reads the same as a missing one). Server said: ${e.message}`;
+  }
+  if (e.kind === 'forbidden') {
+    return `The server refused this pairing — creating a connector owned by another account requires operator authority. Server said: ${e.message}`;
+  }
+  return null;
 }
 
 /** Slice one page out of a resolved list. Kept pure (and tested) so the preview's paging cannot

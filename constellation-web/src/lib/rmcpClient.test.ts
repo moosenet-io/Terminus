@@ -192,7 +192,17 @@ describe('the resolver re-derives authority on read, exactly as the store does',
       updateClient({ id: client.id, version: client.version, toolGroupIds: ['g-studio'] }),
     ).rejects.toMatchObject({ kind: 'invalid' });
     await expect(
-      createClient({ name: 'Borrowed', redirectUris: [], confidential: false, toolGroupIds: ['g-studio'], namespaces: [] }),
+      createClient({
+        // Accounts that resolve and are authorized, so the refusal below is unambiguously about
+        // the borrowed GROUP and not about ownership of the connector itself (TERM-647).
+        owner: 'delegated-owner',
+        actor: 'delegated-owner',
+        name: 'Borrowed',
+        redirectUris: [],
+        confidential: false,
+        toolGroupIds: ['g-studio'],
+        namespaces: [],
+      }),
     ).rejects.toMatchObject({ kind: 'invalid' });
   });
 
@@ -247,7 +257,15 @@ describe('scoping edits round-trip, and the preview follows them', () => {
 
   it('refuses creating a client scoped to a namespace this session does not own', async () => {
     await expect(
-      createClient({ name: 'Sneaky', redirectUris: [], confidential: false, toolGroupIds: [], namespaces: ['studio'] }),
+      createClient({
+        owner: 'delegated-owner',
+        actor: 'delegated-owner',
+        name: 'Sneaky',
+        redirectUris: [],
+        confidential: false,
+        toolGroupIds: [],
+        namespaces: ['studio'],
+      }),
     ).rejects.toMatchObject({ kind: 'invalid' });
   });
 });
@@ -255,6 +273,8 @@ describe('scoping edits round-trip, and the preview follows them', () => {
 describe('client creation shows the secret exactly once', () => {
   it('returns a secret on create and never again from any read', async () => {
     const created = await createClient({
+      owner: 'delegated-owner',
+      actor: 'delegated-owner',
       name: 'Test connector',
       redirectUris: ['https://example.invalid/cb'],
       confidential: true,
@@ -271,6 +291,8 @@ describe('client creation shows the secret exactly once', () => {
 
   it('mints no secret for a public client', async () => {
     const created = await createClient({
+      owner: 'delegated-owner',
+      actor: 'delegated-owner',
       name: 'Public connector',
       redirectUris: ['https://example.invalid/cb'],
       confidential: false,
@@ -545,5 +567,119 @@ describe('describeRmcpError', () => {
 
   it('falls back to a generic message for a non-RmcpError', () => {
     expect(describeRmcpError(new Error('boom')).kind).toBe('error');
+  });
+});
+
+// ── TERM-647: the create call carries the ownership the server refuses to guess ───────────────
+//
+// The bug this replaces was silent in exactly the way that keeps a bug alive: `createClient`
+// omitted a REQUIRED argument, so every create failed at the server and the dialog showed a
+// generic message. These tests pin both halves — that the wire arguments are actually sent, and
+// that omitting them is refused rather than defaulted.
+describe('creating a connector names its owner', () => {
+  it('succeeds when both accounts are named and the pairing is allowed', async () => {
+    const created = await createClient({
+      owner: 'delegated-owner',
+      actor: 'delegated-owner',
+      name: 'Named owner',
+      redirectUris: [],
+      confidential: false,
+      toolGroupIds: [],
+      namespaces: [],
+    });
+    expect(created.client.name).toBe('Named owner');
+    expect(created.clientSecret).toBeNull();
+  });
+
+  it('actually TRANSMITS both values — proven by the server distinguishing them', async () => {
+    // The created record does not echo its owner back (`RmcpClient` has no owner field), so a
+    // success assertion would pass just as happily with the fields dropped — which is precisely
+    // the shape of the original bug. What proves transmission is the server telling the two
+    // values APART: it can only refuse this pairing if it received both, and received them under
+    // the argument names it declares.
+    const swapped = await createClient({
+      owner: 'studio-owner',
+      actor: 'delegated-owner',
+      name: 'Distinguishable',
+      redirectUris: [],
+      confidential: false,
+      toolGroupIds: [],
+      namespaces: [],
+    }).catch(e => e);
+    expect(swapped).toBeInstanceOf(RmcpError);
+    expect(swapped.tool).toBe('rmcp_client_create');
+    // ...and a value only the OWNER field could carry produces the owner-shaped refusal.
+    const unknownOwner = await createClient({
+      owner: 'nobody-by-that-name',
+      actor: 'delegated-owner',
+      name: 'Distinguishable',
+      redirectUris: [],
+      confidential: false,
+      toolGroupIds: [],
+      namespaces: [],
+    }).catch(e => e);
+    expect(unknownOwner.kind).toBe('not_found');
+    expect(swapped.kind).not.toBe(unknownOwner.kind);
+  });
+
+  it('is REFUSED, not defaulted, when the owner is missing or blank', async () => {
+    const { rmcpFixtureCall } = await import('./rmcpFixtures');
+    // Straight at the server boundary: a caller that skips the wrapper (or a wrapper that
+    // regresses to omitting the field) must still be refused. "Present but blank" is tested
+    // alongside absent because a trimmed-to-empty string is the shape a form actually produces.
+    await expect(rmcpFixtureCall('rmcp_client_create', { name: 'Ownerless' })).rejects.toMatchObject({
+      kind: 'invalid',
+    });
+    await expect(
+      rmcpFixtureCall('rmcp_client_create', { name: 'Blank', owner: '   ', actor: 'delegated-owner' }),
+    ).rejects.toMatchObject({ kind: 'invalid' });
+    await expect(
+      rmcpFixtureCall('rmcp_client_create', { name: 'No actor', owner: 'delegated-owner' }),
+    ).rejects.toMatchObject({ kind: 'invalid' });
+  });
+
+  it('refuses an unknown account without confirming which one is unknown', async () => {
+    const err = await createClient({
+      owner: 'nobody-by-that-name',
+      actor: 'delegated-owner',
+      name: 'Ghost',
+      redirectUris: [],
+      confidential: false,
+      toolGroupIds: [],
+      namespaces: [],
+    }).catch(e => e);
+    expect(err.kind).toBe('not_found');
+    // A disabled account and a missing one collapse into this one answer on the real server, so
+    // the fixture must not be more informative than the thing it stands in for.
+    expect(err.message).not.toContain('nobody-by-that-name');
+  });
+
+  it('refuses to mint a connector owned by someone else — the check auto-filling would dissolve', async () => {
+    const err = await createClient({
+      owner: 'studio-owner',
+      actor: 'delegated-owner',
+      name: 'Not mine to give',
+      redirectUris: [],
+      confidential: false,
+      toolGroupIds: [],
+      namespaces: [],
+    }).catch(e => e);
+    // This is precisely the refusal a GUI defeats by copying `owner` into `actor`: the server
+    // permits a create when actor IS owner, so an auto-filled actor satisfies it unconditionally.
+    expect(err.kind).toBe('forbidden');
+  });
+
+  it('creates nothing when the ownership is refused', async () => {
+    const before = (await listClients()).length;
+    await createClient({
+      owner: 'studio-owner',
+      actor: 'delegated-owner',
+      name: 'Should not exist',
+      redirectUris: [],
+      confidential: false,
+      toolGroupIds: [],
+      namespaces: [],
+    }).catch(() => undefined);
+    expect((await listClients()).length).toBe(before);
   });
 });

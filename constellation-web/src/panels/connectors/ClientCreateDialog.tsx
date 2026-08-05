@@ -20,6 +20,34 @@
 //
 // A public client (no secret) skips that step entirely — inventing a ceremony for a value that
 // does not exist would teach the operator to click through the one that matters.
+//
+// ── OWNERSHIP IS ASKED, NEVER ASSUMED (TERM-647) ────────────────────────────────────────────
+//
+// `rmcp_client_create` requires `owner` and `actor` and refuses to default either. The dialog
+// used to send neither, so every create failed on a required argument — this is the fix, and the
+// SHAPE of the fix is the load-bearing part.
+//
+// The requirement is deliberate (RMCP-08): these tools are reached over transports that
+// authenticate a mesh principal rather than an `rmcp_account`, so there is no authenticated
+// identity to infer an owner from, and inferring one anyway would be an authorization decision
+// made by guessing. A GUI that quietly supplies a value on the server's behalf defeats exactly
+// the property the requirement exists to protect — so the field is:
+//
+//   • EMPTY on open. No default, no most-recently-used, nothing read from the session.
+//   • NOT auto-filled from a sole candidate. If precisely one account is known, it is offered as
+//     a suggestion the operator clicks; the click is the choice. A one-element list silently
+//     selected is a guess wearing a menu's clothes.
+//   • REQUIRED before submit, alongside the connector name.
+//   • Free-typed when it needs to be. There is no account-listing tool (see `accountSuggestions`),
+//     so the suggestions are only the ownership this session can already see and are frequently
+//     incomplete or empty. A picker that could ONLY offer those names would make the correct
+//     answer unreachable and push the operator to the CLI.
+//
+// `actor` is asked for separately and is NOT derived from `owner`. Copying the owner into the
+// actor would be worse than leaving it blank: the server permits a create when the actor IS the
+// owner, so an auto-copied actor satisfies that check unconditionally and quietly dissolves the
+// operator-authority requirement for creating a connector in someone else's name. The two are
+// different claims and the operator states both.
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Badge } from '../../components/Badge';
 import { Button } from '../../components/Button';
@@ -27,7 +55,13 @@ import { describeRmcpError, createClient } from '../../lib/rmcpClient';
 import type { RmcpClient, RmcpServer, RmcpToolGroup } from '../../types/rmcp';
 import { MultiSelect } from './MultiSelect';
 import type { MultiSelectOption } from './MultiSelect';
-import { parseLines, redirectUriHints, serverUnassignableReason } from './connectorForm';
+import {
+  accountRefusal,
+  accountSuggestions,
+  parseLines,
+  redirectUriHints,
+  serverUnassignableReason,
+} from './connectorForm';
 
 const mono = { fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono-sm)' } as const;
 
@@ -50,6 +84,66 @@ const labelStyle = {
   color: 'var(--text-500)',
 } as const;
 
+/**
+ * One account field: a typed name, plus the known names as click-to-fill suggestions.
+ *
+ * The suggestions are rendered as buttons rather than a `<select>` or a `<datalist>` on purpose.
+ * A `<select>` cannot express "or a name that is not in this list", which is the common case
+ * here; a `<datalist>` is invisible until you type, which makes the known names undiscoverable
+ * for an operator who does not already know one. Buttons show what is available AND leave the
+ * field free — and clicking one is an unambiguous, recorded choice by the human.
+ */
+function AccountField({
+  id,
+  label,
+  hint,
+  value,
+  suggestions,
+  onChange,
+  disabled,
+}: {
+  id: string;
+  label: string;
+  hint: string;
+  value: string;
+  suggestions: string[];
+  onChange: (v: string) => void;
+  disabled: boolean;
+}) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-1)' }}>
+      <label htmlFor={id} style={labelStyle}>{label}</label>
+      <input
+        id={id}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        disabled={disabled}
+        spellCheck={false}
+        autoComplete="off"
+        style={inputStyle}
+      />
+      <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--text-400)' }}>{hint}</span>
+      {suggestions.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-2)', alignItems: 'center' }}>
+          <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--text-500)' }}>known accounts:</span>
+          {suggestions.map(s => (
+            <Button
+              key={s}
+              size="sm"
+              variant={value === s ? 'secondary' : 'ghost'}
+              disabled={disabled}
+              onClick={() => onChange(s)}
+              aria-pressed={value === s}
+            >
+              {s}
+            </Button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export interface ClientCreateDialogProps {
   open: boolean;
   groups: RmcpToolGroup[];
@@ -61,6 +155,9 @@ export interface ClientCreateDialogProps {
 
 export function ClientCreateDialog({ open, groups, servers, onDone, onCancel }: ClientCreateDialogProps) {
   const [name, setName] = useState('');
+  // Both start EMPTY and stay empty until the operator says otherwise. See the module doc.
+  const [owner, setOwner] = useState('');
+  const [actor, setActor] = useState('');
   const [redirectText, setRedirectText] = useState('');
   const [confidential, setConfidential] = useState(false);
   const [groupIds, setGroupIds] = useState<string[]>([]);
@@ -78,6 +175,11 @@ export function ClientCreateDialog({ open, groups, servers, onDone, onCancel }: 
 
   const reset = useCallback(() => {
     setName('');
+    // Cleared with everything else: a previously chosen owner surviving into the next flow is
+    // the same class of bug as a surviving secret — the operator would be re-confirming a choice
+    // they did not make this time.
+    setOwner('');
+    setActor('');
     setRedirectText('');
     setConfidential(false);
     setGroupIds([]);
@@ -117,12 +219,26 @@ export function ClientCreateDialog({ open, groups, servers, onDone, onCancel }: 
 
   const redirectUris = parseLines(redirectText);
   const hints = redirectUriHints(redirectUris);
+  const knownAccounts = accountSuggestions(servers);
+  // Submittable only once the operator has named BOTH accounts. Whitespace does not count as a
+  // choice, and the server would refuse it anyway — better to not send it.
+  const ownerName = owner.trim();
+  const actorName = actor.trim();
+  const ready = name.trim().length > 0 && ownerName.length > 0 && actorName.length > 0;
 
   const submit = () => {
     const attempt = generation.current;
     setBusy(true);
     setFailure(null);
-    createClient({ name: name.trim(), redirectUris, confidential, toolGroupIds: groupIds, namespaces })
+    createClient({
+      owner: ownerName,
+      actor: actorName,
+      name: name.trim(),
+      redirectUris,
+      confidential,
+      toolGroupIds: groupIds,
+      namespaces,
+    })
       .then(result => {
         // Cancelled (or unmounted) while this was in flight: drop the result on the floor. The
         // connector still exists server-side — the operator will find it in the list — but its
@@ -134,7 +250,11 @@ export function ClientCreateDialog({ open, groups, servers, onDone, onCancel }: 
       })
       .catch(e => {
         if (attempt !== generation.current) return;
-        setFailure(describeRmcpError(e).message);
+        // A refusal is SHOWN, always — a dialog that fails silently is how the missing-`owner`
+        // gap survived unnoticed in the first place. `accountRefusal` re-words the two kinds
+        // whose generic copy is misleading on this path (see connectorForm); everything else
+        // keeps the shared wording, including the server's field-level `invalid` details.
+        setFailure(accountRefusal(e) ?? describeRmcpError(e).message);
       })
       .finally(() => {
         if (attempt !== generation.current) return;
@@ -219,6 +339,25 @@ export function ClientCreateDialog({ open, groups, servers, onDone, onCancel }: 
               <input value={name} onChange={e => setName(e.target.value)} style={inputStyle} placeholder="Reading assistant" />
             </label>
 
+            <AccountField
+              id="rmcp-create-owner"
+              label="owner account"
+              hint="The account this connector will belong to. There is no default — this surface has no authenticated account identity to infer one from, so it has to be named."
+              value={owner}
+              suggestions={knownAccounts}
+              onChange={setOwner}
+              disabled={busy}
+            />
+            <AccountField
+              id="rmcp-create-actor"
+              label="acting account"
+              hint="The account creating it. Naming a different owner requires operator authority, and the server checks that — it is not the same claim as the owner, so it is asked separately."
+              value={actor}
+              suggestions={knownAccounts}
+              onChange={setActor}
+              disabled={busy}
+            />
+
             <label style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-1)' }}>
               <span style={labelStyle}>redirect URIs (one per line)</span>
               <textarea
@@ -263,7 +402,7 @@ export function ClientCreateDialog({ open, groups, servers, onDone, onCancel }: 
 
             <div style={{ display: 'flex', gap: 'var(--space-3)', justifyContent: 'flex-end' }}>
               <Button variant="ghost" onClick={cancel} disabled={busy}>Cancel</Button>
-              <Button variant="primary" onClick={submit} disabled={busy || name.trim().length === 0}>
+              <Button variant="primary" onClick={submit} disabled={busy || !ready}>
                 {busy ? 'Creating…' : 'Create connector'}
               </Button>
             </div>

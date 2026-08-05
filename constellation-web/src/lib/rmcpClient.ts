@@ -164,6 +164,11 @@ export async function listClients(): Promise<RmcpClient[]> {
 }
 
 export interface CreateClientInput {
+  /** The account the connector will belong to. REQUIRED, with no default and no inference —
+   *  see the note on `createClient`. */
+  owner: string;
+  /** The account performing the creation. REQUIRED for the same reason `owner` is. */
+  actor: string;
   name: string;
   redirectUris: string[];
   /** Mint a client secret (confidential client). Public clients — which is what Claude
@@ -173,8 +178,26 @@ export interface CreateClientInput {
   namespaces: string[];
 }
 
+/**
+ * Mint a connector. TERM-647.
+ *
+ * **`owner` and `actor` are carried, never invented.** `rmcp_client_create` requires both and
+ * refuses to default either (RMCP-08). The reason is worth restating at the call site, because
+ * the tempting "fix" for a missing field is to fill it in: these tools reach Terminus over the
+ * fleet's own transports, which authenticate a MESH PRINCIPAL rather than an `rmcp_account`, so
+ * there is no authenticated OAuth identity here to read an owner from. A layer that picked one
+ * anyway would be making an authorization decision by guessing, silently.
+ *
+ * That reasoning binds this module exactly as it binds the tool. This function must therefore
+ * never derive either value — not from the session, not from `listServers()`, and not by
+ * copying one into the other. Both arrive from a human choice made in the dialog above and are
+ * passed through unchanged; an unknown or disabled account comes back `not_found` and an
+ * unauthorized pairing comes back `forbidden`, both from the server.
+ */
 export function createClient(input: CreateClientInput): Promise<RmcpClientCreated> {
   return callTool<RmcpClientCreated>(RMCP_TOOLS.clientCreate, {
+    actor: input.actor,
+    owner: input.owner,
     name: input.name,
     redirect_uris: input.redirectUris,
     confidential: input.confidential,

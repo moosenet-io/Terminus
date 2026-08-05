@@ -4,7 +4,10 @@
 // summary that reads as permissive when the client reaches nothing, and a redirect-URI hint
 // that waves through something the server will (rightly) refuse.
 import { describe, it, expect } from 'vitest';
+import { RMCP_TOOLS, RmcpError } from '../../lib/rmcpContract';
 import {
+  accountRefusal,
+  accountSuggestions,
   assignmentIncomplete,
   serverUnassignableReason,
   pageCount,
@@ -172,5 +175,62 @@ describe('pageSlice / pageCount', () => {
   it('reports at least one page for an empty list', () => {
     expect(pageCount(0, 25)).toBe(1);
     expect(pageCount(55, 25)).toBe(3);
+  });
+});
+
+// ── TERM-647 ─────────────────────────────────────────────────────────────────────────────────
+
+describe('accountSuggestions', () => {
+  const row = (namespace: string, ownerName: string | null) => ({ namespace, ownerName });
+
+  it('offers each known owner once, sorted', () => {
+    expect(
+      accountSuggestions([row('studio', 'studio-owner'), row('media', 'delegated-owner'), row('home', 'delegated-owner')]),
+    ).toEqual(['delegated-owner', 'studio-owner']);
+  });
+
+  it('contributes nothing for an unclaimed namespace', () => {
+    // `null` is "no ownership row exists", which names no account — distinct from an account
+    // whose name happens to be unknown to this session.
+    expect(accountSuggestions([row('lab', null)])).toEqual([]);
+  });
+
+  it('is empty rather than invented when the session sees no ownership', () => {
+    // The empty case is the one that matters: there is no account-listing tool, so this is
+    // routinely empty, and the field it feeds must still accept a typed name.
+    expect(accountSuggestions([])).toEqual([]);
+  });
+
+  it('ignores a blank name and trims the rest', () => {
+    expect(accountSuggestions([row('a', '  '), row('b', ' spaced ')])).toEqual(['spaced']);
+  });
+});
+
+describe('accountRefusal', () => {
+  it('re-words a create not_found in terms of the accounts, keeping the server text', () => {
+    const m = accountRefusal(new RmcpError('not_found', RMCP_TOOLS.clientCreate, 'no such account'));
+    expect(m).toMatch(/No such account/i);
+    expect(m).toMatch(/disabled/i);
+    expect(m).toContain('no such account');
+    // The misleading generic wording must NOT be what an operator sees here.
+    expect(m).not.toMatch(/revoked elsewhere/i);
+  });
+
+  it('re-words a create forbidden as an authority problem', () => {
+    expect(accountRefusal(new RmcpError('forbidden', RMCP_TOOLS.clientCreate, 'nope'))).toMatch(
+      /operator authority/i,
+    );
+  });
+
+  it('declines everything else, so the shared wording still applies', () => {
+    // Only the two kinds whose generic copy is actively wrong on this path are specialised.
+    // `invalid` in particular carries the server's field-level details and must pass through.
+    expect(accountRefusal(new RmcpError('invalid', RMCP_TOOLS.clientCreate, 'bad uri'))).toBeNull();
+    expect(accountRefusal(new RmcpError('conflict', RMCP_TOOLS.clientCreate, 'stale'))).toBeNull();
+    // ...and it is scoped to the create tool: a not_found from a READ really does mean the row
+    // went away, and re-wording that as an account problem would be the same error inverted.
+    expect(accountRefusal(new RmcpError('not_found', RMCP_TOOLS.clientUpdate, 'gone'))).toBeNull();
+    expect(accountRefusal(new Error('boom'))).toBeNull();
+    expect(accountRefusal(undefined)).toBeNull();
   });
 });
