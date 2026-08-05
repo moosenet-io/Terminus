@@ -360,6 +360,14 @@ async fn main() {
         }
     };
 
+    // RMCP-07 (TERM #631, item 5): the connector ceiling, resolved from the
+    // door's OWN store handle rather than from a second pool opened alongside
+    // it. `None` here — a closed door, or a door with no store — is read by
+    // `handle_mcp` as the EMPTY scope, so a connector that somehow arrives at
+    // an unresolvable process reaches nothing.
+    let scope_resolver =
+        terminus_rs::oauth::scope::scope_source_for_door(oauth_resource.as_ref());
+
     let gateway_config = GatewayServerConfig {
         server_name: "terminus-primary".to_string(),
         server_version: terminus_rs::VERSION.to_string(),
@@ -375,12 +383,7 @@ async fn main() {
         rmcp_endpoints: rmcp_endpoints.clone(),
         oauth_doors: oauth_doors.clone(),
         oauth_resource,
-        // RMCP-07: not wired here yet. The resolver needs its own handle on the
-        // OAuth store, which `resource_server_from_env` currently consumes;
-        // mounting that is RMCP-11/RMCP-14's job. Until then a connector that
-        // reaches `/mcp` resolves to the EMPTY scope and is refused — the
-        // fail-closed reading, and the one `handle_mcp` logs a warning for.
-        scope_resolver: None,
+        scope_resolver,
     };
 
     // Same shared setup `terminus_personal` uses (TGW-01 extraction, see

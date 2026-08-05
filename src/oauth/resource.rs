@@ -659,19 +659,52 @@ pub struct OauthResourceServer {
     /// behaviour of the new door assertable only by reading the code, which
     /// for an internet-facing authentication path is not good enough.
     state: Arc<dyn TokenState>,
+    /// The SAME store the `state` above is, when this door was built the
+    /// production way — kept as its concrete type so the one thing that needs
+    /// more than [`TokenState`] can have it.
+    ///
+    /// TERM #631 item 5: RMCP-07's scope resolver needs an `OauthStore`, and
+    /// the previous shape gave the store away to `state` and left no handle,
+    /// so a process could only have had a resolver by opening a SECOND pool
+    /// against the same database — two connection budgets, two failure modes,
+    /// and two answers to "is the door up" for one door. Sharing the handle
+    /// keeps that a single fact.
+    ///
+    /// `None` for a door built by [`Self::with_state`] over a fake, which has
+    /// no store at all. Callers must read that absence as "no scope source" —
+    /// which resolves to the EMPTY scope, never to an unscoped door. See
+    /// [`crate::oauth::scope::scope_source_for_door`], the one place that
+    /// reading is made.
+    store: Option<Arc<OauthStore>>,
 }
 
 impl OauthResourceServer {
     /// The production constructor: live state comes from the OAuth store.
-    pub fn new(config: ResourceServerConfig, store: OauthStore) -> Self {
-        Self { config, state: Arc::new(store) }
+    ///
+    /// Takes the store as an `Arc` so the handle can be SHARED rather than
+    /// consumed — see the `store` field's doc for why that matters.
+    pub fn new(config: ResourceServerConfig, store: Arc<OauthStore>) -> Self {
+        Self {
+            config,
+            state: Arc::clone(&store) as Arc<dyn TokenState>,
+            store: Some(store),
+        }
+    }
+
+    /// This door's own store handle, if it has one.
+    ///
+    /// `None` for a door built over a fake [`TokenState`]. There is
+    /// deliberately no fallback that opens a store here: a caller that needs a
+    /// store and finds none must fail closed, not manufacture one.
+    pub fn store(&self) -> Option<&Arc<OauthStore>> {
+        self.store.as_ref()
     }
 
     /// Build one over any [`TokenState`]. Production uses [`Self::new`]; this
     /// exists so the request path can be exercised end to end without a
     /// database (see the field doc).
     pub fn with_state(config: ResourceServerConfig, state: Arc<dyn TokenState>) -> Self {
-        Self { config, state }
+        Self { config, state, store: None }
     }
 
     pub fn config(&self) -> &ResourceServerConfig {
@@ -762,7 +795,10 @@ pub async fn resource_server_from_env() -> Result<Option<Arc<OauthResourceServer
         "oauth: RMCP connector door is OPEN for resource {}",
         config.canonical_resource()
     );
-    Ok(Some(Arc::new(OauthResourceServer::new(config, store))))
+    Ok(Some(Arc::new(OauthResourceServer::new(
+        config,
+        Arc::new(store),
+    ))))
 }
 
 /// RMCP-05: refuse — and audit — an access token carried in the URL.
