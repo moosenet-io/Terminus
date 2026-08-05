@@ -472,7 +472,28 @@ async fn run_provider(
             (
                 std::borrow::Cow::Borrowed(bwrap_path.as_path()),
                 provider::BuiltCommand {
-                    binary: sandbox::BWRAP_BIN,
+                    // RVXAGY-01: ATTRIBUTION, not the thing spawned. The
+                    // process actually executed is `bwrap` via
+                    // `spawn_binary_path` (the separate argument below);
+                    // `binary` is used ONLY to label errors. Labelling agy's
+                    // failures "bwrap" is actively misleading, because bwrap
+                    // PROPAGATES its child's exit code -- so an ordinary agy
+                    // error surfaces as `bwrap exited rc=1: ...` and reads as a
+                    // SANDBOX failure.
+                    //
+                    // This is not hypothetical: on 2026-08-05 agy was failing
+                    // with `invalid model selection (--effort "")`, and the
+                    // resulting `bwrap exited rc=1` caused TWO independent
+                    // agents to diagnose a broken sandbox. Measured at the same
+                    // time: bwrap 0.11.0 present, the egress proxy bound on
+                    // loopback, and agy running fine INSIDE bwrap once the
+                    // model selection was correct. The sandbox was never the
+                    // problem; only the label said it was.
+                    //
+                    // Same failure class as the daemon reporting a quota-capped
+                    // codex as an infra/stdin bug: an error whose text points at
+                    // the wrong layer costs far more than one that says nothing.
+                    binary: AGY_ERROR_LABEL,
                     args: wrapped_args,
                     // Preserve whatever build_command(Agy) actually produced
                     // (currently always None -- agy has no --output-* temp
@@ -511,6 +532,14 @@ async fn run_provider(
 
     result
 }
+
+/// RVXAGY-01: how an `agy` dispatch failure is LABELLED in the error text.
+/// Names both layers, because the exit code genuinely comes from bwrap and the
+/// fault genuinely is usually agy's — a reader needs to know which to go look
+/// at, and `bwrap` alone sends them to the wrong one.
+const AGY_ERROR_LABEL: &str = "agy (spawned under the bwrap sandbox; a nonzero rc here is \
+usually agy's OWN exit code, which bwrap propagates -- check the message below before \
+suspecting the sandbox)";
 
 /// Process-global mutex serializing `agy` spawns. agy's OAuth access-token
 /// refresh races when two agy processes run at once (each refresh consults the
@@ -802,6 +831,110 @@ mod tests {
         )
         .await;
         assert_eq!(out.expect("silent-then-speaking must complete"), "READY");
+    }
+
+    /// RVXAGY-01, raised by the review panel: the builder-level tests prove only
+    /// that the payload was ASSIGNED to `stdin_prompt`. They cannot prove the
+    /// EXECUTOR delivers it. This test closes that gap against a REAL process.
+    ///
+    /// `cat` echoes its stdin verbatim, so a payload that survives the round
+    /// trip byte-for-byte proves the whole chain: pipe wiring, the spawned
+    /// writer task, and the EOF shutdown that makes the child stop reading. The
+    /// size is deliberately far past both the 64 KiB argv threshold and the
+    /// 64 KiB default OS pipe buffer -- a payload larger than the pipe buffer is
+    /// exactly the case a blocking (unspawned) write would DEADLOCK on, so this
+    /// also pins the concurrency of the writer against the output pumps.
+    #[tokio::test]
+    async fn the_executor_delivers_an_oversized_stdin_payload_whole_to_a_real_process() {
+        // Head and tail sentinels so truncation at EITHER end is caught, not
+        // just a length mismatch.
+        let mut payload = String::from("HEAD-SENTINEL-7f3a\n");
+        payload.push_str(&"payload line that exists only to exceed the pipe buffer\n".repeat(4000));
+        payload.push_str("TAIL-SENTINEL-9c1b");
+        assert!(
+            payload.len() > provider::MAX_PROMPT_ARGV_BYTES,
+            "payload must exceed the argv threshold to exercise the stdin path"
+        );
+
+        let built = provider::BuiltCommand {
+            binary: "cat",
+            args: vec![],
+            output_path: None,
+            stdin_prompt: Some(payload.clone()),
+        };
+        let stall = StallConfig { timeout_secs: 60, stall_secs: None };
+        let out = run_built_command(
+            &built,
+            std::path::Path::new("/bin/cat"),
+            &stall,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .expect("cat must echo the payload back");
+
+        // `run_built_command` trims the reply, so compare against the trimmed
+        // payload rather than weakening the assertion to a `contains`.
+        assert_eq!(
+            out.len(),
+            payload.trim().len(),
+            "payload length changed in transit: sent {}, got {}",
+            payload.trim().len(),
+            out.len()
+        );
+        assert_eq!(out, payload.trim(), "payload not delivered byte-for-byte");
+        assert!(out.starts_with("HEAD-SENTINEL-7f3a"), "head lost in transit");
+        assert!(out.ends_with("TAIL-SENTINEL-9c1b"), "tail lost in transit");
+    }
+
+    /// The companion negative: with `stdin_prompt: None` the child must reach
+    /// EOF immediately rather than blocking forever on an open stdin.
+    ///
+    /// **What this test proves, stated narrowly on purpose.** Three reviewers
+    /// flagged an earlier version of it as too weak, and they were right about
+    /// the specific defect: it accepted `Ok(_)` as success, which made it pass
+    /// for almost any behavior. That escape hatch is gone — the outcome is now
+    /// pinned to exactly `empty_output`.
+    ///
+    /// **What it deliberately does NOT claim.** It cannot distinguish
+    /// `Stdio::null()` from an INHERITED-but-already-closed stdin, because
+    /// under a test runner whose own stdin is closed those two are genuinely
+    /// indistinguishable from inside the child — the observable behavior is
+    /// identical, so no assertion here could separate them. Rather than dress
+    /// this up as a stronger guarantee than it is, the claim is limited to:
+    /// the no-payload path terminates promptly with empty output and does not
+    /// hang. The `Stdio::piped()` branch being load-bearing is established
+    /// separately and positively, by
+    /// [`the_executor_delivers_an_oversized_stdin_payload_whole_to_a_real_process`],
+    /// which a mutant forcing `Stdio::null()` on every path does kill.
+    #[tokio::test]
+    async fn the_no_payload_path_terminates_promptly_with_empty_output() {
+        let built = provider::BuiltCommand {
+            binary: "cat",
+            args: vec![],
+            output_path: None,
+            stdin_prompt: None,
+        };
+        // A short backstop: if stdin were left OPEN, `cat` would block and this
+        // would surface as a `timeout`, which the assertion below rejects.
+        let stall = StallConfig { timeout_secs: 10, stall_secs: None };
+        let started = std::time::Instant::now();
+        let out = run_built_command(
+            &built,
+            std::path::Path::new("/bin/cat"),
+            &stall,
+            None,
+            &HashMap::new(),
+        )
+        .await;
+        assert!(
+            matches!(out, Err(("empty_output", _))),
+            "no-payload path must terminate with empty_output, got {out:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(9),
+            "must reach EOF promptly, not ride the timeout backstop"
+        );
     }
 
     /// The `last_ms==0` sentinel edge case: a provider that prints IMMEDIATELY
