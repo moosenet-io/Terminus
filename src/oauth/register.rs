@@ -1044,11 +1044,12 @@ mod tests {
     /// store is consulted.
     ///
     /// S132/RMCP-SQLITE also removed a small hazard from this fixture. Its
-    /// Postgres predecessor needed an invented DSN with a user, a
-    /// not-a-password and a host, which had to be spelled carefully (a DOTLESS
-    /// host) to avoid the repo's own `no_pii_in_own_source_tree` scanner
-    /// reading `<email>` as an email address. An in-memory SQLite
-    /// handle names nothing at all.
+    /// Postgres predecessor needed an invented DSN carrying a user and a host,
+    /// which had to be spelled carefully — a DOTLESS host — because the repo's
+    /// own `no_pii_in_own_source_tree` scanner reads that shape as an email
+    /// address. Writing the shape out HERE trips the same scanner, which is
+    /// worth knowing and is why this sentence describes it rather than quoting
+    /// it. An in-memory SQLite handle names no user and no host at all.
     fn lazy_pool() -> sqlx::SqlitePool {
         sqlx::sqlite::SqlitePoolOptions::new()
             .connect_lazy_with(sqlx::sqlite::SqliteConnectOptions::new().in_memory(true))

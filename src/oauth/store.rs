@@ -297,7 +297,7 @@ impl OauthStore {
 
     /// Open a real, empty, migrated database for a test.
     ///
-    /// ## Why this exists at all, and why it is not `#[cfg(test)]`
+    /// ## Why this exists at all, and why it is not test-only
     ///
     /// Under Postgres this crate stood up no database in tests: every fixture
     /// was a `PgPool::connect_lazy` handle that never opened a socket, and the
@@ -311,9 +311,18 @@ impl OauthStore {
     /// module can PROVE rather than describe. That is the single biggest
     /// correctness gain of the port and it would be wasted behind a lazy pool.
     ///
-    /// It is `pub(crate)` rather than `#[cfg(test)]` because the fixtures in
-    /// `mount`, `register`, `scope` and `token` need it too, and a
-    /// `#[cfg(test)]` item in this module is not visible to theirs.
+    /// It is `pub(crate)` rather than test-gated because the fixtures in
+    /// `mount`, `register`, `scope` and `token` need it too, and a test-gated
+    /// item in this module is not visible to theirs.
+    ///
+    /// The test-gate ATTRIBUTE is deliberately not spelled out anywhere in this
+    /// function's docs. Two of the source scanners below split this file on
+    /// that literal to find its production half, so writing it in a comment up
+    /// here silently truncates the text they scan — which is how it was found:
+    /// both went red on their own non-vacuity assertions rather than passing
+    /// green over an empty scan. The scanners have since been anchored on the
+    /// module attribute at column 0, but a comment that would re-trigger it is
+    /// still not worth writing.
     ///
     /// `path` names a file the caller owns (a `tempfile::TempDir` entry).
     /// Every setting matches [`Self::connect`] exactly — including
@@ -3881,7 +3890,14 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
         // test's own array and pass even if every query had been deleted —
         // false coverage of exactly the kind this guard exists to prevent.
         let file = include_str!("store.rs");
-        let production = file.split("#[cfg(test)]").next().expect("file has a production half");
+        // Anchored on the module attribute at COLUMN 0 ("\n" + the attribute),
+        // not on the bare literal. The bare form splits on any MENTION of the
+        // attribute — including one in a doc comment in the production half —
+        // which silently shortens the text being scanned. That happened during
+        // S132/RMCP-SQLITE and was caught only by this test's own non-vacuity
+        // assertion below, which is exactly what it is for.
+        let production =
+            file.split("\n#[cfg(test)]").next().expect("file has a production half");
         let src: String = production
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
@@ -4060,7 +4076,12 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
     #[test]
     fn both_delegation_mutators_re_verify_the_actor_under_lock() {
         let file = include_str!("store.rs");
-        let production = file.split("#[cfg(test)]").next().expect("file has a production half");
+        // Anchored at column 0 — see the note in
+        // `every_owner_scoped_query_excludes_a_disabled_owner`. A bare split
+        // truncates on any mention of the attribute in a production doc
+        // comment, and this scan would then fail to find the functions at all.
+        let production =
+            file.split("\n#[cfg(test)]").next().expect("file has a production half");
 
         for function in ["set_server_owner", "clear_server_owner"] {
             let start = production
@@ -4355,6 +4376,14 @@ pub async fn reassign_owner(pool: &PgPool, ns: &str, owner: Uuid) -> Result<(), 
     #[tokio::test]
     async fn a_missing_operator_column_reports_not_ready() {
         let (_dir, store) = temp_store().await;
+        // The partial index `rmcp_account_operator_idx ... WHERE is_operator`
+        // references the column, and SQLite refuses to drop a column an index
+        // depends on. Dropping the index first is what an interrupted or
+        // hand-rolled migration would leave behind anyway.
+        sqlx::query("DROP INDEX rmcp_account_operator_idx")
+            .execute(&store.pool)
+            .await
+            .expect("drop index");
         sqlx::query("ALTER TABLE rmcp_account DROP COLUMN is_operator")
             .execute(&store.pool)
             .await

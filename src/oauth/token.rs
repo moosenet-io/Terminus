@@ -1540,10 +1540,12 @@ mod tests {
     ///
     /// The fixture used to be an invented Postgres DSN, and it needed two
     /// paragraphs of justification: every part obviously fake, and the host
-    /// deliberately DOTLESS so the repo's own `no_pii_in_own_source_tree`
-    /// scanner did not read `<email>` as an email address. An
-    /// in-memory SQLite handle names no user, no host and no credential, so
-    /// none of that reasoning is needed any more.
+    /// deliberately DOTLESS, because the repo's own `no_pii_in_own_source_tree`
+    /// scanner reads a user part followed by a dotted host as an email address.
+    /// That shape is deliberately described rather than quoted here — writing
+    /// it out trips the scanner even inside a comment. An in-memory SQLite
+    /// handle names no user, no host and no credential, so none of the
+    /// reasoning is needed any more.
     fn store_stub() -> OauthStore {
         OauthStore::from_pool(
             sqlx::sqlite::SqlitePoolOptions::new()
