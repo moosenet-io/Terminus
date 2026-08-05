@@ -84,15 +84,18 @@
 //!
 //! [`Pattern::matches`] carries the per-arm reasoning.
 //!
-//! RMCP-07 holds a SECOND copy of this matcher in its `scope.rs`, and it is the
-//! copy wired into `decide()`. The two used DIFFERENT namespace delimiters —
-//! this one `__`, that one `::` — which meant every namespace-qualified pattern
-//! written here resolved to nothing there, while a `::` pattern written here
-//! passed validation as an innocuous local prefix and was expanded by the
-//! enforcer into a whole federated namespace. That is TERM #637; the resolution
-//! was to standardise on `::`, which is what this module now uses.
+//! RMCP-07 used to hold a SECOND copy of this matcher in its `scope.rs`, and
+//! that copy was the one wired into `decide()`. The two used DIFFERENT
+//! namespace delimiters — this one `__`, that one `::` — which meant every
+//! namespace-qualified pattern written here resolved to nothing there, while a
+//! `::` pattern written here passed validation as an innocuous local prefix and
+//! was expanded by the enforcer into a whole federated namespace. That is TERM
+//! #637. Standardising on `::` closed the vocabulary half; TERM #643 was the
+//! second instance of the same divergence (the copy still inferred provenance
+//! from a name's shape after this one had stopped), and the copy is now
+//! DELETED. `decide()` matches with [`Pattern::matches`] — this one.
 //!
-//! ## Status: authored here, ENFORCED elsewhere
+//! ## Status: authored here, and enforced with this matcher
 //!
 //! Scoped to THIS MODULE. The assembled subsystem's wiring state — which
 //! endpoints are mounted, what a connector can actually reach — has one account
@@ -103,28 +106,22 @@
 //! **What this module does today:** groups are authored, validated and stored
 //! through it, with every semantic below applying at WRITE time.
 //!
-//! **What it does not do today:** nothing calls [`resolve`] or
-//! [`resolve_groups`]. [`crate::oauth::store::OauthStore::client_authorized_groups`]
-//! has no consumer. The matcher on the ENFORCEMENT side is RMCP-07's own, in
-//! `scope.rs`, reading the same stored rows through `client_tool_groups`. So the
-//! fail-closed resolution semantics here — the empty-set rules, the aggregate
-//! bound, the read-path re-derivation of wildcard authority — govern what can be
-//! STORED, and are not the code that would decide a dispatch.
+//! **What the ENFORCEMENT path uses (TERM #637, done):**
+//! [`Pattern::parse_stored`] and [`Pattern::matches`], through
+//! [`crate::oauth::scope::ClientScope::from_rows`] and
+//! [`crate::oauth::scope::decide`]. The pattern semantics below therefore
+//! govern a dispatch as well as a write. What is still authoring-only is the
+//! resolve-a-whole-catalog entry point: [`resolve`] and [`resolve_groups`] have
+//! no caller on the request path, because `decide()` asks about ONE tool at a
+//! time and applies two further dimensions ([`crate::oauth::scope`]'s
+//! intersection) that this module deliberately knows nothing about.
 //!
-//! **When that changes:** TERM #637 sequences the matcher collapse — this item
-//! merges, then `ScopePattern` is deleted and `ClientScope::from_rows` points at
-//! this matcher, with the enforcement tests RE-POINTED rather than deleted
-//! alongside the parser. Until that lands, read anything below as a description
-//! of the authoring path.
-//!
-//! **Why the gap is not closed here.** Wiring this resolver into `tools/list` or
-//! `tools/call` from this branch would create a SECOND enforcement point beside
-//! RMCP-07's `effective()`, which already backs both the list filter and the
-//! call guard from one definition. Two authorization sites over one decision is
-//! how they come to disagree — silently, in the widening direction — which is
-//! the failure TERM #637 already documented once. So this item ships the matcher
-//! and the store and stops there, deliberately caller-less, and the collapse
-//! happens as its own change.
+//! **There is still exactly one enforcement SITE.** [`crate::oauth::scope::decide`]
+//! backs both the list filter and the call guard, and nothing here is wired
+//! into `tools/list` or `tools/call` directly. Two authorization sites over one
+//! decision is how they come to disagree — silently, in the widening direction
+//! — which is the failure TERM #637 documented. The collapse removed a
+//! duplicated MATCHER; it did not add a second door.
 //!
 //! ## Where authority comes from
 //! [`GroupOwner`] is an input to PURE validation here; it is not a claim a

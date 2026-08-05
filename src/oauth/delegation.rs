@@ -62,7 +62,10 @@
 //!    Permitting them would let a delegated account grant its connectors the
 //!    fleet's own tools — the widening this item exists to prevent — and no
 //!    client-side namespace row would ever bound it, because `decide()` applies
-//!    the namespace dimension only to namespaced NAMES.
+//!    the namespace dimension only to tools a namespace CONTRIBUTED (TERM #643;
+//!    it was "only to namespaced NAMES", which is the same sentence with a
+//!    guess where the fact belongs — a local tool named `peerhub__tool` is
+//!    still the operator's).
 //!
 //! Point 3 is the one that needed a shared rule rather than a check: it must
 //! hold at authoring time AND be re-derived at resolution time, so that an
@@ -82,11 +85,11 @@ use crate::oauth::model::ServerOwner;
 
 /// A grant pattern reduced to the only property delegation cares about.
 ///
-/// Both pattern vocabularies map onto this — [`crate::oauth::groups::Pattern`]
-/// (authoring) and [`crate::oauth::scope::ScopePattern`] (enforcing). Those two
-/// types are a known, documented duplication with a migration plan; the
-/// AUTHORITY rule over them is not duplicated, because both reduce to this
-/// shape and both ask [`owner_may_hold`].
+/// There is ONE pattern vocabulary — [`crate::oauth::groups::Pattern`] — and it
+/// maps onto this. It was two until TERM #637 collapsed the enforcing copy onto
+/// the authoring one; the AUTHORITY rule was never duplicated even then,
+/// because both reduced to this shape and both asked [`owner_may_hold`], and
+/// that is why the collapse did not have to re-decide it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PatternShape<'a> {
     /// The bare `*`.

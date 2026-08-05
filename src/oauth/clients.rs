@@ -1281,6 +1281,7 @@ mod tests {
     /// would be proving the account is limited, not the client.
     #[test]
     fn a_dcr_client_reaches_nothing_until_scoped() {
+        use crate::oauth::groups::CatalogTool;
         use crate::oauth::scope::{decide, ClientScope, Decision};
 
         let permits_everything = |_: &str| true;
@@ -1288,16 +1289,19 @@ mod tests {
         // namespaces.
         let unscoped = ClientScope::from_rows("rmcp-freshly-registered", &[], Vec::new());
 
+        // Both sides of the boundary: local entries, and one contributed by an
+        // upstream — an unscoped client reaches neither.
         for tool in [
-            "pg_query",
-            "ledger_read",
-            "vitals_summary",
-            "somenamespace::some_tool",
-            "utc_now",
+            CatalogTool::local("pg_query"),
+            CatalogTool::local("ledger_read"),
+            CatalogTool::local("vitals_summary"),
+            CatalogTool::from_upstream("somenamespace", "some_tool"),
+            CatalogTool::local("utc_now"),
         ] {
             assert!(
-                matches!(decide(&permits_everything, &unscoped, tool), Decision::Deny(_)),
-                "an unscoped client reached {tool}"
+                matches!(decide(&permits_everything, &unscoped, &tool), Decision::Deny(_)),
+                "an unscoped client reached {}",
+                tool.name
             );
         }
 

@@ -120,6 +120,27 @@ impl RoutingTable {
         self.routes.get(advertised_name).cloned().unwrap_or(Route::Local)
     }
 
+    /// The namespace this table sources `advertised_name` FROM — `None` for a
+    /// local entry, and for any name the table does not carry.
+    ///
+    /// This is the catalog's own record of PROVENANCE, and it is the only
+    /// honest answer to "which side of the namespace boundary is this tool
+    /// on". [`split_namespaced`] cannot answer it: it is purely syntactic, so a
+    /// LOCAL tool literally named `peerhub__tool` yields a namespace it does
+    /// not belong to (TERM #643). Authorization reads this; it does not inspect
+    /// the name.
+    ///
+    /// Absence resolves to local, which is the same default [`Self::get`]
+    /// applies and the same one [`resolve_call_route`] reaches for an
+    /// unrecognised prefix — so the answer here always agrees with where the
+    /// call would actually dispatch.
+    pub fn namespace_of(&self, advertised_name: &str) -> Option<&str> {
+        match self.routes.get(advertised_name) {
+            Some(Route::Upstream { namespace, .. }) => Some(namespace.as_str()),
+            Some(Route::Local) | None => None,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.routes.len()
     }
@@ -213,6 +234,54 @@ pub enum CallRoute<'a> {
     /// fall back to local dispatch (a namespaced name is never coincidentally
     /// a local tool).
     Unavailable { namespace: String },
+}
+
+impl CallRoute<'_> {
+    /// The namespace this call DISPATCHES to — `None` when it dispatches
+    /// locally.
+    ///
+    /// The call-path twin of [`RoutingTable::namespace_of`], and the value the
+    /// connector-scope gate reads instead of splitting the name (TERM #643). It
+    /// is deliberately taken from the resolved ROUTE, so the namespace
+    /// authorization is decided against is the namespace the call is about to
+    /// reach: an unhealthy-but-registered upstream still answers with its own
+    /// namespace (the call is refused for availability, not silently
+    /// reclassified as local), and a `__`-shaped name whose prefix names no
+    /// registered upstream answers `None`, because that is where it dispatches.
+    pub fn namespace(&self) -> Option<&str> {
+        match self {
+            CallRoute::Local => None,
+            CallRoute::Upstream { client, .. } => Some(client.namespace()),
+            CallRoute::Unavailable { namespace } => Some(namespace.as_str()),
+        }
+    }
+}
+
+/// Where the advertised names in ONE catalog evaluation come from.
+///
+/// Exists so a caller cannot reach the authorization path without stating,
+/// explicitly, which of the two situations it is in. A plain
+/// `Option<&RoutingTable>` would have made "I forgot to thread the routing
+/// through" and "this process federates nothing" the same value — and they are
+/// not the same: treating a federated tool as local skips the
+/// `namespaces(client)` half of the intersection entirely, which is a widening.
+/// Naming the variant [`Self::AllLocal`] makes that a claim someone wrote down.
+pub enum CatalogSource<'a> {
+    /// This process federates no mesh upstreams, so every advertised name is a
+    /// local one. True exactly when `mesh_pool` is unset.
+    AllLocal,
+    /// Provenance as the merge layer routed it.
+    Routed(&'a RoutingTable),
+}
+
+impl CatalogSource<'_> {
+    /// The namespace `advertised_name` was contributed by, or `None` for local.
+    pub fn namespace_of(&self, advertised_name: &str) -> Option<&str> {
+        match self {
+            CatalogSource::AllLocal => None,
+            CatalogSource::Routed(routing) => routing.namespace_of(advertised_name),
+        }
+    }
 }
 
 /// Route a single advertised `tools/call` name against `pool`'s current
