@@ -92,23 +92,24 @@
 //! enforcer into a whole federated namespace. That is TERM #637; the resolution
 //! was to standardise on `::`, which is what this module now uses.
 //!
-//! ## Status: authored here, ENFORCED elsewhere (the one account of this)
+//! ## Status: authored here, ENFORCED elsewhere
 //!
-//! This is the single authoritative statement of what is and is not wired. The
-//! README points here rather than restating it, because a second account is how
-//! documentation drifts from the code it describes.
+//! Scoped to THIS MODULE. The assembled subsystem's wiring state — which
+//! endpoints are mounted, what a connector can actually reach — has one account
+//! and it is not this one: see *Exactly what is wired today* in the README. It
+//! already records that scope resolution is not wired into `terminus_primary`,
+//! so nothing below should be read as describing a live authorization path.
 //!
 //! **What this module does today:** groups are authored, validated and stored
 //! through it, with every semantic below applying at WRITE time.
 //!
 //! **What it does not do today:** nothing calls [`resolve`] or
-//! [`resolve_groups`] on the request path. [`crate::oauth::store::OauthStore::client_authorized_groups`]
-//! has no consumer in the enforcement decision. The effective enforcement point
-//! is RMCP-07's own matcher in `scope.rs`, which reads the same stored rows
-//! through `client_tool_groups`. So the fail-closed resolution semantics here —
-//! the empty-set rules, the aggregate bound, the read-path re-derivation of
-//! wildcard authority — govern what can be STORED, and do not yet govern what is
-//! ALLOWED at dispatch.
+//! [`resolve_groups`]. [`crate::oauth::store::OauthStore::client_authorized_groups`]
+//! has no consumer. The matcher on the ENFORCEMENT side is RMCP-07's own, in
+//! `scope.rs`, reading the same stored rows through `client_tool_groups`. So the
+//! fail-closed resolution semantics here — the empty-set rules, the aggregate
+//! bound, the read-path re-derivation of wildcard authority — govern what can be
+//! STORED, and are not the code that would decide a dispatch.
 //!
 //! **When that changes:** TERM #637 sequences the matcher collapse — this item
 //! merges, then `ScopePattern` is deleted and `ClientScope::from_rows` points at

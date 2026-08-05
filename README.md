@@ -1158,13 +1158,12 @@ small list of patterns over the tool catalog — so an operator scopes a connect
 live catalog rather than expanded once and stored, so a newly registered tool matching an
 existing pattern needs no config edit.
 
-> **Status — authored here, enforced elsewhere.** Everything below describes how groups are
-> **authored, validated and stored**. It does not yet describe what authorizes a request:
-> nothing calls this resolver on the request path, and the effective enforcement point is
-> still RMCP-07's own matcher, reading the same stored rows. TERM #637 sequences the
-> collapse of the two. The single authoritative account of what is and is not wired lives in
-> the `Status` section of the `src/oauth/groups.rs` module docs — this note points there
-> rather than restating it.
+> **Everything below describes how groups are authored, validated and stored — not what
+> authorizes a request.** Two pointers rather than a third account of either: for the
+> assembled system's wiring state see *Exactly what is wired today* above, which is this
+> file's single account of it and already records that scope resolution is not wired; for
+> which matcher owns these pattern semantics until TERM #637 collapses the two, see the
+> `Status` section of the `src/oauth/groups.rs` module docs.
 
 ### Pattern syntax
 
