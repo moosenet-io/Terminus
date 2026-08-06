@@ -19,6 +19,180 @@ use serde::Deserialize;
 
 use crate::error::ToolError;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Fleet-identifier anchoring — ONE home, shared by the gate and the mirror
+// cleaner (`crate::forge::mirror::native_clean`).
+//
+// TERM #661. The gate detector and the mirror cleaner used to each carry their
+// OWN copy of the fleet-identifier regexes, and they drifted. Both anchored the
+// internal-hostname rule with a LEADING `\b`:
+//
+//     detector  (?i)\b(?:<host>|<host>|<host>|<host>|<host>)\b  // pii-test-fixture
+//     cleaner   (?i)\b(?:<host>|<host>|<host>|<host>|<host>)\d*\b  // pii-test-fixture
+//
+// In `multimodal_pvf1` the character before the token is `_`, which IS a word  // pii-test-fixture
+// character, so there is no `\b` there and NEITHER regex matched. The sweep
+// returned 0 residuals, the mirror auto-approved, and the internal GPU hostname
+// was published live on the public mirror (measured 2026-08-06: 6 occurrences
+// across 3 files, including a `.yaml` preset name and two `host_pvf1` fixtures).  // pii-test-fixture
+// The gate was not switched off — bare `<host>` was being scrubbed correctly on  // pii-test-fixture
+// the same run. It had exactly this hole.
+//
+// The fix is BOTH halves of the defect:
+//   1. Underscore is treated as a token SEPARATOR on the leading side, via
+//      [`is_token_start`] — see that function for why this cannot flood.
+//   2. The pattern source AND its anchoring now live in exactly one place, as
+//      the `*_pattern()` constructors below. Both files call the same
+//      constructor, so the two can no longer drift apart.
+//
+// Deliberately NOT changed: every TRAILING anchor. The trailing `\b` is a
+// load-bearing false-positive guard in two separate ways, and loosening it is
+// how this fix would have made the gate worse than the hole it closes:
+//   * `\d*\b` on the short host tokens is what stops `<host>` matching inside  // pii-test-fixture
+//     `pvenv`, and what keeps the fleet's own `pve__get_nodes` /
+//     `pve_status` mesh tool names intact.
+//   * `\b` on the infra-service tokens is what stops `<secret-manager>` matching  // pii-test-fixture
+//     inside `INFISICAL_CLIENT_ID`. Measured on this tree: loosening it would
+//     have rewritten ~40 env-var names across the docs. A gate that mangles
+//     documentation is a gate that gets switched off.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `true` when byte offset `at` in `hay` begins an identifier token: either the
+/// start of input, or the character immediately before it is not alphanumeric.
+///
+/// This is `\b` PLUS "underscore is a separator". The only characters it admits
+/// over a leading `\b` are the ones `\w` counts as word characters but an
+/// identifier uses as separators — in practice `_`. A preceding LETTER or DIGIT
+/// still blocks the match, and that is the whole false-positive guard: `<host>`  // pii-test-fixture
+/// still cannot match inside `improve`, and `<operator>` still cannot match inside  // pii-test-fixture
+/// `trumpeter`, because in both the preceding character is a letter.
+pub(crate) fn is_token_start(hay: &str, at: usize) -> bool {
+    match hay[..at].chars().next_back() {
+        None => true,
+        Some(c) => !c.is_alphanumeric(),
+    }
+}
+
+/// A fleet-identifier pattern plus its leading-boundary rule.
+///
+/// The `regex` crate has no look-behind, so "not preceded by an alphanumeric"
+/// cannot be written inline without consuming the preceding character — which
+/// would break back-to-back matches (`pvf1_pvf1`). Keeping the check in code  // pii-test-fixture
+/// instead means the exact same predicate governs BOTH the detector's
+/// [`Self::find_iter`] and the cleaner's [`Self::replace_all`].
+pub(crate) struct BoundedPattern {
+    re: Regex,
+    require_token_start: bool,
+}
+
+impl BoundedPattern {
+    fn new(src: &str, require_token_start: bool) -> Self {
+        Self { re: Regex::new(src).expect("bounded fleet-identifier pattern"), require_token_start }
+    }
+
+    /// A pattern with NO leading-boundary condition — behaves exactly like a
+    /// plain `Regex`. For rules that carry their own anchors in the source
+    /// (or deliberately have none).
+    pub(crate) fn unbounded(src: &str) -> Self {
+        Self::new(src, false)
+    }
+
+    /// Every match that satisfies the leading-boundary rule.
+    pub(crate) fn find_iter<'h>(
+        &'h self,
+        hay: &'h str,
+    ) -> impl Iterator<Item = regex::Match<'h>> + 'h {
+        let require = self.require_token_start;
+        self.re.find_iter(hay).filter(move |m| !require || is_token_start(hay, m.start()))
+    }
+
+    /// Replace every boundary-satisfying match with `repl`.
+    ///
+    /// Every pattern here is single-line, so this preserves the line count —
+    /// the mirror's corruption invariant.
+    pub(crate) fn replace_all(&self, hay: &str, repl: &str) -> String {
+        if !self.require_token_start {
+            return self.re.replace_all(hay, regex::NoExpand(repl)).into_owned();
+        }
+        let mut out = String::with_capacity(hay.len());
+        let mut last = 0usize;
+        for m in self.re.find_iter(hay) {
+            if !is_token_start(hay, m.start()) {
+                continue;
+            }
+            out.push_str(&hay[last..m.start()]);
+            out.push_str(repl);
+            last = m.end();
+        }
+        out.push_str(&hay[last..]);
+        out
+    }
+}
+
+/// Private RFC-1918 address. No leading boundary at all: an IP abutted by a
+/// word character is still an IP (`\x02<internal-ip>` in a binary-blob fixture, // pii-test-fixture
+/// `svc_<internal-ip>` in a diagram fixture). The trailing `\b` is kept so a // pii-test-fixture
+/// final octet is never truncated.
+pub(crate) fn private_ip_pattern() -> BoundedPattern {
+    BoundedPattern::new(
+        r"(?:192\.168|10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b",
+        false,
+    )
+}
+
+/// Proxmox container id. `CT` + 3-or-more digits is specific enough to need no
+/// boundary on either side: `<host>ssh` (a newline-collapsed backlog dump) and  // pii-test-fixture
+/// `"clean\nCT327\n"` (an escape-abutted string literal, which was published  // pii-test-fixture
+/// live) both have to scrub, and `\d{3,}` naturally stops at the first
+/// non-digit.
+pub(crate) fn container_id_pattern() -> BoundedPattern {
+    BoundedPattern::new(r"CT\d{3,}", false)
+}
+
+/// Internal host tokens long enough to be unambiguous. `<host>` and `<host>`  // pii-test-fixture
+/// are not substrings of any ordinary word, so they carry NO boundary anchors
+/// at all — `multimodal_pvf1`, `host_pvf1`, `pvf1_bar` and `pvf1x` all scrub.  // pii-test-fixture
+pub(crate) fn host_unambiguous_pattern() -> BoundedPattern {
+    BoundedPattern::new(r"(?i)<host>\d*|<host>", false) // pii-test-fixture
+}
+
+/// Internal host tokens that ARE substrings of ordinary words. These keep the
+/// trailing `\d*\b` guard (`<host>` must not match inside `pvenv`) and gain the  // pii-test-fixture
+/// leading underscore-separator rule (`_pve` must match).  // pii-test-fixture
+pub(crate) fn host_short_pattern() -> BoundedPattern {
+    BoundedPattern::new(r"(?i)(?:<host>|<host>|<host>)\d*\b", true) // pii-test-fixture
+}
+
+/// Named infra services, paired with the mirror cleaner's placeholder.
+///
+/// These keep BOTH `\b` anchors — the only rules here that do, and deliberately
+/// so. A service name is not a fleet address: unlike a hostname it identifies a
+/// product, not a machine, and in this codebase it appears mostly INSIDE
+/// production symbol names (`fetch_downstream_secrets_from_infisical`,
+/// `probe_infisical`) and env-var names (`INFISICAL_CLIENT_ID`). Loosening
+/// either side was measured on this tree: 16 production symbols and ~40 doc
+/// env-var names would start being rewritten, which buys no hostname-level
+/// exposure and would force renaming live code to satisfy the gate. That is the
+/// shape of a gate that gets switched off. Standalone mentions — the ones that
+/// actually read as "this fleet runs X" — are still caught, exactly as today.
+pub(crate) fn infra_service_patterns() -> Vec<(BoundedPattern, &'static str)> {
+    vec![
+        (BoundedPattern::unbounded(r"(?i)\binfisical\b"), "<secret-manager>"), // pii-test-fixture
+        (BoundedPattern::unbounded(r"(?i)\bportainer\b"), "<container-mgr>"),  // pii-test-fixture
+        (BoundedPattern::unbounded(r"(?i)\btuwunel\b"), "<matrix-server>"),    // pii-test-fixture
+        (BoundedPattern::unbounded(r"(?i)\bjellyseerr\b"), "<media-service>"), // pii-test-fixture
+    ]
+}
+
+/// The operator's first name and handle. Trailing `\b` kept so a surname or a
+/// longer word ending in the same letters is untouched.
+pub(crate) fn operator_name_patterns() -> Vec<BoundedPattern> {
+    vec![
+        BoundedPattern::new(r"(?i)<operator>\b", true), // pii-test-fixture
+        BoundedPattern::new(r"(?i)<operator>\b", true), // pii-test-fixture
+    ]
+}
+
 /// One detected PII match. `context` is a short, redacted snippet — the full
 /// matched secret is NEVER stored or echoed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,30 +203,31 @@ pub struct PiiViolation {
 }
 
 struct Patterns {
-    private_ip: Regex,
-    container_id: Regex,
-    internal_host: Regex,
+    private_ip: BoundedPattern,
+    container_id: BoundedPattern,
+    host_unambiguous: BoundedPattern,
+    host_short: BoundedPattern,
     internal_domain: Regex,
     email: Regex,
     phone: Regex,
     api_key: Regex,
     internal_path: Regex,
-    infra_service: Regex,
+    infra_service: Vec<BoundedPattern>,
     uuid: Regex,
     date_like: Regex,
-    operator_name: Regex,
+    operator_name: Vec<BoundedPattern>,
 }
 
 fn patterns() -> &'static Patterns {
     static P: OnceLock<Patterns> = OnceLock::new();
     P.get_or_init(|| Patterns {
-        private_ip: Regex::new(
-            r"\b(?:192\.168|10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b",
-        )
-        .expect("private_ip regex"),
-        container_id: Regex::new(r"\bCT\d{3}\b").expect("container_id regex"),
-        internal_host: Regex::new(r"(?i)\b(?:<host>|<host>|<host>|<host>|<host>)\b") // pii-test-fixture
-            .expect("internal_host regex"),
+        // Fleet identifiers: built from the shared constructors above, which are
+        // the SAME ones the mirror cleaner uses. Do not inline a regex here —
+        // that is exactly the drift that published a hostname (TERM #661).
+        private_ip: private_ip_pattern(),
+        container_id: container_id_pattern(),
+        host_unambiguous: host_unambiguous_pattern(),
+        host_short: host_short_pattern(),
         internal_domain: Regex::new(r"moosenet\.online|moosenet\.local")
             .expect("internal_domain regex"),
         email: Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
@@ -98,8 +273,7 @@ fn patterns() -> &'static Patterns {
             .expect("api_key regex"),
         internal_path: Regex::new(r"<path>/|<path>/|<path>/|/opt/lumina[a-z0-9-]*/") // pii-test-fixture
             .expect("internal_path regex"),
-        infra_service: Regex::new(r"(?i)\b(?:<matrix-server>|<secret-manager>|<media-service>|<container-mgr>)\b") // pii-test-fixture
-            .expect("infra_service regex"),
+        infra_service: infra_service_patterns().into_iter().map(|(re, _)| re).collect(),
         uuid: Regex::new(
             r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
         )
@@ -125,7 +299,7 @@ fn patterns() -> &'static Patterns {
         // close theirs, as an unconditional built-in pattern (not an
         // opt-in config term) so it's caught everywhere `scan_for_pii`
         // runs, including this crate's own self-check.
-        operator_name: Regex::new(r"(?i)\bpeter\b").expect("operator_name regex"),
+        operator_name: operator_name_patterns(),
     })
 }
 
@@ -241,7 +415,10 @@ fn scan_line(
     for m in p.container_id.find_iter(line) {
         push("container_id", m.as_str());
     }
-    for m in p.internal_host.find_iter(line) {
+    for m in p.host_unambiguous.find_iter(line) {
+        push("internal_hostname", m.as_str());
+    }
+    for m in p.host_short.find_iter(line) {
         push("internal_hostname", m.as_str());
     }
     for m in p.internal_domain.find_iter(line) {
@@ -253,11 +430,15 @@ fn scan_line(
     for m in p.internal_path.find_iter(line) {
         push("internal_path", m.as_str());
     }
-    for m in p.infra_service.find_iter(line) {
-        push("infra_service", m.as_str());
+    for re in &p.infra_service {
+        for m in re.find_iter(line) {
+            push("infra_service", m.as_str());
+        }
     }
-    for m in p.operator_name.find_iter(line) {
-        push("operator_name", m.as_str());
+    for re in &p.operator_name {
+        for m in re.find_iter(line) {
+            push("operator_name", m.as_str());
+        }
     }
 
     // Emails: allow-list exception for author attribution.
@@ -436,12 +617,17 @@ pub fn scan_and_redact(content: &str) -> (String, Vec<PiiViolation>) {
 
         collect!(p.private_ip, "private_ip");
         collect!(p.container_id, "container_id");
-        collect!(p.internal_host, "internal_hostname");
+        collect!(p.host_unambiguous, "internal_hostname");
+        collect!(p.host_short, "internal_hostname");
         collect!(p.internal_domain, "internal_domain");
         collect!(p.api_key, "api_key");
         collect!(p.internal_path, "internal_path");
-        collect!(p.infra_service, "infra_service");
-        collect!(p.operator_name, "operator_name");
+        for re in &p.infra_service {
+            collect!(re, "infra_service");
+        }
+        for re in &p.operator_name {
+            collect!(re, "operator_name");
+        }
 
         for m in p.email.find_iter(line) {
             if !email_is_allowed(m.as_str(), &allow) {
@@ -1102,6 +1288,128 @@ mod tests {
         assert!(pii_gate("<host>").is_err()); // pii-test-fixture
         // case-insensitive
         assert!(!scan_for_pii("<host>").is_empty()); // pii-test-fixture
+    }
+
+    // ── TERM #661: underscore-abutted fleet identifiers ──────────────────────
+    // The regression. `_` is a WORD character, so a leading `\b` never fires
+    // before a token that follows one. `multimodal_pvf1` therefore passed the  // pii-test-fixture
+    // sweep clean and the internal GPU hostname was published live on the
+    // public mirror. These are `assert!`, not `debug_assert!` — the test gate
+    // builds `--release` (TERM #659), where a `debug_assert!` passes vacuously.
+
+    #[test]
+    #[serial]
+    fn underscore_abutted_hostname_is_detected() {
+        clear_allow();
+        // The exact published line, from src/model_advisor/mod.rs.
+        let v = scan_for_pii(r#"assert_eq!(v["preset_name"], "multimodal_pvf1");"#); // pii-test-fixture
+        assert!(
+            v.iter().any(|x| x.category == "internal_hostname"),
+            "underscore-abutted hostname must be detected, got {v:?}"
+        );
+        assert!(pii_gate("multimodal_pvf1").is_err()); // pii-test-fixture
+        // Every abutment shape, leading and trailing.
+        for s in ["foo_pvf1", "foo-<host>", "pvf1_bar", "host_pvf1.internal", "PVF1_X"] {  // pii-test-fixture
+            // pii-test-fixture
+            assert!(
+                scan_for_pii(s).iter().any(|x| x.category == "internal_hostname"),
+                "must detect hostname in {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn bare_hostname_detection_is_unchanged_control() {
+        clear_allow();
+        // Control for the mutation runs: the form that ALREADY worked must keep
+        // working, so a green suite can never mean "detection was weakened".
+        assert!(scan_for_pii("ran on <host> build host") // pii-test-fixture
+            .iter()
+            .any(|x| x.category == "internal_hostname"));
+    }
+
+    #[test]
+    #[serial]
+    fn word_containing_a_host_token_is_still_not_a_hostname() {
+        clear_allow();
+        // THE false-positive guard. A preceding/following LETTER still blocks
+        // the match — only `_`/`-` became separators. If this ever fails, the
+        // gate is about to flood and get switched off, which is strictly worse
+        // than the hole it was closing.
+        for s in ["pvenv activate", "the pvenv dir", "improve the pvest", "trumpeter solo"] {
+            let v = scan_for_pii(s);
+            assert!(
+                !v.iter().any(|x| x.category == "internal_hostname"),
+                "{s:?} must not be a hostname, got {v:?}"
+            );
+            assert!(
+                !v.iter().any(|x| x.category == "operator_name"),
+                "{s:?} must not be an operator name, got {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn short_host_tokens_keep_their_trailing_guard() {
+        clear_allow();
+        // `<host>` gains the leading underscore separator...  // pii-test-fixture
+        assert!(scan_for_pii("mesh_pve upstream") // pii-test-fixture
+            .iter()
+            .any(|x| x.category == "internal_hostname"));
+        // ...but the TRAILING `\b` is deliberately kept, so the fleet's own
+        // mesh tool names are not rewritten. Loosening this is the flood.
+        for s in ["pve__get_nodes", "pve_status", "pve_start_ct"] {
+            assert!(
+                !scan_for_pii(s).iter().any(|x| x.category == "internal_hostname"),
+                "{s:?} must stay untouched (trailing guard)"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn infra_service_env_var_names_are_not_flagged() {
+        clear_allow();
+        // The other half of the flood guard: loosening the TRAILING `\b` here
+        // would have rewritten ~40 env-var names across this repo's docs.
+        for s in ["INFISICAL_CLIENT_ID", "JELLYSEERR_URL=", "portainer_api_token"] {
+            assert!(
+                !scan_for_pii(s).iter().any(|x| x.category == "infra_service"),
+                "{s:?} must not be flagged as infra_service"
+            );
+        }
+        // A real STANDALONE mention still is — that is the form that actually
+        // reads as "this fleet runs X", and it is unchanged from before.
+        assert!(scan_for_pii("via <secret-manager>") // pii-test-fixture
+            .iter()
+            .any(|x| x.category == "infra_service"));
+        // And the deliberate limit, asserted so it is a decision and not an
+        // oversight: infra_service is the ONE rule that keeps BOTH `\b`
+        // anchors, so an underscore-abutted service name inside a symbol is
+        // NOT flagged. Extending the leading rule here was measured at 16
+        // production symbols; extending the trailing one at ~40 doc env-var
+        // names. Neither buys hostname-level exposure. If a future change
+        // makes this assertion fail, that is the flood arriving — re-measure
+        // before deciding it is an improvement.
+        assert!(!scan_for_pii("fetch_secrets_from_infisical()") // pii-test-fixture
+            .iter()
+            .any(|x| x.category == "infra_service"));
+    }
+
+    #[test]
+    #[serial]
+    fn abutted_container_id_and_private_ip_are_detected() {
+        clear_allow();
+        // `"clean\nCT327\n"` — in the FILE bytes the escape's `n` abuts the id,  // pii-test-fixture
+        // so the old `\bCT\d{3}\b` missed it. Measured live on the mirror.
+        assert!(scan_for_pii(r#"let content = "clean\nCT327\n";"#) // pii-test-fixture
+            .iter()
+            .any(|x| x.category == "container_id"));
+        assert!(scan_for_pii("fixture_subsystem(\"svc_<internal-ip>\", 30)") // pii-test-fixture
+            .iter()
+            .any(|x| x.category == "private_ip"));
     }
 
     #[test]

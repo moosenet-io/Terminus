@@ -22,9 +22,20 @@
 //!    cannot unbalance a quote or collapse a statement). Because the operator
 //!    forbids ANY internal IP/hostname in public **even inside a
 //!    `pii-test-fixture`-tagged line**, these identifier rules deliberately ignore
-//!    the exemption tag AND drop the gate's leading/trailing `\b` so ABUTTED forms
-//!    scrub too (`<host>ssh` from a newline-collapsed backlog dump; `\x02<internal-ip>`
-//!    in a binary-blob test fixture).
+//!    the exemption tag and loosen the boundaries so ABUTTED forms scrub too
+//!    (`<host>ssh` from a newline-collapsed backlog dump; `\x02<internal-ip>` in a  // pii-test-fixture
+//!    binary-blob test fixture; `multimodal_pvf1` as a preset name).  // pii-test-fixture
+//!
+//!    **These identifier patterns are NOT defined here.** They are built from
+//!    the shared constructors in [`crate::github::pii`] — the same ones the gate
+//!    detector uses. TERM #661: this file and the gate each used to carry their
+//!    own copy, both anchored with a leading `\b`, and `_` is a word character,
+//!    so neither matched `multimodal_pvf1` and the internal GPU hostname went  // pii-test-fixture
+//!    live on the public mirror. A rule that has to agree in two places will
+//!    eventually not; it now has one home. Note the boundary loosening is
+//!    asymmetric on purpose: the leading side treats `_` as a separator, the
+//!    TRAILING `\b` is kept (it is what stops `<host>` matching inside `pvenv` and  // pii-test-fixture
+//!    `<secret-manager>` inside `INFISICAL_CLIENT_ID`).  // pii-test-fixture
 //!
 //! 2. **Secret-shaped tokens are TOKEN-BOUNDED and SINGLE-LINE.** Every secret
 //!    pattern's tail is a bounded token class (`[A-Za-z0-9_\-]{N,}`, never `\S+`)
@@ -48,7 +59,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 
 use crate::error::ToolError;
-use crate::github::pii::TreeViolation;
+use crate::github::pii::{self, BoundedPattern, TreeViolation};
 
 use super::clean::ResidualCleaner;
 use super::sweep::read_text;
@@ -68,8 +79,14 @@ struct CleanPatterns {
     /// `field: "value"` where the field name is secret/token/password/key-shaped,
     /// value single-line → `field: "<REDACTED-SECRET>"`. Named group `field`.
     secret_field: Regex,
-    /// Ordered fleet-identifier substitutions (regex, replacement).
-    literal: Vec<(Regex, &'static str)>,
+    /// Ordered fleet-identifier substitutions (pattern, replacement).
+    ///
+    /// TERM #661: the identifier patterns here are NOT written out locally —
+    /// they are built from the shared constructors in [`crate::github::pii`],
+    /// the same ones the gate detector uses. Two hand-maintained copies of
+    /// these regexes drifted once and published an internal hostname; a rule
+    /// that must agree in two places will eventually not.
+    literal: Vec<(BoundedPattern, &'static str)>,
     /// A canonical v4-shaped UUID (scrubbed only on cue lines).
     uuid: Regex,
 }
@@ -109,42 +126,35 @@ fn patterns() -> &'static CleanPatterns {
         )
         .expect("mirror clean secret_field regex");
 
-        let literal: Vec<(Regex, &'static str)> = vec![
-            // private_ip — NO leading \b (catches an IP abutted by a word char,
-            // e.g. `\x02<internal-ip>`). Trailing \b kept so `.11` isn't truncated.
-            (
-                Regex::new(r"(?:192\.168|10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b")
-                    .unwrap(),
-                "<internal-ip>",
-            ),
-            // container_id + internal_host — NO trailing boundary (catches
-            // `<host>ssh`, `pvf1x`), broader than the gate's `\b…\b` on purpose.
-            (Regex::new(r"\bCT\d{3,}").unwrap(), "<host>"),
-            // Host names + an optional numeric suffix only (`<host>`, `<host>`, `<host>`).  // pii-test-fixture
-            // NOT `\w*`: a trailing `\w*` under `(?i)` would swallow ordinary words
-            // that merely start with a host token (`<host>` → `pvenv`). The `\bCT\d{3,}`  // pii-test-fixture
-            // rule above already handles the abutted-container case (`<host>ssh`),
-            // where `\d{3,}` naturally stops at the first non-digit.
-            (Regex::new(r"(?i)\b(?:<host>|<host>|<host>|<host>|<host>)\d*\b").unwrap(), "<host>"),  // pii-test-fixture
+        // A cleaner-only rule: no leading-boundary condition, so it behaves
+        // exactly like a plain `Regex::replace_all`.
+        let plain = |src: &str| BoundedPattern::unbounded(src);
+
+        let mut literal: Vec<(BoundedPattern, &'static str)> = vec![
+            // private_ip / container_id / internal hostnames — SHARED with the
+            // gate detector (see `crate::github::pii`). Their anchoring lives
+            // there and nowhere else.
+            (pii::private_ip_pattern(), "<internal-ip>"),
+            (pii::container_id_pattern(), "<host>"),
+            (pii::host_unambiguous_pattern(), "<host>"),
+            (pii::host_short_pattern(), "<host>"),
             // internal_domain
-            (Regex::new(r"moosenet\.online|moosenet\.local").unwrap(), "example.com"),
+            (plain(r"moosenet\.online|moosenet\.local"), "example.com"),
             // internal_path
             (
-                Regex::new(r"<path>/|<path>/|<path>/|/opt/lumina[a-z0-9-]*/").unwrap(),  // pii-test-fixture
+                plain(r"<path>/|<path>/|<path>/|/opt/lumina[a-z0-9-]*/"),  // pii-test-fixture
                 "<path>/",
             ),
-            // infra_service → readable placeholders
-            (Regex::new(r"(?i)\bInfisical\b").unwrap(), "<secret-manager>"),
-            (Regex::new(r"(?i)\bPortainer\b").unwrap(), "<container-mgr>"),
-            (Regex::new(r"(?i)\bTuwunel\b").unwrap(), "<matrix-server>"),
-            (Regex::new(r"(?i)\bJellyseerr\b").unwrap(), "<media-service>"),
-            // operator email/handle (email FIRST so the generic-email rule below
-            // doesn't shadow it), then the bare handle/name.
-            (Regex::new(r"(?i)\bpboose@gmail\.com\b").unwrap(), "<operator-email>"),
-            (Regex::new(r"(?i)\bpeter\b").unwrap(), "<operator>"),
-            (Regex::new(r"(?i)\bpboose\b").unwrap(), "<operator>"),
+        ];
+        // infra_service → readable placeholders (shared patterns + placeholders).
+        literal.extend(pii::infra_service_patterns());
+        // operator email FIRST so the generic-email rule below doesn't shadow it,
+        // then the shared bare handle/name patterns.
+        literal.push((plain(r"(?i)\bpboose@gmail\.com\b"), "<operator-email>"));
+        literal.extend(pii::operator_name_patterns().into_iter().map(|re| (re, "<operator>")));
+        literal.extend([
             // generic email — last
-            (Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").unwrap(), "<email>"),
+            (plain(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "<email>"),
             // Canonical phone numbers (GHMRFIX-6) — the SAME shapes the gate's
             // `phone` detector flags (E.164, or grouped 3-3-4 NANP), so a phone the
             // gate would withhold on gets scrubbed by the mirror instead. Found in
@@ -152,10 +162,10 @@ fn patterns() -> &'static CleanPatterns {
             // (`"phone": "<phone>"`) tripped it. The strict shapes (canonical  // pii-test-fixture
             // only, matching GHMRFIX-4) keep this from mangling dates/versions/math.
             (
-                Regex::new(r"(?:\+\d[\d \-]{5,13}\d)|(?:\b\(?\d{3}\)?[ \-]\d{3}[ \-]\d{4}\b)").unwrap(),
+                plain(r"(?:\+\d[\d \-]{5,13}\d)|(?:\b\(?\d{3}\)?[ \-]\d{3}[ \-]\d{4}\b)"),
                 "<phone>",
             ),
-        ];
+        ]);
 
         let uuid =
             Regex::new(r"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap();
@@ -187,9 +197,11 @@ impl DeterministicCleaner {
             .replace_all(&out, r#"${field}"<REDACTED-SECRET>""#)
             .into_owned();
         for (re, repl) in &p.literal {
-            // `replace_all` treats `$` in the replacement as a group ref; none of
-            // our placeholders contain `$`, so a plain &str is safe.
-            out = re.replace_all(&out, *repl).into_owned();
+            // `BoundedPattern::replace_all` substitutes the replacement
+            // LITERALLY (no `$group` expansion) and applies the shared
+            // leading-boundary rule, so the cleaner and the gate agree on
+            // exactly which spans are fleet identifiers.
+            out = re.replace_all(&out, repl);
         }
         // UUIDs: only on a line that also carries an infra-secret cue. Skip the
         // per-line pass entirely when no UUID is present (the common case).
@@ -353,11 +365,67 @@ mod tests {
             "host <host> at <internal-ip> on <host>"
         );
         // Abutted: <host> inside <host>ssh, IP after a `\x02` escape's digit.  // pii-test-fixture
-        assert_eq!(scrub("verified on <host>ssh root@"), "verified on <host>ssh root@");
-        assert_eq!(scrub("start\\0\\x02<internal-ip> end"), "start\\0\\x02<internal-ip> end");
+        assert_eq!(scrub("verified on <host>ssh root@"), "verified on <host>ssh root@");  // pii-test-fixture
+        assert_eq!(scrub("start\\0\\x02<internal-ip> end"), "start\\0\\x02<internal-ip> end");  // pii-test-fixture
         // internal domain + infra service + operator.
         assert_eq!(scrub("git.example.com via <secret-manager> for <operator>"),  // pii-test-fixture
                    "git.example.com via <secret-manager> for <operator>");
+    }
+
+    // ── TERM #661: the cleaner's half of the underscore hole ─────────────────
+    #[test]
+    fn underscore_abutted_identifiers_are_scrubbed() {
+        // The exact published line. `_` is a word char, so the old leading `\b`
+        // never fired and this shipped to the public mirror verbatim.
+        assert_eq!(
+            scrub(r#"assert_eq!(v["preset_name"], "multimodal_pvf1");"#), // pii-test-fixture
+            r#"assert_eq!(v["preset_name"], "multimodal_<host>");"#
+        );
+        assert_eq!(scrub("host_pvf1 -> status"), "host_<host> -> status"); // pii-test-fixture
+        assert_eq!(scrub("pvf1_bar and foo-<host>"), "<host>_bar and foo-<host>"); // pii-test-fixture
+        // Back-to-back matches: the boundary check must not consume the
+        // separator, or the second occurrence would survive.
+        assert_eq!(scrub("pvf1_pvf1_pvf1"), "<host>_<host>_<host>"); // pii-test-fixture
+        // Escape-abutted container id, and an underscore-abutted IP.
+        assert_eq!(scrub(r#""clean\nCT327\n""#), r#""clean\n<host>\n""#); // pii-test-fixture
+        assert_eq!(scrub("svc_<internal-ip>"), "svc_<internal-ip>"); // pii-test-fixture
+    }
+
+    #[test]
+    fn bare_identifier_scrub_is_unchanged_control() {
+        // Control for the mutation runs: the forms that ALREADY scrubbed must
+        // keep scrubbing, so green can never mean "the cleaner was weakened".
+        assert_eq!(scrub("host <host> here"), "host <host> here"); // pii-test-fixture
+        assert_eq!(scrub("on <host> now"), "on <host> now"); // pii-test-fixture
+        assert_eq!(scrub("at <internal-ip>"), "at <internal-ip>"); // pii-test-fixture
+    }
+
+    #[test]
+    fn the_false_positive_guard_still_holds() {
+        // A preceding/following LETTER still blocks the match. A cleaner that
+        // mangles ordinary words or the fleet's own identifiers gets switched
+        // off, which is worse than the hole it closes.
+        for s in [
+            "pvenv activate",
+            "the pvenv dir",
+            "pve__get_nodes",
+            "pve_status probe",
+            "INFISICAL_CLIENT_ID",
+            "JELLYSEERR_URL=",
+            "trumpeter solo",
+        ] {
+            assert_eq!(scrub(s), s, "{s:?} must be left alone");
+        }
+    }
+
+    #[test]
+    fn abutted_scrubs_preserve_line_count() {
+        // The mirror's corruption invariant, on the newly-matching shapes.
+        let block = "let a = \"multimodal_pvf1\";\nlet b = \"host_pvf1\";\nlet c = 1;\n"; // pii-test-fixture
+        let out = scrub(block);
+        assert_eq!(out.matches('\n').count(), block.matches('\n').count());
+        assert!(!out.contains("<host>"), "no residual hostname: {out}"); // pii-test-fixture
+        assert!(out.contains("let c = 1;"), "following statement intact: {out}");
     }
 
     // ── public tool names & synthetic non-PII are left intact ──
