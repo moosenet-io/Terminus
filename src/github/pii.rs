@@ -130,6 +130,19 @@ impl BoundedPattern {
         Self::new(src, false)
     }
 
+    /// The compiled pattern source. Exists so the mirror cleaner's
+    /// consumer-parity test can assert it consumes the shared rules VERBATIM —
+    /// comparing placeholders alone would pass on a re-inlined regex that
+    /// happened to keep the same placeholder (round 3, codex).
+    pub(crate) fn as_str(&self) -> &str {
+        self.re.as_str()
+    }
+
+    /// Whether this pattern applies the shared leading-boundary rule.
+    pub(crate) fn requires_token_start(&self) -> bool {
+        self.require_token_start
+    }
+
     /// Every match that satisfies the leading-boundary rule.
     pub(crate) fn find_iter<'h>(
         &'h self,
@@ -446,32 +459,52 @@ fn phone_match_is_phone_shaped(matched: &str) -> bool {
 /// This is the single source of truth for per-line PII detection — both the
 /// legacy [`scan_for_pii`] content gate and the tree-sweep [`PiiRuleSet`] route
 /// through here, so their coverage can never silently diverge.
-/// Byte spans of every email on `line` that the `GITHUB_ALLOWED_AUTHORS`
-/// allow-list permits.
+/// Byte spans of the emails on `line` that suppression may apply to: those
+/// whose text is EXACTLY an allow-listed address.
 ///
 /// TERM #661 round 2 (found by the review panel): the author-attribution
-/// exception is documented at the top of this module, but it only ever governed
-/// the `email` CATEGORY. A fleet-identifier rule whose token happens to be the
-/// LOCAL PART of an allowed address — `<operator>` in `<operator-email>` — would  // pii-test-fixture
-/// report `operator_name` anyway and defeat the exception, and `scan_and_redact`
-/// would rewrite the address to `<REDACTED>@gmail.com`. Fleet rules therefore
-/// skip any match that lands inside an allowed email.
+/// exception documented at the top of this module only ever governed the
+/// `email` CATEGORY. A fleet rule whose token is the LOCAL PART of an allowed
+/// address — `<operator>` in `<operator-email>` — reported `operator_name` anyway,  // pii-test-fixture
+/// defeating the exception, and `scan_and_redact` rewrote the address to
+/// `<REDACTED>@gmail.com`. Fleet rules therefore skip matches inside an
+/// allowed email.
 ///
-/// Note this only ever SUPPRESSES a match on an explicitly allow-listed
-/// address; an operator handle anywhere else on the line is still flagged.
+/// **Round 3 (codex and free, independently, both correct): this must be EXACT
+/// equality, not `email_is_allowed`'s substring containment.** Containment plus
+/// the email regex's permissive domain class is a way to HIDE an identifier:
+/// `<operator-email>.<host>` matches as ONE email, contains the allow-listed  // pii-test-fixture
+/// address as a substring, and would have suppressed a real `<host>` hostname  // pii-test-fixture
+/// parked as a fake TLD. An entry as broad as `com` would likewise have
+/// suppressed `<operator>` in `<operator>@evil.com` — a detection the pre-#661 gate kept.  // pii-test-fixture
+/// Suppression is therefore deliberately NARROWER than the email allow-list:
+/// the matched text must equal a full allow-list address outright. The
+/// substring semantics of `email_is_allowed` are pre-existing and continue to
+/// govern the `email` category unchanged; they just no longer silence a
+/// hostname. Narrower suppression errs toward MORE detection, which is the only
+/// safe direction for a leak gate.
 fn allowed_email_spans(p: &Patterns, allow: &[String], line: &str) -> Vec<(usize, usize)> {
     if allow.is_empty() {
         return Vec::new();
     }
     p.email
         .find_iter(line)
-        .filter(|m| email_is_allowed(m.as_str(), allow))
+        .filter(|m| {
+            let matched = m.as_str().to_lowercase();
+            // `allow` entries are already trimmed + lowercased.
+            allow.iter().any(|entry| *entry == matched)
+        })
         .map(|m| (m.start(), m.end()))
         .collect()
 }
 
-fn overlaps(spans: &[(usize, usize)], start: usize, end: usize) -> bool {
-    spans.iter().any(|&(s, e)| start < e && s < end)
+/// Whether `[start, end)` lies ENTIRELY inside one of `spans`.
+///
+/// Full containment, not overlap (round 3): a match that merely straddles the
+/// edge of an allowed address is not part of that address, and suppressing it
+/// would be the hiding trick above in another shape.
+fn contained_in(spans: &[(usize, usize)], start: usize, end: usize) -> bool {
+    spans.iter().any(|&(s, e)| s <= start && end <= e)
 }
 
 fn scan_line(
@@ -501,7 +534,7 @@ fn scan_line(
         for m in r.pattern.find_iter(line) {
             // Never override the author-attribution allow-list — see
             // `allowed_email_spans`.
-            if overlaps(&allowed_emails, m.start(), m.end()) {
+            if contained_in(&allowed_emails, m.start(), m.end()) {
                 continue;
             }
             push(r.category, m.as_str());
@@ -697,7 +730,7 @@ pub fn scan_and_redact(content: &str) -> (String, Vec<PiiViolation>) {
                 continue;
             }
             for m in r.pattern.find_iter(line) {
-                if overlaps(&allowed_emails, m.start(), m.end()) {
+                if contained_in(&allowed_emails, m.start(), m.end()) {
                     continue;
                 }
                 spans.push((m.start(), m.end(), r.category.to_string()));
@@ -1509,6 +1542,41 @@ mod tests {
         let v3 = scan_for_pii("Author: <operator-email>"); // pii-test-fixture
         assert!(v3.iter().any(|x| x.category == "operator_name"));
         assert!(v3.iter().any(|x| x.category == "email"));
+        clear_allow();
+    }
+
+    #[test]
+    #[serial]
+    fn the_allow_list_cannot_be_used_to_hide_a_fleet_identifier() {
+        // Review-panel round 3 — codex and free found this INDEPENDENTLY, and
+        // both were right. Suppressing on `email_is_allowed`'s SUBSTRING
+        // containment made the allow-list a hiding place: the email regex's
+        // domain class swallows `.<host>`, so `<operator-email>.<host>` matches as  // pii-test-fixture
+        // ONE email that CONTAINS the allow-listed address, and a real hostname
+        // parked as a fake TLD would have been silenced. Suppression is now
+        // EXACT-match + FULL containment, i.e. strictly narrower than the
+        // allow-list itself.
+        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<operator-email>"); // pii-test-fixture
+        let v = scan_for_pii("contact <operator-email>.<host> for access"); // pii-test-fixture
+        assert!(
+            v.iter().any(|x| x.category == "internal_hostname"),
+            "a hostname parked as a fake TLD after an allowed address must STILL flag: {v:?}"
+        );
+
+        // A broad entry must not silence an operator name in an unrelated
+        // address — a detection the pre-#661 gate kept.
+        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "com");
+        let v2 = scan_for_pii("from <operator>@evil.com"); // pii-test-fixture
+        assert!(
+            v2.iter().any(|x| x.category == "operator_name"),
+            "a substring-only allow entry must not suppress a fleet match: {v2:?}"
+        );
+
+        // The exact-address case still works — the round-2 fix is intact.
+        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<operator-email>"); // pii-test-fixture
+        let v3 = scan_for_pii("Author: <operator-email>"); // pii-test-fixture
+        assert!(!v3.iter().any(|x| x.category == "operator_name"));
+        clear_allow();
     }
 
     #[test]

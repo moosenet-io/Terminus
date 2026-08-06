@@ -435,9 +435,24 @@ mod tests {
             fleet.len()
         );
         for (i, r) in fleet.iter().enumerate() {
+            // Round 3 (codex, correct): comparing PLACEHOLDERS alone proves
+            // nothing — several rules share `<host>`, so a re-inlined or
+            // reordered pattern would still pass. Compare the compiled pattern
+            // SOURCE and its anchoring too. That is what makes this verbatim.
+            assert_eq!(
+                literal[i].0.as_str(),
+                r.pattern.as_str(),
+                "cleaner rule {i} uses a DIFFERENT pattern than the shared registry — \
+                 this is exactly the drift TERM #661 was about"
+            );
+            assert_eq!(
+                literal[i].0.requires_token_start(),
+                r.pattern.requires_token_start(),
+                "cleaner rule {i} anchors differently than the shared registry"
+            );
             assert_eq!(
                 literal[i].1, r.placeholder,
-                "cleaner rule {i} diverged from the shared registry — the drift TERM #661 was about"
+                "cleaner rule {i} substitutes a different placeholder than the shared registry"
             );
         }
     }
