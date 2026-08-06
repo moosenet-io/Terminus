@@ -130,14 +130,20 @@ fn patterns() -> &'static CleanPatterns {
         // exactly like a plain `Regex::replace_all`.
         let plain = |src: &str| BoundedPattern::unbounded(src);
 
-        let mut literal: Vec<(BoundedPattern, &'static str)> = vec![
-            // private_ip / container_id / internal hostnames — SHARED with the
-            // gate detector (see `crate::github::pii`). Their anchoring lives
-            // there and nowhere else.
-            (pii::private_ip_pattern(), "<internal-ip>"),
-            (pii::container_id_pattern(), "<host>"),
-            (pii::host_unambiguous_pattern(), "<host>"),
-            (pii::host_short_pattern(), "<host>"),
+        let mut literal: Vec<(BoundedPattern, &'static str)> = Vec::new();
+        // THE shared fleet-identifier rule set — private IPs, container ids,
+        // internal hostnames, infra services, the operator's email/handle. The
+        // patterns, their anchoring AND the list membership all live in
+        // `crate::github::pii`, so the cleaner and the gate detector cannot
+        // disagree about which spans are fleet identifiers (TERM #661).
+        literal.extend(
+            pii::fleet_identifier_rules()
+                .into_iter()
+                .map(|r| (r.pattern, r.placeholder)),
+        );
+        // Cleaner-only rules from here down: these have no gate counterpart to
+        // drift against, and carry their own anchors in the pattern source.
+        literal.extend([
             // internal_domain
             (plain(r"moosenet\.online|moosenet\.local"), "example.com"),
             // internal_path
@@ -145,13 +151,7 @@ fn patterns() -> &'static CleanPatterns {
                 plain(r"<path>/|<path>/|<path>/|/opt/lumina[a-z0-9-]*/"),  // pii-test-fixture
                 "<path>/",
             ),
-        ];
-        // infra_service → readable placeholders (shared patterns + placeholders).
-        literal.extend(pii::infra_service_patterns());
-        // operator email FIRST so the generic-email rule below doesn't shadow it,
-        // then the shared bare handle/name patterns.
-        literal.push((plain(r"(?i)\bpboose@gmail\.com\b"), "<operator-email>"));
-        literal.extend(pii::operator_name_patterns().into_iter().map(|re| (re, "<operator>")));
+        ]);
         literal.extend([
             // generic email — last
             (plain(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "<email>"),
@@ -416,6 +416,22 @@ mod tests {
         ] {
             assert_eq!(scrub(s), s, "{s:?} must be left alone");
         }
+    }
+
+    #[test]
+    fn newly_matching_shapes_do_not_over_scrub() {
+        // Review-panel round 1 (codex): an unconditional leading boundary would
+        // have rewritten `OCT2024` to `O<host>` and `apvf1z` to `a<host>z`.
+        // Verified real, so those rules carry `is_token_start` instead.
+        for s in ["OCT2024 release", "apvf1z", "xironclawy", "SELECT327"] {
+            // pii-test-fixture
+            assert_eq!(scrub(s), s, "{s:?} must be left alone");
+        }
+        // But the escape-abutted form — the one live on the mirror — still goes.
+        assert_eq!(scrub(r#""clean\nCT327""#), r#""clean\n<host>""#); // pii-test-fixture
+        // `<host>` keeps its numeric suffix (opus, round 1: grouping the
+        // `\d*` across both tokens, so `<host>` scrubs whole).
+        assert_eq!(scrub("on <host>"), "on <host>"); // pii-test-fixture
     }
 
     #[test]
