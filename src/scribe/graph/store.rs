@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::extract::build_rust_graph;
 use super::model::KnowledgeGraph;
+use super::project_key::ProjectKey;
 use crate::error::ToolError;
-use crate::scribe::vault::slugify;
 
 /// Process-global sequence so every `save` gets a distinct temp file name even
 /// for concurrent writes of the SAME project from multiple threads (pid alone
@@ -44,23 +44,123 @@ impl GraphStore {
         GraphStore::new(&cfg.kg_store_dir)
     }
 
-    /// Path of a project's graph file: `<root>/<project_slug>.json`.
-    fn path_for(&self, project_id: &str) -> PathBuf {
-        self.root.join(format!("{}.json", slugify(project_id)))
+    /// Path of a project's graph file: `<root>/<canonical_key>.json`.
+    ///
+    /// Takes a [`ProjectKey`], never a raw string — and it is the ONLY function
+    /// in the crate that turns a project identifier into a store path. Since
+    /// `ProjectKey` has exactly one constructor ([`ProjectKey::resolve`]) and a
+    /// private field, there is no way to address a graph by an
+    /// un-canonicalized key. That is what makes TERM #653's duplicate-key state
+    /// (`chord.json` stale beside `chrd.json` fresh) unrepresentable rather
+    /// than merely corrected: the stale spelling no longer names anything.
+    fn path_for(&self, key: &ProjectKey) -> PathBuf {
+        self.root.join(format!("{}.json", key))
+    }
+
+    /// The canonical key `project_id` resolves to. Callers that need to REPORT
+    /// which key answered (so a stale-alias query is visible at the point of
+    /// use) should use this rather than re-deriving it.
+    pub fn key_for(project_id: &str) -> ProjectKey {
+        ProjectKey::resolve(project_id)
+    }
+
+    /// When this project's graph file was last written, if it exists.
+    ///
+    /// Surfaced on every `kg_*` response so a consumer can SEE the graph's age
+    /// instead of having to trust it. The whole cost of TERM #653 was that a
+    /// stale answer and a fresh answer were indistinguishable to the caller.
+    pub fn built_at(&self, project_id: &str) -> Option<std::time::SystemTime> {
+        fs::metadata(self.path_for(&ProjectKey::resolve(project_id)))
+            .ok()
+            .and_then(|m| m.modified().ok())
+    }
+
+    /// The stored keys that are canonical — i.e. the keys a caller can retry
+    /// with and actually get an answer. Suggesting anything else reproduces the
+    /// same miss.
+    pub fn canonical_stored_keys(&self) -> Vec<String> {
+        self.stored_keys()
+            .into_iter()
+            .filter(|k| ProjectKey::resolve(k).as_str() == k)
+            .collect()
+    }
+
+    /// Store files whose name is NOT its own canonical key — i.e. graphs left
+    /// behind by a spelling that now collapses elsewhere (`chord.json` after
+    /// `chord` began resolving to `chrd`).
+    ///
+    /// These are never served: the canonical entry answers instead. Reporting
+    /// them is the point — an orphan that nobody can see is the same shape of
+    /// problem as a stale answer nobody can see. Surfaced in the key-miss
+    /// diagnostic so an operator can delete or re-fold them deliberately.
+    pub fn orphaned_alias_keys(&self) -> Vec<String> {
+        self.stored_keys()
+            .into_iter()
+            .filter(|k| ProjectKey::resolve(k).as_str() != k)
+            .collect()
+    }
+
+    /// Every stored graph FILE's key, sorted — canonical entries AND any
+    /// orphaned alias files. This is the raw on-disk inventory; use
+    /// [`Self::canonical_stored_keys`] for the set a caller can usefully retry
+    /// with. (The docstring previously claimed "every canonical key", which it
+    /// never filtered for — caught in review.)
+    ///
+    /// An unreadable store root yields an EMPTY list, never an error — a
+    /// diagnostic must not itself fail.
+    pub fn stored_keys(&self) -> Vec<String> {
+        let Ok(rd) = fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = rd
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.strip_suffix(".json").map(str::to_string)
+            })
+            .filter(|k| !k.is_empty())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Load a project's graph, or `None` if it has never been saved. A missing
     /// file is not an error.
     pub fn load(&self, project_id: &str) -> Result<Option<KnowledgeGraph>, ToolError> {
-        let path = self.path_for(project_id);
-        match fs::read_to_string(&path) {
-            Ok(s) => KnowledgeGraph::from_json(&s).map(Some),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(ToolError::Execution(format!(
-                "read graph {}: {e}",
-                path.display()
-            ))),
-        }
+        Ok(self.load_with_mtime(project_id)?.map(|(g, _)| g))
+    }
+
+    /// Load a graph together with the modification time OF THE VERY FILE THE
+    /// CONTENTS CAME FROM.
+    ///
+    /// Contents and timestamp are taken from ONE open handle, not from a read
+    /// followed by a separate `stat`. Review finding (codex): saves are atomic
+    /// renames, so a concurrent rebuild between a read and a later stat would
+    /// pair OLD contents with the NEW file's timestamp — reporting stale data
+    /// as fresh. Freshness metadata that can lie is worse than none, since the
+    /// entire point of it is to make staleness visible.
+    pub fn load_with_mtime(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<(KnowledgeGraph, Option<std::time::SystemTime>)>, ToolError> {
+        let path = self.path_for(&ProjectKey::resolve(project_id));
+        let mut file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(ToolError::Execution(format!(
+                    "open graph {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        let mtime = file.metadata().ok().and_then(|m| m.modified().ok());
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut file, &mut buf).map_err(|e| {
+            ToolError::Execution(format!("read graph {}: {e}", path.display()))
+        })?;
+        Ok(Some((KnowledgeGraph::from_json(&buf)?, mtime)))
     }
 
     /// Save a project's graph atomically (temp file in the same dir + rename, so
@@ -73,11 +173,12 @@ impl GraphStore {
         fs::create_dir_all(&self.root).map_err(|e| {
             ToolError::Execution(format!("create kg store dir {}: {e}", self.root.display()))
         })?;
-        let path = self.path_for(project_id);
+        let key = ProjectKey::resolve(project_id);
+        let path = self.path_for(&key);
         let json = graph.to_json_pretty()?;
         let tmp = self.root.join(format!(
             "{}.{}.{}.tmp",
-            slugify(project_id),
+            key,
             std::process::id(),
             TMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
@@ -172,7 +273,7 @@ impl GraphStore {
 
     /// Whether a graph file exists for `project_id` (without loading it).
     pub fn exists(&self, project_id: &str) -> bool {
-        Path::new(&self.path_for(project_id)).exists()
+        Path::new(&self.path_for(&ProjectKey::resolve(project_id))).exists()
     }
 }
 
@@ -221,6 +322,311 @@ mod tests {
         store.save("My Proj", &KnowledgeGraph::new("My Proj")).unwrap();
         assert!(root.join("my-proj.json").exists(), "slugified filename");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The part of a source file BEFORE its `#[cfg(test)]` module.
+    ///
+    /// Both ratchets below scan production code only. Test code legitimately
+    /// mentions the very things they ban — the slugify-equivalence test calls
+    /// `slugify` on purpose, and the key-miss test asserts the banned sentence
+    /// is ABSENT by naming it. Scanning tests too would make the ratchets fire
+    /// on the tests that prove they work.
+    fn non_test_source(body: &str) -> &str {
+        match body.find("#[cfg(test)]") {
+            Some(i) => &body[..i],
+            None => body,
+        }
+    }
+
+    // ── TERM #652 / #653: one canonical key per project ────────────────────
+
+    /// The normalization that names graph files MUST stay byte-identical to the
+    /// `slugify` that named the files already on disk. Any divergence silently
+    /// orphans the entire live store — every graph would read as "not found"
+    /// while sitting right there. This is the one property that cannot be
+    /// checked from the standalone harness, so it is pinned here.
+    #[test]
+    fn normalize_matches_slugify_for_every_key_shape_in_play() {
+        use crate::scribe::graph::project_key::normalize;
+        use crate::scribe::vault::slugify;
+        for input in [
+            "TERM", "term", "CHRD", "chrd", "chord", "Chord", "harmony", "harm",
+            "lumina", "lum", "terminus", "muse", "rail", "aptr",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", // pii-test-fixture (fabricated uuid shape)
+            "My Proj", "  Foo   Bar  ", "S91-scribe-knowledge-infrastructure",
+            "../../etc/passwd", "a/b", "..", ".", "Hello, World!",
+            "Модуль", "🎉🎊", "",
+        ] {
+            assert_eq!(
+                normalize(input),
+                slugify(input),
+                "normalize/slugify diverged on {input:?} — this orphans the live store"
+            );
+        }
+    }
+
+    /// A finite hand-picked corpus cannot pin a duplicated algorithm (review
+    /// finding, codex — fair). This sweeps a few thousand DETERMINISTICALLY
+    /// generated strings over the byte classes that actually drive the two
+    /// functions apart: ASCII alphanumerics, separators, leading/trailing
+    /// separators, runs of separators, and non-ASCII. No RNG crate — a tiny
+    /// xorshift keeps the module dependency-free and the test reproducible.
+    #[test]
+    fn normalize_matches_slugify_over_a_generated_corpus() {
+        use crate::scribe::graph::project_key::normalize;
+        use crate::scribe::vault::slugify;
+        const ALPHABET: &[char] = &[
+            'a', 'Z', '0', '9', '-', '_', ' ', '.', '/', ':', '\\', '"', '\'', '!',
+            '\u{00e9}', '\u{0416}', '\u{1F600}', '\t', '\n',
+        ];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..4000 {
+            let len = (next() % 12) as usize;
+            let input: String = (0..len)
+                .map(|_| ALPHABET[(next() as usize) % ALPHABET.len()])
+                .collect();
+            assert_eq!(
+                normalize(&input),
+                slugify(&input),
+                "normalize/slugify diverged on {input:?} — this orphans the live store"
+            );
+        }
+    }
+
+    /// An alias file left on disk after collapsing is NOT silently readable —
+    /// the canonical entry answers — but it must be VISIBLE, so an operator can
+    /// see that `chord.json` is now orphaned rather than discovering it later.
+    #[test]
+    #[serial_test::serial]
+    fn orphaned_alias_files_are_reported_not_served() {
+        let root = tmp_root("orphan");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let store = GraphStore::new(&root);
+
+        // Simulate the live store: a stale `chord.json` beside a fresh `chrd.json`.
+        store.save("chrd", &sample("chrd")).unwrap();
+        fs::write(root.join("chord.json"), sample("chord").to_json_pretty().unwrap()).unwrap();
+
+        // The canonical entry answers; the stale file is never served.
+        assert!(store.load("chord").unwrap().is_some());
+        assert_eq!(
+            store.orphaned_alias_keys(),
+            vec!["chord".to_string()],
+            "the stale file must be reported as orphaned"
+        );
+        // A project with no alias file has no orphans.
+        let root2 = tmp_root("orphan2");
+        let _ = fs::remove_dir_all(&root2);
+        let s2 = GraphStore::new(&root2);
+        s2.save("muse", &sample("muse")).unwrap();
+        assert!(s2.orphaned_alias_keys().is_empty());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root2);
+    }
+
+    /// A key miss must never suggest a key that reproduces the same miss.
+    #[test]
+    fn a_suggestion_is_only_ever_a_key_that_actually_answers() {
+        let root = tmp_root("suggest");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let store = GraphStore::new(&root);
+        // ONLY an orphaned alias file exists — no canonical graph at all.
+        fs::write(root.join("chord.json"), sample("chord").to_json_pretty().unwrap()).unwrap();
+
+        assert_eq!(store.stored_keys(), vec!["chord".to_string()], "raw inventory");
+        assert!(
+            store.canonical_stored_keys().is_empty(),
+            "an orphan is not a key anyone can usefully retry"
+        );
+        assert_eq!(store.orphaned_alias_keys(), vec!["chord".to_string()]);
+        // And it genuinely does not answer, so offering it would be a loop.
+        assert!(store.load("chord").unwrap().is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Freshness metadata must describe the bytes actually returned.
+    #[test]
+    fn load_reports_the_mtime_of_the_file_the_contents_came_from() {
+        let root = tmp_root("mtime");
+        let _ = fs::remove_dir_all(&root);
+        let store = GraphStore::new(&root);
+        store.save("chrd", &sample("chrd")).unwrap();
+
+        let (g, mtime) = store.load_with_mtime("chrd").unwrap().expect("graph");
+        assert_eq!(g.node_count(), 2);
+        let mtime = mtime.expect("mtime present alongside contents");
+        // It matches the canonical file, and is reachable via the alias too.
+        let direct = fs::metadata(root.join("chrd.json")).unwrap().modified().unwrap();
+        assert_eq!(mtime, direct);
+        let (_, via_alias) = store.load_with_mtime("chord").unwrap().expect("via alias");
+        assert_eq!(via_alias.unwrap(), direct);
+        // A missing graph yields no pair at all — never a fabricated timestamp.
+        assert!(store.load_with_mtime("no-such-project").unwrap().is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// SOURCE-LEVEL RATCHET. The duplicate-key bug is only fixed for as long as
+    /// `ProjectKey` is the sole way to name a graph. A future edit that goes
+    /// back to `slugify(project_id)` inside the KG module would silently
+    /// re-open it, so the build fails instead.
+    #[test]
+    fn kg_module_never_builds_a_store_path_from_a_raw_slug() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/scribe/graph");
+        let mut offenders = Vec::new();
+        for entry in fs::read_dir(&dir).expect("kg module dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().map(|e| e != "rs").unwrap_or(true) {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("read kg source");
+            for (i, line) in non_test_source(&source).lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains("slugify(") {
+                    offenders.push(format!("{}:{}", path.display(), i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "KG store paths must go through ProjectKey::resolve, not slugify — found: {offenders:?}"
+        );
+    }
+
+    /// SOURCE-LEVEL RATCHET for TERM #652. The sentence "no knowledge graph for
+    /// this project" asserts something about the system that is FALSE whenever
+    /// the caller merely used the other key space. It must never be emitted
+    /// again — only discussed in comments explaining why it was removed.
+    #[test]
+    fn kg_module_never_claims_a_project_has_no_graph() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/scribe/graph");
+        let mut offenders = Vec::new();
+        for entry in fs::read_dir(&dir).expect("kg module dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().map(|e| e != "rs").unwrap_or(true) {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("read kg source");
+            for (i, line) in non_test_source(&source).lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains("no knowledge graph for this project") {
+                    offenders.push(format!("{}:{}", path.display(), i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a key miss must not be reported as the absence of a graph — found: {offenders:?}"
+        );
+    }
+
+    /// TERM #653, the whole defect in one test: two spellings of one project
+    /// must be ONE stored graph, and the fresh write must be what the stale
+    /// spelling reads back. Before this change these were two files with
+    /// seven weeks between them.
+    #[test]
+    fn duplicate_spellings_share_one_stored_graph() {
+        let root = tmp_root("dupe");
+        let _ = fs::remove_dir_all(&root);
+        let store = GraphStore::new(&root);
+
+        // Write under the LONG (historically stale) spelling...
+        store.save("chord", &sample("chord")).unwrap();
+        // ...and it lands on the canonical short key, not a second file.
+        assert!(root.join("chrd.json").exists(), "canonical file written");
+        assert!(!root.join("chord.json").exists(), "no second, divergent file");
+
+        // Both spellings — and a mixed-case one — read the SAME graph.
+        for spelling in ["chord", "chrd", "Chord", "CHORD"] {
+            let g = store.load(spelling).unwrap().expect("graph via {spelling}");
+            assert_eq!(g.node_count(), 2, "{spelling} must see the one graph");
+            assert!(store.exists(spelling), "{spelling} must report existing");
+        }
+
+        // A later write under the SHORT spelling is visible through the LONG
+        // one — i.e. the stale side can no longer serve an old answer.
+        let mut g2 = sample("chrd");
+        g2.insert_node(KgNode::new("crate::c::fresh", NodeKind::Function, "fresh", "src/c.rs"));
+        store.save("chrd", &g2).unwrap();
+        let via_stale = store.load("chord").unwrap().unwrap();
+        assert!(
+            via_stale.get_node("crate::c::fresh").is_some(),
+            "the alias must return the FRESH graph, never a stale one"
+        );
+
+        // Exactly one graph file for this project.
+        assert_eq!(store.stored_keys(), vec!["chrd".to_string()]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A project with no alias is untouched by collapsing — `muse`/`rail`/`aptr`
+    /// have real graphs and must not be swept into someone else's key.
+    #[test]
+    fn a_project_without_an_alias_keeps_its_own_file() {
+        let root = tmp_root("noalias");
+        let _ = fs::remove_dir_all(&root);
+        let store = GraphStore::new(&root);
+        store.save("muse", &sample("muse")).unwrap();
+        store.save("rail", &sample("rail")).unwrap();
+        assert!(root.join("muse.json").exists());
+        assert!(root.join("rail.json").exists());
+        assert_eq!(store.stored_keys(), vec!["muse".to_string(), "rail".to_string()]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A UUID resolves to the project's graph once the deployment alias table
+    /// maps it — this is TERM #652's headline case.
+    #[test]
+    #[serial_test::serial]
+    fn a_configured_uuid_reads_the_projects_graph() {
+        use crate::scribe::graph::project_key::ALIASES_ENV;
+        let root = tmp_root("uuid");
+        let _ = fs::remove_dir_all(&root);
+        let store = GraphStore::new(&root);
+        store.save("chrd", &sample("chrd")).unwrap();
+
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"; // pii-test-fixture (fabricated uuid shape)
+        assert!(store.load(uuid).unwrap().is_none(), "unmapped UUID: honest miss");
+
+        std::env::set_var(ALIASES_ENV, format!("{uuid}=chrd"));
+        let g = store.load(uuid).unwrap();
+        std::env::remove_var(ALIASES_ENV);
+        assert!(g.is_some(), "a mapped UUID must reach the graph");
+        assert_eq!(g.unwrap().node_count(), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `built_at` is what makes staleness visible at the point of use. It must
+    /// be present for a stored graph and absent (not zero, not "now") for one
+    /// that does not exist — a fabricated timestamp would be the same class of
+    /// lie as the message this change removed.
+    #[test]
+    fn built_at_is_present_for_a_stored_graph_and_absent_otherwise() {
+        let root = tmp_root("builtat");
+        let _ = fs::remove_dir_all(&root);
+        let store = GraphStore::new(&root);
+        assert!(store.built_at("chrd").is_none(), "nothing stored yet");
+        store.save("chrd", &sample("chrd")).unwrap();
+        assert!(store.built_at("chrd").is_some(), "stored graph has a build time");
+        assert!(store.built_at("chord").is_some(), "readable via the alias too");
+        assert!(store.built_at("no-such-project").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `stored_keys` backs the honest key-miss message, so it must degrade to
+    /// an empty list rather than erroring when the store root is missing.
+    #[test]
+    fn stored_keys_on_a_missing_root_is_empty_not_an_error() {
+        let root = tmp_root("gone");
+        let _ = fs::remove_dir_all(&root);
+        assert!(GraphStore::new(&root).stored_keys().is_empty());
     }
 
     #[test]

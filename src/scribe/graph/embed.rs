@@ -11,7 +11,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::scribe::vault::slugify;
+use super::project_key::ProjectKey;
 use crate::scribe::ScribeConfig;
 
 /// Append the architecture-map section for `project_id` to `doc`, if a rendered
@@ -23,7 +23,7 @@ pub fn embed_map_section(doc: String, project_id: Option<&str>, cfg: &ScribeConf
     let Some(pid) = project_id.map(str::trim).filter(|s| !s.is_empty()) else {
         return doc;
     };
-    let slug = slugify(pid);
+    let slug = ProjectKey::resolve(pid).to_string();
     let svg_path = Path::new(&cfg.kg_store_dir).join(format!("{slug}.svg"));
     if !svg_path.exists() {
         return doc;

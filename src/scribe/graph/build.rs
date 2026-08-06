@@ -26,7 +26,7 @@ use super::vec_store::{card_hash, AtlasVecStore};
 use super::{build_rust_graph, cluster, layout, pagerank, render, semantic};
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
-use crate::scribe::vault::slugify;
+use super::project_key::ProjectKey;
 use crate::scribe::ScribeConfig;
 use crate::tool::{RustTool, ToolOutput};
 
@@ -487,7 +487,10 @@ only those files."
         let html = render::to_html(&graph, &lay);
 
         store.save(&project_id, &graph)?;
-        let slug = slugify(&project_id);
+        // Same canonical key as the JSON the store just wrote — the svg/graphml/
+        // html must never be addressed by a different spelling than the graph
+        // they render, or a stale artifact outlives its graph (TERM #653).
+        let slug = ProjectKey::resolve(&project_id).to_string();
         let artifacts = write_artifacts(&cfg.kg_store_dir, &slug, &svg, &graphml, &html)?;
 
         let clusters = graph.nodes().filter_map(|n| n.cluster).collect::<std::collections::HashSet<_>>().len();
@@ -535,13 +538,40 @@ built, and which visual artifacts exist. Returns found:false if no graph has bee
         let project_id = req_str(&args, "project_id")?;
         let store = GraphStore::from_config(&cfg);
         let Some(g) = store.load(&project_id)? else {
-            return Ok(structured(json!({"project_id": project_id, "found": false})));
+            // Never say "no graph for this project" — say which KEY missed and
+            // which keys exist (TERM #652).
+            let key = ProjectKey::resolve(&project_id);
+            let known = store.canonical_stored_keys();
+            let suggestion = super::project_key::nearest(&project_id, &known);
+            return Ok(structured(json!({
+                "project_id": project_id, "found": false,
+                "graph_key": key.to_string(),
+                "error": format!(
+                    "unknown project key '{project_id}' (resolved to '{key}') — no graph is stored under that key"
+                ),
+                "message": "the KEY did not resolve to a stored graph; this does NOT mean the project has no knowledge graph. Retry with one of known_keys, or set SCRIBE_KG_PROJECT_ALIASES to map this identifier to its canonical key.",
+                "known_keys": known,
+                "did_you_mean": suggestion,
+                "orphaned_alias_graphs": store.orphaned_alias_keys(),
+            })));
         };
-        let slug = slugify(&project_id);
+        let slug = ProjectKey::resolve(&project_id).to_string();
         let has = |ext: &str| Path::new(&cfg.kg_store_dir).join(format!("{slug}.{ext}")).exists();
         let clusters = g.nodes().filter_map(|n| n.cluster).collect::<std::collections::HashSet<_>>().len();
+        // Same freshness fields the kg_* envelope reports, so a caller reading
+        // status sees staleness the same way (review finding: this response
+        // escaped LoadedGraph and carried no build time).
+        let built_at = store.built_at(&project_id);
         Ok(structured(json!({
             "project_id": project_id, "found": true,
+            "graph_key": slug,
+            "graph_built_at": built_at.map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.to_rfc3339()
+            }),
+            "graph_age_seconds": built_at.and_then(|t| {
+                std::time::SystemTime::now().duration_since(t).ok().map(|d| d.as_secs())
+            }),
             "nodes": g.node_count(), "edges": g.edge_count(), "clusters": clusters,
             "generated_at": g.generated_at,
             "artifacts": {"svg": has("svg"), "graphml": has("graphml"), "html": has("html")},
