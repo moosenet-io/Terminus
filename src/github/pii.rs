@@ -59,8 +59,14 @@ use crate::error::ToolError;
 
 /// `true` when byte offset `at` in `hay` begins an identifier token.
 ///
-/// This is a STRICT SUPERSET of a leading `\b`: every position `\b` accepts,
-/// this accepts too, so swapping `\b` for it can never LOSE a detection. It
+/// This is a STRICT SUPERSET of a leading `\b` **for a pattern whose first
+/// character is an ASCII word character** — which every rule that uses it has.
+/// Under that condition `\b` accepts iff the preceding character is not a `\w`,
+/// and every `\w` position this rejects is an ASCII alphanumeric, so every
+/// position `\b` accepts, this accepts too: swapping `\b` for it can never LOSE
+/// a detection. (`\b` in general also marks END-of-word boundaries; this
+/// predicate is only ever used as a LEADING condition, so that sense does not
+/// apply — noted because the review panel rightly flagged the looser wording.) It
 /// accepts when any of:
 ///   * `at` is the start of input;
 ///   * the preceding character is not an ASCII letter or digit — this is what
@@ -80,6 +86,11 @@ use crate::error::ToolError;
 /// `<host>` in the file bytes, which is exactly how a container id is published  // pii-test-fixture
 /// on the mirror today. Treating a `\`-preceded escape letter as a separator
 /// catches that WITHOUT admitting `OCT2024`, whose `O` has no backslash.
+///
+/// Its known imprecision, accepted deliberately: it does not count backslash
+/// parity, so an ESCAPED backslash (`\\nCT327`) and a malformed `\xCT327` are  // pii-test-fixture
+/// also accepted. Both err toward MORE scrubbing on a leak gate, and neither
+/// can lose a detection, so parity counting is not worth the complexity here.
 ///
 /// What still BLOCKS a match — the false-positive guard, unchanged: an ordinary
 /// preceding ASCII letter or digit. `<host>` cannot match inside `pvenv`, `<operator>`  // pii-test-fixture
@@ -435,6 +446,34 @@ fn phone_match_is_phone_shaped(matched: &str) -> bool {
 /// This is the single source of truth for per-line PII detection — both the
 /// legacy [`scan_for_pii`] content gate and the tree-sweep [`PiiRuleSet`] route
 /// through here, so their coverage can never silently diverge.
+/// Byte spans of every email on `line` that the `GITHUB_ALLOWED_AUTHORS`
+/// allow-list permits.
+///
+/// TERM #661 round 2 (found by the review panel): the author-attribution
+/// exception is documented at the top of this module, but it only ever governed
+/// the `email` CATEGORY. A fleet-identifier rule whose token happens to be the
+/// LOCAL PART of an allowed address — `<operator>` in `<operator-email>` — would  // pii-test-fixture
+/// report `operator_name` anyway and defeat the exception, and `scan_and_redact`
+/// would rewrite the address to `<REDACTED>@gmail.com`. Fleet rules therefore
+/// skip any match that lands inside an allowed email.
+///
+/// Note this only ever SUPPRESSES a match on an explicitly allow-listed
+/// address; an operator handle anywhere else on the line is still flagged.
+fn allowed_email_spans(p: &Patterns, allow: &[String], line: &str) -> Vec<(usize, usize)> {
+    if allow.is_empty() {
+        return Vec::new();
+    }
+    p.email
+        .find_iter(line)
+        .filter(|m| email_is_allowed(m.as_str(), allow))
+        .map(|m| (m.start(), m.end()))
+        .collect()
+}
+
+fn overlaps(spans: &[(usize, usize)], start: usize, end: usize) -> bool {
+    spans.iter().any(|&(s, e)| start < e && s < end)
+}
+
 fn scan_line(
     p: &Patterns,
     extra: &[(String, Regex)],
@@ -452,6 +491,7 @@ fn scan_line(
         });
     };
 
+    let allowed_emails = allowed_email_spans(p, allow, line);
     for r in &p.fleet {
         // The operator-email rule reports under `email`, which the allow-list
         // below governs; let that one path own it rather than double-reporting.
@@ -459,6 +499,11 @@ fn scan_line(
             continue;
         }
         for m in r.pattern.find_iter(line) {
+            // Never override the author-attribution allow-list — see
+            // `allowed_email_spans`.
+            if overlaps(&allowed_emails, m.start(), m.end()) {
+                continue;
+            }
             push(r.category, m.as_str());
         }
     }
@@ -646,11 +691,17 @@ pub fn scan_and_redact(content: &str) -> (String, Vec<PiiViolation>) {
             };
         }
 
+        let allowed_emails = allowed_email_spans(p, &allow, line);
         for r in &p.fleet {
             if r.category == "email" {
                 continue;
             }
-            collect!(r.pattern, r.category);
+            for m in r.pattern.find_iter(line) {
+                if overlaps(&allowed_emails, m.start(), m.end()) {
+                    continue;
+                }
+                spans.push((m.start(), m.end(), r.category.to_string()));
+            }
         }
         collect!(p.internal_domain, "internal_domain");
         collect!(p.api_key, "api_key");
@@ -1426,6 +1477,39 @@ mod tests {
     }
 
     // ── Review-panel findings, round 1 (all verified real before acting) ─────
+
+    #[test]
+    #[serial]
+    fn an_allow_listed_author_email_is_not_flagged_via_its_local_part() {
+        // Review-panel round 2 (codex), VERIFIED REAL: adding `<operator>` to the  // pii-test-fixture
+        // gate's operator_name rules made the operator's own address flag as
+        // `operator_name` even when GITHUB_ALLOWED_AUTHORS permits it — the
+        // author-attribution exception this module documents at the top was
+        // silently defeated, and `scan_and_redact` would have rewritten the
+        // address to `<REDACTED>@gmail.com`. Fleet rules now skip any match
+        // landing inside an allowed email.
+        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<operator-email>"); // pii-test-fixture
+        let v = scan_for_pii("Author: <operator-email> committed this"); // pii-test-fixture
+        assert!(
+            !v.iter().any(|x| x.category == "operator_name"),
+            "an allow-listed author email must not be flagged via its local part: {v:?}"
+        );
+        assert!(!v.iter().any(|x| x.category == "email"), "email allow-list still applies: {v:?}");
+        assert!(pii_gate("Author: <operator-email>").is_ok()); // pii-test-fixture
+
+        // The suppression is scoped to the allowed address ONLY — the handle
+        // anywhere else on the line is still caught.
+        let v2 = scan_for_pii("<operator> ran it, see <operator-email>"); // pii-test-fixture
+        assert!(
+            v2.iter().any(|x| x.category == "operator_name"),
+            "a bare handle outside the allowed email must still flag: {v2:?}"
+        );
+        clear_allow();
+        // With no allow-list configured, both are flagged exactly as before.
+        let v3 = scan_for_pii("Author: <operator-email>"); // pii-test-fixture
+        assert!(v3.iter().any(|x| x.category == "operator_name"));
+        assert!(v3.iter().any(|x| x.category == "email"));
+    }
 
     #[test]
     #[serial]

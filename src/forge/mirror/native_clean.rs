@@ -419,6 +419,30 @@ mod tests {
     }
 
     #[test]
+    fn the_cleaner_consumes_the_shared_rule_set_verbatim() {
+        // Review-panel round 2 (codex): the registry-shape test in `pii.rs`
+        // proves the LIST exists, not that this consumer actually uses it. This
+        // is the parity assertion — the cleaner's substitution table must BEGIN
+        // with exactly the shared fleet rules, in order, with their placeholders
+        // intact. If someone re-inlines a regex here, or reorders so the
+        // operator-email rule falls after the generic-email rule, this fails.
+        let fleet = crate::github::pii::fleet_identifier_rules();
+        let literal = &patterns().literal;
+        assert!(
+            literal.len() > fleet.len(),
+            "cleaner table ({}) must extend the shared rules ({})",
+            literal.len(),
+            fleet.len()
+        );
+        for (i, r) in fleet.iter().enumerate() {
+            assert_eq!(
+                literal[i].1, r.placeholder,
+                "cleaner rule {i} diverged from the shared registry — the drift TERM #661 was about"
+            );
+        }
+    }
+
+    #[test]
     fn newly_matching_shapes_do_not_over_scrub() {
         // Review-panel round 1 (codex): an unconditional leading boundary would
         // have rewritten `OCT2024` to `O<host>` and `apvf1z` to `a<host>z`.
