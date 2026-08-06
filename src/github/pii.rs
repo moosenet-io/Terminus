@@ -459,42 +459,53 @@ fn phone_match_is_phone_shaped(matched: &str) -> bool {
 /// This is the single source of truth for per-line PII detection — both the
 /// legacy [`scan_for_pii`] content gate and the tree-sweep [`PiiRuleSet`] route
 /// through here, so their coverage can never silently diverge.
-/// Byte spans of the emails on `line` that suppression may apply to: those
-/// whose text is EXACTLY an allow-listed address.
+/// Byte spans of the LOCAL PART of each email on `line` whose full text is
+/// EXACTLY an allow-listed address.
 ///
-/// TERM #661 round 2 (found by the review panel): the author-attribution
-/// exception documented at the top of this module only ever governed the
-/// `email` CATEGORY. A fleet rule whose token is the LOCAL PART of an allowed
-/// address — `<operator>` in `<operator-email>` — reported `operator_name` anyway,  // pii-test-fixture
-/// defeating the exception, and `scan_and_redact` rewrote the address to
-/// `<REDACTED>@gmail.com`. Fleet rules therefore skip matches inside an
-/// allowed email.
+/// TERM #661 round 2 (review panel): the author-attribution exception
+/// documented at the top of this module only ever governed the `email`
+/// CATEGORY. A fleet rule whose token is the LOCAL PART of an allowed address —
+/// `<operator>` in `<operator-email>` — reported `operator_name` anyway, defeating  // pii-test-fixture
+/// the exception, and `scan_and_redact` rewrote the address to
+/// `<REDACTED>@gmail.com`.
 ///
-/// **Round 3 (codex and free, independently, both correct): this must be EXACT
-/// equality, not `email_is_allowed`'s substring containment.** Containment plus
-/// the email regex's permissive domain class is a way to HIDE an identifier:
-/// `<operator-email>.<host>` matches as ONE email, contains the allow-listed  // pii-test-fixture
-/// address as a substring, and would have suppressed a real `<host>` hostname  // pii-test-fixture
-/// parked as a fake TLD. An entry as broad as `com` would likewise have
-/// suppressed `<operator>` in `<operator>@evil.com` — a detection the pre-#661 gate kept.  // pii-test-fixture
-/// Suppression is therefore deliberately NARROWER than the email allow-list:
-/// the matched text must equal a full allow-list address outright. The
-/// substring semantics of `email_is_allowed` are pre-existing and continue to
-/// govern the `email` category unchanged; they just no longer silence a
-/// hostname. Narrower suppression errs toward MORE detection, which is the only
-/// safe direction for a leak gate.
-fn allowed_email_spans(p: &Patterns, allow: &[String], line: &str) -> Vec<(usize, usize)> {
+/// The span has been narrowed three times, once per round, each by a real
+/// counterexample the panel constructed:
+///
+/// * **Round 3 (codex and free, independently): EXACT equality, not
+///   `email_is_allowed`'s substring containment.** Containment plus the email
+///   regex's permissive domain class was a way to HIDE an identifier:
+///   `<operator-email>.<host>` matches as ONE email that CONTAINS the allow-listed  // pii-test-fixture
+///   address, so a hostname parked as a fake TLD was silenced. An entry as
+///   broad as `com` would likewise have silenced `<operator>` in `<operator>@evil.com`.  // pii-test-fixture
+/// * **Round 4 (codex): `operator_name` only** — see
+///   [`suppressed_by_allowed_email`].
+/// * **Round 5 (codex): the LOCAL PART only, not the whole address.** With
+///   `GITHUB_ALLOWED_AUTHORS=ops@<operator>.example` the operator name sits in the  // pii-test-fixture
+///   DOMAIN, and suppressing the whole span lost a pre-#661 detection. Author
+///   attribution is a statement about the local part; the domain is not covered
+///   by it. Ending the span at `@` is what makes the code match the intent this
+///   function has claimed since round 2.
+///
+/// The substring semantics of `email_is_allowed` are pre-existing and continue
+/// to govern the `email` category unchanged. Every narrowing here errs toward
+/// MORE detection, the only safe direction for a leak gate.
+fn allowed_email_local_spans(p: &Patterns, allow: &[String], line: &str) -> Vec<(usize, usize)> {
     if allow.is_empty() {
         return Vec::new();
     }
     p.email
         .find_iter(line)
-        .filter(|m| {
+        .filter_map(|m| {
             let matched = m.as_str().to_lowercase();
             // `allow` entries are already trimmed + lowercased.
-            allow.iter().any(|entry| *entry == matched)
+            if !allow.iter().any(|entry| *entry == matched) {
+                return None;
+            }
+            // The email regex guarantees an `@`; be total anyway.
+            let at = m.as_str().find('@')?;
+            Some((m.start(), m.start() + at))
         })
-        .map(|m| (m.start(), m.end()))
         .collect()
 }
 
@@ -515,7 +526,7 @@ fn allowed_email_spans(p: &Patterns, allow: &[String], line: &str) -> Vec<(usize
 ///    therefore never suppressed, whatever address they sit inside.
 /// 2. **Full containment, not overlap** (round 3): a match that merely straddles
 ///    the edge of an allowed address is not part of that address.
-/// 3. **Exact-match spans only** — see [`allowed_email_spans`].
+/// 3. **Exact-match spans, LOCAL PART only** — see [`allowed_email_local_spans`].
 fn suppressed_by_allowed_email(
     category: &str,
     spans: &[(usize, usize)],
@@ -542,7 +553,7 @@ fn scan_line(
         });
     };
 
-    let allowed_emails = allowed_email_spans(p, allow, line);
+    let allowed_locals = allowed_email_local_spans(p, allow, line);
     for r in &p.fleet {
         // The operator-email rule reports under `email`, which the allow-list
         // below governs; let that one path own it rather than double-reporting.
@@ -552,7 +563,7 @@ fn scan_line(
         for m in r.pattern.find_iter(line) {
             // Never override the author-attribution allow-list — see
             // `suppressed_by_allowed_email`.
-            if suppressed_by_allowed_email(r.category, &allowed_emails, m.start(), m.end()) {
+            if suppressed_by_allowed_email(r.category, &allowed_locals, m.start(), m.end()) {
                 continue;
             }
             push(r.category, m.as_str());
@@ -742,13 +753,13 @@ pub fn scan_and_redact(content: &str) -> (String, Vec<PiiViolation>) {
             };
         }
 
-        let allowed_emails = allowed_email_spans(p, &allow, line);
+        let allowed_locals = allowed_email_local_spans(p, &allow, line);
         for r in &p.fleet {
             if r.category == "email" {
                 continue;
             }
             for m in r.pattern.find_iter(line) {
-                if suppressed_by_allowed_email(r.category, &allowed_emails, m.start(), m.end()) {
+                if suppressed_by_allowed_email(r.category, &allowed_locals, m.start(), m.end()) {
                     continue;
                 }
                 spans.push((m.start(), m.end(), r.category.to_string()));
@@ -1619,11 +1630,42 @@ mod tests {
         assert!(v2.iter().any(|x| x.category == "internal_hostname"));
         assert!(!redacted.contains("<host>"), "hostname must be redacted: {redacted}"); // pii-test-fixture
 
-        // An address carrying an IP or a container id is equally not a licence.
+        // An address carrying a container id is equally not a licence. NOTE the
+        // UPPERCASE `<host>`: the container rule is deliberately case-sensitive,  // pii-test-fixture
+        // and codex caught that my first version of this test used lowercase
+        // and so could never have passed — it also correctly deduced from that
+        // the reported gate run had not included this exact diff. It had not.
         std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<email>"); // pii-test-fixture
-        assert!(scan_for_pii("Author: <email>") // pii-test-fixture
+        assert!(scan_for_pii("Author: ci@<host>.example") // pii-test-fixture
             .iter()
-            .any(|x| x.category == "container_id" || x.category == "internal_hostname"));
+            .any(|x| x.category == "container_id"));
+        clear_allow();
+    }
+
+    #[test]
+    #[serial]
+    fn suppression_covers_the_local_part_only_never_the_domain() {
+        // Review-panel round 5 (codex), VERIFIED REAL: scoping to
+        // `operator_name` was not enough, because the span was still the WHOLE
+        // address. With the operator name in the DOMAIN it was suppressed, and
+        // that is a detection the pre-#661 gate had. Author attribution is a
+        // claim about the LOCAL PART; the domain is not covered by it.
+        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "ops@<operator>.example"); // pii-test-fixture
+        let v = scan_for_pii("Author: ops@<operator>.example"); // pii-test-fixture
+        assert!(
+            v.iter().any(|x| x.category == "operator_name"),
+            "an operator name in the DOMAIN must still flag: {v:?}"
+        );
+        // Same on the redacting path.
+        let (redacted, v2) = scan_and_redact("Author: ops@<operator>.example"); // pii-test-fixture
+        assert!(v2.iter().any(|x| x.category == "operator_name"));
+        assert!(!redacted.contains("<operator>"), "domain name must be redacted: {redacted}"); // pii-test-fixture
+
+        // And the local-part case it exists to permit still works.
+        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<operator-email>"); // pii-test-fixture
+        assert!(!scan_for_pii("Author: <operator-email>") // pii-test-fixture
+            .iter()
+            .any(|x| x.category == "operator_name"));
         clear_allow();
     }
 
