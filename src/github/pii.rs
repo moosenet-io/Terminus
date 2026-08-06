@@ -74,9 +74,10 @@ use crate::error::ToolError;
 ///   * the preceding character is the body of a backslash escape (see below).
 ///
 /// **Why ASCII, not `char::is_alphanumeric` — a real weakening the review panel
-/// caught.** `is_alphanumeric()` is true for `Nl`/`No` characters (`Ⅷ`, `①`,
-/// `¾`) that the regex crate's `\w` does NOT include. Using it would have made
-/// `①<host>` DETECTED by the old `\b` rule but MISSED by the new one — obscure,  // pii-test-fixture
+/// caught.** `is_alphanumeric()` is true for `No` characters (`①`, `¾`) that
+/// the regex crate's `\w` (Alphabetic + M + Nd + Pc + Join_Control) does NOT
+/// include. Using it would have made `①<host>` DETECTED by the old `\b` rule but  // pii-test-fixture
+/// MISSED by the new one — obscure,
 /// but a weakening, and weakening is the one outcome this change must never
 /// produce. Blocking only on ASCII alphanumerics removes the whole class: every
 /// non-ASCII character is a separator, which can only ADD detections.
@@ -535,6 +536,31 @@ fn suppressed_by_allowed_email(
 ) -> bool {
     category == "operator_name" && spans.iter().any(|&(s, e)| s <= start && end <= e)
 }
+
+// ── HELD DESIGN DECISION (round 6; panel split 3-1, codex dissenting) ─────────
+// Documented in code so the next review sees it was intentional.
+//
+// codex: with `GITHUB_ALLOWED_AUTHORS=<operator>@example.com` the pre-#661 gate  // pii-test-fixture
+// still reported `operator_name` for `<operator>`, and this gate does not — a lost  // pii-test-fixture
+// pre-#661 detection. That is factually correct. He proposed scoping
+// suppression to the newly-added `<operator>` rule only, leaving the older `<operator>`  // pii-test-fixture
+// rule firing unconditionally.
+//
+// HELD, deliberately not adopted. That carve-out would make the
+// author-attribution exception depend on which operator token happens to be
+// older — incoherent as a rule, and silently re-broken the first time the rule
+// list is reordered. opus analysed the same case and reached the opposite
+// conclusion: the exception is BY DEFINITION a claim about the local part of an
+// address the operator explicitly allow-listed, so an operator name inside that
+// exact local part is precisely what it is FOR. Everything else — the domain,
+// every other category, every non-exact address — is excluded by the three
+// narrowings above, each of which came from a panel counterexample.
+//
+// The trade is therefore scoped to exactly this: an operator name inside the
+// local part of an address the operator explicitly listed. That is attribution,
+// not disclosure. It is pinned by
+// `an_exactly_allow_listed_operator_address_is_attribution_not_disclosure`, so
+// moving away from it is a deliberate act rather than a silent drift.
 
 fn scan_line(
     p: &Patterns,
@@ -1644,6 +1670,39 @@ mod tests {
 
     #[test]
     #[serial]
+    fn an_exactly_allow_listed_operator_address_is_attribution_not_disclosure() {
+        // Pins the HELD design decision above (round 6, codex dissenting 3-1).
+        // codex is factually right that the pre-#661 gate flagged `<operator>` here  // pii-test-fixture
+        // and this one does not; the disagreement is over whether that is a
+        // defect. It is the author-attribution exception doing exactly its job,
+        // and it is held UNIFORMLY across operator tokens rather than
+        // carved out per-rule by age. If this assertion is ever inverted, that
+        // must be a deliberate decision — which is the point of pinning it.
+        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<operator>@example.com"); // pii-test-fixture
+        let v = scan_for_pii("Author: <operator>@example.com"); // pii-test-fixture
+        assert!(
+            !v.iter().any(|x| x.category == "operator_name"),
+            "an exactly-allow-listed operator address is attribution: {v:?}"
+        );
+        // The narrowings still hold on that very address: the SAME name
+        // elsewhere on the line, and anything in the DOMAIN, still flag.
+        let v2 = scan_for_pii("<operator> wrote it; see <operator>@example.com"); // pii-test-fixture
+        assert!(v2.iter().any(|x| x.category == "operator_name"));
+
+        // Coverage gap codex asked for: the redacting path must leave an
+        // allow-listed address intact rather than mangling it.
+        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<operator-email>"); // pii-test-fixture
+        let (redacted, v3) = scan_and_redact("Author: <operator-email>"); // pii-test-fixture
+        assert_eq!(
+            redacted, "Author: <operator-email>", // pii-test-fixture
+            "an allow-listed author address must survive redaction unchanged"
+        );
+        assert!(v3.is_empty(), "and produce no violations: {v3:?}");
+        clear_allow();
+    }
+
+    #[test]
+    #[serial]
     fn suppression_covers_the_local_part_only_never_the_domain() {
         // Review-panel round 5 (codex), VERIFIED REAL: scoping to
         // `operator_name` was not enough, because the span was still the WHOLE
@@ -1673,12 +1732,19 @@ mod tests {
     #[serial]
     fn boundary_predicate_never_loses_a_detection_the_old_rule_had() {
         clear_allow();
-        // codex, round 1: `char::is_alphanumeric()` is true for Nl/No
-        // (`①`, `Ⅷ`, `¾`), which the regex crate's `\w` does NOT include — so
-        // the old `\bpvf1` DID match `①<host>` and an is_alphanumeric-based  // pii-test-fixture
-        // predicate would have MISSED it. That is a weakening, the one outcome
-        // this change must never produce. `is_token_start` blocks only on ASCII
-        // alphanumerics, so every non-ASCII character is a separator.
+        // codex, round 1: `char::is_alphanumeric()` is true for characters the
+        // regex crate's `\w` does NOT include, so an is_alphanumeric-based
+        // predicate would have LOST a detection the old `\b` had — the one
+        // outcome this change must never produce.
+        //
+        // Precision (codex again, round 6 — my first wording here overstated
+        // it): `\w` is Alphabetic + M + Nd + Pc + Join_Control, so the
+        // genuinely regressing class is `No` — `①`, `¾` — which is NOT
+        // Alphabetic, meaning the old `\b` DID fire before it. `Ⅷ` (Nl) and
+        // `é` (Ll) ARE Alphabetic, hence `\w`, so the old `\b` did NOT fire
+        // before them; those two are new GAINS, not regressions. All four are
+        // asserted because `is_token_start` blocks only on ASCII alphanumerics
+        // and so covers the classes uniformly.
         for s in ["①<host>", "Ⅷpvf1", "¾<host>", "épvf1"] {  // pii-test-fixture
             // pii-test-fixture
             assert!(
