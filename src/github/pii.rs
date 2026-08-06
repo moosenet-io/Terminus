@@ -498,13 +498,31 @@ fn allowed_email_spans(p: &Patterns, allow: &[String], line: &str) -> Vec<(usize
         .collect()
 }
 
-/// Whether `[start, end)` lies ENTIRELY inside one of `spans`.
+/// Whether a fleet match at `[start, end)` is silenced by the author-attribution
+/// allow-list.
 ///
-/// Full containment, not overlap (round 3): a match that merely straddles the
-/// edge of an allowed address is not part of that address, and suppressing it
-/// would be the hiding trick above in another shape.
-fn contained_in(spans: &[(usize, usize)], start: usize, end: usize) -> bool {
-    spans.iter().any(|&(s, e)| s <= start && end <= e)
+/// Three conditions, each narrowing the last, and each one a defect the review
+/// panel found:
+///
+/// 1. **Only `operator_name`.** The round-2 defect was exactly and only that an
+///    allow-listed address flagged via its own local part. Suppressing every
+///    category was broader than the fix needed, and codex showed the cost in
+///    round 4: with `GITHUB_ALLOWED_AUTHORS=ops@<host>.example`, the allowed  // pii-test-fixture
+///    address itself carries a fleet HOSTNAME, so the gate silently stopped
+///    blocking `<host>` — a detection the pre-#661 gate had. An allow-list is a  // pii-test-fixture
+///    statement about WHO may be attributed, never about which infrastructure
+///    may be disclosed. Hostnames, IPs, container ids and service names are
+///    therefore never suppressed, whatever address they sit inside.
+/// 2. **Full containment, not overlap** (round 3): a match that merely straddles
+///    the edge of an allowed address is not part of that address.
+/// 3. **Exact-match spans only** — see [`allowed_email_spans`].
+fn suppressed_by_allowed_email(
+    category: &str,
+    spans: &[(usize, usize)],
+    start: usize,
+    end: usize,
+) -> bool {
+    category == "operator_name" && spans.iter().any(|&(s, e)| s <= start && end <= e)
 }
 
 fn scan_line(
@@ -533,8 +551,8 @@ fn scan_line(
         }
         for m in r.pattern.find_iter(line) {
             // Never override the author-attribution allow-list — see
-            // `allowed_email_spans`.
-            if contained_in(&allowed_emails, m.start(), m.end()) {
+            // `suppressed_by_allowed_email`.
+            if suppressed_by_allowed_email(r.category, &allowed_emails, m.start(), m.end()) {
                 continue;
             }
             push(r.category, m.as_str());
@@ -730,7 +748,7 @@ pub fn scan_and_redact(content: &str) -> (String, Vec<PiiViolation>) {
                 continue;
             }
             for m in r.pattern.find_iter(line) {
-                if contained_in(&allowed_emails, m.start(), m.end()) {
+                if suppressed_by_allowed_email(r.category, &allowed_emails, m.start(), m.end()) {
                     continue;
                 }
                 spans.push((m.start(), m.end(), r.category.to_string()));
@@ -1576,6 +1594,36 @@ mod tests {
         std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<operator-email>"); // pii-test-fixture
         let v3 = scan_for_pii("Author: <operator-email>"); // pii-test-fixture
         assert!(!v3.iter().any(|x| x.category == "operator_name"));
+        clear_allow();
+    }
+
+    #[test]
+    #[serial]
+    fn an_allowed_address_never_silences_infrastructure() {
+        // Review-panel round 4 (codex), VERIFIED REAL: even with EXACT-match
+        // spans, suppressing every category meant an allow-listed address that
+        // itself carries a fleet token silenced that token. An allow-list is a
+        // statement about WHO may be attributed, never about which
+        // infrastructure may be disclosed — so suppression is now scoped to
+        // `operator_name` alone.
+        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "ops@<host>.example"); // pii-test-fixture
+        let v = scan_for_pii("Author: ops@<host>.example"); // pii-test-fixture
+        assert!(
+            v.iter().any(|x| x.category == "internal_hostname"),
+            "a hostname inside an allow-listed address must STILL flag: {v:?}"
+        );
+        assert!(pii_gate("Author: ops@<host>.example").is_err()); // pii-test-fixture
+
+        // Same for the redacting path (codex asked for both to be covered).
+        let (redacted, v2) = scan_and_redact("Author: ops@<host>.example"); // pii-test-fixture
+        assert!(v2.iter().any(|x| x.category == "internal_hostname"));
+        assert!(!redacted.contains("<host>"), "hostname must be redacted: {redacted}"); // pii-test-fixture
+
+        // An address carrying an IP or a container id is equally not a licence.
+        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<email>"); // pii-test-fixture
+        assert!(scan_for_pii("Author: <email>") // pii-test-fixture
+            .iter()
+            .any(|x| x.category == "container_id" || x.category == "internal_hostname"));
         clear_allow();
     }
 
