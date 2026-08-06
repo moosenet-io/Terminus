@@ -787,7 +787,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recommend_selects_multimodal_preset_at_21gb() {
-        // The multimodal_pvf1 preset (alloc 21) is the highest-fitting preset at
+        // The multimodal_strix_halo preset (alloc 21) is the highest-fitting preset at
         // 21GB generic — deterministic, and does not disturb the 24GB tier
         // (still discrete_24gb).
         let tool = ModelAdvisorRecommend;
@@ -796,7 +796,7 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["preset_name"], "multimodal_pvf1");
+        assert_eq!(v["preset_name"], "multimodal_strix_halo");
     }
 
     #[tokio::test]
@@ -820,7 +820,7 @@ mod tests {
                 .await
                 .unwrap();
             let v: Value = serde_json::from_str(&result).unwrap();
-            assert_eq!(v["preset_name"], "multimodal_pvf1", "use_case={use_case}");
+            assert_eq!(v["preset_name"], "multimodal_strix_halo", "use_case={use_case}");
             let top = &v["models"].as_array().unwrap()[0];
             assert_eq!(top["role"], role, "use_case '{use_case}' top role");
             assert_eq!(top["name"], model, "use_case '{use_case}' top model");

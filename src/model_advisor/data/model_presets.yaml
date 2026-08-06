@@ -283,14 +283,14 @@ cpu_only:
     vram_gb: 0
     description: Smallest model for CPU inference
 # ── Multimodal fleet (CB-03, S125) ───────────────────────────────────────────
-# The <host>-class per-modality fleet: one concrete backend per non-chat modality,
+# The Strix Halo-class per-modality fleet: one concrete backend per non-chat modality,
 # each role name aligned to the Chord capability taxonomy so the offline advisor
 # and the online selector agree. Sized so the full modality set fits a ~21GB
 # budget; the modality serves are on-demand (lazy-start / idle-reap on the shared
 # Chord GPU pool), so they are not all VRAM-resident at once. Selected when the
 # budget is ~21GB, or by asking for a modality use_case on a multimodal host.
-multimodal_pvf1:
-  description: <host> multimodal fleet — per-modality backends (VLM/OCR/STT/TTS/rerank/embed/image-gen/tool-router)
+multimodal_strix_halo:
+  description: Strix Halo multimodal fleet — per-modality backends (VLM/OCR/STT/TTS/rerank/embed/image-gen/tool-router)
   vram_allocation_gb: 21
   kernel_params: {}
   ollama_env:
