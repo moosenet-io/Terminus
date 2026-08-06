@@ -429,8 +429,8 @@ mod tests {
         }
         // But the escape-abutted form — the one live on the mirror — still goes.
         assert_eq!(scrub(r#""clean\nCT327""#), r#""clean\n<host>""#); // pii-test-fixture
-        // `<host>` keeps its numeric suffix (opus, round 1: grouping the
-        // `\d*` across both tokens, so `<host>` scrubs whole).
+        // `<host>` keeps its numeric suffix (opus, round 1: grouping the  // pii-test-fixture
+        // `\d*` across both tokens, so `<host>` scrubs whole).  // pii-test-fixture
         assert_eq!(scrub("on <host>"), "on <host>"); // pii-test-fixture
     }
 
