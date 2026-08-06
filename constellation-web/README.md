@@ -851,9 +851,23 @@ same cosmetic-plus-server-enforced pattern as every other panel.
   with the tool — see *Every administrative write is authorized* in the root `README.md`; this note
   only covers what the operator must type. Known account names are offered as click-to-fill
   suggestions, drawn from the server-owner records the page has already loaded; that list is **not**
-  the set of legal answers — there is no account-listing tool, so it is routinely partial or empty
-  and **typing a name is normal, not an error**. An unknown or disabled account, and a pairing you
+  the set of legal answers — it is routinely partial or empty and **typing a name is normal, not an
+  error**. (TERM #654 added `rmcp_account_list`, so a complete list is now obtainable; wiring these
+  suggestions to it is deliberate follow-up work rather than part of that item, and until it lands
+  the suggestions stay what they were.) An unknown or disabled account, and a pairing you
   are not authorized for, are both refused by the server and shown in the dialog.
+- **Accounts (`/terminus/accounts`, TERM #654) is where a fresh deployment starts.** Every surface
+  above presupposes an account — one signs in, one consents, one is named as a connector's `owner`
+  — and until this page there was no way to create one, so the door was deployed and unusable. Its
+  designed case is the FIRST visit, when there are zero accounts: the empty state explains the
+  one-shot first-operator path rather than rendering a blank table. `bootstrapAvailable` and
+  `stranded` come from the server and are never inferred from the list length, because an empty
+  door and a door whose operators are all disabled both show an empty list and need opposite
+  remedies. The last-operator refusal is the server's, inside the transaction; the page only
+  disables the control and says why. A password is sent once and never displayed, echoed, stored
+  or round-tripped — deliberately not the client secret's "shown once" ceremony, because a client
+  secret is minted by the server and a password is the operator's own input.
+
 - **The client secret is shown exactly once.** It lives only in `ClientCreateDialog`'s component
   state, for the life of the created step, with a copy control, an explicit "this is the only
   time you will see this", and an acknowledgement checkbox gating the Done button. No read tool

@@ -17,6 +17,13 @@ export const RMCP_TOOLS = {
   groupUpdate: 'rmcp_group_update',
   groupPreview: 'rmcp_group_preview',
   serverOwnerList: 'rmcp_server_owner_list',
+  // TERM #654 — the account surface. Every other tool in this table presupposes an account;
+  // until these existed, `rmcp_account` was empty and unpopulatable and the whole door reached
+  // nothing. `accountCreate` is also the BOOTSTRAP path (see `types/rmcp.ts`).
+  accountList: 'rmcp_account_list',
+  accountCreate: 'rmcp_account_create',
+  accountPromote: 'rmcp_account_promote',
+  accountDisable: 'rmcp_account_disable',
   sessionList: 'rmcp_session_list',
   sessionRevoke: 'rmcp_session_revoke',
 } as const;

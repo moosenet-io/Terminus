@@ -41,6 +41,11 @@
 pub mod activity;
 pub mod assets;
 pub mod audit;
+/// TERM #654: asserts the COMMITTED web bundle contains the routes the source registers.
+/// `dist/` is a build artifact embedded by rust-embed, and until this module nothing connected
+/// the TypeScript that declares a route to the artifact that ships it — so a page could merge
+/// fully tested and simply not exist in the deployed GUI.
+pub mod dist_freshness;
 pub mod auth;
 pub mod mask;
 pub mod models_api;

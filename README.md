@@ -1000,6 +1000,91 @@ decrypt. That is a deliberate fail-closed gate, not a fault — RMCP-08 provisio
 Clearing `totp_secret_enc` to work around it would silently downgrade the account to one
 factor and must not be done.
 
+#### Where the FIRST account comes from — the one-shot operator bootstrap
+
+Everything below presupposes an account: an account logs in at `/oauth/login`, an account
+grants consent, and `rmcp_client_create` names an account as a connector's owner. Until
+**TERM #654** nothing created one — the store's insert had zero callers, there was no tool and
+no route — so `rmcp_account` was empty and unpopulatable and the door, though deployed, reached
+nothing.
+
+Four tools close that, on the sanctioned Terminus door (not the OAuth router, whose whole
+surface is unauthenticated by design):
+
+```
+rmcp_account_create   [actor=<operator>] name=<account> password=<secret> [operator=true]
+rmcp_account_promote  [actor=<operator>] account=<account> [revoke=true]
+rmcp_account_disable  [actor=<operator>] account=<account> [enable=true]
+rmcp_account_list     [actor=<operator>]
+```
+
+**The first-account rule, stated once.** While this deployment has **never had an account** —
+`rmcp_account` is empty — whoever reaches `rmcp_account_create` may create the first one, and it
+is created as an operator. **The instant any account exists that path is closed permanently.**
+There is no bootstrap secret to provision and none to forget to remove; the emptiness of the
+table *is* the authorization, and reaching the tool at all already required an mTLS-verified
+fleet identity.
+
+The gate is deliberately "no account **row**", not "no active **operator**". The latter is what
+the first draft used and review rejected it: operator-ness is revocable, so gating an
+unauthenticated privilege-creation path on it is fail-open — bootstrap an operator, disable it,
+and the door would report no active operator and mint a second one. A row's existence is not
+revocable (nothing here deletes an account; disabling sets a flag), so the corrected gate closes
+once and stays closed. It loses nothing reachable, because creating a delegated account already
+requires an operator.
+
+The transition is not a mode any code carries. The condition is re-derived on the **write**
+path, inside the same `BEGIN IMMEDIATE` transaction as the insert — so a stale observation, a
+racing second bootstrap, or an account created in between are all refused rather than honoured.
+What the tool layer resolves is only which request to make.
+
+**Who the action is attributed to.** `actor` is optional when the deployment has exactly one
+operator (or one is named in `RMCP_OPERATOR_ACCOUNT`) and **required when several exist** — with
+several and no `actor`, the tools refuse rather than acting as whichever operator happened to be
+configured. Naming an `actor` confers nothing: the store re-derives that account's operator status
+inside the transaction, and it is never inferred from any other field.
+
+An omitted `actor` on a WRITE resolves to the sole active operator, and the store re-verifies
+that it is *still* the only one inside the write transaction — otherwise a second operator
+appearing in between would let an inferred identity act on an ambiguous fleet.
+
+`rmcp_account_list` is the one exception, and only because it is a read: with several operators
+and no `actor` it resolves any one of them rather than refusing, since every operator gets the
+identical answer and refusing would make a multi-operator door unlistable (you would have to know
+an operator's name to discover who the operators are). A named `actor` is still validated. No
+**write** takes that shortcut.
+
+**Not yet audited — say so rather than imply otherwise.** `actor` selects *which account's
+authority is used*, and each tool echoes the resolved account back as `acted_as` so an inferred
+one is visible rather than silent — but these tools emit no entry in the OAuth audit log the way
+`rmcp_server_owner_set` does. Until they do, do not describe
+account administration as audited. Tracked as follow-up work on TERM #654.
+
+The password is argon2id-hashed by the login verifier before the store is touched, reaches the
+store only as a verified `Argon2idHash`, and is never echoed in a result, a structured payload,
+an error, or the journal. These tools are deliberately **not** approval-gated: the approval gate
+persists a guarded call's raw arguments, which would write the plaintext to disk.
+
+So a fresh deployment goes: apply the migration → `rmcp_account_create` → `rmcp_client_create`
+→ paste the `client_id` into Claude.
+
+The **Accounts** page (`/terminus/accounts`) is that same flow in the GUI and calls exactly these
+tools — **but it is not usable yet, and this is the honest state of it**: the page reaches the
+tools through `POST /api/terminus/rmcp/call`, a web bridge that **does not exist in this repo**.
+Until it is built the page renders an explanatory "cannot reach the account tools" state instead
+of a list, exactly as the Connectors page has since RMCP-13. The tools themselves are live on the
+Terminus door, so **the CLI path above is the working one today**; the page is built, embedded in
+the binary, and waiting on its bridge.
+
+**Nothing can strand the door.** `rmcp_account_promote … revoke=true` and `rmcp_account_disable`
+both refuse to remove the last *active* operator, through one shared server-side check that runs
+**after** the write inside the same transaction and rolls it back — which is correct for demoting
+yourself, for demoting someone else, and for the case a count-taken-first gets wrong (two
+operator rows, one of them disabled). That guard matters more under the corrected bootstrap gate
+than it did under the first draft: a door with no active operator is now **unrecoverable without
+direct database access**, so the API must never be able to create one. The GUI reflects the
+refusal; it does not implement it.
+
 #### Where a `client_id` comes from — operator minting, and gated DCR
 
 There are exactly two ways a connector comes into existence, and the default posture is the
